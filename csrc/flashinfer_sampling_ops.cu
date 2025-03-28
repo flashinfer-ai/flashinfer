@@ -52,7 +52,7 @@ void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
-                                at::Tensor output_emitted_token_num, bool deterministic,
+                                at::Tensor output_final_emitted_token_pos, bool deterministic,
                                 std::optional<at::Generator> gen);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

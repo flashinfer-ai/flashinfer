@@ -1383,7 +1383,7 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
                                          DType* target_probs, IdType* output_token_ids,
                                          IdType* output_accepted_token_num,
-                                         IdType* output_emitted_token_num,
+                                         IdType* output_final_emitted_token_pos,
                                          uint32_t num_speculative_tokens, uint32_t d,
                                          uint64_t philox_seed, uint64_t philox_offset) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -1426,8 +1426,8 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   }
 
   if (tx == 0) {
-    output_accepted_token_num[row_idx] += accepted_token_num;
-    output_emitted_token_num[row_idx] += emitted_token_num;
+    output_accepted_token_num[row_idx] = accepted_token_num;
+    output_final_emitted_token_pos[row_idx] = emitted_token_num;
   }
 
   // sample from relu(target_probs - draft_probs)
@@ -1517,7 +1517,7 @@ template <typename DType, typename IdType>
 cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
                                      DType* target_probs, IdType* output_token_ids,
                                      IdType* output_accepted_token_num,
-                                     IdType* output_emitted_token_num, uint32_t batch_size,
+                                     IdType* output_final_emitted_token_pos, uint32_t batch_size,
                                      uint32_t num_speculative_tokens, uint32_t d,
                                      bool deterministic, uint64_t philox_seed,
                                      uint64_t philox_offset, cudaStream_t stream = 0) {
@@ -1532,7 +1532,7 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
                   &target_probs,
                   &output_token_ids,
                   &output_accepted_token_num,
-                  &output_emitted_token_num,
+                  &output_final_emitted_token_pos,
                   &num_speculative_tokens,
                   &d,
                   &philox_seed,

@@ -333,14 +333,14 @@ def get_sampling_module():
 
         @register_custom_op(
             "flashinfer::chain_speculative_sampling",
-            mutates_args=("output_accepted_token_num", "output_emitted_token_num"),
+            mutates_args=("output_accepted_token_num", "output_final_emitted_token_pos"),
         )
         def chain_speculative_sampling(
             draft_probs: torch.Tensor,
             draft_token_ids: torch.Tensor,
             target_probs: torch.Tensor,
             output_accepted_token_num: torch.Tensor,
-            output_emitted_token_num: torch.Tensor,
+            output_final_emitted_token_pos: torch.Tensor,
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
@@ -349,7 +349,7 @@ def get_sampling_module():
             draft_token_ids = draft_token_ids.int()
             target_probs = target_probs.float()
             output_accepted_token_num = output_accepted_token_num.int()
-            output_emitted_token_num = output_emitted_token_num.int()
+            output_final_emitted_token_pos = output_final_emitted_token_pos.int()
             b, n = draft_token_ids.shape
             output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
             module.chain_speculative_sampling.default(
@@ -358,7 +358,7 @@ def get_sampling_module():
                 target_probs,
                 output_token_ids,
                 output_accepted_token_num,
-                output_emitted_token_num,
+                output_final_emitted_token_pos,
                 deterministic,
                 generator,
             )
@@ -370,7 +370,7 @@ def get_sampling_module():
             draft_token_ids: torch.Tensor,
             target_probs: torch.Tensor,
             output_accepted_token_num: torch.Tensor,
-            output_emitted_token_num: torch.Tensor,
+            output_final_emitted_token_pos: torch.Tensor,
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
@@ -1130,7 +1130,7 @@ def chain_speculative_sampling(
     draft_token_ids,
     target_probs,
     maybe_output_accepted_token_num: Optional[torch.Tensor] = None,
-    maybe_output_emitted_token_num: Optional[torch.Tensor] = None,
+    maybe_output_final_emitted_token_pos: Optional[torch.Tensor] = None,
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
@@ -1158,8 +1158,10 @@ def chain_speculative_sampling(
         It only evaluates the alignment of draft model and target model.
         Shape: ``(batch_size)``
         If specified, the number of accepted token number will be added to this tensor inplace. Default is ``None``.
-    maybe_output_emitted_token_num: Optional[torch.Tensor]
-        The number of tokens that are finally emitted/generated for each request.
+    maybe_output_final_emitted_token_pos: Optional[torch.Tensor]
+        The position of the final token that is emitted/generated for each request. The final token emitted is
+        either 1) resampled (under the resampling distribution (q - p)+) after the draft token at the given pos
+        is rejected, or 2) sampled under the target distribution q if all draft tokens are accepted.
         Shape: ``(batch_size)``
         If specified, the number of emitted token number will be added to this tensor inplace. Default is ``None``.
     deterministic: bool
@@ -1182,8 +1184,10 @@ def chain_speculative_sampling(
         satisfy the probability requirement r < p/q.
         It only evaluates the alignment of draft model and target model.
         Shape: ``(batch_size)``
-    output_emitted_token_num: torch.Tensor
-        The number of tokens that are finally emitted/generated for each request.
+    output_final_emitted_token_pos: torch.Tensor
+        The position of the final token that is emitted/generated for each request. The final token emitted is
+        either 1) resampled (under the resampling distribution (q - p)+) after the draft token at the given pos
+        is rejected, or 2) sampled under the target distribution q if all draft tokens are accepted.
         Shape: ``(batch_size)``
 
     Examples
@@ -1209,7 +1213,7 @@ def chain_speculative_sampling(
     tensor([[ 2,  0, -1]], device='cuda:0', dtype=torch.int32)
     >>> output_accepted_token_num
     tensor([1], device='cuda:0')
-    >>> output_emitted_token_num
+    >>> output_final_emitted_token_pos
     tensor([1], device='cuda:0')
     """
     b = draft_probs.size(0)
@@ -1218,17 +1222,17 @@ def chain_speculative_sampling(
         output_accepted_token_num = torch.zeros(b, dtype=torch.int32, device=dev)
     else:
         output_accepted_token_num = maybe_output_accepted_token_num
-    if maybe_output_emitted_token_num is None:
-        output_emitted_token_num = torch.zeros(b, dtype=torch.int32, device=dev)
+    if maybe_output_final_emitted_token_pos is None:
+        output_final_emitted_token_pos = torch.zeros(b, dtype=torch.int32, device=dev)
     else:
-        output_emitted_token_num = maybe_output_emitted_token_num
+        output_final_emitted_token_pos = maybe_output_final_emitted_token_pos
     output_token_ids = get_sampling_module().chain_speculative_sampling(
         draft_probs,
         draft_token_ids,
         target_probs,
         output_accepted_token_num,
-        output_emitted_token_num,
+        output_final_emitted_token_pos,
         deterministic,
         generator,
     )
-    return output_token_ids, output_accepted_token_num, output_emitted_token_num
+    return output_token_ids, output_accepted_token_num, output_final_emitted_token_pos
