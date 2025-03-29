@@ -4,6 +4,19 @@ set(FLASHINFER_UTILS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 set(CUTLASS_INCLUDE_DIRS ${NvidiaCutlass_DIR}/include
                          ${NvidiaCutlass_DIR}/tools/util/include)
 
+# ==== RPATH CONFIGURATION FOR C++ LIBRARY ====
+# Use standard GNU installation directories
+include(GNUInstallDirs)
+
+# Calculate relative path from bin to lib directory
+file(RELATIVE_PATH _rel_path "${CMAKE_INSTALL_FULL_BINDIR}"
+     "${CMAKE_INSTALL_FULL_LIBDIR}")
+
+# Set RPATH for core library targets
+set(CMAKE_INSTALL_RPATH "${FLASHINFER_RPATH_BASE}/${_rel_path}")
+# Add the absolute library path as a fallback for third-party applications
+list(APPEND CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}")
+
 # Apply data type definitions based on enabled options
 if(FLASHINFER_ENABLE_FP8_E4M3)
   message(STATUS "Compile fp8_e4m3 kernels.")

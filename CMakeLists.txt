@@ -19,6 +19,20 @@ project(
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 
+# ==== RPATH CONFIGURATION ====
+# Set Linux RPATH base
+set(FLASHINFER_RPATH_BASE "$ORIGIN")
+
+# Always build with install RPATH to avoid needs for LD_LIBRARY_PATH
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+
+# Include the link path in RPATH by default for better dependency resolution
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Skip the build tree rpath - we only care about install rpath
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+set(CMAKE_SKIP_INSTALL_RPATH FALSE)
+
 # cmake-format: off
 # Compiler flags
 string(
