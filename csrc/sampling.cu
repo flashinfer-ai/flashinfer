@@ -186,7 +186,7 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
-                                at::Tensor output_emitted_token_num, bool deterministic,
+                                at::Tensor output_emitted_draft_token_num, bool deterministic,
                                 std::optional<at::Generator> gen_) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
@@ -205,7 +205,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
   CHECK_EQ(num_speculate_tokens + 1, target_probs.size(1));
   CHECK_EQ(vocab_size, target_probs.size(2));
   CHECK_EQ(batch_size, output_accepted_token_num.size(0));
-  CHECK_EQ(batch_size, output_emitted_token_num.size(0));
+  CHECK_EQ(batch_size, output_emitted_draft_token_num.size(0));
   uint64_t philox_seed, philox_offset;
   auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -221,8 +221,8 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()), static_cast<int*>(output_token_ids.data_ptr()),
       static_cast<int*>(output_accepted_token_num.data_ptr()),
-      static_cast<int*>(output_emitted_token_num.data_ptr()), batch_size, num_speculate_tokens,
-      vocab_size, deterministic, philox_seed, philox_offset, stream);
+      static_cast<int*>(output_emitted_draft_token_num.data_ptr()), batch_size,
+      num_speculate_tokens, vocab_size, deterministic, philox_seed, philox_offset, stream);
 
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
