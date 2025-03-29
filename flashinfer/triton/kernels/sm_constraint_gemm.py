@@ -17,10 +17,10 @@ def matmul_get_configs():
             num_warps=w,
         )
         for BM in [128]
-        for BN in [128, 256]
-        for BK in [64, 128]
-        for s in ([3, 4])
-        for w in [4, 8]
+        for BN in [128]
+        for BK in [64]
+        for s in ([3])
+        for w in [4]
     ]
 
 
@@ -127,7 +127,16 @@ def matmul_kernel_persistent(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if c_ptr.dtype.element_ty == tl.float8e4nv:
             c = accumulator.to(tl.float8e4nv)
-        else:
+        elif c_ptr.dtype.element_ty == tl.bfloat16:
+            c = accumulator.to(tl.bfloat16)
+        elif c_ptr.dtype.element_ty == tl.float16:
             c = accumulator.to(tl.float16)
+        else:
+            c = accumulator.to(tl.float32)
+
+        # c_buf = tl.load(c_ptrs, mask=c_mask)
+        # c = alpha * c + beta * c_buf
+        # tl.device_print("c_buf", c_buf)
+        # tl.device_print("c", c)
         c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
         tl.store(c_ptrs, c, mask=c_mask)
