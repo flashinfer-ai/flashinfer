@@ -5,21 +5,8 @@ import flashinfer
 import flashinfer.triton
 
 def torch_gemm(a, b, c, alpha=1.0, beta=0.0):
-    convert = a.dtype == torch.float8_e4m3fn
-
-    if convert:
-        a = a.to(torch.float16)
-        b = b.to(torch.float16)
-        c = c.to(torch.float16)
-
-    # Perform matrix multiplication
     x = torch.matmul(a, b.T)
-    # Scale the result by alpha
     c = alpha * x + beta * c
-
-    if convert:
-        c = c.to(torch.float8_e4m3fn)
-
     return c
 
 def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
@@ -33,7 +20,7 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
 @pytest.mark.parametrize("alpha", [1.0, 0.5, 2.0])
 @pytest.mark.parametrize("beta", [0.0, 0.5, 2.0]) 
 @pytest.mark.parametrize("num_sms", [1, 16, 64, 128, 132, 133])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float16, torch.bfloat16, torch.float32])
 # todo: torch.float8_e4m3fn, bf16
 # @pytest.mark.parametrize("M", [128])
 # @pytest.mark.parametrize("N", [128])
