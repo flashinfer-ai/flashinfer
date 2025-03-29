@@ -52,32 +52,14 @@ message(
 message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
 # ----------------------- SM90 head dims computation ------------------------#
-set(SM90_ALLOWED_HEAD_DIMS "64,64" "128,128" "256,256" "192,128")
+# Include the logic to caclulate the head dims for SM90
+include(CalculateSM90HeadDims)
 set(HEAD_DIMS_SM90 "")
-
-foreach(DIM_VAL ${HEAD_DIMS})
-  string(CONCAT TUPLE_VAL "${DIM_VAL}" "," "${DIM_VAL}")
-  list(FIND SM90_ALLOWED_HEAD_DIMS ${TUPLE_VAL} RESULT)
-  if(NOT ${RESULT} EQUAL -1)
-    list(APPEND HEAD_DIMS_SM90 ${TUPLE_VAL})
-  endif()
-endforeach()
-
-foreach(TUPLE_VAL ${SM90_ALLOWED_HEAD_DIMS})
-  string(REPLACE "," ";" HEAD_DIMS_LIST ${TUPLE_VAL})
-  list(GET HEAD_DIMS_LIST 0 K)
-  list(GET HEAD_DIMS_LIST 1 V)
-  if(NOT K EQUAL V)
-    list(APPEND HEAD_DIMS_SM90 ${TUPLE_VAL})
-  endif()
-endforeach()
-
-list(REMOVE_DUPLICATES HEAD_DIMS_SM90)
-# ---------------------------------------------------------------------------#
-
+flashinfer_compute_sm90_head_dims(RESULT HEAD_DIMS_SM90)
 # Log SM90_ALLOWED_HEAD_DIMS and HEAD_DIMS_SM90
-message(STATUS "SM90_ALLOWED_HEAD_DIMS=${SM90_ALLOWED_HEAD_DIMS}")
+message(STATUS "SM90_ALLOWED_HEAD_DIMS=${FLASHINFER_SM90_ALLOWED_HEAD_DIMS}")
 message(STATUS "HEAD_DIMS_SM90=${HEAD_DIMS_SM90}")
+# ---------------------------------------------------------------------------#
 
 set(GENERATED_SOURCE_DIR
     "${CMAKE_BINARY_DIR}/libflashinfer/src/generated"
@@ -86,6 +68,30 @@ set(GENERATED_SOURCE_DIR_ROOT
     "${CMAKE_BINARY_DIR}/libflashinfer/src"
     CACHE INTERNAL "")
 file(MAKE_DIRECTORY ${GENERATED_SOURCE_DIR})
+
+# Define the stamp file for tracking regeneration
+set(GENERATION_STAMP "${GENERATED_SOURCE_DIR}/generation.stamp")
+
+# Find all generator scripts to track for changes
+file(GLOB GENERATOR_SCRIPTS "${PROJECT_SOURCE_DIR}/aot_build_utils/*.py")
+
+# Check if we need to regenerate based on script changes
+set(NEED_SOURCE_REGENERATION FALSE)
+if(NOT EXISTS "${GENERATION_STAMP}")
+  message(STATUS "Generation needed: Stamp file not found")
+  set(NEED_SOURCE_REGENERATION TRUE)
+elseif(NOT EXISTS "${GENERATED_SOURCE_DIR}/dispatch.inc")
+  message(STATUS "Generation needed: Generated files not found")
+  set(NEED_SOURCE_REGENERATION TRUE)
+else()
+  foreach(script ${GENERATOR_SCRIPTS})
+    if("${script}" IS_NEWER_THAN "${GENERATION_STAMP}")
+      message(STATUS "Generation needed: ${script} changed")
+      set(NEED_SOURCE_REGENERATION TRUE)
+      break()
+    endif()
+  endforeach()
+endif()
 
 # cmake-format: off
 # Command to generate kernel sources
@@ -112,35 +118,48 @@ set(AOT_GENERATE_DISPATCH_INC_COMMAND
     --mask_modes ${MASK_MODES})
 # cmake-format: on
 
-# Generate kernel sources during configure time
-execute_process(COMMAND ${AOT_GENERATE_COMMAND}
-                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-execute_process(COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
-                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+# Only regenerate at configure time if needed
+if(NEED_SOURCE_REGENERATION)
+  message(STATUS "Generating kernel sources (configure time)")
+  execute_process(
+    COMMAND ${AOT_GENERATE_COMMAND}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    RESULT_VARIABLE GEN_RESULT)
+  if(NOT GEN_RESULT EQUAL 0)
+    message(FATAL_ERROR "Kernel generation failed with error ${GEN_RESULT}")
+  endif()
 
-# Find generated source files
+  execute_process(
+    COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    RESULT_VARIABLE DISPATCH_RESULT)
+  if(NOT DISPATCH_RESULT EQUAL 0)
+    message(
+      FATAL_ERROR
+        "Dispatch header generation failed with error ${DISPATCH_RESULT}")
+  endif()
+
+  # Create a stamp file to track when we last generated
+  execute_process(COMMAND ${CMAKE_COMMAND} -E touch "${GENERATION_STAMP}")
+endif()
+
+# Now we can safely glob the files (they exist at configure time)
 file(GLOB_RECURSE DECODE_KERNELS_SRCS ${GENERATED_SOURCE_DIR}/*decode_head*.cu)
 file(GLOB_RECURSE PREFILL_KERNELS_SRCS
      ${GENERATED_SOURCE_DIR}/*prefill_head*.cu)
 file(GLOB_RECURSE DISPATCH_INC_FILE ${GENERATED_SOURCE_DIR}/dispatch.inc)
 
-# Custom commands to regenerate sources when dependencies change
-add_custom_command(
-  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS} ${DISPATCH_INC_FILE}
-  COMMAND ${AOT_GENERATE_COMMAND}
-  COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
-  DEPENDS ${FLASHINFER_GENERATORS}
-  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-  COMMENT "Generating kernel sources"
-  VERBATIM)
-
-# Custom target to explicitly trigger kernel generation
+# A custom target for manual kernel regeneration
 add_custom_target(
   generate_kernels
   COMMAND ${AOT_GENERATE_COMMAND}
   COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
+  COMMAND ${CMAKE_COMMAND} -E touch "${GENERATION_STAMP}"
+  # After generation, force CMake to reconfigure to pick up new files
+  COMMAND ${CMAKE_COMMAND} -E echo "Generated files - reconfiguration needed"
+  COMMAND ${CMAKE_COMMAND} ${CMAKE_BINARY_DIR}
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-  COMMENT "Manually generating kernel sources"
+  COMMENT "Manually generating kernel sources and reconfiguring"
   VERBATIM)
 add_custom_target(dispatch_inc DEPENDS ${DISPATCH_INC_FILE})
 
