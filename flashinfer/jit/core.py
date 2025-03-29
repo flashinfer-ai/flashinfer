@@ -87,8 +87,9 @@ def load_cuda_ops(
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags=None,
     extra_include_paths=None,
-    verbose=False,
 ):
+    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+
     if extra_cflags is None:
         extra_cflags = []
     if extra_cuda_cflags is None:
@@ -106,6 +107,14 @@ def load_cuda_ops(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if verbose:
+        cuda_cflags += [
+            "-g",
+            "-lineinfo",
+            "--ptxas-options=-v",
+            "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
+        ]
+
     cflags += extra_cflags
     cuda_cflags += extra_cuda_cflags
     logger.info(f"Loading JIT ops: {name}")
