@@ -35,15 +35,17 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
     b = b.T.contiguous()
     c = torch.randn((M, N), device="cuda", dtype=torch.float16).to(dtype)
 
-    c_torch = torch_gemm(a, b, c, alpha, beta) if dtype == torch.float16 or dtype == torch.float32 else None
-    c_triton = flashinfer.triton.sm_constraint_gemm.matmul_persistent(a, b.T, c, alpha, beta, num_sms)
-
-    in_place_triton = c_triton.data_ptr() == c.data_ptr() and torch.allclose(c_triton.to(torch.float16), c.to(torch.float16))
-    assert in_place_triton # modified in place
+    c_torch = torch_gemm(a, b, c, alpha, beta) if dtype == torch.float16 or dtype == torch.float32 or dtype == torch.bfloat16 else None
+    c_triton = flashinfer.triton.sm_constraint_gemm.gemm_persistent(a, b.T, c, alpha, beta, num_sms)
 
     cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
+    torch_atol = 10.0 if dtype == torch.bfloat16 else 1.0
+    in_place_triton = c_triton.data_ptr() == c.data_ptr() and torch.allclose(c_triton.to(cmp_dtype), c.to(cmp_dtype))
+    assert in_place_triton # modified in place
+
+    # cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
     if c_torch is not None:
-        torch_vs_triton = torch.allclose(c_torch.to(cmp_dtype), c_triton.to(cmp_dtype), atol=1.0)
+        torch_vs_triton = torch.allclose(c_torch.to(cmp_dtype), c_triton.to(cmp_dtype), atol=torch_atol)
         if torch_vs_triton == False:
             print(f"c_torch: {c_torch}")
             print(f"c_triton: {c_triton}")
