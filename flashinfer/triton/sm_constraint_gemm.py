@@ -31,7 +31,8 @@ def matmul_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
     c = torch.empty((M, N), device=a.device, dtype=dtype) if c is None else c
 
     # Set num_sms to be 100% of the available SMs
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count if num_sms is None else num_sms
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count 
+    num_sms = NUM_SMS if num_sms is None else min(NUM_SMS, num_sms)
     
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (
