@@ -1,8 +1,6 @@
 # Set global paths and directories
 set(FLASHINFER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(FLASHINFER_UTILS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/utils)
-set(CUTLASS_INCLUDE_DIRS ${NvidiaCutlass_DIR}/include
-                         ${NvidiaCutlass_DIR}/tools/util/include)
 
 # ==== RPATH CONFIGURATION FOR C++ LIBRARY ====
 # Use standard GNU installation directories

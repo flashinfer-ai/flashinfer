@@ -135,10 +135,8 @@ if(FLASHINFER_CUTLASS_DIR)
 endif()
 
 if(FLASHINFER_CUTLASS_DIR)
-  # Add CUTLASS include directories directly
-  include_directories(${FLASHINFER_CUTLASS_DIR}/include)
-  include_directories(${FLASHINFER_CUTLASS_DIR}/tools/util/include)
-
+  set(CUTLASS_INCLUDE_DIRS ${FLASHINFER_CUTLASS_DIR}/include
+                           ${FLASHINFER_CUTLASS_DIR}/tools/util/include)
   message(STATUS "Using CUTLASS from ${FLASHINFER_CUTLASS_DIR}")
 else()
   message(
