@@ -38,10 +38,17 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
     c_torch = torch_gemm(a, b, c, alpha, beta) if dtype == torch.float16 or dtype == torch.float32 or dtype == torch.bfloat16 else None
     c_triton = flashinfer.triton.sm_constraint_gemm.gemm_persistent(a, b.T, c, alpha, beta, num_sms)
 
+    c_clone = c.clone()
+    c_naive = flashinfer.triton.sm_constraint_gemm.gemm(a, b.T, c_clone, alpha, beta)
+
     cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
     torch_atol = 10.0 if dtype == torch.bfloat16 else 1.0
-    in_place_triton = c_triton.data_ptr() == c.data_ptr() and torch.allclose(c_triton.to(cmp_dtype), c.to(cmp_dtype))
-    assert in_place_triton # modified in place
+
+    in_place_triton_persistent = c_triton.data_ptr() == c.data_ptr() and torch.allclose(c_triton.to(cmp_dtype), c.to(cmp_dtype))
+    assert in_place_triton_persistent # modified in place
+
+    in_place_naive = c_naive.data_ptr() == c_clone.data_ptr() and torch.allclose(c_naive.to(cmp_dtype), c_clone.to(cmp_dtype))
+    assert in_place_naive # modified in place
 
     # cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
     if c_torch is not None:
