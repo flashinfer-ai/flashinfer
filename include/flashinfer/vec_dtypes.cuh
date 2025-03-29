@@ -29,7 +29,11 @@ namespace flashinfer {
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
 #endif
 
+#ifdef _WIN32
+#define FLASHINFER_INLINE inline [[msvc::forceinline]] __device__
+#else
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
+#endif
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 < 120200) && \
     (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
