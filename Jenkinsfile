@@ -114,50 +114,14 @@ def run_unittest_CPU_AOT_COMPILE(node_type) {
   }
 }
 
-def shard_run_unittest_GPU_1(node_type) {
+def shard_run_unittest_GPU(node_type, shard_id) {
   echo "Running unittest on ${node_type}, shard ${shard_id}"
   node(node_type) {
     ws(per_exec_ws('flashinfer-unittest')) {
       init_git(true) // we need cutlass submodule
       sh(script: "ls -alh", label: 'Show work directory')
       sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part1.sh", label: 'JIT Unittest Part 1')
-    }
-  }
-}
-
-def shard_run_unittest_GPU_2(node_type) {
-  echo "Running unittest on ${node_type}, shard ${shard_id}"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-unittest')) {
-      init_git(true) // we need cutlass submodule
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
-    }
-  }
-}
-
-def shard_run_unittest_GPU_3(node_type) {
-  echo "Running unittest on ${node_type}, shard ${shard_id}"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-unittest')) {
-      init_git(true) // we need cutlass submodule
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part3.sh", label: 'JIT Unittest Part 3')
-    }
-  }
-}
-
-def shard_run_unittest_GPU_4(node_type) {
-  echo "Running unittest on ${node_type}, shard ${shard_id}"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-unittest')) {
-      init_git(true) // we need cutlass submodule
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part4.sh", label: 'JIT Unittest Part 4')
+      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
     }
   }
 }
@@ -176,7 +140,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_build('CPU-LARGE')
+          run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -185,7 +149,7 @@ stage('Unittest') {
     },
     'JIT-Unittest-1': {
       try {
-        shard_run_unittest_GPU_1('GPU-G5-SPOT', 1)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 1)
       } catch (Throwable ex) {
         if (is_last_build()) {
           // retry if we are currently at last build
@@ -193,7 +157,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_build('GPU-G5')
+          shard_run_unittest_GPU('GPU-G5-SPOT', 1)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -202,7 +166,7 @@ stage('Unittest') {
     },
     'JIT-Unittest-2': {
       try {
-        shard_run_unittest_GPU_2('GPU-G5-SPOT', 2)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 2)
       } catch (Throwable ex) {
         if (is_last_build()) {
           // retry if we are currently at last build
@@ -210,7 +174,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_build('GPU-G5')
+          shard_run_unittest_GPU('GPU-G5-SPOT', 2)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -219,7 +183,7 @@ stage('Unittest') {
     },
     'JIT-Unittest-3': {
       try {
-        shard_run_unittest_GPU_3('GPU-G5-SPOT', 3)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 3)
       } catch (Throwable ex) {
         if (is_last_build()) {
           // retry if we are currently at last build
@@ -227,7 +191,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_build('GPU-G5')
+          shard_run_unittest_GPU('GPU-G5-SPOT', 3)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -236,7 +200,7 @@ stage('Unittest') {
     },
     'JIT-Unittest-4': {
       try {
-        shard_run_unittest_GPU_4('GPU-G5-SPOT', 4)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 4)
       } catch (Throwable ex) {
         if (is_last_build()) {
           // retry if we are currently at last build
@@ -244,7 +208,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_build('GPU-G5')
+          shard_run_unittest_GPU('GPU-G5-SPOT', 4)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
