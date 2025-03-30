@@ -1,3 +1,4 @@
+// adapted from https://github.com/efeslab/Nanoflow/blob/d6b381e58110a8b5d08cfabd4a55c0d5d0ebef57/pipeline/src/comm_test.cu
 #include <mpi.h>
 #include <iostream>
 #include <cmath>
