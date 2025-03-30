@@ -17,5 +17,8 @@
             ]
         }
     },
+    "mounts": [
+        "type=bind,source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,readonly"
+    ],
     "remoteUser": "devuser"
 }
