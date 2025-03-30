@@ -134,10 +134,6 @@ def gemm_kernel_persistent(
         else:
             c = accumulator.to(tl.float32)
 
-        # c_buf = tl.load(c_ptrs, mask=c_mask)
-        # c = alpha * c + beta * c_buf
-        # tl.device_print("c_buf", c_buf)
-        # tl.device_print("c", c)
         c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
         tl.store(c_ptrs, c, mask=c_mask)
 
