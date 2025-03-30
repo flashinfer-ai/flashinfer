@@ -10,6 +10,10 @@
     "customizations": {
         "vscode": {
             "extensions": [
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-python.python",
+                "ms-python.black-formatter",
+                "nvidia.nsight-vscode-edition"
             ]
         }
     },
