@@ -29,7 +29,6 @@ flashinfer_option(FLASHINFER_ENABLE_BF16 "Enable BF16 data type support" ON)
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dimensions to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Position encoding modes to enable" 0 1 2)
 flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
-# FIXME: CAUTION!!! Turning on this option will cause build failures. (refer #806, #936)
 flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS "Use FP16 for QK reductions" OFF)
 flashinfer_option(FLASHINFER_SM90_ALLOWED_HEAD_DIMS "64,64" "128,128" "256,256" "192,128")
 

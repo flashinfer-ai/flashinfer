@@ -48,11 +48,17 @@ configure_flashinfer_target(
   IS_BENCHMARK ON
 )
 
-configure_flashinfer_target(TARGET_NAME bench_sampling SOURCES
-                            "bench_sampling.cu" IS_BENCHMARK ON)
+configure_flashinfer_target(
+  TARGET_NAME bench_sampling
+  SOURCES "bench_sampling.cu"
+  IS_BENCHMARK ON
+)
 
-configure_flashinfer_target(TARGET_NAME bench_norm SOURCES "bench_norm.cu"
-                            IS_BENCHMARK ON)
+configure_flashinfer_target(
+  TARGET_NAME bench_norm
+  SOURCES "bench_norm.cu"
+  IS_BENCHMARK ON
+)
 
 # === FP8 Benchmark Configuration ===
 if(FLASHINFER_FP8_BENCHMARKS)

@@ -132,9 +132,7 @@ endif()
 # === CUTLASS Configuration ===
 if(FLASHINFER_CUTLASS_DIR)
   list(APPEND CMAKE_PREFIX_PATH ${FLASHINFER_CUTLASS_DIR})
-endif()
 
-if(FLASHINFER_CUTLASS_DIR)
   set(CUTLASS_INCLUDE_DIRS ${FLASHINFER_CUTLASS_DIR}/include
                            ${FLASHINFER_CUTLASS_DIR}/tools/util/include)
   message(STATUS "Using CUTLASS from ${FLASHINFER_CUTLASS_DIR}")
