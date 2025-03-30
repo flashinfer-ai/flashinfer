@@ -32,7 +32,6 @@ from .utils import (
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
-    get_cuda_stream,
 )
 
 
@@ -207,7 +206,7 @@ class BlockSparseAttentionWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -270,8 +269,7 @@ class BlockSparseAttentionWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
 
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -363,25 +361,23 @@ class BlockSparseAttentionWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
             )
 
-            with self.device as device:
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    kv_indptr_host,
-                    num_blocks_row,
-                    num_qo_heads,
-                    num_kv_heads,
-                    C,
-                    False,  # is_cuda_graph_enabled
-                    -1,  # window_left
-                    logits_soft_cap,  # logits_soft_cap
-                    head_dim,
-                    head_dim,
-                    torch.empty(0, dtype=q_data_type),
-                    torch.empty(0, dtype=kv_data_type),
-                    get_cuda_stream(device),
-                )
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                kv_indptr_host,
+                num_blocks_row,
+                num_qo_heads,
+                num_kv_heads,
+                C,
+                False,  # is_cuda_graph_enabled
+                -1,  # window_left
+                logits_soft_cap,  # logits_soft_cap
+                head_dim,
+                head_dim,
+                torch.empty(0, dtype=q_data_type),
+                torch.empty(0, dtype=kv_data_type),
+            )
         else:
             # if the operation is compute-bound, we use the tensor-core implementation
             self._use_tensor_cores = True
@@ -414,7 +410,7 @@ class BlockSparseAttentionWrapper:
 
             kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
             self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
-                kv_lens_arr_host, non_blocking=non_blocking
+                kv_lens_arr_host,
             )
 
             if self._backend == "fa3":
@@ -431,25 +427,23 @@ class BlockSparseAttentionWrapper:
                     ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                     kv_indptr_host = vector_sparse_indptr_host
 
-            with self.device as device:
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    kv_indptr_host,
-                    kv_lens_arr_host,
-                    M,  # total_num_rows
-                    num_blocks_row,  # batch_size
-                    num_qo_heads,
-                    num_kv_heads,
-                    self.C,  # page_size
-                    False,  # is_cuda_graph_enabled,
-                    head_dim,
-                    head_dim,
-                    causal,
-                    get_cuda_stream(device),
-                )
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                kv_indptr_host,
+                kv_lens_arr_host,
+                M,  # total_num_rows
+                num_blocks_row,  # batch_size
+                num_qo_heads,
+                num_kv_heads,
+                self.C,  # page_size
+                False,  # is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                causal,
+            )
 
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction

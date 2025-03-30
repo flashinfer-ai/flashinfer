@@ -23,12 +23,11 @@ using namespace flashinfer::group_gemm;
 void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                             at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
                             at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
-                            at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
-                            int64_t cuda_stream) {
+                            at::Tensor y_stride, at::Tensor empty_x_data,
+                            bool weight_column_major) {
   unsigned int batch_size = x_ptr.size(0);
-  auto device = float_workspace_buffer.device();
-
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_x_data.scalar_type(), c_type, [&] {
     using cutlass_t = cutlass_dtype_t<c_type>;
     auto status = CutlassSegmentGEMMSM90Run<cutlass_t, cutlass_t>(

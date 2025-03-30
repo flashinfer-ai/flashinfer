@@ -19,26 +19,25 @@
 
 void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
                 at::Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                double rope_theta, int64_t cuda_stream);
+                double rope_theta);
 
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim, bool interleave,
                         double rope_scale, double rope_theta, double low_freq_factor,
-                        double high_freq_factor, double old_context_length, int64_t cuda_stream);
+                        double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, int64_t cuda_stream);
+                        double rope_theta);
 
 void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                 at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
                                 double rope_scale, double rope_theta, double low_freq_factor,
-                                double high_freq_factor, double old_context_length,
-                                int64_t cuda_stream);
+                                double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
-                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
+                                      at::Tensor pos_ids, bool interleave);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Apply RoPE"

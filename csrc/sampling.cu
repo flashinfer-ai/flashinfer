@@ -27,7 +27,7 @@ using namespace flashinfer;
 
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
-                         std::optional<at::Generator> gen_, int64_t cuda_stream) {
+                         std::optional<at::Generator> gen_) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -42,7 +42,8 @@ void sampling_from_probs(at::Tensor probs, at::Tensor output,
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::SamplingFromProb(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
@@ -54,8 +55,7 @@ void sampling_from_probs(at::Tensor probs, at::Tensor output,
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                               bool deterministic, std::optional<at::Generator> gen_,
-                               int64_t cuda_stream) {
+                               bool deterministic, std::optional<at::Generator> gen_) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -70,7 +70,8 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
@@ -83,8 +84,7 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                               bool deterministic, std::optional<at::Generator> gen_,
-                               int64_t cuda_stream) {
+                               bool deterministic, std::optional<at::Generator> gen_) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   auto device = probs.device();
@@ -102,7 +102,8 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
@@ -115,8 +116,7 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
-                               bool deterministic, std::optional<at::Generator> gen_,
-                               int64_t cuda_stream) {
+                               bool deterministic, std::optional<at::Generator> gen_) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   auto device = probs.device();
@@ -134,7 +134,8 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
       has_min_p_arr ? static_cast<float*>(maybe_min_p_arr->data_ptr()) : nullptr,
@@ -149,8 +150,7 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                      std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, std::optional<at::Generator> gen_,
-                                     int64_t cuda_stream) {
+                                     bool deterministic, std::optional<at::Generator> gen_) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   auto device = probs.device();
@@ -169,7 +169,8 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::TopKTopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
@@ -185,8 +186,8 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
-                                at::Tensor output_emitted_token_num, bool deterministic,
-                                std::optional<at::Generator> gen_, int64_t cuda_stream) {
+                                at::Tensor output_emitted_draft_token_num, bool deterministic,
+                                std::optional<at::Generator> gen_) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(target_probs);
@@ -204,7 +205,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
   CHECK_EQ(num_speculate_tokens + 1, target_probs.size(1));
   CHECK_EQ(vocab_size, target_probs.size(2));
   CHECK_EQ(batch_size, output_accepted_token_num.size(0));
-  CHECK_EQ(batch_size, output_emitted_token_num.size(0));
+  CHECK_EQ(batch_size, output_emitted_draft_token_num.size(0));
   uint64_t philox_seed, philox_offset;
   auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -214,13 +215,14 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()), static_cast<int*>(output_token_ids.data_ptr()),
       static_cast<int*>(output_accepted_token_num.data_ptr()),
-      static_cast<int*>(output_emitted_token_num.data_ptr()), batch_size, num_speculate_tokens,
-      vocab_size, deterministic, philox_seed, philox_offset, stream);
+      static_cast<int*>(output_emitted_draft_token_num.data_ptr()), batch_size,
+      num_speculate_tokens, vocab_size, deterministic, philox_seed, philox_offset, stream);
 
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));

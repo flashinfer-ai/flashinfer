@@ -35,6 +35,22 @@ from ..utils import (
 from .utils import generate_additional_params
 
 
+def gen_sampling_tvm_binding(uri: str):
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+    for filename in ["sampling.cu", "sampling_jit_tvm_binding.cu"]:
+        src_path = FLASHINFER_TVM_BINDING_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    return uri, source_paths
+
+
 def gen_customize_batch_prefill_tvm_binding(
     backend: str,
     uri: str,

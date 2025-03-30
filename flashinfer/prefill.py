@@ -46,7 +46,6 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
-    get_cuda_stream,
     is_float8,
     register_custom_op,
     register_fake_op,
@@ -73,13 +72,13 @@ def get_single_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    run_func = _kernels.single_prefill_with_kv_cache
+                    run_func = _kernels.single_prefill_with_kv_cache.default
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
+                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90.default
             else:
-                run_func = gen_single_prefill_module(backend, *args).run
+                run_func = gen_single_prefill_module(backend, *args).run.default
 
             # torch library for single_prefill_with_kv_cache
 
@@ -103,42 +102,39 @@ def get_single_prefill_module(backend):
                 rope_scale: float,
                 rope_theta: float,
             ) -> None:
-                with q.device as device:  # device guard
-                    if backend == "fa3":
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            logits_soft_cap,
-                            sm_scale,
-                            get_cuda_stream(device),
-                        )
-                    else:
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            maybe_packed_custom_mask,
-                            maybe_alibi_slopes,
-                            logits_soft_cap,
-                            sm_scale,
-                            1.0 / rope_scale,  # rope_rcp_scale
-                            1.0 / rope_theta,  # rope_rcp_theta
-                            get_cuda_stream(device),
-                        )
-                    return o
+                if backend == "fa3":
+                    run_func(
+                        q,
+                        k,
+                        v,
+                        tmp,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        logits_soft_cap,
+                        sm_scale,
+                    )
+                else:
+                    run_func(
+                        q,
+                        k,
+                        v,
+                        tmp,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        maybe_packed_custom_mask,
+                        maybe_alibi_slopes,
+                        logits_soft_cap,
+                        sm_scale,
+                        1.0 / rope_scale,  # rope_rcp_scale
+                        1.0 / rope_theta,  # rope_rcp_theta
+                    )
+                return o
 
             @register_fake_op(f"flashinfer::{uri}_run")
             def _fake_run_single_prefill(
@@ -180,24 +176,30 @@ def get_batch_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    plan_func = _kernels.batch_prefill_with_kv_cache_plan
-                    ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
-                    paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
+                    plan_func = _kernels.batch_prefill_with_kv_cache_plan.default
+                    ragged_run_func = (
+                        _kernels.batch_prefill_with_ragged_kv_cache_run.default
+                    )
+                    paged_run_func = (
+                        _kernels.batch_prefill_with_paged_kv_cache_run.default
+                    )
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    plan_func = _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan
+                    plan_func = (
+                        _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan.default
+                    )
                     ragged_run_func = (
-                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run.default
                     )
                     paged_run_func = (
-                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run.default
                     )
             else:
                 module = gen_batch_prefill_module(backend, *args)
-                plan_func = module.plan
-                ragged_run_func = module.ragged_run
-                paged_run_func = module.paged_run
+                plan_func = module.plan.default
+                ragged_run_func = module.ragged_run.default
+                paged_run_func = module.paged_run.default
 
             # torch library for ragged_run
 
@@ -232,52 +234,49 @@ def get_batch_prefill_module(backend):
                 rope_scale: float,
                 rope_theta: float,
             ) -> None:
-                with q.device as device:  # device guard
-                    if backend == "fa2":
-                        ragged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            k,
-                            v,
-                            qo_indptr,
-                            kv_indptr,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            maybe_custom_mask,
-                            maybe_mask_indptr,
-                            maybe_alibi_slopes,
-                            logits_soft_cap,
-                            sm_scale,
-                            1.0 / rope_scale,  # rope_rcp_scale
-                            1.0 / rope_theta,  # rope_rcp_theta
-                            get_cuda_stream(device),
-                        )
-                    else:
-                        ragged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            k,
-                            v,
-                            qo_indptr,
-                            kv_indptr,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            logits_soft_cap,
-                            sm_scale,
-                            get_cuda_stream(device),
-                        )
+                if backend == "fa2":
+                    ragged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        kv_indptr,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        maybe_custom_mask,
+                        maybe_mask_indptr,
+                        maybe_alibi_slopes,
+                        logits_soft_cap,
+                        sm_scale,
+                        1.0 / rope_scale,  # rope_rcp_scale
+                        1.0 / rope_theta,  # rope_rcp_theta
+                    )
+                else:
+                    ragged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        kv_indptr,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        logits_soft_cap,
+                        sm_scale,
+                    )
 
-                    return o
+                return o
 
             @register_fake_op(f"flashinfer::{uri}_ragged_run")
             def _fake_ragged_run(
@@ -341,55 +340,52 @@ def get_batch_prefill_module(backend):
                 rope_scale: float,
                 rope_theta: float,
             ) -> None:
-                with q.device as device:  # device guard
-                    if backend == "fa2":
-                        paged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            paged_k_cache,
-                            paged_v_cache,
-                            qo_indptr,
-                            paged_kv_indptr,
-                            paged_kv_indices,
-                            paged_kv_last_page_len,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            maybe_custom_mask,
-                            maybe_mask_indptr,
-                            maybe_alibi_slopes,
-                            logits_soft_cap,
-                            sm_scale,
-                            1.0 / rope_scale,  # rope_rcp_scale
-                            1.0 / rope_theta,  # rope_rcp_theta
-                            get_cuda_stream(device),
-                        )
-                    else:
-                        paged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            paged_k_cache,
-                            paged_v_cache,
-                            qo_indptr,
-                            paged_kv_indptr,
-                            paged_kv_indices,
-                            paged_kv_last_page_len,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            logits_soft_cap,
-                            sm_scale,
-                            get_cuda_stream(device),
-                        )
-                    return o
+                if backend == "fa2":
+                    paged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        paged_k_cache,
+                        paged_v_cache,
+                        qo_indptr,
+                        paged_kv_indptr,
+                        paged_kv_indices,
+                        paged_kv_last_page_len,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        maybe_custom_mask,
+                        maybe_mask_indptr,
+                        maybe_alibi_slopes,
+                        logits_soft_cap,
+                        sm_scale,
+                        1.0 / rope_scale,  # rope_rcp_scale
+                        1.0 / rope_theta,  # rope_rcp_theta
+                    )
+                else:
+                    paged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        paged_k_cache,
+                        paged_v_cache,
+                        qo_indptr,
+                        paged_kv_indptr,
+                        paged_kv_indices,
+                        paged_kv_last_page_len,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        logits_soft_cap,
+                        sm_scale,
+                    )
+                return o
 
             @register_fake_op(f"flashinfer::{uri}_paged_run")
             def _fake_paged_run(
@@ -437,9 +433,9 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     if module_name in _batch_prefill_jit_modules:
         return _batch_prefill_jit_modules[module_name]
 
-    plan_func = jit_module.plan
-    ragged_run_func = jit_module.ragged_run
-    paged_run_func = jit_module.paged_run
+    plan_func = jit_module.plan.default
+    ragged_run_func = jit_module.ragged_run.default
+    paged_run_func = jit_module.paged_run.default
 
     # torch library for ragged_run
     @register_custom_op(
@@ -467,24 +463,22 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         window_left: int,
         *args,
     ) -> None:
-        with q.device as device:  # device guard
-            ragged_run_func(
-                float_workspace_buffer,
-                int_workspace_buffer,
-                plan_info_vec,
-                q,
-                k,
-                v,
-                qo_indptr,
-                kv_indptr,
-                o,
-                maybe_lse,
-                mask_mode,
-                layout,
-                window_left,
-                *args,
-                get_cuda_stream(device),
-            )
+        ragged_run_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            q,
+            k,
+            v,
+            qo_indptr,
+            kv_indptr,
+            o,
+            maybe_lse,
+            mask_mode,
+            layout,
+            window_left,
+            *args,
+        )
 
     @register_fake_op(f"flashinfer::{module_name}_ragged_run")
     def _fake_ragged_run(
@@ -535,26 +529,24 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         window_left: int,
         *args,
     ) -> None:
-        with q.device as device:  # device guard
-            paged_run_func(
-                float_workspace_buffer,
-                int_workspace_buffer,
-                plan_info_vec,
-                q,
-                paged_k_cache,
-                paged_v_cache,
-                qo_indptr,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_len,
-                o,
-                maybe_lse,
-                mask_mode,
-                layout,
-                window_left,
-                *args,
-                get_cuda_stream(device),
-            )
+        paged_run_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            q,
+            paged_k_cache,
+            paged_v_cache,
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            o,
+            maybe_lse,
+            mask_mode,
+            layout,
+            window_left,
+            *args,
+        )
 
     @register_fake_op(f"flashinfer::{module_name}_paged_run")
     def _fake_paged_run(
@@ -601,30 +593,27 @@ def single_prefill_with_kv_cache_with_jit_module(
     window_left: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    with q.device as device:  # device guard
-        tmp = _get_cache_buf(
-            "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
-        )
-        o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
-        lse = None
-        if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=device
-            )
-        jit_module.run(
-            q,
-            k,
-            v,
-            tmp,
-            o,
-            lse,
-            mask_mode,
-            TensorLayout[kv_layout].value,
-            window_left,
-            *args,
-            get_cuda_stream(device),
-        )
-        return (o, lse) if return_lse else o
+    device = q.device
+    tmp = _get_cache_buf(
+        "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
+    )
+    o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
+    lse = None
+    if return_lse:
+        lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=device)
+    jit_module.run.default(
+        q,
+        k,
+        v,
+        tmp,
+        o,
+        lse,
+        mask_mode,
+        TensorLayout[kv_layout].value,
+        window_left,
+        *args,
+    )
+    return (o, lse) if return_lse else o
 
 
 @overload
@@ -1195,7 +1184,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1269,8 +1258,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
         Note
         ----
@@ -1349,11 +1337,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
             self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-                paged_kv_indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 paged_kv_last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+                paged_kv_indices,
+                non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
             )
 
             if packed_custom_mask is not None:
@@ -1366,7 +1355,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-                    packed_custom_mask, non_blocking=non_blocking
+                    packed_custom_mask,
+                    non_blocking=(packed_custom_mask.device == self.device)
+                    and non_blocking,
                 )
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
@@ -1438,25 +1429,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                 paged_kv_indptr_host = vector_sparse_indptr_host
 
-        with self.device as device:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                paged_kv_indptr_host,
-                kv_lens_arr_host,
-                self._max_total_num_rows or total_num_rows,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim_qk,
-                head_dim_vo,
-                causal,
-                get_cuda_stream(device),
-            )
+        self._plan_info = self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_host,
+            paged_kv_indptr_host,
+            kv_lens_arr_host,
+            self._max_total_num_rows or total_num_rows,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            causal,
+        )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -2157,25 +2146,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 *get_module_args
             )
 
-        with self.device as device:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                kv_indptr_host,
-                kv_len_arr,
-                self._max_total_num_rows or total_num_rows,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                1,  # page_size
-                self.is_cuda_graph_enabled,
-                head_dim_qk,
-                head_dim_vo,
-                causal,
-                get_cuda_stream(device),
-            )
+        self._plan_info = self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_len_arr,
+            self._max_total_num_rows or total_num_rows,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            1,  # page_size
+            self.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            causal,
+        )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode

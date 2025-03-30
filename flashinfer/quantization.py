@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Tuple
+from functools import cache
+from typing import Any, Tuple
 
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _quantization_module = None
 
@@ -42,13 +43,21 @@ def get_quantization_module():
     return _quantization_module
 
 
+@cache
+def get_module_attr(attr: str) -> Any:
+    global _quantization_module
+    if _quantization_module is None:
+        get_quantization_module()
+    return getattr(_quantization_module, attr).default
+
+
 @register_custom_op("flashinfer::packbits", mutates_args=())
 def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
-    with x.device as device:  # device guard
-        x = x.to(torch.bool)
-        y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
-        get_quantization_module().packbits(x, bitorder, y, get_cuda_stream(device))
-        return y
+    device = x.device
+    x = x.to(torch.bool)
+    y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
+    get_module_attr("packbits")(x, bitorder, y)
+    return y
 
 
 @register_fake_op("flashinfer::packbits")
@@ -142,14 +151,9 @@ def segment_packbits(
     indptr_new[1:] = torch.cumsum(packed_len, 0)
     output_nnzs = indptr_new[-1].item()
 
-    with x.device as device:
-        indptr = indptr.to(torch.int32)
-        indptr_new = indptr_new.to(torch.int32)
-        y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-        get_quantization_module().segment_packbits(
-            x, indptr, indptr_new, bitorder, y, get_cuda_stream(device)
-        )
-        return (
-            y,
-            indptr_new,
-        )
+    device = x.device
+    indptr = indptr.to(torch.int32)
+    indptr_new = indptr_new.to(torch.int32)
+    y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
+    get_module_attr("segment_packbits")(x, indptr, indptr_new, bitorder, y)
+    return y, indptr_new

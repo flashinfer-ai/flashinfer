@@ -38,7 +38,7 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
-    at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
+    at::Tensor empty_q_data, at::Tensor empty_kv_data) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -53,7 +53,8 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
               "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
               "cores template for different head dim");
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
@@ -77,12 +78,14 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
   return vec_to_tensor(plan_info.ToVector());
 }
 
-void BatchDecodeWithPagedKVCacheRun(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
-    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, int64_t kv_layout_code,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
+void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
+                                    at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+                                    at::Tensor q, at::Tensor paged_k_cache,
+                                    at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
+                                    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
+                                    at::Tensor o, std::optional<at::Tensor> maybe_lse,
+                                    int64_t kv_layout_code,
+                                    int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -129,7 +132,8 @@ void BatchDecodeWithPagedKVCacheRun(
   TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
   kv_cache_strides = k_strides.data();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,

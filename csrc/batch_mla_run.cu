@@ -29,7 +29,7 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
                                at::Tensor ckv_cache, at::Tensor kpe_cache, at::Tensor kv_indices,
                                at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
-                               double sm_scale, int64_t cuda_stream) {
+                               double sm_scale) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -58,7 +58,8 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
   unsigned int o_stride_n = o.stride(0);
   unsigned int o_stride_h = o.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, Params, [&] {

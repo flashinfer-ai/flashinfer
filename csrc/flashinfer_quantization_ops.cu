@@ -15,10 +15,10 @@
  */
 #include "pytorch_extension_utils.h"
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);
 
 void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+                      const std::string& bitorder, at::Tensor y);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // GPU packbits operator

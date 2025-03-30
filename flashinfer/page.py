@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional, Tuple, Union
+from functools import cache
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -23,7 +24,6 @@ from .utils import (
     TensorLayout,
     _check_kv_layout,
     _unpack_paged_kv_cache,
-    get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )
@@ -49,6 +49,14 @@ def get_page_module():
     return _page_module
 
 
+@cache
+def get_module_attr(attr: str) -> Any:
+    global _page_module
+    if _page_module is None:
+        get_page_module()
+    return getattr(_page_module, attr).default
+
+
 def block_sparse_indices_to_vector_sparse_offsets(
     block_sparse_indices: torch.Tensor,
     block_sparse_indptr: torch.Tensor,
@@ -65,25 +73,23 @@ def block_sparse_indices_to_vector_sparse_offsets(
         else:
             return block_sparse_indices * stride_block
 
-    with block_sparse_indices.device as device:
-        assert block_sparse_indices.dtype == torch.int32
-        assert block_sparse_indptr.dtype == torch.int32
-        assert vector_sparse_offsets.dtype == torch.int32
-        assert vector_sparse_indptr.dtype == torch.int32
-        assert kv_lens.dtype == torch.int32
-        batch_size = block_sparse_indptr.size(0) - 1
-        get_page_module().block_sparse_indices_to_vector_sparse_offsets(
-            block_sparse_indices,
-            block_sparse_indptr,
-            vector_sparse_offsets,
-            vector_sparse_indptr,
-            kv_lens,
-            stride_block,
-            stride_n,
-            batch_size,
-            block_size,
-            get_cuda_stream(device),
-        )
+    assert block_sparse_indices.dtype == torch.int32
+    assert block_sparse_indptr.dtype == torch.int32
+    assert vector_sparse_offsets.dtype == torch.int32
+    assert vector_sparse_indptr.dtype == torch.int32
+    assert kv_lens.dtype == torch.int32
+    batch_size = block_sparse_indptr.size(0) - 1
+    get_module_attr("block_sparse_indices_to_vector_sparse_offsets")(
+        block_sparse_indices,
+        block_sparse_indptr,
+        vector_sparse_offsets,
+        vector_sparse_indptr,
+        kv_lens,
+        stride_block,
+        stride_n,
+        batch_size,
+        block_size,
+    )
     return vector_sparse_offsets
 
 
@@ -102,24 +108,22 @@ def _append_paged_mla_kv_cache_kernel(
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
 ) -> None:
-    with append_ckv.device as device:
-        batch_indices = batch_indices.int()
-        positions = positions.int()
-        kv_indices = kv_indices.int()
-        kv_indptr = kv_indptr.int()
-        kv_last_page_len = kv_last_page_len.int()
-        get_page_module().append_paged_mla_kv_cache(
-            append_ckv,
-            append_kpe,
-            batch_indices,
-            positions,
-            ckv_cache,
-            kpe_cache,
-            kv_indices,
-            kv_indptr,
-            kv_last_page_len,
-            get_cuda_stream(device),
-        )
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
+    get_module_attr("append_paged_mla_kv_cache")(
+        append_ckv,
+        append_kpe,
+        batch_indices,
+        positions,
+        ckv_cache,
+        kpe_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
 
 
 @register_custom_op(
@@ -138,25 +142,23 @@ def _append_paged_kv_cache_kernel(
     kv_last_page_len: torch.Tensor,
     layout: int,
 ) -> None:
-    with append_key.device as device:
-        batch_indices = batch_indices.int()
-        positions = positions.int()
-        kv_indices = kv_indices.int()
-        kv_indptr = kv_indptr.int()
-        kv_last_page_len = kv_last_page_len.int()
-        get_page_module().append_paged_kv_cache(
-            append_key,
-            append_value,
-            batch_indices,
-            positions,
-            paged_k_cache,
-            paged_v_cache,
-            kv_indices,
-            kv_indptr,
-            kv_last_page_len,
-            layout,
-            get_cuda_stream(device),
-        )
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
+    get_module_attr("append_paged_kv_cache")(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        paged_k_cache,
+        paged_v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        layout,
+    )
 
 
 @register_fake_op("flashinfer::append_paged_kv_cache")

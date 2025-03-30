@@ -19,13 +19,14 @@
 
 using namespace flashinfer;
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream) {
+void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y) {
   CHECK_INPUT(x);
   auto device = x.device();
   TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
 
   int64_t num_elements = x.numel();
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = quantization::PackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()), num_elements,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
@@ -35,7 +36,7 @@ void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t c
 }
 
 void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream) {
+                      const std::string& bitorder, at::Tensor y) {
   CHECK_INPUT(x);
   CHECK_INPUT(input_indptr);
   CHECK_INPUT(output_indptr);
@@ -46,7 +47,8 @@ void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_i
   unsigned int batch_size = input_indptr.size(0) - 1;
   CHECK_EQ(output_indptr.size(0), batch_size + 1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = quantization::SegmentPackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()),
       static_cast<int32_t*>(input_indptr.data_ptr()),

@@ -18,8 +18,7 @@
 void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                             at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
                             at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
-                            at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
-                            int64_t cuda_stream);
+                            at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Cutlass Segment GEMM operator for SM90"

@@ -25,7 +25,6 @@ from .utils import (
     MaskMode,
     _check_shape_dtype_device,
     determine_mla_backend,
-    get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )
@@ -253,19 +252,17 @@ class BatchMLAPagedAttentionWrapper:
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
 
-        with self.device as device:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                kv_indptr_host,
-                kv_len_arr_host,
-                num_heads,
-                head_dim_ckv,  # head_dim_o
-                causal,
-                get_cuda_stream(device),
-            )
+        self._plan_info = self._cached_module.plan.default(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_len_arr_host,
+            num_heads,
+            head_dim_ckv,  # head_dim_o
+            causal,
+        )
 
     @overload
     def run(
@@ -331,41 +328,38 @@ class BatchMLAPagedAttentionWrapper:
         sm_scale = self._sm_scale
         causal = self._causal
         mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
-        with self.device as device:
-            if out is None:
-                out = torch.empty_like(q_nope)
+        device = self.device
+        if out is None:
+            out = torch.empty_like(q_nope)
+        else:
+            _check_shape_dtype_device(
+                out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+            )
+
+        if return_lse:
+            if lse is None:
+                lse = torch.empty(q_nope.shape[:2], dtype=torch.float32, device=device)
             else:
                 _check_shape_dtype_device(
-                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                    lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
-
-            if return_lse:
-                if lse is None:
-                    lse = torch.empty(
-                        q_nope.shape[:2], dtype=torch.float32, device=device
-                    )
-                else:
-                    _check_shape_dtype_device(
-                        lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
-                    )
-            profiler_args = (profiler_buffer,) if self._use_profiler else ()
-            self._cached_module.run(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._plan_info,
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                self._kv_indices_buf,
-                out,
-                lse,
-                mask_mode,
-                num_heads,
-                page_size,
-                sm_scale,
-                *profiler_args,
-                get_cuda_stream(device),
-            )
+        profiler_args = (profiler_buffer,) if self._use_profiler else ()
+        self._cached_module.run.default(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            self._kv_indices_buf,
+            out,
+            lse,
+            mask_mode,
+            num_heads,
+            page_size,
+            sm_scale,
+            *profiler_args,
+        )
 
         return (out, lse) if return_lse else out

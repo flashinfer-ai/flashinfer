@@ -23,7 +23,6 @@ from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
-    get_cuda_stream,
     get_indptr,
     register_custom_op,
     register_fake_op,
@@ -64,18 +63,16 @@ def get_gemm_module():
             A_scale: torch.Tensor,
             B_scale: torch.Tensor,
         ) -> None:
-            with A.device as device:
-                cublas_handle = torch.cuda.current_blas_handle()
-                module.bmm_fp8(
-                    A,
-                    B,
-                    D,
-                    A_scale,
-                    B_scale,
-                    workspace_buffer,
-                    cublas_handle,
-                    get_cuda_stream(device),
-                )
+            cublas_handle = torch.cuda.current_blas_handle()
+            module.bmm_fp8.default(
+                A,
+                B,
+                D,
+                A_scale,
+                B_scale,
+                workspace_buffer,
+                cublas_handle,
+            )
 
         @register_fake_op("flashinfer::bmm_fp8")
         def _fake_bmm_fp8(
@@ -104,20 +101,18 @@ def get_gemm_module():
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
-            with x_data.device as device:
-                module.cutlass_segment_gemm(
-                    workspace_buffer,
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_ld,
-                    w_ld,
-                    y_ld,
-                    empty_x_data,
-                    weight_column_major,
-                    get_cuda_stream(device),
-                )
+            module.cutlass_segment_gemm.default(
+                workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld,
+                w_ld,
+                y_ld,
+                empty_x_data,
+                weight_column_major,
+            )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm")
         def _fake_cutlass_segment_gemm(
@@ -181,21 +176,19 @@ def get_gemm_sm90_module():
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
-            with x_data.device as device:
-                module.cutlass_segment_gemm_sm90(
-                    workspace_buffer,
-                    int_workspace_buffer,
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_stride,
-                    w_stride,
-                    y_stride,
-                    empty_x_data,
-                    weight_column_major,
-                    get_cuda_stream(device),
-                )
+            module.cutlass_segment_gemm_sm90.default(
+                workspace_buffer,
+                int_workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride,
+                w_stride,
+                y_stride,
+                empty_x_data,
+                weight_column_major,
+            )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
         def _fake_cutlass_segment_gemm_sm90(
