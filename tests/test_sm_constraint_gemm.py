@@ -4,7 +4,7 @@ import torch
 import flashinfer
 import flashinfer.triton
 
-def torch_gemm(a, b, c, alpha=1.0, beta=0.0):
+def torch_gemm(a, b, c, alpha, beta):
     x = torch.matmul(a, b.T)
     c = alpha * x + beta * c
     return c
@@ -22,11 +22,11 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
 @pytest.mark.parametrize("num_sms", [1, 16, 64, 128, 132, 133])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float16, torch.bfloat16, torch.float32])
 # todo: torch.float8_e4m3fn, bf16
-# @pytest.mark.parametrize("M", [128])
-# @pytest.mark.parametrize("N", [128])
-# @pytest.mark.parametrize("K", [128])
-# @pytest.mark.parametrize("alpha", [2.0])
-# @pytest.mark.parametrize("beta", [2.0]) 
+# @pytest.mark.parametrize("M", [8192])
+# @pytest.mark.parametrize("N", [256, 512])
+# @pytest.mark.parametrize("K", [256, 512])
+# @pytest.mark.parametrize("alpha", [1.0, 0.5, 2.0])
+# @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0]) 
 # @pytest.mark.parametrize("num_sms", [1])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
@@ -34,11 +34,15 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
     b = b.T.contiguous()
     c = torch.randn((M, N), device="cuda", dtype=torch.float16).to(dtype)
+    c_clone = c.clone()
+    assert torch.allclose(c.to(torch.float16), c_clone.to(torch.float16))
+
+    # print(f"a: {a}")
+    # print(f"b: {b}")
+    # print(f"c: {c}")
 
     c_torch = torch_gemm(a, b, c, alpha, beta) if dtype == torch.float16 or dtype == torch.float32 or dtype == torch.bfloat16 else None
     c_triton = flashinfer.triton.sm_constraint_gemm.gemm_persistent(a, b.T, c, alpha, beta, num_sms)
-
-    c_clone = c.clone()
     c_naive = flashinfer.triton.sm_constraint_gemm.gemm(a, b.T, c_clone, alpha, beta)
 
     cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
@@ -50,7 +54,6 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
     in_place_naive = c_naive.data_ptr() == c_clone.data_ptr() and torch.allclose(c_naive.to(cmp_dtype), c_clone.to(cmp_dtype))
     assert in_place_naive # modified in place
 
-    # cmp_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
     if c_torch is not None:
         torch_vs_triton = torch.allclose(c_torch.to(cmp_dtype), c_triton.to(cmp_dtype), atol=torch_atol)
         if torch_vs_triton == False:
@@ -58,3 +61,13 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
             print(f"c_triton: {c_triton}")
             print(f"max diff: {torch.max(torch.abs(c_torch.to(cmp_dtype) - c_triton.to(cmp_dtype)))}")
         assert torch_vs_triton # value is correct
+
+    triton_atol = 1.0
+    naive_vs_persistent = torch.allclose(c_naive.to(cmp_dtype), c_triton.to(cmp_dtype), atol=triton_atol)
+    if naive_vs_persistent == False:
+        if c_torch is not None:
+            print(f"c_torch: {c_torch}")
+        print(f"c_naive: {c_naive}")
+        print(f"c_triton: {c_triton}")
+        print(f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_triton.to(cmp_dtype)))}")
+    assert naive_vs_persistent # value is correct

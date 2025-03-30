@@ -108,8 +108,7 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
     c = torch.empty((M, N), device=a.device, dtype=dtype) if c is None else c
 
     # 1D launch kernel where each block gets its own program.
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count 
-    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])), )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
 
     gemm_kernel[grid](
         a,
@@ -126,11 +125,5 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
         c.stride(1),
         alpha=alpha,
         beta=beta,
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=8,
-        num_stages=3,
-        num_warps=8,
     )
     return c

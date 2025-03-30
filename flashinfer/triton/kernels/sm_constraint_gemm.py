@@ -142,6 +142,10 @@ def gemm_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 # only for testing
+@triton.autotune(
+    configs=matmul_get_configs(),
+    key=["M", "N", "K"],
+)
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def gemm_kernel(a_ptr, b_ptr, c_ptr,  #
                   M, N, K,  #
@@ -189,9 +193,9 @@ def gemm_kernel(a_ptr, b_ptr, c_ptr,  #
 
     if (c_ptr.dtype.element_ty == tl.float8e4nv):
         c = accumulator.to(tl.float8e4nv)
-    elif (c_ptr.dtype.element_ty == tl.bfloat16):
+    elif c_ptr.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
-    elif (c_ptr.dtype.element_ty == tl.float16):
+    elif c_ptr.dtype.element_ty == tl.float16:
         c = accumulator.to(tl.float16)
     else:
         c = accumulator.to(tl.float32)
@@ -200,5 +204,5 @@ def gemm_kernel(a_ptr, b_ptr, c_ptr,  #
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c = alpha * accumulator + beta * tl.load(c_ptrs, mask=c_mask)
+    c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
     tl.store(c_ptrs, c, mask=c_mask)
