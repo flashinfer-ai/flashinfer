@@ -50,16 +50,16 @@ WORKDIR /home/$USERNAME
 COPY install/install_python.sh /install/install_python.sh
 RUN bash /install/install_python.sh py312
 
-RUN echo "source activate py312" >> ~/.bashrc
+# clangd
+ENV PATH="/usr/lib/llvm-19/bin:$PATH"
+# conda
 ENV PATH="/home/devuser/conda/bin:$PATH"
 ENV PATH="/home/devuser/envs/py312/bin:$PATH"
 
 # Install python packages
 COPY install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh
-
-# Setup pre-commit
-RUN pre-commit install --install-hooks
+RUN echo "source activate py312" >> /home/devuser/.zshrc
 
 # Set zsh as default shell
 ENV SHELL=/bin/zsh
