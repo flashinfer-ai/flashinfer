@@ -157,7 +157,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5-SPOT', 1)
+          shard_run_unittest_GPU('GPU-G5', 1)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -174,7 +174,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5-SPOT', 2)
+          shard_run_unittest_GPU('GPU-G5', 2)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -191,7 +191,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5-SPOT', 3)
+          shard_run_unittest_GPU('GPU-G5', 3)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
@@ -208,7 +208,7 @@ stage('Unittest') {
           // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5-SPOT', 4)
+          shard_run_unittest_GPU('GPU-G5', 4)
         } else {
           echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
           throw ex
