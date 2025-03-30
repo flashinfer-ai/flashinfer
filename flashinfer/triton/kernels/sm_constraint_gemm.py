@@ -125,17 +125,11 @@ def gemm_kernel_persistent(
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if c_ptr.dtype.element_ty == tl.float8e4nv:
-            c = accumulator.to(tl.float8e4nv)
-        elif c_ptr.dtype.element_ty == tl.bfloat16:
-            c = accumulator.to(tl.bfloat16)
-        elif c_ptr.dtype.element_ty == tl.float16:
-            c = accumulator.to(tl.float16)
-        else:
-            c = accumulator.to(tl.float32)
+        c = accumulator.to(c_ptr.dtype.element_ty)
 
         c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
         tl.store(c_ptrs, c, mask=c_mask)
+
 
 # only for testing
 @triton.autotune(
@@ -143,17 +137,26 @@ def gemm_kernel_persistent(
     key=["M", "N", "K"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def gemm_kernel(a_ptr, b_ptr, c_ptr,  #
-                  M, N, K,  #
-                  stride_am, stride_ak,  #
-                  stride_bk, stride_bn,  #
-                  stride_cm, stride_cn,  #
-                  alpha, beta,
-                  BLOCK_SIZE_M: tl.constexpr,  #
-                  BLOCK_SIZE_N: tl.constexpr,  #
-                  BLOCK_SIZE_K: tl.constexpr,  #
-                  GROUP_SIZE_M: tl.constexpr,  #
-                  ):
+def gemm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,  #
+    M,
+    N,
+    K,  #
+    stride_am,
+    stride_ak,  #
+    stride_bk,
+    stride_bn,  #
+    stride_cm,
+    stride_cn,  #
+    alpha,
+    beta,
+    BLOCK_SIZE_M: tl.constexpr,  #
+    BLOCK_SIZE_N: tl.constexpr,  #
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -187,14 +190,7 @@ def gemm_kernel(a_ptr, b_ptr, c_ptr,  #
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if (c_ptr.dtype.element_ty == tl.float8e4nv):
-        c = accumulator.to(tl.float8e4nv)
-    elif c_ptr.dtype.element_ty == tl.bfloat16:
-        c = accumulator.to(tl.bfloat16)
-    elif c_ptr.dtype.element_ty == tl.float16:
-        c = accumulator.to(tl.float16)
-    else:
-        c = accumulator.to(tl.float32)
+    c = accumulator.to(c_ptr.dtype.element_ty)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)

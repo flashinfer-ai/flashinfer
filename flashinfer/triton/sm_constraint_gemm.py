@@ -11,7 +11,7 @@ from .utils import check_device, check_dim, check_input
 
 def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
     """
-    GEMM operation with SM constraint by Triton.
+    GEMM operation with SM constraint by Triton (Hopper).
     C = alpha * (a @ b.T) + beta * C
 
     Args:
