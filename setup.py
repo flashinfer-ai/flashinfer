@@ -209,7 +209,7 @@ if enable_aot:
 
     cutlass = root / "3rdparty" / "cutlass"
     include_dirs = [
-        root.resolve() / "include",
+        root.resolve() / "libflashinfer/include",
         cutlass.resolve() / "include",  # for group gemm
         cutlass.resolve() / "tools" / "util" / "include",
     ]

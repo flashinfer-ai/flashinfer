@@ -43,7 +43,7 @@ packages = [
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
     "flashinfer.data.tvm_binding",
-    "flashinfer.data.include",
+    "flashinfer.data.libflashinfer.include",
     "flashinfer.jit",
     "flashinfer.jit.attention",
     "flashinfer.triton",
@@ -54,11 +54,12 @@ include-package-data = false
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
+"flashinfer.data.libflashinfer" = "libflashinfer"
 
 [tool.setuptools.package-data]
 "flashinfer.data" = [
     "csrc/**",
-    "include/**",
+    "libflashinfer/include/**",
     "tvm_binding/**",
     "version.txt"
 ]

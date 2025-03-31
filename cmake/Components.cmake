@@ -1,0 +1,14 @@
+# Define the component structure
+set(FLASHINFER_COMPONENTS "Headers")
+
+if(FLASHINFER_BUILD_KERNELS)
+  list(APPEND FLASHINFER_COMPONENTS "Kernels")
+
+  if(FLASHINFER_TVM_BINDING)
+    list(APPEND FLASHINFER_COMPONENTS "TVMBinding")
+  endif()
+endif()
+
+if(FLASHINFER_DISTRIBUTED)
+  list(APPEND FLASHINFER_COMPONENTS "Distributed")
+endif()
