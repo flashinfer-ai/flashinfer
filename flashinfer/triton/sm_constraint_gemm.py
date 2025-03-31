@@ -176,7 +176,7 @@ def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
 
     grid = lambda META: (
         min(
-            NUM_SMS,
+            num_sms,
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         ),
     )
@@ -189,7 +189,7 @@ def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
         N,
         K,  #
         alpha, beta,
-        NUM_SMS=NUM_SMS,  #
+        NUM_SMS=num_sms,  #
         BLOCK_SIZE_M=128,
         BLOCK_SIZE_N=128 if dtype != torch.float32 else 64,
         BLOCK_SIZE_K=64,
