@@ -1,0 +1,72 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+# Required dependencies for FlashInfer headers
+find_dependency(CUDAToolkit REQUIRED)
+
+# Optional dependencies based on components
+if("Distributed" IN_LIST flashinfer_FIND_COMPONENTS)
+  find_dependency(MPI REQUIRED)
+  find_package(mscclpp REQUIRED)
+endif()
+
+# Define available components passed from main CMakeLists.txt
+set(_flashinfer_available_components @FLASHINFER_COMPONENTS@)
+
+# Initialize component found status
+foreach(_comp Headers Kernels TVMBinding Distributed)
+  set(flashinfer_${_comp}_FOUND FALSE)
+endforeach()
+
+# Mark available components as found
+foreach(_comp ${_flashinfer_available_components})
+  set(flashinfer_${_comp}_FOUND TRUE)
+endforeach()
+
+# Check for requested components
+foreach(_comp ${flashinfer_FIND_COMPONENTS})
+  if(NOT _comp IN_LIST _flashinfer_available_components)
+    set(flashinfer_FOUND False)
+    set(flashinfer_NOT_FOUND_MESSAGE "Requested component: ${_comp} is not available")
+    return()
+  endif()
+endforeach()
+
+# Headers component is always available and included
+set(flashinfer_Headers_FOUND TRUE)
+
+# Include kernel targets if available and requested
+if(flashinfer_Kernels_FOUND AND
+   ("Kernels" IN_LIST flashinfer_FIND_COMPONENTS OR NOT flashinfer_FIND_COMPONENTS))
+  include("${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake" OPTIONAL)
+endif()
+
+# Include TVM binding targets if available and requested
+if(flashinfer_TVMBinding_FOUND AND
+   "TVMBinding" IN_LIST flashinfer_FIND_COMPONENTS)
+  include("${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingTargets.cmake" OPTIONAL)
+endif()
+
+# Include Distributed targets if available and requested
+if(flashinfer_Distributed_FOUND AND
+   "Distributed" IN_LIST flashinfer_FIND_COMPONENTS)
+  # Create aliases to make usage consistent
+  if(NOT TARGET flashinfer::dist)
+    add_library(flashinfer::dist INTERFACE IMPORTED)
+    set_target_properties(flashinfer::dist PROPERTIES
+      INTERFACE_LINK_LIBRARIES mscclpp)
+  endif()
+
+  include("${CMAKE_CURRENT_LIST_DIR}/flashinferDistTargets.cmake")
+endif()
+
+# Set include directories
+set(FLASHINFER_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/include")
+
+# Print status message
+if(NOT flashinfer_FIND_QUIETLY)
+  message(STATUS "Found flashinfer: ${PACKAGE_PREFIX_DIR} (version: ${flashinfer_VERSION})")
+  message(STATUS "Available components: ${_flashinfer_available_components}")
+endif()
+
+check_required_components(flashinfer)
