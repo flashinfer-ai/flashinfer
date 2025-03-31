@@ -187,20 +187,24 @@ __device__ __forceinline__ void prefetch_offset(
       uint32_t packed_block_iter =
           packed_block_iter_base + lane_idx / 8 + (j + mma_kv * 2) * 16 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
-      ckv_offset[mma_kv][j] = (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
-                         r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
-      kpe_offset[mma_kv][j] = (packed_block_iter < packed_kv_bound ? indices[q] : 0) * kpe_stride_page +
-                         r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      ckv_offset[mma_kv][j] =
+          (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
+          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      kpe_offset[mma_kv][j] =
+          (packed_block_iter < packed_kv_bound ? indices[q] : 0) * kpe_stride_page +
+          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
     }
   }
 }
 
 template <bool predicate, typename KTraits>
-__device__ __forceinline__ void load_kv(
-    typename KTraits::SharedStorage* smem_storage, typename KTraits::DTypeKV* ckv,
-    typename KTraits::DTypeKV* kpe, 
-    const uint32_t packed_kv_bound, const uint32_t packed_block_iter_base,
-    const uint32_t stage_idx, int64_t (*ckv_offset)[2], int64_t (*kpe_offset)[2]) {
+__device__ __forceinline__ void load_kv(typename KTraits::SharedStorage* smem_storage,
+                                        typename KTraits::DTypeKV* ckv,
+                                        typename KTraits::DTypeKV* kpe,
+                                        const uint32_t packed_kv_bound,
+                                        const uint32_t packed_block_iter_base,
+                                        const uint32_t stage_idx, int64_t (*ckv_offset)[2],
+                                        int64_t (*kpe_offset)[2]) {
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
   constexpr uint32_t UPCAST_STRIDE_KPE = KTraits::UPCAST_STRIDE_KPE;
@@ -701,17 +705,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       const uint32_t block_iter_base = kv_indptr * block_size + kv_start;
 
-      prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound, ckv_stride_page, ckv_stride_n,
-                               kpe_stride_page, kpe_stride_n, block_size, kv_indices, ckv_offset, kpe_offset);
+      prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                               ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
+                               block_size, kv_indices, ckv_offset, kpe_offset);
       if (has_kv) {
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
-        load_kv<true, KTraits>(&smem_storage, ckv, kpe, packed_kv_bound, block_iter_base + kv_tile_idx * CTA_TILE_KV,
+        load_kv<true, KTraits>(&smem_storage, ckv, kpe, packed_kv_bound,
+                               block_iter_base + kv_tile_idx * CTA_TILE_KV,
                                smem_pipe_write_kv.index(), ckv_offset, kpe_offset);
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         kv_tile_idx -= 1;
         ++smem_pipe_write_kv;
-        prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound, ckv_stride_page, ckv_stride_n,
-                                kpe_stride_page, kpe_stride_n, block_size, kv_indices, ckv_offset, kpe_offset);
+        prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                 ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
+                                 block_size, kv_indices, ckv_offset, kpe_offset);
       }
 
       pipeline_q.producer_acquire(smem_pipe_write_q);
@@ -729,8 +736,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                                 block_iter_base + kv_tile_idx * CTA_TILE_KV,
                                 smem_pipe_write_kv.index(), ckv_offset, kpe_offset);
         if (kv_tile_idx > 0) {
-          prefetch_offset<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV, packed_kv_bound, ckv_stride_page, ckv_stride_n,
-                                kpe_stride_page, kpe_stride_n, block_size, kv_indices, ckv_offset, kpe_offset);
+          prefetch_offset<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                   packed_kv_bound, ckv_stride_page, ckv_stride_n, kpe_stride_page,
+                                   kpe_stride_n, block_size, kv_indices, ckv_offset, kpe_offset);
         }
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_kv;
