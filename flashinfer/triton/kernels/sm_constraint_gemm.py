@@ -228,21 +228,28 @@ def gemm_kernel_descriptor_persistent(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
+        # tl.device_print("pre-accumulator", accumulator)
+
         if EPILOGUE_SUBTILE:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
-            acc0 = alpha * acc0 + beta * c_desc.load([offs_cm, offs_cn])
-            acc1 = alpha * acc1 + beta * c_desc.load(
-                [offs_cm, offs_cn + BLOCK_SIZE_N // 2]
-            )
-
+            # acc0 = alpha * acc0 + beta * c_desc.load([offs_cm, offs_cn])
+            # acc1 = alpha * acc1 + beta * c_desc.load(
+            #     [offs_cm, offs_cn + BLOCK_SIZE_N // 2]
+            # )
+            acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
+            acc1 = tl.fma(acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2]))
+            # tl.device_print("acc0", acc0)
+            # tl.device_print("acc1", acc1)
             c0 = acc0.to(dtype)
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
         else:
-            accumulator = alpha * accumulator + beta * c_desc.load([offs_cm, offs_cn])
+            # accumulator = alpha * accumulator + beta * c_desc.load([offs_cm, offs_cn])
+            accumulator = tl.fma(accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn]))
+            # tl.device_print("post-accumulator", accumulator)
             c = accumulator.to(dtype)
             c_desc.store([offs_cm, offs_cn], c)
 
