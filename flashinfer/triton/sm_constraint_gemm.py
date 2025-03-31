@@ -133,7 +133,7 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
     return c
 
 
-def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
+def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None, EPILOGUE_SUBTILE=False):
     """
     GEMM operation with SM constraint by Triton (Hopper & TMA), using TMA and device-side descriptor creation.
     C = alpha * (a @ b.T) + beta * C
@@ -196,6 +196,6 @@ def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
         GROUP_SIZE_M=8,
         num_stages=3,
         num_warps=8,
-        EPILOGUE_SUBTILE=False,
+        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
     )
     return c
