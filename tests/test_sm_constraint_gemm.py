@@ -33,6 +33,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
     b = b.T.contiguous()
     c = torch.randn((M, N), device="cuda", dtype=torch.float16).to(dtype)
+    c_unmodified = c.clone()
     c0 = c.clone()
     c1 = c.clone()
     assert torch.allclose(c.to(torch.float16), c0.to(torch.float16))
@@ -71,3 +72,13 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype):
         print(f"c_triton: {c_triton}")
         print(f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_triton.to(cmp_dtype)))}")
     assert naive_vs_persistent # value is correct
+
+    naive_vs_descriptor = torch.allclose(c_naive.to(cmp_dtype), c_descriptor.to(cmp_dtype), atol=triton_atol)
+    if naive_vs_descriptor == False:
+        print(f"a: {a}")
+        print(f"b: {b}")
+        print(f"c_unmodified: {c_unmodified}")
+        print(f"c_naive: {c_naive}")
+        print(f"c_descriptor: {c_descriptor}")
+        print(f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_descriptor.to(cmp_dtype)))}")
+    assert naive_vs_descriptor # value is correct

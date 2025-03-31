@@ -196,6 +196,6 @@ def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
         GROUP_SIZE_M=8,
         num_stages=3,
         num_warps=8,
-        EPILOGUE_SUBTILE=True,
+        EPILOGUE_SUBTILE=False,
     )
     return c
