@@ -133,7 +133,9 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None):
     return c
 
 
-def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None, EPILOGUE_SUBTILE=False):
+def gemm_descriptor_persistent(
+    a, b, c=None, alpha=1.0, beta=0.0, num_sms=None, EPILOGUE_SUBTILE=False
+):
     """
     GEMM operation with SM constraint by Triton (Hopper & TMA), using TMA and device-side descriptor creation.
     C = alpha * (a @ b.T) + beta * C
@@ -188,7 +190,8 @@ def gemm_descriptor_persistent(a, b, c=None, alpha=1.0, beta=0.0, num_sms=None, 
         M,
         N,
         K,  #
-        alpha, beta,
+        alpha,
+        beta,
         NUM_SMS=num_sms,  #
         BLOCK_SIZE_M=128,
         BLOCK_SIZE_N=128 if dtype != torch.float32 else 64,

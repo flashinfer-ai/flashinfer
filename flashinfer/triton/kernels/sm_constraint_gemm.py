@@ -173,7 +173,6 @@ def gemm_kernel_descriptor_persistent(
     EPILOGUE_SUBTILE: tl.constexpr,  #
     NUM_SMS: tl.constexpr,
 ):  #
-    # Matmul using TMA and device-side descriptor creation
     dtype = c_ptr.dtype.element_ty
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -234,7 +233,9 @@ def gemm_kernel_descriptor_persistent(
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
             acc0 = alpha * acc0 + beta * c_desc.load([offs_cm, offs_cn])
-            acc1 = alpha * acc1 + beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2])
+            acc1 = alpha * acc1 + beta * c_desc.load(
+                [offs_cm, offs_cn + BLOCK_SIZE_N // 2]
+            )
 
             c0 = acc0.to(dtype)
             c_desc.store([offs_cm, offs_cn], c0)
