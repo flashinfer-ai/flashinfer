@@ -54,7 +54,7 @@ RUN bash /install/install_python.sh py312
 ENV PATH="/usr/lib/llvm-19/bin:$PATH"
 # conda
 ENV PATH="/home/devuser/conda/bin:$PATH"
-ENV PATH="/home/devuser/envs/py312/bin:$PATH"
+ENV PATH="/home/devuser/conda/envs/py312/bin:$PATH"
 
 # Install python packages
 COPY install/install_python_packages.sh /install/install_python_packages.sh
