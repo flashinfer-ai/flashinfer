@@ -32,9 +32,7 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
 @pytest.mark.parametrize("beta", [2.0])
 @pytest.mark.parametrize("num_sms", [1])
 @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "EPILOGUE_SUBTILE", [True]
-)  # only for descriptor persistent
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [True])  # only for descriptor persistent
 # @pytest.mark.parametrize("M", [128, 256, 512, 1024, 8192])
 # @pytest.mark.parametrize("N", [128, 256, 512, 1024, 8192])
 # @pytest.mark.parametrize("K", [128, 256, 512, 1024, 8192])
@@ -53,15 +51,22 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     c1 = c.clone()
     assert torch.allclose(c.to(torch.float16), c0.to(torch.float16))
 
+    # torch gemm: disabled for float8
     c_torch = (
         torch_gemm(a, b, c, alpha, beta)
         if dtype == torch.float16 or dtype == torch.float32 or dtype == torch.bfloat16
         else None
     )
+
+    # triton gemm: persistent
     c_persistent = flashinfer.triton.sm_constraint_gemm.gemm_persistent(
         a, b.T, c, alpha, beta, num_sms
     )
+
+    # triton gemm: naive
     c_naive = flashinfer.triton.sm_constraint_gemm.gemm(a, b.T, c0, alpha, beta)
+
+    # triton gemm: descriptor persistent
     c_descriptor = flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
         a, b, c1, alpha, beta, num_sms, EPILOGUE_SUBTILE
     )
@@ -84,15 +89,20 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     )
     assert in_place_descriptor  # modified in place
 
+    # torch results vs triton results
     if c_torch is not None:
         torch_vs_triton_persistent = torch.allclose(
             c_torch.to(cmp_dtype), c_persistent.to(cmp_dtype), atol=torch_atol
         )
         if torch_vs_triton_persistent == False:
-            print(f"c_torch: {c_torch}")
+            print(f"a: {a}")
+            print(f"b: {b}")
+            print(f"c_unmodified: {c_unmodified}")
+            print(f"c_naive: {c_naive}")
             print(f"c_persistent: {c_persistent}")
+            print(f"c_descriptor: {c_descriptor}")
             print(
-                f"max diff: {torch.max(torch.abs(c_torch.to(cmp_dtype) - c_persistent.to(cmp_dtype)))}"
+                f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_persistent.to(cmp_dtype)))}"
             )
         assert torch_vs_triton_persistent  # value is correct
 
@@ -100,13 +110,18 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
             c_torch.to(cmp_dtype), c_descriptor.to(cmp_dtype), atol=torch_atol
         )
         if torch_vs_triton_descriptor == False:
-            print(f"c_torch: {c_torch}")
+            print(f"a: {a}")
+            print(f"b: {b}")
+            print(f"c_unmodified: {c_unmodified}")
+            print(f"c_naive: {c_naive}")
+            print(f"c_persistent: {c_persistent}")
             print(f"c_descriptor: {c_descriptor}")
             print(
-                f"max diff: {torch.max(torch.abs(c_torch.to(cmp_dtype) - c_descriptor.to(cmp_dtype)))}"
+                f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_descriptor.to(cmp_dtype)))}"
             )
         assert torch_vs_triton_descriptor  # value is correct
 
+    # triton naive results vs each other
     triton_atol = 1.0
     naive_vs_persistent = torch.allclose(
         c_naive.to(cmp_dtype), c_persistent.to(cmp_dtype), atol=triton_atol
@@ -114,26 +129,16 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     if naive_vs_persistent == False:
         if c_torch is not None:
             print(f"c_torch: {c_torch}")
+        print(f"a: {a}")
+        print(f"b: {b}")
+        print(f"c_unmodified: {c_unmodified}")
         print(f"c_naive: {c_naive}")
         print(f"c_persistent: {c_persistent}")
+        print(f"c_descriptor: {c_descriptor}")
         print(
             f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_persistent.to(cmp_dtype)))}"
         )
 
-        max_diff_index = torch.argmax(
-            torch.abs(c_naive.to(cmp_dtype) - c_descriptor.to(cmp_dtype))
-        )
-
-        # If c_descriptor is multi-dimensional, convert the flat index to a tuple of indices
-        if c_descriptor.dim() > 1:
-            max_diff_index = torch.unravel_index(max_diff_index, c_descriptor.shape)
-
-        # Print the value at the index of maximum difference
-        print(f"max_diff_index: {max_diff_index}")
-        print(f"c_unmodified of max diff: {c_unmodified[max_diff_index]}")
-        print(f"c_naive of max diff: {c_naive[max_diff_index]}")
-        print(f"c_persistent of max diff: {c_persistent[max_diff_index]}")
-        print(f"c_descriptor of max diff: {c_descriptor[max_diff_index]}")
     assert naive_vs_persistent  # value is correct
 
     descriptor_atol = (
@@ -156,27 +161,14 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
         print(
             f"max diff: {torch.max(torch.abs(c_naive.to(cmp_dtype) - c_descriptor.to(cmp_dtype)))}"
         )
-        # Calculate the index of the maximum difference
-        max_diff_index = torch.argmax(
-            torch.abs(c_naive.to(cmp_dtype) - c_descriptor.to(cmp_dtype))
-        )
-
-        # If c_descriptor is multi-dimensional, convert the flat index to a tuple of indices
-        if c_descriptor.dim() > 1:
-            max_diff_index = torch.unravel_index(max_diff_index, c_descriptor.shape)
-
-        # Print the value at the index of maximum difference
-        print(f"max_diff_index: {max_diff_index}")
-        print(f"c_unmodified of max diff: {c_unmodified[max_diff_index]}")
-        print(f"c_naive of max diff: {c_naive[max_diff_index]}")
-        print(f"c_persistent of max diff: {c_persistent[max_diff_index]}")
-        print(f"c_descriptor of max diff: {c_descriptor[max_diff_index]}")
 
     assert naive_vs_descriptor  # value is correct
+
+    # debug only
     print(f"a: {a}")
     print(f"b: {b}")
     print(f"c_unmodified: {c_unmodified}")
     print(f"c_naive: {c_naive}")
     print(f"c_persistent: {c_persistent}")
     print(f"c_descriptor: {c_descriptor}")
-    assert False
+    # assert False
