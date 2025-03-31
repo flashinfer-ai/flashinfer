@@ -140,6 +140,9 @@ def gemm_descriptor_persistent(
     GEMM operation with SM constraint by Triton (Hopper & TMA), using TMA and device-side descriptor creation.
     C = alpha * (a @ b.T) + beta * C
 
+    Note:
+        - K and N must be greater than 16.
+
     Args:
         a: The first input matrix. Shape: (M, K)
         b: The second input matrix. Shape: (K, N)
@@ -164,6 +167,9 @@ def gemm_descriptor_persistent(
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
+
+    assert K >= 16, "K must be greater than 16"
+    assert N >= 16, "N must be greater than 16"
 
     c = torch.empty((M, N), device=a.device, dtype=dtype) if c is None else c
 
