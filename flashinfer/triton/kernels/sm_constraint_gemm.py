@@ -239,7 +239,9 @@ def gemm_kernel_descriptor_persistent(
             #     [offs_cm, offs_cn + BLOCK_SIZE_N // 2]
             # )
             acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
-            acc1 = tl.fma(acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2]))
+            acc1 = tl.fma(
+                acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2])
+            )
             # tl.device_print("acc0", acc0)
             # tl.device_print("acc1", acc1)
             c0 = acc0.to(dtype)
@@ -248,7 +250,9 @@ def gemm_kernel_descriptor_persistent(
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
         else:
             # accumulator = alpha * accumulator + beta * c_desc.load([offs_cm, offs_cn])
-            accumulator = tl.fma(accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn]))
+            accumulator = tl.fma(
+                accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
+            )
             # tl.device_print("post-accumulator", accumulator)
             c = accumulator.to(dtype)
             c_desc.store([offs_cm, offs_cn], c)
