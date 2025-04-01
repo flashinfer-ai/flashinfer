@@ -214,16 +214,12 @@ def gemm_descriptor_persistent(
 
     # check on TMA tensor map swizzling granularity
     # Swizzle 16B chunks within at least 32B span
-    assert (
-        K >= 16 and dtype == torch.float8_e4m3fn or K >= 8
-    ), "Least chunk size must be 16B"
-    assert (
-        N >= 16 and dtype == torch.float8_e4m3fn or N >= 8
-    ), "Least chunk size must be 16B"
-
-    assert (
-        c is None or c.dtype == out_dtype
-    ), "Incompatible dtypes between c and out_dtype"
+    if dtype == torch.float8_e4m3fn:
+        assert K >= 16, "Least chunk size must be 16B"
+        assert N >= 16, "Least chunk size must be 16B"
+    else:
+        assert K >= 8, "Least chunk size must be 16B"
+        assert N >= 8, "Least chunk size must be 16B"
 
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
 
