@@ -171,7 +171,7 @@ def gemm_descriptor_persistent(
     C = alpha * (a @ b.T) + beta * C
 
     Note:
-        - K and N must be greater than 16.
+        - K and N must be greater than 16B.
         - Support float16, float8_e4m3fn, bfloat16.
         - float32 is not supported due to performance issues.
 
@@ -209,8 +209,12 @@ def gemm_descriptor_persistent(
 
     # check on TMA tensor map swizzling granularity
     # Swizzle 16B chunks within at least 32B span
-    assert K >= 16 and dtype == torch.float8_e4m3fn or K >= 8, "Least chunk size must be 16B"
-    assert N >= 16 and dtype == torch.float8_e4m3fn or N >= 8, "Least chunk size must be 16B"
+    assert (
+        K >= 16 and dtype == torch.float8_e4m3fn or K >= 8
+    ), "Least chunk size must be 16B"
+    assert (
+        N >= 16 and dtype == torch.float8_e4m3fn or N >= 8
+    ), "Least chunk size must be 16B"
 
     assert (
         c is None or c.dtype == out_dtype

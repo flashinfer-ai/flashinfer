@@ -39,10 +39,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     c0 = c.clone()
     c1 = c.clone()
 
-    # # set b to vector of 1
-    # b = torch.ones_like(b)
-    # torch.set_printoptions(threshold=float("inf"))  # print the full tensor
-
+    # torch gemm
     c_torch = torch_gemm(a.to(out_dtype), b.to(out_dtype), c.to(out_dtype), alpha, beta)
 
     # triton gemm: persistent
@@ -112,7 +109,6 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
                 c_naive,
                 c_persistent,
                 c_descriptor,
-                out_dtype,
             )
             print("compare c_torch and c_descriptor")
             print_max_diff_on_failure(c_torch, c_descriptor, out_dtype)
@@ -133,9 +129,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     assert naive_vs_persistent  # value is correct
 
     if c_descriptor is not None:
-        # disable fp8 test due to overflow (temp?)
         descriptor_atol = 10.0 if out_dtype == torch.bfloat16 else 1.0
-        # compare, but skip fp8 overflow
         naive_vs_descriptor = torch.allclose(
             c_naive.to(out_dtype), c_descriptor.to(out_dtype), atol=descriptor_atol
         )
@@ -148,27 +142,15 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
                 c_naive,
                 c_persistent,
                 c_descriptor,
-                out_dtype,
             )
             print("compare c_naive and c_descriptor")
             print_max_diff_on_failure(c_naive, c_descriptor, out_dtype)
 
         assert naive_vs_descriptor  # value is correct
 
-    # debug only
-    # print(f"a: {a}")
-    # print(f"b: {b}")
-    # print(f"c_unmodified: {c_unmodified}")
-    # if c_torch is not None:
-    #     print(f"c_torch: {c_torch}")
-    # print(f"c_naive: {c_naive}")
-    # print(f"c_persistent: {c_persistent}")
-    # print(f"c_descriptor: {c_descriptor}")
-    # assert False
-
 
 def print_all_on_failure(
-    a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor, out_dtype
+    a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor
 ):
     print(f"a: {a}")
     print(f"b: {b}")

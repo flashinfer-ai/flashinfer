@@ -22,28 +22,6 @@ def matmul_get_configs():
     ]
 
 
-# def matmul_tma_persistent_get_configs():
-#     return [
-#         triton.Config(
-#             {
-#                 "BLOCK_SIZE_M": BM,
-#                 "BLOCK_SIZE_N": BN,
-#                 "BLOCK_SIZE_K": BK,
-#                 "GROUP_SIZE_M": 8,
-#                 "EPILOGUE_SUBTILE": SUBTILE,
-#             },
-#             num_stages=s,
-#             num_warps=w,
-#         )
-#         for BM in [128]
-#         for BN in [128]
-#         for BK in [64]
-#         for s in ([3])
-#         for w in [4]
-#         for SUBTILE in [True]
-#     ]
-
-
 def _matmul_launch_metadata(grid, kernel, args):
     ret = {}
     M, N, K = args["M"], args["N"], args["K"]
@@ -147,15 +125,10 @@ def gemm_kernel_persistent(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         c = accumulator.to(c_ptr.dtype.element_ty)
 
-        # c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
         c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-# @triton.autotune(
-#     configs=matmul_tma_persistent_get_configs(),
-#     key=["M", "N", "K"],
-# )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def gemm_kernel_descriptor_persistent(
     a_ptr,
@@ -228,32 +201,22 @@ def gemm_kernel_descriptor_persistent(
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
 
-        # tl.device_print("pre-accumulator", accumulator)
-
         if EPILOGUE_SUBTILE:
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
-            # acc0 = alpha * acc0 + beta * c_desc.load([offs_cm, offs_cn])
-            # acc1 = alpha * acc1 + beta * c_desc.load(
-            #     [offs_cm, offs_cn + BLOCK_SIZE_N // 2]
-            # )
             acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
             acc1 = tl.fma(
                 acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2])
             )
-            # tl.device_print("acc0", acc0)
-            # tl.device_print("acc1", acc1)
             c0 = acc0.to(dtype)
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
         else:
-            # accumulator = alpha * accumulator + beta * c_desc.load([offs_cm, offs_cn])
             accumulator = tl.fma(
                 accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
             )
-            # tl.device_print("post-accumulator", accumulator)
             c = accumulator.to(dtype)
             c_desc.store([offs_cm, offs_cn], c)
 
@@ -324,5 +287,4 @@ def gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     c = tl.fma(c, alpha, beta * tl.load(c_ptrs, mask=c_mask))
-    # c = alpha * c + beta * tl.load(c_ptrs, mask=c_mask)
     tl.store(c_ptrs, c, mask=c_mask)
