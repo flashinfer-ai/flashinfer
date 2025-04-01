@@ -29,18 +29,21 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
     # Check inputs.
     check_input(a)
     # b can be non-contiguous
-    if c is not None:
-        check_input(c)
-    check_device([a, b, c])
+    check_device([a, b])
     check_dim(2, a)
     check_dim(2, b)
-    if c is not None:   
+
+    if c is not None:
+        check_input(c)
+        check_device([c])
         check_dim(2, c)
 
     assert a.shape[1] == b.shape[0], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
-    assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
-    assert b.shape[1] == c.shape[1], "Incompatible dimensions between b and c"
+
+    if c is not None:
+        assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
+        assert b.shape[1] == c.shape[1], "Incompatible dimensions between b and c"
 
     M, K = a.shape
     K, N = b.shape
@@ -107,18 +110,21 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
     # Check inputs.
     check_input(a)
     # b can be non-contiguous
-    if c is not None:
-        check_input(c)
-    check_device([a, b, c])
+    check_device([a, b])
     check_dim(2, a)
     check_dim(2, b)
+
     if c is not None:
+        check_input(c)
+        check_device([c])
         check_dim(2, c)
 
     assert a.shape[1] == b.shape[0], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
-    assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
-    assert b.shape[1] == c.shape[1], "Incompatible dimensions between b and c"
+
+    if c is not None:
+        assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
+        assert b.shape[1] == c.shape[1], "Incompatible dimensions between b and c"
 
     M, K = a.shape
     K, N = b.shape
@@ -193,18 +199,21 @@ def gemm_descriptor_persistent(
     # Check inputs.
     check_input(a)
     check_input(b)
-    if c is not None:
-        check_input(c)
-    check_device([a, b, c])
+    check_device([a, b])
     check_dim(2, a)
     check_dim(2, b)
+
     if c is not None:
+        check_input(c)
+        check_device([c])
         check_dim(2, c)
 
     assert a.shape[1] == b.shape[1], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
-    assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
-    assert b.shape[0] == c.shape[1], "Incompatible dimensions between b and c"
+
+    if c is not None:
+        assert a.shape[0] == c.shape[0], "Incompatible dimensions between a and c"
+        assert b.shape[0] == c.shape[1], "Incompatible dimensions between b and c"
 
     M, K = a.shape
     N, K = b.shape
