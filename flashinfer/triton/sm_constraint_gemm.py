@@ -4,9 +4,9 @@ import torch
 import triton
 
 from .kernels.sm_constraint_gemm import (
-    gemm_kernel_persistent,
     gemm_kernel,
     gemm_kernel_descriptor_persistent,
+    gemm_kernel_persistent,
 )
 from .utils import check_device, check_dim, check_input
 
