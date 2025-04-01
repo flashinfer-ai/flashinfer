@@ -629,7 +629,7 @@ __device__ void DevicePersistentMergeStates(
     typename KTraits::IdType* merge_partial_stride, typename KTraits::DTypeO* partial_o,
     float* partial_lse, typename KTraits::DTypeO* final_o, float* final_lse,
     const uint32_t o_stride_n, const uint32_t o_stride_h, const uint_fastdiv& num_heads) {
-  constexpr uint32_t VEC_SIZE = 4;  // partial o has data type float
+  constexpr uint32_t VEC_SIZE = 8;  // partial o has data type float
   constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
   constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
   const uint32_t cta_idx = (gridDim.x * blockIdx.y + blockIdx.x);

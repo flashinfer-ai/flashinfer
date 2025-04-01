@@ -10,8 +10,15 @@
     "customizations": {
         "vscode": {
             "extensions": [
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-python.python",
+                "ms-python.black-formatter",
+                "nvidia.nsight-vscode-edition"
             ]
         }
     },
+    "mounts": [
+        "type=bind,source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,readonly"
+    ],
     "remoteUser": "devuser"
 }
