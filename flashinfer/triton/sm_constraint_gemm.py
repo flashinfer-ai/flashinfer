@@ -34,7 +34,8 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
-    check_dim(2, c)
+    if c is not None:   
+        check_dim(2, c)
 
     assert a.shape[1] == b.shape[0], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
@@ -111,7 +112,8 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
-    check_dim(2, c)
+    if c is not None:
+        check_dim(2, c)
 
     assert a.shape[1] == b.shape[0], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
@@ -196,7 +198,8 @@ def gemm_descriptor_persistent(
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
-    check_dim(2, c)
+    if c is not None:
+        check_dim(2, c)
 
     assert a.shape[1] == b.shape[1], "Incompatible dimensions between a and b"
     assert a.dtype == b.dtype, "Incompatible dtypes between a and b"
