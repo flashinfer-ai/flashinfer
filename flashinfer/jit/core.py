@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
-from filelock import FileLock
+from filelock import Timeout, FileLock
 
 from .env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
@@ -127,21 +127,25 @@ def load_cuda_ops(
         FLASHINFER_INCLUDE_DIR,
         FLASHINFER_CSRC_DIR,
     ] + CUTLASS_INCLUDE_DIRS
-    lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", thread_local=False)
-    with lock:
-        torch_cpp_ext.load(
-            name,
-            list(map(lambda _: str(_), sources)),
-            extra_cflags=cflags,
-            extra_cuda_cflags=cuda_cflags,
-            extra_ldflags=extra_ldflags,
-            extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
-            build_directory=build_directory,
-            verbose=verbose,
-            with_cuda=True,
-            # We switched to torch.library, so will be loaded into torch.ops
-            # instead of into a separate module.
-            is_python_module=False,
-        )
+    lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", timeout=30, thread_local=False)
+    try:
+        with lock:
+            torch_cpp_ext.load(
+                name,
+                list(map(lambda _: str(_), sources)),
+                extra_cflags=cflags,
+                extra_cuda_cflags=cuda_cflags,
+                extra_ldflags=extra_ldflags,
+                extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
+                build_directory=build_directory,
+                verbose=verbose,
+                with_cuda=True,
+                # We switched to torch.library, so will be loaded into torch.ops
+                # instead of into a separate module.
+                is_python_module=False,
+            )
+    except Timeout:
+        raise RuntimeError(f"failed to require JIT filelock for JIT ops {name}")
+
     logger.info(f"Finished loading JIT ops: {name}")
     return getattr(torch.ops, name)
