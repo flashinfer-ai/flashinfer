@@ -26,10 +26,11 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
         num_sms: The number of SMs to use for the computation.
     """
 
-    # Check constraints.
+    # Check inputs.
     check_input(a)
-    # check_input(b) # b can be non-contiguous
-    check_input(c)
+    # b can be non-contiguous
+    if c is not None:
+        check_input(c)
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
@@ -102,9 +103,11 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
         out_dtype: The dtype of the output matrix. Default: fp8 --> bf16. Otherwise, same as a.dtype.
         num_sms: The number of SMs to use for the computation.
     """
-    # Check constraints.
+    # Check inputs.
     check_input(a)
-    check_input(c)
+    # b can be non-contiguous
+    if c is not None:
+        check_input(c)
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
@@ -185,9 +188,11 @@ def gemm_descriptor_persistent(
         num_sms: The number of SMs to use for the computation.
         EPILOGUE_SUBTILE: Whether to use the epilogue subtile optimization.
     """
-    # Check constraints.
+    # Check inputs.
     check_input(a)
-    check_input(c)
+    check_input(b)
+    if c is not None:
+        check_input(c)
     check_device([a, b, c])
     check_dim(2, a)
     check_dim(2, b)
