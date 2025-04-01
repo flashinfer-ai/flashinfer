@@ -1,9 +1,9 @@
 import pytest
 import torch
 import triton
+from triton.testing import do_bench
 import flashinfer
 import flashinfer.triton
-from triton.testing import do_bench
 
 
 def is_cuda():
@@ -30,9 +30,14 @@ def bench_gemm_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000)
     # matmul: 2 * M * N * K
     # scale and add: 3 * M * N
     flops = (2 * M * N * K + 3 * M * N) / ms / 1e9
-    print(f"GEMM Persistent | num_sms: {num_sms}, M: {M}, N: {N}, K: {K}, {dtype}: {flops:.3f} TFLOPs/s")
+    print(
+        f"GEMM Persistent | num_sms: {num_sms}, M: {M}, N: {N}, K: {K}, {dtype}: {flops:.3f} TFLOPs/s"
+    )
 
-def bench_gemm_descriptor_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000):
+
+def bench_gemm_descriptor_persistent(
+    num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000
+):
     if dtype == torch.float32:
         return
     ms = do_bench(
@@ -50,7 +55,10 @@ def bench_gemm_descriptor_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_
     # matmul: 2 * M * N * K
     # scale and add: 3 * M * N
     flops = (2 * M * N * K + 3 * M * N) / ms / 1e9
-    print(f"GEMM Descriptor | num_sms: {num_sms}, M: {M}, N: {N}, K: {K}, {dtype}: {flops:.3f} TFLOPs/s")
+    print(
+        f"GEMM Descriptor | num_sms: {num_sms}, M: {M}, N: {N}, K: {K}, {dtype}: {flops:.3f} TFLOPs/s"
+    )
+
 
 if __name__ == "__main__":
     assert supports_tma()
