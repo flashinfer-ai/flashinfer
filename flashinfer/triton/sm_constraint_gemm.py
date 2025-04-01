@@ -177,7 +177,7 @@ def gemm_descriptor_persistent(
 
     Args:
         a: The first input matrix. Shape: (M, K)
-        b: The second input matrix. Shape: (K, N)
+        b: The second input matrix. Shape: (N, K)
         c: The output matrix. Shape: (M, N). In-place epilogue is supported. Expected to be out_dtype (if not specified, same as a.dtype, but fp8 --> bf16).
         alpha: The scaling factor for the product of a and b.
         beta: The scaling factor for the output matrix c.
