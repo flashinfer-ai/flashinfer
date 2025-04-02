@@ -1,13 +1,14 @@
 import logging
 import os
 import re
+import shutil
 from contextlib import suppress
 from pathlib import Path
 from typing import List, Optional, Union
 
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
-from filelock import Timeout, FileLock
+from filelock import FileLock, Timeout
 
 from .env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
@@ -78,6 +79,14 @@ def remove_unwanted_pytorch_nvcc_flags():
 remove_unwanted_pytorch_nvcc_flags()
 
 sm90a_nvcc_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
+
+
+# cleanup compiled ops and filelock of a given name
+def cleanup_compiled_ops(name: str):
+    if os.path.exists(FLASHINFER_JIT_DIR / f"{name}.lock"):
+        os.remove(FLASHINFER_JIT_DIR / f"{name}.lock")
+    if os.path.exists(FLASHINFER_JIT_DIR / name):
+        shutil.rmtree(FLASHINFER_JIT_DIR / name)
 
 
 def load_cuda_ops(
