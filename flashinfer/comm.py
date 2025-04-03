@@ -31,7 +31,8 @@ def get_comm_module():
             "comm",
             [
                 FLASHINFER_CSRC_DIR / "comm.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu"
+                FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+                FLASHINFER_CSRC_DIR / "customAllReduceKernels.cu"
             ],
         )
 
