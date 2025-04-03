@@ -158,7 +158,7 @@ CUTE_HOST_DEVICE constexpr auto upcast(Shape const& shape, Stride const& stride)
                             [](auto const& s, auto const& d) { return upcast<N, I>(s, d); });
   } else if constexpr (is_scaled_basis<Stride>::value) {
     if constexpr (Stride::mode() == I) {
-      return make_layout(shape_div(shape, Int<N>{}), shape_div(stride, Int<N>{}));
+      return make_layout(ceil_div(shape, Int<N>{}), ceil_div(stride, Int<N>{}));
     } else {
       return make_layout(shape, stride);
     }
