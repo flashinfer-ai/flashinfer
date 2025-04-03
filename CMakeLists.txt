@@ -34,41 +34,44 @@ set(CMAKE_SKIP_BUILD_RPATH FALSE)
 set(CMAKE_SKIP_INSTALL_RPATH FALSE)
 
 # cmake-format: off
-# Compiler flags
-string(
-  CONCAT WARNING_FLAGS
-         "-Wall "
-         "-Wextra "
-         "-Winit-self "
-         "-Wno-switch-bool "
-         "-Wunused-function "
-         "-Wuninitialized "
-         "-Wmissing-declarations "
-         "-Wno-unused-parameter "
-         "-fdiagnostics-color=auto ")
+# Compiler flags - defined as lists for cleaner management
+set(WARNING_FLAGS
+    "-Wall"
+    "-Wextra"
+    "-Winit-self"
+    "-Wno-switch-bool"
+    "-Wunused-function"
+    "-Wuninitialized"
+    "-Wmissing-declarations"
+    "-Wno-unused-parameter"
+    "-fdiagnostics-color=auto")
 
-string(
-  CONCAT SECURITY_FLAGS
-         "-fstack-protector "
-         "-fstack-protector-all "
-         "-fpic "
-         "-fPIC "
-         "-D_FORTIFY_SOURCE=2 "
-         "-Wformat "
-         "-Wformat-security "
-         "-fno-delete-null-pointer-checks "
-         "-fwrapv ")
+set(SECURITY_FLAGS
+    "-fstack-protector"
+    "-fstack-protector-all"
+    "-fpic"
+    "-fPIC"
+    "-D_FORTIFY_SOURCE=2"
+    "-Wformat"
+    "-Wformat-security"
+    "-fno-delete-null-pointer-checks"
+    "-fwrapv")
 
-string(
-  CONCAT FLASHINFER_NVCC_FLAGS
-         "-O3 "
-         "--threads=1 "
-         "-Xfatbin=-compress-all "
-         "-use_fast_math "
-         "--expt-relaxed-constexpr ")
+set(FLASHINFER_NVCC_FLAGS
+    "-O3"
+    "--threads=1"
+    "-Xfatbin=-compress-all"
+    "-use_fast_math"
+    "--expt-relaxed-constexpr")
 # cmake-format: on
 
-string(CONCAT FLASHINFER_CXXFLAGS "${WARNING_FLAGS}" "${SECURITY_FLAGS}")
+# Join the lists with spaces to form the flag strings
+string(JOIN " " WARNING_FLAGS ${WARNING_FLAGS})
+string(JOIN " " SECURITY_FLAGS ${SECURITY_FLAGS})
+string(JOIN " " FLASHINFER_NVCC_FLAGS ${FLASHINFER_NVCC_FLAGS})
+
+# Combine warning and security flags for C++ compiler
+string(CONCAT FLASHINFER_CXXFLAGS "${WARNING_FLAGS} " "${SECURITY_FLAGS}")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLASHINFER_CXXFLAGS}")
 set(CMAKE_CXX_FLAGS_DEBUG
