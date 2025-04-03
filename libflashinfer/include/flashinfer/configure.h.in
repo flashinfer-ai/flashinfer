@@ -1,0 +1,17 @@
+#pragma once
+#ifndef FLASHINFER_CONFIGURE_H_
+#define FLASHINFER_CONFIGURE_H_
+
+// Auto-generated configuration header for FlashInfer
+// Do not edit manually
+
+// Version info
+#define FLASHINFER_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define FLASHINFER_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define FLASHINFER_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define FLASHINFER_VERSION_FULL "@PROJECT_VERSION_FULL@"
+
+// Build configuration - automatically generated from CMake options
+@FLASHINFER_CONFIG_DEFINES@
+
+#endif  // FLASHINFER_CONFIGURE_H_

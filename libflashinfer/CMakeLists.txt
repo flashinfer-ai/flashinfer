@@ -67,6 +67,25 @@ include(ConfigureKernelGeneration)
 flashinfer_configure_kernel_generation()
 # ---------------------------------------------------------------------------#
 
+# ---------------------- Generate configure.h -------------------------------#
+include(${CMAKE_SOURCE_DIR}/cmake/utils/GenerateConfigHeader.cmake)
+flashinfer_generate_config_header(
+  SOURCE_DIR
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  BINARY_DIR
+  ${CMAKE_CURRENT_BINARY_DIR}
+  INSTALL_DIR
+  ${CMAKE_INSTALL_INCLUDEDIR}/flashinfer
+  COMPONENT
+  Headers
+  EXCLUDE_PATTERNS
+  ".*_DIR$"
+  ".*_PATH$"
+  ".*_FOUND$"
+  ".*_FILE$"
+  ".*_VERSION$")
+# ---------------------------------------------------------------------------#
+
 # Build decode_kernels and prefill_kernels if FLASHINFER_BUILD_KERNELS is ON or
 # if tests or benchmarks are enabled
 if(FLASHINFER_BUILD_KERNELS
