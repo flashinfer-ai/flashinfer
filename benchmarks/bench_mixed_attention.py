@@ -29,7 +29,7 @@ kv_data = (
     torch.randn(num_blocks, 2, page_block_size, num_kv_heads, head_dim).to(0).half()
 )
 wrapper = flashinfer.BatchAttention(
-    kv_layout="NHD",  # use_tensor_cores=True
+    kv_layout="NHD",
 )
 wrapper.plan(
     q_indptr.to(0),
@@ -46,18 +46,7 @@ wrapper.plan(
     kv_data_type=torch.float16,
 )
 
-# s = torch.cuda.Stream()
-# s.wait_stream(torch.cuda.current_stream())
-# with torch.cuda.stream(s):
-#     for _ in range(3):
-#         o = wrapper.run(q, kv_data)
-# torch.cuda.current_stream().wait_stream(s)
 
-# g = torch.cuda.CUDAGraph()
-# with torch.cuda.graph(g):
-#     wrapper.run(q, kv_data)
-
-# ms = do_bench(lambda: g.replay())
 ms = do_bench(lambda: wrapper.run(q, kv_data))
 print(ms)
 
