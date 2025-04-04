@@ -594,7 +594,7 @@ bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t 
     return supported_algo && (msg_size % msg_align == 0);
 }
 
-std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReduceParams& params, size_t elts_per_thread)
+std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReduceParams& params, size_t elts_per_thread, int num_ctas)
 {
     int blocks_per_grid = 1, threads_per_block = DEFAULT_BLOCK_SIZE;
 
@@ -643,6 +643,7 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
     default: throw std::runtime_error("Algorithm not supported here.");
     }
 
+    blocks_per_grid = std::min(blocks_per_grid, num_ctas);
     return std::make_tuple(blocks_per_grid, threads_per_block);
 }
 
@@ -708,12 +709,12 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
 void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
-    AllReduceParams& params, cudaStream_t stream)
+    AllReduceParams& params, cudaStream_t stream, int num_ctas)
 {
     TORCH_CHECK(fusionOp == AllReduceFusionOp::NONE);
     TORCH_CHECK(!(USE_MEMCPY && PUSH_MODE), "Memcpy cannot be used with PUSH_MODE.");
     size_t elts_per_thread = 16 / sizeof(T);
-    auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(algo, params, elts_per_thread);
+    auto [blocks_per_grid, threads_per_block] = kernelLaunchConfig(algo, params, elts_per_thread, num_ctas);
     if (USE_MEMCPY)
     {
         cudaMemcpyAsync(params.peer_comm_buffer_ptrs[params.local_rank], params.local_input_buffer_ptr,
@@ -753,12 +754,12 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
 void AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
-    AllReduceParams& params, cudaStream_t stream)
+    AllReduceParams& params, cudaStream_t stream, int num_ctas)
 {
     if (fusionOp == AllReduceFusionOp::NONE)
     {
         // TLLM_LOG_DEBUG("AllReduceDispatch enabled");
-        AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream);
+        AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream, num_ctas);
     }
     else
     {
@@ -770,45 +771,45 @@ void AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceStrategyConfig
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false>
 void AllReduceDispatchPushMode(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
-    AllReduceParams& params, cudaStream_t stream)
+    AllReduceParams& params, cudaStream_t stream, int num_ctas)
 {
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
         & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::USE_MEMCPY))
     {
-        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(algo, config, fusionOp, params, stream);
+        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(algo, config, fusionOp, params, stream, num_ctas);
     }
     else
     {
-        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(algo, config, fusionOp, params, stream);
+        AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(algo, config, fusionOp, params, stream, num_ctas);
     }
 }
 
 template <typename T, int RANKS_PER_NODE> //, bool USE_MEMCPY = false, bool PUSH_MODE = false>
 void AllReduceDispatchRanksPerNode(AllReduceStrategyType algo, AllReduceStrategyConfig config,
-    AllReduceFusionOp fusionOp, AllReduceParams& params, cudaStream_t stream)
+    AllReduceFusionOp fusionOp, AllReduceParams& params, cudaStream_t stream, int num_ctas)
 {
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
         & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::PUSH_MODE))
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, fusionOp, params, stream);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, fusionOp, params, stream, int num_ctas);
     }
     else
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, fusionOp, params, stream);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, fusionOp, params, stream, int num_ctas);
     }
 }
 
 template <typename T>
 void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat, AllReduceStrategyConfig config,
-    AllReduceFusionOp fusionOp, cudaStream_t stream)
+    AllReduceFusionOp fusionOp, cudaStream_t stream, int num_ctas)
 {
     switch (params.ranks_per_node)
     {
-    case 2: AllReduceDispatchRanksPerNode<T, 2>(strat, config, fusionOp, params, stream); break;
-    case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream); break;
-    case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
-    case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
-    case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream); break;
+    case 2: AllReduceDispatchRanksPerNode<T, 2>(strat, config, fusionOp, params, stream, num_ctas); break;
+    case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream, num_ctas); break;
+    case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream, num_ctas); break;
+    case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream, num_ctas); break;
+    case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream, num_ctas); break;
     default: throw std::runtime_error("Custom all reduce only supported on {2, 4, 6, 8, 16} GPUs per node.");
     }
 }
@@ -849,7 +850,7 @@ AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, siz
 }
 
 void customAllReduce(kernels::AllReduceParams& params, at::ScalarType dataType, AllReduceStrategyType strat,
-    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream)
+    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream, int num_ctas)
 {
     TORCH_CHECK(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType),
         "Custom all-reduce configuration unsupported");
@@ -858,11 +859,11 @@ void customAllReduce(kernels::AllReduceParams& params, at::ScalarType dataType, 
 
     switch (dataType)
     {
-    case at::ScalarType::Float: AllReduceDispatchType<float>(params, strat, config, fusionOp, stream); break;
-    case at::ScalarType::Half: AllReduceDispatchType<half>(params, strat, config, fusionOp, stream); break;
+    case at::ScalarType::Float: AllReduceDispatchType<float>(params, strat, config, fusionOp, stream, num_ctas); break;
+    case at::ScalarType::Half: AllReduceDispatchType<half>(params, strat, config, fusionOp, stream, num_ctas); break;
 #ifdef ENABLE_BF16
     case at::ScalarType::BFloat16:
-        AllReduceDispatchType<__nv_bfloat16>(params, strat, config, fusionOp, stream);
+        AllReduceDispatchType<__nv_bfloat16>(params, strat, config, fusionOp, stream, num_ctas);
         break;
 #endif
     default: throw std::runtime_error("Unsupported dataType for customAllReduce");

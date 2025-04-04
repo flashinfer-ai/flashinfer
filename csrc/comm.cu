@@ -49,5 +49,5 @@ void AllReduceSum(at::Tensor data,
     auto strat_config = tensorrt_llm::kernels::AllReduceStrategyConfig::PUSH_MODE;
     auto strat_type = tensorrt_llm::kernels::AllReduceStrategyType::AUTO;
 
-    customAllReduce(params, dtype, strat_type, strat_config, fusion_op, stream);
+    customAllReduce(params, dtype, strat_type, strat_config, fusion_op, stream, num_ctas);
 }
