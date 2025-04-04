@@ -34,7 +34,7 @@ jobs:
       - name: Select builder image based on PyTorch and CUDA versions
         id: select-builder
         run: |
-          if [[ "${{ matrix.torch }}" == "2.6" && "${{ matrix.cuda }}" == "12.6" ]] || [[ "${{ matrix.torch }}" > "2.6" ]]; then
+          if [[ "${{ matrix.torch }}" == "2.6" && "${{ matrix.cuda }}" >= "12.6" ]] || [[ "${{ matrix.torch }}" > "2.6" ]]; then
             echo "BUILDER_IMAGE=pytorch/manylinux2_28-builder:cuda${{ matrix.cuda }}" >> $GITHUB_OUTPUT
           else
             echo "BUILDER_IMAGE=pytorch/manylinux-builder:cuda${{ matrix.cuda }}" >> $GITHUB_OUTPUT
