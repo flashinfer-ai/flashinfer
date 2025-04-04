@@ -114,6 +114,9 @@ def load_cuda_ops(
             "--ptxas-options=-v",
             "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
         ]
+    else:
+        # non debug mode
+        cuda_cflags += ["-DNDEBUG"]
 
     cflags += extra_cflags
     cuda_cflags += extra_cuda_cflags
