@@ -35,6 +35,7 @@ jobs:
           submodules: true
       
       - name: Set torch and cuda version value
+        id: set_torch_and_cuda_version
         run: |
           IFS='.' read -r major minor <<< "${{ matrix.torch }}"
           version_value=$((major * 100 + minor))
@@ -45,9 +46,9 @@ jobs:
 
       - name: Build wheel
         env:
-          TORCH_VERSION: ${{ steps.torch_version.outputs.TORCH_VERSION }}
-          CUDA_VERSION: ${{ steps.cuda_version.outputs.CUDA_VERSION }}
-          BUILDER_IMAGE: ${{ ((steps.torch_version.outputs.TORCH_VERSION == 206 && steps.cuda_version.outputs.CUDA_VERSION >= 1206) || steps.torch_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
+          TORCH_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.TORCH_VERSION }}
+          CUDA_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.CUDA_VERSION }}
+          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
         run: |
           echo "TORCH_VERSION: $TORCH_VERSION"
           echo "CUDA_VERSION: $CUDA_VERSION"
