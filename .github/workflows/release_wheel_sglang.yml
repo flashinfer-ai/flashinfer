@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         cuda: ["11.8", "12.4", "12.6"]
-        torch: ["2.5", "2.6"]
+        torch: ["2.5", "2.6", "2.10"]
 
     runs-on: [self-hosted]
     steps:
