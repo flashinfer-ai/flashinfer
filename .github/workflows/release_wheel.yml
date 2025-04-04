@@ -46,10 +46,25 @@ jobs:
         with:
           submodules: true
 
+      - name: Set torch and cuda version value
+        id: set_torch_and_cuda_version
+        run: |
+          IFS='.' read -r major minor <<< "${{ matrix.torch }}"
+          version_value=$((major * 100 + minor))
+          echo "TORCH_VERSION=$version_value" >> $GITHUB_OUTPUT
+          IFS='.' read -r major minor <<< "${{ matrix.cuda }}"
+          version_value=$((major * 100 + minor))
+          echo "CUDA_VERSION=$version_value" >> $GITHUB_OUTPUT
+
       - name: Build wheel
         env:
-          BUILDER_IMAGE: ${{ ((matrix.torch == '2.6' && matrix.cuda >= '12.6') || matrix.torch > '2.6') && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
+          TORCH_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.TORCH_VERSION }}
+          CUDA_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.CUDA_VERSION }}
+          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
         run: |
+          echo "TORCH_VERSION: $TORCH_VERSION"
+          echo "CUDA_VERSION: $CUDA_VERSION"
+          echo "BUILDER_IMAGE: $BUILDER_IMAGE"
           chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
           docker run --rm -t \
               -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
