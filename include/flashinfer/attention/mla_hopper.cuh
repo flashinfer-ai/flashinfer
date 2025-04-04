@@ -656,7 +656,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   pipeline_params.producer_arv_count = 128;
   pipeline_params.consumer_arv_count = 128;
   MainloopPipeline pipeline_q(smem_storage.pipeline_q, pipeline_params);
-  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
+  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::ProducerConsumer
                                              : MainloopPipeline::ThreadCategory::Consumer;
   pipeline_params.producer_arv_count = 128;
   pipeline_params.consumer_arv_count = 256;
