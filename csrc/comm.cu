@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include <flashinfer/customAllReduceKernels.h>
-#include <optional>
 
 #include "pytorch_extension_utils.h"
 

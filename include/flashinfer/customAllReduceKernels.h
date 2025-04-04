@@ -19,6 +19,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <ATen/ATen.h>
+#include <optional>
 
 
 namespace tensorrt_llm::kernels
