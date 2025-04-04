@@ -48,7 +48,7 @@ jobs:
 
       - name: Build wheel
         env:
-          BUILDER_IMAGE: "${{ matrix.torch == '2.6' && matrix.cuda >= '12.6' || matrix.torch > '2.6' ? 'pytorch/manylinux2_28-builder:cuda' : 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}"
+          BUILDER_IMAGE: ${{ (matrix.torch == '2.6' && matrix.cuda >= '12.6') || matrix.torch > '2.6' && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
         run: |
           chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
           docker run --rm -t \
