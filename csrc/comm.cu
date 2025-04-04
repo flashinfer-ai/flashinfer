@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/customAllReduceKernels.h>
+#include <optional>
 
 #include "pytorch_extension_utils.h"
 
@@ -21,14 +22,19 @@ void AllReduceSum(at::Tensor data,
                   at::Tensor workspace,
                   int64_t world_size, 
                   int64_t rank, 
-                  int64_t num_ctas) {
+                  int64_t num_ctas,
+                  std::optional<tensorrt_llm::kernels::AllReduceFusionOp> fusion_op) {
     printf("AllReduce called with num_ctas = %d\n", (int)num_ctas);
 
     float* workspace_ptr = workspace.data_ptr<float>();
     auto dtype = data.scalar_type();
     int hidden_size = data.size(-1);
     int token_num = data.numel() / hidden_size;
-    auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
+    if (fusion_op.has_value()) {
+        auto fusion_op = fusion_op.value();
+    } else {
+        auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
+    }
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
