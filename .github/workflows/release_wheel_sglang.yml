@@ -45,9 +45,7 @@ jobs:
 
       - name: Build wheel
         env:
-          TORCH_VERSION: ${{ steps.torch_version.outputs.TORCH_VERSION }}
-          CUDA_VERSION: ${{ steps.cuda_version.outputs.CUDA_VERSION }}
-          BUILDER_IMAGE: ${{ (($TORCH_VERSION == 206 && $CUDA_VERSION >= 1206) || $TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
+          BUILDER_IMAGE: ${{ ((steps.torch_version.outputs.TORCH_VERSION == 206 && steps.cuda_version.outputs.CUDA_VERSION >= 1206) || steps.torch_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
         run: |
           echo "torch: ${{ matrix.torch }}"
           echo "cuda: ${{ matrix.cuda }}"
