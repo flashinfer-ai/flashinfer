@@ -33,10 +33,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      
+      - name: Set torch and cuda version value
+        run: |
+          IFS='.' read -r major minor <<< "${{ matrix.torch }}"
+          version_value=$((major * 100 + minor))
+          echo "TORCH_VERSION=$version_value" >> $GITHUB_OUTPUT
+          IFS='.' read -r major minor <<< "${{ matrix.cuda }}"
+          version_value=$((major * 100 + minor))
+          echo "CUDA_VERSION=$version_value" >> $GITHUB_OUTPUT
 
       - name: Build wheel
         env:
-          BUILDER_IMAGE: ${{ ((matrix.torch == '2.6' && matrix.cuda >= '12.6') || matrix.torch > '2.6') && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
+          TORCH_VERSION: ${{ steps.torch_version.outputs.TORCH_VERSION }}
+          CUDA_VERSION: ${{ steps.cuda_version.outputs.CUDA_VERSION }}
+          BUILDER_IMAGE: ${{ ((TORCH_VERSION == 206 && CUDA_VERSION >= 1206) || TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
         run: |
           echo "torch: ${{ matrix.torch }}"
           echo "cuda: ${{ matrix.cuda }}"
