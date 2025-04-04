@@ -106,6 +106,6 @@ struct AllReduceParams
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, at::ScalarType type);
 
 void customAllReduce(kernels::AllReduceParams& params, at::ScalarType dataType, AllReduceStrategyType strat,
-    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
+    AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream, int num_ctas);
 
 } // namespace tensorrt_llm::kernels

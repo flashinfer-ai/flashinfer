@@ -66,7 +66,7 @@ class NetWrapper:
         if self.num_ctas is None:
             # raise RuntimeError("NetWrapper.plan() must be called before kernel execution")
             pass
-        get_comm_module().all_reduce_sum(
+        get_comm_module().all_reduce(
             data, self.workspace_buffer, 
             torch.distributed.get_world_size(),
             torch.distributed.get_rank(),

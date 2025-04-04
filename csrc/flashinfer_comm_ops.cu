@@ -18,5 +18,5 @@
 void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int64_t rank, int64_t num_ctas);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-    m.def("all_reduce_sum", AllReduceSum);
+    m.def("all_reduce", AllReduceSum);
 }

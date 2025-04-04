@@ -791,11 +791,11 @@ void AllReduceDispatchRanksPerNode(AllReduceStrategyType algo, AllReduceStrategy
     if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config)
         & static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(AllReduceStrategyConfig::PUSH_MODE))
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, fusionOp, params, stream, int num_ctas);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, true>(algo, config, fusionOp, params, stream, num_ctas);
     }
     else
     {
-        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, fusionOp, params, stream, int num_ctas);
+        AllReduceDispatchPushMode<T, RANKS_PER_NODE, false>(algo, config, fusionOp, params, stream, num_ctas);
     }
 }
 
