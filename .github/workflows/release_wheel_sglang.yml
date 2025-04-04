@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      
+
       - name: Set torch and cuda version value
         id: set_torch_and_cuda_version
         run: |
