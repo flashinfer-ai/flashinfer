@@ -46,7 +46,18 @@ jobs:
         with:
           submodules: true
 
+      - name: Select builder image based on PyTorch and CUDA versions
+        id: select-builder
+        run: |
+          if [[ "${{ matrix.torch }}" == "2.6" && "${{ matrix.cuda }}" == "12.6" ]] || [[ "${{ matrix.torch }}" > "2.6" ]]; then
+            echo "BUILDER_IMAGE=pytorch/manylinux2_28-builder:cuda${{ matrix.cuda }}" >> $GITHUB_OUTPUT
+          else
+            echo "BUILDER_IMAGE=pytorch/manylinux-builder:cuda${{ matrix.cuda }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build wheel
+        env:
+          BUILDER_IMAGE: ${{ steps.select-builder.outputs.BUILDER_IMAGE }}
         run: |
           chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
           docker run --rm -t \
@@ -59,7 +70,7 @@ jobs:
               -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
               -e MAX_JOBS=128 \
               --user $CI_UID:$CI_GID \
-              pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
+              $BUILDER_IMAGE \
               bash /app/scripts/run-ci-build-wheel.sh
         timeout-minutes: 120
       - run: du -h dist/*
