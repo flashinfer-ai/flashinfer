@@ -16,12 +16,10 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <ATen/ATen.h>
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm::kernels
 {
@@ -30,16 +28,6 @@ constexpr size_t WARP_SIZE = 32;
 constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
 constexpr size_t MAX_RANKS_PER_NODE = 16;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
-
-namespace reduce_fusion::details
-{
-static constexpr int kBytesPerAccess = 16;
-static constexpr int kWarpSize = 32;
-static constexpr int kMaxCtaSize = 1024;
-static constexpr int kClusterMaxSize = 8;
-static constexpr int kLamportTokenNumThreshold = 16;
-static constexpr int kLamportHiddenSizeThreshold = 256;
-}; // namespace reduce_fusion::details
 
 // Warning: python definition is in tensorrt_llm/functional.py
 // they must be kept in sync
@@ -110,18 +98,13 @@ struct AllReduceParams
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, at::ScalarType dataType,
         int token_num, int hidden_size, AllReduceFusionOp op);
 };
 
-bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, at::ScalarType type);
 
-void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
+void customAllReduce(kernels::AllReduceParams& params, at::ScalarType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
-
-void residualRmsNorm(
-    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
-
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

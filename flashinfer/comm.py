@@ -31,7 +31,8 @@ def get_comm_module():
             "comm",
             [
                 FLASHINFER_CSRC_DIR / "comm.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu"
+                FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+                FLASHINFER_CSRC_DIR / "customAllReduceKernels.cu"
             ],
         )
 
@@ -48,11 +49,18 @@ class NetWrapper:
 
     def __init__(self):
         self.num_ctas = None
+        # need to specify device for workspace buffer?
+        self.workspace_buffer = torch.empty((1024 * 1024,), dtype=torch.int8)
 
     def plan(self, num_ctas):
         self.num_ctas = num_ctas
 
-    def all_reduce(self, data: torch.Tensor, reduce_op: int):
+    def all_reduce(self, data: torch.Tensor):
         if self.num_ctas is None:
             raise RuntimeError("NetWrapper.plan() must be called before kernel execution")
-        get_comm_module().all_reduce(data, reduce_op, self.num_ctas)
+        get_comm_module().all_reduce_sum(
+            data, self.workspace_buffer, 
+            torch.distributed.get_world_size(),
+            torch.distributed.get_rank(),
+            self.num_ctas,
+        )
