@@ -1,8 +1,5 @@
 name: Release Wheel
 on:
-  pull_request: # debug
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       tag_name:
