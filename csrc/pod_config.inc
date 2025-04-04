@@ -22,10 +22,10 @@ using namespace flashinfer;
       return DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(                                    \
         q_scalar_type, kv_scalar_type, DTypeQ, DTypeKV, [&] {                        \
           using DTypeO = DTypeQ;                                                     \
-          constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;                 \
-          constexpr bool USE_FP16_QK_REDUCTION = false;                              \
+          static constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;          \
+          static constexpr bool USE_FP16_QK_REDUCTION = false;                       \
           return DISPATCH_head_dim(head_dim_qk, HEAD_DIM_QK, [&] {                   \
-            [[maybe_unused]] constexpr int HEAD_DIM_VO = HEAD_DIM_QK;                \
+            [[maybe_unused]] static constexpr int HEAD_DIM_VO = HEAD_DIM_QK;         \
             return DISPATCH_BOOL(window_left_p > -1, USE_SLIDING_WINDOW_P, [&] {     \
               return DISPATCH_BOOL(window_left_d > -1, USE_SLIDING_WINDOW_D, [&] {   \
                 return DISPATCH_BOOL(false, USE_LOGITS_SOFT_CAP, [&] {               \

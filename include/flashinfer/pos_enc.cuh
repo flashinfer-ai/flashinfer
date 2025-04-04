@@ -26,6 +26,10 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
+#ifdef _WIN32
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace flashinfer {
 
 /*!
@@ -780,6 +784,15 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
 }
 
 template <typename DType, typename IdType>
+#ifdef _WIN32
+cudaError_t BatchQKApplyLlama31Rotary(
+    DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* indptr, IdType* offsets,
+    uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim,
+    uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
+    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
+    bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+    float high_freq_factor, float old_context_length, cudaStream_t stream = nullptr)
+#else
 cudaError_t BatchQKApplyLlama31Rotary(
     DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ indptr,
     IdType* __restrict__ offsets, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -787,7 +800,9 @@ cudaError_t BatchQKApplyLlama31Rotary(
     size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
     size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
     float low_freq_factor, float high_freq_factor, float old_context_length,
-    cudaStream_t stream = nullptr) {
+    cudaStream_t stream = nullptr)
+#endif
+{
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
