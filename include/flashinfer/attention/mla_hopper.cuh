@@ -813,43 +813,29 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           (kv_start / CTA_TILE_KV);
 
       consumer_wait(pipeline_q, smem_pipe_read_q);
-#pragma unroll 1
-      for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
-        consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-        warpgroup_wait<0>();
-        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
-                              kv_len, kv_end, num_heads, s_frag);
-        update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-        write_o_scale_smem<KTraits>(&smem_storage, o_scale);
-        convert_s_to_p<KTraits>(s_frag, p_frag);
-        write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-        barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
-        rescale_o_<KTraits>(o_scale, o_frag);
-        __syncthreads();
-        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
-        warpgroup_wait<0>();
-        pipeline_kv.consumer_release(smem_pipe_read_kv);
-        ++smem_pipe_read_kv;
-      }
 
-#pragma unroll 1
-      for (; kv_tile_idx + 1 > NUM_STAGES; --kv_tile_idx) {
-        consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-        warpgroup_wait<0>();
-        update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-        write_o_scale_smem<KTraits>(&smem_storage, o_scale);
-        convert_s_to_p<KTraits>(s_frag, p_frag);
-        write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-        barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
-        rescale_o_<KTraits>(o_scale, o_frag);
-        __syncthreads();
-        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
-        warpgroup_wait<0>();
-        pipeline_kv.consumer_release(smem_pipe_read_kv);
-        ++smem_pipe_read_kv;
-      }
+      LOOP_SPLIT_MASK(
+          kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
+          kv_tile_idx + 1 > NUM_STAGES, {
+            consumer_wait(pipeline_kv, smem_pipe_read_kv);
+            compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
+            warpgroup_wait<0>();
+            if constexpr (WITH_MASK) {
+              logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
+                                    kv_len, kv_end, num_heads, s_frag);
+            }
+            update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
+            write_o_scale_smem<KTraits>(&smem_storage, o_scale);
+            convert_s_to_p<KTraits>(s_frag, p_frag);
+            write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
+            barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+            rescale_o_<KTraits>(o_scale, o_frag);
+            __syncthreads();
+            compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
+            warpgroup_wait<0>();
+            pipeline_kv.consumer_release(smem_pipe_read_kv);
+            ++smem_pipe_read_kv;
+          });
 
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {

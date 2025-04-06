@@ -267,10 +267,10 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
  * \param kv_len The length of kv tensor.
  */
 template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits>
-__device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
-                                           uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
-                                           const uint32_t stride_n, const uint32_t kv_idx_base,
-                                           const uint32_t kv_len, const dim3 tid = threadIdx) {
+__device__ __forceinline__ void load_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
+                                        uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
+                                        const uint32_t stride_n, const uint32_t kv_idx_base,
+                                        const uint32_t kv_len, const dim3 tid = threadIdx) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
@@ -318,7 +318,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
 }
 
 template <bool produce_v, typename KTraits>
-__device__ __forceinline__ void page_produce_kv(
+__device__ __forceinline__ void page_load_kv(
     smem_t<KTraits::SWIZZLE_MODE_KV> smem, uint32_t* smem_offset,
     const paged_kv_t<typename KTraits::DTypeKV, typename KTraits::IdType>& paged_kv,
     const uint32_t kv_idx_base, const size_t* thr_local_kv_offset, const uint32_t kv_len,
@@ -1010,10 +1010,12 @@ __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant va
  * \brief Synchronize the states of the MDO kernel across the threadblock along threadIdx.z.
  */
 template <typename KTraits>
-__device__ __forceinline__ void threadblock_sync_mdo_states(
-    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::SharedStorage* smem_storage,
-    typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2], const uint32_t warp_idx,
-    const uint32_t lane_idx, const dim3 tid = threadIdx) {
+__device__ __forceinline__ void threadblock_allreduce(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
+                                                      typename KTraits::SharedStorage* smem_storage,
+                                                      typename KTraits::DTypeQKAccum (*m)[2],
+                                                      float (*d)[2], const uint32_t warp_idx,
+                                                      const uint32_t lane_idx,
+                                                      const dim3 tid = threadIdx) {
   // only necessary when blockDim.z > 1
   if constexpr (KTraits::NUM_WARPS_KV > 1) {
     float* smem_o = smem_storage->cta_sync_o_smem;
@@ -1398,11 +1400,11 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
              v_smem_offset_w = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
                  warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                  lane_idx % KV_THR_LAYOUT_COL);
-    produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
-                                                           k_stride_n, 0, chunk_size, tid);
+    load_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                        k_stride_n, 0, chunk_size, tid);
     cp_async::commit_group();
-    produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
-                                                            v_stride_n, 0, chunk_size, tid);
+    load_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                         v_stride_n, 0, chunk_size, tid);
     cp_async::commit_group();
 
 #pragma unroll 1
@@ -1436,7 +1438,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
-      produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+      load_kv<false, SharedMemFillMode::kNoFill, KTraits>(
           k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
@@ -1446,7 +1448,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
-      produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+      load_kv<true, SharedMemFillMode::kFillZero, KTraits>(
           v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
       cp_async::commit_group();
     }
@@ -1456,7 +1458,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
-    threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+    threadblock_allreduce<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
     normalize_d<KTraits>(o_frag, m, d);
@@ -1821,11 +1823,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                      kv_head_idx * v_stride_h +
                      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
 
-    produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
-                                                           k_stride_n, 0, chunk_size, tid);
+    load_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                        k_stride_n, 0, chunk_size, tid);
     cp_async::commit_group();
-    produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
-                                                            v_stride_n, 0, chunk_size, tid);
+    load_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                         v_stride_n, 0, chunk_size, tid);
     cp_async::commit_group();
 
 #pragma unroll 1
@@ -1865,7 +1867,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
-      produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+      load_kv<false, SharedMemFillMode::kNoFill, KTraits>(
           k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
@@ -1875,7 +1877,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
-      produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+      load_kv<true, SharedMemFillMode::kFillZero, KTraits>(
           v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
       cp_async::commit_group();
     }
@@ -1885,7 +1887,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
-    threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+    threadblock_allreduce<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
     normalize_d<KTraits>(o_frag, m, d);
@@ -2086,11 +2088,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           page_iter, kv_head_idx, entry_idx,
           (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
     }
-    page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
-                                    chunk_size, tid);
+    page_load_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
+                                 chunk_size, tid);
     cp_async::commit_group();
-    page_produce_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
-                                   chunk_size, tid);
+    page_load_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
+                                chunk_size, tid);
     cp_async::commit_group();
 
     const uint32_t num_iterations = ceil_div(
@@ -2160,8 +2162,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
-      page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
-                                      thr_local_kv_offset, chunk_size, tid);
+      page_load_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
+                                   thr_local_kv_offset, chunk_size, tid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
@@ -2170,8 +2172,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
-      page_produce_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
-                                     thr_local_kv_offset, chunk_size, tid);
+      page_load_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
+                                  thr_local_kv_offset, chunk_size, tid);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
@@ -2180,7 +2182,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
-    threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+    threadblock_allreduce<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
     normalize_d<KTraits>(o_frag, m, d);

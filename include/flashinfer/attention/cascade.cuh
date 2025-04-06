@@ -116,8 +116,8 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
 }
 
 template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
-__device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
-                                                       float* s_smem) {
+__device__ __forceinline__ void threadblock_attention_allreduce(state_t<vec_size>& st,
+                                                                DTypeIn* v_smem, float* s_smem) {
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t head_dim = vec_size * bdx;
   st.o.cast_store(v_smem + ty * head_dim + tx * vec_size);
@@ -135,7 +135,8 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
 }
 
 template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
-__device__ __forceinline__ void threadblock_sum(vec_t<float, vec_size>& v, DTypeIn* v_smem) {
+__device__ __forceinline__ void threadblock_sum_allreduce(vec_t<float, vec_size>& v,
+                                                          DTypeIn* v_smem) {
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t head_dim = vec_size * bdx;
   v.cast_store(v_smem + ty * head_dim + tx * vec_size);
@@ -310,7 +311,7 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
   __syncthreads();
 
   st.normalize();
-  threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+  threadblock_attention_allreduce<bdx, bdy, vec_size>(st, v_smem, s_smem);
   st.normalize();
 
   st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -426,7 +427,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     __syncthreads();
 
     st.normalize();
-    threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+    threadblock_attention_allreduce<bdx, bdy, vec_size>(st, v_smem, s_smem);
     st.normalize();
 
     st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -508,7 +509,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
     cp_async::wait_group<0>();
     __syncthreads();
 
-    threadblock_sum<bdx, bdy, vec_size>(v_sum_vec, v_smem);
+    threadblock_sum_allreduce<bdx, bdy, vec_size>(v_sum_vec, v_smem);
 
     v_sum_vec.cast_store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   }
