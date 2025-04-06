@@ -1,3 +1,4 @@
+// refer to sgl-kernel/csrc/common_extension.cc from sglang
 /*
  * Copyright (c) 2023 by FlashInfer team.
  *
@@ -13,10 +14,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "flashinfer/distributed/comm_ops.h"
 #include "pytorch_extension_utils.h"
 
-void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int64_t rank, int64_t num_ctas);
-
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-    m.def("all_reduce", AllReduceSum);
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
+  m.def("dispose", &dispose);
+  m.def("meta_size", &meta_size);
+  m.def("register_buffer", &register_buffer);
+
+  m.def(
+      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
+      "int rank, bool full_nvlink) -> int");
+//   m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
+
+  m.def(
+      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes, int num_ctas) -> ()");
+//   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 }

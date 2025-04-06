@@ -250,7 +250,7 @@ if enable_aot:
         "csrc/single_prefill.cu",
         # "csrc/pod.cu",  # Temporarily disabled
         "csrc/flashinfer_ops.cu",
-        "csrc/comm.cu",
+        "csrc/custom_all_reduce.cu",
     ]
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",
