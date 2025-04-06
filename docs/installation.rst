@@ -27,6 +27,21 @@ Quick Start
 The easiest way to install FlashInfer is via pip, we host wheels with indexed URL for different PyTorch versions and CUDA versions. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
 
 .. tabs::
+    .. tab:: PyTorch 2.6
+
+        .. tabs::
+
+            .. tab:: CUDA 12.6
+
+                .. code-block:: bash
+
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6/
+
+            .. tab:: CUDA 12.4
+
+                .. code-block:: bash
+
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.6/
 
     .. tab:: PyTorch 2.5
 
