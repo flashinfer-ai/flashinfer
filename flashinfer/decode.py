@@ -354,7 +354,7 @@ def single_decode_with_kv_cache(
     v: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    use_tensor_cores: bool = True,
+    use_tensor_cores: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -374,7 +374,7 @@ def single_decode_with_kv_cache(
     v: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    use_tensor_cores: bool = True,
+    use_tensor_cores: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -393,7 +393,7 @@ def single_decode_with_kv_cache(
     v: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    use_tensor_cores: bool = True,
+    use_tensor_cores: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -426,7 +426,7 @@ def single_decode_with_kv_cache(
         Defaults to ``NONE``.
     use_tensor_cores: bool
         Whether to use tensor cores for the computation. Will be faster for large group
-        size in grouped query attention. Defaults to ``True``.
+        size in grouped query attention. Defaults to ``False``.
     q_scale : Optional[float]
         The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
     k_scale : Optional[float]
@@ -522,7 +522,7 @@ def single_decode_with_kv_cache(
             v,
             tmp,
             out,
-            lse.unsqueeze(0),
+            lse.unsqueeze(0) if lse is not None else None,
             MaskMode.NON_CAUSAL.value,
             TensorLayout[kv_layout].value,
             window_left,
@@ -642,7 +642,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
-        use_tensor_cores: bool = True,
+        use_tensor_cores: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
@@ -667,7 +667,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``True``.
+            size in grouped query attention. Defaults to ``False``.
 
         paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
@@ -1271,7 +1271,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
         indices_buffer: torch.Tensor,
         last_page_len_buffer: torch.Tensor,
         kv_layout: str = "NHD",
-        use_tensor_cores: bool = True,
+        use_tensor_cores: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1299,7 +1299,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``True``.
+            size in grouped query attention. Defaults to ``False``.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -1325,7 +1325,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
-        use_tensor_cores: bool = True,
+        use_tensor_cores: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
