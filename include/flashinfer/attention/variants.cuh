@@ -80,8 +80,12 @@ struct DefaultAttention : AttentionVariantBase {
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     bool mask = true;
     if constexpr (use_custom_mask) {
-      const uint32_t offset = qo_idx * kv_len + kv_idx;
-      mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
+      if (qo_idx >= qo_len || kv_idx >= kv_len) {
+        mask = false;
+      } else {
+        const uint32_t offset = qo_idx * kv_len + kv_idx;
+        mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
+      }
     }
     if constexpr (use_sliding_window) {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
