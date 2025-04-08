@@ -568,7 +568,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     of requests. The shared-prefix KV-Cache was stored in a standalone tensors, and the
     unique KV-Cache of each request was stored in a paged KV-Cache data structure.
 
-    Check :ref:`our tutorial<page-layout>` for page table layout.
+    Check :ref:`our tutorial<kv-layout>` for page table layout.
 
     Warning
     -------
@@ -807,7 +807,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with shared-prefix paged kv-cache for
     batch of requests.
 
-    Check :ref:`our tutorial<page-layout>` for paged kv-cache layout.
+    Check :ref:`our tutorial<kv-layout>` for paged kv-cache layout.
 
     Warning
     -------

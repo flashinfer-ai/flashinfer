@@ -449,7 +449,7 @@ class SegmentGEMMWrapper:
             y[i] = x[i] \times W[\text{weight_indices}[i]]
 
         We use Ragged Tensor to represent the input tensor :attr:`x` and the output tensor :attr:`y`, and each x[i]
-        is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details.
+        is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details.
         We use a ``seg_len`` or ``seg_indptr`` tensor (either would work) to indicate the start and end of each segment,
         where the ``seg_indptr`` is the cumulative sum of the ``seg_lens`` tensor (with an additional 0 at the beginning):
 

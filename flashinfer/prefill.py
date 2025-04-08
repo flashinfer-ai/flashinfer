@@ -887,7 +887,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
 
-    Check :ref:`our tutorial <page-layout>` for page table layout.
+    Check :ref:`our tutorial <kv-layout>` for page table layout.
 
     Example
     -------
@@ -1722,7 +1722,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with ragged (tensor) kv-cache for
     batch of requests.
 
-    Check :ref:`our tutorial <ragged-layout>` for ragged kv-cache layout.
+    Check :ref:`our tutorial <kv-layout>` for ragged kv-cache layout.
 
     Example
     -------
