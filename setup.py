@@ -257,7 +257,7 @@ if enable_aot:
         "csrc/single_prefill_sm90.cu",
         "csrc/batch_prefill_sm90.cu",
         "csrc/flashinfer_ops_sm90.cu",
-        "csrc/comm_sm90.cu", # todo: place holder,
+        "csrc/comm_sm90.cu",  # todo: place holder,
     ]
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
     prefill_sources = [

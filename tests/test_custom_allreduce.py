@@ -7,10 +7,11 @@ import socket
 import unittest
 from typing import Any, List, Optional
 
-import flashinfer.custom_all_reduce as custom_ops
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+import flashinfer.custom_all_reduce as custom_ops
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/cuda_wrapper.py
 
@@ -78,19 +79,19 @@ class CudaRTLibrary:
     exported_functions = [
         # ​cudaError_t cudaSetDevice ( int  device )
         Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
-        # cudaError_t 	cudaDeviceSynchronize ( void )
+        # cudaError_t   cudaDeviceSynchronize ( void )
         Function("cudaDeviceSynchronize", cudaError_t, []),
         # ​cudaError_t cudaDeviceReset ( void )
         Function("cudaDeviceReset", cudaError_t, []),
-        # const char* 	cudaGetErrorString ( cudaError_t error )
+        # const char*   cudaGetErrorString ( cudaError_t error )
         Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
-        # ​cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
+        # ​cudaError_t    cudaMalloc ( void** devPtr, size_t size )
         Function(
             "cudaMalloc",
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t],
         ),
-        # ​cudaError_t 	cudaFree ( void* devPtr )
+        # ​cudaError_t    cudaFree ( void* devPtr )
         Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
         # ​cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
         Function(

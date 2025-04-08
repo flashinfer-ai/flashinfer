@@ -60,9 +60,7 @@ struct packed_t {
 #define DINLINE __device__ __forceinline__
 
 // scalar cast functions
-DINLINE float upcast_s(half val) {
-  return __half2float(val);
-}
+DINLINE float upcast_s(half val) { return __half2float(val); }
 
 template <typename T>
 DINLINE T downcast_s(float val);
@@ -78,14 +76,10 @@ DINLINE half& assign_add(half& a, half b) {
   a = __hadd(a, b);
   return a;
 }
-DINLINE float& assign_add(float& a, float b) {
-  return a += b;
-}
+DINLINE float& assign_add(float& a, float b) { return a += b; }
 
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-DINLINE float upcast_s(nv_bfloat16 val) {
-  return __bfloat162float(val);
-}
+DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
 template <>
 DINLINE nv_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
@@ -179,12 +173,10 @@ DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank)
     auto self_counter_ptr = &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x];
     if constexpr (need_fence) {
       st_flag_release(peer_counter_ptr, val);
-      while (ld_flag_acquire(self_counter_ptr) != val)
-        ;
+      while (ld_flag_acquire(self_counter_ptr) != val);
     } else {
       st_flag_volatile(peer_counter_ptr, val);
-      while (ld_flag_volatile(self_counter_ptr) != val)
-        ;
+      while (ld_flag_volatile(self_counter_ptr) != val);
     }
   }
   if constexpr (is_start || need_fence) __syncthreads();
@@ -201,8 +193,9 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
+                               T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
@@ -222,8 +215,9 @@ DINLINE P* get_tmp_buf(Signal* sg) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
+                               T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -311,8 +305,8 @@ class CustomAllreduce {
    * Note: this class does not own any device memory. Any required buffers
    * are passed in from the constructor.
    */
-  CustomAllreduce(
-      Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size, bool full_nvlink = true)
+  CustomAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size,
+                  bool full_nvlink = true)
       : rank_(rank),
         world_size_(world_size),
         full_nvlink_(full_nvlink),
@@ -328,8 +322,9 @@ class CustomAllreduce {
     auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
     if (new_handle) {
       char* ipc_ptr;
-      CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle(
-          (void**)&ipc_ptr, *((const cudaIpcMemHandle_t*)ipc_handle), cudaIpcMemLazyEnablePeerAccess));
+      CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle((void**)&ipc_ptr,
+                                              *((const cudaIpcMemHandle_t*)ipc_handle),
+                                              cudaIpcMemLazyEnablePeerAccess));
       it->second = ipc_ptr;
     }
     return it->second;
@@ -345,9 +340,11 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      if (cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)ptr) != CUDA_SUCCESS)
+      if (cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                (CUdeviceptr)ptr) != CUDA_SUCCESS)
         throw std::runtime_error("failed to get pointer attr");
-      CHECK_CUDA_SUCCESS(cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+      CHECK_CUDA_SUCCESS(
+          cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
     }
     return std::make_pair(handles, offsets);
@@ -355,8 +352,8 @@ class CustomAllreduce {
 
   void check_rank_data_capacity(size_t num = 1) {
     if (d_rank_data_base_ + num > d_rank_data_end_)
-      throw std::runtime_error(
-          "Rank data buffer is overflowed by " + std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
+      throw std::runtime_error("Rank data buffer is overflowed by " +
+                               std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
   }
 
   /**
@@ -380,8 +377,8 @@ class CustomAllreduce {
   // rank 1 may get the same input address for the second allreduce, but rank 2
   // got a different address. IPC handles have internal reference counting
   // mechanism so overhead should be small.
-  void
-  register_graph_buffers(const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets) {
+  void register_graph_buffers(const std::vector<std::string>& handles,
+                              const std::vector<std::vector<int64_t>>& offsets) {
     auto num_buffers = graph_unreg_buffers_.size();
     check_rank_data_capacity(num_buffers);
     std::vector<RankData> rank_data(num_buffers);
@@ -398,8 +395,8 @@ class CustomAllreduce {
         }
       }
     }
-    CHECK_CUDA_SUCCESS(
-        cudaMemcpy(d_rank_data_base_, rank_data.data(), sizeof(RankData) * num_buffers, cudaMemcpyHostToDevice));
+    CHECK_CUDA_SUCCESS(cudaMemcpy(d_rank_data_base_, rank_data.data(),
+                                  sizeof(RankData) * num_buffers, cudaMemcpyHostToDevice));
     d_rank_data_base_ += num_buffers;
     graph_unreg_buffers_.clear();
   }
@@ -414,7 +411,8 @@ class CustomAllreduce {
    * guess is that too many SMs will cause contention on NVLink bus.
    */
   template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size, , int block_limit, int threads = 512) {
+  void allreduce(cudaStream_t stream, T* input, T* output, int size, , int block_limit,
+                 int threads = 512) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -422,8 +420,8 @@ class CustomAllreduce {
           "of " +
           std::to_string(d));
     if (block_limit > kMaxBlocks)
-      throw std::runtime_error(
-          "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
+      throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
+                               ". Got " + std::to_string(block_limit));
 
     RankData* ptrs;
     cudaStreamCaptureStatus status;
@@ -434,15 +432,17 @@ class CustomAllreduce {
     } else {
       auto it = buffers_.find(input);
       if (it == buffers_.end())
-        throw std::runtime_error(
-            "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
+        throw std::runtime_error("buffer address " +
+                                 std::to_string(reinterpret_cast<uint64_t>(input)) +
+                                 " is not registered!");
       ptrs = it->second;
     }
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name) name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+#define KL(ngpus, name) \
+  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.
 #define REDUCE_CASE(ngpus)                                                                        \
