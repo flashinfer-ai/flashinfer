@@ -77,6 +77,7 @@ def test_fused_gelu_mul(dim, batch_size, seq_len, enable_pdl):
     major, _ = get_compute_capability(x.device)
     if major < 9 and enable_pdl:
         pytest.skip("PDL is only available for Hopper and later GPUs")
+
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="none")
     y = flashinfer.activation.gelu_and_mul(x, enable_pdl=enable_pdl)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
