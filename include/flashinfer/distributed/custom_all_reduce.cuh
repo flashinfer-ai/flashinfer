@@ -15,7 +15,32 @@
 
 #include "utils.h"
 
-#define CHECK_CUDA_SUCCESS(x) x
+struct cuda_error : public std::runtime_error {
+  /**
+   * @brief Constructs a `cuda_error` object with the given `message`.
+   *
+   * @param message The error char array used to construct `cuda_error`
+   */
+  cuda_error(const char* message) : std::runtime_error(message) {}
+  /**
+   * @brief Constructs a `cuda_error` object with the given `message` string.
+   *
+   * @param message The `std::string` used to construct `cuda_error`
+   */
+  cuda_error(std::string const& message) : cuda_error{message.c_str()} {}
+};
+
+#define CHECK_CUDA_SUCCESS(cmd)                                         \
+  do {                                                                  \
+    cudaError_t e = cmd;                                                \
+    if (e != cudaSuccess) {                                             \
+      std::stringstream _message;                                       \
+      auto s = cudaGetErrorString(e);                                   \
+      _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
+      throw cuda_error(_message.str());                                 \
+    }                                                                   \
+  } while (0)
+
 
 namespace vllm {
 
@@ -342,9 +367,11 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
+      /*
       if (cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
                                 (CUdeviceptr)ptr) != CUDA_SUCCESS)
         throw std::runtime_error("failed to get pointer attr");
+        */
       CHECK_CUDA_SUCCESS(
           cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);

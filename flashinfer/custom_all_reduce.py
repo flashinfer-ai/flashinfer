@@ -93,7 +93,7 @@ def get_comm_module():
             reg_buffer_sz_bytes: int,
             num_ctas: int,
         ) -> None:
-            module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+            module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
         _comm_module = SimpleNamespace(
             init_custom_ar=init_custom_ar,

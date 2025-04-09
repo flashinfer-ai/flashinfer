@@ -198,7 +198,7 @@ class CudaRTLibrary:
 
 
 def _run_correctness_worker(
-    world_size, rank, distributed_init_port, test_sizes, num_ctas
+    world_size, rank, distributed_init_port, test_sizes, num_ctas_list
 ):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -226,7 +226,7 @@ def _run_correctness_worker(
 
         test_loop = 10
         for sz in test_sizes:
-            for num_ctas in num_ctas:
+            for num_ctas in num_ctas_list:
                 for dtype in [torch.float32, torch.float16, torch.bfloat16]:
                     for _ in range(test_loop):
                         inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)

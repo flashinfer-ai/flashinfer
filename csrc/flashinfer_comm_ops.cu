@@ -27,10 +27,10 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def(
       "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
       "int rank, bool full_nvlink) -> int");
-  //   m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
+  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
 
   m.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes, int num_ctas) -> ()");
-  //   m.impl("all_reduce", torch::kCUDA, &all_reduce);
+  m.impl("all_reduce", torch::kCUDA, &all_reduce);
 }
