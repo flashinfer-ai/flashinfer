@@ -36,6 +36,7 @@ wrapper.plan(
     kv_indptr.to(0),
     torch.arange(num_blocks).int().to(0),
     seq_lens.to(0),
+    batch_size,
     num_qo_heads,
     num_kv_heads,
     head_dim,
