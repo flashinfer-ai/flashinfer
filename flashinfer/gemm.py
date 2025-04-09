@@ -428,6 +428,7 @@ class SegmentGEMMWrapper:
         weights: torch.Tensor,
         batch_size: int,
         weight_column_major: bool,
+        out: Optional[torch.Tensor] = None,
         seg_lens: Optional[torch.Tensor] = None,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
@@ -474,6 +475,9 @@ class SegmentGEMMWrapper:
             The number of segments.
         weight_column_major : bool
             Whether the weight tensor is column major.
+        out : Optional[torch.Tensor]
+            The output tensor, with shape ``(sum(seg_lens), d_out)``.
+            If not provided, a new tensor will be created internally.
         seg_lens : Optional[torch.Tensor]
             The length of each segment, with shape ``(batch_size,)``, expects a 1D tensor of dtype ``torch.int64``.
         seg_indptr : Optional[torch.Tensor]
@@ -499,7 +503,15 @@ class SegmentGEMMWrapper:
             weight_indices = torch.empty(0, dtype=torch.int64)
         cumulative_batch_size = x.size(0)
         d_out = weights.size(1) if weight_column_major else weights.size(2)
-        y = torch.zeros((cumulative_batch_size, d_out), dtype=x.dtype, device=x.device)
+        if out is None:
+            out = torch.zeros(
+                (cumulative_batch_size, d_out), dtype=x.dtype, device=x.device
+            )
+        else:
+            if out.shape != (cumulative_batch_size, d_out):
+                raise ValueError(
+                    f"Output tensor shape mismatch, expected {cumulative_batch_size, d_out}, got {out.shape}"
+                )
         empty_x_data = torch.empty(0, dtype=x.dtype, device=x.device)
 
         if self.backend == "auto":
@@ -519,7 +531,7 @@ class SegmentGEMMWrapper:
             ) = launch_compute_sm90_group_gemm_args(
                 x,
                 weights,
-                y,
+                out,
                 weight_column_major,
                 batch_size,
                 seg_indptr,
@@ -535,7 +547,7 @@ class SegmentGEMMWrapper:
                 x_stride_data,
                 w_stride_data,
                 y_stride_data,
-                y,  # for torch compile mutates_args
+                out,  # for torch compile mutates_args
                 empty_x_data,  # for kernel type dispatch
                 weight_column_major,
             )
@@ -551,7 +563,7 @@ class SegmentGEMMWrapper:
             ) = launch_compute_sm80_group_gemm_args(
                 x,
                 weights,
-                y,
+                out,
                 weight_column_major,
                 batch_size,
                 seg_indptr,
@@ -566,13 +578,13 @@ class SegmentGEMMWrapper:
                 x_ld_data,
                 w_ld_data,
                 y_ld_data,
-                y,
+                out,
                 empty_x_data,
                 weight_column_major,
             )
         else:
             raise ValueError(f"Unsupported gemm backend: {backend}")
-        return y
+        return out
 
     forward = run
 

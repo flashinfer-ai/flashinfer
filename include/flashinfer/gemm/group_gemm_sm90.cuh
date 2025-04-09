@@ -88,7 +88,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
       using ArchTag = cutlass::arch::Sm90;
       using OperatorClass = cutlass::arch::OpClassTensorOp;
       using TileShape =
-          typename std::conditional<is_fp8, Shape<_128, _128, _64>, Shape<_128, _64, _64>>::type;
+          typename std::conditional<is_fp8, Shape<_256, _128, _128>, Shape<_128, _128, _128>>::type;
       using ClusterShape =
           typename std::conditional<is_fp8, Shape<_2, _2, _1>, Shape<_2, _1, _1>>::type;
       using StageCountType = cutlass::gemm::collective::StageCountAuto;
