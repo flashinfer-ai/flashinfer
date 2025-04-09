@@ -22,11 +22,18 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper
 
 
 def get_holistic_attention_module():
-    pass
+    return load_cuda_ops(
+        "holistic_persistent_attention",
+        [
+            FLASHINFER_CSRC_DIR / "batch_persistent.cu",
+            FLASHINFER_CSRC_DIR / "batch_persistent_pybind.cu",
+        ],
+    )
 
 
 class BatchAttention:
@@ -39,11 +46,23 @@ class BatchAttention:
             dtype=torch.uint8,
             device=torch.device("cuda"),
         )
-        self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout=kv_layout,
-            use_cuda_graph=False,
+        self.int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device("cuda"),
         )
+        self.page_locked_int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device("cpu"),
+            pin_memory=True,
+        )
+        self.module = get_holistic_attention_module()
+        # self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        #     self.float_workspace_buffer,
+        #     kv_layout=kv_layout,
+        #     use_cuda_graph=False,
+        # )
 
     def plan(
         self,
@@ -51,6 +70,7 @@ class BatchAttention:
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
         kv_len_arr: torch.Tensor,
+        batch_size: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim_qk: int,
@@ -61,23 +81,40 @@ class BatchAttention:
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype = torch.float16,
     ) -> None:
-        last_page_len = (kv_len_arr - 1) % page_size + 1
-        self.wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            last_page_len,
+        qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
+        kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
+        kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
+        torch.cuda.synchronize()
+        self.module.plan(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self.page_locked_int_workspace_buffer,
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_len_arr_host,
+            batch_size,
             num_qo_heads,
             num_kv_heads,
-            head_dim_qk,
-            page_size,
-            head_dim_vo=head_dim_vo,
-            causal=causal,
-            sm_scale=sm_scale,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            non_blocking=True,
+            head_dim_vo,
+            causal,
         )
+        # last_page_len = (kv_len_arr - 1) % page_size + 1
+        # self.wrapper.plan(
+        #     qo_indptr,
+        #     kv_indptr,
+        #     kv_indices,
+        #     last_page_len,
+        #     num_qo_heads,
+        #     num_kv_heads,
+        #     head_dim_qk,
+        #     page_size,
+        #     head_dim_vo=head_dim_vo,
+        #     causal=causal,
+        #     sm_scale=sm_scale,
+        #     q_data_type=q_data_type,
+        #     kv_data_type=kv_data_type,
+        #     non_blocking=True,
+        # )
 
     def run(
         self,
@@ -86,9 +123,10 @@ class BatchAttention:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.wrapper.run(
-            q,
-            kv_cache,
-            out,
-            lse,
-        )
+        # return self.wrapper.run(
+        #     q,
+        #     kv_cache,
+        #     out,
+        #     lse,
+        # )
+        return None

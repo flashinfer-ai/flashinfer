@@ -126,7 +126,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
 }
 
 template <typename KTraits1, typename KTraits2, typename Params>
-__global__ __launch_bounds__() void BatchPagedAttentionPersistentHolisticKernel(
+__global__ __launch_bounds__(128) void BatchPagedAttentionPersistentHolisticKernel(
     const __grid_constant__ Params params_1, const __grid_constant__ Params params_2) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage_1 = reinterpret_cast<typename KTraits1::SharedStorage&>(smem);

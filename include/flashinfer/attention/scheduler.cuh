@@ -1101,10 +1101,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        int effective_kv_len = causal
-                                   ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
-                                                          cluster_tile_q, num_qo_tiles, num_heads)
-                                   : kv_len;
+        int effective_kv_len =
+            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q, num_qo_tiles,
+                                          gqa_group_size)
+                   : kv_len;
         total_kv_lens += effective_kv_len;
       }
     }
@@ -1123,9 +1123,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        int remaining_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
-                                                          cluster_tile_q, num_qo_tiles, num_heads)
-                                   : kv_len;
+        int remaining_len = causal
+                                ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
+                                                       num_qo_tiles, gqa_group_size)
+                                : kv_len;
         int kv_start = 0;
         bool split_kv = remaining_len > kv_len_limit;
         int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
