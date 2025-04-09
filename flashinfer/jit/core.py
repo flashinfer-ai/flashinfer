@@ -11,6 +11,7 @@ from filelock import FileLock
 
 from .env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
+from .env import FLASHINFER_SRC_DIR as FLASHINFER_SRC_DIR
 from .env import FLASHINFER_GEN_SRC_DIR as FLASHINFER_GEN_SRC_DIR
 from .env import FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR
 from .env import FLASHINFER_JIT_DIR as FLASHINFER_JIT_DIR
@@ -129,6 +130,7 @@ def load_cuda_ops(
     extra_include_paths += [
         FLASHINFER_INCLUDE_DIR,
         FLASHINFER_CSRC_DIR,
+        FLASHINFER_SRC_DIR,
     ] + CUTLASS_INCLUDE_DIRS
     lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", thread_local=False)
     with lock:

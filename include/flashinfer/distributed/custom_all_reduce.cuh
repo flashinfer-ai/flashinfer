@@ -15,6 +15,8 @@
 
 #include "utils.h"
 
+#define CHECK_CUDA_SUCCESS(x) x
+
 namespace vllm {
 
 constexpr int kMaxBlocks = 36;
@@ -411,7 +413,7 @@ class CustomAllreduce {
    * guess is that too many SMs will cause contention on NVLink bus.
    */
   template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size, , int block_limit,
+  void allreduce(cudaStream_t stream, T* input, T* output, int size, int block_limit,
                  int threads = 512) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)

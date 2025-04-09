@@ -133,9 +133,10 @@ void register_graph_buffers(fptr_t _fa, const std::vector<std::vector<int64_t>>&
   fa->register_graph_buffers(bytes, offsets);
 }
 
+/*
 void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int64_t rank,
                   int64_t num_ctas
-                  /* std::optional<tensorrt_llm::kernels::AllReduceFusionOp> fusion_op */) {
+                  ) {
   printf("AllReduce called with num_ctas = %d\n", (int)num_ctas);
 
   float* workspace_ptr = workspace.data_ptr<float>();
@@ -143,13 +144,11 @@ void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int
   int hidden_size = data.size(-1);
   int token_num = data.numel() / hidden_size;
   auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
-  /*
   if (fusion_op.has_value()) {
       auto fusion_op = fusion_op.value();
   } else {
       auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
   }
-  */
   auto stream = at::cuda::getCurrentCUDAStream();
 
   auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
@@ -161,3 +160,4 @@ void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int
 
   customAllReduce(params, dtype, strat_type, strat_config, fusion_op, stream, num_ctas);
 }
+*/
