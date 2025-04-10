@@ -53,7 +53,7 @@ struct PersistentParams {
   IdType* work_indptr;
 
   uint_fastdiv gqa_group_size;
-  uint_fastdiv num_heads;
+  uint_fastdiv page_size;
 
   uint32_t q_stride_n;
   uint32_t q_stride_h;
@@ -62,6 +62,9 @@ struct PersistentParams {
   uint32_t v_stride_page;
   uint32_t v_stride_n;
   uint32_t o_stride_n;
+  uint32_t o_stride_h;
+
+  float sm_scale;
 };
 
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, Params, ...) \

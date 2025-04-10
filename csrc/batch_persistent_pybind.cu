@@ -22,7 +22,15 @@ at::Tensor BatchPagedAttentionPlan(at::Tensor float_workspace_buffer,
                                    int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
                                    int64_t head_dim_o, bool causal);
 
+at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
+                                  at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+                                  at::Tensor q, at::Tensor k_cache, at::Tensor v_cache,
+                                  at::Tensor kv_indices, at::Tensor o,
+                                  std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                                  int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
+                                  double sm_scale);
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchPagedAttentionPlan);
-  // m.def("run", &BatchPagedAttentionRun);
+  m.def("run", &BatchPagedAttentionRun);
 }

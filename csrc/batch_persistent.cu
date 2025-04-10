@@ -13,7 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/attention/persistent.cuh>
 #include <flashinfer/attention/mask.cuh>
+#include <flashinfer/attention/variants.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
@@ -85,8 +87,56 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  // DISPATCH_context(
+  PersistentParams<nv_bfloat16, nv_bfloat16, nv_bfloat16, int> params[2];
 
-  // );
+  for (int i = 0; i < 2; i++) {
+  params[i].q = static_cast<nv_bfloat16*>(q.data_ptr());
+  params[i].k = static_cast<nv_bfloat16*>(k_cache.data_ptr());
+  params[i].v = static_cast<nv_bfloat16*>(v_cache.data_ptr());
+
+  params[i].q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_indptr_offset);
+  params[i].kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_indptr_offset);
+  params[i].partial_indptr =
+      GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].partial_indptr_offset);
+  params[i].kv_indices = static_cast<int*>(kv_indices.data_ptr());
+  params[i].q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_len_offset);
+  params[i].kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_len_offset);
+  params[i].q_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_start_offset);
+  params[i].kv_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_start_offset);
+  params[i].kv_end = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_end_offset);
+  params[i].work_indptr =
+      GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
+
+  params[i].final_o = static_cast<nv_bfloat16*>(o.data_ptr());
+  params[i].final_lse =
+      maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+  params[i].partial_o =
+      GetPtrFromBaseOffset<nv_bfloat16>(float_buffer_ptr, plan_info.partial_o_offset);
+  params[i].partial_lse =
+      GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_lse_offset);
+
+  params[i].gqa_group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
+  params[i].page_size = uint_fastdiv(page_size);
+
+  params[i].q_stride_n = q_stride_n;
+  params[i].q_stride_h = q_stride_h;
+  params[i].k_stride_page = k_stride_page;
+  params[i].k_stride_n = k_stride_n;
+  params[i].v_stride_page = v_stride_page;
+  params[i].v_stride_n = v_stride_n;
+  params[i].o_stride_n = o_stride_n;
+  params[i].o_stride_h = o_stride_h;
+
+  params[i].sm_scale = sm_scale;
+  }
+
+  using AttentionVariant = DefaultAttention<false, false, false, false>; 
+
+  cudaError_t status = BatchPagedAttentionPersistentHolistic<16, 128, 128, 128, MaskMode::kCausal, AttentionVariant>(
+      params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+
+  TORCH_CHECK(status == cudaSuccess,
+              "Failed to run persistent paged attention, error: ", cudaGetErrorString(status));
+
   return o;
 }

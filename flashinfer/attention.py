@@ -24,6 +24,7 @@ import torch
 
 from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper
+from .utils import _unpack_paged_kv_cache, MaskMode
 
 
 def get_holistic_attention_module():
@@ -41,6 +42,7 @@ class BatchAttention:
         self,
         kv_layout: str = "NHD",
     ):
+        self._kv_layout = kv_layout
         self.float_workspace_buffer = torch.empty(
             256 * 1024 * 1024,
             dtype=torch.uint8,
@@ -85,7 +87,18 @@ class BatchAttention:
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
         torch.cuda.synchronize()
-        self.module.plan(
+        self._qo_indptr = qo_indptr
+        self._kv_indptr = kv_indptr
+        self._kv_indices = kv_indices
+        self._kv_len_arr = kv_len_arr
+        self._page_size = page_size
+        self._sm_scale = sm_scale
+        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+        self._page_size = page_size
+        self._sm_scale = sm_scale
+        self._plan_info = self.module.plan(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
             self.page_locked_int_workspace_buffer,
@@ -98,23 +111,7 @@ class BatchAttention:
             head_dim_vo,
             causal,
         )
-        # last_page_len = (kv_len_arr - 1) % page_size + 1
-        # self.wrapper.plan(
-        #     qo_indptr,
-        #     kv_indptr,
-        #     kv_indices,
-        #     last_page_len,
-        #     num_qo_heads,
-        #     num_kv_heads,
-        #     head_dim_qk,
-        #     page_size,
-        #     head_dim_vo=head_dim_vo,
-        #     causal=causal,
-        #     sm_scale=sm_scale,
-        #     q_data_type=q_data_type,
-        #     kv_data_type=kv_data_type,
-        #     non_blocking=True,
-        # )
+
 
     def run(
         self,
@@ -123,10 +120,29 @@ class BatchAttention:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # return self.wrapper.run(
-        #     q,
-        #     kv_cache,
-        #     out,
-        #     lse,
-        # )
-        return None
+        k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
+        if out is None:
+            out = torch.empty_like(q)
+        if lse is None:
+            lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
+        
+        head_dim_qk = q.shape[2]
+        if self._sm_scale is None:
+            self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+        return self.module.run(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self._plan_info,
+            q,
+            k_cache,
+            v_cache,
+            self._kv_indices,
+            out,
+            lse,
+            self._mask_mode,
+            self._num_qo_heads,
+            self._num_kv_heads,
+            self._page_size,
+            self._sm_scale,
+        )

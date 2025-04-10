@@ -30,7 +30,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
 
 template <typename KTraits, typename Params>
 __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
-    const __grid_constant__ Params params, typename KTraits::SharedStorage* smem_storage) {
+    const Params& params, typename KTraits::SharedStorage* smem_storage) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -54,6 +54,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
+  [[maybe_unused]] constexpr uint32_t NUM_STAGES = KTraits::NUM_STAGES;
 
   DTypeQ* q = params.q;
   DTypeKV* k = params.k;
@@ -133,6 +134,16 @@ __global__ __launch_bounds__(128) void BatchPagedAttentionPersistentHolisticKern
   BlockBatchPagedAttentionPersistent<KTraits1>(params_1, &smem_storage_1);
   auto& smem_storage_2 = reinterpret_cast<typename KTraits2::SharedStorage&>(smem);
   BlockBatchPagedAttentionPersistent<KTraits2>(params_2, &smem_storage_2);
+}
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+MaskMode MASK_MODE,
+typename AttentionVariant,
+typename Params>
+cudaError_t BatchPagedAttentionPersistentHolistic(
+    const Params params_1, const Params params_2, const uint32_t num_blks_x,
+    const uint32_t num_blks_y, const cudaStream_t stream) {
+
 }
 
 };  // namespace flashinfer
