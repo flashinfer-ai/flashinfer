@@ -1224,6 +1224,11 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                            work_indptr_vec);
   }
 
+  auto cluster_cost_heap_vec = cluster_cost_heap.getHeap();
+  for (auto [cluster_idx, accum_cost] : cluster_cost_heap_vec) {
+    std::cout << "cluster_idx: " << cluster_idx << ", accum_cost: " << accum_cost << std::endl;
+  }
+
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
