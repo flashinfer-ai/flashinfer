@@ -46,11 +46,9 @@ wrapper.plan(
     q_data_type=torch.float16,
     kv_data_type=torch.float16,
 )
-
+print(wrapper._plan_info)
 
 ms = do_bench(lambda: wrapper.run(q, kv_data))
-print(ms)
-
 print((q.numel() * q.element_size() + (kv_data.numel()) * kv_data.element_size()))
 print(
     100

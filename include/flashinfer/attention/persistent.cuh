@@ -141,7 +141,30 @@ template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, ui
 cudaError_t BatchPagedAttentionPersistentHolistic(const Params params_1, const Params params_2,
                                                   const uint32_t num_blks_x,
                                                   const uint32_t num_blks_y,
-                                                  const cudaStream_t stream) {}
+                                                  const cudaStream_t stream) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+  constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_KV_1 = 2;
+  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
+  using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_1, NUM_WARPS_KV_1, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_KV_2 = 8;
+  using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+
+  return cudaSuccess;
+}
 
 };  // namespace flashinfer
 
