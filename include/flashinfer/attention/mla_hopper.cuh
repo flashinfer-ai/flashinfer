@@ -647,6 +647,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   const uint32_t warp_idx = cutlass::canonical_warp_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 
+  PROFILER_INIT(params, smem_storage, variant, warp_group_idx, 2, (threadIdx.x % 128 == 0));
+
   using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
@@ -710,9 +712,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                                block_size, kv_indices, ckv_offset, kpe_offset);
       if (has_kv) {
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
+        PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
         load_kv<true, KTraits>(&smem_storage, ckv, kpe, packed_kv_bound,
                                block_iter_base + kv_tile_idx * CTA_TILE_KV,
                                smem_pipe_write_kv.index(), ckv_offset, kpe_offset);
+        PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         kv_tile_idx -= 1;
         ++smem_pipe_write_kv;
@@ -722,19 +726,23 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       }
 
       pipeline_q.producer_acquire(smem_pipe_write_q);
+      PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadQ);
       load_q<KTraits>(&smem_storage, q_nope + q_indptr * q_nope_stride_n,
                       q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
                       q_pe_stride_n, q_pe_stride_h, qo_upperbound, qo_packed_idx_base,
                       params.num_heads);
+      PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadQ);
       pipeline_q.producer_commit(smem_pipe_write_q, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_q;
 
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
+        PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
         load_kv<false, KTraits>(&smem_storage, ckv, kpe, packed_kv_bound,
                                 block_iter_base + kv_tile_idx * CTA_TILE_KV,
                                 smem_pipe_write_kv.index(), ckv_offset, kpe_offset);
+        PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
         if (kv_tile_idx > 0) {
           prefetch_offset<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                                    packed_kv_bound, ckv_stride_page, ckv_stride_n, kpe_stride_page,
@@ -745,11 +753,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
+        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
+        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         __syncthreads();
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
         pipeline_kv.consumer_release(smem_pipe_read_kv);
         ++smem_pipe_read_kv;
       }
@@ -757,11 +769,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       if (has_kv) {
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
+        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
+        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         __syncthreads();
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
         pipeline_kv.consumer_release(smem_pipe_read_kv);
         ++smem_pipe_read_kv;
       }
@@ -774,12 +790,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       }
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
+      PROFILER_EVENT_START(variant, ProfileEventType::kWriteO);
       write_o<false, KTraits>(
           &smem_storage, smem_pipe_write_kv.index(), final_o + q_indptr * o_stride_n,
           final_lse ? final_lse + q_indptr * num_heads : nullptr,
           (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
           o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
+      PROFILER_EVENT_END(variant, ProfileEventType::kWriteO);
       __syncthreads();
     }
   } else {
@@ -816,19 +834,28 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
                               kv_len, kv_end, num_heads, s_frag);
+        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
+        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
+
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
+        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
         __syncthreads();
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
         pipeline_kv.consumer_release(smem_pipe_read_kv);
         ++smem_pipe_read_kv;
       }
@@ -836,17 +863,25 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx + 1 > NUM_STAGES; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
+        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
+        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
+        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
         __syncthreads();
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
         pipeline_kv.consumer_release(smem_pipe_read_kv);
         ++smem_pipe_read_kv;
       }
@@ -854,19 +889,27 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
                               kv_len, kv_end, num_heads, s_frag);
+        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
+        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         write_o_scale_smem<KTraits>(&smem_storage, o_scale);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
+        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
         __syncthreads();
+        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
+        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
         pipeline_kv.consumer_release(smem_pipe_read_kv);
         ++smem_pipe_read_kv;
       }
@@ -886,12 +929,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
       barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kMDReady);
+      PROFILER_EVENT_START(variant, ProfileEventType::kWriteO);
       write_o<true, KTraits>(
           &smem_storage, smem_pipe_read_kv.index(), final_o + q_indptr * o_stride_n,
           final_lse ? final_lse + q_indptr * num_heads : nullptr,
           (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
           o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
+      PROFILER_EVENT_END(variant, ProfileEventType::kWriteO);
       __syncthreads();
     }
   }
