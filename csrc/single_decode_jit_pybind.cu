@@ -18,7 +18,7 @@
 #include "single_decode_config.inc"
 
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 at::Tensor o, int64_t layout,
+                                 at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

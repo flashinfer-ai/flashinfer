@@ -81,6 +81,7 @@ def get_single_decode_module(*args):
             v: torch.Tensor,
             tmp: torch.Tensor,
             o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
             alibi_slopes: Optional[torch.Tensor],
             kv_layout_code: int,
             window_left: int,
@@ -95,6 +96,7 @@ def get_single_decode_module(*args):
                 v,
                 tmp,
                 o,
+                maybe_lse,
                 kv_layout_code,
                 window_left,
                 alibi_slopes,
@@ -111,6 +113,7 @@ def get_single_decode_module(*args):
             v: torch.Tensor,
             tmp: torch.Tensor,
             o: torch.Tensor,
+            maybe_lse: Optional[torch.Tensor],
             alibi_slopes: Optional[torch.Tensor],
             kv_layout_code: int,
             window_left: int,
@@ -314,16 +317,22 @@ def single_decode_with_kv_cache_with_jit_module(
     *args,
     kv_layout: str = "NHD",
     window_left: int = -1,
+    return_lse: bool = False,
 ):
     device = q.device
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, device)
     o = torch.empty_like(q)
+    if return_lse:
+        lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
+    else:
+        lse = None
     jit_module.run.default(
         q,
         k,
         v,
         tmp,
         o,
+        lse,
         TensorLayout[kv_layout].value,
         window_left,
         *args,
@@ -336,6 +345,46 @@ def get_batch_decode_mla_module(*args):
     if args not in _batch_decode_mla_modules:
         _batch_decode_mla_modules[args] = gen_batch_decode_mla_module(*args)
     return _batch_decode_mla_modules[args]
+
+
+@overload
+def single_decode_with_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_layout: str = "NHD",
+    pos_encoding_mode: str = "NONE",
+    use_tensor_cores: bool = False,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def single_decode_with_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_layout: str = "NHD",
+    pos_encoding_mode: str = "NONE",
+    use_tensor_cores: bool = False,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    return_lse: Literal[True] = True,
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def single_decode_with_kv_cache(
@@ -353,7 +402,8 @@ def single_decode_with_kv_cache(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
     Parameters
@@ -398,11 +448,17 @@ def single_decode_with_kv_cache(
         The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to ``1e4``.
+    return_lse : bool
+        Whether to return the log sum exp value of the attention logits.
 
     Returns
     -------
-    torch.Tensor
-        The attention output, shape: ``[num_qo_heads, head_dim]``
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_len, num_qo_heads, head_dim_vo]``.
+        If :attr:`return_lse` is ``True``, a tuple of two tensors:
+
+        * The attention output, shape: ``[num_qo_heads, head_dim_vo]``.
+        * The log sum exp value, shape: ``[num_qo_heads]``.
 
     Examples
     --------
@@ -444,6 +500,10 @@ def single_decode_with_kv_cache(
         rope_theta = 1e4
     num_qo_heads = q.shape[0]
 
+    lse = None
+    if return_lse:
+        lse = torch.empty((num_qo_heads,), dtype=torch.float32, device=q.device)
+
     if use_tensor_cores:
         out = torch.empty_like(q.unsqueeze(0))
         get_single_prefill_module("fa2")(
@@ -462,7 +522,7 @@ def single_decode_with_kv_cache(
             v,
             tmp,
             out,
-            None,  # maybe_lse,
+            lse.unsqueeze(0) if lse is not None else None,
             MaskMode.NON_CAUSAL.value,
             TensorLayout[kv_layout].value,
             window_left,
@@ -474,6 +534,8 @@ def single_decode_with_kv_cache(
             rope_theta,
         )
         out = out.squeeze(0)
+        if return_lse:
+            lse = lse.squeeze(0)
     else:
         out = torch.empty_like(q)
         get_single_decode_module(
@@ -491,6 +553,7 @@ def single_decode_with_kv_cache(
             v,
             tmp,
             out,
+            lse,
             _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
             TensorLayout[kv_layout].value,
             window_left,
@@ -502,7 +565,10 @@ def single_decode_with_kv_cache(
 
     if v_scale is not None:
         out *= v_scale
-    return out
+    if return_lse:
+        return out, lse
+    else:
+        return out
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
