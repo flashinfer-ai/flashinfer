@@ -1,4 +1,5 @@
-// refer to sgl-kernel/csrc/common_extension.cc from sglang
+// flashinfer: adapted from sglang + vllm code
+// refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/common_extension.cc
 /*
  * Copyright (c) 2023 by FlashInfer team.
  *

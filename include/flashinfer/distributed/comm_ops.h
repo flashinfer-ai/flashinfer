@@ -1,5 +1,5 @@
-// referece: sgl-kernel/csrc/common_extension.cc from sglang
-
+// flashinfer: adapted from sglang + vllm code
+// refer to: sgl-kernel/csrc/common_extension.cc from sglang
 #pragma once
 
 #include <ATen/ATen.h>

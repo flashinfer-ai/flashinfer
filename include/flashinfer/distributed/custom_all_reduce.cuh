@@ -1,4 +1,5 @@
-// Adapted from https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cuh
+// flashinfer: adapted from sglang + vllm code
+// refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cuh
 #pragma once
 
 #include <cuda.h>

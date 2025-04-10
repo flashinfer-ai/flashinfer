@@ -1,3 +1,4 @@
+# flashinfer: adapted from sglang + vllm code
 # refer to sgl-kernel/python/sgl_kernel/allreduce.py from sglang
 """
 Copyright (c) 2024 by FlashInfer team.
@@ -24,7 +25,6 @@ from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import register_custom_op
 
 _comm_module = None
-_comm_module_sm90 = None  # todo(yingyi): place holder for sm90
 
 
 def get_comm_module():

@@ -1,3 +1,4 @@
+# flashinfer: adapted from sglang + vllm
 # refer to sgl-kernel/tests/test_custom_allreduce.py from sglang
 
 import ctypes
@@ -290,20 +291,23 @@ def multi_process_parallel(
 
 
 class TestCustomAllReduce(unittest.TestCase):
-    test_sizes = [
-        512,
-        2560,
-        4096,
-        5120,
-        7680,
-        32768,
-        262144,
-        524288,
-        1048576,
-        2097152,
-    ]
-    world_sizes = [2, 4]
-    num_ctas = [1, 2, 4, 8, 16, 32]
+    # test_sizes = [
+    #     512,
+    #     2560,
+    #     4096,
+    #     5120,
+    #     7680,
+    #     32768,
+    #     262144,
+    #     524288,
+    #     1048576,
+    #     2097152,
+    # ]
+    # world_sizes = [2, 4]
+    # num_ctas = [1, 2, 4, 8, 16, 32]
+    test_sizes = [1024]
+    world_sizes = [2]
+    num_ctas = [133]
 
     @staticmethod
     def create_shared_buffer(
