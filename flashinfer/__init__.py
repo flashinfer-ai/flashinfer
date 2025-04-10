@@ -32,6 +32,7 @@ from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
+    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
 )
 from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
