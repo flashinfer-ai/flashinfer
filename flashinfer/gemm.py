@@ -514,7 +514,7 @@ class SegmentGEMMWrapper:
         cumulative_batch_size = x.size(0)
         d_out = weights.size(1) if weight_column_major else weights.size(2)
         if out is None:
-            if is_float8(x.dtype):
+            if is_float8(x):
                 out_dtype = torch.bfloat16
             else:
                 out_dtype = x.dtype
