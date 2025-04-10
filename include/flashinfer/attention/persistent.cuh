@@ -137,14 +137,11 @@ __global__ __launch_bounds__(128) void BatchPagedAttentionPersistentHolisticKern
 }
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-MaskMode MASK_MODE,
-typename AttentionVariant,
-typename Params>
-cudaError_t BatchPagedAttentionPersistentHolistic(
-    const Params params_1, const Params params_2, const uint32_t num_blks_x,
-    const uint32_t num_blks_y, const cudaStream_t stream) {
-
-}
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+cudaError_t BatchPagedAttentionPersistentHolistic(const Params params_1, const Params params_2,
+                                                  const uint32_t num_blks_x,
+                                                  const uint32_t num_blks_y,
+                                                  const cudaStream_t stream) {}
 
 };  // namespace flashinfer
 

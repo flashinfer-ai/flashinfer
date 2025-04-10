@@ -24,7 +24,7 @@ import torch
 
 from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper
-from .utils import _unpack_paged_kv_cache, MaskMode
+from .utils import MaskMode, _unpack_paged_kv_cache
 
 
 def get_holistic_attention_module():
@@ -112,7 +112,6 @@ class BatchAttention:
             causal,
         )
 
-
     def run(
         self,
         q: torch.Tensor,
@@ -125,7 +124,7 @@ class BatchAttention:
             out = torch.empty_like(q)
         if lse is None:
             lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
-        
+
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
