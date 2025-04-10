@@ -41,7 +41,6 @@ struct cuda_error : public std::runtime_error {
     }                                                                   \
   } while (0)
 
-
 namespace vllm {
 
 constexpr int kMaxBlocks = 36;
