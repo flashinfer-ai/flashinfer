@@ -16,7 +16,7 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/persistent.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/attention/variant_helper.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
@@ -54,6 +54,18 @@ at::Tensor BatchPagedAttentionPlan(at::Tensor float_workspace_buffer,
 
   return vec_to_tensor(plan_info.ToVector());
 }
+
+struct StandardAttention : AttentionVariantBase {
+  float sm_scale_log2;
+
+  PROFILER_CLOSURE_PARAMS_DECL
+
+  template <typename Params>
+  __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
+                                        uint8_t* smem_ptr) {
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+};
 
 at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
                                   at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
@@ -110,6 +122,8 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
         GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_start_offset);
     params[i].kv_end =
         GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_end_offset);
+    params[i].kv_head_idx_arr =
+        GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_head_idx_offset);
     params[i].work_indptr =
         GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
 
@@ -136,7 +150,7 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
     params[i].sm_scale = sm_scale;
   }
 
-  using AttentionVariant = DefaultAttention<false, false, false, false>;
+  using AttentionVariant = StandardAttention;
 
   cudaError_t status =
       BatchPagedAttentionPersistentHolistic<16, 128, 128, 128, MaskMode::kCausal, AttentionVariant>(

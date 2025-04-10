@@ -25,7 +25,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
   return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
                     params.partial_indptr[work_idx], params.q_len[work_idx],
                     params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx]);
+                    params.kv_end[work_idx], params.kv_head_idx_arr[work_idx]);
 }
 
 template <typename KTraits, typename Params>
@@ -36,6 +36,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
+  using AttentionVariant = typename KTraits::AttentionVariant;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_D_QK = KTraits::NUM_MMA_D_QK;
@@ -53,6 +54,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::MASK_MODE == MaskMode::kCausal;
+  [[maybe_unused]] constexpr uint32_t NUM_STAGES = KTraits::NUM_STAGES;
 
   DTypeQ* q = params.q;
   DTypeKV* k = params.k;
@@ -64,10 +66,10 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   float* final_lse = params.final_lse;
   IdType* work_indptr = params.work_indptr;
 
-  float s_frag[NUM_MMA_KV][8];
-  alignas(16) float o_frag[NUM_MMA_D_VO][8];
-  float m[2];
-  float d[2];
+  float s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
+  alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
+  float m[NUM_MMA_Q][2];
+  float d[NUM_MMA_Q][2];
 
   const uint_fastdiv& gqa_group_size = params.gqa_group_size;
   const uint_fastdiv& block_size = params.page_size;
@@ -80,21 +82,29 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   const uint32_t o_stride_n = params.o_stride_n;
   const uint32_t o_stride_h = params.o_stride_h;
   const uint32_t cluster_tile_q = gridDim.x * CTA_TILE_Q;
+  smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage->q_smem);
+
+  AttentionVariant variant(params, /*batch_idx=*/0, nullptr);
+
+  const uint32_t lane_idx = threadIdx.x % 32;
+  const uint32_t warp_idx = threadIdx.x / 32;
 
 #pragma unroll 1
   for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
        ++work_idx) {
     const auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start,
-                kv_end] = get_block_coord(params, work_idx);
+                kv_end, kv_head_idx] = get_block_coord(params, work_idx);
 
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q;
     const uint32_t qo_upperbound =
         min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
 
-    // init_states<KTraits>(o_frag, m, d);
+    init_states<KTraits>(variant, o_frag, m, d);
 
-    __syncthreads();
+    DTypeQ* q_ptr_base = q + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
     // load_q
+    load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upperbound, q_ptr_base, q_stride_n,
+                                q_stride_h, gqa_group_size, &qo_smem, threadIdx);
 
     int kv_tile_idx =
         ceil_div((CAUSAL ? min(kv_end,
@@ -113,15 +123,41 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     __syncthreads();
     uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
 
-    // load_kv
     cp_async::commit_group();
 #pragma unroll
-    for (int stage_idx = 1; stage_idx < 2; ++stage_idx) {
+    for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
       if (kv_tile_idx - stage_idx >= 0) {
-        // load_kv
+        // load_kv<false, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n,
+        // ckv_stride_page,
+        //                         kpe_stride_n, kpe_stride_page, packed_kv_bound,
+        //                         block_iter_base + (kv_tile_idx - stage_idx) * CTA_TILE_KV,
+        //                         block_size, (kv_tile_idx - stage_idx) % NUM_STAGES);
         cp_async::commit_group();
       }
     }
+
+    // loop with mask
+    LOOP_SPLIT_MASK(kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
+                    kv_tile_idx + 1 > NUM_STAGES,
+                    {
+
+                    });
+
+#pragma unroll
+    for (; kv_tile_idx >= 0; --kv_tile_idx) {
+    }
+
+    __syncthreads();
+
+    finalize_m<KTraits>(variant, m);
+
+    // threadblock synchronization
+    // threadblock_allreduce<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, threadIdx);
+
+    // normalize d
+    normalize_d<KTraits>(o_frag, m, d);
+
+    // write back to global memory
   }
 }
 

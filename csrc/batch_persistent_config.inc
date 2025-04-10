@@ -50,6 +50,7 @@ struct PersistentParams {
   IdType* q_start;
   IdType* kv_start;
   IdType* kv_end;
+  IdType* kv_head_idx_arr;
   IdType* work_indptr;
 
   uint_fastdiv gqa_group_size;
