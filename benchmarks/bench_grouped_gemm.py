@@ -25,10 +25,10 @@ def bench_grouped_gemm(
     batch_size, num_tokens_per_group, d_in, d_out, dtype, output_dtype
 ):
     np.random.seed(42)
-    W = torch.randn(batch_size, d_out, d_in, dtype=dtype, device="cuda:0")
+    W = torch.randn(batch_size, d_out, d_in, device="cuda:0").to(dtype)
     X = torch.randn(
-        batch_size * num_tokens_per_group, d_in, dtype=dtype, device="cuda:0"
-    )
+        batch_size * num_tokens_per_group, d_in, device="cuda:0"
+    ).to(dtype)
     Y = torch.empty(
         batch_size * num_tokens_per_group, d_out, dtype=output_dtype, device="cuda:0"
     )
@@ -55,15 +55,17 @@ def bench_grouped_gemm(
 
 
 if __name__ == "__main__":
-    for batch_size in [1, 3, 8, 16]:
-        for num_tokens_per_group in [32, 64, 128, 256, 512]:
-            for d_in in [4096, 8192]:
-                for d_out in [4096, 8192]:
-                    bench_grouped_gemm(
-                        batch_size,
-                        num_tokens_per_group,
-                        d_in,
-                        d_out,
-                        torch.bfloat16,
-                        torch.bfloat16,
-                    )
+    for dtype_in in [torch.float8_e4m3fn, torch.bfloat16]:
+        for dtype_out in [torch.bfloat16]:
+            for batch_size in [1, 3, 8, 16]:
+                for num_tokens_per_group in [32, 64, 128, 256, 512]:
+                    for d_in in [4096, 8192]:
+                        for d_out in [4096, 8192]:
+                            bench_grouped_gemm(
+                                batch_size,
+                                num_tokens_per_group,
+                                d_in,
+                                d_out,
+                                dtype_in,
+                                dtype_out
+                            )
