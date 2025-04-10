@@ -18,6 +18,7 @@ mask_mode_literal = {
     0: "MaskMode::kNone",
     1: "MaskMode::kCausal",
     2: "MaskMode::kCustom",
+    3: "MaskMode::kMultiItemScoring"
 }
 
 pos_encoding_mode_literal = {
