@@ -26,9 +26,7 @@ def bench_grouped_gemm(
 ):
     np.random.seed(42)
     W = torch.randn(batch_size, d_out, d_in, device="cuda:0").to(dtype)
-    X = torch.randn(
-        batch_size * num_tokens_per_group, d_in, device="cuda:0"
-    ).to(dtype)
+    X = torch.randn(batch_size * num_tokens_per_group, d_in, device="cuda:0").to(dtype)
     Y = torch.empty(
         batch_size * num_tokens_per_group, d_out, dtype=output_dtype, device="cuda:0"
     )
@@ -67,5 +65,5 @@ if __name__ == "__main__":
                                 d_in,
                                 d_out,
                                 dtype_in,
-                                dtype_out
+                                dtype_out,
                             )

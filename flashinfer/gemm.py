@@ -24,9 +24,9 @@ from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
     get_indptr,
+    is_float8,
     register_custom_op,
     register_fake_op,
-    is_float8,
 )
 
 _gemm_module = None
