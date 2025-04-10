@@ -367,11 +367,6 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      /*
-      if (cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
-                                (CUdeviceptr)ptr) != CUDA_SUCCESS)
-        throw std::runtime_error("failed to get pointer attr");
-        */
       CHECK_CUDA_SUCCESS(
           cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
