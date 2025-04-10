@@ -52,15 +52,13 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_KV = KTraits::SWIZZLE_MODE_KV;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
-  [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
-  [[maybe_unused]] constexpr uint32_t NUM_STAGES = KTraits::NUM_STAGES;
+  [[maybe_unused]] constexpr bool CAUSAL = KTraits::MASK_MODE == MaskMode::kCausal;
 
   DTypeQ* q = params.q;
   DTypeKV* k = params.k;
   DTypeKV* v = params.v;
   IdType* kv_indices = params.kv_indices;
-  IdType* partial_o = params.partial_o;
+  DTypeO* partial_o = params.partial_o;
   float* partial_lse = params.partial_lse;
   DTypeO* final_o = params.final_o;
   float* final_lse = params.final_lse;
@@ -71,8 +69,8 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   float m[2];
   float d[2];
 
-  const uint_fastdiv& num_heads = params.num_heads;
-  const uint_fastdiv& block_size = params.block_size;
+  const uint_fastdiv& gqa_group_size = params.gqa_group_size;
+  const uint_fastdiv& block_size = params.page_size;
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   const uint32_t k_stride_page = params.k_stride_page;
@@ -90,22 +88,23 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
                 kv_end] = get_block_coord(params, work_idx);
 
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q;
-    const uint32_t qo_upperbound = min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, num_heads));
+    const uint32_t qo_upperbound =
+        min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
 
-    init_states<KTraits>(o_frag, m, d);
+    // init_states<KTraits>(o_frag, m, d);
 
     __syncthreads();
     // load_q
 
     int kv_tile_idx =
-        ceil_div(
-            (CAUSAL ? min(kv_end, kv_len - q_len + (packed_qo_start + cluster_tile_q) / num_heads)
-                    : kv_end),
-            CTA_TILE_KV) -
+        ceil_div((CAUSAL ? min(kv_end,
+                               kv_len - q_len + (packed_qo_start + cluster_tile_q) / gqa_group_size)
+                         : kv_end),
+                 CTA_TILE_KV) -
         1 - (kv_start / CTA_TILE_KV);
 
     int mask_tile_idx =
-        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end) /
+        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / gqa_group_size) : kv_end) /
             CTA_TILE_KV -
         (kv_start / CTA_TILE_KV);
 
@@ -117,7 +116,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     // load_kv
     cp_async::commit_group();
 #pragma unroll
-    for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
+    for (int stage_idx = 1; stage_idx < 2; ++stage_idx) {
       if (kv_tile_idx - stage_idx >= 0) {
         // load_kv
         cp_async::commit_group();
@@ -127,8 +126,12 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
 }
 
 template <typename KTraits1, typename KTraits2, typename Params>
-__global__ __launch_bounds__(128) void BatchPagedAttentionPersistentHolisticKernel(
-    const __grid_constant__ Params params_1, const __grid_constant__ Params params_2) {
+__global__ __launch_bounds__(std::max(
+    KTraits1::NUM_THREADS,
+    KTraits2::NUM_THREADS)) void BatchPagedAttentionPersistentHolisticKernel(const __grid_constant__
+                                                                                 Params params_1,
+                                                                             const __grid_constant__
+                                                                                 Params params_2) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage_1 = reinterpret_cast<typename KTraits1::SharedStorage&>(smem);
   BlockBatchPagedAttentionPersistent<KTraits1>(params_1, &smem_storage_1);
@@ -162,6 +165,19 @@ cudaError_t BatchPagedAttentionPersistentHolistic(const Params params_1, const P
   using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
                                 NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
                                 DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+
+  size_t smem_size =
+      max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));
+  auto kernel = BatchPagedAttentionPersistentHolisticKernel<KTraits1, KTraits2, Params>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  dim3 nblks(num_blks_x, num_blks_y);
+  dim3 nthrs(max(KTraits1::NUM_THREADS, KTraits2::NUM_THREADS));
+  void* args[] = {(void*)&params_1, (void*)&params_2};
+
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 
   return cudaSuccess;
 }
