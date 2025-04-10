@@ -78,7 +78,7 @@ class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
     `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
 
-    Check :ref:`our tutorial<page-layout>` for page table layout.
+    Check :ref:`our tutorial<kv-layout>` for page table layout.
 
     Examples
     --------

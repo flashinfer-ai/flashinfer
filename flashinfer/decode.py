@@ -509,7 +509,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with paged kv-cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
 
-    Check :ref:`our tutorial<page-layout>` for page table layout.
+    Check :ref:`our tutorial<kv-layout>` for page table layout.
 
     Examples
     --------
@@ -1187,7 +1187,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
     to accommodate the CUDAGraph requirement.
 
-    Check :ref:`our tutorial<page-layout>` for page table layout.
+    Check :ref:`our tutorial<kv-layout>` for page table layout.
 
     Note
     ----

@@ -24,6 +24,7 @@ from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
     get_indptr,
+    is_float8,
     register_custom_op,
     register_fake_op,
 )
@@ -152,6 +153,12 @@ def get_gemm_sm90_module():
                 [
                     FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
                 ],
                 extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
             )
@@ -174,6 +181,7 @@ def get_gemm_sm90_module():
             y_stride: torch.Tensor,
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
+            empty_y_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
             module.cutlass_segment_gemm_sm90.default(
@@ -187,6 +195,7 @@ def get_gemm_sm90_module():
                 w_stride,
                 y_stride,
                 empty_x_data,
+                empty_y_data,
                 weight_column_major,
             )
 
@@ -203,6 +212,7 @@ def get_gemm_sm90_module():
             y_stride: torch.Tensor,
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
+            empty_y_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
             pass
@@ -428,6 +438,7 @@ class SegmentGEMMWrapper:
         weights: torch.Tensor,
         batch_size: int,
         weight_column_major: bool,
+        out: Optional[torch.Tensor] = None,
         seg_lens: Optional[torch.Tensor] = None,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
@@ -449,7 +460,7 @@ class SegmentGEMMWrapper:
             y[i] = x[i] \times W[\text{weight_indices}[i]]
 
         We use Ragged Tensor to represent the input tensor :attr:`x` and the output tensor :attr:`y`, and each x[i]
-        is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details.
+        is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details.
         We use a ``seg_len`` or ``seg_indptr`` tensor (either would work) to indicate the start and end of each segment,
         where the ``seg_indptr`` is the cumulative sum of the ``seg_lens`` tensor (with an additional 0 at the beginning):
 
@@ -474,6 +485,9 @@ class SegmentGEMMWrapper:
             The number of segments.
         weight_column_major : bool
             Whether the weight tensor is column major.
+        out : Optional[torch.Tensor]
+            The output tensor, with shape ``(sum(seg_lens), d_out)``.
+            If not provided, a new tensor will be created internally.
         seg_lens : Optional[torch.Tensor]
             The length of each segment, with shape ``(batch_size,)``, expects a 1D tensor of dtype ``torch.int64``.
         seg_indptr : Optional[torch.Tensor]
@@ -499,8 +513,21 @@ class SegmentGEMMWrapper:
             weight_indices = torch.empty(0, dtype=torch.int64)
         cumulative_batch_size = x.size(0)
         d_out = weights.size(1) if weight_column_major else weights.size(2)
-        y = torch.zeros((cumulative_batch_size, d_out), dtype=x.dtype, device=x.device)
+        if out is None:
+            if is_float8(x):
+                out_dtype = torch.bfloat16
+            else:
+                out_dtype = x.dtype
+            out = torch.zeros(
+                (cumulative_batch_size, d_out), dtype=out_dtype, device=x.device
+            )
+        else:
+            if out.shape != (cumulative_batch_size, d_out):
+                raise ValueError(
+                    f"Output tensor shape mismatch, expected {cumulative_batch_size, d_out}, got {out.shape}"
+                )
         empty_x_data = torch.empty(0, dtype=x.dtype, device=x.device)
+        empty_y_data = torch.empty(0, dtype=out.dtype, device=out.device)
 
         if self.backend == "auto":
             backend = determine_gemm_backend(x.device)
@@ -519,7 +546,7 @@ class SegmentGEMMWrapper:
             ) = launch_compute_sm90_group_gemm_args(
                 x,
                 weights,
-                y,
+                out,
                 weight_column_major,
                 batch_size,
                 seg_indptr,
@@ -535,8 +562,9 @@ class SegmentGEMMWrapper:
                 x_stride_data,
                 w_stride_data,
                 y_stride_data,
-                y,  # for torch compile mutates_args
+                out,  # for torch compile mutates_args
                 empty_x_data,  # for kernel type dispatch
+                empty_y_data,
                 weight_column_major,
             )
         elif backend == "sm80":
@@ -551,7 +579,7 @@ class SegmentGEMMWrapper:
             ) = launch_compute_sm80_group_gemm_args(
                 x,
                 weights,
-                y,
+                out,
                 weight_column_major,
                 batch_size,
                 seg_indptr,
@@ -566,13 +594,13 @@ class SegmentGEMMWrapper:
                 x_ld_data,
                 w_ld_data,
                 y_ld_data,
-                y,
+                out,
                 empty_x_data,
                 weight_column_major,
             )
         else:
             raise ValueError(f"Unsupported gemm backend: {backend}")
-        return y
+        return out
 
     forward = run
 
