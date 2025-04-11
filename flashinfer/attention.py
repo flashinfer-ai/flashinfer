@@ -23,7 +23,6 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
-from .prefill import BatchPrefillWithPagedKVCacheWrapper
 from .utils import MaskMode, _unpack_paged_kv_cache
 
 
@@ -41,7 +40,6 @@ class BatchAttention:
     def __init__(
         self,
         kv_layout: str = "NHD",
-        kv_indices_buf: torch.Tensor = None,
     ):
         self._kv_layout = kv_layout
         self.float_workspace_buffer = torch.empty(
@@ -62,13 +60,6 @@ class BatchAttention:
         )
         # Used for CUDA Graph
         # All other metadata is stored in workspace buffers
-        if kv_indices_buf is None:
-            kv_indices_buf = torch.empty(
-                8*1024*1024,
-                dtype=torch.int32,
-                device=torch.device("cuda"),
-            )
-        self._kv_indices_buf = kv_indices_buf
         self.module = get_holistic_attention_module()
 
     def plan(
@@ -101,9 +92,9 @@ class BatchAttention:
         self._page_size = page_size
         self._sm_scale = sm_scale
         
-        # copy kv_indices into kv_indices_buf
-        assert kv_indices.shape[0] <= self._kv_indices_buf.shape[0]
-        self._kv_indices_buf[: kv_indices.shape[0]] = kv_indices
+        # No addtional buf allocated for CUDA graph tensor
+        # Allocate outside FlashInfer
+        self._kv_indices = kv_indices
         
         self._plan_info = self.module.plan(
             self.float_workspace_buffer,
@@ -144,7 +135,7 @@ class BatchAttention:
             q,
             k_cache,
             v_cache,
-            self._kv_indices_buf,
+            self._kv_indices,
             out,
             lse,
             self._mask_mode,
