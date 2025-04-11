@@ -68,6 +68,10 @@ struct RaggedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -108,6 +112,10 @@ struct PagedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

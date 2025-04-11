@@ -629,8 +629,8 @@ def gen_customize_pod_module(
 
     source_paths = []
 
-    for mask_mode_p in [0, 1, 2]:
-        for mask_mode_d in [0, 1, 2]:
+    for mask_mode_p in [0, 1, 2, 3]:
+        for mask_mode_d in [0, 1, 2, 3]:
             kwargs["mask_mode_p"] = mask_mode_literal[mask_mode_p]
             kwargs["mask_mode_d"] = mask_mode_literal[mask_mode_d]
 
@@ -929,7 +929,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -987,7 +987,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1170,7 +1170,7 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1243,7 +1243,7 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
