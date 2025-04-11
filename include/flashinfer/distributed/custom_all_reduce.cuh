@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "utils.h"
+#include "flashinfer/utils.h"
 
 struct cuda_error : public std::runtime_error {
   /**

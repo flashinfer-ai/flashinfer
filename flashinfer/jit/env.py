@@ -47,7 +47,7 @@ FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
 _package_root = pathlib.Path(__file__).resolve().parents[1]
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
-FLASHINFER_SRC_DIR = _package_root / ".." / "src"
+# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
