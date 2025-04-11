@@ -42,7 +42,8 @@ using IdType = int32_t;
         return DISPATCH_head_dim_sm90(head_dim_qk, head_dim_vo, HEAD_DIM_QK, HEAD_DIM_VO, [&] {  \
           return DISPATCH_BOOL(window_left > -1, USE_SLIDING_WINDOW, [&] {                       \
             return DISPATCH_BOOL(logits_soft_cap > 0.f, USE_LOGITS_SOFT_CAP, [&] {               \
-              using AttentionVariant = DefaultAttention<USE_LOGITS_SOFT_CAP>;                    \
+              static constexpr bool stat_use_logits_soft_cap = USE_LOGITS_SOFT_CAP;              \
+              using AttentionVariant = DefaultAttention<stat_use_logits_soft_cap>;               \
               __VA_ARGS__();                                                                     \
               return true;                                                                       \
             });                                                                                  \
