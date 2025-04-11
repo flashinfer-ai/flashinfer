@@ -23,7 +23,6 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
-from .prefill import BatchPrefillWithPagedKVCacheWrapper
 from .utils import MaskMode, _unpack_paged_kv_cache
 
 
@@ -60,11 +59,6 @@ class BatchAttention:
             pin_memory=True,
         )
         self.module = get_holistic_attention_module()
-        # self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
-        #     self.float_workspace_buffer,
-        #     kv_layout=kv_layout,
-        #     use_cuda_graph=False,
-        # )
 
     def plan(
         self,
@@ -72,7 +66,6 @@ class BatchAttention:
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
         kv_len_arr: torch.Tensor,
-        batch_size: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim_qk: int,
@@ -80,17 +73,15 @@ class BatchAttention:
         page_size: int,
         causal: bool = False,
         sm_scale: float = None,
-        q_data_type: torch.dtype = torch.float16,
-        kv_data_type: torch.dtype = torch.float16,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
     ) -> None:
         qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
         torch.cuda.synchronize()
-        self._qo_indptr = qo_indptr
-        self._kv_indptr = kv_indptr
-        self._kv_indices = kv_indices
-        self._kv_len_arr = kv_len_arr
+        
+        batch_size = kv_len_arr.shape[0]
         self._page_size = page_size
         self._sm_scale = sm_scale
         self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
@@ -98,6 +89,11 @@ class BatchAttention:
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._sm_scale = sm_scale
+        
+        # No addtional buf allocated for CUDA graph tensor
+        # Allocate outside FlashInfer
+        self._kv_indices = kv_indices
+        
         self._plan_info = self.module.plan(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -123,13 +119,14 @@ class BatchAttention:
         if out is None:
             out = torch.empty_like(q)
         if lse is None:
+            # lse shape: [batch_size, num_qo_heads]
             lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
 
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
-        return self.module.run(
+        self.module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
             self._plan_info,
@@ -145,3 +142,5 @@ class BatchAttention:
             self._page_size,
             self._sm_scale,
         )
+        
+        return out, lse
