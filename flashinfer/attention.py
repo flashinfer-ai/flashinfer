@@ -58,8 +58,6 @@ class BatchAttention:
             device=torch.device("cpu"),
             pin_memory=True,
         )
-        # Used for CUDA Graph
-        # All other metadata is stored in workspace buffers
         self.module = get_holistic_attention_module()
 
     def plan(
