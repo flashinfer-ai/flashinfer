@@ -126,6 +126,17 @@ def all_reduce(
     reg_buffer_sz_bytes: int,
     num_ctas: int,
 ) -> None:
+    """Performs an out-of-place all reduce.
+
+    Args:
+        fa: The handle to the custom all reduce.
+        inp: The input tensor to all reduce.
+        out: The output tensor to all reduce.
+        reg_buffer: The register buffer to all reduce.
+        reg_buffer_sz_bytes: The size of the register buffer.
+        num_ctas: The number of CTAs to use for the all reduce.
+        CTA upper bounds: 36. Generally, we can saturate the bandwidth even with small amount the SMs.
+    """
     get_comm_module().all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
