@@ -142,33 +142,33 @@
     FLASHINFER_ERROR(err_msg.str());                         \
   }
 
-#define DISPATCH_MASK_MODE(mask_mode, MASK_MODE, ...)         \
-  switch (mask_mode) {                                        \
-    case MaskMode::kNone: {                                   \
-      constexpr MaskMode MASK_MODE = MaskMode::kNone;         \
-      __VA_ARGS__                                             \
-      break;                                                  \
-    }                                                         \
-    case MaskMode::kCausal: {                                 \
-      constexpr MaskMode MASK_MODE = MaskMode::kCausal;       \
-      __VA_ARGS__                                             \
-      break;                                                  \
-    }                                                         \
-    case MaskMode::kCustom: {                                 \
-      constexpr MaskMode MASK_MODE = MaskMode::kCustom;       \
-      __VA_ARGS__                                             \
-      break;                                                  \
-    }                                                         \
-    case MaskMode::kMultiItemScoring: {                       \
+#define DISPATCH_MASK_MODE(mask_mode, MASK_MODE, ...)             \
+  switch (mask_mode) {                                            \
+    case MaskMode::kNone: {                                       \
+      constexpr MaskMode MASK_MODE = MaskMode::kNone;             \
+      __VA_ARGS__                                                 \
+      break;                                                      \
+    }                                                             \
+    case MaskMode::kCausal: {                                     \
+      constexpr MaskMode MASK_MODE = MaskMode::kCausal;           \
+      __VA_ARGS__                                                 \
+      break;                                                      \
+    }                                                             \
+    case MaskMode::kCustom: {                                     \
+      constexpr MaskMode MASK_MODE = MaskMode::kCustom;           \
+      __VA_ARGS__                                                 \
+      break;                                                      \
+    }                                                             \
+    case MaskMode::kMultiItemScoring: {                           \
       constexpr MaskMode MASK_MODE = MaskMode::kMultiItemScoring; \
-      __VA_ARGS__                                             \
-      break;                                                  \
-    }                                                         \
-    default: {                                                \
-      std::ostringstream err_msg;                             \
-      err_msg << "Unsupported mask_mode: " << int(mask_mode); \
-      FLASHINFER_ERROR(err_msg.str());                        \
-    }                                                         \
+      __VA_ARGS__                                                 \
+      break;                                                      \
+    }                                                             \
+    default: {                                                    \
+      std::ostringstream err_msg;                                 \
+      err_msg << "Unsupported mask_mode: " << int(mask_mode);     \
+      FLASHINFER_ERROR(err_msg.str());                            \
+    }                                                             \
   }
 
 // convert head_dim to compile-time constant

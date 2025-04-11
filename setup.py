@@ -227,7 +227,7 @@ if enable_aot:
         "-use_fast_math",
         "-DNDEBUG",
         "-DPy_LIMITED_API=0x03080000",
-        "-lineinfo"
+        "-lineinfo",
     ]
     libraries = [
         "cublas",

@@ -788,10 +788,10 @@ __device__ __forceinline__ void logits_mask(
 
 template <typename KTraits, typename Params>
 __device__ __forceinline__ void logits_mask_customized(
-  const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
+    const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
     const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
-    const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end, const uint_fastdiv group_size,
-    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end,
+    const uint_fastdiv group_size, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     // new arguments for compact description of mask
     const uint32_t prefix_len, uint16_t* token_pos_in_items) {
   const uint32_t lane_idx = threadIdx.x, kv_head_idx = blockIdx.z;
@@ -818,11 +818,11 @@ __device__ __forceinline__ void logits_mask_customized(
       // use __ldca to hint compiler to cache in L1 for further reuse by other tiles
       const int idx_in_original_seq = q_idx + kv_len - qo_len;
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        token_pos_in_items_regs[mma_q][eff_reg_id] = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+        token_pos_in_items_regs[mma_q][eff_reg_id] =
+            __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
       }
     }
   }
-
 
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
@@ -835,19 +835,18 @@ __device__ __forceinline__ void logits_mask_customized(
                                                                     8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
         const uint32_t idx_in_original_seq = q_idx + kv_len - qo_len;
-        const bool out_of_boundary =
-                    kv_idx > idx_in_original_seq || (kv_idx >= chunk_end) ||
-                    kv_idx + window_left < idx_in_original_seq;
+        const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= chunk_end) ||
+                                     kv_idx + window_left < idx_in_original_seq;
         const bool is_prefix = idx_in_original_seq < prefix_len;
         if (out_of_boundary || is_prefix) {
-          s_frag[mma_q][mma_kv][reg_id] = out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
+          s_frag[mma_q][mma_kv][reg_id] =
+              out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
         } else {
           s_frag[mma_q][mma_kv][reg_id] =
-            (kv_idx < prefix_len |
-              (idx_in_original_seq < kv_idx + token_pos_in_items_regs[mma_q][((reg_id % 4) / 2)])
-            )
-          ? s_frag[mma_q][mma_kv][reg_id]
-          : (KTraits::MaskFillValue);
+              (kv_idx < prefix_len |
+               (idx_in_original_seq < kv_idx + token_pos_in_items_regs[mma_q][((reg_id % 4) / 2)]))
+                  ? s_frag[mma_q][mma_kv][reg_id]
+                  : (KTraits::MaskFillValue);
         }
       }
     }
@@ -2050,7 +2049,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     uint32_t* prefix_len_ptr = params.prefix_len_ptr;
     uint16_t* token_pos_in_items_ptr = params.token_pos_in_items_ptr;
-    const uint32_t token_pos_in_items_len =  params.token_pos_in_items_len;
+    const uint32_t token_pos_in_items_len = params.token_pos_in_items_len;
     uint16_t* max_item_len_ptr = params.max_item_len_ptr;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -2171,35 +2170,37 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t num_iterations_full = 0;
 
     if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-      num_iterations = ceil_div(
-        (MASK_MODE == MaskMode::kCausal
-             ? min(chunk_size,
-                   sub_if_greater_or_zero(
-                       kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                       chunk_start))
-             : chunk_size),
-        CTA_TILE_KV);
+      num_iterations =
+          ceil_div((MASK_MODE == MaskMode::kCausal
+                        ? min(chunk_size,
+                              sub_if_greater_or_zero(
+                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
+                                  chunk_start))
+                        : chunk_size),
+                   CTA_TILE_KV);
     } else {
       num_iterations = ceil_div(
-        min(
-            min(chunk_size,
-                sub_if_greater_or_zero(
-                    kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                    chunk_start))
-            , sub_if_greater_or_zero(__ldg(prefix_len_ptr + request_idx), chunk_start)
-        ),
-        CTA_TILE_KV);
-      num_iterations_mask =
-          max(min(chunk_size, sub_if_greater_or_zero(
-                          sub_if_greater_or_zero(kv_len - qo_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
-                                                __ldg(max_item_len_ptr + request_idx)),
-                          chunk_start)) / (CTA_TILE_KV), num_iterations);
+          min(min(chunk_size, sub_if_greater_or_zero(
+                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
+                                  chunk_start)),
+              sub_if_greater_or_zero(__ldg(prefix_len_ptr + request_idx), chunk_start)),
+          CTA_TILE_KV);
+      num_iterations_mask = max(
+          min(chunk_size,
+              sub_if_greater_or_zero(
+                  sub_if_greater_or_zero(kv_len - qo_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
+                                         __ldg(max_item_len_ptr + request_idx)),
+                  chunk_start)) /
+              (CTA_TILE_KV),
+          num_iterations);
 
-      num_iterations_full = max(num_iterations_mask, ceil_div(
-          min(chunk_size, sub_if_greater_or_zero(
-                          kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                          chunk_start)),
-          CTA_TILE_KV));
+      num_iterations_full = max(
+          num_iterations_mask,
+          ceil_div(
+              min(chunk_size, sub_if_greater_or_zero(
+                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
+                                  chunk_start)),
+              CTA_TILE_KV));
     }
 
     const uint32_t window_iteration =
@@ -2215,18 +2216,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
              : chunk_size) /
         CTA_TILE_KV;
 
-    const uint32_t unified_num_iterations = (MASK_MODE == MaskMode::kMultiItemScoring) ? num_iterations_full : num_iterations;
+    const uint32_t unified_num_iterations =
+        (MASK_MODE == MaskMode::kMultiItemScoring) ? num_iterations_full : num_iterations;
 #pragma unroll 1
-    for (uint32_t iter = 0;
-         iter < unified_num_iterations;
-         iter =
-            (MASK_MODE == MaskMode::kMultiItemScoring)
-            ? ((iter + 1 == num_iterations) ? num_iterations_mask : (iter + 1))
-            : (iter + 1)) {
+    for (uint32_t iter = 0; iter < unified_num_iterations;
+         iter = (MASK_MODE == MaskMode::kMultiItemScoring)
+                    ? ((iter + 1 == num_iterations) ? num_iterations_mask : (iter + 1))
+                    : (iter + 1)) {
       const uint32_t prefetch_skip_step =
           (MASK_MODE == MaskMode::kMultiItemScoring)
-          ? ((iter + 1 == num_iterations) ? (num_iterations_mask - num_iterations) : 0)
-          : 0;
+              ? ((iter + 1 == num_iterations) ? (num_iterations_mask - num_iterations) : 0)
+              : 0;
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 #pragma unroll
       for (uint32_t i = 0;
@@ -2262,30 +2262,32 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
         logits_mask<KTraits>(
-              params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-              chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-              qo_len, kv_len, chunk_end, group_size, s_frag);
+            params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+            qo_len, kv_len, chunk_end, group_size, s_frag);
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
           if (iter >= mask_iteration || iter < window_iteration) {
             logits_mask<KTraits>(
-              params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-              chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-              qo_len, kv_len, chunk_end, group_size, s_frag);
+                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                qo_len, kv_len, chunk_end, group_size, s_frag);
           }
         } else {
           if (iter + 1 >= num_iterations) {
             logits_mask_customized<KTraits>(
-              params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-              chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-              qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
-              __ldg(prefix_len_ptr + request_idx), token_pos_in_items_ptr + request_idx * token_pos_in_items_len);
+                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
+                __ldg(prefix_len_ptr + request_idx),
+                token_pos_in_items_ptr + request_idx * token_pos_in_items_len);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-                qo_len, kv_len, chunk_end, group_size, s_frag);
+                  params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                  chunk_start +
+                      (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                  qo_len, kv_len, chunk_end, group_size, s_frag);
             }
           }
         }

@@ -133,9 +133,18 @@ struct CollectiveMainloop {
     Tensor mV = make_tensor(make_gmem_ptr(args.V_ptr), args.layout_V);
     TMA_V tma_load_V = make_tma_copy(GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}),
                                      select<2, 1>(TileShape_PDV{}), _1{});  // no mcast
-    return {args.layout_Q, args.layout_K, args.layout_V,    tma_load_Q,
-            tma_load_K,    tma_load_V,    args.window_left, args.additional_params,
-            args.prefix_len_ptr, args.token_pos_in_items_ptr, args.token_pos_in_items_len, args.max_item_len_ptr};
+    return {args.layout_Q,
+            args.layout_K,
+            args.layout_V,
+            tma_load_Q,
+            tma_load_K,
+            tma_load_V,
+            args.window_left,
+            args.additional_params,
+            args.prefix_len_ptr,
+            args.token_pos_in_items_ptr,
+            args.token_pos_in_items_len,
+            args.max_item_len_ptr};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -176,7 +185,8 @@ struct CollectiveMainloop {
     Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
     Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
 
-    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] = block_coord;
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
 
     // Prepare the TMA loads
     Tensor gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShape_QKD{}), qo_head_idx, qo_indptr,

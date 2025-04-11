@@ -33,8 +33,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL,
-          bool MULTIITEMSCORING = false>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -182,7 +181,8 @@ struct SparseCollectiveMainloop {
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx,
-                           const int num_kv_tiles_outside_items_window = 0, const int num_kv_tiles_prefix = 0) {
+                           const int num_kv_tiles_outside_items_window = 0,
+                           const int num_kv_tiles_prefix = 0) {
     int thread_idx = threadIdx.x;
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (thread_idx / 32) % 4, 0);
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
@@ -191,7 +191,8 @@ struct SparseCollectiveMainloop {
 
     Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
 
-    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] = block_coord;
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
 
     // Prepare the TMA loads
     Tensor gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShape_QKD{}), qo_head_idx, qo_indptr,
@@ -256,7 +257,8 @@ struct SparseCollectiveMainloop {
     auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
       int result = kv_tile_idx - 1;
       if constexpr (MULTIITEMSCORING) {
-        if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) & (kv_tile_idx >= num_kv_tiles_prefix)) {
+        if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) &
+            (kv_tile_idx >= num_kv_tiles_prefix)) {
           result = num_kv_tiles_prefix - 1;
         }
       }
@@ -305,8 +307,8 @@ struct SparseCollectiveMainloop {
     } else {
       // load second last k-tile and last v-tile
       pipeline_k.producer_acquire(smem_pipe_write_k);
-      Tensor tKgKi = tKgK(_, _, _, kv_tile_idx_decrement(kv_tile_idx));            // (CPY, CPY_KV, CPY_D)
-      Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
+      Tensor tKgKi = tKgK(_, _, _, kv_tile_idx_decrement(kv_tile_idx));  // (CPY, CPY_KV, CPY_D)
+      Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());           // (CPY, CPY_KV, CPY_D)
       copy(gmem_tiled_copy_k, tKgKi, tKsKi);
 
       pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
@@ -324,14 +326,12 @@ struct SparseCollectiveMainloop {
 
       // load remaining k/v tiles
 #pragma unroll 2
-      for (;
-          kv_tile_idx > swa_begin_kv_tile_idx;
-          kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)
-      ) {
+      for (; kv_tile_idx > swa_begin_kv_tile_idx;
+           kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
         pipeline_k.producer_acquire(smem_pipe_write_k);
 
-        Tensor tKgKi = tKgK(_, _, _, kv_tile_idx_decrement(kv_tile_idx));            // (CPY, CPY_KV, CPY_D)
-        Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
+        Tensor tKgKi = tKgK(_, _, _, kv_tile_idx_decrement(kv_tile_idx));  // (CPY, CPY_KV, CPY_D)
+        Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());           // (CPY, CPY_KV, CPY_D)
         copy(gmem_tiled_copy_k, tKgKi, tKsKi);
 
         pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);

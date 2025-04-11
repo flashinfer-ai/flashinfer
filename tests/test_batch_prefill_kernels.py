@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy
 import pytest
 import torch
 from jit_utils import jit_prefill_attention_func_args
 
 import flashinfer
-import numpy
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -810,7 +810,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     [
         (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
         (97, 81, 16, list(range(80)) + [0], 97, [79]),
-    ]
+    ],
 )
 @pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
@@ -877,8 +877,12 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
         prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     if return_lse:
@@ -925,7 +929,9 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
             dim=0,
         )
 
-        def create_2D_multi_item_mask_dense(is_delimiter, sliding_window_size=-1, prefix_cache_len=None):
+        def create_2D_multi_item_mask_dense(
+            is_delimiter, sliding_window_size=-1, prefix_cache_len=None
+        ):
             # Function to create custom_mask for multi-item scoring
             #
             # Note, sliding window implementation assumes that candidate_i_size < sliding_window_size < prefix_size
@@ -943,17 +949,28 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 
             group_ids = torch.cumsum(is_delimiter, 0)
             # Get mask for within-group causal attention
-            within_group_causal = (group_ids.unsqueeze(1) == group_ids.unsqueeze(0)) & (pos.unsqueeze(0) <= pos.unsqueeze(1))
+            within_group_causal = (group_ids.unsqueeze(1) == group_ids.unsqueeze(0)) & (
+                pos.unsqueeze(0) <= pos.unsqueeze(1)
+            )
             # Combine all conditions
             attention_mask = (
-                within_group_causal |
-                ((pos >= first_delimiter_pos).unsqueeze(1) & (pos < first_delimiter_pos).unsqueeze(0))  # Prefix attention
-            ) & ~is_delimiter.unsqueeze(0) & ~is_delimiter.unsqueeze(1)  # No delimiter attention
+                (
+                    within_group_causal
+                    | (
+                        (pos >= first_delimiter_pos).unsqueeze(1)
+                        & (pos < first_delimiter_pos).unsqueeze(0)
+                    )  # Prefix attention
+                )
+                & ~is_delimiter.unsqueeze(0)
+                & ~is_delimiter.unsqueeze(1)
+            )  # No delimiter attention
 
             if sliding_window_size > 0 and sliding_window_size < len(is_delimiter):
                 # Calculate how many positions from right of prefix each token can attend to
 
-                group_size = torch.sum(within_group_causal & ~is_delimiter.unsqueeze(0), dim=1)
+                group_size = torch.sum(
+                    within_group_causal & ~is_delimiter.unsqueeze(0), dim=1
+                )
 
                 # For prefix: after sliding_window_size position, can see window_size tokens
                 # For candidate items: can see (sliding_window_size - group_size) tokens from prefix end
@@ -963,8 +980,8 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
                     torch.where(
                         pos < sliding_window_size,
                         first_delimiter_pos,
-                        sliding_window_size
-                    )
+                        sliding_window_size,
+                    ),
                 )
 
                 # Starting index of attention window relative to token position for candidate item/group
@@ -972,13 +989,20 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 
                 attention_mask = attention_mask & (pos >= prefix_start)
             if prefix_cache_len:
-                patch = torch.ones(seq_len, prefix_cache_len, device=is_delimiter.device, dtype=torch.bool)
+                patch = torch.ones(
+                    seq_len,
+                    prefix_cache_len,
+                    device=is_delimiter.device,
+                    dtype=torch.bool,
+                )
                 attention_mask = torch.concat([patch, attention_mask], dim=1)
             return attention_mask.unsqueeze(0).reshape(-1)
 
-        custom_mask = create_2D_multi_item_mask_dense(is_delimiter=torch.tensor(token_pos_in_items_ptr).to(0) == 0,
-                                        sliding_window_size=-1,
-                                        prefix_cache_len=prefix_len_ptr)
+        custom_mask = create_2D_multi_item_mask_dense(
+            is_delimiter=torch.tensor(token_pos_in_items_ptr).to(0) == 0,
+            sliding_window_size=-1,
+            prefix_cache_len=prefix_len_ptr,
+        )
         o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             qi,
             ki,

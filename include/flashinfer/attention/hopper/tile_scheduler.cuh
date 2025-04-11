@@ -46,7 +46,7 @@ struct SingleTileScheduler {
 
     CUTLASS_DEVICE
     auto get_block_coord(Params const& params) const {
-      return cute::tuple{q_tile_idx,      qo_head_idx,   kv_head_idx,  /*qo_indptr=*/0,
+      return cute::tuple{q_tile_idx,      qo_head_idx,   kv_head_idx,   /*qo_indptr=*/0,
                          /*kv_indptr=*/0, params.qo_len, params.kv_len, /*batch_idx=*/0};
     }
   };
@@ -96,8 +96,9 @@ struct BatchPrefillPersistentTileScheduler {
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return {args.work_indptr, args.head_indices, args.qo_tile_indices, args.qo_indptr,
-            args.kv_indptr, args.qo_lens, args.kv_lens, args.batch_indices, args.group_size_fastdiv};
+    return {args.work_indptr, args.head_indices,  args.qo_tile_indices,
+            args.qo_indptr,   args.kv_indptr,     args.qo_lens,
+            args.kv_lens,     args.batch_indices, args.group_size_fastdiv};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {(unsigned)num_sm}; }
@@ -121,7 +122,7 @@ struct BatchPrefillPersistentTileScheduler {
     CUTLASS_DEVICE
     auto get_block_coord(Params const& params) const {
       return cute::tuple{q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr,
-                         kv_indptr,  qo_len,      kv_len,    batch_idx};
+                         kv_indptr,  qo_len,      kv_len,      batch_idx};
     }
   };
 
@@ -210,14 +211,16 @@ struct BatchPrefillTileScheduler {
 
   // Device side kernel params
   struct Params {
-    IdType *work_indptr, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens, *kv_lens, *batch_indices;
+    IdType *work_indptr, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens, *kv_lens,
+        *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return {args.work_indptr, args.qo_tile_indices, args.qo_indptr, args.kv_indptr,
-            args.qo_lens, args.kv_lens, args.batch_indices, args.group_size_fastdiv, args.num_qo_heads};
+    return {args.work_indptr, args.qo_tile_indices, args.qo_indptr,     args.kv_indptr,
+            args.qo_lens,     args.kv_lens,         args.batch_indices, args.group_size_fastdiv,
+            args.num_qo_heads};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {
@@ -243,7 +246,7 @@ struct BatchPrefillTileScheduler {
     CUTLASS_DEVICE
     auto get_block_coord(Params const& params) const {
       return cute::tuple{q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr,
-                         kv_indptr,  qo_len,      kv_len,     batch_idx};
+                         kv_indptr,  qo_len,      kv_len,      batch_idx};
     }
   };
 
@@ -288,12 +291,17 @@ struct BatchPrefillTileScheduler {
                                             WorkTileInfo const& current_work) const {
     int work_idx = current_work.ptr_begin + current_work.counter + 1;
     if (work_idx < current_work.ptr_end) {
-      return {params.qo_tile_indices[work_idx], current_work.qo_head_idx,
-              current_work.kv_head_idx,         params.qo_indptr[work_idx],
-              params.kv_indptr[work_idx],       params.qo_lens[work_idx],
-              params.kv_lens[work_idx],         params.batch_indices[work_idx],
+      return {params.qo_tile_indices[work_idx],
+              current_work.qo_head_idx,
+              current_work.kv_head_idx,
+              params.qo_indptr[work_idx],
+              params.kv_indptr[work_idx],
+              params.qo_lens[work_idx],
+              params.kv_lens[work_idx],
+              params.batch_indices[work_idx],
               current_work.counter + 1,
-              current_work.ptr_begin,           current_work.ptr_end};
+              current_work.ptr_begin,
+              current_work.ptr_end};
     } else {
       return {-1,
               -1,

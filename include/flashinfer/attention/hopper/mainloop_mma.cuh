@@ -14,21 +14,19 @@
 
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING, typename WarpScheduler,
-          typename AttentionVariant, typename Params, typename MainloopPipeline,
-          typename PipelineState, typename SharedStorage, typename FrgTensorO,
-          typename AttentionUpdater>
-CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& variant,
-                            MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
-                            PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
-                            FrgTensorO& tOrO, AttentionUpdater& attention_updater,
-                            int kv_tile_idx_count, int swa_begin_kv_tile_idx,
-                            int swa_end_kv_tile_idx, int thread_idx, int work_idx, int q_tile_idx,
-                            SharedStorage& shared_storage, const int32_t qo_len,
-                            const int32_t kv_len, const int32_t qo_head_idx,
-                            const int32_t kv_head_idx,
-                            const uint32_t prefix_len, uint16_t* token_pos_in_items,
-                            const int num_kv_tiles_outside_items_window = 0, const int num_kv_tiles_prefix = 0) {
+template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
+          typename WarpScheduler, typename AttentionVariant, typename Params,
+          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
+          typename FrgTensorO, typename AttentionUpdater>
+CUTLASS_DEVICE void mma_f16(
+    const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
+    MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
+    FrgTensorO& tOrO, AttentionUpdater& attention_updater, int kv_tile_idx_count,
+    int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
+    int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
+    const int32_t qo_head_idx, const int32_t kv_head_idx, const uint32_t prefix_len,
+    uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
+    const int num_kv_tiles_prefix = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -97,29 +95,38 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
   };
   auto mask_multi_item_scoring = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
-    const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= std::min(kv_len, col_limit_right(qo_idx)));
+    const bool out_of_boundary =
+        kv_idx > idx_in_original_seq || (kv_idx >= std::min(kv_len, col_limit_right(qo_idx)));
     const bool is_prefix = idx_in_original_seq < prefix_len;
-    uint16_t token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+    uint16_t token_pos_in_items_regs =
+        __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
     if (out_of_boundary || is_prefix) {
       tSrS(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS(i);
-    }else{
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs)) ? tSrS(i) : (AttentionUpdater::fill_value);
+    } else {
+      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+                    ? tSrS(i)
+                    : (AttentionUpdater::fill_value);
     }
   };
-  auto mask_multi_item_scoring_assume_in_bound = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
+  auto mask_multi_item_scoring_assume_in_bound = [&](decltype(tSrS)& tSrS, int i, int qo_idx,
+                                                     int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool is_prefix = idx_in_original_seq < prefix_len;
     if (is_prefix) {
       tSrS(i) = AttentionUpdater::fill_value;
-    }else{
-      uint16_t token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs)) ? tSrS(i) : (AttentionUpdater::fill_value);
+    } else {
+      uint16_t token_pos_in_items_regs =
+          __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+                    ? tSrS(i)
+                    : (AttentionUpdater::fill_value);
     }
   };
   auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
     int result = kv_tile_idx - 1;
     if constexpr (MULTIITEMSCORING) {
-      if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) & (kv_tile_idx >= num_kv_tiles_prefix)) {
+      if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) &
+          (kv_tile_idx >= num_kv_tiles_prefix)) {
         result = num_kv_tiles_prefix - 1;
       }
     }
@@ -136,8 +143,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
                                         qo_head_idx, kv_head_idx);
       if constexpr (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
-      } else
-      if constexpr (!CAUSAL) {  // Just masking based on col
+      } else if constexpr (!CAUSAL) {  // Just masking based on col
         if (kv_idx >= kv_len) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
@@ -158,10 +164,8 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
-  constexpr int n_masking_steps =
-      MULTIITEMSCORING
-          ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
-          : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
   // masking loops
   // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
 #pragma unroll
@@ -189,13 +193,13 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
-      if(MULTIITEMSCORING) {
+      if (MULTIITEMSCORING) {
         if (masking_step == n_masking_steps - 1) {
           mask_multi_item_scoring_assume_in_bound(tSrS, i, qo_idx, kv_idx);
         } else {
           mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
         }
-      }else{
+      } else {
         if (kv_idx >= col_limit_right(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
@@ -217,9 +221,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
   }
 
 #pragma unroll 1
-  for (;
-      kv_tile_idx > swa_end_kv_tile_idx + 1;
-      kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
+  for (; kv_tile_idx > swa_end_kv_tile_idx + 1; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
     WarpScheduler::barrier_sync();
@@ -243,7 +245,8 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
                                         qo_head_idx, kv_head_idx);
     }
     if constexpr (MULTIITEMSCORING) {
-      // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q, CTA_KV);
+      // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q,
+      // CTA_KV);
       if (kv_tile_idx >= num_kv_tiles_prefix - 1) {
 #pragma unroll
         for (int i = 0; i < size(tSrS); ++i) {

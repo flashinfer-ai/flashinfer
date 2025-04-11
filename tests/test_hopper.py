@@ -302,7 +302,7 @@ def test_batch_paged_prefill(
     [
         (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
         (97, 81, 16, list(range(80)) + [0], 97, [79]),
-    ]
+    ],
 )
 @pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
@@ -354,7 +354,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
     kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
 
     wrapper_fa2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout,  backend="fa2"
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_fa2.plan(
         q_indptr_gpu,
@@ -368,14 +368,18 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         causal=causal,
         logits_soft_cap=logits_soft_cap,
         prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
 
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout,  backend="fa3"
+        workspace_buffer, kv_layout, backend="fa3"
     )
     wrapper_fa3.plan(
         q_indptr_gpu,
@@ -389,8 +393,12 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         causal=causal,
         logits_soft_cap=logits_soft_cap,
         prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
 
@@ -404,9 +412,29 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
 @pytest.mark.parametrize(
     "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
     [
-        (54, 37, [17, 17], list(range(17)) + list(range(19)) + [0] + [0]*63 + list(range(15)) + list(range(21)) + [0], 100, [18, 20]),
-        (97, 81, [16, 16], list(range(80)) + [0] + [0]*16 + list(range(76)) + [0], 97, [79, 75]),
-    ]
+        (
+            54,
+            37,
+            [17, 17],
+            list(range(17))
+            + list(range(19))
+            + [0]
+            + [0] * 63
+            + list(range(15))
+            + list(range(21))
+            + [0],
+            100,
+            [18, 20],
+        ),
+        (
+            97,
+            81,
+            [16, 16],
+            list(range(80)) + [0] + [0] * 16 + list(range(76)) + [0],
+            97,
+            [79, 75],
+        ),
+    ],
 )
 @pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
@@ -458,7 +486,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
     kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
 
     wrapper_fa2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout,  backend="fa2"
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_fa2.plan(
         q_indptr_gpu,
@@ -472,14 +500,18 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         causal=causal,
         logits_soft_cap=logits_soft_cap,
         prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
 
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout,  backend="fa3"
+        workspace_buffer, kv_layout, backend="fa3"
     )
     wrapper_fa3.plan(
         q_indptr_gpu,
@@ -493,8 +525,12 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         causal=causal,
         logits_soft_cap=logits_soft_cap,
         prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
 

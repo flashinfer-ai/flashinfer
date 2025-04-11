@@ -355,7 +355,7 @@ struct BatchPrefillPagedParams {
         prefix_len_ptr(nullptr),
         token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        max_item_len_ptr(nullptr){}
+        max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,

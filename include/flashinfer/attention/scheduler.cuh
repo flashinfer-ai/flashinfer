@@ -721,23 +721,23 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
 
-  if(prefix_len_ptr == nullptr){
+  if (prefix_len_ptr == nullptr) {
     plan_info.prefix_len_ptr = 0;
-  }else{
+  } else {
     plan_info.prefix_len_ptr = reinterpret_cast<int64_t>(prefix_len_ptr);
   }
 
-  if(token_pos_in_items_ptr == nullptr){
+  if (token_pos_in_items_ptr == nullptr) {
     plan_info.token_pos_in_items_ptr = 0;
-  }else{
+  } else {
     plan_info.token_pos_in_items_ptr = reinterpret_cast<int64_t>(token_pos_in_items_ptr);
   }
 
   plan_info.token_pos_in_items_len = token_pos_in_items_len;
 
-  if(max_item_len_ptr == nullptr){
+  if (max_item_len_ptr == nullptr) {
     plan_info.max_item_len_ptr = 0;
-  }else{
+  } else {
     plan_info.max_item_len_ptr = reinterpret_cast<int64_t>(max_item_len_ptr);
   }
 
@@ -895,9 +895,8 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
-    void* prefix_len_ptr, void* token_pos_in_items_ptr, uint32_t token_pos_in_items_len, void* max_item_len_ptr
-    ) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream, void* prefix_len_ptr,
+    void* token_pos_in_items_ptr, uint32_t token_pos_in_items_len, void* max_item_len_ptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -944,7 +943,6 @@ inline cudaError_t PrefillSM90Plan(
       cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
       cta_head_indices(num_sm90_ctas, std::vector<IdType>()),
       cta_batch_indices(num_sm90_ctas, std::vector<IdType>());
-
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
@@ -1014,23 +1012,23 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
-  if(prefix_len_ptr == nullptr){
+  if (prefix_len_ptr == nullptr) {
     plan_info.prefix_len_ptr = 0;
-  }else{
+  } else {
     plan_info.prefix_len_ptr = reinterpret_cast<int64_t>(prefix_len_ptr);
   }
 
-  if(token_pos_in_items_ptr == nullptr){
+  if (token_pos_in_items_ptr == nullptr) {
     plan_info.token_pos_in_items_ptr = 0;
-  }else{
+  } else {
     plan_info.token_pos_in_items_ptr = reinterpret_cast<int64_t>(token_pos_in_items_ptr);
   }
 
   plan_info.token_pos_in_items_len = token_pos_in_items_len;
 
-  if(max_item_len_ptr == nullptr){
+  if (max_item_len_ptr == nullptr) {
     plan_info.max_item_len_ptr = 0;
-  }else{
+  } else {
     plan_info.max_item_len_ptr = reinterpret_cast<int64_t>(max_item_len_ptr);
   }
 

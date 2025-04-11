@@ -21,7 +21,8 @@ IntTuple BatchPrefillWithKVCacheSM90Plan(
     DLTensor* page_locked_int_workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
     IntTuple kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, TVMStreamHandle cuda_stream, std::optional<at::Tensor> prefix_len_ptr, std::optional<at::Tensor> token_pos_in_items_ptr,
+    int64_t head_dim_vo, bool causal, TVMStreamHandle cuda_stream,
+    std::optional<at::Tensor> prefix_len_ptr, std::optional<at::Tensor> token_pos_in_items_ptr,
     std::optional<int64_t> token_pos_in_items_len, std::optional<at::Tensor> max_item_len_ptr);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
