@@ -44,7 +44,9 @@ IntTuple BatchPrefillWithKVCachePlan(
     DLTensor* page_locked_int_workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
     IntTuple kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, TVMStreamHandle cuda_stream) {
+    int64_t head_dim_vo, bool causal, TVMStreamHandle cuda_stream,
+    std::optional<at::Tensor> prefix_len_ptr, std::optional<at::Tensor> token_pos_in_items_ptr,
+    std::optional<int64_t> token_pos_in_items_len, std::optional<at::Tensor> max_item_len_ptr) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer->shape[0] * DataType(float_workspace_buffer->dtype).bytes();
   size_t int_workspace_size_in_bytes =
@@ -53,6 +55,13 @@ IntTuple BatchPrefillWithKVCachePlan(
   PrefillPlanInfo plan_info;
 
   cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
+  // Check if the optional values have a value before accessing them
+  auto* prefix_len_p = prefix_len_ptr.has_value() ? prefix_len_ptr->data_ptr() : nullptr;
+  auto* token_pos_in_items_p =
+      token_pos_in_items_ptr.has_value() ? token_pos_in_items_ptr->data_ptr() : nullptr;
+  auto token_pos_in_items_v =
+      token_pos_in_items_len.has_value() ? token_pos_in_items_len.value() : 0;
+  auto* max_item_len_p = max_item_len_ptr.has_value() ? max_item_len_ptr->data_ptr() : nullptr;
   cudaError_t status = PrefillPlan<IdType>(
       static_cast<char*>(float_workspace_buffer->data) + float_workspace_buffer->byte_offset,
       float_workspace_size_in_bytes,
@@ -64,7 +73,8 @@ IntTuple BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(IdType),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, stream);
+      /*sizeof_dtype_o=*/2, stream, prefix_len_p, token_pos_in_items_p, token_pos_in_items_v,
+      max_item_len_p);
 
   CHECK(status == cudaSuccess) << "Failed to plan prefill with error: "
                                << cudaGetErrorString(status);
@@ -174,6 +184,13 @@ void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+
+        // set the prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr
+        params.prefix_len_ptr = reinterpret_cast<uint32_t*>(plan_info.prefix_len_ptr);
+        params.token_pos_in_items_ptr =
+            reinterpret_cast<uint16_t*>(plan_info.token_pos_in_items_ptr);
+        params.token_pos_in_items_len = static_cast<uint32_t>(plan_info.token_pos_in_items_len);
+        params.max_item_len_ptr = reinterpret_cast<uint16_t*>(plan_info.max_item_len_ptr);
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -333,6 +350,13 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+
+        // set the prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr
+        params.prefix_len_ptr = reinterpret_cast<uint32_t*>(plan_info.prefix_len_ptr);
+        params.token_pos_in_items_ptr =
+            reinterpret_cast<uint16_t*>(plan_info.token_pos_in_items_ptr);
+        params.token_pos_in_items_len = static_cast<uint32_t>(plan_info.token_pos_in_items_len);
+        params.max_item_len_ptr = reinterpret_cast<uint16_t*>(plan_info.max_item_len_ptr);
 
         ADDITIONAL_PARAMS_SETTER
 

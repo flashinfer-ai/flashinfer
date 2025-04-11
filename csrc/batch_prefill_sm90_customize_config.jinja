@@ -43,6 +43,7 @@ struct RaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
@@ -66,6 +67,11 @@ struct RaggedParams {
   int window_left;
 
   bool causal;
+
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 };
 
 struct PagedParams {
@@ -88,6 +94,7 @@ struct PagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
@@ -111,6 +118,11 @@ struct PagedParams {
   int window_left;
 
   bool causal;
+
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 };
 
 {{ variant_decl }}

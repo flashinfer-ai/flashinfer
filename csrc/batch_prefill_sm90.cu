@@ -43,7 +43,9 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal) {
+    int64_t head_dim_vo, bool causal, std::optional<at::Tensor> prefix_len_ptr,
+    std::optional<at::Tensor> token_pos_in_items_ptr, std::optional<int64_t> token_pos_in_items_len,
+    std::optional<at::Tensor> max_item_len_ptr) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -53,6 +55,13 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
 
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  // Check if the optional values have a value before accessing them
+  auto* prefix_len_p = prefix_len_ptr.has_value() ? prefix_len_ptr->data_ptr() : nullptr;
+  auto* token_pos_in_items_p =
+      token_pos_in_items_ptr.has_value() ? token_pos_in_items_ptr->data_ptr() : nullptr;
+  auto token_pos_in_items_v =
+      token_pos_in_items_len.has_value() ? token_pos_in_items_len.value() : 0;
+  auto* max_item_len_p = max_item_len_ptr.has_value() ? max_item_len_ptr->data_ptr() : nullptr;
 
   cudaError_t status =
       PrefillSM90Plan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
@@ -60,7 +69,8 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
                       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
                       kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
                       batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream, prefix_len_p,
+                      token_pos_in_items_p, token_pos_in_items_v, max_item_len_p);
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
@@ -141,6 +151,15 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
+
+        // Set the multi-item scoring parameters
+        params.prefix_len_ptr = reinterpret_cast<uint32_t*>(plan_info.prefix_len_ptr);
+        params.token_pos_in_items_ptr =
+            reinterpret_cast<uint16_t*>(plan_info.token_pos_in_items_ptr);
+        params.token_pos_in_items_len = static_cast<uint32_t>(plan_info.token_pos_in_items_len);
+        params.max_item_len_ptr = reinterpret_cast<uint16_t*>(plan_info.max_item_len_ptr);
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -238,7 +257,16 @@ void BatchPrefillWithPagedKVCacheSM90Run(
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
         params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
+
+        // Set the multi-item scoring parameters
+        params.prefix_len_ptr = reinterpret_cast<uint32_t*>(plan_info.prefix_len_ptr);
+        params.token_pos_in_items_ptr =
+            reinterpret_cast<uint16_t*>(plan_info.token_pos_in_items_ptr);
+        params.token_pos_in_items_len = static_cast<uint32_t>(plan_info.token_pos_in_items_len);
+        params.max_item_len_ptr = reinterpret_cast<uint16_t*>(plan_info.max_item_len_ptr);
 
         ADDITIONAL_PARAMS_SETTER
 

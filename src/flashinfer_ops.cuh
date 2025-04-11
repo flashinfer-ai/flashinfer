@@ -435,11 +435,14 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
     paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
     bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool use_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr,
+    uint32_t* prefix_len_ptr, uint16_t* token_pos_in_items_ptr, uint32_t token_pos_in_items_len,
+    uint16_t* max_item_len_ptr) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
-  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  if (prefix_len_ptr != nullptr) mask_mode = MaskMode::kMultiItemScoring;
   auto plan_info = handler->GetPlanInfo();
   DISPATCH_head_dim(
       head_dim, HEAD_DIM,
@@ -470,6 +473,10 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.max_total_num_rows = plan_info.total_num_rows;
                 params.total_num_rows = handler->GetTotalNumRows();
                 params.padded_batch_size = plan_info.padded_batch_size;
+                params.prefix_len_ptr = prefix_len_ptr;
+                params.token_pos_in_items_ptr = token_pos_in_items_ptr;
+                params.token_pos_in_items_len = token_pos_in_items_len;
+                params.max_item_len_ptr = max_item_len_ptr;
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<
                       CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
