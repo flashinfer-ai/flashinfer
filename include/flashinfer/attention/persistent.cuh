@@ -243,8 +243,8 @@ template <typename Params, uint32_t NUM_THREADS>
 __global__ __launch_bounds__(NUM_THREADS) void BatchPagedAttentionPersistentHolisticKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
-  using DTypeIn = Params::DTypeO;
-  using DTypeOut = Params::DTypeO;
+  using DTypeIn = typename Params::DTypeO;
+  using DTypeOut = typename Params::DTypeO;
   using DTypeAccum = float;
   using IdType = typename Params::IdType;
 
