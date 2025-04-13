@@ -1051,6 +1051,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
+  // NOTE(Zihao): two cta per sm
+  num_sm *= 2;
+
   // step 0. determine the number of blocks in x and y dimensions
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec[NUM_TASKS];
   for (uint32_t i = 0; i < batch_size; ++i) {
