@@ -28,6 +28,33 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
                     params.kv_end[work_idx], params.kv_head_idx_arr[work_idx]);
 }
 
+template <typename KTraits>
+__device__ __forceinline__ void prefetch_offest(
+    const uint32_t packed_block_iter_base, const uint32_t packed_kv_bound,
+    const uint32_t kv_stride_page, const uint32_t kv_stride_n, const uint_fastdiv& block_size,
+    typename KTraits::IdType* indices, size_t* kv_offset) {
+  using DTypeKV = typename KTraits::DTypeKV;
+  constexpr uint32_t KV_THR_LAYOUT_ROW = KTraits::KV_THR_LAYOUT_ROW;
+  constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
+  constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
+  constexpr uint32_t NUM_WARPS_KV = KTraits::NUM_WARPS_KV;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr SwizzleMode SWIZZLE_MODE_KV = KTraits::SWIZZLE_MODE_KV;
+  const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<KTraits>(threadIdx.y, threadIdx.z);
+
+#pragma unroll
+  for (uint32_t i = 0;
+       i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
+    uint32_t page_iter, entry_idx;
+    block_size.divmod(packed_block_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
+                          lane_idx / KV_THR_LAYOUT_COL +
+                          KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i,
+                      page_iter, entry_idx);
+    kv_offset[i] = indices[page_iter] * kv_stride_page + entry_idx * kv_stride_n +
+                   (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+  }
+}
+
 template <typename KTraits, typename Params>
 __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     const Params& params, typename KTraits::SharedStorage* smem_storage) {
@@ -82,12 +109,29 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   const uint32_t o_stride_n = params.o_stride_n;
   const uint32_t o_stride_h = params.o_stride_h;
   const uint32_t cluster_tile_q = gridDim.x * CTA_TILE_Q;
-  smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage->q_smem);
+  smem_t<SWIZZLE_MODE_Q> q_smem(smem_storage->q_smem);
 
   AttentionVariant variant(params, /*batch_idx=*/0, nullptr);
 
   const uint32_t lane_idx = threadIdx.x % 32;
   const uint32_t warp_idx = threadIdx.x / 32;
+
+  uint32_t q_smem_offset_r = get_permuted_offset<SWIZZLE_MODE_Q, UPCAST_STRIDE_Q>(
+      get_warp_idx_q<KTraits>(threadIdx.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+  uint32_t k_smem_offset_r = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_K>(
+               get_warp_idx_kv<KTraits>(threadIdx.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
+                   lane_idx % 8,
+               (lane_idx % 16) / 8),
+           v_smem_offset_r = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_V>(
+               get_warp_idx_kv<KTraits>(threadIdx.z) * NUM_MMA_KV * 16 + lane_idx % 16,
+               lane_idx / 16);
+  uint32_t k_smem_offset_w = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_K>(
+               warp_idx * KTraits::KV_THR_LAYOUT_ROW + lane_idx / KTraits::KV_THR_LAYOUT_COL,
+               lane_idx % KTraits::KV_THR_LAYOUT_COL),
+           v_smem_offset_w = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_V>(
+               warp_idx * KTraits::KV_THR_LAYOUT_ROW + lane_idx / KTraits::KV_THR_LAYOUT_COL,
+               lane_idx % KTraits::KV_THR_LAYOUT_COL);
+  size_t thr_local_kv_offset[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
 
 #pragma unroll 1
   for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
@@ -103,9 +147,11 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
 
     DTypeQ* q_ptr_base = q + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
     // load_q
-    load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upperbound, q_ptr_base, q_stride_n,
-                                q_stride_h, gqa_group_size, &qo_smem, threadIdx);
+    // load_q_global_smem<KTraits>(&smem_storage, qo_packed_idx_base, qo_upperbound, q_ptr_base,
+    // q_stride_n,
+    //                             q_stride_h, gqa_group_size, threadIdx);
 
+    smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage->k_smem), v_smem(smem_storage->v_smem);
     int kv_tile_idx =
         ceil_div((CAUSAL ? min(kv_end,
                                kv_len - q_len + (packed_qo_start + cluster_tile_q) / gqa_group_size)
@@ -123,28 +169,56 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     __syncthreads();
     uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
 
+    prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                             k_stride_page, k_stride_n, block_size, kv_indices,
+                             thr_local_kv_offset);
+    page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
+                                 block_iter_base + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
+                                 kv_len, threadIdx);
     cp_async::commit_group();
-#pragma unroll
-    for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
-      if (kv_tile_idx - stage_idx >= 0) {
-        // load_kv<false, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n,
-        // ckv_stride_page,
-        //                         kpe_stride_n, kpe_stride_page, packed_kv_bound,
-        //                         block_iter_base + (kv_tile_idx - stage_idx) * CTA_TILE_KV,
-        //                         block_size, (kv_tile_idx - stage_idx) % NUM_STAGES);
-        cp_async::commit_group();
-      }
-    }
+    page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
+                                block_iter_base + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
+                                kv_len, threadIdx);
+    cp_async::commit_group();
 
     // loop with mask
-    LOOP_SPLIT_MASK(kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
-                    kv_tile_idx + 1 > NUM_STAGES,
-                    {
+    LOOP_SPLIT_MASK(
+        kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0, kv_tile_idx + 1 > NUM_STAGES,
+        {
+          prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                   k_stride_page, k_stride_n, block_size, kv_indices,
+                                   thr_local_kv_offset);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
+          __syncthreads();
 
-                    });
+          compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
+
+          __syncthreads();
+          page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
+                                       block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                       thr_local_kv_offset, kv_len, threadIdx);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
+
+          __syncthreads();
+          compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          __syncthreads();
+
+          page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
+                                      block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                      thr_local_kv_offset, kv_len, threadIdx);
+          cp_async::commit_group();
+        });
+    cp_async::wait_group<0>();
+    __syncthreads();
 
 #pragma unroll
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
+      compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
+      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
     }
 
     __syncthreads();

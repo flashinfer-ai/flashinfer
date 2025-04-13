@@ -44,6 +44,16 @@ constexpr __host__ __device__ __forceinline__ uint32_t upcast_size() {
   return sizeof(b128_t) / sizeof(T);
 }
 
+template <SwizzleMode swizzle_mode, uint32_t stride>
+__device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
+  if constexpr (swizzle_mode == SwizzleMode::k128B) {
+    return i * stride + (j ^ (i % 8));
+  } else {
+    // swizzle_mode == SwizzleMode::k64B
+    return i * stride + (j ^ ((i / 2) % 4));
+  }
+}
+
 /*!
  * \brief The shared memory wrapper.
  */
@@ -67,9 +77,9 @@ struct smem_t {
       return i * stride + (j ^ (i % 8));
     } else {
       // swizzle_mode == SwizzleMode::k64B
-      static_assert(stride == 4);
       return i * stride + (j ^ ((i / 2) % 4));
     }
+    // return get_permuted_offset<swizzle_mode, stride>(i, j);
   }
 
   template <uint32_t step_size>
