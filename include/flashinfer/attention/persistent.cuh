@@ -146,6 +146,9 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     init_states<KTraits>(variant, o_frag, m, d);
 
     DTypeQ* q_ptr_base = q + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
+    DTypeO* o_ptr_base =
+        final_o + q_indptr * o_stride_n + (kv_head_idx * gqa_group_size) * o_stride_h;
+
     // load_q
     // load_q_global_smem<KTraits>(&smem_storage, qo_packed_idx_base, qo_upperbound, q_ptr_base,
     // q_stride_n,
@@ -232,6 +235,9 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     normalize_d<KTraits>(o_frag, m, d);
 
     // write back to global memory
+    // NOTE(Zihao): use new write back
+    write_o_reg_gmem<KTraits>(o_frag, &q_smem, o_ptr_base, qo_packed_idx_base, qo_upperbound,
+                              o_stride_n, o_stride_h, gqa_group_size, threadIdx);
   }
 }
 
