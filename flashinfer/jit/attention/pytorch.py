@@ -108,6 +108,9 @@ def gen_batch_mla_module(
     head_dim_ckv: int,
     head_dim_kpe: int,
     use_profiler: bool,
+    mask_mode: int,
+    custom_mask: torch.Tensor = None,
+    packed_custom_mask: torch.Tensor = None,
 ):
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -117,6 +120,7 @@ def gen_batch_mla_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
+        mask_mode,
         head_dim_ckv,
         head_dim_kpe,
         use_profiler,
@@ -135,8 +139,10 @@ def gen_batch_mla_module(
                 dtype_kv=dtype_map[dtype_kv],
                 dtype_o=dtype_map[dtype_o],
                 dtype_idx=dtype_map[dtype_idx],
+                mask_mode=mask_mode,
                 head_dim_ckv=head_dim_ckv,
                 head_dim_kpe=head_dim_kpe,
+                
             ),
         )
 
@@ -163,6 +169,7 @@ def gen_batch_mla_module(
                 dtype_kv=dtype_map[dtype_kv],
                 dtype_o=dtype_map[dtype_o],
                 dtype_idx=dtype_map[dtype_idx],
+                mask_mode=mask_mode,
                 head_dim_ckv=head_dim_ckv,
                 head_dim_kpe=head_dim_kpe,
             ),
