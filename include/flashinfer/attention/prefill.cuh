@@ -776,8 +776,6 @@ __device__ __forceinline__ void logits_mask(
                    ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
                    : kv_idx >= chunk_end)) &&
             variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
-        // printf("mma_q: %d, mma_kv: %d, reg_id: %d, s_frag: %f\n", mma_q, mma_kv, reg_id,
-        // s_frag[mma_q][mma_kv][reg_id]);
         s_frag[mma_q][mma_kv][reg_id] =
             (mask) ? s_frag[mma_q][mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
