@@ -13,7 +13,7 @@ def run_bench(
     num_qo_heads=28,
     head_dim=128,
     device=0,
-    causal=False,
+    causal=True,
 ):
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
     q_lens = torch.tensor(qo_lens, dtype=torch.int32)
@@ -70,8 +70,7 @@ def run_bench(
         kv_data_type=torch.bfloat16,
     )
     ms = do_bench(lambda: wrapper.run(q, kv_data))
-    o = wrapper.run(q, kv_data)
-    print(o)
+    o, lse = wrapper.run(q, kv_data)
 
     print(f"Elapsed time (old scheduler): {ms_old:.2f} ms")
     print(f"Elapsed time (mixed scheduler): {ms:.2f} ms")
@@ -93,52 +92,52 @@ if __name__ == "__main__":
     torch.random.manual_seed(42)
 
     seq_len_configs = [
-        # [(600, 1)] * 122 + [(10000, 17)] * 8,
-        [(64, 16)] * 768,
-        # [(400, 1)] * 242 + [(8192, 17)] * 16,
-        # [(8192, 1)] * 256,
+        [(600, 1)] * 122 + [(10000, 17)] * 8,
+        [(10000, 1)] * 128,
+        [(400, 1)] * 242 + [(8192, 17)] * 16,
+        [(8192, 1)] * 256,
     ]
 
     # construct random length testcases
-    # for _ in range(1):
-    #     bsz = 256
-    #     stride = 16
-    #     sparsity = 0.05
+    for _ in range(1):
+        bsz = 256
+        stride = 16
+        sparsity = 0.05
 
-    #     full_kv_len = np.random.randint(1000, 8192, size=bsz)
-    #     seq_len = []
-    #     for i in range(bsz):
-    #         if i % stride == 0:
-    #             kv_len = full_kv_len[i]
-    #             qo_len = stride + 1
-    #         else:
-    #             kv_len = int(full_kv_len[i] * sparsity)
-    #             qo_len = 1
+        full_kv_len = np.random.randint(1000, 8192, size=bsz)
+        seq_len = []
+        for i in range(bsz):
+            if i % stride == 0:
+                kv_len = full_kv_len[i]
+                qo_len = stride + 1
+            else:
+                kv_len = int(full_kv_len[i] * sparsity)
+                qo_len = 1
 
-    #         seq_len.append((kv_len, qo_len))
-    #     seq_len_configs.append(seq_len)
+            seq_len.append((kv_len, qo_len))
+        seq_len_configs.append(seq_len)
 
-    # for _ in range(1):
-    #     bsz = 128
-    #     stride = 16
-    #     sparsity = 0.05
+    for _ in range(1):
+        bsz = 128
+        stride = 16
+        sparsity = 0.05
 
-    #     full_kv_len = np.random.randint(2000, 16000, size=bsz)
-    #     seq_len = []
-    #     for i in range(bsz):
-    #         if i % stride == 0:
-    #             kv_len = full_kv_len[i]
-    #             qo_len = stride + 1
-    #         else:
-    #             kv_len = int(full_kv_len[i] * sparsity)
-    #             qo_len = 1
+        full_kv_len = np.random.randint(2000, 16000, size=bsz)
+        seq_len = []
+        for i in range(bsz):
+            if i % stride == 0:
+                kv_len = full_kv_len[i]
+                qo_len = stride + 1
+            else:
+                kv_len = int(full_kv_len[i] * sparsity)
+                qo_len = 1
 
-    #         seq_len.append((kv_len, qo_len))
-    #     seq_len_configs.append(seq_len)
+            seq_len.append((kv_len, qo_len))
+        seq_len_configs.append(seq_len)
 
     page_block_size = 1
     num_kv_heads = 4
-    num_qo_heads = 32
+    num_qo_heads = 28
     head_dim = 128
 
     for idx, seq_len_pairs in enumerate(seq_len_configs):
