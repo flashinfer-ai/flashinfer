@@ -80,7 +80,7 @@ class BatchAttention:
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
         torch.cuda.synchronize()
-        
+
         batch_size = kv_len_arr.shape[0]
         self._page_size = page_size
         self._sm_scale = sm_scale
@@ -89,11 +89,11 @@ class BatchAttention:
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._sm_scale = sm_scale
-        
+
         # No addtional buf allocated for CUDA graph tensor
         # Allocate outside FlashInfer
         self._kv_indices = kv_indices
-        
+
         self._plan_info = self.module.plan(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -142,5 +142,5 @@ class BatchAttention:
             self._page_size,
             self._sm_scale,
         )
-        
+
         return out, lse
