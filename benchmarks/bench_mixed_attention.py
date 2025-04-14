@@ -67,12 +67,30 @@ if __name__ == "__main__":
     ]
     
     # construct random length testcases
-    for _ in range(2):
+    for _ in range(1):
         bsz = 256
         stride = 16
         sparsity = 0.05
         
         full_kv_len = np.random.randint(1000, 8192, size=bsz)
+        seq_len = []
+        for i in range(bsz):
+            if i % stride == 0:
+                kv_len = full_kv_len[i]
+                qo_len = stride + 1
+            else:
+                kv_len = int(full_kv_len[i] * sparsity)
+                qo_len = 1
+            
+            seq_len.append((kv_len, qo_len))
+        seq_len_configs.append(seq_len)
+        
+    for _ in range(1):
+        bsz = 128
+        stride = 16
+        sparsity = 0.05
+        
+        full_kv_len = np.random.randint(2000, 16000, size=bsz)
         seq_len = []
         for i in range(bsz):
             if i % stride == 0:
