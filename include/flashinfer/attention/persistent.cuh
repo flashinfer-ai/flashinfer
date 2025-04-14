@@ -46,11 +46,12 @@ __device__ __forceinline__ void prefetch_offest(
   for (uint32_t i = 0;
        i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
     uint32_t page_iter, entry_idx;
-    block_size.divmod(packed_block_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
-                          lane_idx / KV_THR_LAYOUT_COL +
-                          KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i,
-                      page_iter, entry_idx);
-    kv_offset[i] = indices[page_iter] * kv_stride_page + entry_idx * kv_stride_n +
+    uint32_t packed_block_iter = packed_block_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
+                                 lane_idx / KV_THR_LAYOUT_COL +
+                                 KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i;
+    block_size.divmod(packed_block_iter, page_iter, entry_idx);
+    kv_offset[i] = (packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) * kv_stride_page +
+                   entry_idx * kv_stride_n +
                    (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
   }
 }
@@ -188,57 +189,55 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     cp_async::commit_group();
 
     // loop with mask
-    LOOP_SPLIT_MASK(kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
-                    kv_tile_idx + 1 > NUM_STAGES, {
-                      prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                               packed_kv_bound, k_stride_page, k_stride_n,
-                                               block_size, kv_indices, thr_local_kv_offset);
-                      cp_async::commit_group();
-                      cp_async::wait_group<1>();
-                      __syncthreads();
+    LOOP_SPLIT_MASK(
+        kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0, kv_tile_idx + 1 > NUM_STAGES,
+        {
+          prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                   packed_kv_bound, k_stride_page, k_stride_n, block_size,
+                                   kv_indices, thr_local_kv_offset);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
+          __syncthreads();
 
-                      compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-                                          s_frag);
-                      // if constexpr (WITH_MASK) {
-                      //   logits_mask<KTraits>(
-                      //       params, variant,
-                      //       /*batch_idx=*/0, qo_packed_idx_base,
-                      //       kv_start + (kv_tile_idx * NUM_WARPS_KV +
-                      //       get_warp_idx_kv<KTraits>(warp_idx)) *
-                      //                      NUM_MMA_KV * 16,
-                      //       q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
-                      // }
-                      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
+          compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+          if constexpr (WITH_MASK) {
+            logits_mask<KTraits>(
+                params, variant,
+                /*batch_idx=*/0, qo_packed_idx_base,
+                kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) *
+                               NUM_MMA_KV * 16,
+                q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
+          }
+          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
-                      __syncthreads();
-                      page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
-                                                   kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                                   thr_local_kv_offset, kv_end);
-                      cp_async::commit_group();
-                      cp_async::wait_group<1>();
+          __syncthreads();
+          page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
+                                       kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                       thr_local_kv_offset, kv_end);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
 
-                      __syncthreads();
-                      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
-                      __syncthreads();
+          __syncthreads();
+          compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          __syncthreads();
 
-                      page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
-                                                  kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                                  thr_local_kv_offset, kv_end);
-                      cp_async::commit_group();
-                    });
+          page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
+                                      kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                      thr_local_kv_offset, kv_end);
+          cp_async::commit_group();
+        });
     cp_async::wait_group<0>();
     __syncthreads();
 
 #pragma unroll
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
       compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-      // logits_mask<KTraits>(
-      //     params, variant,
-      //     /*batch_idx=*/0, qo_packed_idx_base,
-      //     kv_start +
-      //         (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) * NUM_MMA_KV *
-      //         16,
-      //     q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
+      logits_mask<KTraits>(
+          params, variant,
+          /*batch_idx=*/0, qo_packed_idx_base,
+          kv_start +
+              (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) * NUM_MMA_KV * 16,
+          q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
     }
@@ -248,7 +247,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
-    // threadblock_allreduce<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, threadIdx);
+    threadblock_allreduce<KTraits>(o_frag, smem_storage, m, d);
 
     // normalize d
     normalize_d<KTraits>(o_frag, m, d);
@@ -270,6 +269,7 @@ __global__ __launch_bounds__(std::max(
   extern __shared__ uint8_t smem[];
   auto& smem_storage_1 = reinterpret_cast<typename KTraits1::SharedStorage&>(smem);
   BlockBatchPagedAttentionPersistent<KTraits1>(params_1, &smem_storage_1);
+  __syncthreads();
   auto& smem_storage_2 = reinterpret_cast<typename KTraits2::SharedStorage&>(smem);
   BlockBatchPagedAttentionPersistent<KTraits2>(params_2, &smem_storage_2);
 }
@@ -296,7 +296,7 @@ cudaError_t BatchPagedAttentionPersistentHolistic(const Params params_1, const P
   constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
   constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
   constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
-  constexpr uint32_t NUM_MMA_KV_2 = 8;
+  constexpr uint32_t NUM_MMA_KV_2 = 4;
   using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
                                 NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
                                 DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
