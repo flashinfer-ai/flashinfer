@@ -13,9 +13,6 @@ def run_bench(
     device=0,
     causal=True
 ):
-    np.random.seed(42)
-    torch.random.manual_seed(42)
-
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
     q_lens = torch.tensor(qo_lens, dtype=torch.int32)
 
@@ -52,13 +49,15 @@ def run_bench(
     print(f"Elapsed time: {ms:.2f} ms")
 
     total_bytes = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
-    print(f"Loading memory size (bytes): {total_bytes}")
+    print(f"Loading memory size (MB): {total_bytes / (1024**2):.2f} MB")
 
     bandwidth_util_percent = 100 * total_bytes / ((ms * 3352 * (1024**3)) / 1000)
     print(f"Memory bandwidth utilization: {bandwidth_util_percent:.4f} %\n")
 
 
 if __name__ == "__main__":
+    np.random.seed(42)
+    torch.random.manual_seed(42)
 
     seq_len_configs = [
         [(600, 1)] * 122 + [(10000, 17)] * 8,
@@ -66,6 +65,25 @@ if __name__ == "__main__":
         [(400, 1)] * 242 + [(8192, 17)] * 16,
         [(8192,1)] * 256,
     ]
+    
+    # construct random length testcases
+    for _ in range(2):
+        bsz = 256
+        stride = 16
+        sparsity = 0.05
+        
+        full_kv_len = np.random.randint(1000, 8192, size=bsz)
+        seq_len = []
+        for i in range(bsz):
+            if i % stride == 0:
+                kv_len = full_kv_len[i]
+                qo_len = stride + 1
+            else:
+                kv_len = int(full_kv_len[i] * sparsity)
+                qo_len = 1
+            
+            seq_len.append((kv_len, qo_len))
+        seq_len_configs.append(seq_len)
 
     page_block_size = 1
     num_kv_heads = 4
