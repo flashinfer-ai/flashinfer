@@ -61,7 +61,7 @@ namespace {
  */
 template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
-__device__ __forceinline__ void compute_qk(
+__device__ __forceinline__ void gemm_qk(
     const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* smem,
     const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
     uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
@@ -307,7 +307,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    gemm_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, /*batch_idx=*/0,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, qo_head_idx,
@@ -525,7 +525,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
+    gemm_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, batch_idx,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
@@ -787,7 +787,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
 
 template <uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
-__device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
+__device__ __forceinline__ void gemm_qk_and_update_local_stat_mla(
     const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* ckv_smem,
     const vec_t<float, vec_size_ckv>& q_nope_vec, const T* kpe_smem,
     const vec_t<float, vec_size_kpe>& q_pe_vec, const vec_t<float, vec_size_kpe>& freq,
@@ -897,7 +897,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   constexpr uint32_t kv_iter_len = bdy * bdz;
-  constexpr uint32_t compute_qk_tile = bdy;
+  constexpr uint32_t gemm_qk_tile = bdy;
 
   extern __attribute__((shared)) uint8_t smem[];
   DTypeKV* ckv_smem = (DTypeKV*)smem;
@@ -978,10 +978,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
         cur_chunk_start + iter * kv_iter_len;
 #pragma unroll
     for (int i = 0; i < tile_size_qo_heads; ++i) {
-      compute_qk_and_update_local_stat_mla<vec_size_ckv, vec_size_kpe, bdx, compute_qk_tile>(
+      gemm_qk_and_update_local_stat_mla<vec_size_ckv, vec_size_kpe, bdx, gemm_qk_tile>(
           params, variant, mapped_batch_idx,
-          ckv_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile) * head_dim_ckv, q_nope_vec[i],
-          kpe_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile) * head_dim_kpe, q_pe_vec[i],
+          ckv_smem + (stage_idx * kv_iter_len + tz * gemm_qk_tile) * head_dim_ckv, q_nope_vec[i],
+          kpe_smem + (stage_idx * kv_iter_len + tz * gemm_qk_tile) * head_dim_kpe, q_pe_vec[i],
           freq, kv_idx_base,
           /*iter_base*/ iter * kv_iter_len, /*iter_bound*/ cur_chunk_len, st[i]);
     }

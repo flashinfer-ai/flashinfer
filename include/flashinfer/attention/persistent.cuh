@@ -138,15 +138,9 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
        ++work_idx) {
     const auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start,
                 kv_end, kv_head_idx] = get_block_coord(params, work_idx);
-    // if (threadIdx.x == 0) {
-    //   printf(
-    //       "q_indptr: %d, kv_indptr: %d, partial_indptr: %d, q_len: %d, kv_len: %d, "
-    //       "packed_qo_start: %d, kv_start: %d, kv_end: %d, kv_head_idx: %d\n",
-    //       q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end,
-    //       kv_head_idx);
-    // }
 
-    const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q;
+    const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
+                                        get_warp_idx_q<KTraits>(warp_idx) * NUM_MMA_Q * 16;
     const uint32_t qo_upperbound =
         min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
 
@@ -199,7 +193,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
           cp_async::wait_group<1>();
           __syncthreads();
 
-          compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+          gemm_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
           if constexpr (WITH_MASK) {
             logits_mask<KTraits>(
                 params, variant,
@@ -218,7 +212,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
           cp_async::wait_group<1>();
 
           __syncthreads();
-          compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          gemm_pv<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
           __syncthreads();
 
           page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
@@ -231,7 +225,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
 
 #pragma unroll
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
-      compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+      gemm_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       logits_mask<KTraits>(
           params, variant,
           /*batch_idx=*/0, qo_packed_idx_base,
@@ -239,7 +233,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
               (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) * NUM_MMA_KV * 16,
           q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
-      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      gemm_pv<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
     }
 
     __syncthreads();

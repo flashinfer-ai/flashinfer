@@ -282,9 +282,9 @@ __device__ __forceinline__ void load_kv(
 
 template <bool init, typename KTraits, uint32_t NUM_MMA_D_QK, uint32_t UPCAST_STRIDE_Q,
           uint32_t UPCAST_STRIDE_K, SwizzleMode SWIZZLE_MODE_Q, SwizzleMode SWIZZLE_MODE_KV>
-__device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
-                                            smem_t<SWIZZLE_MODE_KV> k_smem,
-                                            typename KTraits::DTypeQKAccum (*s_frag)[8]) {
+__device__ __forceinline__ void gemm_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
+                                         smem_t<SWIZZLE_MODE_KV> k_smem,
+                                         typename KTraits::DTypeQKAccum (*s_frag)[8]) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   alignas(16) uint32_t q_frag[4], k_frag[4];
   // compute q*k^T
@@ -488,10 +488,10 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
   smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
-              KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
-  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
-              KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  gemm_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+           KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
+  gemm_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+           KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
 }
 
 template <typename KTraits>

@@ -152,12 +152,12 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
 
   using AttentionVariant = StandardAttention;
 
-  cudaError_t status =
-      BatchPagedAttentionPersistentHolistic<16, 128, 128, 128, MaskMode::kCausal, AttentionVariant>(
-          params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
-
-  TORCH_CHECK(status == cudaSuccess,
-              "Failed to run persistent paged attention, error: ", cudaGetErrorString(status));
-
+  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
+    cudaError_t status =
+        BatchPagedAttentionPersistentHolistic<16, 128, 128, 128, MASK_MODE, AttentionVariant>(
+            params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+    TORCH_CHECK(status == cudaSuccess,
+                "Failed to run persistent paged attention, error: ", cudaGetErrorString(status));
+  });
   return o;
 }
