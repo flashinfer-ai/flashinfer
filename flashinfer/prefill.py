@@ -632,6 +632,7 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    backend: str = "auto",
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -652,6 +653,7 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    backend: str = "auto",
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -671,8 +673,8 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-    return_lse: bool = False,
     backend: str = "auto",
+    return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -728,12 +730,12 @@ def single_prefill_with_kv_cache(
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
-    return_lse : bool
-        Whether to return the log sum exp value of the attention logits.
     backend : str
         The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
         If set to ``auto``, the function will automatically choose the backend based on the
         device architecture and kernel availability.
+    return_lse : bool
+        Whether to return the log sum exp value of the attention logits.
 
     Returns
     -------
