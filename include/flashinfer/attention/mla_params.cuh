@@ -38,6 +38,7 @@ struct MLAParams {
   DTypeO* final_o;
   float* final_lse;
 
+  IdType* batch_indices;
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* partial_indptr;

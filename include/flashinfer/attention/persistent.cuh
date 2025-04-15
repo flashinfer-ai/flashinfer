@@ -22,17 +22,19 @@ namespace flashinfer {
 
 template <typename Params>
 __device__ __forceinline__ auto get_block_coord(const Params& params, const uint32_t work_idx) {
-  return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
-                    params.partial_indptr[work_idx], params.q_len[work_idx],
-                    params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx], params.kv_head_idx_arr[work_idx]);
+  return std::tuple(params.batch_indices[work_idx], params.q_indptr[work_idx],
+                    params.kv_indptr[work_idx], params.partial_indptr[work_idx],
+                    params.q_len[work_idx], params.kv_len[work_idx], params.q_start[work_idx],
+                    params.kv_start[work_idx], params.kv_end[work_idx],
+                    params.kv_head_idx_arr[work_idx]);
 }
 
 template <typename KTraits>
 __device__ __forceinline__ void prefetch_offest(
     const uint32_t packed_block_iter_base, const uint32_t packed_kv_bound,
-    const uint32_t kv_stride_page, const uint32_t kv_stride_n, const uint_fastdiv& block_size,
-    typename KTraits::IdType* indices, size_t* kv_offset) {
+    const uint32_t kv_head_idx, const uint32_t kv_stride_page, const uint32_t kv_stride_h,
+    const uint32_t kv_stride_n, const uint_fastdiv& block_size, typename KTraits::IdType* indices,
+    size_t* kv_offset) {
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t KV_THR_LAYOUT_ROW = KTraits::KV_THR_LAYOUT_ROW;
   constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
@@ -51,7 +53,7 @@ __device__ __forceinline__ void prefetch_offest(
                                  KV_THR_LAYOUT_ROW * NUM_WARPS_Q * NUM_WARPS_KV * i;
     block_size.divmod(packed_block_iter, page_iter, entry_idx);
     kv_offset[i] = (packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) * kv_stride_page +
-                   entry_idx * kv_stride_n +
+                   entry_idx * kv_stride_n + kv_head_idx * kv_stride_h +
                    (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
   }
 }
@@ -104,8 +106,10 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   const uint32_t k_stride_page = params.k_stride_page;
+  const uint32_t k_stride_h = params.k_stride_h;
   const uint32_t k_stride_n = params.k_stride_n;
   const uint32_t v_stride_page = params.v_stride_page;
+  const uint32_t v_stride_h = params.v_stride_h;
   const uint32_t v_stride_n = params.v_stride_n;
   const uint32_t o_stride_n = params.o_stride_n;
   const uint32_t o_stride_h = params.o_stride_h;
@@ -136,8 +140,8 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
 #pragma unroll 1
   for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
        ++work_idx) {
-    const auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start,
-                kv_end, kv_head_idx] = get_block_coord(params, work_idx);
+    const auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
+                kv_start, kv_end, kv_head_idx] = get_block_coord(params, work_idx);
 
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                         get_warp_idx_q<KTraits>(warp_idx) * NUM_MMA_Q * 16;
@@ -173,8 +177,8 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
 
     prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                             k_stride_page, k_stride_n, block_size, kv_indices,
-                             thr_local_kv_offset);
+                             kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
+                             kv_indices, thr_local_kv_offset);
     page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
                                  kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset, kv_end);
     cp_async::commit_group();
@@ -187,17 +191,15 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
         kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0, kv_tile_idx + 1 > NUM_STAGES,
         {
           prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                   packed_kv_bound, k_stride_page, k_stride_n, block_size,
-                                   kv_indices, thr_local_kv_offset);
-          cp_async::commit_group();
+                                   packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h,
+                                   k_stride_n, block_size, kv_indices, thr_local_kv_offset);
           cp_async::wait_group<1>();
           __syncthreads();
 
           gemm_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
           if constexpr (WITH_MASK) {
             logits_mask<KTraits>(
-                params, variant,
-                /*batch_idx=*/0, qo_packed_idx_base,
+                params, variant, batch_idx, qo_packed_idx_base,
                 kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) *
                                NUM_MMA_KV * 16,
                 q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
@@ -227,8 +229,7 @@ __device__ __forceinline__ void BlockBatchPagedAttentionPersistent(
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
       gemm_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       logits_mask<KTraits>(
-          params, variant,
-          /*batch_idx=*/0, qo_packed_idx_base,
+          params, variant, batch_idx, qo_packed_idx_base,
           kv_start +
               (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(warp_idx)) * NUM_MMA_KV * 16,
           q_len, kv_len, kv_end, gqa_group_size, s_frag, kv_head_idx);
@@ -266,6 +267,7 @@ __global__ __launch_bounds__(std::max(
   __syncthreads();
   auto& smem_storage_2 = reinterpret_cast<typename KTraits2::SharedStorage&>(smem);
   BlockBatchPagedAttentionPersistent<KTraits2>(params_2, &smem_storage_2);
+  __syncthreads();
 }
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,

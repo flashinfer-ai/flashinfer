@@ -550,14 +550,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   }
 }
 
-template <typename Params>
-__device__ __forceinline__ auto get_block_coord(const Params& params, const uint32_t work_idx) {
-  return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
-                    params.partial_indptr[work_idx], params.q_len[work_idx],
-                    params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx]);
-}
-
 template <typename KTraits>
 __device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag) {
 #pragma unroll
@@ -684,8 +676,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
          ++work_idx) {
-      auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end] =
-          get_block_coord(params, work_idx);
+      auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
+            kv_start, kv_end] = get_block_coord(params, work_idx);
 
       init_states_<KTraits>(o_frag, m, d, o_scale);
 
@@ -792,8 +784,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
          ++work_idx) {
-      auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end] =
-          get_block_coord(params, work_idx);
+      auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
+            kv_start, kv_end] = get_block_coord(params, work_idx);
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
       const uint32_t qo_upperbound =
           min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));

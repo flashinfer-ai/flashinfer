@@ -791,10 +791,10 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 
 template <typename Params>
 __device__ __forceinline__ auto get_block_coord(const Params& params, const uint32_t work_idx) {
-  return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
-                    params.partial_indptr[work_idx], params.q_len[work_idx],
-                    params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx]);
+  return std::tuple(params.batch_indices[work_idx], params.q_indptr[work_idx],
+                    params.kv_indptr[work_idx], params.partial_indptr[work_idx],
+                    params.q_len[work_idx], params.kv_len[work_idx], params.q_start[work_idx],
+                    params.kv_start[work_idx], params.kv_end[work_idx]);
 }
 
 template <typename KTraits, typename Params>
@@ -807,8 +807,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
   extern __shared__ __align__(alignof(typename KTraits::SharedStorage)) uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
-
-  typename KTraits::AttentionVariant variant(params, blockIdx.y, smem);
 
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_NOPE = KTraits::SWIZZLE_MODE_Q_NOPE;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
@@ -854,8 +852,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 #pragma unroll 1
   for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
        ++work_idx) {
-    const auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start,
-                kv_end] = get_block_coord(params, work_idx);
+    const auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
+                kv_start, kv_end] = get_block_coord(params, work_idx);
+
+    typename KTraits::AttentionVariant variant(params, batch_idx, smem);
 
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
     const uint32_t qo_upperbound =

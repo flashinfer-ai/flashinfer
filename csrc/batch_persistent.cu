@@ -90,8 +90,10 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
   unsigned int q_stride_n = q.stride(0);
   unsigned int q_stride_h = q.stride(1);
   unsigned int k_stride_page = k_cache.stride(0);
+  unsigned int k_stride_h = k_cache.stride(2);
   unsigned int k_stride_n = k_cache.stride(1);
   unsigned int v_stride_page = v_cache.stride(0);
+  unsigned int v_stride_h = v_cache.stride(2);
   unsigned int v_stride_n = v_cache.stride(1);
   unsigned int o_stride_n = o.stride(0);
   unsigned int o_stride_h = o.stride(1);
@@ -106,6 +108,8 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
     params[i].k = static_cast<nv_bfloat16*>(k_cache.data_ptr());
     params[i].v = static_cast<nv_bfloat16*>(v_cache.data_ptr());
 
+    params[i].batch_indices =
+        GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].batch_indices_offset);
     params[i].q_indptr =
         GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_indptr_offset);
     params[i].kv_indptr =
@@ -141,8 +145,10 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
     params[i].q_stride_n = q_stride_n;
     params[i].q_stride_h = q_stride_h;
     params[i].k_stride_page = k_stride_page;
+    params[i].k_stride_h = k_stride_h;
     params[i].k_stride_n = k_stride_n;
     params[i].v_stride_page = v_stride_page;
+    params[i].v_stride_h = v_stride_h;
     params[i].v_stride_n = v_stride_n;
     params[i].o_stride_n = o_stride_n;
     params[i].o_stride_h = o_stride_h;

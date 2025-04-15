@@ -94,7 +94,7 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
           typename AttentionVariant_>
 struct KernelTraits {
-  static constexpr uint32_t NUM_STAGES = 2;
+  static constexpr uint32_t NUM_STAGES = 1;
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
   static constexpr uint32_t NUM_MMA_Q = NUM_MMA_Q_;
   static constexpr uint32_t NUM_MMA_KV = NUM_MMA_KV_;

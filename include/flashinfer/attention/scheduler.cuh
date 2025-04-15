@@ -972,6 +972,7 @@ struct HolisticPlanInfo {
   int64_t num_blks_x;
   int64_t num_blks_y;
   struct {
+    int64_t batch_indices_offset;
     int64_t q_indptr_offset;
     int64_t kv_indptr_offset;
     int64_t partial_indptr_offset;
@@ -991,6 +992,7 @@ struct HolisticPlanInfo {
     vec.push_back(num_blks_x);
     vec.push_back(num_blks_y);
     for (uint32_t i = 0; i < NUM_TASKS; ++i) {
+      vec.push_back(tasks[i].batch_indices_offset);
       vec.push_back(tasks[i].q_indptr_offset);
       vec.push_back(tasks[i].kv_indptr_offset);
       vec.push_back(tasks[i].partial_indptr_offset);
@@ -1008,28 +1010,29 @@ struct HolisticPlanInfo {
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 4 + NUM_TASKS * 10) {
+    if (vec.size() != 4 + NUM_TASKS * 11) {
       std::ostringstream err_msg;
-      err_msg << "HolisticPlanInfo::FromVector: vec.size() should be " << 4 + NUM_TASKS * 10
+      err_msg << "HolisticPlanInfo::FromVector: vec.size() should be " << 4 + NUM_TASKS * 11
               << ", but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
     num_blks_y = vec[1];
     for (uint32_t i = 0; i < NUM_TASKS; ++i) {
-      tasks[i].q_indptr_offset = vec[2 + i * 10];
-      tasks[i].kv_indptr_offset = vec[2 + i * 10 + 1];
-      tasks[i].partial_indptr_offset = vec[2 + i * 10 + 2];
-      tasks[i].q_len_offset = vec[2 + i * 10 + 3];
-      tasks[i].kv_len_offset = vec[2 + i * 10 + 4];
-      tasks[i].q_start_offset = vec[2 + i * 10 + 5];
-      tasks[i].kv_start_offset = vec[2 + i * 10 + 6];
-      tasks[i].kv_end_offset = vec[2 + i * 10 + 7];
-      tasks[i].kv_head_idx_offset = vec[2 + i * 10 + 8];
-      tasks[i].work_indptr_offset = vec[2 + i * 10 + 9];
+      tasks[i].batch_indices_offset = vec[2 + i * 11];
+      tasks[i].q_indptr_offset = vec[2 + i * 11 + 1];
+      tasks[i].kv_indptr_offset = vec[2 + i * 11 + 2];
+      tasks[i].partial_indptr_offset = vec[2 + i * 11 + 3];
+      tasks[i].q_len_offset = vec[2 + i * 11 + 4];
+      tasks[i].kv_len_offset = vec[2 + i * 11 + 5];
+      tasks[i].q_start_offset = vec[2 + i * 11 + 6];
+      tasks[i].kv_start_offset = vec[2 + i * 11 + 7];
+      tasks[i].kv_end_offset = vec[2 + i * 11 + 8];
+      tasks[i].kv_head_idx_offset = vec[2 + i * 11 + 9];
+      tasks[i].work_indptr_offset = vec[2 + i * 11 + 10];
     }
-    partial_o_offset = vec[2 + NUM_TASKS * 10];
-    partial_lse_offset = vec[3 + NUM_TASKS * 10];
+    partial_o_offset = vec[2 + NUM_TASKS * 11];
+    partial_lse_offset = vec[3 + NUM_TASKS * 11];
   }
 };
 
@@ -1248,6 +1251,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
 struct MLAPlanInfo {
   int64_t num_blks_x;
   int64_t num_blks_y;
+  int64_t batch_indices_offset;
   int64_t q_indptr_offset;
   int64_t kv_indptr_offset;
   int64_t partial_indptr_offset;
@@ -1268,6 +1272,7 @@ struct MLAPlanInfo {
   std::vector<int64_t> ToVector() const {
     return {num_blks_x,
             num_blks_y,
+            batch_indices_offset,
             q_indptr_offset,
             kv_indptr_offset,
             partial_indptr_offset,
@@ -1287,29 +1292,30 @@ struct MLAPlanInfo {
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 18) {
+    if (vec.size() != 19) {
       std::ostringstream err_msg;
-      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 18, but got " << vec.size();
+      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
     num_blks_y = vec[1];
-    q_indptr_offset = vec[2];
-    kv_indptr_offset = vec[3];
-    partial_indptr_offset = vec[4];
-    merge_packed_offset_start_offset = vec[5];
-    merge_packed_offset_end_offset = vec[6];
-    merge_partial_packed_offset_start_offset = vec[7];
-    merge_partial_packed_offset_end_offset = vec[8];
-    merge_partial_stride_offset = vec[9];
-    q_len_offset = vec[10];
-    kv_len_offset = vec[11];
-    q_start_offset = vec[12];
-    kv_start_offset = vec[13];
-    kv_end_offset = vec[14];
-    work_indptr_offset = vec[15];
-    partial_o_offset = vec[16];
-    partial_lse_offset = vec[17];
+    batch_indices_offset = vec[2];
+    q_indptr_offset = vec[3];
+    kv_indptr_offset = vec[4];
+    partial_indptr_offset = vec[5];
+    merge_packed_offset_start_offset = vec[6];
+    merge_packed_offset_end_offset = vec[7];
+    merge_partial_packed_offset_start_offset = vec[8];
+    merge_partial_packed_offset_end_offset = vec[9];
+    merge_partial_stride_offset = vec[10];
+    q_len_offset = vec[11];
+    kv_len_offset = vec[12];
+    q_start_offset = vec[13];
+    kv_start_offset = vec[14];
+    kv_end_offset = vec[15];
+    work_indptr_offset = vec[16];
+    partial_o_offset = vec[17];
+    partial_lse_offset = vec[18];
   }
 };
 
@@ -1386,7 +1392,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);
-  std::vector<std::vector<IdType>> cluster_q_indptr(num_clusters, std::vector<IdType>()),
+  std::vector<std::vector<IdType>> cluster_batch_indices(num_clusters, std::vector<IdType>()),
+      cluster_q_indptr(num_clusters, std::vector<IdType>()),
       cluster_kv_indptr(num_clusters, std::vector<IdType>()),
       cluster_q_len(num_clusters, std::vector<IdType>()),
       cluster_kv_len(num_clusters, std::vector<IdType>()),
@@ -1450,6 +1457,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         int actual_len = std::min(remaining_len, kv_len_limit);
         cluster_cost_heap.insert(
             {cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)});
+        cluster_batch_indices[cluster_idx].push_back(i);
         cluster_q_len[cluster_idx].push_back(qo_len);
         cluster_kv_len[cluster_idx].push_back(kv_len);
         cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
@@ -1481,6 +1489,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
   }
   int total_num_works = work_indptr_vec.back();
+  auto batch_indices_vec = flatten(cluster_batch_indices, total_num_works);
   auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
   auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
@@ -1491,6 +1500,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "mla_batch_indices");
   plan_info.q_indptr_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_q_indptr");
   plan_info.kv_indptr_offset =
@@ -1520,6 +1531,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "mla_work_indptr");
 
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.batch_indices_offset, batch_indices_vec);
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.q_indptr_offset, q_indptr_vec);
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.kv_indptr_offset, kv_indptr_vec);
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.partial_indptr_offset,

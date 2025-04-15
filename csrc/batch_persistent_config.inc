@@ -41,6 +41,7 @@ struct PersistentParams {
   DTypeO* final_o;
   float* final_lse;
 
+  IdType* batch_indices;
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* partial_indptr;
@@ -59,8 +60,10 @@ struct PersistentParams {
   uint32_t q_stride_n;
   uint32_t q_stride_h;
   uint32_t k_stride_page;
+  uint32_t k_stride_h;
   uint32_t k_stride_n;
   uint32_t v_stride_page;
+  uint32_t v_stride_h;
   uint32_t v_stride_n;
   uint32_t o_stride_n;
   uint32_t o_stride_h;
