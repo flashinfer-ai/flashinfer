@@ -1046,7 +1046,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                                         uint32_t num_kv_heads, uint32_t head_dim, bool causal,
                                         cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
-  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {16, 128};
+  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
   int num_sm = 0;
   int dev_id = 0;
 
@@ -1072,7 +1072,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     int kv_len = kv_len_arr_h[i];
 
     // TODO(Zihao): add more stages
-    if (packed_qo_len <= CTA_TILE_Q_SIZES[0]) {
+    if (packed_qo_len > CTA_TILE_Q_SIZES[1]) {
       idx_qo_kv_len_vec[0].push_back({i, qo_len, kv_len});
     } else {
       idx_qo_kv_len_vec[1].push_back({i, qo_len, kv_len});
