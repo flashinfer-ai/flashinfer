@@ -14,8 +14,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "flashinfer/utils.h"
-
 struct cuda_error : public std::runtime_error {
   /**
    * @brief Constructs a `cuda_error` object with the given `message`.
