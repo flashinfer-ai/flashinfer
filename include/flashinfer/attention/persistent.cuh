@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_PERSISTENT_CUH_
 #define FLASHINFER_PERSISTENT_CUH_
 
+#include "mask.cuh"
 #include "persistent_template.cuh"
 #include "prefill.cuh"
 
@@ -285,9 +286,10 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
   constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
   constexpr uint32_t NUM_MMA_KV_2 = 2;
-  using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
-                                NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
-                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  using KTraits2 =
+      KernelTraits<MaskMode::kNone, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
+                   NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone, DTypeQ,
+                   DTypeKV, DTypeO, float, IdType, AttentionVariant>;
 
   size_t smem_size =
       max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));

@@ -767,7 +767,9 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   return cudaSuccess;
 }
 
-inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
+inline float cost_function(int qo_len, int kv_len) {
+  return qo_len + kv_len;
+}  // float(qo_len) + kv_len; }
 
 template <typename T>
 std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_flatten) {
