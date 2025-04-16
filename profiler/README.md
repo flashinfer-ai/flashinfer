@@ -4,12 +4,12 @@ FlashInfer Profiler is a tool for intra-kernel profiling for diagnosing kernel p
 
 ## Prerequisites
 
-The Chrome tracing do not support overlapping events inside a single thread (the wgmma instructions are asynchronous, and the execution of several wgmma instructions might overlap). We use [tg4perfetto](https://github.com/ihavnoid/tg4perfetto) to generate perfetto traces.
+The Chrome tracing do not support overlapping events inside a single thread (the wgmma instructions are asynchronous, and the execution of several wgmma instructions might overlap). We use our fork of [tg4perfetto](https://github.com/ihavnoid/tg4perfetto), modified to use the latest protobuf, to generate perfetto traces.
 
 ```bash
 # pip install from github
-pip install protobuf==3.20.0
-pip install git+https://github.com/ihavnoid/tg4perfetto.git
+pip install protobuf
+pip install git+https://github.com/flashinfer-ai/tg4perfetto.git
 ```
 
 ## Examples
