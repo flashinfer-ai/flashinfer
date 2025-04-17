@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["11.8", "12.1", "12.4", "12.6"]
+        cuda: ["12.6", "12.8"]
         cpu: ["cpu-aarch64"]
         torch: ["2.4", "2.5", "2.6"]
         exclude: # We use release_wheel_sglang.yml for faster release and verification. If everything is okay, then we trigger release_wheel.yml. This combination (cuda 12.4 or 11.8 + torch 2.5) is already handled in release_wheel_sglang.yml
@@ -61,7 +61,7 @@ jobs:
         env:
           TORCH_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.TORCH_VERSION }}
           CUDA_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.CUDA_VERSION }}
-          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28_aarch64-builder:' || 'pytorch/manylinuxaarch64-builder:' }}${{ matrix.cpu }}
+          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinuxaarch64-builder:cuda' }}${{ matrix.cuda }}
         run: |
           echo "TORCH_VERSION: $TORCH_VERSION"
           echo "CUDA_VERSION: $CUDA_VERSION"
