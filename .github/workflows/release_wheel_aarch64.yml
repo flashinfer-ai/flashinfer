@@ -60,7 +60,7 @@ jobs:
         env:
           TORCH_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.TORCH_VERSION }}
           CUDA_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.CUDA_VERSION }}
-          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28-builder:cuda' || 'pytorch/manylinux-builder:cuda' }}${{ matrix.cuda }}
+          BUILDER_IMAGE: ${{ ((steps.set_torch_and_cuda_version.outputs.TORCH_VERSION == 206 && steps.set_torch_and_cuda_version.outputs.CUDA_VERSION >= 1206) || steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 206) && 'pytorch/manylinux2_28_aarch64-builder:cuda' || 'pytorch/manylinuxaarch64-builder:cuda' }}${{ matrix.cuda }}
         run: |
           echo "TORCH_VERSION: $TORCH_VERSION"
           echo "CUDA_VERSION: $CUDA_VERSION"
