@@ -67,7 +67,6 @@ jobs:
           echo "BUILDER_IMAGE: $BUILDER_IMAGE"
           chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
           docker run --rm -t \
-              -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
               -v "$GITHUB_WORKSPACE":/app \
               -e FLASHINFER_CI_CACHE=/ci-cache \
               -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
