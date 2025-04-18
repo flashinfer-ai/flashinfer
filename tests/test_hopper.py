@@ -296,6 +296,250 @@ def test_batch_paged_prefill(
     torch.testing.assert_close(o_sm80, o_sm90, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
+    [
+        (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
+        (97, 81, 16, list(range(80)) + [0], 97, [79]),
+    ],
+)
+@pytest.mark.parametrize("page_size", [1, 5, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("return_lse", [True, False])
+def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
+    batch_size,
+    kv_len,
+    qo_len,
+    prefix_len_ptr,
+    token_pos_in_items_ptr,
+    token_pos_in_items_len,
+    max_item_len_ptr,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    kv_layout,
+    logits_soft_cap,
+    return_lse,
+):
+
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data = (
+        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0).half()
+        if kv_layout == "HND"
+        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim)
+        .to(0)
+        .half()
+    )
+    kv_indptr_cpu = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
+    kv_indices_cpu = torch.arange(0, total_num_pages).int()
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
+
+    wrapper_fa2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa2"
+    )
+    wrapper_fa2.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
+        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+    )
+    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+
+    wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa3"
+    )
+    wrapper_fa3.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
+        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+    )
+
+    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
+
+    torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize(
+    "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
+    [
+        (
+            54,
+            37,
+            [17, 17],
+            list(range(17))
+            + list(range(19))
+            + [0]
+            + [0] * 63
+            + list(range(15))
+            + list(range(21))
+            + [0],
+            100,
+            [18, 20],
+        ),
+        (
+            97,
+            81,
+            [16, 16],
+            list(range(80)) + [0] + [0] * 16 + list(range(76)) + [0],
+            97,
+            [79, 75],
+        ),
+    ],
+)
+@pytest.mark.parametrize("page_size", [1, 5, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("return_lse", [True, False])
+def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
+    batch_size,
+    kv_len,
+    qo_len,
+    prefix_len_ptr,
+    token_pos_in_items_ptr,
+    token_pos_in_items_len,
+    max_item_len_ptr,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    kv_layout,
+    logits_soft_cap,
+    return_lse,
+):
+
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data = (
+        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0).half()
+        if kv_layout == "HND"
+        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim)
+        .to(0)
+        .half()
+    )
+    kv_indptr_cpu = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
+    kv_indices_cpu = torch.arange(0, total_num_pages).int()
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
+
+    wrapper_fa2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa2"
+    )
+    wrapper_fa2.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
+        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+    )
+    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+
+    wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa3"
+    )
+    wrapper_fa3.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
+        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+    )
+
+    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
+
+    torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     # test_batch_prefill(14, 64, 32, 32, False, 128)
     # test_batch_prefill(1, 32767, 8, 8, True, 128)

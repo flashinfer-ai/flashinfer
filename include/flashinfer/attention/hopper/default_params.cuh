@@ -82,6 +82,7 @@ struct BatchPrefillRaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
@@ -105,6 +106,11 @@ struct BatchPrefillRaggedParams {
   int window_left;
 
   bool causal;
+
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -128,6 +134,7 @@ struct BatchPrefillPagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
@@ -151,6 +158,11 @@ struct BatchPrefillPagedParams {
   int window_left;
 
   bool causal;
+
+  uint32_t* prefix_len_ptr;
+  uint16_t* token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* max_item_len_ptr;
 };
 
 }  // namespace flashinfer
