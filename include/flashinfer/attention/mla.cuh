@@ -63,7 +63,7 @@ struct SharedStorageQKVO {
 
 template <bool CAUSAL_, uint32_t NUM_STAGES_, bool QK_SHARD_, uint32_t HEAD_DIM_CKV_,
           uint32_t HEAD_DIM_KPE_, uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_,
-          typename DTypeKV_, typename DTypeO_, typename IdType_>
+          typename DTypeKV_, typename DTypeO_, typename IdType_, typename AttentionVariant_>
 struct KernelTraits {
   static constexpr bool CAUSAL = CAUSAL_;
   static constexpr uint32_t NUM_STAGES = NUM_STAGES_;
@@ -100,12 +100,15 @@ struct KernelTraits {
   using DTypeO = DTypeO_;
   using IdType = IdType_;
   using DTypeQKAccum = float;
+  using AttentionVariant = AttentionVariant_;
 
   using SharedStorage = SharedStorageQKVO<NUM_STAGES, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_CKV,
                                           HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO>;
   using AttentionVariant = StandardAttention;
 
-  static constexpr DTypeQKAccum MaskFillValue = -math::inf;
+  // static constexpr DTypeQKAccum MaskFillValue = -math::inf;
+  static constexpr DTypeQKAccum MaskFillValue =
+      AttentionVariant::use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f);
 };
 
 template <typename KTraits>
@@ -1004,7 +1007,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -1027,7 +1030,7 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
     using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType, AttentionVariant>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
     void* args[] = {(void*)&params};
