@@ -787,7 +787,7 @@ __device__ __forceinline__ void logits_mask(
 }
 
 template <typename KTraits, typename Params>
-__device__ __forceinline__ void logits_mask_customized(
+__device__ __forceinline__ void logits_mask_multi_item_scoring(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
     const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
     const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end,
@@ -2165,9 +2165,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                    chunk_size, tid);
     cp_async::commit_group();
 
-    uint32_t num_iterations;
+    uint32_t num_iterations_prefix;
     uint32_t num_iterations_mask;
-    uint32_t num_iterations_full = 0;
+    uint32_t num_iterations = 0;
 
     if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
       num_iterations =
@@ -2179,7 +2179,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                         : chunk_size),
                    CTA_TILE_KV);
     } else {
-      num_iterations = ceil_div(
+      num_iterations_prefix = ceil_div(
           min(min(chunk_size, sub_if_greater_or_zero(
                                   kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
                                   chunk_start)),
@@ -2192,9 +2192,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          __ldg(max_item_len_ptr + request_idx)),
                   chunk_start)) /
               (CTA_TILE_KV),
-          num_iterations);
+          num_iterations_prefix);
 
-      num_iterations_full = max(
+      num_iterations = max(
           num_iterations_mask,
           ceil_div(
               min(chunk_size, sub_if_greater_or_zero(
@@ -2216,16 +2216,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
              : chunk_size) /
         CTA_TILE_KV;
 
-    const uint32_t unified_num_iterations =
-        (MASK_MODE == MaskMode::kMultiItemScoring) ? num_iterations_full : num_iterations;
 #pragma unroll 1
-    for (uint32_t iter = 0; iter < unified_num_iterations;
+    for (uint32_t iter = 0; iter < num_iterations;
          iter = (MASK_MODE == MaskMode::kMultiItemScoring)
-                    ? ((iter + 1 == num_iterations) ? num_iterations_mask : (iter + 1))
+                    ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
                     : (iter + 1)) {
       const uint32_t prefetch_skip_step =
           (MASK_MODE == MaskMode::kMultiItemScoring)
-              ? ((iter + 1 == num_iterations) ? (num_iterations_mask - num_iterations) : 0)
+              ? ((iter + 1 == num_iterations_prefix) ? (num_iterations_mask - num_iterations_prefix)
+                                                     : 0)
               : 0;
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 #pragma unroll
@@ -2274,8 +2273,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 qo_len, kv_len, chunk_end, group_size, s_frag);
           }
         } else {
-          if (iter + 1 >= num_iterations) {
-            logits_mask_customized<KTraits>(
+          if (iter + 1 >= num_iterations_prefix) {
+            logits_mask_multi_item_scoring<KTraits>(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                 chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
                 qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
