@@ -443,6 +443,10 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                None,
+                None,
+                None,
+                None,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
