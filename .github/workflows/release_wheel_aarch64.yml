@@ -33,7 +33,7 @@ jobs:
             torch: "2.5"
 
 
-    runs-on: [ubuntu-24.04-arm]
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,7 +80,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: [ubuntu-24.04-arm]
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/download-artifact@v4
         with:
