@@ -53,7 +53,7 @@ jobs:
         env:
           TORCH_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.TORCH_VERSION }}
           CUDA_VERSION: ${{ steps.set_torch_and_cuda_version.outputs.CUDA_VERSION }}
-          BUILDER_IMAGE: ${{ (steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 203) && 'pytorch/manylinuxaarch64-builder:cuda' }}${{ matrix.cuda }}
+          BUILDER_IMAGE: ${{ (steps.set_torch_and_cuda_version.outputs.TORCH_VERSION > 203) && 'nvcr.io/nvidia/pytorch:25.03-py3' }}
         run: |
           echo "TORCH_VERSION: $TORCH_VERSION"
           echo "CUDA_VERSION: $CUDA_VERSION"
@@ -69,7 +69,7 @@ jobs:
               -e MAX_JOBS=128 \
               --user $CI_UID:$CI_GID \
               $BUILDER_IMAGE \
-              bash /app/scripts/run-ci-build-wheel.sh
+              bash /app/scripts/run-ci-build-aarch64-wheel.sh
         timeout-minutes: 120
       - run: du -h dist/*
 
