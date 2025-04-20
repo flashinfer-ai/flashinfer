@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer import pad_ragged_tensor_to_multiple_of
+from flashinfer.triton import pad_ragged_tensor_to_multiple_of
 
 
 def pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(

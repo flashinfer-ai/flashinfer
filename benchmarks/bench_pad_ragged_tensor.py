@@ -4,7 +4,7 @@ from typing import cast
 import torch
 from triton.testing import do_bench
 
-from flashinfer import pad_ragged_tensor_to_multiple_of
+from flashinfer.triton import pad_ragged_tensor_to_multiple_of
 
 
 def bench_pad_ragged_tensor_to_multiple_of(batch_size, qkv_len, d, multiple_of):
