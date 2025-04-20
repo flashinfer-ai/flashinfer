@@ -99,6 +99,42 @@ def _pad_ragged_tensor(
                 tl.store(padded_tensor_ptr + dst_offset + j_offsets, 0.0, mask=j_mask)
 
 
+@triton.jit
+def _pack_ragged_tensor(
+    padded_tensor_ptr,
+    packed_tensor_ptr,
+    padded_indptr_ptr,
+    original_indptr_ptr,
+    n_rows,
+    dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # Process one row per program
+    if pid >= n_rows:
+        return
+
+    # Get original and padded row information
+    original_row_start = tl.load(original_indptr_ptr + pid)
+    original_row_end = tl.load(original_indptr_ptr + pid + 1)
+    original_row_length = original_row_end - original_row_start
+
+    padded_row_start = tl.load(padded_indptr_ptr + pid)
+
+    # Copy only the original data (not the padding)
+    for i in range(0, original_row_length):
+        src_offset = (padded_row_start + i) * dim
+        dst_offset = (original_row_start + i) * dim
+
+        # Copy the entire feature vector for this position
+        for j in range(0, dim, BLOCK_SIZE):
+            j_offsets = j + tl.arange(0, BLOCK_SIZE)
+            j_mask = j_offsets < dim
+            values = tl.load(padded_tensor_ptr + src_offset + j_offsets, mask=j_mask)
+            tl.store(packed_tensor_ptr + dst_offset + j_offsets, values, mask=j_mask)
+
+
 def max_power_of_2_leq(x: int) -> int:
     r"""Return the maximum power of 2 less than or equal to x."""
     return 1 << (x - 1).bit_length()
@@ -188,3 +224,61 @@ def pad_ragged_tensor_to_multiple_of(
     )
 
     return padded_ragged_tensor, padded_indptr
+
+
+def pack_ragged_tensor(
+    padded_tensor: torch.Tensor,
+    padded_indptr: torch.Tensor,
+    original_indptr: torch.Tensor,
+    output_tensor: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Convert a padded ragged tensor back to packed format.
+
+    This function reverses the operation of pad_ragged_tensor_to_multiple_of by
+    removing the padding and returning the original packed tensor.
+
+    Parameters
+    ----------
+    padded_tensor: torch.Tensor
+        The padded ragged tensor, expected shape: (padded_nnz, D)
+    padded_indptr: torch.Tensor
+        The padded indptr, expected shape: (n_rows + 1,)
+    original_indptr: torch.Tensor
+        The original indptr before padding, expected shape: (n_rows + 1,)
+    output_tensor: Optional[torch.Tensor]
+        If provided, the packed tensor will be stored in this tensor,
+        otherwise a new tensor will be allocated.
+
+    Returns
+    -------
+    packed_tensor: torch.Tensor
+        The packed tensor with padding removed, expected shape: (original_nnz, D)
+    """
+    # Get dimensions
+    n_rows = padded_indptr.shape[0] - 1
+    dim = padded_tensor.shape[1]
+    original_nnz = original_indptr[-1].item()
+
+    # Allocate output tensor if not provided
+    if output_tensor is None:
+        packed_tensor = torch.empty(
+            (original_nnz, dim),
+            dtype=padded_tensor.dtype,
+            device=padded_tensor.device,
+        )
+    else:
+        packed_tensor = output_tensor
+
+    # Pack the tensor by removing padding
+    _pack_ragged_tensor[(n_rows,)](
+        padded_tensor,
+        packed_tensor,
+        padded_indptr,
+        original_indptr,
+        n_rows,
+        dim,
+        BLOCK_SIZE=min(max_power_of_2_leq(dim), 16384),
+        num_stages=2,
+    )
+
+    return packed_tensor

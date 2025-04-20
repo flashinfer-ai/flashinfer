@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer.triton import pad_ragged_tensor_to_multiple_of
+from flashinfer.triton import pack_ragged_tensor, pad_ragged_tensor_to_multiple_of
 
 
 def pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(
@@ -46,7 +46,7 @@ def pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(
 
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("n_rows", [1, 2, 5, 10])
-@pytest.mark.parametrize("dim", [64, 128, 1024])
+@pytest.mark.parametrize("dim", [64, 128, 1024, 4096, 16384])
 @pytest.mark.parametrize("multiple_of", [8, 16, 32, 64, 128])
 def test_pad_ragged_tensor_to_multiple_of(dtype, n_rows, dim, multiple_of):
     device = torch.device("cuda:0")
@@ -85,6 +85,76 @@ def test_pad_ragged_tensor_to_multiple_of(dtype, n_rows, dim, multiple_of):
     assert torch.allclose(
         padded_ragged_tensor, padded_ragged_tensor_ref, rtol=1e-3, atol=1e-3
     )
+
+
+def pack_ragged_tensor_pytorch(
+    padded_tensor: torch.Tensor,
+    padded_indptr: torch.Tensor,
+    original_indptr: torch.Tensor,
+) -> torch.Tensor:
+    """PyTorch reference implementation of pack_ragged_tensor."""
+    n_rows = padded_indptr.shape[0] - 1
+    dim = padded_tensor.shape[1]
+    original_nnz = original_indptr[-1].item()
+
+    packed_tensor = torch.empty(
+        (original_nnz, dim),
+        dtype=padded_tensor.dtype,
+        device=padded_tensor.device,
+    )
+
+    for i in range(n_rows):
+        padded_row_start = padded_indptr[i].item()
+        original_row_start = original_indptr[i].item()
+        original_row_length = original_indptr[i + 1].item() - original_row_start
+
+        # Copy the original data (without padding)
+        packed_tensor[original_row_start : original_row_start + original_row_length] = (
+            padded_tensor[padded_row_start : padded_row_start + original_row_length]
+        )
+
+    return packed_tensor
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("n_rows", [1, 2, 5, 10])
+@pytest.mark.parametrize("dim", [64, 128, 1024, 4096, 16384])
+@pytest.mark.parametrize("multiple_of", [8, 16, 32, 64, 128])
+def test_pack_ragged_tensor(dtype, n_rows, dim, multiple_of):
+    device = torch.device("cuda:0")
+    torch.manual_seed(42)
+
+    # Create random row lengths
+    row_lengths = torch.randint(1, 100, (n_rows,), device=device)
+
+    # Create indptr
+    original_indptr = torch.zeros(n_rows + 1, dtype=torch.int32, device=device)
+    original_indptr[1:] = torch.cumsum(row_lengths, dim=0)
+
+    # Create ragged tensor
+    nnz = original_indptr[-1].item()
+    original_tensor = torch.randn(nnz, dim, dtype=dtype, device=device)
+
+    # First pad the tensor
+    padded_tensor, padded_indptr = pad_ragged_tensor_to_multiple_of(
+        original_tensor, original_indptr, multiple_of, fill_zeros=True
+    )
+
+    # Now unpad (pack) the tensor
+    packed_tensor = pack_ragged_tensor(padded_tensor, padded_indptr, original_indptr)
+
+    # Reference implementation
+    packed_tensor_ref = pack_ragged_tensor_pytorch(
+        padded_tensor, padded_indptr, original_indptr
+    )
+
+    # Check shapes
+    assert packed_tensor.shape == original_tensor.shape
+    assert packed_tensor.shape == packed_tensor_ref.shape
+
+    # Check tensor values
+    assert torch.allclose(packed_tensor, original_tensor, rtol=1e-3, atol=1e-3)
+    assert torch.allclose(packed_tensor, packed_tensor_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
