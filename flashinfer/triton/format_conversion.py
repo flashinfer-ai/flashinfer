@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 
 
 @triton.jit
@@ -96,6 +97,7 @@ def _pad_ragged_tensor(
                 j_offsets = j + tl.arange(0, BLOCK_SIZE)
                 j_mask = j_offsets < dim
                 tl.store(padded_tensor_ptr + dst_offset + j_offsets, 0.0, mask=j_mask)
+
 
 def max_power_of_2_leq(x: int) -> int:
     r"""Return the maximum power of 2 less than or equal to x."""

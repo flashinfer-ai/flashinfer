@@ -1,10 +1,13 @@
-import torch
-import pytest
 import numpy as np
+import pytest
+import torch
+
 from flashinfer import pad_ragged_tensor_to_multiple_of
 
 
-def pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(ragged_tensor, indptr, multiple_of):
+def pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(
+    ragged_tensor, indptr, multiple_of
+):
     """PyTorch baseline implementation of pad_ragged_tensor_to_multiple_of."""
     n_rows = indptr.shape[0] - 1
     dim = ragged_tensor.shape[1]
@@ -66,7 +69,9 @@ def test_pad_ragged_tensor_to_multiple_of(dtype, n_rows, dim, multiple_of):
     )
 
     padded_ragged_tensor_ref, padded_indptr_ref = (
-        pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(ragged_tensor, indptr, multiple_of)
+        pad_ragged_tensor_to_multiple_of_pytorch_fill_zeros(
+            ragged_tensor, indptr, multiple_of
+        )
     )
 
     # Check shapes
