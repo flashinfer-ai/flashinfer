@@ -150,6 +150,38 @@ def test_sampling(batch_size, vocab_size):
         samples = flashinfer.sampling.sampling_from_probs(normalized_prob)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_logits(batch_size, vocab_size):
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    num_trails = 5000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.sampling_from_logits(logits)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+def test_sampling_from_logits_freq(vocab_size, distribution):
+    torch.manual_seed(42)
+    num_trials = 5000000
+    logits = distribution((1, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
+    samples = flashinfer.sampling.sampling_from_logits(
+        logits, indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device)
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / num_trials
+    similarity = torch.cosine_similarity(freq, probs)
+    assert similarity > 0.999, f"similarity: {similarity}"
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
@@ -471,7 +503,8 @@ def test_chain_speculative_sampling(
 
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
-    test_top_p_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
+    test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
+    # test_top_p_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     # test_top_k_sampling_freq(1, 128256, 10)
     # test_sampling(19, 500)
     # test_sampling(1, 111)

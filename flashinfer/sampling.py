@@ -42,6 +42,39 @@ def get_sampling_module():
                 ],
             )
 
+        # torch library for sampling_from_logits
+        @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
+        def sampling_from_logits(
+            logits: torch.Tensor,
+            indices: Optional[torch.Tensor],
+            deterministic: bool,
+            generator: Optional[torch.Generator],
+        ) -> torch.Tensor:
+            device = logits.device
+            # TODO: support more data types in logits to avoid conversion
+            # to float32
+            logits = logits.float()
+            batch_size = indices.size(0) if indices is not None else logits.size(0)
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.sampling_from_logits.default(
+                logits,
+                samples,
+                indices,
+                deterministic,
+                generator,
+            )
+            return samples
+        
+        @register_fake_op("flashinfer::sampling_from_logits")
+        def _fake_sampling_from_logits(
+            logits: torch.Tensor,
+            indices: Optional[torch.Tensor],
+            deterministic: bool,
+            generator: Optional[torch.Generator],
+        ) -> torch.Tensor:
+            batch_size = indices.size(0) if indices is not None else logits.size(0)
+            return torch.empty(batch_size, dtype=torch.int32, device=logits.device)
+        
         # torch library for sampling_from_probs
 
         @register_custom_op("flashinfer::sampling_from_probs", mutates_args=())
@@ -64,6 +97,8 @@ def get_sampling_module():
             )
             return samples
 
+        # torch library for sampling_from_probs
+        
         @register_fake_op("flashinfer::sampling_from_probs")
         def _fake_sampling_from_probs(
             probs: torch.Tensor,
@@ -384,6 +419,7 @@ def get_sampling_module():
         # Register the module
         _sampling_module = SimpleNamespace(
             sampling_from_probs=sampling_from_probs,
+            sampling_from_logits=sampling_from_logits,
             top_p_sampling_from_probs=top_p_sampling_from_probs,
             top_k_sampling_from_probs=top_k_sampling_from_probs,
             min_p_sampling_from_probs=min_p_sampling_from_probs,
@@ -403,6 +439,48 @@ def _to_tensor_scalar_tuple(x):
     else:
         return (None, x)
 
+def sampling_from_logits(
+    logits: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
+    deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    # TODO: Add examples
+    r"""Fused GPU kernel for category sampling from logits.
+    Parameters
+    ----------
+    logits: torch.Tensor
+        Logits for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of logits. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in logits.
+        For example, if indices[i] = j, then the i-th output will be sampled from logits[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of logits.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
+    check_nan: bool
+        Whether to check nan in :attr:`logits`, default is ``False``.
+    Returns
+    -------
+    samples: torch.Tensor
+        Sampled categories, shape (batch_size,). It's equivalent to sampling from
+        :attr:`logits` after applying softmax.
+    Examples
+    --------
+    """
+    # TODO: Add examples
+    if check_nan:
+        if torch.any(torch.isnan(logits)):
+            raise ValueError("Input logits contains NaN.")
+    return get_sampling_module().sampling_from_logits(
+        logits, indices, deterministic, generator
+    )
 
 def sampling_from_probs(
     probs: torch.Tensor,
