@@ -55,6 +55,7 @@ def _pad_ragged_tensor(
     n_rows,
     dim,
     BLOCK_SIZE: tl.constexpr,
+    fill_zeros: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -85,25 +86,31 @@ def _pad_ragged_tensor(
             tl.store(padded_tensor_ptr + dst_offset + j_offsets, values, mask=j_mask)
 
     # Zero-pad the remaining positions
-    for i in range(row_length, padded_row_length):
-        col_idx = i
-        dst_offset = (padded_row_start + i) * dim
+    if fill_zeros:
+        for i in range(row_length, padded_row_length):
+            col_idx = i
+            dst_offset = (padded_row_start + i) * dim
 
-        # Zero out the entire feature vector for this position
-        for j in range(0, dim, BLOCK_SIZE):
-            j_offsets = j + tl.arange(0, BLOCK_SIZE)
-            j_mask = j_offsets < dim
-            tl.store(padded_tensor_ptr + dst_offset + j_offsets, 0.0, mask=j_mask)
+            # Zero out the entire feature vector for this position
+            for j in range(0, dim, BLOCK_SIZE):
+                j_offsets = j + tl.arange(0, BLOCK_SIZE)
+                j_mask = j_offsets < dim
+                tl.store(padded_tensor_ptr + dst_offset + j_offsets, 0.0, mask=j_mask)
+
+def max_power_of_2_leq(x: int) -> int:
+    r"""Return the maximum power of 2 less than or equal to x."""
+    return 1 << (x - 1).bit_length()
 
 
 def pad_ragged_tensor_to_multiple_of(
     ragged_tensor: torch.Tensor,
     indptr: torch.Tensor,
     multiple_of: int,
+    fill_zeros: bool = False,
     output_ragged_tensor: Optional[torch.Tensor] = None,
     output_indptr: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""Pad each row of ragged tensor to a multiple of `multiple_of`.
+    r"""Pad each row of ragged tensor to a multiple of ``multiple_of``.
 
     Suppose the ragged tensor has shape (150, 1024), and the indptr is [0, 100, 150] (which means there are 2 rows,
     the first row has 100 columns, the second row has 50 columns), and the multiple_of is 16.
@@ -118,6 +125,9 @@ def pad_ragged_tensor_to_multiple_of(
         The indptr of the ragged tensor, expected shape: (n_rows + 1,)
     multiple_of: int
         The multiple of to pad to, e.g. 256
+    fill_zeros: bool
+        If True, the padded positions will be filled with zeros, otherwise they will be random values,
+        default is False.
     output_ragged_tensor: Optional[torch.Tensor]
         If provided, the padded ragged tensor will be stored in this tensor,
         otherwise a new tensor will be allocated.
@@ -154,7 +164,7 @@ def pad_ragged_tensor_to_multiple_of(
     # Allocate padded tensor
     if output_ragged_tensor is None:
         total_padded_length = padded_indptr[-1].item()
-        padded_ragged_tensor = torch.zeros(
+        padded_ragged_tensor = torch.empty(
             (total_padded_length, dim),
             dtype=ragged_tensor.dtype,
             device=ragged_tensor.device,
@@ -170,7 +180,9 @@ def pad_ragged_tensor_to_multiple_of(
         padded_indptr,
         n_rows,
         dim,
-        BLOCK_SIZE=32,
+        BLOCK_SIZE=min(max_power_of_2_leq(dim), 16384),
+        num_stages=2,
+        fill_zeros=fill_zeros,
     )
 
     return padded_ragged_tensor, padded_indptr
