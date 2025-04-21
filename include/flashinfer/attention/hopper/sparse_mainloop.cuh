@@ -53,7 +53,7 @@ struct SparseCollectiveMainloop {
   static constexpr auto AlignmentKV = 128 / cutlass::sizeof_bits<DTypeKV>::value;
   using AlignmentTypeKV = cute::uint_byte_t<static_cast<int>(sizeof(DTypeKV)) * AlignmentKV>;
   // NOTE(Zihao): use SM80_CP_ASYNC for sparse loading of KV-cache
-  using GmemCopyAtomKV = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<AlignmentTypeKV>, DTypeKV>;
+  using GmemCopyAtomKV = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<AlignmentTypeKV>, DTypeKV>;
   using GmemTiledCopyK =
       decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
                GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
