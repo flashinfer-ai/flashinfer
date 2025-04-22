@@ -42,7 +42,7 @@ fi
 
 echo "::group::Install PyTorch"
 python -c "import torch; print(torch.__version__)"
-# pip install torch==${FLASHINFER_CI_TORCH_VERSION}.* --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
+pip install torch==${FLASHINFER_CI_TORCH_VERSION}.* --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
 echo "::endgroup::"
 
 echo "::group::Install build system"

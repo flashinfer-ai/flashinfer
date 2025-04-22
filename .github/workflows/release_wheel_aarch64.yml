@@ -28,7 +28,7 @@ jobs:
         cuda: ["12.6", "12.8"]
         cpu: ["cpu-aarch64"]
         torch: ["2.4", "2.5", "2.6"]
-        exclude: # We use release_wheel_sglang.yml for faster release and verification. If everything is okay, then we trigger release_wheel.yml. This combination (cuda 12.4 or 11.8 + torch 2.5) is already handled in release_wheel_sglang.yml
+        exclude:
           - cuda: "12.4"
             torch: "2.5"
 
