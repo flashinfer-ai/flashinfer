@@ -29,16 +29,16 @@
  *
  **************************************************************************************************/
 
-#include "collective/fmha_common.hpp"
-#include "collective/fmha_fusion.hpp"
+#include "../collective/fmha_common.hpp"
+#include "../collective/fmha_fusion.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/layout.hpp"
 #include "cutlass/arch/arch.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/pipeline/pipeline.hpp"
-#include "kernel/fmha_options.hpp"
-#include "kernel/fmha_tile_scheduler.hpp"
+#include "fmha_options.hpp"
+#include "fmha_tile_scheduler.hpp"
 
 namespace cutlass::fmha::kernel {
 

@@ -78,6 +78,7 @@ def remove_unwanted_pytorch_nvcc_flags():
 remove_unwanted_pytorch_nvcc_flags()
 
 sm90a_nvcc_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
+sm100a_nvcc_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
 
 
 def load_cuda_ops(

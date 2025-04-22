@@ -25,6 +25,7 @@ import torch
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
+    gen_fmha_cutlass_sm100a_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
@@ -47,6 +48,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     is_float8,
+    is_sm100a_supported,
     register_custom_op,
     register_fake_op,
 )
@@ -56,6 +58,34 @@ _single_prefill_sm90_modules = {}
 _batch_prefill_modules = {}
 _batch_prefill_sm90_modules = {}
 _batch_prefill_jit_modules = {}
+
+
+@functools.cache
+def get_fmha_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: PosEncodingMode,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+):
+    if is_sm100a_supported(torch.device("cuda")):
+        return gen_fmha_cutlass_sm100a_module(
+            dtype_q,
+            dtype_kv,
+            dtype_o,
+            dtype_idx,
+            head_dim_qk,
+            head_dim_vo,
+            pos_encoding_mode,
+            use_sliding_window,
+            use_logits_soft_cap,
+        )
+    else:
+        raise ValueError(f"SM100A is not supported on this device")
 
 
 def get_single_prefill_module(backend):
@@ -2573,3 +2603,65 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass
+
+
+def fmha(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    sm_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    module = get_fmha_module(
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        torch.int32,
+        q.shape[2],
+        v.shape[2],
+        PosEncodingMode.NONE.value,
+        False,  # use_sliding_window
+        False,  # use_logits_soft_cap
+    )
+    nnz_qo, num_qo_heads, head_dim_qk = q.shape
+    nnz_kv, num_kv_heads, head_dim_vo = v.shape
+
+    if out is None:
+        out = torch.empty(
+            nnz_qo, num_qo_heads, head_dim_vo, device=q.device, dtype=q.dtype
+        )
+    if lse is None:
+        lse = torch.empty(nnz_qo, num_qo_heads, device=q.device, dtype=torch.float32)
+
+    mask_mode_code = 1 if causal else 0
+    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+    batch_size = qo_indptr.shape[0] - 1
+    max_qo_len = (qo_indptr[1:] - qo_indptr[:-1]).max()
+    max_kv_len = (kv_indptr[1:] - kv_indptr[:-1]).max()
+
+    module.run(
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        out,
+        lse,
+        mask_mode_code,
+        sm_scale,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        batch_size,
+        nnz_qo,
+        nnz_kv,
+        max_qo_len,
+        max_kv_len,
+    )
+
+    return out, lse

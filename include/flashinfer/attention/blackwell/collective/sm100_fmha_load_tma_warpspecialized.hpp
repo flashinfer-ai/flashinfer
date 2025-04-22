@@ -30,13 +30,13 @@
  **************************************************************************************************/
 #pragma once
 
-#include "collective/fmha_common.hpp"
-#include "collective/fmha_fusion.hpp"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/arch/memory_sm80.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "fmha_common.hpp"
+#include "fmha_fusion.hpp"
 
 namespace cutlass::fmha::collective {
 

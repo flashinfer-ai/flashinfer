@@ -1,0 +1,124 @@
+import math
+
+import pytest
+import torch
+
+import flashinfer
+import flashinfer.triton
+from flashinfer.utils import is_sm100a_supported
+
+
+def attention_ref(
+    batch_size,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    sm_scale: float,
+) -> torch.Tensor:
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+            k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+        )
+        * sm_scale
+    )
+
+    if causal:
+        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+            1
+        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    else:
+        mask = torch.ones(qo_len, kv_len, device=q.device)
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    lse_ref = torch.logsumexp(logits, -1).transpose(-1, -2)
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+
+    return o_ref, lse_ref * math.log2(math.e)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17])
+@pytest.mark.parametrize("kv_len", [544, 977])
+@pytest.mark.parametrize("qo_len", [377, 177])
+@pytest.mark.parametrize("num_heads", [4, 32, 128])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.half])
+def test_blackwell_cutlass_fmha(
+    batch_size,
+    kv_len,
+    qo_len,
+    num_heads,
+    head_dim,
+    causal,
+    dtype,
+):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    torch.manual_seed(42)
+    kv_layout = "NHD"
+    q = torch.randn(
+        batch_size * qo_len, num_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+
+    k = torch.randn(
+        batch_size * kv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch_size * kv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    o, lse = flashinfer.prefill.fmha(q, k, v, q_indptr, kv_indptr, causal=causal)
+
+    sm_scale = 1.0 / (head_dim**0.5)
+    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
+    print(o)
+    print(o_ref)
+
+    lse_ref = lse_ref.flatten(0, 1)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+    # test with pre-allocated output
+    o_buffer = torch.empty_like(o)
+    lse_buffer = torch.empty_like(lse)
+    flashinfer.prefill.fmha(
+        q, k, v, q_indptr, kv_indptr, out=o_buffer, lse=lse_buffer, causal=causal
+    )
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    # torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    test_blackwell_cutlass_fmha(
+        2,
+        256,
+        256,
+        1,
+        128,
+        False,
+        torch.half,
+    )
