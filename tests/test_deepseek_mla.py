@@ -25,7 +25,7 @@ from flashinfer.jit.attention import (
     gen_batch_prefill_module,
     gen_single_prefill_module,
 )
-from flashinfer.utils import is_sm90a_supported
+from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -631,6 +631,9 @@ def test_batch_mla_page_attention(
 @pytest.mark.parametrize("page_size", [1, 16, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
 def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Cutlass MLA is not supported on this device")
+
     torch.manual_seed(42)
 
     num_local_heads = 128
