@@ -20,7 +20,8 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import gen_batch_mla_module, load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import FLASHINFER_CSRC_DIR, gen_batch_mla_module, load_cuda_ops
+from .jit.env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
@@ -28,7 +29,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
-from .jit.env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
+
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
     if q_nope_pe.ndim != 3:
@@ -44,15 +45,23 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
     if H != 128:
         raise ValueError(f"Expected 128 heads for q_nope_pe, got {H}")
     if D_q != D_ckv or D_q != 576:
-        raise ValueError(f"Expected head dim 576 for q_nope_pe and ckv_kpe_cache, got {D_q} and {D_ckv}")
+        raise ValueError(
+            f"Expected head dim 576 for q_nope_pe and ckv_kpe_cache, got {D_q} and {D_ckv}"
+        )
     B_block_table, block_num = page_table.shape
     block_size = ckv_kpe_cache.shape[1]
     if B_q != B_block_table:
-        raise ValueError(f"Expected batch size {B_q} for q_nope_pe and block_table, got {B_q} and {B_block_table}")
+        raise ValueError(
+            f"Expected batch size {B_q} for q_nope_pe and block_table, got {B_q} and {B_block_table}"
+        )
     if block_num % (128 / block_size) != 0:
-        raise ValueError(f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}")
+        raise ValueError(
+            f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
+        )
+
 
 _mla_module = None
+
 
 def get_mla_module():
     global _mla_module
@@ -70,6 +79,7 @@ def get_mla_module():
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
         )
     return _mla_module
+
 
 _batch_mla_modules = {}
 _batch_mla_sm90_modules = {}
@@ -201,7 +211,7 @@ class BatchMLAPagedAttentionWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
-        if backend == 'cutlass':
+        if backend == "cutlass":
             self._backend = backend
             return
 
@@ -373,11 +383,13 @@ class BatchMLAPagedAttentionWrapper:
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
         """
-        if self._backend == 'cutlass':
+        if self._backend == "cutlass":
             if return_lse:
                 raise ValueError("return_lse does not support cutlass backend for now.")
             if profiler_buffer is not None:
-                raise ValueError("profiler_buffer does not support cutlass backend for now.")
+                raise ValueError(
+                    "profiler_buffer does not support cutlass backend for now."
+                )
             self._cached_module = get_mla_module()
             if out is None:
                 out = torch.empty_like(q_nope)

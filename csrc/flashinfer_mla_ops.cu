@@ -15,10 +15,8 @@
  */
 #include "pytorch_extension_utils.h"
 
-
-void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out,
-                              at::Tensor lse, at::Tensor q_nope_pe,
-                              at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
+void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor lse,
+                              at::Tensor q_nope_pe, at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
                               at::Tensor page_table);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

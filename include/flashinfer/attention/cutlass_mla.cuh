@@ -16,9 +16,9 @@
 #ifndef FLASHINFER_ATTENTION_CUTLASS_MLA_CUH_
 #define FLASHINFER_ATTENTION_CUTLASS_MLA_CUH_
 #include <sstream>
+
 #include "../cutlass_utils.cuh"
 #include "../exception.h"
-
 #include "cutlass/kernel_hardware_info.h"
 
 // From 3rdparty/cutlass/examples/77_blackwell_fmha
@@ -32,17 +32,17 @@ namespace attention {
 using namespace cute;
 using namespace cutlass::fmha::kernel;
 
-#define CUTLASS_CHECK(cmd) \
-do { \
-  auto status = cmd; \
-  if (status != cutlass::Status::kSuccess) { \
-    std::ostringstream err_msg; \
-    err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
-    FLASHINFER_ERROR(err_msg.str()); \
-  } \
-} while (0)
+#define CUTLASS_CHECK(cmd)                                                            \
+  do {                                                                                \
+    auto status = cmd;                                                                \
+    if (status != cutlass::Status::kSuccess) {                                        \
+      std::ostringstream err_msg;                                                     \
+      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
+      FLASHINFER_ERROR(err_msg.str());                                                \
+    }                                                                                 \
+  } while (0)
 
-template<bool v>
+template <bool v>
 struct IsPersistent {
   static const bool value = v;
 };
@@ -59,41 +59,36 @@ struct MlaSm100 {
 
   // H K (D_latent D_rope) B
   using ProblemShape = cute::tuple<TileShapeH, int, TileShapeD, int>;
-  
+
   using StrideQ = cute::tuple<int64_t, _1, int64_t>;  // H D B
   using StrideK = cute::tuple<int64_t, _1, int64_t>;  // K D B
   using StrideO = StrideK;                            // H D B
   using StrideLSE = cute::tuple<_1, int>;             // H B
 
-  using TileScheduler = std::conditional_t<
-      PersistenceOption::value,
-      Sm100MlaPersistentTileScheduler,
-      Sm100MlaIndividualTileScheduler>;
+  using TileScheduler =
+      std::conditional_t<PersistenceOption::value, Sm100MlaPersistentTileScheduler,
+                         Sm100MlaIndividualTileScheduler>;
 
-  using FmhaKernel =
-      cutlass::fmha::kernel::Sm100FmhaMlaKernelTmaWarpspecialized<
-          TileShape, Element, ElementAcc, ElementOut, ElementAcc,
-          TileScheduler, /*kIsCpAsync=*/true>;
+  using FmhaKernel = cutlass::fmha::kernel::Sm100FmhaMlaKernelTmaWarpspecialized<
+      TileShape, Element, ElementAcc, ElementOut, ElementAcc, TileScheduler, /*kIsCpAsync=*/true>;
   using Fmha = cutlass::fmha::device::MLA<FmhaKernel>;
 };
 
-
 template <typename T>
-typename T::Fmha::Arguments args_from_options(
-    void* out_ptr, void* lse_ptr, void* q_absorbed_ptr, void* ckv_kpe_cache_ptr,
-    void* seq_lens_ptr, void* page_table_ptr, int batches, int page_count_per_seq,
-    int page_count_total, int page_size, int device_index) {
+typename T::Fmha::Arguments args_from_options(void* out_ptr, void* lse_ptr, void* q_absorbed_ptr,
+                                              void* ckv_kpe_cache_ptr, void* seq_lens_ptr,
+                                              void* page_table_ptr, int batches,
+                                              int page_count_per_seq, int page_count_total,
+                                              int page_size, int device_index) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = device_index;
   hw_info.sm_count =
-      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-          hw_info.device_id);
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   int max_seq_len = page_size * page_count_per_seq;
   using TileShapeH = typename T::TileShapeH;
   using TileShapeD = typename T::TileShapeD;
-  auto problem_shape = cute::make_tuple(
-      TileShapeH{}, max_seq_len, TileShapeD{}, batches);
+  auto problem_shape = cute::make_tuple(TileShapeH{}, max_seq_len, TileShapeD{}, batches);
 
   auto [H, K, D, B] = problem_shape;
   auto [D_latent, D_rope] = D;
@@ -108,20 +103,14 @@ typename T::Fmha::Arguments args_from_options(
   using StrideO = typename T::StrideO;
   using StrideLSE = typename T::StrideLSE;
 
-  StrideQ stride_Q = cute::make_tuple(
-      static_cast<int64_t>(0 + D_latent + D_rope),
-      _1{},
-      static_cast<int64_t>(H * (0 + D_latent + D_rope)));
-  StrideK stride_C = cute::make_tuple(
-      static_cast<int64_t>(0 + D_latent + D_rope),
-      _1{},
-      static_cast<int64_t>(page_size * (D_latent + D_rope)));
+  StrideQ stride_Q = cute::make_tuple(static_cast<int64_t>(0 + D_latent + D_rope), _1{},
+                                      static_cast<int64_t>(H * (0 + D_latent + D_rope)));
+  StrideK stride_C = cute::make_tuple(static_cast<int64_t>(0 + D_latent + D_rope), _1{},
+                                      static_cast<int64_t>(page_size * (D_latent + D_rope)));
   StrideLSE stride_PT = cute::make_stride(_1{}, page_count_per_seq);
   StrideLSE stride_LSE = cute::make_tuple(_1{}, 0 + H);
-  StrideO stride_O = cute::make_tuple(
-      static_cast<int64_t>(0 + D_latent),
-      _1{},
-      static_cast<int64_t>(0 + H * D_latent));
+  StrideO stride_O = cute::make_tuple(static_cast<int64_t>(0 + D_latent), _1{},
+                                      static_cast<int64_t>(0 + H * D_latent));
 
   using Element = typename T::Element;
   using ElementOut = typename T::ElementOut;
@@ -129,21 +118,16 @@ typename T::Fmha::Arguments args_from_options(
   auto Q_ptr = reinterpret_cast<Element*>(q_absorbed_ptr);
   auto C_ptr = reinterpret_cast<Element*>(ckv_kpe_cache_ptr);
   typename T::Fmha::Arguments arguments{
-    problem_shape,
-    { scale,
-      Q_ptr, stride_Q,
-      Q_ptr + D_latent, stride_Q,
-      C_ptr, stride_C,
-      C_ptr + D_latent, stride_C,
-      reinterpret_cast<int*>(seq_lens_ptr),
-      reinterpret_cast<int*>(page_table_ptr), stride_PT,
-      page_count_total, page_size},
-    { reinterpret_cast<ElementOut*>(out_ptr), stride_O,
-      // static_cast<ElementAcc*>(lse.data_ptr()), stride_LSE},
-      static_cast<ElementAcc*>(nullptr), stride_LSE},
-    hw_info,
-    -1, // split_kv
-    nullptr, // is_var_split_kv=false
+      problem_shape,
+      {scale, Q_ptr, stride_Q, Q_ptr + D_latent, stride_Q, C_ptr, stride_C, C_ptr + D_latent,
+       stride_C, reinterpret_cast<int*>(seq_lens_ptr), reinterpret_cast<int*>(page_table_ptr),
+       stride_PT, page_count_total, page_size},
+      {reinterpret_cast<ElementOut*>(out_ptr), stride_O,
+       // static_cast<ElementAcc*>(lse.data_ptr()), stride_LSE},
+       static_cast<ElementAcc*>(nullptr), stride_LSE},
+      hw_info,
+      -1,       // split_kv
+      nullptr,  // is_var_split_kv=false
   };
   // TODO(kaixih@nvidia): When split_kv=-1 and is_var_split_kv=false, we compute
   // split_kv automatically based on batch size and sequence length to balance
@@ -154,18 +138,15 @@ typename T::Fmha::Arguments args_from_options(
 }
 
 template <typename Element>
-cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr,
-                   void* q_absorbed_ptr, void* ckv_kpe_cache_ptr,
-                   void* seq_lens_ptr, void* page_table_ptr, int batches,
-                   int page_count_per_seq, int page_count_total, int page_size,
-                   int device_index, cudaStream_t stream) {
+cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr, void* q_absorbed_ptr,
+                   void* ckv_kpe_cache_ptr, void* seq_lens_ptr, void* page_table_ptr, int batches,
+                   int page_count_per_seq, int page_count_total, int page_size, int device_index,
+                   cudaStream_t stream) {
   using MlaSm100Type = MlaSm100<Element>;
   typename MlaSm100Type::Fmha fmha;
-  auto arguments =
-      args_from_options<MlaSm100Type>(
-          out_ptr, lse_ptr, q_absorbed_ptr, ckv_kpe_cache_ptr, seq_lens_ptr,
-          page_table_ptr, batches, page_count_per_seq, page_count_total,
-          page_size, device_index);
+  auto arguments = args_from_options<MlaSm100Type>(
+      out_ptr, lse_ptr, q_absorbed_ptr, ckv_kpe_cache_ptr, seq_lens_ptr, page_table_ptr, batches,
+      page_count_per_seq, page_count_total, page_size, device_index);
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
@@ -180,4 +161,3 @@ cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr,
 
 }  // namespace flashinfer
 #endif  // FLASHINFER_ATTENTION_CUTLASS_MLA_CUH_
-
