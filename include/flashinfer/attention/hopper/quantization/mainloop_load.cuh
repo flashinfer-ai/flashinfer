@@ -48,8 +48,8 @@ struct SmemTransposeFP8_64x64 {
   TiledCopyLDSM tiled_copy_ldsm;
 
   using stsm_thread_shape = Shape<_4, _1, _8, _4>;
-  using stsm_value_shape = Shape<_4, _4, _1, _2>;
-  using stsm_value_stride = Stride<_1, _8, _0, _4>;
+  using stsm_value_shape = Shape<_4, _4, _2, _1>;
+  using stsm_value_stride = Stride<_1, _8, _4, _0>;
 
   using TiledCopySTSM =
       decltype(make_tiled_copy(Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<stsm_thread_shape>{},

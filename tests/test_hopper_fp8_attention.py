@@ -67,16 +67,16 @@ def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
     assert not torch.any(torch.isnan(o_ref))
 
     # MSE
-    mse = torch.mean((o_ref - o_fp8) ** 2)
+    mse = torch.mean((o_ref.float() - o_fp8.float()) ** 2)
     print(
-        f"test_single_prefill (seq_len={seq_len}, num_heads={num_heads}, causal={causal}, head_dim={head_dim}, dtype={dtype}), MSE: {mse:.3f}"
+        f"test_single_prefill (seq_len={seq_len}, num_heads={num_heads}, causal={causal}, head_dim={head_dim}, dtype={dtype}), MSE: {mse:.5f}"
     )
 
 
 if __name__ == "__main__":
-    for seq_len in [512, 1024, 4096, 8192]:
+    for seq_len in [117, 509, 1011, 2372, 7777]:
         for num_heads in [24, 32]:
-            for causal in [False]:
+            for causal in [True, False]:
                 for head_dim in [64, 128, 256]:
                     for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                         test_single_prefill(seq_len, num_heads, causal, head_dim, dtype)

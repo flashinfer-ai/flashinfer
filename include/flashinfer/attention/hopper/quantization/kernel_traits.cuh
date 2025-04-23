@@ -57,7 +57,7 @@ struct TranposeTraits_64x64 {
   static_assert(cutlass::sizeof_bits_v<TransElement> == 8);
 
   using SmemShapeLDSM = Shape<Shape<_8, _8>, Shape<_16, _4>>;
-  using SmemShapeSTSM = Shape<Shape<_16, _4>, Shape<_8, _8>>;
+  using SmemShapeSTSM = Shape<Shape<_16, _4>, Shape<_16, _4>>;
 
   using SmemLayoutAtomV =
       decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<TransElement>{}, TransposeShapeAtom_{}));
