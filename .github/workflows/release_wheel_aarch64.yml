@@ -66,6 +66,7 @@ jobs:
           chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
           docker run --rm -t \
               -v "$GITHUB_WORKSPACE":/app \
+              -v "$GITHUB_WORKSPACE/ci-cache":/ci-cache \
               -e FLASHINFER_CI_CACHE=/ci-cache \
               -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
               -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
