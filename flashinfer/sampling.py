@@ -446,8 +446,8 @@ def sampling_from_logits(
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
-    # TODO: Add examples
-    r"""Fused GPU kernel for category sampling from logits.
+    r"""Fused GPU kernel for category sampling from logits. It's equivalent to sampling
+    from :attr:`logits` after applying softmax.
     Parameters
     ----------
     logits: torch.Tensor
@@ -461,7 +461,8 @@ def sampling_from_logits(
         This allows reusing the same probability distribution for multiple outputs.
         If indices is not provided, the i-th output will be sampled from the i-th row of logits.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        Since the sampling doesn't use cub's BlockScan, the sampling is deterministic. We keep this
+        argument for compatibility with other sampling functions.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -473,8 +474,21 @@ def sampling_from_logits(
         :attr:`logits` after applying softmax.
     Examples
     --------
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> logits = torch.rand(batch_size, vocab_size).to(0)
+    >>> logits
+    tensor([[0.8823, 0.9150, 0.3829, 0.9593, 0.3904],
+            [0.6009, 0.2566, 0.7936, 0.9408, 0.1332],
+            [0.9346, 0.5936, 0.8694, 0.5677, 0.7411],
+            [0.4294, 0.8854, 0.5739, 0.2666, 0.6274]], device='cuda:0')
+    >>> samples = flashinfer.sampling.sampling_from_logits(logits)
+    >>> samples
+    tensor([0, 1, 1, 1], device='cuda:0', dtype=torch.int32)
     """
-    # TODO: Add examples
     if check_nan:
         if torch.any(torch.isnan(logits)):
             raise ValueError("Input logits contains NaN.")
