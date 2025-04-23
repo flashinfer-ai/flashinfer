@@ -99,23 +99,44 @@ def get_single_prefill_module(backend):
                 maybe_alibi_slopes: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
+                scale_q: Optional[torch.Tensor],
+                scale_k: Optional[torch.Tensor],
+                scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
             ) -> None:
                 if backend == "fa3":
-                    run_func(
-                        q,
-                        k,
-                        v,
-                        tmp,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        logits_soft_cap,
-                        sm_scale,
-                    )
+                    if not is_float8(q):
+                        run_func(
+                            q,
+                            k,
+                            v,
+                            tmp,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            logits_soft_cap,
+                            sm_scale,
+                        )
+                    else:
+                        # FP8 enabled
+                        run_func(
+                            q,
+                            k,
+                            v,
+                            tmp,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            scale_q,
+                            scale_k,
+                            scale_v,
+                            sm_scale,
+                        )
                 else:
                     run_func(
                         q,
@@ -621,6 +642,10 @@ def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    scale_q: Optional[torch.Tensor] = None,
+    scale_k: Optional[torch.Tensor] = None,
+    scale_v: Optional[torch.Tensor] = None,
+    o_dtype: Optional[torch.dtype] = None,
     custom_mask: Optional[torch.Tensor] = None,
     packed_custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -642,6 +667,10 @@ def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    scale_q: Optional[torch.Tensor] = None,
+    scale_k: Optional[torch.Tensor] = None,
+    scale_v: Optional[torch.Tensor] = None,
+    o_dtype: Optional[torch.dtype] = None,
     custom_mask: Optional[torch.Tensor] = None,
     packed_custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -662,6 +691,10 @@ def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    scale_q: Optional[torch.Tensor] = None,
+    scale_k: Optional[torch.Tensor] = None,
+    scale_v: Optional[torch.Tensor] = None,
+    o_dtype: Optional[torch.dtype] = None,
     custom_mask: Optional[torch.Tensor] = None,
     packed_custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -691,6 +724,18 @@ def single_prefill_with_kv_cache(
         The key tensor, shape: ``[kv_len, num_kv_heads, head_dim_vo]`` if :attr:`kv_layout`
         is ``NHD``, ``[num_kv_heads, kv_len, head_dim_vo]`` if :attr:`kv_layout` is
         ``HND``.
+    scale_q : Optional[torch.Tensor]
+        The scale tensor for query, per-head quantization with shape: ``[num_qo_heads]``.
+        Used with FP8 Quantization. If not provided, will be set to ``1.0``.
+    scale_k : Optional[torch.Tensor]
+        The scale tensor for key, per-head quantization with shape: ``[num_kv_heads]``.
+        Used with FP8 Quantization. If not provided, will be set to ``1.0``.
+    scale_v : Optional[torch.Tensor]
+        The scale tensor for value, per-head quantization with shape: ``[num_kv_heads]``.
+        Used with FP8 Quantization. If not provided, will be set to ``1.0``.
+    o_dtype : Optional[torch.dtype]
+        The output tensor data type, if not provided, will be set to the same as the q.
+        This is necessary as output dtype cannot be automatically inferred in quant.
     custom_mask : Optional[torch.Tensor]
         The custom boolean mask tensor, shape: ``[qo_len, kv_len]``.
         The elements in the mask tensor should be either ``True`` or ``False``,
@@ -814,6 +859,20 @@ def single_prefill_with_kv_cache(
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
 
+    if is_float8(q):
+        # FP8 quant enabled, do sanity check:
+        #   1. unsupported feature
+        #   2. dtype check
+        assert window_left == -1
+        assert q.dtype == k.dtype == v.dtype
+        assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        if scale_q is None:
+            scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
+        if scale_k is None:
+            scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+        if scale_v is None:
+            scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -825,11 +884,15 @@ def single_prefill_with_kv_cache(
         )
     module_getter = get_single_prefill_module(backend)
 
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
+    # o_dtype should be provided for FP8 attention
+    if o_dtype is None:
+        o_dtype = q.dtype
+    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+
     module_getter(
         q.dtype,
         k.dtype,
-        q.dtype,
+        out.dtype,
         q.shape[-1],  # head_dim_qk
         v.shape[-1],  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
@@ -850,6 +913,9 @@ def single_prefill_with_kv_cache(
         _get_cache_alibi_slopes_buf(q.shape[1], q.device),
         logits_soft_cap,
         sm_scale,
+        scale_q,
+        scale_k,
+        scale_v,
         rope_scale,
         rope_theta,
     )

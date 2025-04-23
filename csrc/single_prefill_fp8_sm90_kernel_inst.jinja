@@ -1,0 +1,11 @@
+#include <flashinfer/attention/hopper/quantization/prefill_sm90.cuh>
+#include "single_prefill_sm90_config.inc"
+
+using namespace flashinfer;
+
+namespace flashinfer {
+
+template cudaError_t SingleFP8PrefillWithKVCacheDispatched
+    <{{ head_dim_qk }}, {{ mask_mode }}, /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }}, {{ variant_name }}, Params>(
+    Params& params, cudaStream_t stream);
+};

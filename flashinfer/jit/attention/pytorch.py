@@ -452,7 +452,12 @@ def gen_single_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     )
+
+    # use `fp8_enabled` flag to use separate kernel template
+    fp8_enabled = "e4m3" in uri or "e5m2" in uri
+
     if backend == "fa2":
+        assert not fp8_enabled, "fp8 is not supported in fa2 backend"
         additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
         additional_tensor_dtypes = ["uint8_t", "float"]
         additional_scalar_names = [
@@ -465,12 +470,20 @@ def gen_single_prefill_module(
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = f"#include<flashinfer/attention/variants.cuh>"
     else:
-        additional_tensor_names = []
-        additional_tensor_dtypes = []
-        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-        additional_scalar_dtypes = ["double", "double"]
-        variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+        if not fp8_enabled:
+            additional_tensor_names = []
+            additional_tensor_dtypes = []
+            additional_scalar_names = ["logits_soft_cap", "sm_scale"]
+            additional_scalar_dtypes = ["double", "double"]
+            variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+        else:
+            additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
+            additional_tensor_dtypes = ["float", "float", "float"]
+            additional_scalar_names = ["sm_scale"]
+            additional_scalar_dtypes = ["double"]
+            variant_name = f"DefaultFP8Attention"
+            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_single_prefill_module(
         backend,
@@ -490,6 +503,7 @@ def gen_single_prefill_module(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
     )
 
 
@@ -884,6 +898,7 @@ def gen_customize_single_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
 ):
     kwargs = {
         "variant_decl": variant_decl,
@@ -967,12 +982,18 @@ def gen_customize_single_prefill_module(
             )
         )
 
-        with open(
-            FLASHINFER_CSRC_DIR / "single_prefill_sm90_customize_config.jinja"
-        ) as f:
+        _file_config = "single_prefill_sm90_customize_config.jinja"
+        if fp8_enabled:
+            _file_kernel_inst = "single_prefill_fp8_sm90_kernel_inst.jinja"
+            _file_csrc = "single_prefill_fp8_sm90.cu"
+        else:
+            _file_kernel_inst = "single_prefill_sm90_kernel_inst.jinja"
+            _file_csrc = "single_prefill_sm90.cu"
+
+        with open(FLASHINFER_CSRC_DIR / _file_config) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "single_prefill_sm90_kernel_inst.jinja") as f:
+        with open(FLASHINFER_CSRC_DIR / _file_kernel_inst) as f:
             kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -998,7 +1019,7 @@ def gen_customize_single_prefill_module(
             write_if_different(dest_path, source)
 
         for filename in [
-            "single_prefill_sm90.cu",
+            _file_csrc,
             "single_prefill_sm90_jit_pybind.cu",
         ]:
             src_path = FLASHINFER_CSRC_DIR / filename
