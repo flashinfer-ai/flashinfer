@@ -63,7 +63,9 @@ jobs:
           echo "CUDA_VERSION: $CUDA_VERSION"
           echo "PYTHON_VERSION: $PYTHON_VERSION"
           echo "BUILDER_IMAGE: $BUILDER_IMAGE"
-          chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
+          chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE/ci-cache"
+          chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE/ci-cache"
           docker run --rm -t \
               -v "$GITHUB_WORKSPACE":/app \
               -v "$GITHUB_WORKSPACE/ci-cache":/ci-cache \
