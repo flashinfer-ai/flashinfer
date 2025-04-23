@@ -340,7 +340,6 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   aggregate += aggregate_local;
 }
 
-// TODO: move this to utils.cuh
 template <typename DType, typename IdType>
 struct DataAndIndex {
   DType data;
@@ -364,7 +363,6 @@ struct DataAndIndex {
   }
 };
 
-// TODO: move this to utils.cuh
 template<uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed, uint64_t philox_offset, uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
