@@ -24,16 +24,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - torch: "2.5"
-            cuda: "12.6"
+          - cuda: "12.6"
+            torch: "2.5"
             python: "3.10"
             image: "nvcr.io/nvidia/pytorch:24.10-py3"
-          - torch: "2.6"
-            cuda: "12.8"
+          - cuda: "12.8"
+            torch: "2.6"
             python: "3.12"
             image: "nvcr.io/nvidia/pytorch:25.01-py3"
-          - torch: "2.7"
-            cuda: "12.8"
+          - cuda: "12.8"
+            torch: "2.7"
             python: "3.12"
             image: "nvcr.io/nvidia/pytorch:25.03-py3"
 
@@ -77,14 +77,14 @@ jobs:
               -e MAX_JOBS=128 \
               --user $(id -u):$(id -g) \
               $BUILDER_IMAGE \
-              bash /app/scripts/run-ci-build-aarch64-wheel.sh
+              bash /app/scripts/run-ci-build-wheel.sh
         timeout-minutes: 120
 
       - run: du -h dist/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}
+          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}-aarch64
           path: dist/*
 
   release:
@@ -118,3 +118,12 @@ jobs:
 
       - name: Update wheel index
         run: python3 scripts/update_whl_index.py
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl"
+          git push
