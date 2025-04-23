@@ -626,6 +626,7 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
 @pytest.mark.parametrize("page_size", [1, 16, 128])
@@ -646,14 +647,14 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         num_local_heads,
         head_dim_ckv + head_dim_kpe,
         dtype=dtype,
-        device="cuda"
+        device="cuda",
     )
     ckv_kpe = torch.randn(
         total_page_num,
         page_size,
         head_dim_ckv + head_dim_kpe,
         dtype=dtype,
-        device="cuda"
+        device="cuda",
     )
     kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device="cuda")
     page_num_per_batch = (max_seq_len + page_size - 1) // page_size
@@ -664,7 +665,7 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         total_page_num,
         (batch_size, page_num_per_batch),
         dtype=torch.int32,
-        device='cuda'
+        device="cuda",
     )
 
     mla_ref = flashinfer.mla.BatchMLAPagedAttentionWrapper(

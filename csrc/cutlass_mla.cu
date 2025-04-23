@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/cutlass_mla.cuh>
+
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
@@ -22,7 +23,6 @@ using namespace flashinfer::attention;
 void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor lse,
                               at::Tensor q_nope_pe, at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
                               at::Tensor page_table) {
-
   const c10::cuda::OptionalCUDAGuard device_guard(q_nope_pe.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -43,4 +43,3 @@ void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor l
     return true;
   });
 }
-
