@@ -332,7 +332,7 @@ cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t s
     SingleFP8PrefillWithKVCacheKernelTraitsDispatched<
         FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM,
                                  /*CTA_Q_=*/128,
-                                 /*CTA_KV_=*/CAUSAL ? 128 : 192,
+                                 /*CTA_KV_=*/192,
                                  /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                  typename Params::DTypeKV, typename Params::DTypeO,
                                  typename Params::IdType, AttentionVariant>,
