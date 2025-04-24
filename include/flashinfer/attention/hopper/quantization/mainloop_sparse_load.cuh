@@ -273,6 +273,7 @@ struct FP8SparseCollectiveMainloop {
 
       // Transpose V
       pipeline_v.consumer_wait(smem_pipe_read);
+      pipeline_vt.producer_acquire(smem_pipe_write);
       v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
       pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
       pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
@@ -289,6 +290,7 @@ struct FP8SparseCollectiveMainloop {
 
       // Transpose V
       pipeline_v.consumer_wait(smem_pipe_read);
+      pipeline_vt.producer_acquire(smem_pipe_write);
       v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
       pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
       pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
@@ -314,6 +316,7 @@ struct FP8SparseCollectiveMainloop {
 
         // Transpose V
         pipeline_v.consumer_wait(smem_pipe_read);
+        pipeline_vt.producer_acquire(smem_pipe_write);
         v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
         pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
         pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
@@ -338,6 +341,7 @@ struct FP8SparseCollectiveMainloop {
 
         // Transpose V
         pipeline_v.consumer_wait(smem_pipe_read);
+        pipeline_vt.producer_acquire(smem_pipe_write);
         v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
         pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
         pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
