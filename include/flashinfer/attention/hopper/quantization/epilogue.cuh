@@ -151,8 +151,12 @@ struct FP8CollectiveEpilogue {
       }
     }
 
-    int write_warp_idx = NUM_WARPS - 1;
+    // make sure all WG finish STSM o
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
+                                      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+
     TiledCopyO gmem_tiled_copy_O;
+    int write_warp_idx = NUM_WARPS - 1;
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 2>(TileShape_QKD{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);

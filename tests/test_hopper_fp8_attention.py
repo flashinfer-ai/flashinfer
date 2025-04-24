@@ -62,7 +62,7 @@ def bsr_attention_ref(
 
 
 # Test single_prefill correctness: MSE should be below threshold
-@pytest.mark.parametrize("seq_len", [117, 509, 1011, 2372, 7777])
+@pytest.mark.parametrize("seq_len", [117, 509, 1011, 2372, 7777, 12315])
 @pytest.mark.parametrize("num_heads", [24, 32])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -107,19 +107,27 @@ def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
 # Test block sparse attention correctness: MSE should be below threshold
 @pytest.mark.parametrize("R", [1, 4, 16])
 @pytest.mark.parametrize("C", [1, 4, 16])
-@pytest.mark.parametrize("M", [256, 512, 1024])
-@pytest.mark.parametrize("N", [256, 512, 1024])
-@pytest.mark.parametrize("num_heads", [24, 32])
+@pytest.mark.parametrize("M", [256, 512, 1024, 4096])
+@pytest.mark.parametrize("N", [256, 512, 1024, 4096])
+@pytest.mark.parametrize("num_heads", [1, 8, 24, 32])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("mask_inside_block", [False])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_block_sparse_attention(
     R, C, M, N, num_heads, head_dim, mask_inside_block, dtype
 ):
+    # print args
+    print(
+        f"Testing block sparse attention with R={R}, C={C}, M={M}, N={N}, num_heads={num_heads}, "
+        f"head_dim={head_dim}, mask_inside_block={mask_inside_block}, dtype={dtype}"
+    )
+    # setup random seed for reproducibility
+    torch.manual_seed(0)
+    np.random.seed(0)
     # Build sparse mask
     MB = M // R
     NB = N // C
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed=0)
     S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
     indptr = torch.from_numpy(S.indptr).cuda()
     indices = torch.from_numpy(S.indices).cuda()
@@ -169,19 +177,12 @@ def test_block_sparse_attention(
 
 
 if __name__ == "__main__":
-    for seq_len in [117, 509, 1011, 2372, 7777]:
-        for num_heads in [24, 32]:
-            for causal in [True, False]:
-                for head_dim in [64, 128, 256]:
-                    for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-                        test_single_prefill(seq_len, num_heads, causal, head_dim, dtype)
-
-    for R in [1, 4, 16]:
-        for C in [1, 4, 16]:
-            for M in [64, 128, 256]:
-                for N in [64, 128, 256]:
-                    for num_heads in [32]:
-                        for head_dim in [128, 256]:
+    for R in [4]:
+        for C in [1]:
+            for M in [1024]:
+                for N in [512]:
+                    for num_heads in [8]:
+                        for head_dim in [256]:
                             for mask_inside_block in [False]:
                                 for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                                     test_block_sparse_attention(
@@ -189,7 +190,6 @@ if __name__ == "__main__":
                                         C,
                                         M,
                                         N,
-                                        num_heads,
                                         num_heads,
                                         head_dim,
                                         mask_inside_block,
