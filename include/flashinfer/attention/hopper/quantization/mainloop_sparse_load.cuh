@@ -36,7 +36,7 @@ namespace flashinfer {
 using namespace cute;
 
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
-struct SparseCollectiveMainloop {
+struct FP8SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -46,16 +46,17 @@ struct SparseCollectiveMainloop {
 
   static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
   static constexpr int HEAD_DIM = Ktraits::HEAD_DIM;
-  static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
   static constexpr auto AlignmentKV = 128 / cutlass::sizeof_bits<DTypeKV>::value;
   using AlignmentTypeKV = cute::uint_byte_t<static_cast<int>(sizeof(DTypeKV)) * AlignmentKV>;
 
+  // Use ZFILL for out-of-bound V loading (avoid nan)
   using GmemCopyAtomKV = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<AlignmentTypeKV>, DTypeKV>;
   using GmemTiledCopyKV =
       decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
-               GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
+               GmemCopyAtomKV, Ktraits::NUM_PRODUCER_THREADS, AlignmentKV,
                cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
                decltype(cute::get<1>(TileShape_QKD{})), decltype(cute::get<2>(TileShape_QKD{}))>());
 
@@ -78,11 +79,13 @@ struct SparseCollectiveMainloop {
                   repeat_like(StrideT{}, int32_t(0)), StrideT{}),
       SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{}));  // no mcast for Q
 
+  // for sparse loading, we use cp.async
   static constexpr bool USE_TMA_LOAD_KV = false;
-  static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMmaQK{});
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
+  using MainloopPipelineVt = typename Ktraits::MainloopPipelineNoTMA;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
 
   static constexpr uint32_t TmaTransactionBytesQ =
       static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<DTypeQ> / 8);
@@ -115,6 +118,7 @@ struct SparseCollectiveMainloop {
     IdType* kv_indices;
     int window_left;
     AdditionalParams additional_params;
+    using DTypeKV = typename Ktraits::DTypeKV;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -154,18 +158,32 @@ struct SparseCollectiveMainloop {
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
             typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
-                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
-                           PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
-                           Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
+                           MainloopPipeline pipeline_v, MainloopPipelineVt pipeline_vt,
+                           PipelineState& smem_pipe_write, PipelineState& smem_pipe_read,
+                           SharedStorage& shared_storage, Scheduler& scheduler,
+                           typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx) {
     int thread_idx = threadIdx.x;
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (thread_idx / 32) % 4, 0);
+    bool issue_tma_thread = (warp_idx_in_warpgroup == 0) && (elect_one_sync() == 1);
+
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
     Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
+
+    // *** Prepare In-kernel V Transpose ***
+    using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
+    using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
+
+    Tensor sV_src = as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVTransposeSrc{}));
+    Tensor sVt_tgt = as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtTransposeTgt{}));
+    auto v_tranposer = SmemTransposeFP8_64x64<Ktraits>();
+    /* ----- V Transpose ---- */
 
     auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
 
@@ -219,94 +237,112 @@ struct SparseCollectiveMainloop {
     };
 
     // load last k-tile
+    // all threads are issuing as TMA is disabled
     {
-      pipeline_k.producer_acquire(smem_pipe_write_k);
+      pipeline_k.producer_acquire(smem_pipe_write);
       Tensor tKgKiGroup = flatten_1(tKgK(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
       Tensor tKsKiGroup =
-          flatten_1(tKsK(_, _, _, smem_pipe_write_k.index()));  // (CPY, (CPY_KV, CPY_D))
+          flatten_1(tKsK(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
       copy_if(gmem_tiled_copy_kv, predicate_fn, tKgKiGroup, tKsKiGroup);
-
-      pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_k;
+      pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
     }
 
+    // Wait for the MMA warpgroups to say that smem_q is ready
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
+                                      static_cast<int>(NamedBarriers::kQueryEmpty));
     // load Q tile
-    if (warp_idx_in_warpgroup == 0) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
-                                        static_cast<int>(NamedBarriers::kQueryEmpty));
-
-      int lane_predicate = cute::elect_one_sync();
-      if (lane_predicate) {
-        shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-        copy(mainloop_params.tma_load_Q.with(
-                 reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-                     shared_storage.barrier_Q),
-                 /*mcast_mask=*/0),
-             tQgQ, tQsQ);
-      }
+    if (issue_tma_thread) {
+      shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+      copy(mainloop_params.tma_load_Q.with(
+               reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                   shared_storage.barrier_Q),
+               /*mcast_mask=*/0),
+           tQgQ, tQsQ);
     }
 
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
     if (kv_tile_idx == swa_begin_kv_tile_idx) {
-      pipeline_v.producer_acquire(smem_pipe_write_v);
+      // first tile is the last tile
+      pipeline_v.producer_acquire(smem_pipe_write);
       Tensor tVgViGroup = flatten_1(tVgV(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
       Tensor tVsViGroup =
-          flatten_1(tVsV(_, _, _, smem_pipe_write_v.index()));  // (CPY, (CPY_KV, CPY_D))
+          flatten_1(tVsV(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
       copy_if(gmem_tiled_copy_kv, predicate_fn, tVgViGroup, tVsViGroup);
+      pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
-      pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_v;
+      // Transpose V
+      pipeline_v.consumer_wait(smem_pipe_read);
+      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
+      pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
+      ++smem_pipe_read;
+      ++smem_pipe_write;  // update state, as K is loaded 1 step faster
     } else {
       // load second last k-tile and last v-tile
-      pipeline_k.producer_acquire(smem_pipe_write_k);
-      Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);            // (CPY, CPY_KV, CPY_D)
-      Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
-      copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
-
-      pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_k;
-
-      pipeline_v.producer_acquire(smem_pipe_write_v);
+      pipeline_v.producer_acquire(smem_pipe_write);
       Tensor tVgViGroup = flatten_1(tVgV(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
       Tensor tVsViGroup =
-          flatten_1(tVsV(_, _, _, smem_pipe_write_v.index()));  // (CPY, (CPY_KV, CPY_D))
+          flatten_1(tVsV(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
       copy_if(gmem_tiled_copy_kv, predicate_fn, tVgViGroup, tVsViGroup);
+      pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
-      pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
+      // Transpose V
+      pipeline_v.consumer_wait(smem_pipe_read);
+      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
+      pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
+      ++smem_pipe_read;
+      ++smem_pipe_write;  // update state, as K is loaded 1 step faster
+
+      pipeline_k.producer_acquire(smem_pipe_write);
+      Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);          // (CPY, CPY_KV, CPY_D)
+      Tensor tKsKi = tKsK(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
+      copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
+      pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+
       --kv_tile_idx;
-      ++smem_pipe_write_v;
 
       // load remaining k/v tiles
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
-        pipeline_k.producer_acquire(smem_pipe_write_k);
-
-        Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);            // (CPY, CPY_KV, CPY_D)
-        Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
-        copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
-
-        pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_k;
-
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        Tensor tVgVi = tVgV(_, _, _, kv_tile_idx);                // (CPY, CPY_KV, CPY_D)
-        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write_v.index());  // (CPY, CPY_KV, CPY_D)
+        pipeline_v.producer_acquire(smem_pipe_write);
+        Tensor tVgVi = tVgV(_, _, _, kv_tile_idx);              // (CPY, CPY_KV, CPY_D)
+        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
         copy(gmem_tiled_copy_kv, tVgVi, tVsVi);
+        pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
-        pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_v;
+        // Transpose V
+        pipeline_v.consumer_wait(smem_pipe_read);
+        v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+        pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
+        pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
+        ++smem_pipe_read;
+        ++smem_pipe_write;  // update state, as K is loaded 1 step faster
+
+        pipeline_k.producer_acquire(smem_pipe_write);
+        Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);          // (CPY, CPY_KV, CPY_D)
+        Tensor tKsKi = tKsK(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
+        copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
+        pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
       // load first v tile
       {
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        Tensor tVgVi = tVgV(_, _, _, 0);                          // (CPY, (CPY_KV, CPY_D))
-        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write_v.index());  // (CPY, (CPY_KV, CPY_D))
+        pipeline_v.producer_acquire(smem_pipe_write);
+        Tensor tVgVi = tVgV(_, _, _, 0);                        // (CPY, (CPY_KV, CPY_D))
+        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write.index());  // (CPY, (CPY_KV, CPY_D))
         copy(gmem_tiled_copy_kv, tVgVi, tVsVi);
-        pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_v;
+        pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+
+        // Transpose V
+        pipeline_v.consumer_wait(smem_pipe_read);
+        v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+        pipeline_vt.producer_commit(smem_pipe_write);  // ping MMA consumer
+        pipeline_v.consumer_release(smem_pipe_read);   // release V loading consumer
+        ++smem_pipe_read;
+        ++smem_pipe_write;  // update state, as K is loaded 1 step faster
       }
     }
 
@@ -314,10 +350,9 @@ struct SparseCollectiveMainloop {
   }
 
   CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
-                                PipelineState& smem_pipe_write_k,
-                                PipelineState& smem_pipe_write_v) {
-    pipeline_k.producer_tail(smem_pipe_write_k);
-    pipeline_v.producer_tail(smem_pipe_write_v);
+                                PipelineState& smem_pipe_write) {
+    pipeline_k.producer_tail(smem_pipe_write);
+    pipeline_v.producer_tail(smem_pipe_write);
   }
 };
 

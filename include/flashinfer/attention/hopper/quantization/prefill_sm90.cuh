@@ -31,6 +31,7 @@
 #include "kernel_traits.cuh"
 #include "mainloop_load.cuh"
 #include "mainloop_mma.cuh"
+#include "mainloop_sparse_load.cuh"
 
 namespace flashinfer {
 
@@ -55,7 +56,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
   // We always assign one WG as producer
   // For FP8 kernel, all 4 warps collectively process ldmatrix with ldmatrix
-  static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_COPY_THREADS = Ktraits::NUM_PRODUCER_THREADS;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
@@ -112,19 +113,21 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }();
 
   MainloopPipeline pipeline_v = [&] {
+    // specialized for shared memory of V transpose
     pipeline_params.role = MainloopPipeline::ThreadCategory::ProducerConsumer;
-    pipeline_params.num_consumers = Ktraits::NUM_PRODUCER_THREADS;
     if constexpr (use_tma_load_kv) {
+      pipeline_params.num_consumers = NUM_COPY_THREADS;
       return MainloopPipeline(shared_storage.pipeline_v, pipeline_params,
                               /*cluster_shape=*/Shape<_1, _1, _1>{});
     } else {
+      pipeline_params.consumer_arv_count = NUM_COPY_THREADS;
       return MainloopPipeline(shared_storage.pipeline_v, pipeline_params);
     }
   }();
 
   // Init pipeline_vt for transpose and consumed by mma
   PipelineParamsVt pipeline_params_vt;
-  pipeline_params_vt.producer_arv_count = Ktraits::NUM_PRODUCER_THREADS;
+  pipeline_params_vt.producer_arv_count = NUM_COPY_THREADS;
   pipeline_params_vt.consumer_arv_count = NUM_MMA_THREADS;
   MainloopPipelineVt pipeline_vt(shared_storage.pipeline_vt, pipeline_params_vt);
 
@@ -309,6 +312,74 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   return cudaSuccess;
 }
 
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
+                                                                  cudaStream_t stream) {
+  using DTypeQ = typename KernelTraits::DTypeQ;
+  using DTypeKV = typename KernelTraits::DTypeKV;
+  using DTypeO = typename KernelTraits::DTypeO;
+  using IdType = typename KernelTraits::IdType;
+
+  using CollectiveMainloop =
+      FP8SparseCollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+  using CollectiveEpilogue = FP8CollectiveEpilogue<KernelTraits>;
+  using Scheduler =
+      std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+                         BatchPrefillPersistentTileScheduler<IdType>>;
+
+  typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
+      {params.q_ptr,
+       get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM,
+                       params.q_stride_n,
+                       params.q_stride_h),  // layout_Q
+       params.k_ptr,
+       // NOTE(Zihao): nnz was useless here, we can just pass 0
+       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM, params.k_stride_n,
+                       params.k_stride_h),  // layout_K
+       params.v_ptr,
+       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM, params.v_stride_n,
+                       params.v_stride_h),  // layout_V
+       params.kv_indices, params.window_left, params.additional_params});
+  typename CollectiveEpilogue::Params epilogue_params =
+      CollectiveEpilogue::to_underlying_arguments({
+          params.o_ptr,
+          get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM,
+                          params.o_stride_n,
+                          params.o_stride_h),                                       // layout_O
+          params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+      });
+
+  typename Scheduler::Arguments scheduler_args = {
+      params.work_indptr,     params.head_indices,
+      params.qo_tile_indices, params.qo_indptr,
+      params.kv_indptr,       params.qo_lens,
+      params.kv_lens,         cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      params.num_qo_heads};
+  typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
+
+  // Get the ptr to kernel function.
+  auto kernel =
+      (void*)FP8PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+                                         LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+  int smem_size = sizeof(typename KernelTraits::SharedStorage);
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  int device;
+  cudaGetDevice(&device);
+  int multiprocessor_count;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
+  static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
+  dim3 block_dims(ctaSize);
+  void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+
+  return cudaSuccess;
+}
+
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
@@ -351,6 +422,49 @@ cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t s
   cudaError_t status = cudaGetLastError();
   return status;
 }
+
+template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
+cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
+  static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;  // Not supported yet.
+  }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  if constexpr (HEAD_DIM == 64) {
+    // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
+    BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
+                                 /*CTA_Q_=*/192,
+                                 /*CTA_KV_=*/128,
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  } else if constexpr (HEAD_DIM == 128) {
+    BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
+                                 /*CTA_Q_=*/128,
+                                 /*CTA_KV_=*/128,
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  } else {
+    // HEAD_DIM == 256;
+    // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
+    BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
+                                 /*CTA_Q_=*/128,
+                                 /*CTA_KV_=*/128,
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  }
+  cudaError_t status = cudaGetLastError();
+  return status;
+};
 
 }  // namespace flashinfer
 

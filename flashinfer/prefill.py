@@ -358,10 +358,14 @@ def get_batch_prefill_module(backend):
                 maybe_alibi_slopes: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
+                scale_q: Optional[torch.Tensor],
+                scale_k: Optional[torch.Tensor],
+                scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
             ) -> None:
                 if backend == "fa2":
+                    assert not is_float8(q)
                     paged_run_func(
                         float_workspace_buffer,
                         int_workspace_buffer,
@@ -387,25 +391,48 @@ def get_batch_prefill_module(backend):
                         1.0 / rope_theta,  # rope_rcp_theta
                     )
                 else:
-                    paged_run_func(
-                        float_workspace_buffer,
-                        int_workspace_buffer,
-                        plan_info_vec,
-                        q,
-                        paged_k_cache,
-                        paged_v_cache,
-                        qo_indptr,
-                        paged_kv_indptr,
-                        paged_kv_indices,
-                        paged_kv_last_page_len,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        logits_soft_cap,
-                        sm_scale,
-                    )
+                    if not is_float8(q):
+                        paged_run_func(
+                            float_workspace_buffer,
+                            int_workspace_buffer,
+                            plan_info_vec,
+                            q,
+                            paged_k_cache,
+                            paged_v_cache,
+                            qo_indptr,
+                            paged_kv_indptr,
+                            paged_kv_indices,
+                            paged_kv_last_page_len,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            logits_soft_cap,
+                            sm_scale,
+                        )
+                    else:
+                        paged_run_func(
+                            float_workspace_buffer,
+                            int_workspace_buffer,
+                            plan_info_vec,
+                            q,
+                            paged_k_cache,
+                            paged_v_cache,
+                            qo_indptr,
+                            paged_kv_indptr,
+                            paged_kv_indices,
+                            paged_kv_last_page_len,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            scale_q,
+                            scale_k,
+                            scale_v,
+                            sm_scale,
+                        )
                 return o
 
             @register_fake_op(f"flashinfer::{uri}_paged_run")
