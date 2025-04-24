@@ -1,5 +1,8 @@
 from typing import Tuple
 
+import numpy as np
+import pytest
+import scipy as sp
 import torch
 
 import flashinfer
@@ -37,20 +40,52 @@ def per_head_symmetric_quant(
     return q_x_out, s_out
 
 
+def bsr_attention_ref(
+    q,
+    k,
+    v,
+    indptr,
+    indices,
+    mask_data,
+):
+    M = q.shape[0]
+    N = k.shape[0]
+    bsr = sp.sparse.bsr_matrix(
+        (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
+        shape=(M, N),
+    )
+    dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
+    o = flashinfer.prefill.single_prefill_with_kv_cache(
+        q, k, v, custom_mask=dense_mask, backend="fa2"
+    )
+    return o
+
+
+# Test single_prefill correctness: MSE should be below threshold
+@pytest.mark.parametrize("seq_len", [117, 509, 1011, 2372, 7777])
+@pytest.mark.parametrize("num_heads", [24, 32])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
+    # Prepare inputs
     o_dtype = torch.half
     num_qo_heads = num_kv_heads = num_heads
-
     q = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
+
+    # Reference output
     o_ref = flashinfer.single_prefill_with_kv_cache(
         q, k, v, causal=causal, backend="fa3"
     )
 
+    # Quantize
     q_fp8, s_q = per_head_symmetric_quant(q, quant_dtype=dtype)
     k_fp8, s_k = per_head_symmetric_quant(k, quant_dtype=dtype)
     v_fp8, s_v = per_head_symmetric_quant(v, quant_dtype=dtype)
+
+    # FP8 output
     o_fp8 = flashinfer.single_prefill_with_kv_cache(
         q_fp8,
         k_fp8,
@@ -63,14 +98,74 @@ def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
         o_dtype=o_dtype,
     )
 
-    assert not torch.any(torch.isnan(o_fp8))
-    assert not torch.any(torch.isnan(o_ref))
-
-    # MSE
+    # Compute MSE and assert
+    # NOTE: This is not a strict correctness guarantee
     mse = torch.mean((o_ref.float() - o_fp8.float()) ** 2)
-    print(
-        f"test_single_prefill (seq_len={seq_len}, num_heads={num_heads}, causal={causal}, head_dim={head_dim}, dtype={dtype}), MSE: {mse:.5f}"
+    assert mse < 1.0, f"MSE too high: {mse.item()}"
+
+
+# Test block sparse attention correctness: MSE should be below threshold
+@pytest.mark.parametrize("R", [1, 4, 16])
+@pytest.mark.parametrize("C", [1, 4, 16])
+@pytest.mark.parametrize("M", [256, 512, 1024])
+@pytest.mark.parametrize("N", [256, 512, 1024])
+@pytest.mark.parametrize("num_heads", [24, 32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("mask_inside_block", [False])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_block_sparse_attention(
+    R, C, M, N, num_heads, head_dim, mask_inside_block, dtype
+):
+    # Build sparse mask
+    MB = M // R
+    NB = N // C
+    rng = np.random.default_rng()
+    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
+    indptr = torch.from_numpy(S.indptr).cuda()
+    indices = torch.from_numpy(S.indices).cuda()
+    nnz = S.nnz
+    if mask_inside_block:
+        data_mask = (torch.rand((nnz, R, C)) > 0.5).to(torch.bool).cuda()
+    else:
+        data_mask = torch.ones((nnz, R, C), dtype=torch.bool, device="cuda")
+
+    # Random inputs
+    q = torch.randn((M, num_heads, head_dim), dtype=torch.float16, device="cuda")
+    k = torch.randn((N, num_heads, head_dim), dtype=torch.float16, device="cuda")
+    v = torch.randn((N, num_heads, head_dim), dtype=torch.float16, device="cuda")
+
+    # Reference output via dense mask
+    o_ref = bsr_attention_ref(q, k, v, indptr, indices, data_mask)
+
+    # Plan and run BlockSparseAttention
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    sparse_wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(
+        workspace_buffer, backend="fa3"
     )
+    sparse_wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        head_dim,
+        mask=data_mask if mask_inside_block else None,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=torch.float16,
+    )
+    q_fp8, s_q = per_head_symmetric_quant(q, quant_dtype=dtype)
+    k_fp8, s_k = per_head_symmetric_quant(k, quant_dtype=dtype)
+    v_fp8, s_v = per_head_symmetric_quant(v, quant_dtype=dtype)
+    o = sparse_wrapper.run(q_fp8, k_fp8, v_fp8, s_q, s_k, s_v)
+
+    # Compute MSE and assert
+    # NOTE: This is not a strict correctness guarantee
+    mse = torch.mean((o_ref.float() - o.float()) ** 2)
+    assert mse < 1.0, f"Block sparse MSE too high: {mse.item()}"
 
 
 if __name__ == "__main__":
@@ -80,3 +175,23 @@ if __name__ == "__main__":
                 for head_dim in [64, 128, 256]:
                     for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                         test_single_prefill(seq_len, num_heads, causal, head_dim, dtype)
+
+    for R in [1, 4, 16]:
+        for C in [1, 4, 16]:
+            for M in [64, 128, 256]:
+                for N in [64, 128, 256]:
+                    for num_heads in [32]:
+                        for head_dim in [128, 256]:
+                            for mask_inside_block in [False]:
+                                for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                                    test_block_sparse_attention(
+                                        R,
+                                        C,
+                                        M,
+                                        N,
+                                        num_heads,
+                                        num_heads,
+                                        head_dim,
+                                        mask_inside_block,
+                                        dtype,
+                                    )
