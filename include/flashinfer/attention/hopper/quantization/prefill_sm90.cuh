@@ -145,38 +145,38 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
 
-    if constexpr (use_tma_load_kv) {  // Load Q, K, V
-      PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
-      PipelineState smem_pipe_read;
+    // Here no condition as the entire warp group is used as producer
+    PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+    PipelineState smem_pipe_read;
 
-      int work_idx = 0;
+    int work_idx = 0;
 
-      TileScheduler scheduler;
-      for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
-           work_tile_info.is_valid(scheduler_params);
-           work_tile_info = scheduler.template get_next_work</*is_producer=*/true>(
-               scheduler_params, work_tile_info)) {
-        auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-        auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
-            block_coord;
+    TileScheduler scheduler;
+    for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
+         work_tile_info.is_valid(scheduler_params);
+         work_tile_info = scheduler.template get_next_work</*is_producer=*/true>(scheduler_params,
+                                                                                 work_tile_info)) {
+      auto block_coord = work_tile_info.get_block_coord(scheduler_params);
+      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+          block_coord;
 
-        if (q_tile_idx * CTA_Q >= qo_len) {
-          continue;
-        }
-        int num_kv_tiles =
-            collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-        if (num_kv_tiles <= 0) {
-          scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-          scheduler.broadcast_next_work(work_tile_info);
-          continue;
-        }
-        collective_mainloop.load<LEFT_SLIDING_WINDOW>(
-            mainloop_params, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, smem_pipe_read,
-            shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
-        ++work_idx;
+      if (q_tile_idx * CTA_Q >= qo_len) {
+        continue;
       }
-      collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write);
+      int num_kv_tiles =
+          collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+      if (num_kv_tiles <= 0) {
+        scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+        scheduler.broadcast_next_work(work_tile_info);
+        continue;
+      }
+      collective_mainloop.load<LEFT_SLIDING_WINDOW>(
+          mainloop_params, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, smem_pipe_read,
+          shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
+      ++work_idx;
     }
+    collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write);
+
   } else {  // Consumer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();

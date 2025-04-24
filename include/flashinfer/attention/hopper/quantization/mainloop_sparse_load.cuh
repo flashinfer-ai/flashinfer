@@ -248,7 +248,7 @@ struct FP8SparseCollectiveMainloop {
     }
 
     // Wait for the MMA warpgroups to say that smem_q is ready
-    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                       static_cast<int>(NamedBarriers::kQueryEmpty));
     // load Q tile
     if (issue_tma_thread) {
