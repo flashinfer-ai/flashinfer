@@ -152,7 +152,8 @@ struct CausalMask : NoMask {
 
 struct VariableLength {
   int max_length;
-  int* cumulative_length = nullptr;
+  int* segment_offsets = nullptr;
+  int* lengths = nullptr;
 
   CUTE_HOST_DEVICE operator int() const { return max_length; }
 };
@@ -168,7 +169,7 @@ template <class Shape, class Idx>
 CUTE_HOST_DEVICE constexpr auto apply_variable_length(Shape const& shape, Idx const& idx) {
   return transform_leaf(shape, [&](auto const& s) {
     if constexpr (is_variable_length_v<remove_cvref_t<decltype(s)>>) {
-      return s.cumulative_length[idx + 1] - s.cumulative_length[idx];
+      return s.lengths[idx];
     } else {
       return s;
     }
@@ -181,7 +182,7 @@ CUTE_HOST_DEVICE constexpr auto apply_variable_length(Shape const& shape, Coord 
   auto new_shape = apply_variable_length(shape, idx);
   auto new_coord = transform_leaf(shape, coord, [&](auto const& s, auto const& c) {
     if constexpr (is_variable_length_v<remove_cvref_t<decltype(s)>>) {
-      return cute::make_tuple(c, s.cumulative_length[idx]);
+      return cute::make_tuple(c, s.segment_offsets[idx]);
     } else {
       return c;
     }
@@ -198,7 +199,7 @@ struct is_integral<cutlass::fmha::collective::VariableLength> : true_type {};
 
 CUTE_HOST_DEVICE
 void print(cutlass::fmha::collective::VariableLength a) {
-  printf("Varlen<%d, %p>", a.max_length, a.cumulative_length);
+  printf("Varlen<%d, %p, %p>", a.max_length, a.segment_offsets, a.lengths);
 }
 
 }  // namespace cute

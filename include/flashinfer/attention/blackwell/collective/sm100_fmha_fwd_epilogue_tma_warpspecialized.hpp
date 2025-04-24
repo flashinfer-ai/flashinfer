@@ -84,8 +84,8 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     auto problem_shape_O = select<0, 2, 3>(problem_shape);
 
     if constexpr (is_variable_length_v<tuple_element_t<0, ProblemShape>>) {
-      auto cumulative_length_q = get<0>(problem_shape).cumulative_length;
-      if (cumulative_length_q != nullptr) {
+      auto segment_offsets_q = get<0>(problem_shape).segment_offsets;
+      if (segment_offsets_q != nullptr) {
         int max_length_q = get<0>(problem_shape).max_length;
         // for variable sequence lenght, the batch is in units of row_stride
         get<2, 1>(dO) = get<0>(dO);
@@ -121,18 +121,18 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     Tensor mO_qdl_p = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
     // offset mode 0 by (max_length - real_length)
-    // offset mode 3,1 by cumulative_length + real_length
+    // offset mode 3,1 by segment_offsets + real_length
     // the ptr is already offset by - max_length
     // so in total this achieves
     int offs_0 = 0;
     int offs_2_1 = 0;
 
     if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
-      auto cumulative_length_q = get<0>(params_problem_shape).cumulative_length;
-      if (cumulative_length_q != nullptr) {
+      auto segment_offsets_q = get<0>(params_problem_shape).segment_offsets;
+      if (segment_offsets_q != nullptr) {
         int max_length_q = get<0>(params_problem_shape).max_length;
         offs_0 = max_length_q - get<0>(problem_shape);
-        offs_2_1 = cumulative_length_q[get<2, 1>(blk_coord)] + get<0>(problem_shape);
+        offs_2_1 = segment_offsets_q[get<2, 1>(blk_coord)] + get<0>(problem_shape);
         get<2, 1>(blk_coord) = 0;
       }
     }

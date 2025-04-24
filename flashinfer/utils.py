@@ -388,3 +388,7 @@ def _check_shape_dtype_device(
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
+
+
+def pad_to_multiple_of(x: torch.Tensor, multiple_of: int) -> torch.Tensor:
+    return (x + multiple_of - 1) // multiple_of * multiple_of

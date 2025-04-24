@@ -49,6 +49,7 @@ from .utils import (
     determine_attention_backend,
     is_float8,
     is_sm100a_supported,
+    pad_to_multiple_of,
     register_custom_op,
     register_fake_op,
 )
@@ -2605,12 +2606,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pass
 
 
-def fmha(
+def fmha_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
+    qo_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    qo_segment_offsets: Optional[torch.Tensor] = None,
+    kv_segment_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -2630,28 +2633,106 @@ def fmha(
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     nnz_kv, num_kv_heads, head_dim_vo = v.shape
 
-    if out is None:
-        out = torch.empty(
-            nnz_qo, num_qo_heads, head_dim_vo, device=q.device, dtype=q.dtype
-        )
-    if lse is None:
-        lse = torch.empty(nnz_qo, num_qo_heads, device=q.device, dtype=torch.float32)
-
     mask_mode_code = 1 if causal else 0
     sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
-    batch_size = qo_indptr.shape[0] - 1
-    max_qo_len = (qo_indptr[1:] - qo_indptr[:-1]).max()
-    max_kv_len = (kv_indptr[1:] - kv_indptr[:-1]).max()
+    batch_size = qo_lens.shape[0]
+    max_qo_len = (qo_lens.max() + 255) // 256 * 256
+    max_kv_len = (kv_lens.max() + 127) // 128 * 128
+    from .triton import build_pos_ids_from_segment_offsets_and_lengths
+
+    need_padding = False
+
+    if qo_segment_offsets is None:
+        qo_segment_offsets = torch.zeros(
+            batch_size + 1, device=q.device, dtype=torch.int32
+        )
+        qo_segment_offsets[1:] = torch.cumsum(qo_lens, dim=0)
+        padded_qo_lens = pad_to_multiple_of(qo_lens, 256)
+        padded_qo_segment_offsets = torch.zeros(
+            batch_size + 1, device=q.device, dtype=torch.int32
+        )
+        padded_qo_segment_offsets[1:] = torch.cumsum(padded_qo_lens, dim=0)
+        qo_pos_ids = build_pos_ids_from_segment_offsets_and_lengths(
+            padded_qo_segment_offsets,
+            qo_segment_offsets,
+        )
+        padded_qo_total_len = padded_qo_segment_offsets[-1]
+        q_padded = torch.empty(
+            (padded_qo_total_len,) + q.shape[1:],
+            device=q.device,
+            dtype=q.dtype,
+        )
+        q_padded[qo_pos_ids] = q
+        need_padding = True
+    else:
+        # qo_segment_offsets elements must be multiple of 256
+        assert (qo_segment_offsets % 256 == 0).all()
+        q_padded = q
+        padded_qo_total_len = nnz_qo
+        padded_qo_segment_offsets = qo_segment_offsets
+
+    if kv_segment_offsets is None:
+        kv_segment_offsets = torch.zeros(
+            batch_size + 1, device=q.device, dtype=torch.int32
+        )
+        kv_segment_offsets[1:] = torch.cumsum(kv_lens, dim=0)
+        padded_kv_lens = pad_to_multiple_of(kv_lens, 128)
+        padded_kv_segment_offsets = torch.zeros(
+            batch_size + 1, device=q.device, dtype=torch.int32
+        )
+        padded_kv_segment_offsets[1:] = torch.cumsum(padded_kv_lens, dim=0)
+        kv_pos_ids = build_pos_ids_from_segment_offsets_and_lengths(
+            padded_kv_segment_offsets,
+            kv_segment_offsets,
+        )
+        k_padded = torch.empty(
+            (padded_kv_segment_offsets[-1],) + k.shape[1:],
+            device=k.device,
+            dtype=k.dtype,
+        )
+        k_padded[kv_pos_ids] = k
+        v_padded = torch.empty(
+            (padded_kv_segment_offsets[-1],) + v.shape[1:],
+            device=v.device,
+            dtype=v.dtype,
+        )
+        v_padded[kv_pos_ids] = v
+    else:
+        # kv_segment_offsets elements must be multiple of 128
+        assert (kv_segment_offsets % 128 == 0).all()
+        k_padded = k
+        v_padded = v
+        padded_kv_segment_offsets = kv_segment_offsets
+
+    if out is None:
+        out_padded = torch.empty(
+            padded_qo_total_len,
+            num_qo_heads,
+            head_dim_vo,
+            device=q.device,
+            dtype=q.dtype,
+        )
+    else:
+        out_padded = out
+
+    if lse is None:
+        lse_padded = torch.empty(
+            padded_qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
+        )
+    else:
+        lse_padded = lse
 
     module.run(
-        q,
-        k,
-        v,
-        qo_indptr,
-        kv_indptr,
-        out,
-        lse,
+        q_padded,
+        k_padded,
+        v_padded,
+        qo_lens,
+        kv_lens,
+        padded_qo_segment_offsets,
+        padded_kv_segment_offsets,
+        out_padded,
+        lse_padded,
         mask_mode_code,
         sm_scale,
         num_qo_heads,
@@ -2663,5 +2744,12 @@ def fmha(
         max_qo_len,
         max_kv_len,
     )
+
+    if need_padding:
+        out = out_padded[qo_pos_ids]
+        lse = lse_padded[qo_pos_ids]
+    else:
+        out = out_padded
+        lse = lse_padded
 
     return out, lse

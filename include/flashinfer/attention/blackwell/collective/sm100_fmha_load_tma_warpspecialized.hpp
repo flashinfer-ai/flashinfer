@@ -80,8 +80,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     auto problem_shape_qk = problem_shape;
 
     if constexpr (is_variable_length_v<tuple_element_t<0, ProblemShape>>) {
-      auto cumulative_length_q = get<0>(problem_shape).cumulative_length;
-      if (cumulative_length_q != nullptr) {
+      auto segment_offsets_q = get<0>(problem_shape).segment_offsets;
+      if (segment_offsets_q != nullptr) {
         int max_length_q = get<0>(problem_shape).max_length;
         // for variable sequence lenght, the batch is in units of row_stride
         get<2, 1>(dQ) = get<0>(dQ);
@@ -93,8 +93,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     }
 
     if constexpr (is_variable_length_v<tuple_element_t<1, ProblemShape>>) {
-      auto cumulative_length_kv = get<1>(problem_shape).cumulative_length;
-      if (cumulative_length_kv != nullptr) {
+      auto segment_offsets_kv = get<1>(problem_shape).segment_offsets;
+      if (segment_offsets_kv != nullptr) {
         int max_length_kv = get<1>(problem_shape).max_length;
         // for variable sequence lenght, the batch is in units of row_stride
         get<2, 1>(dK) = get<0>(dK);
@@ -165,11 +165,11 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int q_offs_2_1 = 0;
 
     if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
-      auto cumulative_length_q = get<0>(params_problem_shape).cumulative_length;
-      if (cumulative_length_q != nullptr) {
+      auto segment_offsets_q = get<0>(params_problem_shape).segment_offsets;
+      if (segment_offsets_q != nullptr) {
         int max_length_q = get<0>(params_problem_shape).max_length;
         q_offs_0 = max_length_q - get<0>(problem_shape);
-        q_offs_2_1 = cumulative_length_q[get<2, 1>(blk_coord_q)] + get<0>(problem_shape);
+        q_offs_2_1 = segment_offsets_q[get<2, 1>(blk_coord_q)] + get<0>(problem_shape);
         get<2, 1>(blk_coord_q) = 0;
       }
     }
@@ -191,11 +191,11 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int kv_offs_2_1 = 0;
 
     if constexpr (is_variable_length_v<tuple_element_t<1, ParamsProblemShape>>) {
-      auto cumulative_length = get<1>(params_problem_shape).cumulative_length;
-      if (cumulative_length != nullptr) {
+      auto segment_offsets = get<1>(params_problem_shape).segment_offsets;
+      if (segment_offsets != nullptr) {
         int max_length = get<1>(params_problem_shape).max_length;
         kv_offs_0 = max_length - get<1>(problem_shape);
-        kv_offs_2_1 = cumulative_length[get<2, 1>(blk_coord_kv)] + get<1>(problem_shape);
+        kv_offs_2_1 = segment_offsets[get<2, 1>(blk_coord_kv)] + get<1>(problem_shape);
         get<2, 1>(blk_coord_kv) = 0;
       }
     }

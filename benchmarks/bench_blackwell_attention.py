@@ -38,17 +38,31 @@ def bench_fmha_blackwell(
         batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
     )
 
-    qo_indptr = (
+    qo_lens = torch.full((batch_size,), qkv_len, device="cuda", dtype=torch.int32)
+    kv_lens = torch.full((batch_size,), qkv_len, device="cuda", dtype=torch.int32)
+
+    qo_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
     )
-    kv_indptr = (
+    kv_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
     )
 
-    o, lse = flashinfer.prefill.fmha(q, k, v, qo_indptr, kv_indptr, causal=causal)
+    o, lse = flashinfer.prefill.fmha_varlen(
+        q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, causal=causal
+    )
 
     ms = do_bench(
-        lambda: flashinfer.prefill.fmha(q, k, v, qo_indptr, kv_indptr, causal=causal)
+        lambda: flashinfer.prefill.fmha_varlen(
+            q,
+            k,
+            v,
+            qo_lens,
+            kv_lens,
+            qo_segment_offsets,
+            kv_segment_offsets,
+            causal=causal,
+        )
     )
 
     def flops(ms):
@@ -63,6 +77,11 @@ def bench_fmha_blackwell(
 
 
 if __name__ == "__main__":
+    bench_fmha_blackwell(128, 1024, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(64, 2048, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(32, 4096, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(16, 8192, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(1, 32768, 32, 128, False, torch.bfloat16)
     bench_fmha_blackwell(128, 1024, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(64, 2048, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(32, 4096, 32, 128, True, torch.bfloat16)

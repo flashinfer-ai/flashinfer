@@ -64,8 +64,9 @@ struct FwdRunner {
               ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, StrideO, StrideLSE>,
           cutlass::fmha::kernel::PersistentTileScheduler>>;
 
-  void run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_indptr, at::Tensor kv_indptr,
-           at::Tensor o, std::optional<at::Tensor> maybe_lse, int mask_mode_code, double sm_scale,
+  void run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens, at::Tensor kv_lens,
+           at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets, at::Tensor o,
+           std::optional<at::Tensor> maybe_lse, int mask_mode_code, double sm_scale,
            int num_qo_heads, int num_kv_heads, int head_dim, int batch_size, int total_qo_len,
            int total_kv_len, int max_qo_len, int max_kv_len) {
     cutlass::KernelHardwareInfo hw_info;
@@ -82,9 +83,11 @@ struct FwdRunner {
     int h_r = num_qo_heads / num_kv_heads;
     assert(num_qo_heads % num_kv_heads == 0);
     ProblemShapeVarlen problem_shape = cute::make_tuple(
-        VariableLength{max_qo_len, static_cast<int*>(qo_indptr.data_ptr())},
-        VariableLength{max_kv_len, static_cast<int*>(kv_indptr.data_ptr())}, head_dim,
-        cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
+        VariableLength{max_qo_len, static_cast<int*>(qo_segment_offsets.data_ptr()),
+                       static_cast<int*>(qo_lens.data_ptr())},
+        VariableLength{max_kv_len, static_cast<int*>(kv_segment_offsets.data_ptr()),
+                       static_cast<int*>(kv_lens.data_ptr())},
+        head_dim, cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
 
     stride_Q = make_stride(num_qo_heads * head_dim, _1{},
                            make_stride(make_stride(head_dim, h_r * head_dim), 0));
