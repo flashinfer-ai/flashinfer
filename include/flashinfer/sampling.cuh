@@ -363,8 +363,8 @@ struct DataAndIndex {
   }
 };
 
-template <uint32_t VEC_SIZE>
-__device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed,
+template <typename DType, uint32_t VEC_SIZE>
+__device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed,
                                                                       uint64_t philox_offset,
                                                                       uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
@@ -394,7 +394,16 @@ __device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t p
     }
   }
 
-  return noise;
+  if constexpr (std::is_same_v<DType, float>) {
+    return noise;
+  } else {
+    vec_t<DType, VEC_SIZE> ret;
+#pragma unroll
+    for (uint32_t i = 0; i < VEC_SIZE; ++i) {
+      ret[i] = static_cast<DType>(noise[i]);
+    }
+    return ret;
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -409,21 +418,23 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling[];
   auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
 
-  vec_t<float, VEC_SIZE> logits_vec;
+  vec_t<DType, VEC_SIZE> logits_vec;
   DataAndIndex<DType, IdType> max_data;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    logits_vec.fill(-cuda::std::numeric_limits<float>::infinity());
-    // BUG? The tail of the logits is not loaded
+    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 
-    vec_t<float, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<VEC_SIZE>(
-        philox_seed, philox_offset, bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
+        philox_seed, philox_offset,
+        static_cast<uint64_t>(bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE));
     DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      cur_data[j].data = logits_vec[j] + gumbel_noise[j];
+      cur_data[j].data = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d
+                             ? logits_vec[j] + gumbel_noise[j]
+                             : -cuda::std::numeric_limits<DType>::infinity();
       cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
     }
 
