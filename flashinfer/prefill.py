@@ -1969,6 +1969,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2036,6 +2037,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the query tensor, defaults to torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        non_blocking : bool
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
         Note
         ----
@@ -2098,8 +2101,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         batch_size, self._fixed_batch_size
                     )
                 )
-            self._qo_indptr_buf.copy_(qo_indptr)
-            self._kv_indptr_buf.copy_(kv_indptr)
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+            self._kv_indptr_buf.copy_(kv_indptr, non_blocking=non_blocking)
             if packed_custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
                     raise ValueError(
@@ -2110,13 +2113,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
-                self._mask_indptr_buf.copy_(mask_indptr)
+                self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device)
-            self._kv_indptr_buf = kv_indptr.to(self.device)
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
+            self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask.to(self.device)
-                self._mask_indptr_buf = mask_indptr.to(self.device)
+                self._custom_mask_buf = packed_custom_mask.to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._mask_indptr_buf = mask_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
