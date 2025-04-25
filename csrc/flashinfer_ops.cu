@@ -177,8 +177,8 @@ void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Generator> gen);
 
 void sampling_from_logits(at::Tensor logits, at::Tensor output,
-                         std::optional<at::Tensor> maybe_indices, bool deterministic,
-                         std::optional<at::Generator> gen);
+                          std::optional<at::Tensor> maybe_indices, bool deterministic,
+                          std::optional<at::Generator> gen);
 
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,

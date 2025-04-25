@@ -26,15 +26,18 @@ def init_seed_sampling(*args, **kwargs):
     torch.manual_seed(42)
     return flashinfer.sampling.sampling_from_probs(*args, **kwargs)
 
+
 def init_seed_sampling_from_logits(*args, **kwargs):
     torch.manual_seed(42)
     return flashinfer.sampling.sampling_from_logits(*args, **kwargs)
 
-def init_seed_sampling_from_softmax_logits(logits ,*args, **kwargs):
+
+def init_seed_sampling_from_softmax_logits(logits, *args, **kwargs):
     torch.manual_seed(42)
     return flashinfer.sampling.sampling_from_probs(
         torch.softmax(logits, dim=-1), *args, **kwargs
     )
+
 
 def init_seed_top_k_sampling(*args, **kwargs):
     torch.manual_seed(42)
@@ -179,7 +182,6 @@ def main():
                         f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, deterministic: {deterministic}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
-
     print("---")
     print("sampling from logits")
     for vocab_size in [128512]:
@@ -211,6 +213,7 @@ def main():
                     print(
                         f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, deterministic: {deterministic}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
+
 
 if __name__ == "__main__":
     main()

@@ -150,6 +150,7 @@ def test_sampling(batch_size, vocab_size):
         samples = flashinfer.sampling.sampling_from_probs(normalized_prob)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_sampling_from_logits(batch_size, vocab_size):
@@ -159,6 +160,7 @@ def test_sampling_from_logits(batch_size, vocab_size):
     for _ in range(num_trails):
         samples = flashinfer.sampling.sampling_from_logits(logits)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
@@ -182,6 +184,7 @@ def test_sampling_from_logits_freq(vocab_size, distribution):
     freq = counter.float() / num_trials
     similarity = torch.cosine_similarity(freq, probs)
     assert similarity > 0.99, f"similarity: {similarity}"
+
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])

@@ -64,7 +64,7 @@ def get_sampling_module():
                 generator,
             )
             return samples
-        
+
         @register_fake_op("flashinfer::sampling_from_logits")
         def _fake_sampling_from_logits(
             logits: torch.Tensor,
@@ -74,7 +74,7 @@ def get_sampling_module():
         ) -> torch.Tensor:
             batch_size = indices.size(0) if indices is not None else logits.size(0)
             return torch.empty(batch_size, dtype=torch.int32, device=logits.device)
-        
+
         # torch library for sampling_from_probs
 
         @register_custom_op("flashinfer::sampling_from_probs", mutates_args=())
@@ -98,7 +98,7 @@ def get_sampling_module():
             return samples
 
         # torch library for sampling_from_probs
-        
+
         @register_fake_op("flashinfer::sampling_from_probs")
         def _fake_sampling_from_probs(
             probs: torch.Tensor,
@@ -439,6 +439,7 @@ def _to_tensor_scalar_tuple(x):
     else:
         return (None, x)
 
+
 def sampling_from_logits(
     logits: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -495,6 +496,7 @@ def sampling_from_logits(
     return get_sampling_module().sampling_from_logits(
         logits, indices, deterministic, generator
     )
+
 
 def sampling_from_probs(
     probs: torch.Tensor,

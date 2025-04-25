@@ -344,13 +344,13 @@ template <typename DType, typename IdType>
 struct DataAndIndex {
   DType data;
   IdType index;
-  
+
   __device__ DataAndIndex operator+(const DataAndIndex& other) const {
     if (data > other.data) {
       return {data, index};
     } else {
       return {other.data, other.index};
-    } 
+    }
   }
   __device__ DataAndIndex& operator+=(const DataAndIndex& other) {
     if (data > other.data) {
@@ -363,32 +363,34 @@ struct DataAndIndex {
   }
 };
 
-template<uint32_t VEC_SIZE>
-__device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed, uint64_t philox_offset, uint64_t subsequence) {
+template <uint32_t VEC_SIZE>
+__device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed,
+                                                                      uint64_t philox_offset,
+                                                                      uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
   vec_t<float, VEC_SIZE> noise;
-  // TODO: compare the speed of log2 and log
-  #pragma unroll
-  for (uint32_t i = 0; i+4 <= VEC_SIZE; i+=4) {
-    curand_init(philox_seed, subsequence+i, philox_offset, &state);
+// TODO: compare the speed of log2 and log
+#pragma unroll
+  for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {
+    curand_init(philox_seed, subsequence + i, philox_offset, &state);
     float4 noise_vec = curand_uniform4(&state);
     noise[i] = -log(-log(noise_vec.x));
-    noise[i+1] = -log(-log(noise_vec.y));
-    noise[i+2] = -log(-log(noise_vec.z));
-    noise[i+3] = -log(-log(noise_vec.w));
+    noise[i + 1] = -log(-log(noise_vec.y));
+    noise[i + 2] = -log(-log(noise_vec.z));
+    noise[i + 3] = -log(-log(noise_vec.w));
   }
   if constexpr (VEC_SIZE % 4 != 0) {
-    curand_init(philox_seed, subsequence+VEC_SIZE/4*4, philox_offset, &state);
+    curand_init(philox_seed, subsequence + VEC_SIZE / 4 * 4, philox_offset, &state);
     float4 noise_vec = curand_uniform4(&state);
     if (VEC_SIZE % 4 == 1) {
-      noise[VEC_SIZE-1] = -log(-log(noise_vec.x));
+      noise[VEC_SIZE - 1] = -log(-log(noise_vec.x));
     } else if (VEC_SIZE % 4 == 2) {
-      noise[VEC_SIZE-2] = -log(-log(noise_vec.x));
-      noise[VEC_SIZE-1] = -log(-log(noise_vec.y));
+      noise[VEC_SIZE - 2] = -log(-log(noise_vec.x));
+      noise[VEC_SIZE - 1] = -log(-log(noise_vec.y));
     } else if (VEC_SIZE % 4 == 3) {
-      noise[VEC_SIZE-3] = -log(-log(noise_vec.x));
-      noise[VEC_SIZE-2] = -log(-log(noise_vec.y));
-      noise[VEC_SIZE-1] = -log(-log(noise_vec.z));
+      noise[VEC_SIZE - 3] = -log(-log(noise_vec.x));
+      noise[VEC_SIZE - 2] = -log(-log(noise_vec.y));
+      noise[VEC_SIZE - 1] = -log(-log(noise_vec.z));
     }
   }
 
@@ -398,17 +400,15 @@ __device__ __forceinline__ vec_t<float, VEC_SIZE> GenerateGumbelNoise(uint64_t p
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices,
-                                       uint32_t d, uint64_t philox_seed, uint64_t philox_offset) {
+__global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices, uint32_t d,
+                                         uint64_t philox_seed, uint64_t philox_offset) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage;
-  extern __shared__ __align__(
-    alignof(SharedMem))
-    uint8_t smem_sampling[];
-  auto& temp_storage =
-      reinterpret_cast<SharedMem&>(smem_sampling);
-    
+  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
+                                         REDUCE_ALGORITHM>::TempStorage;
+  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling[];
+  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
+
   vec_t<float, VEC_SIZE> logits_vec;
   DataAndIndex<DType, IdType> max_data;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -419,8 +419,7 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
     }
 
     vec_t<float, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<VEC_SIZE>(
-      philox_seed, philox_offset, bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE
-    );
+        philox_seed, philox_offset, bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -428,8 +427,9 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
       cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
     }
 
-    max_data += BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-        temp_storage).Sum<VEC_SIZE>(cur_data);    
+    max_data +=
+        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
+            .Sum<VEC_SIZE>(cur_data);
   }
   if (tx == 0) {
     output[bx] = max_data.index;
@@ -900,14 +900,15 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 
 template <typename T, typename IdType>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
-                             uint32_t d, bool deterministic, uint64_t philox_seed,
-                             uint64_t philox_offset, cudaStream_t stream = 0) {
+                               uint32_t d, bool deterministic, uint64_t philox_seed,
+                               uint64_t philox_offset, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   void* args[] = {&logits, &output, &indices, &d, &philox_seed, &philox_offset};
-  const uint32_t smem_size = sizeof(typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage); 
+  const uint32_t smem_size = sizeof(
+      typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {

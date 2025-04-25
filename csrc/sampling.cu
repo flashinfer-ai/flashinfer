@@ -26,8 +26,8 @@
 using namespace flashinfer;
 
 void sampling_from_logits(at::Tensor logits, at::Tensor output,
-                         std::optional<at::Tensor> maybe_indices, bool deterministic,
-                         std::optional<at::Generator> gen_) {
+                          std::optional<at::Tensor> maybe_indices, bool deterministic,
+                          std::optional<at::Generator> gen_) {
   CHECK_INPUT(logits);
   auto device = logits.device();
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
