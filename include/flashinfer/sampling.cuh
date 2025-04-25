@@ -371,7 +371,7 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
   vec_t<float, VEC_SIZE> noise;
   constexpr float kEPSILON = 1e-20f;
   constexpr float kLOG2 = 0.6931471806f;
-  auto log_func = [](float x) { return log2f(x) * kLOG2; }; 
+  auto log_func = [](float x) { return log2f(x) * kLOG2; };
 // TODO: compare the speed of log2 and log
 #pragma unroll
   for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {
