@@ -21,9 +21,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, std::optional<at::Tensor> prefix_len_ptr,
-    std::optional<at::Tensor> token_pos_in_items_ptr, std::optional<int64_t> token_pos_in_items_len,
-    std::optional<at::Tensor> max_item_len_ptr);
+    int64_t head_dim_vo, bool causal);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
                                           at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
@@ -42,13 +40,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache plan
-  m.def("plan", BatchPrefillWithKVCacheSM90Plan, "float_workspace_buffer"_a,
-        "int_workspace_buffer"_a, "page_locked_int_workspace_buffer"_a, "qo_indptr"_a,
-        "kv_indptr"_a, "kv_len_arr"_a, "total_num_rows"_a, "batch_size"_a, "num_qo_heads"_a,
-        "num_kv_heads"_a, "page_size"_a, "enable_cuda_graph"_a, "head_dim_qk"_a, "head_dim_vo"_a,
-        "causal"_a, py::arg("prefix_len_ptr") = py::none(),
-        py::arg("token_pos_in_items_ptr") = py::none(),
-        py::arg("token_pos_in_items_len") = py::none(), py::arg("max_item_len_ptr") = py::none());
+  m.def("plan", BatchPrefillWithKVCacheSM90Plan);
   // Batch-request prefill attention with KV-Cache operator
   m.def("ragged_run", BatchPrefillWithRaggedKVCacheSM90Run);
   // Batch-request prefill attention with KV-Cache operator

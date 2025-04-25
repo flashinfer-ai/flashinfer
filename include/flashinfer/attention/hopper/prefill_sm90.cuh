@@ -159,8 +159,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
         if constexpr (MULTIITEMSCORING) {
-          auto prefix_len = __ldg(mainloop_params.prefix_len_ptr + batch_idx);
-          auto max_item_len = __ldg(mainloop_params.max_item_len_ptr + batch_idx);
+          auto prefix_len =
+              __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
+          auto max_item_len =
+              __ldg(mainloop_params.additional_params.maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
               std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
           num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);
@@ -238,15 +240,17 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       uint32_t prefix_len = 0;
       uint16_t* token_pos_in_items = nullptr;
       if constexpr (MULTIITEMSCORING) {
-        prefix_len = __ldg(mainloop_params.prefix_len_ptr + batch_idx);
-        token_pos_in_items = mainloop_params.token_pos_in_items_ptr +
-                             batch_idx * mainloop_params.token_pos_in_items_len;
+        prefix_len = __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
+        token_pos_in_items =
+            mainloop_params.additional_params.maybe_token_pos_in_items_ptr +
+            batch_idx * mainloop_params.additional_params.maybe_token_pos_in_items_len;
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
       if constexpr (MULTIITEMSCORING) {
-        auto prefix_len = __ldg(mainloop_params.prefix_len_ptr + batch_idx);
-        auto max_item_len = __ldg(mainloop_params.max_item_len_ptr + batch_idx);
+        auto prefix_len = __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
+        auto max_item_len =
+            __ldg(mainloop_params.additional_params.maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =
             std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
         num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);
@@ -358,8 +362,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
        params.v_ptr,
        get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO, params.v_stride_n,
                        params.v_stride_h),  // layout_V
-       params.kv_indices, params.window_left, params.additional_params, params.prefix_len_ptr,
-       params.token_pos_in_items_ptr, params.token_pos_in_items_len, params.max_item_len_ptr});
+       params.kv_indices, params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           params.o_ptr,
@@ -433,8 +436,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
        get_gmem_layout(params.nnz_kv, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
                        params.v_stride_n,
                        params.v_stride_h),  // layout_V
-       params.window_left, params.additional_params, params.prefix_len_ptr,
-       params.token_pos_in_items_ptr, params.token_pos_in_items_len, params.max_item_len_ptr});
+       params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           params.o_ptr,

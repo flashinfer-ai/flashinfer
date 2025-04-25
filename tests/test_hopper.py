@@ -367,16 +367,25 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
-    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+
+    prefix_len_ptr = torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0)
+    token_pos_in_items_ptr = (
+        torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0)
+    )
+    token_pos_in_items_len = (
+        torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0)
+    )
+    max_item_len_ptr = torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0)
+
+    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(
+        q,
+        kv_data,
+        prefix_len_ptr=prefix_len_ptr,
+        token_pos_in_items_ptr=token_pos_in_items_ptr,
+        token_pos_in_items_len=token_pos_in_items_len,
+        max_item_len_ptr=max_item_len_ptr,
+    )
 
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="fa3"
@@ -392,17 +401,16 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
 
-    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
+    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(
+        q,
+        kv_data,
+        prefix_len_ptr=prefix_len_ptr,
+        token_pos_in_items_ptr=token_pos_in_items_ptr,
+        token_pos_in_items_len=token_pos_in_items_len,
+        max_item_len_ptr=max_item_len_ptr,
+    )
 
     torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
@@ -499,16 +507,24 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
-    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+    prefix_len_ptr = torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0)
+    token_pos_in_items_ptr = (
+        torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0)
+    )
+    token_pos_in_items_len = (
+        torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0)
+    )
+    max_item_len_ptr = torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0)
+
+    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(
+        q,
+        kv_data,
+        prefix_len_ptr=prefix_len_ptr,
+        token_pos_in_items_ptr=token_pos_in_items_ptr,
+        token_pos_in_items_len=token_pos_in_items_len,
+        max_item_len_ptr=max_item_len_ptr,
+    )
 
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="fa3"
@@ -524,18 +540,15 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
-
-    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
-
+    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(
+        q,
+        kv_data,
+        prefix_len_ptr=prefix_len_ptr,
+        token_pos_in_items_ptr=token_pos_in_items_ptr,
+        token_pos_in_items_len=token_pos_in_items_len,
+        max_item_len_ptr=max_item_len_ptr,
+    )
     torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
 

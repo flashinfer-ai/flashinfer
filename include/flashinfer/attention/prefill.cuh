@@ -2047,10 +2047,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
-    uint32_t* prefix_len_ptr = params.prefix_len_ptr;
-    uint16_t* token_pos_in_items_ptr = params.token_pos_in_items_ptr;
-    const uint32_t token_pos_in_items_len = params.token_pos_in_items_len;
-    uint16_t* max_item_len_ptr = params.max_item_len_ptr;
+    uint32_t* maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
+    const uint32_t maybe_token_pos_in_items_len = params.maybe_token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
 
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();
@@ -2183,13 +2183,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           min(min(chunk_size, sub_if_greater_or_zero(
                                   kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
                                   chunk_start)),
-              sub_if_greater_or_zero(__ldg(prefix_len_ptr + request_idx), chunk_start)),
+              sub_if_greater_or_zero(__ldg(maybe_prefix_len_ptr + request_idx), chunk_start)),
           CTA_TILE_KV);
       num_iterations_mask = max(
           min(chunk_size,
               sub_if_greater_or_zero(
                   sub_if_greater_or_zero(kv_len - qo_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
-                                         __ldg(max_item_len_ptr + request_idx)),
+                                         __ldg(maybe_max_item_len_ptr + request_idx)),
                   chunk_start)) /
               (CTA_TILE_KV),
           num_iterations_prefix);
@@ -2278,8 +2278,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                 chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
                 qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
-                __ldg(prefix_len_ptr + request_idx),
-                token_pos_in_items_ptr + request_idx * token_pos_in_items_len);
+                __ldg(maybe_prefix_len_ptr + request_idx),
+                maybe_token_pos_in_items_ptr + request_idx * maybe_token_pos_in_items_len);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(
