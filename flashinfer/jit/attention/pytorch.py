@@ -732,17 +732,32 @@ def gen_batch_prefill_module(
         use_fp16_qk_reduction,
     )
 
+    # Define multi-itemn scoring parameters common to both backends
+    prefill_mis_tensor_names = [
+        "maybe_prefix_len_ptr",
+        "maybe_token_pos_in_items_ptr", 
+        "maybe_token_pos_in_items_len",
+        "maybe_max_item_len_ptr"
+    ]
+    
+    prefill_mis_tensor_dtypes = [
+        "uint32_t",
+        "uint16_t", 
+        "uint32_t",
+        "uint16_t"
+    ]
+
     if backend == "fa2":
         additional_tensor_names = [
             "maybe_custom_mask",
             "maybe_mask_indptr",
             "maybe_alibi_slopes",
-        ]
+        ] + prefill_mis_tensor_names
         additional_tensor_dtypes = [
             "uint8_t",
             "int32_t",
             "float",
-        ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        ] + prefill_mis_tensor_dtypes  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -751,14 +766,14 @@ def gen_batch_prefill_module(
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
-        additional_tensor_names = []
-        additional_tensor_dtypes = []
+        additional_tensor_names = prefill_mis_tensor_names
+        additional_tensor_dtypes = prefill_mis_tensor_dtypes
         additional_scalar_names = ["logits_soft_cap", "sm_scale"]
         additional_scalar_dtypes = ["double", "double"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_batch_prefill_module(
         backend,
