@@ -111,8 +111,10 @@ struct CausalMask : NoMask {
                                     ProblemSize const& problem_size) {
     // See note below on different ways to think about causal attention
     // Again, we'd add the offset_q into the max_blocks_q calculation
+    int offset_q = int(get<1>(problem_size)) - int(get<0>(problem_size));
     int max_blocks_k = Base::get_trip_count(blk_coord, tile_shape, problem_size);
-    int max_blocks_q = ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape), get<1>(tile_shape));
+    int max_blocks_q =
+        ceil_div((get<0>(blk_coord) + 1) * get<0>(tile_shape) + offset_q, get<1>(tile_shape));
     return std::min(max_blocks_k, max_blocks_q);
   }
 
@@ -140,10 +142,11 @@ struct CausalMask : NoMask {
     //      where we only compute the next row and use cache for the rest
     //    - if you'd like this, you only need to add an offset like so:
     //      get<0>(pos) + offset_q < get<1>(pos)
+    int offset_q = int(get<1>(problem_size)) - int(get<0>(problem_size));
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(acc_qk); i++) {
       auto pos = index_qk(i);
-      if ((get<0>(pos) < get<1>(pos)) || (get<1>(pos) >= get<1>(problem_size))) {
+      if ((get<0>(pos) + offset_q < get<1>(pos)) || (get<1>(pos) >= get<1>(problem_size))) {
         acc_qk(i) = -INFINITY;
       }
     }
