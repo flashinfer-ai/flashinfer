@@ -878,7 +878,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         logits_soft_cap=logits_soft_cap,
     )
 
-    prefix_len_ptr = (torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),)
+    prefix_len_ptr = torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0)
     token_pos_in_items_ptr = (
         torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0)
     )
