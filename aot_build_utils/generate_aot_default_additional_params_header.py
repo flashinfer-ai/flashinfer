@@ -123,10 +123,21 @@ def get_aot_default_additional_params_header_str() -> str:
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
     )
 
+    # Define batch prefill optional parameters directly
+    prefill_mis_tensor_names = [
+        "maybe_prefix_len_ptr",
+        "maybe_token_pos_in_items_ptr",
+        "maybe_token_pos_in_items_len",
+        "maybe_max_item_len_ptr",
+    ]
+
+    prefill_mis_tensor_dtypes = ["uint32_t", "uint16_t", "uint32_t", "uint16_t"]
+
     ret += generate_macro_entry(
         "BATCH_PREFILL",
-        ["maybe_custom_mask", "maybe_mask_indptr", "maybe_alibi_slopes"],
-        ["uint8_t", "int32_t", "float"],
+        ["maybe_custom_mask", "maybe_mask_indptr", "maybe_alibi_slopes"]
+        + prefill_mis_tensor_names,
+        ["uint8_t", "int32_t", "float"] + prefill_mis_tensor_dtypes,
         [
             "logits_soft_cap",
             "sm_scale",
@@ -138,8 +149,8 @@ def get_aot_default_additional_params_header_str() -> str:
 
     ret += generate_macro_entry(
         "BATCH_PREFILL_SM90",
-        [],
-        [],
+        prefill_mis_tensor_names,
+        prefill_mis_tensor_dtypes,
         ["logits_soft_cap", "sm_scale"],
         ["double", "double"],
         is_sm90_template=True,

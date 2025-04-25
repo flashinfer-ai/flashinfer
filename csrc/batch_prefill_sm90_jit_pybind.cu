@@ -42,7 +42,13 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache plan
-  m.def("plan", BatchPrefillWithKVCacheSM90Plan);
+  m.def("plan", BatchPrefillWithKVCacheSM90Plan, "float_workspace_buffer"_a,
+        "int_workspace_buffer"_a, "page_locked_int_workspace_buffer"_a, "qo_indptr"_a,
+        "kv_indptr"_a, "kv_len_arr"_a, "total_num_rows"_a, "batch_size"_a, "num_qo_heads"_a,
+        "num_kv_heads"_a, "page_size"_a, "enable_cuda_graph"_a, "head_dim_qk"_a, "head_dim_vo"_a,
+        "causal"_a, py::arg("prefix_len_ptr") = py::none(),
+        py::arg("token_pos_in_items_ptr") = py::none(),
+        py::arg("token_pos_in_items_len") = py::none(), py::arg("max_item_len_ptr") = py::none());
   // Batch-request prefill attention with KV-Cache operator
   m.def("ragged_run", BatchPrefillWithRaggedKVCacheSM90Run);
   // Batch-request prefill attention with KV-Cache operator
