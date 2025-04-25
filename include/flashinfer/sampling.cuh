@@ -369,28 +369,31 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
                                                                       uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
   vec_t<float, VEC_SIZE> noise;
+  constexpr float kEPSILON = 1e-20f;
+  constexpr float kLOG2 = 0.6931471806f;
+  auto log_func = [](float x) { return log2f(x) * kLOG2; }; 
 // TODO: compare the speed of log2 and log
 #pragma unroll
   for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {
     curand_init(philox_seed, subsequence + i, philox_offset, &state);
     float4 noise_vec = curand_uniform4(&state);
-    noise[i] = -log(-log(noise_vec.x));
-    noise[i + 1] = -log(-log(noise_vec.y));
-    noise[i + 2] = -log(-log(noise_vec.z));
-    noise[i + 3] = -log(-log(noise_vec.w));
+    noise[i] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
+    noise[i + 1] = -log_func(-log_func(noise_vec.y + kEPSILON) + kEPSILON);
+    noise[i + 2] = -log_func(-log_func(noise_vec.z + kEPSILON) + kEPSILON);
+    noise[i + 3] = -log_func(-log_func(noise_vec.w + kEPSILON) + kEPSILON);
   }
   if constexpr (VEC_SIZE % 4 != 0) {
     curand_init(philox_seed, subsequence + VEC_SIZE / 4 * 4, philox_offset, &state);
     float4 noise_vec = curand_uniform4(&state);
     if (VEC_SIZE % 4 == 1) {
-      noise[VEC_SIZE - 1] = -log(-log(noise_vec.x));
+      noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
     } else if (VEC_SIZE % 4 == 2) {
-      noise[VEC_SIZE - 2] = -log(-log(noise_vec.x));
-      noise[VEC_SIZE - 1] = -log(-log(noise_vec.y));
+      noise[VEC_SIZE - 2] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
+      noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.y + kEPSILON) + kEPSILON);
     } else if (VEC_SIZE % 4 == 3) {
-      noise[VEC_SIZE - 3] = -log(-log(noise_vec.x));
-      noise[VEC_SIZE - 2] = -log(-log(noise_vec.y));
-      noise[VEC_SIZE - 1] = -log(-log(noise_vec.z));
+      noise[VEC_SIZE - 3] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
+      noise[VEC_SIZE - 2] = -log_func(-log_func(noise_vec.y + kEPSILON) + kEPSILON);
+      noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.z + kEPSILON) + kEPSILON);
     }
   }
 
