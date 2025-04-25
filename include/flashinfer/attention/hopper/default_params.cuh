@@ -87,6 +87,10 @@ struct BatchPrefillRaggedParams {
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t maybe_token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;
@@ -106,11 +110,6 @@ struct BatchPrefillRaggedParams {
   int window_left;
 
   bool causal;
-
-  uint32_t* prefix_len_ptr;
-  uint16_t* token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  uint16_t* max_item_len_ptr;
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -139,6 +138,10 @@ struct BatchPrefillPagedParams {
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t maybe_token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;
@@ -158,11 +161,6 @@ struct BatchPrefillPagedParams {
   int window_left;
 
   bool causal;
-
-  uint32_t* prefix_len_ptr;
-  uint16_t* token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  uint16_t* max_item_len_ptr;
 };
 
 }  // namespace flashinfer
