@@ -36,6 +36,10 @@ RUN groupadd --gid $USER_GID $USERNAME \
     && chmod 0440 /etc/sudoers.d/$USERNAME \
     && rm -rf /var/lib/apt/lists/*
 
+# Remove default 'ubuntu' user (UID 1000) to prevent devcontainer permission conflicts
+# Ref: https://github.com/rapidsai/devcontainers/pull/373
+RUN if grep ubuntu:x:1000:1000 /etc/passwd >/dev/null; then userdel -f -r ubuntu; fi
+
 # Copy zsh configuration to the new user's home
 RUN cp -r /root/.oh-my-zsh /home/$USERNAME/.oh-my-zsh && \
     cp /root/.zshrc /home/$USERNAME/.zshrc && \
