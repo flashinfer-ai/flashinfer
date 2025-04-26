@@ -295,7 +295,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
        get_gmem_layout(params.kv_len, params.num_kv_heads, KernelTraits::HEAD_DIM_VO,
                        params.v_stride_n,
                        params.v_stride_h),  // layout_V
-       params.window_left, params.additional_params, nullptr, nullptr, 0, nullptr});
+       params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           static_cast<DTypeO*>(params.o_ptr),
