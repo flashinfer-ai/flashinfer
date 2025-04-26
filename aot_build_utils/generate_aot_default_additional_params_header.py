@@ -123,15 +123,6 @@ def get_aot_default_additional_params_header_str() -> str:
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
     )
 
-    # Define batch prefill optional parameters directly
-    prefill_mis_tensor_names = [
-        "maybe_prefix_len_ptr",
-        "maybe_token_pos_in_items_ptr",
-        "maybe_max_item_len_ptr",
-    ]
-
-    prefill_mis_tensor_dtypes = ["uint32_t", "uint16_t", "uint32_t", "uint16_t"]
-
     ret += generate_macro_entry(
         "BATCH_PREFILL",
         [
