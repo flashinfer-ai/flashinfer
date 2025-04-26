@@ -470,10 +470,6 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.max_total_num_rows = plan_info.total_num_rows;
                 params.total_num_rows = handler->GetTotalNumRows();
                 params.padded_batch_size = plan_info.padded_batch_size;
-                params.prefix_len_ptr = prefix_len_ptr;
-                params.token_pos_in_items_ptr = token_pos_in_items_ptr;
-                params.token_pos_in_items_len = token_pos_in_items_len;
-                params.max_item_len_ptr = max_item_len_ptr;
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<
                       CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
