@@ -756,7 +756,7 @@ def gen_batch_prefill_module(
             "rope_rcp_theta",
             "maybe_token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double", "uint32_t"]
+        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
@@ -771,7 +771,7 @@ def gen_batch_prefill_module(
             "sm_scale",
             "maybe_token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "uint32_t"]
+        additional_scalar_dtypes = ["double", "double", "int64_t"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
         variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
