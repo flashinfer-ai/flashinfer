@@ -385,12 +385,12 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
   if constexpr (VEC_SIZE % 4 != 0) {
     curand_init(philox_seed, subsequence + VEC_SIZE / 4 * 4, philox_offset, &state);
     float4 noise_vec = curand_uniform4(&state);
-    if (VEC_SIZE % 4 == 1) {
+    if constexpr (VEC_SIZE % 4 == 1) {
       noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
-    } else if (VEC_SIZE % 4 == 2) {
+    } else if constexpr (VEC_SIZE % 4 == 2) {
       noise[VEC_SIZE - 2] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
       noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.y + kEPSILON) + kEPSILON);
-    } else if (VEC_SIZE % 4 == 3) {
+    } else if constexpr (VEC_SIZE % 4 == 3) {
       noise[VEC_SIZE - 3] = -log_func(-log_func(noise_vec.x + kEPSILON) + kEPSILON);
       noise[VEC_SIZE - 2] = -log_func(-log_func(noise_vec.y + kEPSILON) + kEPSILON);
       noise[VEC_SIZE - 1] = -log_func(-log_func(noise_vec.z + kEPSILON) + kEPSILON);
@@ -422,7 +422,7 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
 
   vec_t<DType, VEC_SIZE> logits_vec;
-  DataAndIndex<DType, IdType> max_data;
+  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
