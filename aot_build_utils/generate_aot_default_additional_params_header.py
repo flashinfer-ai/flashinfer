@@ -127,7 +127,6 @@ def get_aot_default_additional_params_header_str() -> str:
     prefill_mis_tensor_names = [
         "maybe_prefix_len_ptr",
         "maybe_token_pos_in_items_ptr",
-        "maybe_token_pos_in_items_len",
         "maybe_max_item_len_ptr",
     ]
 
@@ -135,24 +134,35 @@ def get_aot_default_additional_params_header_str() -> str:
 
     ret += generate_macro_entry(
         "BATCH_PREFILL",
-        ["maybe_custom_mask", "maybe_mask_indptr", "maybe_alibi_slopes"]
-        + prefill_mis_tensor_names,
-        ["uint8_t", "int32_t", "float"] + prefill_mis_tensor_dtypes,
+        [
+            "maybe_custom_mask",
+            "maybe_mask_indptr",
+            "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+        ],
+        ["uint8_t", "int32_t", "float", "uint32_t", "uint16_t", "uint16_t"],
         [
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
+            "maybe_token_pos_in_items_len",
         ],
-        ["double", "double", "double", "double"],
+        ["double", "double", "double", "double", "uint32_t"],
     )
 
     ret += generate_macro_entry(
         "BATCH_PREFILL_SM90",
-        prefill_mis_tensor_names,
-        prefill_mis_tensor_dtypes,
-        ["logits_soft_cap", "sm_scale"],
-        ["double", "double"],
+        [
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+        ],
+        ["uint32_t", "uint16_t", "uint16_t"],
+        ["logits_soft_cap", "sm_scale", "maybe_token_pos_in_items_len"],
+        ["double", "double", "uint32_t"],
         is_sm90_template=True,
     )
 
