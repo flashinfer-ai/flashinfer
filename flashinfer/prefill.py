@@ -1185,6 +1185,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: Optional[int] = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1259,6 +1263,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
+        prefix_len_ptr :Optional[torch.Tensor]
+            prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
+        token_pos_in_items_ptr : Optional[float]
+            A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
+            for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
+            `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
+            we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
+            `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
+        token_pos_in_items_len : Optional[int]
+            zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
+            If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
+            with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
+        max_item_len_ptr : Optional[float]
+            a uint16 vector contains the max token length of all items for each prompt
 
         Note
         ----
@@ -1297,6 +1315,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_indptr,
                 bitorder="little",
             )
+
+        self._prefix_len_ptr = prefix_len_ptr
+        self._token_pos_in_items_ptr = token_pos_in_items_ptr
+        self._token_pos_in_items_len = token_pos_in_items_len
+        self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
@@ -1472,10 +1495,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        prefix_len_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
-        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
@@ -1486,16 +1505,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(
-            q,
-            paged_kv_cache,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-        )
+        return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
     @overload
     def run(
@@ -1508,10 +1518,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
-        prefix_len_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
-        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1525,10 +1531,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
-        prefix_len_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
-        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1541,10 +1543,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
-        prefix_len_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
-        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1578,20 +1576,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
-        prefix_len_ptr :Optional[torch.Tensor]
-            prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
-        token_pos_in_items_ptr : Optional[float]
-            A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
-            for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
-            `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
-            we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
-            `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
-        token_pos_in_items_len : Optional[int]
-            zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
-            If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
-            with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
-        max_item_len_ptr : Optional[float]
-            a uint16 vector contains the max token length of all items for each prompt
 
         Returns
         -------
@@ -1654,11 +1638,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_mode = MaskMode.CAUSAL.value
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
-
-        self._prefix_len_ptr = prefix_len_ptr
-        self._token_pos_in_items_ptr = token_pos_in_items_ptr
-        self._token_pos_in_items_len = token_pos_in_items_len
-        self._max_item_len_ptr = max_item_len_ptr
 
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
@@ -1738,10 +1717,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        prefix_len_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
-        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         self._causal = causal
@@ -1752,16 +1727,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(
-            q,
-            paged_kv_cache,
-            k_scale,
-            v_scale,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-        )
+        return self.run_return_lse(q, paged_kv_cache, k_scale, v_scale)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
@@ -2249,10 +2215,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_qk,
             head_dim_vo,
             causal,
-            self._prefix_len_ptr,
-            self._token_pos_in_items_ptr,
-            self._token_pos_in_items_len,
-            self._max_item_len_ptr,
         )
 
         self._causal = causal
@@ -2428,10 +2390,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+                self._prefix_len_ptr,
+                self._token_pos_in_items_ptr,
+                self._max_item_len_ptr,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
+                self._token_pos_in_items_len,
             ]
 
         self._cached_module.ragged_run(*run_args)
