@@ -876,35 +876,19 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         causal=causal,
         pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
+        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+        .to(dtype=torch.uint16)
+        .to(0),
+        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
+        .to(dtype=torch.uint32)
+        .to(0),
+        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
-
-    prefix_len_ptr = torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0)
-    token_pos_in_items_ptr = (
-        torch.tensor(token_pos_in_items_ptr).to(dtype=torch.uint16).to(0)
-    )
-    token_pos_in_items_len = (
-        torch.tensor(token_pos_in_items_len).to(dtype=torch.uint32).to(0)
-    )
-    max_item_len_ptr = torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0)
-
     if return_lse:
-        o, _ = wrapper.run_return_lse(
-            q,
-            kv_data,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-        )
+        o, _ = wrapper.run_return_lse(q, kv_data)
     else:
-        o = wrapper.run(
-            q,
-            kv_data,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-        )
+        o = wrapper.run(q, kv_data)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
