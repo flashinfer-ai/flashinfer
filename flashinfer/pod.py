@@ -437,10 +437,6 @@ class PODWithPagedKVCacheWrapper:
             head_dim,
             head_dim,
             False,  # causal
-            None,
-            None,
-            None,
-            None
         )
 
         self._indptr_type = indptr.dtype
