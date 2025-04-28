@@ -67,11 +67,6 @@ struct RaggedParams {
   int window_left;
 
   bool causal;
-
-  uint32_t* prefix_len_ptr;
-  uint16_t* token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  uint16_t* max_item_len_ptr;
 };
 
 struct PagedParams {
@@ -118,11 +113,6 @@ struct PagedParams {
   int window_left;
 
   bool causal;
-
-  uint32_t* prefix_len_ptr;
-  uint16_t* token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  uint16_t* max_item_len_ptr;
 };
 
 {{ variant_decl }}

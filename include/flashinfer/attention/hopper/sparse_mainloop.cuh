@@ -108,10 +108,6 @@ struct SparseCollectiveMainloop {
     IdType const* kv_indices;
     int window_left;
     AdditionalParams additional_params;
-    uint32_t* prefix_len_ptr;
-    uint16_t* token_pos_in_items_ptr;
-    uint32_t token_pos_in_items_len;
-    uint16_t* max_item_len_ptr;
   };
 
   // Device side kernel params
@@ -125,10 +121,6 @@ struct SparseCollectiveMainloop {
     IdType* kv_indices;
     int window_left;
     AdditionalParams additional_params;
-    uint32_t* prefix_len_ptr;
-    uint16_t* token_pos_in_items_ptr;
-    uint32_t token_pos_in_items_len;
-    uint16_t* max_item_len_ptr;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -143,11 +135,7 @@ struct SparseCollectiveMainloop {
             const_cast<DTypeKV*>(args.V_ptr),
             const_cast<IdType*>(args.kv_indices),
             args.window_left,
-            args.additional_params,
-            args.prefix_len_ptr,
-            args.token_pos_in_items_ptr,
-            args.token_pos_in_items_len,
-            args.max_item_len_ptr};
+            args.additional_params};
   }
 
   CUTLASS_DEVICE

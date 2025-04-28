@@ -229,10 +229,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                maybe_token_pos_in_items_len: Optional[int],
             ) -> None:
                 if backend == "fa2":
                     ragged_run_func(
@@ -252,10 +256,14 @@ def get_batch_prefill_module(backend):
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
+                        maybe_token_pos_in_items_len,
                     )
                 else:
                     ragged_run_func(
@@ -272,8 +280,12 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
+                        maybe_token_pos_in_items_len,
                     )
 
                 return o
@@ -296,10 +308,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                maybe_token_pos_in_items_len: Optional[int],
             ) -> None:
                 pass
 
@@ -335,10 +351,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                maybe_token_pos_in_items_len: Optional[int],
             ) -> None:
                 if backend == "fa2":
                     paged_run_func(
@@ -360,10 +380,14 @@ def get_batch_prefill_module(backend):
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
+                        maybe_token_pos_in_items_len,
                     )
                 else:
                     paged_run_func(
@@ -382,8 +406,12 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
+                        maybe_token_pos_in_items_len,
                     )
                 return o
 
@@ -407,10 +435,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                maybe_token_pos_in_items_len: Optional[int],
             ) -> None:
                 pass
 
@@ -1468,10 +1500,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_qk,
             head_dim_vo,
             causal,
-            self._prefix_len_ptr,
-            self._token_pos_in_items_ptr,
-            self._token_pos_in_items_len,
-            self._max_item_len_ptr,
         )
 
         self._causal = causal
@@ -1689,10 +1717,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                self._prefix_len_ptr,
+                self._token_pos_in_items_ptr,
+                self._max_item_len_ptr,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
+                self._token_pos_in_items_len,
             ]
 
         self._cached_module.paged_run(*run_args)
@@ -2215,10 +2247,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_qk,
             head_dim_vo,
             causal,
-            self._prefix_len_ptr,
-            self._token_pos_in_items_ptr,
-            self._token_pos_in_items_len,
-            self._max_item_len_ptr,
         )
 
         self._causal = causal
@@ -2394,10 +2422,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+                self._prefix_len_ptr,
+                self._token_pos_in_items_ptr,
+                self._max_item_len_ptr,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
+                self._token_pos_in_items_len,
             ]
 
         self._cached_module.ragged_run(*run_args)

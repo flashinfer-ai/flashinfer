@@ -737,28 +737,43 @@ def gen_batch_prefill_module(
             "maybe_custom_mask",
             "maybe_mask_indptr",
             "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
         ]
         additional_tensor_dtypes = [
             "uint8_t",
             "int32_t",
             "float",
+            "uint32_t",
+            "uint16_t",
+            "uint16_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
+            "maybe_token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double"]
+        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
-        additional_tensor_names = []
-        additional_tensor_dtypes = []
-        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-        additional_scalar_dtypes = ["double", "double"]
+        additional_tensor_names = [
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+        ]
+        additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t"]
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "maybe_token_pos_in_items_len",
+        ]
+        additional_scalar_dtypes = ["double", "double", "int64_t"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_batch_prefill_module(
         backend,

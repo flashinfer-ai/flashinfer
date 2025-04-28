@@ -602,10 +602,6 @@ struct PrefillPlanInfo {
   int64_t v_offset;
   int64_t s_offset;
   int64_t block_valid_mask_offset;
-  int64_t prefix_len_ptr;
-  int64_t token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  int64_t max_item_len_ptr;
   bool enable_cuda_graph;
   bool split_kv;
 
@@ -623,10 +619,6 @@ struct PrefillPlanInfo {
         v_offset(0),
         s_offset(0),
         block_valid_mask_offset(0),
-        prefix_len_ptr(0),
-        token_pos_in_items_ptr(0),
-        token_pos_in_items_len(0),
-        max_item_len_ptr(0),
         enable_cuda_graph(false),
         split_kv(false) {}
 
@@ -645,19 +637,15 @@ struct PrefillPlanInfo {
             v_offset,
             s_offset,
             block_valid_mask_offset,
-            prefix_len_ptr,
-            token_pos_in_items_ptr,
-            token_pos_in_items_len,
-            max_item_len_ptr,
             enable_cuda_graph,
             split_kv};
   }
 
   // From std::vector<int64_t> to PrefillPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 19) {
+    if (vec.size() != 15) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
@@ -673,12 +661,8 @@ struct PrefillPlanInfo {
     v_offset = vec[10];
     s_offset = vec[11];
     block_valid_mask_offset = vec[12];
-    prefix_len_ptr = vec[13];
-    token_pos_in_items_ptr = vec[14];
-    token_pos_in_items_len = vec[15];
-    max_item_len_ptr = vec[16];
-    enable_cuda_graph = vec[17];
-    split_kv = vec[18];
+    enable_cuda_graph = vec[13];
+    split_kv = vec[14];
   }
 };
 
@@ -689,9 +673,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
-                               bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
-                               void* prefix_len_ptr, void* token_pos_in_items_ptr,
-                               uint32_t token_pos_in_items_len, void* max_item_len_ptr) {
+                               bool enable_cuda_graph, uint32_t sizeof_dtype_o,
+                               cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -720,26 +703,6 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   plan_info.enable_cuda_graph = enable_cuda_graph;
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
-
-  if (prefix_len_ptr == nullptr) {
-    plan_info.prefix_len_ptr = 0;
-  } else {
-    plan_info.prefix_len_ptr = reinterpret_cast<int64_t>(prefix_len_ptr);
-  }
-
-  if (token_pos_in_items_ptr == nullptr) {
-    plan_info.token_pos_in_items_ptr = 0;
-  } else {
-    plan_info.token_pos_in_items_ptr = reinterpret_cast<int64_t>(token_pos_in_items_ptr);
-  }
-
-  plan_info.token_pos_in_items_len = token_pos_in_items_len;
-
-  if (max_item_len_ptr == nullptr) {
-    plan_info.max_item_len_ptr = 0;
-  } else {
-    plan_info.max_item_len_ptr = reinterpret_cast<int64_t>(max_item_len_ptr);
-  }
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
@@ -827,10 +790,6 @@ struct PrefillPlanSM90Info {
   int64_t head_indices_offset;
   int64_t work_indptr_offset;
   int64_t batch_indices_offset;
-  int64_t prefix_len_ptr;
-  int64_t token_pos_in_items_ptr;
-  uint32_t token_pos_in_items_len;
-  int64_t max_item_len_ptr;
   bool same_schedule_for_all_heads;
 
   PrefillPlanSM90Info()
@@ -841,35 +800,21 @@ struct PrefillPlanSM90Info {
         kv_len_offset(0),
         head_indices_offset(0),
         work_indptr_offset(0),
-        prefix_len_ptr(0),
         batch_indices_offset(0),
-        token_pos_in_items_ptr(0),
-        token_pos_in_items_len(0),
-        max_item_len_ptr(0),
         same_schedule_for_all_heads(false) {}
 
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {qo_tile_indices_offset,
-            qo_indptr_offset,
-            kv_indptr_offset,
-            qo_len_offset,
-            kv_len_offset,
-            head_indices_offset,
-            work_indptr_offset,
-            batch_indices_offset,
-            prefix_len_ptr,
-            token_pos_in_items_ptr,
-            token_pos_in_items_len,
-            max_item_len_ptr,
-            same_schedule_for_all_heads};
+    return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
+            qo_len_offset,          kv_len_offset,        head_indices_offset,
+            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads};
   }
 
   // From std::vector<int64_t> to PrefillPlanSM90Info
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 13) {
+    if (vec.size() != 9) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 13, but got " << vec.size();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     qo_tile_indices_offset = vec[0];
@@ -880,11 +825,7 @@ struct PrefillPlanSM90Info {
     head_indices_offset = vec[5];
     work_indptr_offset = vec[6];
     batch_indices_offset = vec[7];
-    prefix_len_ptr = vec[8];
-    token_pos_in_items_ptr = vec[9];
-    token_pos_in_items_len = vec[10];
-    max_item_len_ptr = vec[11];
-    same_schedule_for_all_heads = vec[12];
+    same_schedule_for_all_heads = vec[8];
   }
 };
 
@@ -895,8 +836,7 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream, void* prefix_len_ptr,
-    void* token_pos_in_items_ptr, uint32_t token_pos_in_items_len, void* max_item_len_ptr) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -1011,26 +951,6 @@ inline cudaError_t PrefillSM90Plan(
       sizeof(IdType) * (num_sm90_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
-
-  if (prefix_len_ptr == nullptr) {
-    plan_info.prefix_len_ptr = 0;
-  } else {
-    plan_info.prefix_len_ptr = reinterpret_cast<int64_t>(prefix_len_ptr);
-  }
-
-  if (token_pos_in_items_ptr == nullptr) {
-    plan_info.token_pos_in_items_ptr = 0;
-  } else {
-    plan_info.token_pos_in_items_ptr = reinterpret_cast<int64_t>(token_pos_in_items_ptr);
-  }
-
-  plan_info.token_pos_in_items_len = token_pos_in_items_len;
-
-  if (max_item_len_ptr == nullptr) {
-    plan_info.max_item_len_ptr = 0;
-  } else {
-    plan_info.max_item_len_ptr = reinterpret_cast<int64_t>(max_item_len_ptr);
-  }
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
