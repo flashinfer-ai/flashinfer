@@ -38,7 +38,7 @@ void sampling_from_logits(at::Tensor logits, at::Tensor output,
   auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       gen_, at::cuda::detail::getDefaultCUDAGenerator());
   std::lock_guard<std::mutex> lock(gen->mutex_);
-  at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(batch_size);
+  at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(batch_size * vocab_size);
   philox_seed = rng_engine_inputs.seed_.val;
   philox_offset = rng_engine_inputs.offset_.val;
 
