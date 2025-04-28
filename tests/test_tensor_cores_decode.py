@@ -168,7 +168,7 @@ def test_batch_decode_tensor_cores(
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o = wrapper.run(q, kv_data)
+    o, lse = wrapper.run(q, kv_data, return_lse=True)
 
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
@@ -185,9 +185,12 @@ def test_batch_decode_tensor_cores(
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
+    o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
+        q, kv_data, return_lse=True
+    )
 
     torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -274,13 +277,13 @@ def test_batch_decode_tensor_cores_cuda_graph(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o = wrapper.run(q, kv_data)
+            o, lse = wrapper.run(q, kv_data, return_lse=True)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.run(q, kv_data)
+        o, lse = wrapper.run(q, kv_data, return_lse=True)
 
     # replay
     g.replay()
@@ -312,15 +315,20 @@ def test_batch_decode_tensor_cores_cuda_graph(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
+            o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
+                q, kv_data, return_lse=True
+            )
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
+        o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
+            q, kv_data, return_lse=True
+        )
 
     # replay
     g.replay()
 
     torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)

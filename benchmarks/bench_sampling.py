@@ -27,6 +27,18 @@ def init_seed_sampling(*args, **kwargs):
     return flashinfer.sampling.sampling_from_probs(*args, **kwargs)
 
 
+def init_seed_sampling_from_logits(*args, **kwargs):
+    torch.manual_seed(42)
+    return flashinfer.sampling.sampling_from_logits(*args, **kwargs)
+
+
+def init_seed_sampling_from_softmax_logits(logits, *args, **kwargs):
+    torch.manual_seed(42)
+    return flashinfer.sampling.sampling_from_probs(
+        torch.softmax(logits, dim=-1), *args, **kwargs
+    )
+
+
 def init_seed_top_k_sampling(*args, **kwargs):
     torch.manual_seed(42)
     return flashinfer.sampling.top_k_sampling_from_probs(*args, **kwargs)
@@ -138,6 +150,69 @@ def main():
                         print(
                             f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, deterministic: {deterministic}, p: {p}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                         )
+
+    print("---")
+    print("sampling from softmax(logits)")
+    for vocab_size in [128512]:
+        for batch_size in [1, 16, 32, 64, 128, 256, 512]:
+            for distrib in [
+                normal_distribution(1),
+                normal_distribution(5),
+                gumbel_distribution(0.1),
+                gumbel_distribution(1),
+            ]:
+                for deterministic in [True, False]:
+                    logits = distrib((batch_size, vocab_size), device="cuda")
+                    samples = torch.zeros(
+                        batch_size, dtype=torch.int32, device=logits.device
+                    )
+                    ms = do_bench(
+                        lambda: init_seed_sampling_from_softmax_logits(
+                            logits, samples, deterministic=deterministic
+                        ),
+                        warmup=100,
+                        rep=1000,
+                    )
+                    io = (
+                        logits.numel() * logits.element_size()
+                        + samples.numel() * samples.element_size()
+                    )
+                    bandwidth = io * 1e-6 / ms
+                    print(
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, deterministic: {deterministic}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                    )
+
+    print("---")
+    print("sampling from logits")
+    for vocab_size in [128512]:
+        for batch_size in [1, 16, 32, 64, 128, 256, 512]:
+            for distrib in [
+                normal_distribution(1),
+                normal_distribution(5),
+                gumbel_distribution(0.1),
+                gumbel_distribution(1),
+            ]:
+                for deterministic in [True, False]:
+                    logits = distrib((batch_size, vocab_size), device="cuda")
+                    samples = torch.zeros(
+                        batch_size, dtype=torch.int32, device=logits.device
+                    )
+                    ms = do_bench(
+                        lambda: init_seed_sampling_from_logits(
+                            logits, samples, deterministic=deterministic
+                        ),
+                        warmup=100,
+                        rep=1000,
+                    )
+
+                    io = (
+                        logits.numel() * logits.element_size()
+                        + samples.numel() * samples.element_size()
+                    )
+                    bandwidth = io * 1e-6 / ms
+                    print(
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, deterministic: {deterministic}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                    )
 
 
 if __name__ == "__main__":

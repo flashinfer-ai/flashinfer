@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025 by FlashInfer team.
+ * Copyright (c) 2023 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,15 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include "pytorch_extension_utils.h"
-#include "single_decode_config.inc"
 
-void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t layout,
-                                 int64_t window_left ADDITIONAL_FUNC_PARAMS);
+void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor lse,
+                              at::Tensor q_nope_pe, at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
+                              at::Tensor page_table);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Single-request decode with KV-Cache operator
-  m.def("run", single_decode_with_kv_cache);
+  // "Cutlass MLA Paged Attention"
+  m.def("cutlass_mla_paged_attention", CutlassMLAPagedAttention);
 }

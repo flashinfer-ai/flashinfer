@@ -1,0 +1,129 @@
+name: Release aarch64 wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+    secrets:
+      WHL_TOKEN:
+        required: true
+
+env:
+  TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0+PTX"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.6"
+            torch: "2.5"
+            python: "3.10"
+            image: "nvcr.io/nvidia/pytorch:24.10-py3"
+          - cuda: "12.8"
+            torch: "2.6"
+            python: "3.12"
+            image: "nvcr.io/nvidia/pytorch:25.01-py3"
+          - cuda: "12.8"
+            torch: "2.7"
+            python: "3.12"
+            image: "nvcr.io/nvidia/pytorch:25.03-py3"
+
+    runs-on: [self-hosted, Linux, ARM64]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set version values
+        id: set_versions
+        run: |
+          IFS='.' read -r major minor <<< "${{ matrix.torch }}"
+          echo "TORCH_VERSION=$((major * 100 + minor))" >> $GITHUB_OUTPUT
+          IFS='.' read -r major minor <<< "${{ matrix.cuda }}"
+          echo "CUDA_VERSION=$((major * 100 + minor))" >> $GITHUB_OUTPUT
+
+      - name: Build wheel
+        env:
+          TORCH_VERSION: ${{ steps.set_versions.outputs.TORCH_VERSION }}
+          CUDA_VERSION: ${{ steps.set_versions.outputs.CUDA_VERSION }}
+          PYTHON_VERSION: ${{ matrix.python }}
+          BUILDER_IMAGE: ${{ matrix.image }}
+        run: |
+          echo "TORCH_VERSION: $TORCH_VERSION"
+          echo "CUDA_VERSION: $CUDA_VERSION"
+          echo "PYTHON_VERSION: $PYTHON_VERSION"
+          echo "BUILDER_IMAGE: $BUILDER_IMAGE"
+          chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE/ci-cache"
+          chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE/ci-cache"
+          docker run --rm -t \
+              -v "$GITHUB_WORKSPACE":/app \
+              -v "$GITHUB_WORKSPACE/ci-cache":/ci-cache \
+              -e FLASHINFER_CI_CACHE=/ci-cache \
+              -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
+              -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
+              -e FLASHINFER_CI_PYTHON_VERSION=${{ matrix.python }} \
+              -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+              -e MAX_JOBS=128 \
+              --user $(id -u):$(id -g) \
+              $BUILDER_IMAGE \
+              bash /app/scripts/run-ci-build-wheel.sh
+        timeout-minutes: 120
+
+      - run: du -h dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}-aarch64
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - run: ls -lah dist/
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer-*.tar.gz
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_whl_index.py
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl"
+          git push

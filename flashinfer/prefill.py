@@ -664,6 +664,7 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    backend: str = "auto",
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -684,6 +685,7 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    backend: str = "auto",
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -703,8 +705,8 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-    return_lse: bool = False,
     backend: str = "auto",
+    return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -760,12 +762,12 @@ def single_prefill_with_kv_cache(
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
-    return_lse : bool
-        Whether to return the log sum exp value of the attention logits.
     backend : str
         The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
         If set to ``auto``, the function will automatically choose the backend based on the
         device architecture and kernel availability.
+    return_lse : bool
+        Whether to return the log sum exp value of the attention logits.
 
     Returns
     -------
@@ -1434,6 +1436,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._mask_indptr_buf = mask_indptr.to(
                     self.device, non_blocking=non_blocking
                 )
+            else:
+                self._custom_mask_buf = None
+                self._mask_indptr_buf = None
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -2026,6 +2031,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: Optional[int] = 0,
@@ -2097,6 +2103,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the query tensor, defaults to torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        non_blocking : bool
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
             prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
         token_pos_in_items_ptr : Optional[float]
@@ -2173,8 +2181,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         batch_size, self._fixed_batch_size
                     )
                 )
-            self._qo_indptr_buf.copy_(qo_indptr)
-            self._kv_indptr_buf.copy_(kv_indptr)
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+            self._kv_indptr_buf.copy_(kv_indptr, non_blocking=non_blocking)
             if packed_custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
                     raise ValueError(
@@ -2185,13 +2193,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
-                self._mask_indptr_buf.copy_(mask_indptr)
+                self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device)
-            self._kv_indptr_buf = kv_indptr.to(self.device)
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
+            self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask.to(self.device)
-                self._mask_indptr_buf = mask_indptr.to(self.device)
+                self._custom_mask_buf = packed_custom_mask.to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._mask_indptr_buf = mask_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
