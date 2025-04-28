@@ -174,7 +174,6 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
         }
         params.padded_batch_size = plan_info.padded_batch_size;
         params.max_total_num_rows = plan_info.total_num_rows;
-
         if (plan_info.enable_cuda_graph) {
           params.total_num_rows =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
@@ -309,7 +308,6 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         }
         params.padded_batch_size = plan_info.padded_batch_size;
         params.max_total_num_rows = plan_info.total_num_rows;
-
         if (plan_info.enable_cuda_graph) {
           params.total_num_rows =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
