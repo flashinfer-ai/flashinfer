@@ -40,6 +40,7 @@ TORCH_COMPILE_FNS = [
     flashinfer.rope.apply_llama31_rope_pos_ids,
     flashinfer.rope.apply_llama31_rope_pos_ids_inplace,
     flashinfer.sampling.sampling_from_probs,
+    flashinfer.sampling.sampling_from_logits,
     flashinfer.sampling.top_p_sampling_from_probs,
     flashinfer.sampling.top_k_sampling_from_probs,
     flashinfer.sampling.min_p_sampling_from_probs,

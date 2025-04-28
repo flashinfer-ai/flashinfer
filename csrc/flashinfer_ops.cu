@@ -176,6 +176,10 @@ void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
                          std::optional<at::Generator> gen);
 
+void sampling_from_logits(at::Tensor logits, at::Tensor output,
+                          std::optional<at::Tensor> maybe_indices, bool deterministic,
+                          std::optional<at::Generator> gen);
+
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
@@ -294,6 +298,8 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // sampling
   // Sample from probabilities
   m.def("sampling_from_probs", sampling_from_probs);
+  // Sample from logits
+  m.def("sampling_from_logits", sampling_from_logits);
   // Top-k sampling from probabilities
   m.def("top_k_sampling_from_probs", top_k_sampling_from_probs);
   // Min-p sampling from probabilities
