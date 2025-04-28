@@ -67,30 +67,43 @@ include(ConfigureKernelGeneration)
 flashinfer_configure_kernel_generation()
 # ---------------------------------------------------------------------------#
 
+# Set the install path for the libflashinfer headers based on whether the build
+# is for a Python Wheels package or for standalone libflashinfer.
+
+if(FLASHINFER_BUILD_WHEELS)
+  # When building wheels, install headers inside the Python package
+  set(_FLASHINFER_INCLUDE_INSTALL_DIR
+      "${SKBUILD_PLATLIB_DIR}/flashinfer/include")
+else()
+  # For standalone installation, use standard paths
+  set(_FLASHINFER_INCLUDE_INSTALL_DIR "${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
 # ---------------------- Generate configure.h -------------------------------#
+# cmake-format: off
 include(${CMAKE_SOURCE_DIR}/cmake/utils/GenerateConfigHeader.cmake)
 flashinfer_generate_config_header(
-  SOURCE_DIR
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  BINARY_DIR
-  ${CMAKE_CURRENT_BINARY_DIR}
-  INSTALL_DIR
-  ${CMAKE_INSTALL_INCLUDEDIR}/flashinfer
-  COMPONENT
-  Headers
+  SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
+  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}
+  INSTALL_DIR ${_FLASHINFER_INCLUDE_INSTALL_DIR}/flashinfer
+  COMPONENT Headers
   EXCLUDE_PATTERNS
-  ".*_DIR$"
-  ".*_PATH$"
-  ".*_FOUND$"
-  ".*_FILE$"
-  ".*_VERSION$")
+    ".*_DIR$"
+    ".*_PATH$"
+    ".*_FOUND$"
+    ".*_FILE$"
+    ".*_VERSION$"
+)
+# cmake-format: on
 # ---------------------------------------------------------------------------#
 
-# Build decode_kernels and prefill_kernels if FLASHINFER_BUILD_KERNELS is ON or
-# if tests or benchmarks are enabled
+# Build decode_kernels and prefill_kernels if needed
 if(FLASHINFER_BUILD_KERNELS
    OR FLASHINFER_UNITTESTS
    OR FLASHINFER_CXX_BENCHMARKS)
+
+  set(FLASHINFER_KERNEL_TARGETS decode_kernels prefill_kernels)
+
   add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
   add_library(flashinfer::decode_kernels ALIAS decode_kernels)
   target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
@@ -105,29 +118,47 @@ if(FLASHINFER_BUILD_KERNELS
     target_link_libraries(prefill_kernels PRIVATE Boost::math)
   endif()
 
-  # Add targets to export set
-  install(
-    TARGETS decode_kernels
-    EXPORT libflashinferTargets
-    COMPONENT Kernels)
-  install(
-    TARGETS prefill_kernels
-    EXPORT libflashinferTargets
-    COMPONENT Kernels)
+  if(FLASHINFER_ENABLE_SM90)
+    list(APPEND FLASHINFER_KERNEL_TARGETS prefill_kernels_sm90)
+    add_library(prefill_kernels_sm90 STATIC ${PREFILL_KERNELS_SM90_SRCS})
+    add_library(flashinfer::prefill_kernels_sm90 ALIAS prefill_kernels_sm90)
+    target_include_directories(prefill_kernels_sm90
+                               PRIVATE ${FLASHINFER_INCLUDE_DIR})
+    target_compile_options(
+      prefill_kernels_sm90
+      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+              --generate-code=arch=compute_90a,code=sm_90a>)
+    if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+      target_link_libraries(prefill_kernels_sm90 PRIVATE Boost::math)
+    endif()
+  endif()
 
-  # Export targets from the build tree
-  export(
-    EXPORT libflashinferTargets
-    FILE "${CMAKE_CURRENT_BINARY_DIR}/libflashinferTargets.cmake"
-    NAMESPACE flashinfer::)
+  # Only for non-wheel builds: Install libraries and export targets
+  if(NOT FLASHINFER_BUILD_WHEELS)
+    install(
+      TARGETS ${FLASHINFER_KERNEL_TARGETS}
+      EXPORT libflashinferTargets
+      COMPONENT Kernels
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+      INCLUDES
+      DESTINATION ${_FLASHINFER_INCLUDE_INSTALL_DIR})
 
-  # Install the export set for use with the install-tree
-  install(
-    EXPORT libflashinferTargets
-    FILE libflashinferTargets.cmake
-    NAMESPACE flashinfer::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer
-    COMPONENT Kernels)
+    # Export targets from the build tree
+    export(
+      EXPORT libflashinferTargets
+      FILE "${CMAKE_CURRENT_BINARY_DIR}/libflashinferTargets.cmake"
+      NAMESPACE flashinfer::)
+
+    # Install the export set
+    install(
+      EXPORT libflashinferTargets
+      FILE libflashinferTargets.cmake
+      NAMESPACE flashinfer::
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer
+      COMPONENT Kernels)
+  endif()
 endif()
 
 # Compile Flash Attention 3 libraries if FP8 unit tests are enabled
@@ -146,7 +177,7 @@ endif()
 # distributed directory as it is installed separately
 install(
   DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  DESTINATION ${_FLASHINFER_INCLUDE_INSTALL_DIR}
   COMPONENT Headers
   FILES_MATCHING
   REGEX "\\.(cuh|h|hpp)$"
@@ -156,20 +187,10 @@ install(
 if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
   install(
     DIRECTORY ${boost_math_SOURCE_DIR}/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/
+    DESTINATION ${_FLASHINFER_INCLUDE_INSTALL_DIR}/
     COMPONENT Headers
     FILES_MATCHING
     REGEX "\\.(h|hpp)$")
-endif()
-
-# Install libraries if kernels are built
-if(FLASHINFER_BUILD_KERNELS)
-  # Install libraries
-  install(
-    TARGETS decode_kernels prefill_kernels
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Kernels)
 endif()
 
 # Install distributed headers if enabled
@@ -184,7 +205,7 @@ if(FLASHINFER_DISTRIBUTED)
   # Install mscclpp headers with Distributed component
   install(
     DIRECTORY ${mscclpp_SOURCE_DIR}/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    DESTINATION ${_FLASHINFER_INCLUDE_INSTALL_DIR}
     COMPONENT Distributed
     FILES_MATCHING
     REGEX "\\.(h|hpp|cuh)$")

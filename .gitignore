@@ -10,6 +10,8 @@ csrc/generated/
 docs/generated/
 flashinfer/_build_meta.py
 flashinfer/data/
+flashinfer/_version.py
+flashinfer/__config__.py
 flashinfer/jit/aot_config.py
 src/generated/
 csrc/aot_default_additional_params.h
@@ -49,7 +51,9 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.whl
 MANIFEST
+_skbuild/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

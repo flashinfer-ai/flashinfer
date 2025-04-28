@@ -1,0 +1,34 @@
+"""Configuration for AOT compiled kernels.
+
+This file is auto-generated. DO NOT EDIT!
+"""
+# SPDX - FileCopyrightText : 2025 Advanced Micro Devices, Inc.
+#
+# SPDX - License - Identifier : Apache - 2.0
+
+import os
+import importlib.util
+from typing import Set, Optional
+
+# Import from Python's importlib location detection API
+def get_extension_path(name: str) -> Optional[str]:
+    """Try to find installed extension module"""
+    try:
+        spec = importlib.util.find_spec(name)
+        if spec and spec.origin:
+            return spec.origin
+        return None
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+# Standard extensions
+prebuilt_ops_uri: Set[str] = set()
+
+# Try to discover installed extensions
+kernels_path = get_extension_path("flashinfer.flashinfer_kernels")
+if kernels_path:
+    prebuilt_ops_uri.add(kernels_path)
+
+kernels_sm90_path = get_extension_path("flashinfer.flashinfer_kernels_sm90")
+if kernels_sm90_path:
+    prebuilt_ops_uri.add(kernels_sm90_path)

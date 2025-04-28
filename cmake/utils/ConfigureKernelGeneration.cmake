@@ -60,6 +60,17 @@ function(flashinfer_configure_kernel_generation)
       --pos_encoding_modes ${FLASHINFER_GEN_POS_ENCODING_MODES}
       --use_fp16_qk_reductions ${FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS}
       --mask_modes ${FLASHINFER_GEN_MASK_MODES})
+
+  set(AOT_GENERATE_SM90_COMMAND COMMAND
+      ${Python3_EXECUTABLE} -m aot_build_utils.generate_sm90
+      --path ${GENERATED_SOURCE_DIR}
+      --head_dims ${HEAD_DIMS_SM90}
+      --pos_encoding_modes ${FLASHINFER_GEN_POS_ENCODING_MODES}
+      --use_fp16_qk_reductions ${FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS}
+      --mask_modes ${FLASHINFER_GEN_MASK_MODES}
+      --enable_f16 ${FLASHINFER_ENABLE_F16}
+      --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+  )
   # cmake-format: on
 
   # Only regenerate at configure time if needed
@@ -83,6 +94,17 @@ function(flashinfer_configure_kernel_generation)
           "Dispatch header generation failed with error ${DISPATCH_RESULT}")
     endif()
 
+    if(FLASHINFER_ENABLE_SM90)
+      message(STATUS "Generating SM90 kernel sources (configure time)")
+      execute_process(
+        COMMAND ${AOT_GENERATE_SM90_COMMAND}
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        RESULT_VARIABLE GEN_RESULT)
+      if(NOT GEN_RESULT EQUAL 0)
+        message(FATAL_ERROR "Kernel generation failed with error ${GEN_RESULT}")
+      endif()
+    endif()
+
     # Create a stamp file to track when we last generated
     execute_process(COMMAND ${CMAKE_COMMAND} -E touch "${GENERATION_STAMP}")
   endif()
@@ -92,6 +114,8 @@ function(flashinfer_configure_kernel_generation)
        ${GENERATED_SOURCE_DIR}/*decode_head*.cu)
   file(GLOB_RECURSE PREFILL_KERNELS_SRCS
        ${GENERATED_SOURCE_DIR}/*prefill_head*.cu)
+  file(GLOB_RECURSE PREFILL_KERNELS_SM90_SRCS
+       ${GENERATED_SOURCE_DIR}/*prefill_head*_sm90.cu)
   set(DISPATCH_INC_FILE "${GENERATED_SOURCE_DIR}/dispatch.inc")
 
   # Create a custom target for manual kernel regeneration
@@ -118,5 +142,8 @@ function(flashinfer_configure_kernel_generation)
       PARENT_SCOPE)
   set(DISPATCH_INC_FILE
       ${DISPATCH_INC_FILE}
+      PARENT_SCOPE)
+  set(PREFILL_KERNELS_SM90_SRCS
+      ${PREFILL_KERNELS_SM90_SRCS}
       PARENT_SCOPE)
 endfunction()
