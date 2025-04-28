@@ -53,6 +53,7 @@ IntTuple BatchPrefillWithKVCacheSM90Plan(
   flashinfer::PrefillPlanSM90Info plan_info;
 
   cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
+
   cudaError_t status = PrefillSM90Plan(
       static_cast<char*>(float_workspace_buffer->data) + float_workspace_buffer->byte_offset,
       float_workspace_size_in_bytes,
