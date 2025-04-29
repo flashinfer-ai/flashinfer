@@ -2637,20 +2637,22 @@ def fmha_varlen(
     sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
     batch_size = qo_lens.shape[0]
-    # max_qo_len = (qo_lens.max() + 255) // 256 * 256
     max_qo_len = qo_lens.max()
-    # max_kv_len = (kv_lens.max() + 127) // 128 * 128
     max_kv_len = kv_lens.max()
 
     q_padded = torch.cat(
         [
             torch.zeros(
-                max_qo_len, q.shape[1], q.shape[2], device=q.device, dtype=q.dtype
+                max(max_qo_len, 128),
+                q.shape[1],
+                q.shape[2],
+                device=q.device,
+                dtype=q.dtype,
             ),
             q,
         ],
         dim=0,
-    )[max_qo_len:]
+    )[max(max_qo_len, 128) :]
 
     if qo_segment_offsets is None:
         qo_segment_offsets = torch.zeros(
@@ -2672,21 +2674,29 @@ def fmha_varlen(
     k_padded = torch.cat(
         [
             torch.zeros(
-                max_kv_len, k.shape[1], k.shape[2], device=k.device, dtype=k.dtype
+                max(max_kv_len, 128),
+                k.shape[1],
+                k.shape[2],
+                device=k.device,
+                dtype=k.dtype,
             ),
             k,
         ],
         dim=0,
-    )[max_kv_len:]
+    )[max(max_kv_len, 128) :]
     v_padded = torch.cat(
         [
             torch.zeros(
-                max_kv_len, v.shape[1], v.shape[2], device=v.device, dtype=v.dtype
+                max(max_kv_len, 128),
+                v.shape[1],
+                v.shape[2],
+                device=v.device,
+                dtype=v.dtype,
             ),
             v,
         ],
         dim=0,
-    )[max_kv_len:]
+    )[max(max_kv_len, 128) :]
 
     if kv_segment_offsets is None:
         kv_segment_offsets = torch.zeros(
@@ -2705,12 +2715,12 @@ def fmha_varlen(
 
     if out is None:
         out_padded = torch.empty(
-            padded_qo_total_len + max_qo_len,
+            padded_qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
             head_dim_vo,
             device=q.device,
             dtype=q.dtype,
-        )[max_qo_len:]
+        )[max(max_qo_len, 128) :]
     else:
         out_padded = out
 
@@ -2720,11 +2730,6 @@ def fmha_varlen(
         )
     else:
         lse_padded = lse
-
-    print(qo_lens, kv_lens)
-    print(padded_qo_segment_offsets, padded_kv_segment_offsets)
-
-    torch.cuda.synchronize()
 
     module.run(
         q_padded,

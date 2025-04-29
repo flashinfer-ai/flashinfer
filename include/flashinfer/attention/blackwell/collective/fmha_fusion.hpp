@@ -121,7 +121,7 @@ struct CausalMask : NoMask {
   template <class BlkCoord, class TileShape, class ProblemSize>
   CUTLASS_DEVICE int get_masked_trip_count(BlkCoord const& blk_coord, TileShape const& tile_shape,
                                            ProblemSize const& problem_size) {
-    return ceil_div(min(get<0>(tile_shape), get<1>(problem_size)), get<1>(tile_shape));
+    return get_trip_count(blk_coord, tile_shape, problem_size);
   }
 
   template <class BlkCoord, class TileShape, class ProblemSize>

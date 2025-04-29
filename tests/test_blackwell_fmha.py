@@ -54,12 +54,12 @@ def attention_ref(
     return o_ref, lse_ref * math.log2(math.e)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 3])
-@pytest.mark.parametrize("qo_len", [377, 177])
-@pytest.mark.parametrize("kv_len", [544, 977])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
+@pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
+@pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
 @pytest.mark.parametrize("num_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.half])
 def test_blackwell_cutlass_fmha(
     batch_size,
@@ -70,6 +70,9 @@ def test_blackwell_cutlass_fmha(
     causal,
     dtype,
 ):
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
     torch.manual_seed(42)
@@ -88,11 +91,9 @@ def test_blackwell_cutlass_fmha(
     kv_lens = torch.full((batch_size,), kv_len, device="cuda", dtype=torch.int32)
 
     o, lse = flashinfer.prefill.fmha_varlen(q, k, v, qo_lens, kv_lens, causal=causal)
-    torch.cuda.synchronize()
 
     sm_scale = 1.0 / (head_dim**0.5)
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
-    torch.cuda.synchronize()
 
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
@@ -111,9 +112,9 @@ def test_blackwell_cutlass_fmha(
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         3,
-        177,
-        977,
-        128,
+        17,
+        17,
+        1,
         128,
         True,
         torch.half,

@@ -1036,7 +1036,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
-
     cutlass::arch::fence_view_async_tmem_load();
 
     pipeline_o.consumer_release(pipeline_o_consumer_state);
