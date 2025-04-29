@@ -17,7 +17,7 @@ include(GenerateConfigPython)
 flashinfer_generate_config_python(INSTALL_DIR "flashinfer")
 
 message(STATUS "Vendored CUTLASS headers to be installed along with package "
-               "at ${SKBUILD_PLATLIB_DIR}/flashinfer/include")
+               "at flashinfer/include")
 
 # Extract the two include paths from CUTLASS_INCLUDE_DIRS defined in
 # Dependencies.cmake
@@ -27,7 +27,7 @@ list(GET CUTLASS_INCLUDE_DIRS 1 CUTLASS_TOOLS_INCLUDE_DIR)
 # Install main CUTLASS and CUTE headers
 install(
   DIRECTORY "${CUTLASS_MAIN_INCLUDE_DIR}/"
-  DESTINATION "${SKBUILD_PLATLIB_DIR}/flashinfer/include"
+  DESTINATION "flashinfer/include"
   FILES_MATCHING
   PATTERN "*.h"
   PATTERN "*.hpp"
@@ -37,7 +37,7 @@ install(
 # Install CUTLASS tools/utils/include headers
 install(
   DIRECTORY "${CUTLASS_TOOLS_INCLUDE_DIR}/"
-  DESTINATION "${SKBUILD_PLATLIB_DIR}/flashinfer/include"
+  DESTINATION "flashinfer/include"
   FILES_MATCHING
   PATTERN "*.h"
   PATTERN "*.hpp"
@@ -45,12 +45,12 @@ install(
   PATTERN "*.inl")
 
 message(STATUS "TVM bindings to be installed along with package at "
-               "${SKBUILD_PLATLIB_DIR}/flashinfer/tvm_binding")
+               "flashinfer/tvm_binding")
 
 # Install TVM binding files
 install(
   DIRECTORY "${CMAKE_SOURCE_DIR}/tvm_binding/"
-  DESTINATION "${SKBUILD_PLATLIB_DIR}/flashinfer/tvm_binding"
+  DESTINATION "flashinfer/tvm_binding"
   FILES_MATCHING
   PATTERN "*.py"
   PATTERN "*.cc"

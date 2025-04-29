@@ -72,8 +72,7 @@ flashinfer_configure_kernel_generation()
 
 if(FLASHINFER_BUILD_WHEELS)
   # When building wheels, install headers inside the Python package
-  set(_FLASHINFER_INCLUDE_INSTALL_DIR
-      "${SKBUILD_PLATLIB_DIR}/flashinfer/include")
+  set(_FLASHINFER_INCLUDE_INSTALL_DIR "flashinfer/include")
 else()
   # For standalone installation, use standard paths
   set(_FLASHINFER_INCLUDE_INSTALL_DIR "${CMAKE_INSTALL_INCLUDEDIR}")
