@@ -359,7 +359,7 @@ class BlockSparseAttentionWrapper:
             self._cached_module = get_batch_decode_module(
                 q_data_type,
                 kv_data_type,
-                o_data_type,
+                self._o_dtype,
                 indptr.dtype,
                 head_dim,
                 head_dim,
