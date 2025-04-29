@@ -40,41 +40,41 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
 
-namespace flashinfer {
+namespace flashinfer
+{
 
-template <typename T>
-struct cutlass_dtype {
-  using type = T;
+template <typename T> struct cutlass_dtype
+{
+    using type = T;
 };
 
-template <>
-struct cutlass_dtype<half> {
-  using type = cutlass::half_t;
+template <> struct cutlass_dtype<half>
+{
+    using type = cutlass::half_t;
 };
 
-template <>
-struct cutlass_dtype<nv_bfloat16> {
-  using type = cutlass::bfloat16_t;
+template <> struct cutlass_dtype<nv_bfloat16>
+{
+    using type = cutlass::bfloat16_t;
 };
 
-template <>
-struct cutlass_dtype<__nv_fp8_e4m3> {
-  using type = cutlass::float_e4m3_t;
+template <> struct cutlass_dtype<__nv_fp8_e4m3>
+{
+    using type = cutlass::float_e4m3_t;
 };
 
-template <>
-struct cutlass_dtype<__nv_fp8_e5m2> {
-  using type = cutlass::float_e5m2_t;
+template <> struct cutlass_dtype<__nv_fp8_e5m2>
+{
+    using type = cutlass::float_e5m2_t;
 };
 
-template <typename T>
-using cutlass_dtype_t = typename cutlass_dtype<T>::type;
+template <typename T> using cutlass_dtype_t = typename cutlass_dtype<T>::type;
 
-template <typename T>
-void compileTimeDebug(T&&) {
-  static_assert(sizeof(T) == 0, "Compile time debug");
+template <typename T> void compileTimeDebug(T &&)
+{
+    static_assert(sizeof(T) == 0, "Compile time debug");
 }
 
-}  // namespace flashinfer
+} // namespace flashinfer
 
-#endif  // FLASHINFER_CUTLASS_UTILS_CUH_
+#endif // FLASHINFER_CUTLASS_UTILS_CUH_

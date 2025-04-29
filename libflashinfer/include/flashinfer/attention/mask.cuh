@@ -16,14 +16,16 @@
 #ifndef FLASHINFER_ATTENTION_MASK_CUH_
 #define FLASHINFER_ATTENTION_MASK_CUH_
 
-namespace flashinfer {
+namespace flashinfer
+{
 
-enum class MaskMode {
-  kNone = 0U,    // No mask
-  kCausal = 1U,  // Causal mask
-  kCustom = 2U,  // Custom mask
+enum class MaskMode
+{
+    kNone = 0U,   // No mask
+    kCausal = 1U, // Causal mask
+    kCustom = 2U, // Custom mask
 };
 
-}  // namespace flashinfer
+} // namespace flashinfer
 
-#endif  // FLASHINFER_ATTENTION_MASK_CUH_
+#endif // FLASHINFER_ATTENTION_MASK_CUH_
