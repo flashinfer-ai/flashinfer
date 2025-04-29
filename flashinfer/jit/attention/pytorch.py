@@ -454,10 +454,12 @@ def gen_single_prefill_module(
     )
 
     # use `fp8_enabled` flag to use separate kernel template
-    fp8_enabled = "e4m3" in uri or "e5m2" in uri
+    # this is used for fp8 tensor core computation
+    # KV-only quant is not influenced by this flag
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
 
     if backend == "fa2":
-        assert not fp8_enabled, "fp8 is not supported in fa2 backend"
+        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
         additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
         additional_tensor_dtypes = ["uint8_t", "float"]
         additional_scalar_names = [
@@ -747,10 +749,12 @@ def gen_batch_prefill_module(
     )
 
     # use `fp8_enabled` flag to use separate kernel template
-    fp8_enabled = "e4m3" in uri or "e5m2" in uri
+    # this is used for fp8 tensor core computation
+    # KV-only quant is not influenced by this flag
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
 
     if backend == "fa2":
-        assert not fp8_enabled, "fp8 is not supported in fa2 backend"
+        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
         additional_tensor_names = [
             "maybe_custom_mask",
             "maybe_mask_indptr",
