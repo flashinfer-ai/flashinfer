@@ -136,7 +136,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if constexpr (has_maybe_token_pos_in_items_ptr_v<decltype(mainloop_params.additional_params)>) {
     maybe_token_pos_in_items_ptr = mainloop_params.additional_params.maybe_token_pos_in_items_ptr;
   }
-  const uint32_t token_pos_in_items_len = 0;
+  uint32_t token_pos_in_items_len = 0;
   if constexpr (has_token_pos_in_items_len_v<decltype(mainloop_params.additional_params)>) {
     token_pos_in_items_len = mainloop_params.additional_params.token_pos_in_items_len;
   }
