@@ -43,6 +43,7 @@ struct RaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
@@ -88,6 +89,7 @@ struct PagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     {{ additional_params_decl }}

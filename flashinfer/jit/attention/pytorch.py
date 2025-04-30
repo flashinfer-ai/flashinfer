@@ -645,8 +645,8 @@ def gen_customize_pod_module(
 
     source_paths = []
 
-    for mask_mode_p in [0, 1, 2]:
-        for mask_mode_d in [0, 1, 2]:
+    for mask_mode_p in [0, 1, 2, 3]:
+        for mask_mode_d in [0, 1, 2, 3]:
             kwargs["mask_mode_p"] = mask_mode_literal[mask_mode_p]
             kwargs["mask_mode_d"] = mask_mode_literal[mask_mode_d]
 
@@ -759,27 +759,42 @@ def gen_batch_prefill_module(
             "maybe_custom_mask",
             "maybe_mask_indptr",
             "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
         ]
         additional_tensor_dtypes = [
             "uint8_t",
             "int32_t",
             "float",
+            "uint32_t",
+            "uint16_t",
+            "uint16_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
+            "token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double"]
+        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
-            additional_tensor_names = []
-            additional_tensor_dtypes = []
-            additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-            additional_scalar_dtypes = ["double", "double"]
+            additional_tensor_names = [
+                "maybe_prefix_len_ptr",
+                "maybe_token_pos_in_items_ptr",
+                "maybe_max_item_len_ptr",
+            ]
+            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t"]
+            additional_scalar_names = [
+                "logits_soft_cap",
+                "sm_scale",
+                "token_pos_in_items_len",
+            ]
+            additional_scalar_dtypes = ["double", "double", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
             variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
         else:
@@ -961,7 +976,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1025,7 +1040,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1209,7 +1224,7 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1286,7 +1301,7 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2]:
+        for mask_mode in [0, 1, 2, 3]:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)

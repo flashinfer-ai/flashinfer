@@ -82,10 +82,15 @@ struct BatchPrefillRaggedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;
@@ -128,10 +133,15 @@ struct BatchPrefillPagedParams {
   IdType* kv_lens;
   IdType* head_indices;
   IdType* work_indptr;
+  IdType* batch_indices;
 
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    uint32_t* maybe_prefix_len_ptr;
+    uint16_t* maybe_token_pos_in_items_ptr;
+    uint32_t token_pos_in_items_len;
+    uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
   int64_t q_stride_n;

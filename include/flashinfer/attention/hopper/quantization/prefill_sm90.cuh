@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
          work_tile_info = scheduler.template get_next_work</*is_producer=*/true>(scheduler_params,
                                                                                  work_tile_info)) {
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
           block_coord;
 
       if (q_tile_idx * CTA_Q >= qo_len) {
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       clear(tOrO);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
           block_coord;
 
       AttentionVariant variant(mainloop_params, block_coord);
@@ -238,7 +238,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           mainloop_params, variant, pipeline_k, pipeline_vt, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx);
+          qo_head_idx, kv_head_idx, batch_idx);
 
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);

@@ -250,10 +250,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 if backend == "fa2":
                     ragged_run_func(
@@ -273,10 +277,14 @@ def get_batch_prefill_module(backend):
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
+                        token_pos_in_items_len,
                     )
                 else:
                     ragged_run_func(
@@ -293,8 +301,12 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
+                        token_pos_in_items_len,
                     )
 
                 return o
@@ -317,10 +329,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -356,6 +372,9 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 scale_q: Optional[torch.Tensor],
@@ -363,6 +382,7 @@ def get_batch_prefill_module(backend):
                 scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 if backend == "fa2":
                     assert not is_float8(q)
@@ -385,10 +405,14 @@ def get_batch_prefill_module(backend):
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
+                        maybe_prefix_len_ptr,
+                        maybe_token_pos_in_items_ptr,
+                        maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
+                        token_pos_in_items_len,
                     )
                 else:
                     if not is_float8(q):
@@ -408,8 +432,12 @@ def get_batch_prefill_module(backend):
                             mask_mode,
                             layout,
                             window_left,
+                            maybe_prefix_len_ptr,
+                            maybe_token_pos_in_items_ptr,
+                            maybe_max_item_len_ptr,
                             logits_soft_cap,
                             sm_scale,
+                            token_pos_in_items_len,
                         )
                     else:
                         paged_run_func(
@@ -455,10 +483,14 @@ def get_batch_prefill_module(backend):
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -1280,6 +1312,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1354,6 +1390,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
+        prefix_len_ptr :Optional[torch.Tensor]
+            prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
+        token_pos_in_items_ptr : Optional[float]
+            A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
+            for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
+            `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
+            we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
+            `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
+        token_pos_in_items_len : int
+            zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
+            If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
+            with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
+        max_item_len_ptr : Optional[float]
+            a uint16 vector contains the max token length of all items for each prompt
 
         Note
         ----
@@ -1392,6 +1442,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_indptr,
                 bitorder="little",
             )
+
+        self._prefix_len_ptr = prefix_len_ptr
+        self._token_pos_in_items_ptr = token_pos_in_items_ptr
+        self._token_pos_in_items_len = token_pos_in_items_len
+        self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
@@ -1714,6 +1769,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        if self._prefix_len_ptr is not None:
+            mask_mode = MaskMode.MULTIITEMSCORING.value
+
         if self._backend == "fa3":
             # NOTE(Zihao): we divide both stride_block and stride_n by stride_n
             # because we will multiply stride_n back in the kernel
@@ -1757,6 +1815,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                self._prefix_len_ptr,
+                self._token_pos_in_items_ptr,
+                self._max_item_len_ptr,
                 logits_soft_cap,
                 sm_scale,
                 None,  # scale_q, not supported yet
@@ -1764,6 +1825,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 None,  # scale_v
                 rope_scale,
                 rope_theta,
+                self._token_pos_in_items_len,
             ]
 
         self._cached_module.paged_run(*run_args)
@@ -2066,6 +2128,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2135,6 +2201,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
+        prefix_len_ptr :Optional[torch.Tensor]
+            prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
+        token_pos_in_items_ptr : Optional[float]
+            A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
+            for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
+            `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
+            we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
+            `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
+        token_pos_in_items_len : int
+            zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
+            If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
+            with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
+        max_item_len_ptr : Optional[float]
+            a uint16 vector contains the max token length of all items for each prompt
 
         Note
         ----
@@ -2224,6 +2304,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
+
+        self._prefix_len_ptr = prefix_len_ptr
+        self._token_pos_in_items_ptr = token_pos_in_items_ptr
+        self._token_pos_in_items_len = token_pos_in_items_len
+        self._max_item_len_ptr = max_item_len_ptr
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -2445,10 +2530,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+                self._prefix_len_ptr,
+                self._token_pos_in_items_ptr,
+                self._max_item_len_ptr,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
+                self._token_pos_in_items_len,
             ]
 
         self._cached_module.ragged_run(*run_args)

@@ -635,7 +635,7 @@ struct DebugPrintLogits : AttentionVariantBase {
   template <typename MainloopParams, typename BlockCoord>
   __device__ __host__ DebugPrintLogits(const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
-    auto [_, __, ___, ____, _____, qo_len_, kv_len_] =
+    auto [_, __, ___, ____, _____, qo_len_, kv_len_, batch_idx] =
         block_coord;
 
     qo_len = qo_len_;
