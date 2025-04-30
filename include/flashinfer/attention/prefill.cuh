@@ -2178,7 +2178,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   chunk_start))
                         : chunk_size),
                    CTA_TILE_KV);
-    } else {
+    } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
       num_iterations_prefix = ceil_div(
           min(min(chunk_size, sub_if_greater_or_zero(
                                   kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
