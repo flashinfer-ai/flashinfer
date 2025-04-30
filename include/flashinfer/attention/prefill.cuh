@@ -2059,7 +2059,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     if constexpr (has_maybe_token_pos_in_items_ptr_v<Params>) {
       maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
     }
-    const uint32_t token_pos_in_items_len = 0;
+    uint32_t token_pos_in_items_len = 0;
     if constexpr (has_token_pos_in_items_len_v<Params>) {
       token_pos_in_items_len = params.token_pos_in_items_len;
     }
