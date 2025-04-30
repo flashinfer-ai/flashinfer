@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
          work_tile_info = scheduler.template get_next_work</*is_producer=*/true>(scheduler_params,
                                                                                  work_tile_info)) {
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
           block_coord;
 
       if (q_tile_idx * CTA_Q >= qo_len) {
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       clear(tOrO);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
+      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
           block_coord;
 
       AttentionVariant variant(mainloop_params, block_coord);
