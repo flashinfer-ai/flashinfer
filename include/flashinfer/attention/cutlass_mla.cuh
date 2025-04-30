@@ -32,16 +32,6 @@ namespace attention {
 using namespace cute;
 using namespace cutlass::fmha::kernel;
 
-#define CUTLASS_CHECK(cmd)                                                            \
-  do {                                                                                \
-    auto status = cmd;                                                                \
-    if (status != cutlass::Status::kSuccess) {                                        \
-      std::ostringstream err_msg;                                                     \
-      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
-      FLASHINFER_ERROR(err_msg.str());                                                \
-    }                                                                                 \
-  } while (0)
-
 template <bool v>
 struct IsPersistent {
   static const bool value = v;

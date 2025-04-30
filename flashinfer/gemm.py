@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from types import SimpleNamespace
 from typing import Optional
 
@@ -138,6 +139,24 @@ def get_gemm_module():
         )
 
     return _gemm_module
+
+
+@functools.cache
+def get_gemm_sm100_module():
+    if has_prebuilt_ops:
+        _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
+        module = _kernels_sm100
+    else:
+        module = load_cuda_ops(
+            "gemm_sm100",
+            [
+                FLASHINFER_CSRC_DIR / "gemm_blockwise_sm100.cu",
+                FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+            ],
+            extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
+        )
+
+    return module
 
 
 def get_gemm_sm90_module():
@@ -672,4 +691,40 @@ def bmm_fp8(
         )
     workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
     get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
+    return out
+
+
+def gemm_fp8_nt_blockscaled(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    workspace_buffer = _get_cache_buf(
+        "gemm_fp8_nt_blockscaled_workspace", 32 * 1024 * 1024, a.device
+    )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
+    m = a.shape[0]
+    n = b.shape[0]
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
+        )
+
+    if out is None:
+        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
+        # if out_dtype is not provided, we use bfloat16 as default
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0],
+            b.shape[0],
+            device=a.device,
+            dtype=out_dtype,
+        )
+    get_gemm_sm100_module().gemm_fp8_nt_blockscaled.default(
+        workspace_buffer, a, b, a_scale, b_scale, out
+    )
     return out
