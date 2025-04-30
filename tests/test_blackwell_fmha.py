@@ -82,7 +82,9 @@ def test_blackwell_cutlass_fmha(
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda"
     )
-    qo_lens = torch.full((batch_size,), qo_len, device="cuda", dtype=torch.int32)
+    qo_segment_offsets = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
 
     k = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
@@ -90,12 +92,21 @@ def test_blackwell_cutlass_fmha(
     v = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
-    kv_lens = torch.full((batch_size,), kv_len, device="cuda", dtype=torch.int32)
+    kv_segment_offsets = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
 
-    o, lse = flashinfer.prefill.fmha_varlen(q, k, v, qo_lens, kv_lens, causal=causal)
+    o, lse = flashinfer.prefill.fmha_varlen(
+        q, k, v, qo_segment_offsets, kv_segment_offsets, causal=causal
+    )
 
     sm_scale = 1.0 / (head_dim**0.5)
-    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref, lse_ref = attention_ref(
+        batch_size, q, k_repeated, v_repeated, causal, sm_scale
+    )
 
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)

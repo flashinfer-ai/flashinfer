@@ -2610,10 +2610,8 @@ def fmha_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    qo_lens: torch.Tensor,
-    kv_lens: torch.Tensor,
-    qo_segment_offsets: Optional[torch.Tensor] = None,
-    kv_segment_offsets: Optional[torch.Tensor] = None,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -2636,6 +2634,8 @@ def fmha_varlen(
     mask_mode_code = 1 if causal else 0
     sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
+    qo_lens = qo_segment_offsets[1:] - qo_segment_offsets[:-1]
+    kv_lens = kv_segment_offsets[1:] - kv_segment_offsets[:-1]
     batch_size = qo_lens.shape[0]
     max_qo_len = qo_lens.max()
     max_kv_len = kv_lens.max()
@@ -2654,22 +2654,7 @@ def fmha_varlen(
         dim=0,
     )[max(max_qo_len, 128) :]
 
-    if qo_segment_offsets is None:
-        qo_segment_offsets = torch.zeros(
-            batch_size + 1, device=q.device, dtype=torch.int32
-        )
-        qo_segment_offsets[1:] = torch.cumsum(qo_lens, dim=0)
-        padded_qo_lens = qo_lens
-        padded_qo_segment_offsets = torch.zeros(
-            batch_size + 1, device=q.device, dtype=torch.int32
-        )
-        padded_qo_segment_offsets[1:] = torch.cumsum(padded_qo_lens, dim=0)
-        padded_qo_total_len = padded_qo_segment_offsets[-1]
-    else:
-        # qo_segment_offsets elements must be multiple of 256
-        assert (qo_segment_offsets % 256 == 0).all()
-        padded_qo_total_len = nnz_qo
-        padded_qo_segment_offsets = qo_segment_offsets
+    qo_total_len = nnz_qo
 
     k_padded = torch.cat(
         [
@@ -2698,24 +2683,9 @@ def fmha_varlen(
         dim=0,
     )[max(max_kv_len, 128) :]
 
-    if kv_segment_offsets is None:
-        kv_segment_offsets = torch.zeros(
-            batch_size + 1, device=q.device, dtype=torch.int32
-        )
-        kv_segment_offsets[1:] = torch.cumsum(kv_lens, dim=0)
-        padded_kv_lens = kv_lens
-        padded_kv_segment_offsets = torch.zeros(
-            batch_size + 1, device=q.device, dtype=torch.int32
-        )
-        padded_kv_segment_offsets[1:] = torch.cumsum(padded_kv_lens, dim=0)
-    else:
-        # kv_segment_offsets elements must be multiple of 128
-        assert (kv_segment_offsets % 128 == 0).all()
-        padded_kv_segment_offsets = kv_segment_offsets
-
     if out is None:
         out_padded = torch.empty(
-            padded_qo_total_len + max(max_qo_len, 128),
+            qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
             head_dim_vo,
             device=q.device,
@@ -2726,7 +2696,7 @@ def fmha_varlen(
 
     if lse is None:
         lse_padded = torch.empty(
-            padded_qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
+            qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
         )
     else:
         lse_padded = lse
@@ -2737,8 +2707,8 @@ def fmha_varlen(
         v_padded,
         qo_lens,
         kv_lens,
-        padded_qo_segment_offsets,
-        padded_kv_segment_offsets,
+        qo_segment_offsets,
+        kv_segment_offsets,
         out_padded,
         lse_padded,
         mask_mode_code,

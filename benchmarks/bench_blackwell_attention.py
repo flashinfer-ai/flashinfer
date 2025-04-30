@@ -38,9 +38,6 @@ def bench_fmha_blackwell(
         batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
     )
 
-    qo_lens = torch.full((batch_size,), qkv_len, device="cuda", dtype=torch.int32)
-    kv_lens = torch.full((batch_size,), qkv_len, device="cuda", dtype=torch.int32)
-
     qo_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
     )
@@ -49,7 +46,7 @@ def bench_fmha_blackwell(
     )
 
     o, lse = flashinfer.prefill.fmha_varlen(
-        q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, causal=causal
+        q, k, v, qo_segment_offsets, kv_segment_offsets, causal=causal
     )
 
     ms = do_bench(
@@ -57,8 +54,6 @@ def bench_fmha_blackwell(
             q,
             k,
             v,
-            qo_lens,
-            kv_lens,
             qo_segment_offsets,
             kv_segment_offsets,
             causal=causal,
