@@ -41,6 +41,9 @@ namespace flashinfer {
 
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
 DEFINE_HAS_MEMBER(maybe_k_rope_offset)
+DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
+DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
+DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
@@ -2047,10 +2050,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
-    uint32_t* maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
-    uint16_t* maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
+    uint32_t* maybe_prefix_len_ptr =
+        (has_maybe_prefix_len_ptr_v<Params>) ? params.maybe_prefix_len_ptr : nullptr;
+    uint16_t* maybe_token_pos_in_items_ptr = (has_maybe_token_pos_in_items_ptr_v<Params>)
+                                                 ? params.maybe_token_pos_in_items_ptr
+                                                 : nullptr;
     const uint32_t token_pos_in_items_len = params.token_pos_in_items_len;
-    uint16_t* maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
+    uint16_t* maybe_max_item_len_ptr =
+        (has_maybe_max_item_len_ptr_v<Params>) ? params.maybe_max_item_len_ptr : nullptr;
 
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();
@@ -2272,7 +2279,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
                 qo_len, kv_len, chunk_end, group_size, s_frag);
           }
-        } else {
+        } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
           if (iter + 1 >= num_iterations_prefix) {
             logits_mask_multi_item_scoring<KTraits>(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
