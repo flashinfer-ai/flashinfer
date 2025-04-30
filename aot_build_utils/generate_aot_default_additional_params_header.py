@@ -139,7 +139,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
-            "maybe_token_pos_in_items_len",
+            "token_pos_in_items_len",
         ],
         ["double", "double", "double", "double", "int64_t"],
     )
@@ -152,7 +152,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "maybe_max_item_len_ptr",
         ],
         ["uint32_t", "uint16_t", "uint16_t"],
-        ["logits_soft_cap", "sm_scale", "maybe_token_pos_in_items_len"],
+        ["logits_soft_cap", "sm_scale", "token_pos_in_items_len"],
         ["double", "double", "int64_t"],
         is_sm90_template=True,
     )

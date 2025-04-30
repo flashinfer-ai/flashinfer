@@ -241,9 +241,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       uint16_t* token_pos_in_items = nullptr;
       if constexpr (MULTIITEMSCORING) {
         prefix_len = __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
-        token_pos_in_items =
-            mainloop_params.additional_params.maybe_token_pos_in_items_ptr +
-            batch_idx * mainloop_params.additional_params.maybe_token_pos_in_items_len;
+        token_pos_in_items = mainloop_params.additional_params.maybe_token_pos_in_items_ptr +
+                             batch_idx * mainloop_params.additional_params.token_pos_in_items_len;
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;

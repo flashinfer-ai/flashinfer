@@ -2049,7 +2049,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     uint32_t* maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
     uint16_t* maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
-    const uint32_t maybe_token_pos_in_items_len = params.maybe_token_pos_in_items_len;
+    const uint32_t token_pos_in_items_len = params.token_pos_in_items_len;
     uint16_t* maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -2279,7 +2279,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
                 qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
-                maybe_token_pos_in_items_ptr + request_idx * maybe_token_pos_in_items_len);
+                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(

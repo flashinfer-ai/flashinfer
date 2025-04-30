@@ -174,7 +174,7 @@ struct BatchPrefillRaggedParams {
   bool partition_kv;
   uint32_t* maybe_prefix_len_ptr;
   uint16_t* maybe_token_pos_in_items_ptr;
-  uint32_t maybe_token_pos_in_items_len;
+  uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillRaggedParams()
@@ -217,7 +217,7 @@ struct BatchPrefillRaggedParams {
         partition_kv(false),
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
-        maybe_token_pos_in_items_len(0),
+        token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
@@ -268,7 +268,7 @@ struct BatchPrefillRaggedParams {
         partition_kv(false),
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
-        maybe_token_pos_in_items_len(0),
+        token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
@@ -319,7 +319,7 @@ struct BatchPrefillPagedParams {
   bool partition_kv;
   uint32_t* maybe_prefix_len_ptr;
   uint16_t* maybe_token_pos_in_items_ptr;
-  uint32_t maybe_token_pos_in_items_len;
+  uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillPagedParams()
@@ -354,7 +354,7 @@ struct BatchPrefillPagedParams {
         partition_kv(false),
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
-        maybe_token_pos_in_items_len(0),
+        token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
@@ -395,7 +395,7 @@ struct BatchPrefillPagedParams {
         partition_kv(false),
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
-        maybe_token_pos_in_items_len(0),
+        token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {

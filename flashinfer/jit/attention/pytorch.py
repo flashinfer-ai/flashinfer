@@ -776,7 +776,7 @@ def gen_batch_prefill_module(
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
-            "maybe_token_pos_in_items_len",
+            "token_pos_in_items_len",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
@@ -792,7 +792,7 @@ def gen_batch_prefill_module(
             additional_scalar_names = [
                 "logits_soft_cap",
                 "sm_scale",
-                "maybe_token_pos_in_items_len",
+                "token_pos_in_items_len",
             ]
             additional_scalar_dtypes = ["double", "double", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"

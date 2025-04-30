@@ -89,7 +89,7 @@ struct BatchPrefillRaggedParams {
     float sm_scale;
     uint32_t* maybe_prefix_len_ptr;
     uint16_t* maybe_token_pos_in_items_ptr;
-    uint32_t maybe_token_pos_in_items_len;
+    uint32_t token_pos_in_items_len;
     uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 
@@ -140,7 +140,7 @@ struct BatchPrefillPagedParams {
     float sm_scale;
     uint32_t* maybe_prefix_len_ptr;
     uint16_t* maybe_token_pos_in_items_ptr;
-    uint32_t maybe_token_pos_in_items_len;
+    uint32_t token_pos_in_items_len;
     uint16_t* maybe_max_item_len_ptr;
   } additional_params;
 

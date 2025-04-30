@@ -257,7 +257,7 @@ def get_batch_prefill_module(backend):
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
-                maybe_token_pos_in_items_len: Optional[int],
+                token_pos_in_items_len: int,
             ) -> None:
                 if backend == "fa2":
                     ragged_run_func(
@@ -284,7 +284,7 @@ def get_batch_prefill_module(backend):
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
-                        maybe_token_pos_in_items_len,
+                        token_pos_in_items_len,
                     )
                 else:
                     ragged_run_func(
@@ -306,7 +306,7 @@ def get_batch_prefill_module(backend):
                         maybe_max_item_len_ptr,
                         logits_soft_cap,
                         sm_scale,
-                        maybe_token_pos_in_items_len,
+                        token_pos_in_items_len,
                     )
 
                 return o
@@ -336,7 +336,7 @@ def get_batch_prefill_module(backend):
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
-                maybe_token_pos_in_items_len: Optional[int],
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -382,7 +382,7 @@ def get_batch_prefill_module(backend):
                 scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
-                maybe_token_pos_in_items_len: Optional[int],
+                token_pos_in_items_len: int,
             ) -> None:
                 if backend == "fa2":
                     assert not is_float8(q)
@@ -412,7 +412,7 @@ def get_batch_prefill_module(backend):
                         sm_scale,
                         1.0 / rope_scale,  # rope_rcp_scale
                         1.0 / rope_theta,  # rope_rcp_theta
-                        maybe_token_pos_in_items_len,
+                        token_pos_in_items_len,
                     )
                 else:
                     if not is_float8(q):
@@ -437,7 +437,7 @@ def get_batch_prefill_module(backend):
                             maybe_max_item_len_ptr,
                             logits_soft_cap,
                             sm_scale,
-                            maybe_token_pos_in_items_len,
+                            token_pos_in_items_len,
                         )
                     else:
                         paged_run_func(
@@ -490,7 +490,7 @@ def get_batch_prefill_module(backend):
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
-                maybe_token_pos_in_items_len: Optional[int],
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -1314,7 +1314,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
+        token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
@@ -1398,7 +1398,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
             we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
             `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
-        token_pos_in_items_len : Optional[int]
+        token_pos_in_items_len : int
             zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
             If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
@@ -2130,7 +2130,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
-        token_pos_in_items_len: Optional[int] = 0,
+        token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
@@ -2209,7 +2209,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
             we will concat them as 1D with zero paddings to make sure each has the same length, the padding length is defined by
             `token_pos_in_items_len` - length of the raw `token_pos_in_items_ptr` for each prompt.
-        token_pos_in_items_len : Optional[int]
+        token_pos_in_items_len : int
             zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
             If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
