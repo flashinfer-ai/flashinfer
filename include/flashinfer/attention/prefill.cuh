@@ -43,6 +43,7 @@ DEFINE_HAS_MEMBER(maybe_q_rope_offset)
 DEFINE_HAS_MEMBER(maybe_k_rope_offset)
 DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
 DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
+DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 namespace cg = cooperative_groups;
@@ -2050,14 +2051,22 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
-    uint32_t* maybe_prefix_len_ptr =
-        (has_maybe_prefix_len_ptr_v<Params>) ? params.maybe_prefix_len_ptr : nullptr;
-    uint16_t* maybe_token_pos_in_items_ptr = (has_maybe_token_pos_in_items_ptr_v<Params>)
-                                                 ? params.maybe_token_pos_in_items_ptr
-                                                 : nullptr;
-    const uint32_t token_pos_in_items_len = params.token_pos_in_items_len;
-    uint16_t* maybe_max_item_len_ptr =
-        (has_maybe_max_item_len_ptr_v<Params>) ? params.maybe_max_item_len_ptr : nullptr;
+    uint32_t* maybe_prefix_len_ptr = nullptr;
+    if constexpr (has_maybe_prefix_len_ptr_v<Params>) {
+      maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
+    }
+    uint16_t* maybe_token_pos_in_items_ptr = nullptr;
+    if constexpr (has_maybe_token_pos_in_items_ptr_v<Params>) {
+      maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
+    }
+    const uint32_t token_pos_in_items_len = 0;
+    if constexpr (has_token_pos_in_items_len_v<Params>) {
+      token_pos_in_items_len = params.token_pos_in_items_len;
+    }
+    uint16_t* maybe_max_item_len_ptr = nullptr;
+    if constexpr (has_maybe_max_item_len_ptr_v<Params>) {
+      maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
+    }
 
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();

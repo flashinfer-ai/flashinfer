@@ -35,6 +35,11 @@ namespace flashinfer {
 
 using namespace cute;
 
+DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
+DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
+DEFINE_HAS_MEMBER(token_pos_in_items_len)
+DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+
 template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
           bool MULTIITEMSCORING = false>
@@ -123,6 +128,23 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   // blocks in the Cluster
   __syncthreads();
 
+  uint32_t* maybe_prefix_len_ptr = nullptr;
+  if constexpr (has_maybe_prefix_len_ptr_v<decltype(mainloop_params.additional_params)>) {
+    maybe_prefix_len_ptr = mainloop_params.additional_params.maybe_prefix_len_ptr;
+  }
+  uint16_t* maybe_token_pos_in_items_ptr = nullptr;
+  if constexpr (has_maybe_token_pos_in_items_ptr_v<decltype(mainloop_params.additional_params)>) {
+    maybe_token_pos_in_items_ptr = mainloop_params.additional_params.maybe_token_pos_in_items_ptr;
+  }
+  const uint32_t token_pos_in_items_len = 0;
+  if constexpr (has_token_pos_in_items_len_v<decltype(mainloop_params.additional_params)>) {
+    token_pos_in_items_len = mainloop_params.additional_params.token_pos_in_items_len;
+  }
+  uint16_t* maybe_max_item_len_ptr = nullptr;
+  if constexpr (has_maybe_max_item_len_ptr_v<decltype(mainloop_params.additional_params)>) {
+    maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
+  }
+
   if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
@@ -159,10 +181,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
         if constexpr (MULTIITEMSCORING) {
-          auto prefix_len =
-              __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
-          auto max_item_len =
-              __ldg(mainloop_params.additional_params.maybe_max_item_len_ptr + batch_idx);
+          auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
+          auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
               std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
           num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);
@@ -240,16 +260,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       uint32_t prefix_len = 0;
       uint16_t* token_pos_in_items = nullptr;
       if constexpr (MULTIITEMSCORING) {
-        prefix_len = __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
-        token_pos_in_items = mainloop_params.additional_params.maybe_token_pos_in_items_ptr +
-                             batch_idx * mainloop_params.additional_params.token_pos_in_items_len;
+        prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
+        token_pos_in_items = maybe_token_pos_in_items_ptr + batch_idx * token_pos_in_items_len;
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
       if constexpr (MULTIITEMSCORING) {
-        auto prefix_len = __ldg(mainloop_params.additional_params.maybe_prefix_len_ptr + batch_idx);
-        auto max_item_len =
-            __ldg(mainloop_params.additional_params.maybe_max_item_len_ptr + batch_idx);
+        auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
+        auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =
             std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
         num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);

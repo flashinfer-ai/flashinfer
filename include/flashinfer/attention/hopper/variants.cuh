@@ -66,7 +66,8 @@ struct StandardFP8Attention {
 
   template <typename MainloopParams, typename BlockCoord>
   __device__ StandardFP8Attention(const MainloopParams& params, const BlockCoord& block_coord) {
-    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
     // 448 for e4m3; 57344 for e5m2
     p_scale = std::numeric_limits<typename MainloopParams::DTypeKV>::max();
     scale_pv = params.additional_params.scale_v[kv_head_idx] / p_scale;
