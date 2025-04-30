@@ -1170,6 +1170,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     None,  # packed_custom_mask
                     None,  # mask_indptr_buf
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    None,  # maybe_prefix_len_ptr
+                    None,  # maybe_token_pos_in_items_ptr
+                    None,  # maybe_max_item_len_ptr
                     logits_soft_cap,
                     sm_scale,
                     None,  # scale_q, not supported yet
@@ -1177,6 +1180,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     None,  # scale_v
                     rope_scale,
                     rope_theta,
+                    0,  # token_pos_in_items_len
                 ]
 
             self._cached_module.paged_run(*run_args)
