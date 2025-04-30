@@ -57,7 +57,8 @@ def attention_ref(
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
 @pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
 @pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
-@pytest.mark.parametrize("num_heads", [4, 32])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.half])
@@ -65,7 +66,8 @@ def test_blackwell_cutlass_fmha(
     batch_size,
     qo_len,
     kv_len,
-    num_heads,
+    num_qo_heads,
+    num_kv_heads,
     head_dim,
     causal,
     dtype,
@@ -78,15 +80,15 @@ def test_blackwell_cutlass_fmha(
     torch.manual_seed(42)
     kv_layout = "NHD"
     q = torch.randn(
-        batch_size * qo_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda"
     )
     qo_lens = torch.full((batch_size,), qo_len, device="cuda", dtype=torch.int32)
 
     k = torch.randn(
-        batch_size * kv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
     v = torch.randn(
-        batch_size * kv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
     kv_lens = torch.full((batch_size,), kv_len, device="cuda", dtype=torch.int32)
 

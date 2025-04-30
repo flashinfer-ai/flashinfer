@@ -109,14 +109,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     kSizeO = 128,
     kSizeP = 32,
     S0 = 0,
-    S1 = S0 + kSizeS,
-    V0 = S0,  // stats storage from softmax to correction
-    V1 = S1,
-    P0 = S0 + kSizeP,
-    P1 = S1 + kSizeP,
-    O0 = S1 + kSizeS,
-    O1 = O0 + kSizeO,
-    kEnd = O1 + kSizeO
+    S1 = S0 + kSizeS,   // 128
+    V0 = S0,            // 0   // stats storage from softmax to correction
+    V1 = S1,            // 128
+    P0 = S0 + kSizeP,   // 32
+    P1 = S1 + kSizeP,   // 160
+    O0 = S1 + kSizeS,   // 256
+    O1 = O0 + kSizeO,   // 384
+    kEnd = O1 + kSizeO  // 512
   };
 
   // indices for V0 / V1

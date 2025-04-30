@@ -42,6 +42,18 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
+                                          int head_idx, int offset, int seq_len) {
+  auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
+                             make_coord(offset, _0{}));
+  auto g_sequence =
+      make_tensor(g_offset.data(),
+                  make_layout(cute::make_shape(seq_len, get<1>(tile_shape)), g_offset.stride()));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
 template <class Element, class StrideQ, class StrideK, class StrideV, class CollectiveMmaQK,
           class CollectiveMmaPV, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV,
           class TensorStorage, class PipelineQ, class PipelineKV, class Mask, class TileShape>
