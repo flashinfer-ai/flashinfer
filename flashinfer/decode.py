@@ -530,6 +530,9 @@ def single_decode_with_kv_cache(
             _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
             logits_soft_cap,
             sm_scale,
+            None,  # scale_q, not supported yet
+            None,  # scale_k
+            None,  # scale_v
             rope_scale,
             rope_theta,
         )
@@ -1169,6 +1172,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
                     logits_soft_cap,
                     sm_scale,
+                    None,  # scale_q, not supported yet
+                    None,  # scale_k
+                    None,  # scale_v
                     rope_scale,
                     rope_theta,
                 ]
