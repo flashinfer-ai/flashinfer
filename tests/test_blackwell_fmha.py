@@ -82,8 +82,8 @@ def test_blackwell_cutlass_fmha(
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda"
     )
-    qo_segment_offsets = (
-        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
     )
 
     k = torch.randn(
@@ -92,13 +92,20 @@ def test_blackwell_cutlass_fmha(
     v = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
-    kv_segment_offsets = (
-        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
     )
 
-    o, lse = flashinfer.prefill.fmha_varlen(
-        q, k, v, qo_segment_offsets, kv_segment_offsets, causal=causal
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="cutlass"
     )
+
+    wrapper.plan(
+        qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, causal=causal
+    )
+
+    o, lse = wrapper.run(q, k, v, return_lse=True)
 
     sm_scale = 1.0 / (head_dim**0.5)
     gqa_group_ratio = num_qo_heads // num_kv_heads
@@ -127,6 +134,7 @@ if __name__ == "__main__":
         3,
         17,
         17,
+        1,
         1,
         128,
         True,
