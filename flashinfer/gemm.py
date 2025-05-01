@@ -151,6 +151,7 @@ def get_gemm_sm100_module():
             "gemm_sm100",
             [
                 FLASHINFER_CSRC_DIR / "gemm_blockwise_sm100.cu",
+                FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
                 FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
             ],
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
@@ -725,6 +726,42 @@ def gemm_fp8_nt_blockscaled(
             dtype=out_dtype,
         )
     get_gemm_sm100_module().gemm_fp8_nt_blockscaled.default(
+        workspace_buffer, a, b, a_scale, b_scale, out
+    )
+    return out
+
+
+def gemm_fp8_nt_groupwise(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    workspace_buffer = _get_cache_buf(
+        "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
+    )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
+    m = a.shape[0]
+    n = b.shape[0]
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
+        )
+
+    if out is None:
+        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
+        # if out_dtype is not provided, we use bfloat16 as default
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0],
+            b.shape[0],
+            device=a.device,
+            dtype=out_dtype,
+        )
+    get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
         workspace_buffer, a, b, a_scale, b_scale, out
     )
     return out

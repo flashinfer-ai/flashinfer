@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.gemm import gemm_fp8_nt_blockscaled
+from flashinfer.gemm import gemm_fp8_nt_blockscaled, gemm_fp8_nt_groupwise
 
 
 def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.float16):
@@ -117,5 +117,52 @@ def test_fp8_blockscale_gemm(
     torch.testing.assert_close(c.cpu(), ref_c.to(c.dtype), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("out_dtype", [torch.float32])
+def test_fp8_groupwise_gemm(
+    m,
+    n,
+    k,
+    out_dtype,
+):
+    torch.random.manual_seed(0)
+    tile_size = 128
+    factor_for_scale = 0.01
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    fp8_max, fp8_min = fp8_info.max, fp8_info.min
+
+    a_fp32 = (torch.randn((m, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
+    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+    b_fp32 = (torch.randn((n, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
+    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+    a_scale = (
+        torch.ones((k // tile_size, m), dtype=torch.float32, device="cuda")
+        * factor_for_scale
+    )
+    b_scale = (
+        torch.ones((n // tile_size, k // tile_size), dtype=torch.float32, device="cuda")
+        * factor_for_scale
+    )
+
+    c = gemm_fp8_nt_groupwise(a_fp8, b_fp8, a_scale, b_scale, out_dtype=out_dtype)
+    out_dtype = torch.float
+    a_scale_naive = torch.transpose(a_scale, 0, 1).contiguous()
+    ref_c = native_w8a8_block_fp8_matmul(
+        a_fp8.to("cpu"),
+        b_fp8.to("cpu"),
+        a_scale_naive.to("cpu"),
+        b_scale.to("cpu"),
+        [tile_size, tile_size],
+        out_dtype,
+    )
+    print(c, ref_c)
+    torch.testing.assert_close(c.cpu(), ref_c.to(c.dtype), atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     test_fp8_blockscale_gemm(8192, 8192, 8192, torch.bfloat16)
+    test_fp8_groupwise_gemm(8192, 8192, 8192, torch.bfloat16)
