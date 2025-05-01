@@ -26,13 +26,14 @@ from .jit import FLASHINFER_CSRC_DIR, load_cuda_ops
 from .utils import MaskMode, _unpack_paged_kv_cache
 
 
-def get_holistic_attention_module():
+def get_holistic_attention_module(use_profiler: bool):
     return load_cuda_ops(
         "holistic_persistent_attention",
         [
             FLASHINFER_CSRC_DIR / "batch_persistent.cu",
             FLASHINFER_CSRC_DIR / "batch_persistent_pybind.cu",
         ],
+        extra_cuda_cflags=(["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
     )
 
 
@@ -58,7 +59,6 @@ class BatchAttention:
             device=torch.device("cpu"),
             pin_memory=True,
         )
-        self.module = get_holistic_attention_module()
 
     def plan(
         self,
@@ -75,7 +75,10 @@ class BatchAttention:
         sm_scale: float = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
+        use_profiler: bool = False,
     ) -> None:
+        self.module = get_holistic_attention_module(use_profiler)
+
         qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
@@ -89,6 +92,7 @@ class BatchAttention:
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._sm_scale = sm_scale
+        self._use_profiler = use_profiler
 
         # No addtional buf allocated for CUDA graph tensor
         # Allocate outside FlashInfer
@@ -114,7 +118,13 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if profiler_buffer is None:
+            if self._use_profiler:
+                raise ValueError(
+                    "Profiler is enabled, profiler_buffer must be provided"
+                )   
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
             out = torch.empty_like(q)
@@ -126,6 +136,7 @@ class BatchAttention:
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
+        profiler_args = (profiler_buffer,) if self._use_profiler else ()
         self.module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -141,6 +152,7 @@ class BatchAttention:
             self._num_kv_heads,
             self._page_size,
             self._sm_scale,
+            *profiler_args,
         )
 
         return out, lse

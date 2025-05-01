@@ -639,6 +639,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   const uint32_t warp_idx = cutlass::canonical_warp_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 
+  PROFILER_INIT(params, smem_storage, variant, warp_group_idx, 2, (threadIdx.x % 128 == 0));
+
   using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;

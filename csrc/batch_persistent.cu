@@ -73,7 +73,7 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
                                   at::Tensor kv_indices, at::Tensor o,
                                   std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                                   int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
-                                  double sm_scale) {
+                                  double sm_scale ADDITIONAL_FUNC_PARAMS) {
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -155,6 +155,8 @@ at::Tensor BatchPagedAttentionRun(at::Tensor float_workspace_buffer,
 
     params[i].sm_scale = sm_scale;
   }
+
+  ADDITIONAL_PARAMS_SETTER
 
   using AttentionVariant = StandardAttention;
 
