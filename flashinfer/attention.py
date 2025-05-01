@@ -124,7 +124,7 @@ class BatchAttention:
             if self._use_profiler:
                 raise ValueError(
                     "Profiler is enabled, profiler_buffer must be provided"
-                )   
+                )
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
             out = torch.empty_like(q)

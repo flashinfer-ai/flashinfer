@@ -15,14 +15,14 @@ limitations under the License.
 """
 
 import argparse
+
 import torch
+
 import flashinfer
 from flashinfer.profiler import export_to_perfetto_trace
 
 
-def profile_persistent_decode(
-    batch_size, seq_len, profiler_buffer_size
-):
+def profile_persistent_decode(batch_size, seq_len, profiler_buffer_size):
     device = "cuda"
     num_kv_heads = 4
     num_qo_heads = 28
@@ -43,7 +43,9 @@ def profile_persistent_decode(
     total_q = q_indptr[-1].item()
     total_pages = kv_indptr[-1].item()
 
-    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
 
     kv_cache = torch.randn(
         total_pages,
@@ -78,14 +80,10 @@ def profile_persistent_decode(
 
     wrapper.run(q, kv_cache, profiler_buffer=profiler_buffer)
 
-    trace_name = (
-        f"persistent-{batch_size}-{seq_len}-{num_qo_heads}.perfetto-trace"
-    )
-    events = [
-        "runner1",
-        "runner2"
-    ]
+    trace_name = f"persistent-{batch_size}-{seq_len}-{num_qo_heads}.perfetto-trace"
+    events = ["runner1", "runner2"]
     export_to_perfetto_trace(profiler_buffer, events, trace_name)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

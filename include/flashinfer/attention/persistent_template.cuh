@@ -19,7 +19,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include "../profiler.cuh" 
+
+#include "../profiler.cuh"
 
 namespace flashinfer {
 
@@ -27,7 +28,7 @@ namespace flashinfer {
 enum class PersistentProfileEventType {
   kRunner1 = 0U,
   kRunner2 = 1U,
-  kRunner3 = 2U, 
+  kRunner3 = 2U,
   kRunner4 = 3U,
 };
 
@@ -58,7 +59,7 @@ __launch_bounds__(BlockPersistentRunner::KTraits::NUM_THREADS) void PersistentKe
 
   PROFILER_CLOSURE_STRUCT_DECL
   PROFILER_INIT(params, smem_storage, profiler_closure, 0, 1, (threadIdx.x == 0));
-  
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner1);
   BlockPersistentRunner::Run(params, &smem_storage);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
@@ -76,22 +77,22 @@ __global__ __launch_bounds__(
 
   PROFILER_CLOSURE_STRUCT_DECL
   PROFILER_INIT(params_1, smem, profiler_closure, 0, 1, (threadIdx.x == 0));
-  
+
   auto& smem_storage_1 =
       reinterpret_cast<typename BlockPersistentRunner1::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner1);
   BlockPersistentRunner1::Run(params_1, &smem_storage_1);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
-  
+
   __syncthreads();
-  
+
   auto& smem_storage_2 =
       reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner2);
   BlockPersistentRunner2::Run(params_2, &smem_storage_2);
-  PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner2); 
+  PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner2);
 }
 
 // Three runners version
@@ -105,12 +106,12 @@ __global__ __launch_bounds__(
                                              const __grid_constant__
                                              typename BlockPersistentRunner3::Params params_3) {
   extern __shared__ uint8_t smem[];
-  auto& smem_storage_1 =    
+  auto& smem_storage_1 =
       reinterpret_cast<typename BlockPersistentRunner1::KTraits::SharedStorage&>(smem);
 
   PROFILER_CLOSURE_STRUCT_DECL
   PROFILER_INIT(params_1, smem, profiler_closure, 0, 1, (threadIdx.x == 0));
-  
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner1);
   BlockPersistentRunner1::Run(params_1, &smem_storage_1);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
@@ -118,15 +119,15 @@ __global__ __launch_bounds__(
   __syncthreads();
   auto& smem_storage_2 =
       reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner2);
   BlockPersistentRunner2::Run(params_2, &smem_storage_2);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner2);
-  
+
   __syncthreads();
   auto& smem_storage_3 =
       reinterpret_cast<typename BlockPersistentRunner3::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner3);
   BlockPersistentRunner3::Run(params_3, &smem_storage_3);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner3);
@@ -149,31 +150,31 @@ __global__ __launch_bounds__(
   extern __shared__ uint8_t smem[];
   auto& smem_storage_1 =
       reinterpret_cast<typename BlockPersistentRunner1::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_CLOSURE_STRUCT_DECL
   PROFILER_INIT(params_1, smem, profiler_closure, 0, 1, (threadIdx.x == 0));
-  
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner1);
   BlockPersistentRunner1::Run(params_1, &smem_storage_1);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
   __syncthreads();
   auto& smem_storage_2 =
       reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner2);
   BlockPersistentRunner2::Run(params_2, &smem_storage_2);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner2);
   __syncthreads();
   auto& smem_storage_3 =
       reinterpret_cast<typename BlockPersistentRunner3::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner3);
   BlockPersistentRunner3::Run(params_3, &smem_storage_3);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner3);
   __syncthreads();
   auto& smem_storage_4 =
       reinterpret_cast<typename BlockPersistentRunner4::KTraits::SharedStorage&>(smem);
-      
+
   PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner4);
   BlockPersistentRunner4::Run(params_4, &smem_storage_4);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner4);

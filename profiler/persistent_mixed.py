@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import argparse
+
 import torch
 
 import flashinfer
@@ -22,7 +23,9 @@ from flashinfer.profiler import export_to_perfetto_trace
 
 
 def profile_persistent_mixed_attention(
-    kv_lens, qo_lens, profiler_buffer_size,
+    kv_lens,
+    qo_lens,
+    profiler_buffer_size,
 ):
     device = "cuda"
     num_kv_heads = 4
@@ -73,11 +76,9 @@ def profile_persistent_mixed_attention(
     wrapper.run(q, kv_data, profiler_buffer=profiler_buffer)
 
     trace_name = f"persistent_mixed_attention.perfetto-trace"
-    events = [
-        "runner1",
-        "runner2"
-    ]
+    events = ["runner1", "runner2"]
     export_to_perfetto_trace(profiler_buffer, events, trace_name)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -94,5 +95,3 @@ if __name__ == "__main__":
         qo_lens=qo_lens,
         profiler_buffer_size=args.profiler_buffer_size,
     )
-
-
