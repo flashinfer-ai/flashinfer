@@ -73,6 +73,11 @@ struct ProfilerEntry {
   uint32_t profiler_entry_tag_base;  \
   bool profiler_write_thread_predicate;
 
+#define PROFILER_CLOSURE_STRUCT_DECL \
+  struct {                           \
+    PROFILER_CLOSURE_PARAMS_DECL     \
+  } profiler_closure;
+
 #define PROFILER_PARAMS_DECL uint64_t* profiler_buffer;
 
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,                     \
@@ -121,6 +126,7 @@ struct ProfilerEntry {
 
 #else
 
+#define PROFILER_CLOSURE_STRUCT_DECL
 #define PROFILER_CLOSURE_PARAMS_DECL
 #define PROFILER_PARAMS_DECL
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups, write_thread_predicate)

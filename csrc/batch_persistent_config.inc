@@ -7,8 +7,18 @@
 #include <flashinfer/fastdiv.cuh>
 #include <flashinfer/attention/variant_helper.cuh>
 #include <flashinfer/attention/mla_params.cuh>
+#include <flashinfer/profiler.cuh>
 
 using namespace flashinfer;
+
+#ifdef FLASHINFER_ENABLE_PROFILER
+#define ADDITIONAL_FUNC_PARAMS , at::Tensor profiler_buffer
+#define ADDITIONAL_PARAMS_SETTER \
+  params[0].profiler_buffer = static_cast<uint64_t*>(profiler_buffer.data_ptr());
+#else
+#define ADDITIONAL_FUNC_PARAMS
+#define ADDITIONAL_PARAMS_SETTER
+#endif
 
 // using DTypeQ = {{ dtype_q }};
 // using DTypeKV = {{ dtype_kv }};
@@ -69,6 +79,8 @@ struct PersistentParams {
   uint32_t o_stride_h;
 
   float sm_scale;
+
+  PROFILER_PARAMS_DECL
 };
 
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, Params, ...) \
