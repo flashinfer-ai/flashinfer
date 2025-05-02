@@ -745,6 +745,27 @@ def gemm_fp8_nt_groupwise(
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
     m = a.shape[0]
+    if m % 4 != 0:
+        padded_m = (m + 3) // 4 * 4
+        a = torch.cat(
+            (
+                a,
+                torch.zeros(padded_m - m, a.shape[1], device=a.device, dtype=a.dtype),
+            ),
+            dim=0,
+        )
+        a_scale = torch.cat(
+            (
+                a_scale,
+                torch.zeros(
+                    a_scale.shape[0], padded_m - m, device=a.device, dtype=a_scale.dtype
+                ),
+            ),
+            dim=1,
+        )
+    else:
+        padded_m = m
+
     n = b.shape[0]
     if a.shape[1] != b.shape[1]:
         raise ValueError(
@@ -756,7 +777,8 @@ def gemm_fp8_nt_groupwise(
         # if out_dtype is not provided, we use bfloat16 as default
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(
-            a.shape[0],
+            # a.shape[0],
+            padded_m,
             b.shape[0],
             device=a.device,
             dtype=out_dtype,
@@ -764,4 +786,4 @@ def gemm_fp8_nt_groupwise(
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
         workspace_buffer, a, b, a_scale, b_scale, out
     )
-    return out
+    return out[:m]
