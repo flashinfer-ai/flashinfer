@@ -785,7 +785,7 @@ def gemm_fp8_nt_groupwise(
     )
 
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-        workspace_buffer, a, b, a_scale, b_scale, out
+        workspace_buffer, a, b, a_scale, b_scale, out_padded
     )
 
     if out is not None:
