@@ -773,17 +773,24 @@ def gemm_fp8_nt_groupwise(
         )
 
     if out is None:
-        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
-        # if out_dtype is not provided, we use bfloat16 as default
-        out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(
-            # a.shape[0],
-            padded_m,
-            b.shape[0],
-            device=a.device,
-            dtype=out_dtype,
-        )
+        out_type = out_dtype or torch.bfloat16
+    else:
+        out_type = out.dtype
+
+    out_padded = torch.empty(
+        padded_m,
+        b.shape[0],
+        device=a.device,
+        dtype=out_type,
+    )
+
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
         workspace_buffer, a, b, a_scale, b_scale, out
     )
-    return out[:m]
+
+    if out is not None:
+        out.copy_(out_padded[:m])
+    else:
+        out = out_padded[:m]
+
+    return out
