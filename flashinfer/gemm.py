@@ -704,6 +704,45 @@ def gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
+
+    This function implements a GEMM operation that allows for fine-grained control over
+    scale granularity across different dimensions. Currently only supported on NVIDIA
+    Blackwell architecture.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor shape (m, k), fp8 e4m3 or fp8 e5m2.
+
+    b: torch.Tensor
+        Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape (ceil_div(k, k_granularity), ceil_div(m, m_granularity)).
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape (ceil_div(k, k_granularity), ceil_div(n, n_granularity)).
+
+    scale_granularity_mnk: Tuple[int, int, int]
+        The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        If out is not specified, we will create an output tensor with this dtype.
+        Defaults to ``torch.bfloat16``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Output tensor, shape (m, n).
+
+    Notes
+    -----
+    If ``m`` is not a multiple of 4, we will pad ``m`` to the next multiple of 4 to accommodate the kernel's requirement.
+    """
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
     )
@@ -720,7 +759,6 @@ def gemm_fp8_nt_groupwise(
         a_padded = a
         a_scale_padded = a_scale
 
-    n = b.shape[0]
     if a.shape[1] != b.shape[1]:
         raise ValueError(
             f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
@@ -776,6 +814,11 @@ def gemm_fp8_nt_blockscaled(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    r"""Performs matrix multiplication with FP8 data types using block-scaled scaling.
+
+    Block-scaled scaling is a special case of groupwise scaling where the scale granularity
+    is (128, 128, 128).
+    """
     return gemm_fp8_nt_groupwise(
         a,
         b,
