@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -150,7 +150,6 @@ def get_gemm_sm100_module():
         module = load_cuda_ops(
             "gemm_sm100",
             [
-                FLASHINFER_CSRC_DIR / "gemm_blockwise_sm100.cu",
                 FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
                 FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
             ],
@@ -725,8 +724,8 @@ def gemm_fp8_nt_blockscaled(
             device=a.device,
             dtype=out_dtype,
         )
-    get_gemm_sm100_module().gemm_fp8_nt_blockscaled.default(
-        workspace_buffer, a, b, a_scale, b_scale, out
+    get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+        workspace_buffer, a, b, a_scale, b_scale, out, 128, 128, 128
     )
     return out
 
@@ -736,6 +735,7 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -745,27 +745,6 @@ def gemm_fp8_nt_groupwise(
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
     m = a.shape[0]
-    if m % 4 != 0:
-        padded_m = (m + 3) // 4 * 4
-        a = torch.cat(
-            (
-                a,
-                torch.zeros(padded_m - m, a.shape[1], device=a.device, dtype=a.dtype),
-            ),
-            dim=0,
-        )
-        a_scale = torch.cat(
-            (
-                a_scale,
-                torch.zeros(
-                    a_scale.shape[0], padded_m - m, device=a.device, dtype=a_scale.dtype
-                ),
-            ),
-            dim=1,
-        )
-    else:
-        padded_m = m
-
     n = b.shape[0]
     if a.shape[1] != b.shape[1]:
         raise ValueError(
@@ -777,20 +756,19 @@ def gemm_fp8_nt_groupwise(
     else:
         out_type = out.dtype
 
-    out_padded = torch.empty(
-        padded_m,
-        b.shape[0],
-        device=a.device,
-        dtype=out_type,
-    )
+    if out is None:
+        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
+        # if out_dtype is not provided, we use bfloat16 as default
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0],
+            b.shape[0],
+            device=a.device,
+            dtype=out_dtype,
+        )
 
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-        workspace_buffer, a, b, a_scale, b_scale, out_padded
+        workspace_buffer, a, b, a_scale, b_scale, out, *scale_granularity_mnk
     )
-
-    if out is not None:
-        out.copy_(out_padded[:m])
-    else:
-        out = out_padded[:m]
 
     return out

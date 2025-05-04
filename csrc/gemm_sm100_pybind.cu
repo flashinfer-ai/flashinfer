@@ -15,15 +15,10 @@
  */
 #include "pytorch_extension_utils.h"
 
-void CutlassGemmBlockwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
-                                     at::Tensor SFA, at::Tensor SFB, at::Tensor C);
-
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("gemm_fp8_nt_blockscaled", CutlassGemmBlockwiseScaledSM100);
-}
-
 void CutlassGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
-                                     at::Tensor SFA, at::Tensor SFB, at::Tensor C);
+                                     at::Tensor SFA, at::Tensor SFB, at::Tensor C,
+                                     int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                     int64_t scale_granularity_k);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_fp8_nt_groupwise", CutlassGemmGroupwiseScaledSM100);

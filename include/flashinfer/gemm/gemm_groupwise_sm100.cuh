@@ -26,7 +26,8 @@ namespace gemm {
 
 using namespace cute;
 
-template <typename DTypeIn, typename DTypeOut>
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
+          typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
@@ -62,12 +63,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
-  constexpr int ScaleGranularityM = 1;
-  constexpr int ScaleGranularityN = 128;
-  constexpr int ScaleGranularityK = 128;
+  // NOTE(Zihao): using Major::K for both SFA and SFB
   using ScaleConfig =
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
-                                                 ScaleGranularityK>;
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>;
 
   using LayoutSFA =
       decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand

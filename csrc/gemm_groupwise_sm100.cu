@@ -28,20 +28,48 @@ using namespace flashinfer;
     });                                                                                            \
   }()
 
+#define DISPATCH_SCALE_GRANULARITY(scale_granularity_m, scale_granularity_n, scale_granularity_k, \
+                                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
+                                   ...)                                                           \
+  [&]() -> bool {                                                                                 \
+    if (scale_granularity_m == 1 && scale_granularity_n == 128 && scale_granularity_k == 128) {   \
+      constexpr int SCALE_GRANULARITY_M = 1;                                                      \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                    \
+      constexpr int SCALE_GRANULARITY_K = 128;                                                    \
+      return __VA_ARGS__();                                                                       \
+    } else if (scale_granularity_m == 128 && scale_granularity_n == 128 &&                        \
+               scale_granularity_k == 128) {                                                      \
+      constexpr int SCALE_GRANULARITY_M = 128;                                                    \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                    \
+      constexpr int SCALE_GRANULARITY_K = 128;                                                    \
+      return __VA_ARGS__();                                                                       \
+    }                                                                                             \
+    TORCH_CHECK(false, "Unsupported scale granularity");                                          \
+    return false;                                                                                 \
+  }()
+
 void CutlassGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
-                                     at::Tensor SFA, at::Tensor SFB, at::Tensor C) {
+                                     at::Tensor SFA, at::Tensor SFB, at::Tensor C,
+                                     int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                     int64_t scale_granularity_k) {
   unsigned int batch_size = A.size(0);
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(A.scalar_type(), C.scalar_type(), c_type_in, c_type_out, [&] {
-    using cutlass_t_in = cutlass_dtype_t<c_type_in>;
-    using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-    auto status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100(
-        static_cast<float*>(float_workspace_buffer.data_ptr()),
-        float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
-        static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
-        static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
-        static_cast<cutlass_t_out*>(C.data_ptr()), A.size(0), B.size(0), A.size(1), 1, stream);
-    return true;
+    return DISPATCH_SCALE_GRANULARITY(
+        scale_granularity_m, scale_granularity_n, scale_granularity_k, SCALE_GRANULARITY_M,
+        SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
+          using cutlass_t_in = cutlass_dtype_t<c_type_in>;
+          using cutlass_t_out = cutlass_dtype_t<c_type_out>;
+          auto status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100<
+              SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K>(
+              static_cast<float*>(float_workspace_buffer.data_ptr()),
+              float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
+              static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
+              static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
+              static_cast<cutlass_t_out*>(C.data_ptr()), A.size(0), B.size(0), A.size(1), 1,
+              stream);
+          return true;
+        });
   });
 }
