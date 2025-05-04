@@ -168,17 +168,17 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     b_scale = torch.rand((k // 128, n // 128), dtype=torch.float32, device="cuda")
 
     out = torch.empty((m, n), dtype=out_dtype, device="cuda")
-    gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out)
+    gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out)
 
-    ms = do_bench(lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out))
+    ms = do_bench(lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out))
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     print(
         f"gemm_fp8_nt_groupwise {m} {n} {k} {in_dtype} {out_dtype}: {tflops_per_second:.2f} TFLOPs/s"
     )
 
-    a_scale = a_scale.permute(1, 0).contiguous()
-    b_scale = b_scale.permute(1, 0).contiguous()
     tl_out = torch.empty((m, n), dtype=out_dtype, device="cuda")
+    a_scale = a_scale.transpose(0, 1).contiguous()
+    b_scale = b_scale.transpose(0, 1).contiguous()
     ms = do_bench(lambda: triton_w8a8_block_fp8_matmul(a, b, a_scale, b_scale, tl_out))
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     print(

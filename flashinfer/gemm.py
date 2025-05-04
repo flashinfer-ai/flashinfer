@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
@@ -694,42 +695,6 @@ def bmm_fp8(
     return out
 
 
-def gemm_fp8_nt_blockscaled(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    workspace_buffer = _get_cache_buf(
-        "gemm_fp8_nt_blockscaled_workspace", 32 * 1024 * 1024, a.device
-    )
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
-    m = a.shape[0]
-    n = b.shape[0]
-    if a.shape[1] != b.shape[1]:
-        raise ValueError(
-            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
-        )
-
-    if out is None:
-        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
-        # if out_dtype is not provided, we use bfloat16 as default
-        out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(
-            a.shape[0],
-            b.shape[0],
-            device=a.device,
-            dtype=out_dtype,
-        )
-    get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-        workspace_buffer, a, b, a_scale, b_scale, out, 128, 128, 128
-    )
-    return out
-
-
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -745,6 +710,16 @@ def gemm_fp8_nt_groupwise(
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
     m = a.shape[0]
+    m_padded = ((m + 3) // 4) * 4
+    need_padding = m_padded != m
+    if need_padding:
+        a_padded = F.pad(a, (0, 0, 0, m_padded - m))
+        # a_scale is (k // 128, m)
+        a_scale_padded = F.pad(a_scale, (0, m_padded - m))
+    else:
+        a_padded = a
+        a_scale_padded = a_scale
+
     n = b.shape[0]
     if a.shape[1] != b.shape[1]:
         raise ValueError(
@@ -752,23 +727,61 @@ def gemm_fp8_nt_groupwise(
         )
 
     if out is None:
-        out_type = out_dtype or torch.bfloat16
-    else:
-        out_type = out.dtype
-
-    if out is None:
-        # NOTE(Zihao): when out is not provided, we create output tensor explicitly with out_dtype,
-        # if out_dtype is not provided, we use bfloat16 as default
         out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(
-            a.shape[0],
+    else:
+        out_dtype = out.dtype
+
+    # NOTE(Zihao): (out_specified, need_padding)
+    # (False, False) -> create out_padded tensor explicitly
+    # (False, True) -> create out_padded tensor explicitly
+    # (True, False) -> use out tensor as out_padded
+    # (True, True) -> create out_padded tensor explicitly
+
+    if need_padding or out is None:
+        out_padded = torch.empty(
+            m_padded,
             b.shape[0],
             device=a.device,
             dtype=out_dtype,
         )
+    else:
+        out_padded = out
 
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-        workspace_buffer, a, b, a_scale, b_scale, out, *scale_granularity_mnk
+        workspace_buffer,
+        a_padded,
+        b,
+        a_scale_padded,
+        b_scale,
+        out_padded,
+        *scale_granularity_mnk,
     )
 
+    # NOTE(Zihao): if out is specified and need_padding is True, we need to copy
+    # the result back to out
+
+    if out is not None and need_padding:
+        out.copy_(out_padded[:m])
+    else:
+        out = out_padded[:m]
+
     return out
+
+
+def gemm_fp8_nt_blockscaled(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    return gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_granularity_mnk=(128, 128, 128),
+        out=out,
+        out_dtype=out_dtype,
+    )

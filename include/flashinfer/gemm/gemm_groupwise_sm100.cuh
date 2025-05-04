@@ -63,10 +63,9 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
-  // NOTE(Zihao): using Major::K for both SFA and SFB
-  using ScaleConfig =
-      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
-                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>;
+  // NOTE(Zihao):: UMMA::Major::MN, UMMA::Major::MN is the fastest configuration.
+  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, UMMA::Major::MN, UMMA::Major::MN>;
 
   using LayoutSFA =
       decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
