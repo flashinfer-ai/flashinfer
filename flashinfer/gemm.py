@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
@@ -138,6 +140,24 @@ def get_gemm_module():
         )
 
     return _gemm_module
+
+
+@functools.cache
+def get_gemm_sm100_module():
+    if has_prebuilt_ops:
+        _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
+        module = _kernels_sm100
+    else:
+        module = load_cuda_ops(
+            "gemm_sm100",
+            [
+                FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
+                FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+            ],
+            extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
+        )
+
+    return module
 
 
 def get_gemm_sm90_module():
@@ -673,3 +693,138 @@ def bmm_fp8(
     workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
     get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
+
+
+def gemm_fp8_nt_groupwise(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
+
+    This function implements a GEMM operation that allows for fine-grained control over
+    scale granularity across different dimensions. Currently only supported on NVIDIA
+    Blackwell architecture.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor shape (m, k), fp8 e4m3 or fp8 e5m2.
+
+    b: torch.Tensor
+        Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape (ceil_div(k, k_granularity), ceil_div(m, m_granularity)).
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape (ceil_div(k, k_granularity), ceil_div(n, n_granularity)).
+
+    scale_granularity_mnk: Tuple[int, int, int]
+        The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        If out is not specified, we will create an output tensor with this dtype.
+        Defaults to ``torch.bfloat16``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Output tensor, shape (m, n).
+
+    Notes
+    -----
+    If ``m`` is not a multiple of 4, we will pad ``m`` to the next multiple of 4 to accommodate the kernel's requirement.
+    """
+    workspace_buffer = _get_cache_buf(
+        "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
+    )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
+    m = a.shape[0]
+    m_padded = ((m + 3) // 4) * 4
+    need_padding = m_padded != m
+    if need_padding:
+        a_padded = F.pad(a, (0, 0, 0, m_padded - m))
+        # a_scale is (k // 128, m)
+        a_scale_padded = F.pad(a_scale, (0, m_padded - m))
+    else:
+        a_padded = a
+        a_scale_padded = a_scale
+
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
+        )
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+    else:
+        out_dtype = out.dtype
+
+    # NOTE(Zihao): (out_specified, need_padding)
+    # (False, False) -> create out_padded tensor explicitly
+    # (False, True) -> create out_padded tensor explicitly
+    # (True, False) -> use out tensor as out_padded
+    # (True, True) -> create out_padded tensor explicitly
+
+    if need_padding or out is None:
+        out_padded = torch.empty(
+            m_padded,
+            b.shape[0],
+            device=a.device,
+            dtype=out_dtype,
+        )
+    else:
+        out_padded = out
+
+    get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+        workspace_buffer,
+        a_padded,
+        b,
+        a_scale_padded,
+        b_scale,
+        out_padded,
+        *scale_granularity_mnk,
+    )
+
+    # NOTE(Zihao): if out is specified and need_padding is True, we need to copy
+    # the result back to out
+
+    if out is not None and need_padding:
+        out.copy_(out_padded[:m])
+    else:
+        out = out_padded[:m]
+
+    return out
+
+
+def gemm_fp8_nt_blockscaled(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Performs matrix multiplication with FP8 data types using block-scaled scaling.
+
+    Block-scaled scaling is a special case of groupwise scaling where the scale granularity
+    is (128, 128, 128).
+    """
+    return gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_granularity_mnk=(128, 128, 128),
+        out=out,
+        out_dtype=out_dtype,
+    )

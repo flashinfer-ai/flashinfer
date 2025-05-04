@@ -18,86 +18,11 @@
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "kernel_traits.cuh"
 
 namespace flashinfer {
 
 using namespace cute;
-
-/*
-  In-kernel Transpose of smemV into smemVt with ldmatrix.trans & stmatrix.
-  Note that all magic number corresponds to the /quantization/kernel_traits.cuh setup.
-  This transpose is not a general transpose, but a specific one for the FP8 MMA_PV:
-    1. K-dimension: (2,2,4,4):(1,8,2,16), which adheres to the accum_P's layout
-    2. N-dimension: (8,2,4):(2,1,16), which needs repermutation when rmemO -> smemO
-*/
-template <typename Ktraits>
-struct SmemTransposeFP8_64x64 {
-  using Element = typename Ktraits::DTypeKV;
-  using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
-  using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
-  static_assert(cutlass::sizeof_bits_v<Element> == 8);
-
-  using ldsm_thread_shape = Shape<_4, _1, _8, _4>;
-  using ldsm_value_shape = Shape<_2, _8, _2, _1>;
-  using ldsm_value_stride = Stride<_2, _4, _1, _0>;
-  // use trans to do 16bits transpose
-  // which needs permutation to separate 8bits row and column
-  using TiledCopyLDSM =
-      decltype(make_tiled_copy(Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, Layout<ldsm_thread_shape>{},
-                               Layout<ldsm_value_shape, ldsm_value_stride>{}));
-  TiledCopyLDSM tiled_copy_ldsm;
-
-  using stsm_thread_shape = Shape<_4, _1, _8, _4>;
-  using stsm_value_shape = Shape<_4, _4, _1, _2>;
-  using stsm_value_stride = Stride<_1, _8, _0, _4>;
-
-  using TiledCopySTSM =
-      decltype(make_tiled_copy(Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<stsm_thread_shape>{},
-                               Layout<stsm_value_shape, stsm_value_stride>{}));
-  TiledCopySTSM tiled_copy_stsm;
-
-  template <class SmemTensor, class SmemTensorOut>
-  CUTLASS_DEVICE void _tranpose(SmemTensor&& s_in, SmemTensorOut&& s_out) {
-    using namespace cute;
-
-    auto tid = threadIdx.x;
-    auto thr_copy_ldsm = tiled_copy_ldsm.get_thread_slice(tid);
-    auto thr_copy_stsm = tiled_copy_stsm.get_thread_slice(tid);
-
-    auto tXsX = thr_copy_ldsm.partition_S(s_in);
-    auto tXrX = make_tensor<Element>(shape(tXsX));
-    auto tXsX_out = thr_copy_stsm.partition_D(s_out);
-
-    cute::copy(tiled_copy_ldsm, tXsX, tXrX);
-    auto data = tXrX.data();
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < size(tXrX); n += 8) {
-      uint32_t* data_32bit = reinterpret_cast<uint32_t*>(&data[n]);
-      auto upper = data_32bit[0];
-      auto lower = data_32bit[1];
-      // select row-major elements.
-      // from (0 1 16 17) (128 129 144 145) to (0 16 128 144) (1 17 129 145)
-      // which is (0 1 8 9)
-      data_32bit[0] = __byte_perm(upper, lower, 0x6420);
-      data_32bit[1] = __byte_perm(upper, lower, 0x7531);
-    }
-    cute::copy(tiled_copy_stsm, tXrX, tXsX_out);
-  }
-
-  template <class SmemTensor, class SmemTensorOut>
-  CUTLASS_DEVICE void do_transpose(SmemTensor& s_in, SmemTensorOut& s_out, int stage_idx) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < shape<2>(SmemLayoutVTransposeSrc{}); ++j) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < shape<1>(SmemLayoutVTransposeSrc{}); ++i) {
-        this->_tranpose(flatten(s_in(_, i, j, stage_idx)), flatten(s_out(_, i, j, stage_idx)));
-      }
-    }
-    // For FP8 kernel, all WG threads will arrive for issuing ldmatrix
-    cutlass::arch::NamedBarrier::sync(Ktraits::NUM_PRODUCER_THREADS,
-                                      static_cast<int>(NamedBarriers::kProducerWG) /*id*/);
-  }
-};
 
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
 struct FP8CollectiveMainloop {
@@ -252,7 +177,8 @@ struct FP8CollectiveMainloop {
         make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtTransposeTgt{}));
     auto v_tranposer = SmemTransposeFP8_64x64<Ktraits>();
 
-    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
 
     // Prepare the TMA loads
     Tensor gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShape_QKD{}), qo_head_idx, qo_indptr,
@@ -319,7 +245,7 @@ struct FP8CollectiveMainloop {
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
     pipeline_v.consumer_wait(smem_pipe_read);
-    // pipeline_vt.producer_acquire(smem_pipe_write);
+    pipeline_vt.producer_acquire(smem_pipe_write);
     v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
     pipeline_vt.producer_commit(smem_pipe_write);
     pipeline_v.consumer_release(smem_pipe_read);
@@ -344,7 +270,7 @@ struct FP8CollectiveMainloop {
       }
 
       pipeline_v.consumer_wait(smem_pipe_read);
-      // pipeline_vt.producer_acquire(smem_pipe_write);
+      pipeline_vt.producer_acquire(smem_pipe_write);
       v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
       pipeline_vt.producer_commit(smem_pipe_write);
       pipeline_v.consumer_release(smem_pipe_read);

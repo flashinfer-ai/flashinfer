@@ -141,6 +141,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -238,6 +240,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
         params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
 
         ADDITIONAL_PARAMS_SETTER

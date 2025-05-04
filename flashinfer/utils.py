@@ -37,6 +37,7 @@ class MaskMode(Enum):
     NON_CAUSAL = 0
     CAUSAL = 1
     CUSTOM = 2
+    MULTIITEMSCORING = 3
 
 
 class TensorLayout(Enum):
@@ -357,6 +358,11 @@ def determine_attention_backend(
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and torch.version.cuda >= "12.3"
+
+
+def is_sm100a_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    return major == 10 and minor == 0 and torch.version.cuda >= "12.9"
 
 
 def determine_mla_backend(device: torch.device) -> str:

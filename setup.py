@@ -35,6 +35,7 @@ head_dims_sm90.extend(
     [(k, v) for k, v in SM90_ALLOWED_HEAD_DIMS if k != v]
 )  # Always enable (192,128)
 
+# NOTE(Zihao): exclude 3 (multi-item scoring) from AOT wheel
 mask_modes = [0, 1, 2]
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
@@ -250,6 +251,7 @@ if enable_aot:
         "csrc/single_prefill.cu",
         # "csrc/pod.cu",  # Temporarily disabled
         "csrc/flashinfer_ops.cu",
+        "csrc/custom_all_reduce.cu",
     ]
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",

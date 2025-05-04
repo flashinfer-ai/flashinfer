@@ -172,6 +172,10 @@ struct BatchPrefillRaggedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* maybe_prefix_len_ptr;
+  uint16_t* maybe_token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
@@ -210,7 +214,11 @@ struct BatchPrefillRaggedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
@@ -257,7 +265,11 @@ struct BatchPrefillRaggedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -305,6 +317,10 @@ struct BatchPrefillPagedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t* maybe_prefix_len_ptr;
+  uint16_t* maybe_token_pos_in_items_ptr;
+  uint32_t token_pos_in_items_len;
+  uint16_t* maybe_max_item_len_ptr;
 
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
@@ -335,7 +351,11 @@ struct BatchPrefillPagedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
@@ -372,7 +392,11 @@ struct BatchPrefillPagedParams {
         max_total_num_rows(0),
         total_num_rows(nullptr),
         padded_batch_size(0),
-        partition_kv(false) {}
+        partition_kv(false),
+        maybe_prefix_len_ptr(nullptr),
+        maybe_token_pos_in_items_ptr(nullptr),
+        token_pos_in_items_len(0),
+        maybe_max_item_len_ptr(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

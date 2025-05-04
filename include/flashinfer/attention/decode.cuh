@@ -700,6 +700,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         dim3 nthrs = dim3(bdx, bdy, bdz);
         float* tmp_lse = (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
         auto o = params.o;
+        auto lse = params.lse;
         params.o = tmp;
         params.lse = tmp_lse;
         params.kv_chunk_size = kv_chunk_size;
@@ -708,7 +709,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(
-              MergeStates(tmp, tmp_lse, o, nullptr, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
+              MergeStates(tmp, tmp_lse, o, lse, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
         } else {
           FLASHINFER_CUDA_CALL(AttentionSum(tmp, o, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
         }

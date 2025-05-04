@@ -31,6 +31,9 @@ from .cascade import merge_state as merge_state
 from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
 from .decode import (
+    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
+)
+from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
 )
 from .decode import (
@@ -77,6 +80,7 @@ from .rope import (
 )
 from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
+from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
 from .sampling import top_k_mask_logits as top_k_mask_logits
 from .sampling import top_k_renorm_probs as top_k_renorm_probs

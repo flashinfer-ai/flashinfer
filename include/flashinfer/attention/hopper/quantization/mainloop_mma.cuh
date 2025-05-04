@@ -26,7 +26,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
                             int swa_end_kv_tile_idx, int thread_idx, int work_idx, int q_tile_idx,
                             SharedStorage& shared_storage, const int32_t qo_len,
                             const int32_t kv_len, const int32_t qo_head_idx,
-                            const int32_t kv_head_idx) {
+                            const int32_t kv_head_idx, const int32_t batch_idx) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -100,8 +100,8 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
+                                        kv_idx, qo_head_idx, kv_head_idx);
       if constexpr (!CAUSAL) {  // Just masking based on col
         if (kv_idx >= kv_len) {
           tSrS(i) = AttentionUpdater::fill_value;
@@ -153,8 +153,8 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
+                                        kv_idx, qo_head_idx, kv_head_idx);
       if (kv_idx >= col_limit_right(qo_idx)) {
         tSrS(i) = AttentionUpdater::fill_value;
       }
@@ -199,8 +199,8 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
+                                        kv_idx, qo_head_idx, kv_head_idx);
     }
 
     attention_updater.update</*init=*/false>(tSrS);

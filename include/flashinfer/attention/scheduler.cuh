@@ -789,6 +789,7 @@ struct PrefillPlanSM90Info {
   int64_t kv_len_offset;
   int64_t head_indices_offset;
   int64_t work_indptr_offset;
+  int64_t batch_indices_offset;
   bool same_schedule_for_all_heads;
 
   PrefillPlanSM90Info()
@@ -799,21 +800,21 @@ struct PrefillPlanSM90Info {
         kv_len_offset(0),
         head_indices_offset(0),
         work_indptr_offset(0),
+        batch_indices_offset(0),
         same_schedule_for_all_heads(false) {}
 
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {qo_tile_indices_offset, qo_indptr_offset,
-            kv_indptr_offset,       qo_len_offset,
-            kv_len_offset,          head_indices_offset,
-            work_indptr_offset,     same_schedule_for_all_heads};
+    return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
+            qo_len_offset,          kv_len_offset,        head_indices_offset,
+            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads};
   }
 
   // From std::vector<int64_t> to PrefillPlanSM90Info
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 8) {
+    if (vec.size() != 9) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 8, but got " << vec.size();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     qo_tile_indices_offset = vec[0];
@@ -823,7 +824,8 @@ struct PrefillPlanSM90Info {
     kv_len_offset = vec[4];
     head_indices_offset = vec[5];
     work_indptr_offset = vec[6];
-    same_schedule_for_all_heads = vec[7];
+    batch_indices_offset = vec[7];
+    same_schedule_for_all_heads = vec[8];
   }
 };
 
@@ -879,7 +881,8 @@ inline cudaError_t PrefillSM90Plan(
       cta_kv_indptr(num_sm90_ctas, std::vector<IdType>()),
       cta_qo_len(num_sm90_ctas, std::vector<IdType>()),
       cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
-      cta_head_indices(num_sm90_ctas, std::vector<IdType>());
+      cta_head_indices(num_sm90_ctas, std::vector<IdType>()),
+      cta_batch_indices(num_sm90_ctas, std::vector<IdType>());
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
@@ -903,6 +906,7 @@ inline cudaError_t PrefillSM90Plan(
         cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
         cta_kv_len[cta_idx].push_back(kv_len);
         cta_head_indices[cta_idx].push_back(qo_head_idx);
+        cta_batch_indices[cta_idx].push_back(i);
       }
     }
   }
@@ -918,6 +922,7 @@ inline cudaError_t PrefillSM90Plan(
   auto qo_len_vec = flatten(cta_qo_len, total_num_works);
   auto kv_len_vec = flatten(cta_kv_len, total_num_works);
   auto head_indices_vec = flatten(cta_head_indices, total_num_works);
+  auto batch_indices_vec = flatten(cta_batch_indices, total_num_works);
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   int max_total_num_works;
@@ -944,6 +949,8 @@ inline cudaError_t PrefillSM90Plan(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_head_indices");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * (num_sm90_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
+  plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
@@ -957,6 +964,8 @@ inline cudaError_t PrefillSM90Plan(
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.head_indices_offset);
   IdType* work_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+  IdType* batch_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.batch_indices_offset);
 
   std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
   std::copy(qo_indptr_vec.begin(), qo_indptr_vec.end(), qo_offset_h);
@@ -965,6 +974,7 @@ inline cudaError_t PrefillSM90Plan(
   std::copy(kv_len_vec.begin(), kv_len_vec.end(), kv_len_h);
   std::copy(head_indices_vec.begin(), head_indices_vec.end(), head_indices_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), work_indptr_h);
+  std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), batch_indices_h);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
