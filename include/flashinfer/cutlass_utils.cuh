@@ -75,6 +75,16 @@ void compileTimeDebug(T&&) {
   static_assert(sizeof(T) == 0, "Compile time debug");
 }
 
+#define CUTLASS_CHECK(cmd)                                                            \
+  do {                                                                                \
+    auto status = cmd;                                                                \
+    if (status != cutlass::Status::kSuccess) {                                        \
+      std::ostringstream err_msg;                                                     \
+      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
+      FLASHINFER_ERROR(err_msg.str());                                                \
+    }                                                                                 \
+  } while (0)
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_CUTLASS_UTILS_CUH_
