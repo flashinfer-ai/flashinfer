@@ -152,7 +152,9 @@ def get_gemm_sm100_module():
             "gemm_sm100",
             [
                 FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
+                FLASHINFER_CSRC_DIR / "group_gemm_groupwise_sm100.cu",
                 FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+                FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
             ],
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
         )
@@ -828,3 +830,44 @@ def gemm_fp8_nt_blockscaled(
         out=out,
         out_dtype=out_dtype,
     )
+
+
+def group_gemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (k // block_size * cum_m)
+    b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+
+    workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a[0].device
+    )
+
+    batch_size = m_indptr.shape[0] - 1
+    assert b.shape[0] == batch_size
+    assert b_scale.shape[0] == batch_size
+    n = b.shape[1]
+    k = b.shape[2]
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
+
+    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        workspace_buffer,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        m_indptr,
+        n,
+        k,
+        *scale_granularity_mnk,
+    )
+
+    return out
