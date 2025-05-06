@@ -847,6 +847,9 @@ def group_gemm_fp8_nt_groupwise(
         "group_gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a[0].device
     )
 
+    # add padding as gemm_fp8_nt_groupwise to remove this assertion
+    assert (m_indptr % 4 == 0).all()
+
     batch_size = m_indptr.shape[0] - 1
     assert b.shape[0] == batch_size
     assert b_scale.shape[0] == batch_size
