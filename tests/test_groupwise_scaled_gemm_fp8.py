@@ -179,7 +179,7 @@ def test_fp8_groupwise_gemm(
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("m", [1, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
