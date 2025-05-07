@@ -250,4 +250,4 @@ def test_fp8_groupwise_group_gemm(
 if __name__ == "__main__":
     # test_fp8_blockscale_gemm(8192, 8192, 8192, torch.bfloat16)
     # test_fp8_groupwise_gemm(8192, 8192, 8192, torch.bfloat16)
-    test_fp8_groupwise_group_gemm(8192, 8192, 8192, 4, torch.bfloat16)
+    test_fp8_groupwise_group_gemm(3, 128, 128, 1, torch.bfloat16)
