@@ -837,117 +837,25 @@ import triton.language as tl
 
 
 @triton.jit
-def triton_copy_by_row(
-    src_ptr,
-    dst_ptr,
-    src_indptr,
-    dst_indptr,
-    BLOCK_SIZE: tl.constexpr,
+def compute_padding_map(
+    m_indptr,
+    padded_m_indptr,
+    m_rank,
+    padded_m_rank,
 ):
     pid = tl.program_id(0)
-    src_start = tl.load(src_indptr + pid)
-    dst_start = tl.load(dst_indptr + pid)
-    src_end = tl.load(src_indptr + pid + 1)
-    num_ele = src_end - src_start
-    for i in range(0, num_ele, BLOCK_SIZE):
-        offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < num_ele
-        values = tl.load(src_ptr + src_start + offsets, mask=mask)
-        tl.store(dst_ptr + dst_start + offsets, values, mask=mask)
-
-
-@triton.jit
-def triton_copy_by_col(
-    src_ptr,
-    dst_ptr,
-    src_indptr,
-    dst_indptr,
-    dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    src_start = tl.load(src_indptr + pid)
-    dst_start = tl.load(dst_indptr + pid)
-    src_end = tl.load(src_indptr + pid + 1)
-    dst_end = tl.load(dst_indptr + pid + 1)
-    src_col = (src_end - src_start) // dim
-    dst_col = (dst_end - dst_start) // dim
-    for i in range(0, dim):
-        src_row_start = i * src_col
-        dst_row_start = i * dst_col
-        for i in range(0, src_col, BLOCK_SIZE):
-            offsets = i + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < src_col
-            values = tl.load(src_ptr + src_row_start + offsets, mask=mask)
-            tl.store(dst_ptr + dst_row_start + offsets, values, mask=mask)
-
-
-def max_power_of_2_leq(x: int) -> int:
-    r"""Return the maximum power of 2 less than or equal to x."""
-    return 1 << (x - 1).bit_length()
-
-
-def pad(
-    m_indptr: torch.tensor,
-    a: torch.tensor,
-    a_scale: torch.tensor,
-    o: torch.tensor,
-):
-    batch_size = m_indptr.shape[0] - 1
-    m = m_indptr[1:] - m_indptr[:-1]
-    m = m + (4 - m % 4)
-    k = a.shape[1]
-    n = o.shape[1]
-    scale_granularity_k = m_indptr[-1] * k // a_scale.shape[0]
-    padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
-    padded_m_indptr = padded_m_indptr.cumsum(dim=0)
-    padded_a = torch.zeros((padded_m_indptr[-1], k), dtype=a.dtype, device=a.device)
-    padded_o = torch.zeros((padded_m_indptr[-1], n), dtype=o.dtype, device=o.device)
-    padded_a_scale = torch.zeros(
-        (k * padded_m_indptr[-1] // scale_granularity_k),
-        dtype=a_scale.dtype,
-        device=a_scale.device,
-    )
-    triton_copy_by_row[(batch_size,)](
-        a,
-        padded_a,
-        m_indptr * k,
-        padded_m_indptr * k,
-        min(max_power_of_2_leq(k), 16384),
-    )
-    triton_copy_by_col[(batch_size,)](
-        a_scale,
-        padded_a_scale,
-        m_indptr * k,
-        padded_m_indptr * k,
-        k,
-        min(max_power_of_2_leq(k), 16384),
-    )
-    return padded_m_indptr, padded_a, padded_a_scale, padded_o
-
-
-def pack(
-    padded_m_indptr: torch.tensor,
-    padded_o: torch.tensor,
-    m_indptr: torch.tensor,
-):
-    batch_size = m_indptr.shape[0] - 1
-    n = padded_o.shape[1]
-    o = torch.zeros((m_indptr[-1], n), dtype=padded_o.dtype, device=padded_o.device)
-    triton_copy_by_row[(batch_size,)](
-        padded_o,
-        o,
-        padded_m_indptr * n,
-        m_indptr * n,
-        min(max_power_of_2_leq(n), 16384),
-    )
-    return o
+    m_start = tl.load(m_indptr + pid)
+    m_end = tl.load(m_indptr + pid + 1)
+    padded_m_start = tl.load(padded_m_indptr + pid)
+    for i in range(m_end - m_start):
+        tl.store(m_rank + m_start + i, m_start + i)
+        tl.store(padded_m_rank + m_start + i, padded_m_start + i)
 
 
 def group_gemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k)
-    a_scale: torch.Tensor,  # (k // block_size * cum_m)
+    a_scale: torch.Tensor,  # (k // block_size, cum_m)
     b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
@@ -972,9 +880,30 @@ def group_gemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
 
-    padded_m_indptr, padded_a, padded_a_scale, padded_out = pad(
-        m_indptr, a, a_scale, out
+    m = m_indptr[1:] - m_indptr[:-1]
+    m = m + 3 - (m + 3) % 4
+    padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
+    padded_m_indptr = padded_m_indptr.cumsum(dim=0, dtype=padded_m_indptr.dtype)
+
+    m_rank = torch.zeros((m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device)
+    padded_m_rank = torch.zeros(
+        (m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device
     )
+
+    compute_padding_map[(batch_size,)](m_indptr, padded_m_indptr, m_rank, padded_m_rank)
+
+    padded_a = torch.zeros((padded_m_indptr[-1], k), dtype=a.dtype, device=a.device)
+    padded_out = torch.zeros(
+        (padded_m_indptr[-1], n), dtype=out.dtype, device=out.device
+    )
+    padded_a_scale = torch.zeros(
+        (k // scale_granularity_mnk[2], padded_m_indptr[-1]),
+        dtype=a_scale.dtype,
+        device=a_scale.device,
+    )
+
+    padded_a[padded_m_rank] = a[m_rank]
+    padded_a_scale[::, padded_m_rank] = a_scale[::, m_rank]
 
     get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
         workspace_buffer,
@@ -984,24 +913,12 @@ def group_gemm_fp8_nt_groupwise(
         b_scale,
         padded_out,
         padded_m_indptr,
+        padded_m_indptr[-1],
         n,
         k,
         *scale_granularity_mnk,
     )
 
-    out = pack(padded_m_indptr, padded_out, m_indptr)
-
-    # get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-    #     workspace_buffer,
-    #     a,
-    #     b,
-    #     a_scale,
-    #     b_scale,
-    #     out,
-    #     m_indptr,
-    #     n,
-    #     k,
-    #     *scale_granularity_mnk,
-    # )
+    out[m_rank] = padded_out[padded_m_rank]
 
     return out

@@ -50,8 +50,9 @@ using namespace flashinfer;
 
 void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A,
                                           at::Tensor B, at::Tensor SFA, at::Tensor SFB,
-                                          at::Tensor C, at::Tensor m_indptr, int64_t n, int64_t k,
-                                          int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                          at::Tensor C, at::Tensor m_indptr, int64_t cum_m,
+                                          int64_t n, int64_t k, int64_t scale_granularity_m,
+                                          int64_t scale_granularity_n,
                                           int64_t scale_granularity_k) {
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -68,8 +69,8 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at:
               float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
               static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
               static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
-              static_cast<cutlass_t_out*>(C.data_ptr()), static_cast<int*>(m_indptr.data_ptr()), n,
-              k, batch_size, stream);
+              static_cast<cutlass_t_out*>(C.data_ptr()), static_cast<int*>(m_indptr.data_ptr()),
+              cum_m, n, k, batch_size, stream);
           return true;
         });
   });

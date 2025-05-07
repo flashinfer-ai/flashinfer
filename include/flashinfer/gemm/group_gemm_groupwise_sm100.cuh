@@ -33,25 +33,25 @@ template <typename ScaleConfig, typename DTypeIn, typename DTypeSF, typename DTy
           typename ProblemShape, typename StrideA, typename StrideB, typename StrideC,
           typename LayoutSFA, typename LayoutSFB>
 __global__ void compute_sm100_cutlass_group_gemm_args(
-    DTypeIn* A, DTypeIn* B, DTypeSF* SFA, DTypeSF* SFB, DTypeOut* C, int* m_indptr, int n, int k,
-    int batch_size, int scale_granularity_m, int scale_granularity_n, int scale_granularity_k,
-    ProblemShape* problem_sizes, const DTypeIn** A_ptr, const DTypeIn** B_ptr,
-    const DTypeSF** SFA_ptr, const DTypeSF** SFB_ptr, const DTypeOut** C_ptr, DTypeOut** D_ptr,
-    StrideA* stride_A, StrideB* stride_B, StrideC* stride_C, LayoutSFA* layout_SFA,
-    LayoutSFB* layout_SFB) {
+    DTypeIn* A, DTypeIn* B, DTypeSF* SFA, DTypeSF* SFB, DTypeOut* C, int* m_indptr, int cum_m,
+    int n, int k, int batch_size, int scale_granularity_m, int scale_granularity_n,
+    int scale_granularity_k, ProblemShape* problem_sizes, const DTypeIn** A_ptr,
+    const DTypeIn** B_ptr, const DTypeSF** SFA_ptr, const DTypeSF** SFB_ptr, const DTypeOut** C_ptr,
+    DTypeOut** D_ptr, StrideA* stride_A, StrideB* stride_B, StrideC* stride_C,
+    LayoutSFA* layout_SFA, LayoutSFB* layout_SFB) {
   int i = blockIdx.x;
   int m = m_indptr[i + 1] - m_indptr[i];
   problem_sizes[i] = ProblemShape(m, n, k);
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_C[i] = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
-  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(cum_m, n, k, 1));
   layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
   A_ptr[i] = A + m_indptr[i] * k;
   B_ptr[i] = B + i * k * n;
   C_ptr[i] = C + m_indptr[i] * n;
   D_ptr[i] = C + m_indptr[i] * n;
-  SFA_ptr[i] = SFA + m_indptr[i] * k / scale_granularity_m / scale_granularity_k;
+  SFA_ptr[i] = SFA + m_indptr[i] / scale_granularity_m;
   SFB_ptr[i] = SFB + i * k * n / scale_granularity_n / scale_granularity_k;
 }
 
@@ -60,8 +60,8 @@ template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, t
 cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* float_buffer,
                                                  size_t float_buffer_size_in_bytes, DTypeIn* A,
                                                  DTypeIn* B, float* SFA, float* SFB, DTypeOut* C,
-                                                 int* m_indptr, int n, int k, int batch_size,
-                                                 cudaStream_t stream) {
+                                                 int* m_indptr, int cum_m, int n, int k,
+                                                 int batch_size, cudaStream_t stream) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
 
   using ElementA = DTypeIn;                   // Element type for A matrix operand
@@ -144,7 +144,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* float_buffer,
   cutlass::DeviceAllocation<LayoutSFB> layout_SFB(batch_size);
 
   compute_sm100_cutlass_group_gemm_args<ScaleConfig><<<batch_size, 1, 0, stream>>>(
-      A, B, SFA, SFB, C, m_indptr, n, k, batch_size, ScaleGranularityM, ScaleGranularityN,
+      A, B, SFA, SFB, C, m_indptr, cum_m, n, k, batch_size, ScaleGranularityM, ScaleGranularityN,
       ScaleGranularityK, problem_sizes.get(), A_ptr.get(), B_ptr.get(), SFA_ptr.get(),
       SFB_ptr.get(), C_ptr.get(), D_ptr.get(), stride_A.get(), stride_B.get(), stride_C.get(),
       layout_SFA.get(), layout_SFB.get());

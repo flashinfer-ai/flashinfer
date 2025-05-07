@@ -212,9 +212,7 @@ def test_fp8_groupwise_group_gemm(
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
     a_scale = (
-        torch.rand(
-            (group_size * m * k // tile_size), dtype=torch.float32, device="cuda"
-        )
+        torch.rand((k // tile_size, group_size * m), dtype=torch.float32, device="cuda")
         * factor_for_scale
     )
     b_scale = (
@@ -235,9 +233,7 @@ def test_fp8_groupwise_group_gemm(
         ref_c = gemm_fp8_nt_groupwise_ref(
             a_fp8[m * i : m * (i + 1)],
             b_fp8[i],
-            a_scale[m * i * k // tile_size : m * (i + 1) * k // tile_size].reshape(
-                k // tile_size, m
-            ),
+            a_scale[::, m * i : m * (i + 1)],
             b_scale[i],
             tile_size,
             out_dtype,
@@ -250,4 +246,4 @@ def test_fp8_groupwise_group_gemm(
 if __name__ == "__main__":
     # test_fp8_blockscale_gemm(8192, 8192, 8192, torch.bfloat16)
     # test_fp8_groupwise_gemm(8192, 8192, 8192, torch.bfloat16)
-    test_fp8_groupwise_group_gemm(3, 128, 128, 1, torch.bfloat16)
+    test_fp8_groupwise_group_gemm(8191, 8192, 8192, 16, torch.bfloat16)
