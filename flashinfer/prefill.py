@@ -2643,78 +2643,32 @@ def fmha_varlen(
     batch_size = qo_lens.shape[0]
     max_qo_len = qo_lens.max()
     max_kv_len = kv_lens.max()
-
-    q_padded = torch.cat(
-        [
-            torch.zeros(
-                max(max_qo_len, 128),
-                q.shape[1],
-                q.shape[2],
-                device=q.device,
-                dtype=q.dtype,
-            ),
-            q,
-        ],
-        dim=0,
-    )[max(max_qo_len, 128) :]
-
     qo_total_len = nnz_qo
 
-    k_padded = torch.cat(
-        [
-            torch.zeros(
-                max(max_kv_len, 128),
-                k.shape[1],
-                k.shape[2],
-                device=k.device,
-                dtype=k.dtype,
-            ),
-            k,
-        ],
-        dim=0,
-    )[max(max_kv_len, 128) :]
-    v_padded = torch.cat(
-        [
-            torch.zeros(
-                max(max_kv_len, 128),
-                v.shape[1],
-                v.shape[2],
-                device=v.device,
-                dtype=v.dtype,
-            ),
-            v,
-        ],
-        dim=0,
-    )[max(max_kv_len, 128) :]
-
     if out is None:
-        out_padded = torch.empty(
-            qo_total_len + max(max_qo_len, 128),
+        out = torch.empty(
+            qo_total_len,
             num_qo_heads,
             head_dim_vo,
             device=q.device,
             dtype=q.dtype,
-        )[max(max_qo_len, 128) :]
-    else:
-        out_padded = out
+        )
 
     if lse is None:
-        lse_padded = torch.empty(
+        lse = torch.empty(
             qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
         )
-    else:
-        lse_padded = lse
 
     module.run(
-        q_padded,
-        k_padded,
-        v_padded,
+        q,
+        k,
+        v,
         qo_lens,
         kv_lens,
         qo_segment_offsets,
         kv_segment_offsets,
-        out_padded,
-        lse_padded,
+        out,
+        lse,
         mask_mode_code,
         sm_scale,
         num_qo_heads,
@@ -2727,8 +2681,7 @@ def fmha_varlen(
         max_kv_len,
     )
 
-    out = out_padded
-    lse = lse_padded
+    print(out)
 
     return out, lse
 

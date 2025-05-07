@@ -30,6 +30,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "../../../cutlass_utils.cuh"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/arch/memory_sm80.h"
@@ -54,98 +55,89 @@ CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& 
   return g_tensor;
 }
 
-template <class Element, class StrideQ, class StrideK, class StrideV, class CollectiveMmaQK,
-          class CollectiveMmaPV, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV,
-          class TensorStorage, class PipelineQ, class PipelineKV, class Mask, class TileShape>
+template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
+          class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
+          class PipelineKV, class Mask, class TileShape>
 struct Sm100FmhaLoadTmaWarpspecialized {
   using TileShapeQK = typename CollectiveMmaQK::TileShape;
   using TileShapePV = typename CollectiveMmaPV::TileShape;
 
+  using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
+  using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
+
+  // (N, D, (H_R, H_G))
+  using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
+  // (N, D, (H_R, H_G))
+  using StrideQ = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
+  using StrideKV = cute::Shape<int32_t, _1, cute::Shape<_0, int32_t>>;
+  using LayoutQ = cute::Layout<ShapeT, StrideQ>;
+  using LayoutKV = cute::Layout<ShapeT, StrideKV>;
   struct Arguments {
     const Element* ptr_Q;
-    StrideQ dQ;
+    LayoutQ layout_Q;
     const Element* ptr_K;
-    StrideK dK;
+    LayoutKV layout_K;
     const Element* ptr_V;
-    StrideV dV;
+    LayoutKV layout_V;
   };
 
+  // using ShapeLseT = cute::Shape<int32_t, int32_t>;
+  // using StrideLseT = cute::Shape<_1, int64_t>;
+  // using LayoutLseT = cute::Layout<ShapeLseT, StrideLseT>;
+
+  using ClusterLayout_VMNK =
+      decltype(tiled_divide(make_layout(Shape<_1, _1, _1>{}),
+                            make_tile(typename CollectiveMmaQK::TiledMma::AtomThrID{})));
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
   using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
   using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
 
   struct Params {
-    TMA_Q tma_load_q;
-    TMA_K tma_load_k;
-    TMA_V tma_load_v;
+    TMA_Q tma_load_Q;
+    LayoutQ layout_Q;
+    TMA_K tma_load_K;
+    LayoutKV layout_K;
+    TMA_V tma_load_V;
+    LayoutKV layout_V;
   };
 
   template <class ProblemShape>
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args,
                                         void* workspace) {
+    static_assert(is_variable_length_v<tuple_element_t<0, ProblemShape>>);
+    static_assert(is_variable_length_v<tuple_element_t<1, ProblemShape>>);
     auto ptr_Q = args.ptr_Q;
     auto ptr_K = args.ptr_K;
     auto ptr_V = args.ptr_V;
-    auto dQ = args.dQ;
-    auto dK = args.dK;
-    auto dV = args.dV;
-    auto problem_shape_qk = problem_shape;
+    LayoutQ layout_Q = args.layout_Q;
+    LayoutKV layout_K = args.layout_K;
+    LayoutKV layout_V = args.layout_V;
 
-    if constexpr (is_variable_length_v<tuple_element_t<0, ProblemShape>>) {
-      auto segment_offsets_q = get<0>(problem_shape).segment_offsets;
-      if (segment_offsets_q != nullptr) {
-        int max_length_q = get<0>(problem_shape).max_length;
-        // for variable sequence lenght, the batch is in units of row_stride
-        get<2, 1>(dQ) = get<0>(dQ);
-        get<3, 1>(problem_shape_qk) =
-            std::max(get<3, 1>(problem_shape_qk), max_length_q * (1 + get<3, 1>(problem_shape)));
-        // offset ptr by the amount we add back in later
-        ptr_Q -= max_length_q * get<0>(dQ);
-      }
-    }
+    auto mQ = make_tensor(make_gmem_ptr(ptr_Q), layout_Q);
+    auto mK = make_tensor(make_gmem_ptr(ptr_K), layout_K);
+    auto mV = make_tensor(make_gmem_ptr(ptr_V), layout_V);
 
-    if constexpr (is_variable_length_v<tuple_element_t<1, ProblemShape>>) {
-      auto segment_offsets_kv = get<1>(problem_shape).segment_offsets;
-      if (segment_offsets_kv != nullptr) {
-        int max_length_kv = get<1>(problem_shape).max_length;
-        // for variable sequence lenght, the batch is in units of row_stride
-        get<2, 1>(dK) = get<0>(dK);
-        get<2, 1>(dV) = get<0>(dV);
-        get<3, 1>(problem_shape_qk) =
-            std::max(get<3, 1>(problem_shape_qk), max_length_kv * (1 + get<3, 1>(problem_shape)));
-        // offset ptr by the amount we add back in later
-        ptr_K -= max_length_kv * get<0>(dK);
-        ptr_V -= max_length_kv * get<0>(dV);
-      }
-    }
+    auto cluster_layout_vmnk =
+        tiled_divide(make_layout(Shape<_1, _1, _1>{}),
+                     make_tile(typename CollectiveMmaQK::TiledMma::AtomThrID{}));
+    TMA_Q tma_load_Q = make_tma_atom_A_sm100<Element>(
+        GmemTiledCopyQ{}, mQ, SmemLayoutQ{}(_, _, _, _0{}), TileShapeQK{},
+        typename CollectiveMmaQK::TiledMma{}, cluster_layout_vmnk);
+    TMA_K tma_load_K = make_tma_atom_B_sm100<Element>(
+        GmemTiledCopyKV{}, mK, SmemLayoutK{}(_, _, _, _0{}), TileShapeQK{},
+        typename CollectiveMmaQK::TiledMma{}, cluster_layout_vmnk);
+    TMA_V tma_load_V = make_tma_atom_B_sm100<Element>(
+        GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _, _0{}), TileShapePV{},
+        typename CollectiveMmaPV::TiledMma{}, cluster_layout_vmnk);
 
-    auto params_qk = CollectiveMmaQK::to_underlying_arguments(problem_shape_qk,
-                                                              typename CollectiveMmaQK::Arguments{
-                                                                  ptr_Q,
-                                                                  dQ,
-                                                                  ptr_K,
-                                                                  dK,
-                                                              },
-                                                              /*workspace=*/nullptr);
-
-    auto problem_shape_pv = select<0, 2, 1, 3>(problem_shape_qk);
-    auto params_pv = CollectiveMmaPV::to_underlying_arguments(problem_shape_pv,
-                                                              typename CollectiveMmaPV::Arguments{
-                                                                  ptr_K,
-                                                                  dK,  // never used, dummy
-                                                                  ptr_V,
-                                                                  select<1, 0, 2>(dV),
-                                                              },
-                                                              /*workspace=*/nullptr);
-
-    return Params{params_qk.tma_load_a, params_qk.tma_load_b, params_pv.tma_load_b};
+    return Params{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V};
   }
 
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
-    cute::prefetch_tma_descriptor(params.tma_load_q.get_tma_descriptor());
-    cute::prefetch_tma_descriptor(params.tma_load_k.get_tma_descriptor());
-    cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
   }
 
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
@@ -155,8 +147,13 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                            typename PipelineQ::PipelineState& pipeline_q_producer_state,
                            PipelineKV& pipeline_kv,
                            typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
-    BlkCoord blk_coord_q = blk_coord_in;
-    BlkCoord blk_coord_kv = blk_coord_in;
+    int qo_tile_idx = get<0>(blk_coord_in);
+    int qo_head_idx = get<2, 0>(blk_coord_in);
+    int batch_idx = get<2, 1>(blk_coord_in);
+    int qo_len = get<0>(problem_shape);
+    int kv_len = get<1>(problem_shape);
+    int qo_segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+    int kv_segment_offset = get<1>(params_problem_shape).segment_offsets[batch_idx];
 
     int mask_tile_count = Mask{}.get_trip_count(blk_coord_in, TileShape{}, problem_shape);
 
@@ -168,73 +165,33 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     // two pipes: Q and KV
     // from Memory (prod) to TensorCore (cons)
 
-    // compute gQ, sQ
-    // we load 2*get<0>(blk_coord), and 2*get<0>(blk_coord) + 1
+    Tensor mQ = params.tma_load_Q.get_tma_tensor(params.layout_Q.shape());
+    Tensor mK = params.tma_load_K.get_tma_tensor(params.layout_K.shape());
+    Tensor mV = params.tma_load_V.get_tma_tensor(params.layout_V.shape());
+
     ThrMMA mma_qk = typename CollectiveMmaQK::TiledMma{}.get_slice(0);
-    Tensor mQ_qdl_p = params.tma_load_q.get_tma_tensor(select<0, 2, 3>(problem_shape));
-
-    int q_offs_0 = 0;
-    int q_offs_2_1 = 0;
-
-    if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
-      auto segment_offsets_q = get<0>(params_problem_shape).segment_offsets;
-      if (segment_offsets_q != nullptr) {
-        int max_length_q = get<0>(params_problem_shape).max_length;
-        q_offs_0 = max_length_q - get<0>(problem_shape);
-        q_offs_2_1 = segment_offsets_q[get<2, 1>(blk_coord_q)] + get<0>(problem_shape);
-        get<2, 1>(blk_coord_q) = 0;
-      }
-    }
-
-    Tensor mQ_qdl =
-        domain_offset(make_coord(q_offs_0, _0{}, make_coord(_0{}, q_offs_2_1)), mQ_qdl_p);
-
-    Tensor gQ_qdl = local_tile(mQ_qdl, TileShapeQK{}, make_coord(_, _, _), Step<_1, X, _1>{});
-    Tensor tSgQ_qdl = mma_qk.partition_A(gQ_qdl);
-    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
-    auto [tQgQ_qdl, tQsQ] = tma_partition(params.tma_load_q, _0{}, make_layout(_1{}),
-                                          group_modes<0, 3>(sQ), group_modes<0, 3>(tSgQ_qdl));
-    Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord_q));
-
-    // compute gK, sK
-    Tensor mK_kdl_p = params.tma_load_k.get_tma_tensor(select<1, 2, 3>(problem_shape));
-
-    int kv_offs_0 = 0;
-    int kv_offs_2_1 = 0;
-
-    if constexpr (is_variable_length_v<tuple_element_t<1, ParamsProblemShape>>) {
-      auto segment_offsets = get<1>(params_problem_shape).segment_offsets;
-      if (segment_offsets != nullptr) {
-        int max_length = get<1>(params_problem_shape).max_length;
-        kv_offs_0 = max_length - get<1>(problem_shape);
-        kv_offs_2_1 = segment_offsets[get<2, 1>(blk_coord_kv)] + get<1>(problem_shape);
-        get<2, 1>(blk_coord_kv) = 0;
-      }
-    }
-
-    Tensor mK_kdl =
-        domain_offset(make_coord(kv_offs_0, _0{}, make_coord(_0{}, kv_offs_2_1)), mK_kdl_p);
-
-    Tensor gK_kdl = local_tile(mK_kdl, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});
-    Tensor tSgK_kdl = mma_qk.partition_B(gK_kdl);
-    Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-    auto [tKgK_kdl, tKsK] = tma_partition(params.tma_load_k, _0{}, make_layout(_1{}),
-                                          group_modes<0, 3>(sK), group_modes<0, 3>(tSgK_kdl));
-    Tensor tKgK = tKgK_kdl(_, _, _0{}, get<2>(blk_coord_kv));
-
-    // compute gV, sV
     ThrMMA mma_pv = typename CollectiveMmaPV::TiledMma{}.get_slice(0);
-    Tensor mV_dkl_p = params.tma_load_v.get_tma_tensor(select<2, 1, 3>(problem_shape));
-
-    Tensor mV_dkl =
-        domain_offset(make_coord(_0{}, kv_offs_0, make_coord(_0{}, kv_offs_2_1)), mV_dkl_p);
-
-    Tensor gV_dkl = local_tile(mV_dkl, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{});
-    Tensor tOgV_dkl = mma_pv.partition_B(gV_dkl);
+    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+    Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
-    auto [tVgV_dkl, tVsV] = tma_partition(params.tma_load_v, _0{}, make_layout(_1{}),
-                                          group_modes<0, 3>(sV), group_modes<0, 3>(tOgV_dkl));
-    auto tVgV = tVgV_dkl(_, _0{}, _, get<2>(blk_coord_kv));
+
+    auto gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShapeQK{}), qo_head_idx, qo_segment_offset,
+                                    qo_len);  // (Q, D, _)
+    auto gK = get_local_tile_tensor(mK, select<1, 2>(TileShapeQK{}), qo_head_idx, kv_segment_offset,
+                                    kv_len);  // (K, D, _)
+    auto gV = get_local_tile_tensor(mV, select<2, 1>(TileShapePV{}), qo_head_idx, kv_segment_offset,
+                                    kv_len);  // (K, D, _)
+
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    Tensor tSgQ_qdl = mma_qk.partition_A(gQ);
+    Tensor tSgK_kdl = mma_qk.partition_B(gK);
+    Tensor tOgV_dkl = mma_pv.partition_B(gV);
+    auto [tQgQ, tQsQ] = tma_partition(params.tma_load_Q, _0{}, Layout<_1>{}, group_modes<0, 3>(sQ),
+                                      group_modes<0, 3>(tSgQ_qdl));  // (TMA, q), (TMA, PIPE)
+    auto [tKgK, tKsK] = tma_partition(params.tma_load_K, _0{}, Layout<_1>{}, group_modes<0, 3>(sK),
+                                      group_modes<0, 3>(tSgK_kdl));  // (TMA, k), (TMA, PIPE)
+    auto [tVgV, tVsV] = tma_partition(params.tma_load_V, _0{}, Layout<_1>{}, group_modes<0, 3>(sV),
+                                      group_modes<0, 3>(tOgV_dkl));  // (TMA, k), (TMA, PIPE)
 
     // blk_coord in decomposed in terms of TileShape, not TileShapeQK
     // As such, it needs to be transformed as
@@ -244,12 +201,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     uint32_t lane_predicate = cute::elect_one_sync();
 
     // Q1
-    int q0_index = 2 * get<0>(blk_coord_q);
-    int q1_index = 2 * get<0>(blk_coord_q) + 1;
+    int q0_index = 2 * get<0>(blk_coord_in);
+    int q1_index = 2 * get<0>(blk_coord_in) + 1;
     pipeline_q.producer_acquire(pipeline_q_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);
-      copy(params.tma_load_q.with(*tma_barrier, 0), tQgQ(_, q0_index),
+      copy(params.tma_load_Q.with(*tma_barrier, 0), tQgQ(_, q0_index),
            tQsQ(_, pipeline_q_producer_state.index()));
     }
     ++pipeline_q_producer_state;
@@ -259,7 +216,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-      copy(params.tma_load_k.with(*tma_barrier, 0), tKgK(_, k_index),
+      copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
            tKsK(_, pipeline_kv_producer_state.index()));
     }
     ++pipeline_kv_producer_state;
@@ -268,7 +225,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     pipeline_q.producer_acquire(pipeline_q_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);
-      copy(params.tma_load_q.with(*tma_barrier, 0), tQgQ(_, q1_index),
+      copy(params.tma_load_Q.with(*tma_barrier, 0), tQgQ(_, q1_index),
            tQsQ(_, pipeline_q_producer_state.index()));
     }
     ++pipeline_q_producer_state;
@@ -277,7 +234,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-      copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index),
+      copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, k_index),
            tVsV(_, pipeline_kv_producer_state.index()));
     }
     ++pipeline_kv_producer_state;
@@ -290,7 +247,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
       if (lane_predicate) {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-        copy(params.tma_load_k.with(*tma_barrier, 0), tKgK(_, k_index),
+        copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
              tKsK(_, pipeline_kv_producer_state.index()));
       }
       ++pipeline_kv_producer_state;
@@ -299,7 +256,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
       if (lane_predicate) {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-        copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index),
+        copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, k_index),
              tVsV(_, pipeline_kv_producer_state.index()));
       }
       ++pipeline_kv_producer_state;

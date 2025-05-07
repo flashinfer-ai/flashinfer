@@ -74,6 +74,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
   struct Params {
     TMA_O tma_store_o;
+    ElementAcc* ptr_LSE;
   };
 
   template <class ProblemShape>
@@ -95,10 +96,14 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
       }
     }
 
+    print("SmemLayoutO:\t");
+    print(SmemLayoutO{}(_, _, _0{}));
+    print("\n");
+
     auto tma_store_o = make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, problem_shape_O, dO),
                                      SmemLayoutO{}(_, _, _0{}));
 
-    return {tma_store_o};
+    return {tma_store_o, args.ptr_LSE};
   }
 
   CUTLASS_DEVICE
@@ -118,6 +123,10 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     int o0_index = 2 * get<0>(blk_coord);
     int o1_index = 2 * get<0>(blk_coord) + 1;
+
+    // Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), params.layout_LSE);
+    // Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
+    //                                         qo_len)(_, qo_tile_idx);
 
     Tensor mO_qdl_p = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
     // offset mode 0 by (max_length - real_length)

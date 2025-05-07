@@ -84,9 +84,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
       // the stride for A does not matter since we do not load from smem at all
-      Element, StrideK, Alignment, Element, decltype(select<1, 0, 2>(StrideV{})), Alignment,
-      ElementPV, TileShapePV, ClusterShape,
-      cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
+      Element, StrideK, Alignment, Element, StrideV, Alignment, ElementPV, TileShapePV,
+      ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
       cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
 
   using SmemLayoutQ =
@@ -158,10 +157,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>),
       "K and V smem layouts must be of equal size");
 
-  using Load =
-      Sm100FmhaLoadTmaWarpspecialized<Element, StrideQ, StrideK, StrideV, CollectiveMmaQK,
-                                      CollectiveMmaPV, SmemLayoutQ, SmemLayoutK, SmemLayoutV,
-                                      TensorStorage, PipelineQ, PipelineKV, Mask, TileShape>;
+  using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
+                                               SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
+                                               PipelineQ, PipelineKV, Mask, TileShape>;
+  using LayoutQ = typename Load::LayoutQ;
+  using LayoutKV = typename Load::LayoutKV;
 
   struct Arguments {
     typename Load::Arguments load;
