@@ -152,7 +152,9 @@ def get_gemm_sm100_module():
             "gemm_sm100",
             [
                 FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
+                FLASHINFER_CSRC_DIR / "group_gemm_groupwise_sm100.cu",
                 FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+                FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
             ],
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
         )
@@ -828,3 +830,91 @@ def gemm_fp8_nt_blockscaled(
         out=out,
         out_dtype=out_dtype,
     )
+
+
+def group_gemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (k // block_size, cum_m)
+    b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    from .triton.gemm import compute_padding_mapping
+
+    workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a[0].device
+    )
+
+    batch_size = m_indptr.shape[0] - 1
+    assert b.shape[0] == batch_size
+    assert b_scale.shape[0] == batch_size
+    n = b.shape[1]
+    k = b.shape[2]
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
+
+    if (m_indptr % 4 == 0).all():
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+            workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            m_indptr[-1],
+            n,
+            k,
+            *scale_granularity_mnk,
+        )
+        return out
+
+    m = m_indptr[1:] - m_indptr[:-1]
+    m = m + 3 - (m + 3) % 4
+    padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
+    padded_m_indptr = padded_m_indptr.cumsum(dim=0, dtype=padded_m_indptr.dtype)
+
+    m_rank = torch.zeros((m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device)
+    padded_m_rank = torch.zeros(
+        (m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device
+    )
+
+    compute_padding_mapping[(batch_size,)](
+        m_indptr, padded_m_indptr, m_rank, padded_m_rank
+    )
+
+    padded_a = torch.zeros((padded_m_indptr[-1], k), dtype=a.dtype, device=a.device)
+    padded_out = torch.zeros(
+        (padded_m_indptr[-1], n), dtype=out.dtype, device=out.device
+    )
+    padded_a_scale = torch.zeros(
+        (k // scale_granularity_mnk[2], padded_m_indptr[-1]),
+        dtype=a_scale.dtype,
+        device=a_scale.device,
+    )
+
+    padded_a[padded_m_rank] = a[m_rank]
+    padded_a_scale[::, padded_m_rank] = a_scale[::, m_rank]
+
+    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        workspace_buffer,
+        padded_a,
+        b,
+        padded_a_scale,
+        b_scale,
+        padded_out,
+        padded_m_indptr,
+        padded_m_indptr[-1],
+        n,
+        k,
+        *scale_granularity_mnk,
+    )
+
+    out[m_rank] = padded_out[padded_m_rank]
+
+    return out
