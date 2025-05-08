@@ -161,7 +161,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
                                                PipelineQ, PipelineKV, Mask, TileShape>;
   using LayoutQ = typename Load::LayoutQ;
-  using LayoutKV = typename Load::LayoutKV;
+  using LayoutK = typename Load::LayoutK;
+  using LayoutV = typename Load::LayoutV;
 
   struct Arguments {
     typename Load::Arguments load;

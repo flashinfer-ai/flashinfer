@@ -57,16 +57,18 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
   // (N, D, (H_R, H_G))
   using StrideQ = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
-  using StrideKV = cute::Shape<int32_t, _1, cute::Shape<_0, int32_t>>;
+  using StrideK = cute::Shape<int32_t, _1, cute::Shape<_0, int32_t>>;
+  using StrideV = cute::Shape<_1, int32_t, cute::Shape<_0, int32_t>>;
   using LayoutQ = cute::Layout<ShapeT, StrideQ>;
-  using LayoutKV = cute::Layout<ShapeT, StrideKV>;
+  using LayoutK = cute::Layout<ShapeT, StrideK>;
+  using LayoutV = cute::Layout<ShapeT, StrideV>;
   struct Arguments {
     const Element* ptr_Q;
     LayoutQ layout_Q;
     const Element* ptr_K;
-    LayoutKV layout_K;
+    LayoutK layout_K;
     const Element* ptr_V;
-    LayoutKV layout_V;
+    LayoutV layout_V;
   };
 
   // using ShapeLseT = cute::Shape<int32_t, int32_t>;
@@ -84,9 +86,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     TMA_Q tma_load_Q;
     LayoutQ layout_Q;
     TMA_K tma_load_K;
-    LayoutKV layout_K;
+    LayoutK layout_K;
     TMA_V tma_load_V;
-    LayoutKV layout_V;
+    LayoutV layout_V;
   };
 
   template <class ProblemShape>
@@ -98,8 +100,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     auto ptr_K = args.ptr_K;
     auto ptr_V = args.ptr_V;
     LayoutQ layout_Q = args.layout_Q;
-    LayoutKV layout_K = args.layout_K;
-    LayoutKV layout_V = args.layout_V;
+    LayoutK layout_K = args.layout_K;
+    LayoutV layout_V = args.layout_V;
 
     auto mQ = make_tensor(make_gmem_ptr(ptr_Q), layout_Q);
     auto mK = make_tensor(make_gmem_ptr(ptr_K), layout_K);

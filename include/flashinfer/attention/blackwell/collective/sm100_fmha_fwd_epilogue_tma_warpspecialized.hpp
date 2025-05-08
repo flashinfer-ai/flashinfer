@@ -89,12 +89,6 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     auto ptr_O = args.ptr_O;
     LayoutO layout_O = args.layout_O;
 
-    print("mO:\t");
-    print(make_tensor(ptr_O, layout_O));
-    print("\n");
-    print("SmemLayoutO:\t");
-    print(SmemLayoutO{}(_, _, _0{}));
-    print("\n");
     auto tma_store_o =
         make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, layout_O), SmemLayoutO{}(_, _, _0{}));
 

@@ -50,7 +50,7 @@ struct FwdRunner {
 
   using StrideQ = cute::tuple<int, _1, cute::tuple<int, int>>;  // Q D (H_G H_R B)
   using StrideK = cute::tuple<int, _1, cute::tuple<_0, int>>;   // K D (H_G H_R B)
-  using StrideV = StrideK;
+  using StrideV = cute::tuple<_1, int, cute::tuple<_0, int>>;   // D V (H_G H_R B)
   using StrideO = cute::tuple<int, _1, cute::tuple<int, int>>;
   using StrideLSE = cute::tuple<_1, cute::tuple<int, int>>;  // Q (H_G H_R)
 
@@ -63,7 +63,8 @@ struct FwdRunner {
       cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
           ProblemShapeVarlen, Mainloop, Epilogue, cutlass::fmha::kernel::PersistentTileScheduler>>;
   using LayoutQ = typename Mainloop::LayoutQ;
-  using LayoutKV = typename Mainloop::LayoutKV;
+  using LayoutK = typename Mainloop::LayoutK;
+  using LayoutV = typename Mainloop::LayoutV;
   using LayoutO = typename Epilogue::LayoutO;
   using LayoutLSE = typename Epilogue::LayoutLSE;
 
@@ -95,15 +96,15 @@ struct FwdRunner {
     stride_Q = make_stride(num_qo_heads * head_dim, _1{}, make_stride(head_dim, h_r * head_dim));
     stride_O = stride_Q;
     stride_K = make_stride(num_kv_heads * head_dim, _1{}, make_stride(_0{}, head_dim));
-    stride_V = stride_K;
+    stride_V = make_stride(_1{}, num_kv_heads * head_dim, make_stride(_0{}, head_dim));
     stride_LSE = make_stride(_1{}, make_stride(total_qo_len, total_qo_len * h_r));
 
     LayoutQ layout_Q =
         make_layout(make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads)), stride_Q);
-    LayoutKV layout_K =
+    LayoutK layout_K =
         make_layout(make_shape(total_kv_len, head_dim, make_shape(h_r, num_kv_heads)), stride_K);
-    LayoutKV layout_V =
-        make_layout(make_shape(total_kv_len, head_dim, make_shape(h_r, num_kv_heads)), stride_V);
+    LayoutV layout_V =
+        make_layout(make_shape(head_dim, total_kv_len, make_shape(h_r, num_kv_heads)), stride_V);
     LayoutO layout_O =
         make_layout(make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads)), stride_O);
     LayoutLSE layout_LSE =
