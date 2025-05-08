@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .triton.gemm import compute_padding_mapping
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -30,7 +31,6 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
-from .triton.gemm import compute_padding_mapping
 
 _gemm_module = None
 _gemm_module_sm90 = None
