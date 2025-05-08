@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .triton.gemm import compute_padding_mapping
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -843,6 +842,7 @@ def group_gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    from .triton.gemm import compute_padding_mapping
 
     workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a[0].device
