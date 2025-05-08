@@ -30,6 +30,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
+from .triton.gemm import compute_padding_mapping
 
 _gemm_module = None
 _gemm_module_sm90 = None
@@ -832,26 +833,6 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def compute_padding_map(
-    m_indptr,
-    padded_m_indptr,
-    m_rank,
-    padded_m_rank,
-):
-    pid = tl.program_id(0)
-    m_start = tl.load(m_indptr + pid)
-    m_end = tl.load(m_indptr + pid + 1)
-    padded_m_start = tl.load(padded_m_indptr + pid)
-    for i in range(m_end - m_start):
-        tl.store(m_rank + m_start + i, m_start + i)
-        tl.store(padded_m_rank + m_start + i, padded_m_start + i)
-
-
 def group_gemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -877,6 +858,22 @@ def group_gemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
 
+    if (m_indptr % 4 == 0).all():
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+            workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            m_indptr[-1],
+            n,
+            k,
+            *scale_granularity_mnk,
+        )
+        return out
+
     m = m_indptr[1:] - m_indptr[:-1]
     m = m + 3 - (m + 3) % 4
     padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
@@ -887,7 +884,9 @@ def group_gemm_fp8_nt_groupwise(
         (m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device
     )
 
-    compute_padding_map[(batch_size,)](m_indptr, padded_m_indptr, m_rank, padded_m_rank)
+    compute_padding_mapping[(batch_size,)](
+        m_indptr, padded_m_indptr, m_rank, padded_m_rank
+    )
 
     padded_a = torch.zeros((padded_m_indptr[-1], k), dtype=a.dtype, device=a.device)
     padded_out = torch.zeros(
