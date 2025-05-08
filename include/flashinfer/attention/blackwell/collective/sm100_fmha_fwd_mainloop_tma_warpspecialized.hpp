@@ -1015,6 +1015,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
                             typename TensorStorageEpi::SmemLayoutO{});
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+    // correction_epilogue(params.scale_output, _0{}, sO);
 
     cutlass::arch::fence_view_async_tmem_load();
 
@@ -1036,6 +1037,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+    // correction_epilogue(params.scale_output, _1{}, sO);
     cutlass::arch::fence_view_async_tmem_load();
 
     pipeline_o.consumer_release(pipeline_o_consumer_state);

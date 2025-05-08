@@ -38,6 +38,18 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
+                                          int head_idx, int offset, int seq_len) {
+  auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
+                             make_coord(offset, _0{}));
+  auto g_sequence =
+      make_tensor(g_offset.data(),
+                  make_layout(cute::make_shape(seq_len, get<1>(tile_shape)), g_offset.stride()));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
 template <typename Atom, typename TA, typename TB, typename TC>
 CUTE_DEVICE void gemm_reset_zero_acc(Atom& atom, TA const& tA, TB const& tB, TC&& tC) {
   constexpr int rA = decltype(rank(tA))::value;

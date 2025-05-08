@@ -2681,8 +2681,6 @@ def fmha_varlen(
         max_kv_len,
     )
 
-    print(out)
-
     return out, lse
 
 

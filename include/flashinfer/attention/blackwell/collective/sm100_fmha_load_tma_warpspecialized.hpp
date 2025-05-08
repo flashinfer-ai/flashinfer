@@ -43,18 +43,6 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
-template <typename MTensor, typename Shape>
-CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
-                                          int head_idx, int offset, int seq_len) {
-  auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
-                             make_coord(offset, _0{}));
-  auto g_sequence =
-      make_tensor(g_offset.data(),
-                  make_layout(cute::make_shape(seq_len, get<1>(tile_shape)), g_offset.stride()));
-  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
-  return g_tensor;
-}
-
 template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
           class PipelineKV, class Mask, class TileShape>
@@ -141,21 +129,21 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   }
 
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
-  CUTLASS_DEVICE void load(BlkCoord const& blk_coord_in, ProblemShape const& problem_shape,
+  CUTLASS_DEVICE void load(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                            Params const& params, ParamsProblemShape const& params_problem_shape,
                            TensorStorage& storage, PipelineQ& pipeline_q,
                            typename PipelineQ::PipelineState& pipeline_q_producer_state,
                            PipelineKV& pipeline_kv,
                            typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
-    int qo_tile_idx = get<0>(blk_coord_in);
-    int qo_head_idx = get<2, 0>(blk_coord_in);
-    int batch_idx = get<2, 1>(blk_coord_in);
+    int qo_tile_idx = get<0>(blk_coord);
+    int qo_head_idx = get<2, 0>(blk_coord);
+    int batch_idx = get<2, 1>(blk_coord);
     int qo_len = get<0>(problem_shape);
     int kv_len = get<1>(problem_shape);
     int qo_segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
     int kv_segment_offset = get<1>(params_problem_shape).segment_offsets[batch_idx];
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord_in, TileShape{}, problem_shape);
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     using X = Underscore;
 
@@ -201,8 +189,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     uint32_t lane_predicate = cute::elect_one_sync();
 
     // Q1
-    int q0_index = 2 * get<0>(blk_coord_in);
-    int q1_index = 2 * get<0>(blk_coord_in) + 1;
+    int q0_index = 2 * get<0>(blk_coord);
+    int q1_index = 2 * get<0>(blk_coord) + 1;
     pipeline_q.producer_acquire(pipeline_q_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);

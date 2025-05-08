@@ -34,16 +34,20 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "fmha_common.hpp"
 
 namespace cutlass::fmha::collective {
 
-template <class Element, class ElementAcc,
-          class TileShape,  // Q, D, _
-          class StrideO,    // Q, D, B
-          class StrideLSE   // Q, B
-          >
+template <class Element, class ElementAcc, class TileShape>
 struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using Pipeline = cutlass::PipelineAsync<2>;
+  using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
+  using StrideO = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
+  using LayoutO = cute::Layout<ShapeT, StrideO>;
+
+  using ShapeLSE = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>>;
+  using StrideLSE = cute::Shape<_1, cute::Shape<int32_t, int32_t>>;
+  using LayoutLSE = cute::Layout<ShapeLSE, StrideLSE>;
 
   //  using SmemLayoutO = decltypa(make_layout(append<3>(select<0,1>(TileShape_WG{}), _2{})));
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
@@ -59,13 +63,12 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     using SmemLayoutO = SmemLayoutO_;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>> smem_o;
   };
-
   struct Arguments {
     Element* ptr_O;
-    StrideO dO;
+    LayoutO layout_O;
 
     ElementAcc* ptr_LSE;
-    StrideLSE dLSE;
+    LayoutLSE layout_LSE;
   };
 
   using TMA_O = decltype(make_tma_copy(
@@ -74,36 +77,28 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
   struct Params {
     TMA_O tma_store_o;
+    LayoutO layout_O;
     ElementAcc* ptr_LSE;
+    LayoutLSE layout_LSE;
   };
 
   template <class ProblemShape>
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args,
                                         void* workspace = nullptr) {
+    static_assert(is_variable_length_v<tuple_element_t<0, ProblemShape>>);
     auto ptr_O = args.ptr_O;
-    StrideO dO = args.dO;
-    auto problem_shape_O = select<0, 2, 3>(problem_shape);
+    LayoutO layout_O = args.layout_O;
 
-    if constexpr (is_variable_length_v<tuple_element_t<0, ProblemShape>>) {
-      auto segment_offsets_q = get<0>(problem_shape).segment_offsets;
-      if (segment_offsets_q != nullptr) {
-        int max_length_q = get<0>(problem_shape).max_length;
-        // for variable sequence lenght, the batch is in units of row_stride
-        get<2, 1>(dO) = get<0>(dO);
-        get<2, 1>(problem_shape_O) = max_length_q * (1 + get<2, 1>(problem_shape_O));
-        // offset ptr by the amount we add back in later
-        ptr_O -= max_length_q * get<0>(dO);
-      }
-    }
-
+    print("mO:\t");
+    print(make_tensor(ptr_O, layout_O));
+    print("\n");
     print("SmemLayoutO:\t");
     print(SmemLayoutO{}(_, _, _0{}));
     print("\n");
+    auto tma_store_o =
+        make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, layout_O), SmemLayoutO{}(_, _, _0{}));
 
-    auto tma_store_o = make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, problem_shape_O, dO),
-                                     SmemLayoutO{}(_, _, _0{}));
-
-    return {tma_store_o, args.ptr_LSE};
+    return {tma_store_o, layout_O, args.ptr_LSE, args.layout_LSE};
   }
 
   CUTLASS_DEVICE
@@ -112,11 +107,15 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   }
 
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
-  CUTLASS_DEVICE auto store(BlkCoord const& blk_coord_in, ProblemShape const& problem_shape,
+  CUTLASS_DEVICE auto store(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                             Params const& params, ParamsProblemShape const& params_problem_shape,
                             TensorStorage& shared_storage, Pipeline& pipeline,
                             typename Pipeline::PipelineState& pipeline_consumer_state) {
-    BlkCoord blk_coord = blk_coord_in;
+    int qo_tile_idx = get<0>(blk_coord);
+    int qo_head_idx = get<2, 0>(blk_coord);
+    int batch_idx = get<2, 1>(blk_coord);
+    int qo_len = get<0>(problem_shape);
+    int qo_segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
     uint32_t lane_predicate = cute::elect_one_sync();
 
     using X = Underscore;
@@ -128,28 +127,10 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     // Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
     //                                         qo_len)(_, qo_tile_idx);
 
-    Tensor mO_qdl_p = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
-    // offset mode 0 by (max_length - real_length)
-    // offset mode 3,1 by segment_offsets + real_length
-    // the ptr is already offset by - max_length
-    // so in total this achieves
-    int offs_0 = 0;
-    int offs_2_1 = 0;
+    Tensor mO = params.tma_store_o.get_tma_tensor(params.layout_O.shape());
 
-    if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
-      auto segment_offsets_q = get<0>(params_problem_shape).segment_offsets;
-      if (segment_offsets_q != nullptr) {
-        int max_length_q = get<0>(params_problem_shape).max_length;
-        offs_0 = max_length_q - get<0>(problem_shape);
-        offs_2_1 = segment_offsets_q[get<2, 1>(blk_coord)] + get<0>(problem_shape);
-        get<2, 1>(blk_coord) = 0;
-      }
-    }
-
-    Tensor mO_qdl = domain_offset(make_coord(offs_0, _0{}, make_coord(_0{}, offs_2_1)), mO_qdl_p);
-
-    Tensor gO_qdl = local_tile(mO_qdl, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
-    Tensor gO = gO_qdl(_, _, _, _0{}, get<2>(blk_coord));
+    auto gO = get_local_tile_tensor(mO, select<0, 1>(TileShape{}), qo_head_idx, qo_segment_offset,
+                                    qo_len);
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto block_tma = params.tma_store_o.get_slice(0);
     Tensor tOsO = block_tma.partition_S(sO);
