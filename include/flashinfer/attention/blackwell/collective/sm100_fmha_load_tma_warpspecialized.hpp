@@ -169,8 +169,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                                     qo_len);  // (Q, D, _)
     auto gK = get_local_tile_tensor(mK, select<1, 2>(TileShapeQK{}), qo_head_idx, kv_segment_offset,
                                     kv_len);  // (K, D, _)
-    auto gV = get_local_tile_tensor(mV, select<2, 1>(TileShapePV{}), qo_head_idx, kv_segment_offset,
-                                    kv_len);  // (K, D, _)
+    auto gV =
+        get_local_tile_t_tensor(mV, select<1, 2>(TileShapePV{}), qo_head_idx, kv_segment_offset,
+                                kv_len);  // (K, D, _)
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
     Tensor tSgQ_qdl = mma_qk.partition_A(gQ);

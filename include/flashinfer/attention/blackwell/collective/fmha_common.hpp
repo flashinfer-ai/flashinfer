@@ -41,12 +41,26 @@ using namespace cute;
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
                                           int head_idx, int offset, int seq_len) {
+  // (N, D, H)
   auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
                              make_coord(offset, _0{}));
   auto g_sequence =
       make_tensor(g_offset.data(),
                   make_layout(cute::make_shape(seq_len, get<1>(tile_shape)), g_offset.stride()));
   auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto get_local_tile_t_tensor(const MTensor& m_tensor, const Shape& tile_shape,
+                                            int head_idx, int offset, int seq_len) {
+  // (D, N, H)
+  auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(get<0>(tile_shape), 1),
+                             make_coord(_0{}, offset));
+  auto g_sequence =
+      make_tensor(g_offset.data(),
+                  make_layout(cute::make_shape(get<0>(tile_shape), seq_len), g_offset.stride()));
+  auto g_tensor = local_tile(g_offset, tile_shape, make_coord(_0{}, _));
   return g_tensor;
 }
 
