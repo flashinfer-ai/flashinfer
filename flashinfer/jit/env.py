@@ -25,6 +25,12 @@ import warnings
 
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
+FLASHINFER_BASE_DIR = pathlib.Path(
+    os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
+)
+
+FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+
 
 def _get_workspace_dir_name() -> pathlib.Path:
     try:
@@ -37,11 +43,8 @@ def _get_workspace_dir_name() -> pathlib.Path:
         arch = "_".join(sorted(set(re.findall(r"compute_(\d+)", "".join(flags)))))
     except Exception:
         arch = "noarch"
-    flashinfer_base = os.getenv(
-        "FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix()
-    )
     # e.g.: $HOME/.cache/flashinfer/75_80_89_90/
-    return pathlib.Path(flashinfer_base) / ".cache" / "flashinfer" / arch
+    return FLASHINFER_CACHE_DIR / arch
 
 
 # use pathlib

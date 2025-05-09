@@ -17,9 +17,13 @@ limitations under the License.
 import os
 import platform
 import re
+import shutil
 import subprocess
+import tempfile
+from functools import wraps
 from pathlib import Path
 
+import pybind11
 import setuptools
 
 root = Path(__file__).parent.resolve()
@@ -51,8 +55,23 @@ def generate_build_meta(aot_build_meta: dict) -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["numpy", "torch", "ninja"]
+install_requires = ["numpy", "torch", "ninja", "pybind11"]
 generate_build_meta({})
+
+cubin_utils_sources = [
+    "csrc/cubin_loader.cc",
+]
+
+ext_modules.append(
+    setuptools.Extension(
+        name="flashinfer.cubin_utils",
+        sources=cubin_utils_sources,
+        language="c++",
+        include_dirs=[pybind11.get_include()],
+        # py_limited_api=True,
+    )
+)
+
 
 if enable_aot:
     import torch
