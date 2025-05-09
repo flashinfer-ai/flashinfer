@@ -18,10 +18,14 @@ import argparse
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from functools import wraps
 from pathlib import Path
 
+import pybind11
 import setuptools
 
 root = Path(__file__).parent.resolve()
@@ -137,8 +141,23 @@ def generate_cuda() -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["numpy", "torch", "ninja"]
+install_requires = ["numpy", "torch", "ninja", "pybind11"]
 generate_build_meta({})
+
+cubin_utils_sources = [
+    "csrc/cubin_loader.cc",
+]
+
+ext_modules.append(
+    setuptools.Extension(
+        name="flashinfer.cubin_utils",
+        sources=cubin_utils_sources,
+        language="c++",
+        include_dirs=[pybind11.get_include()],
+        # py_limited_api=True,
+    )
+)
+
 
 if enable_aot:
     import torch
@@ -164,6 +183,46 @@ if enable_aot:
 
             super().__init__(*args, **kwargs)
 
+    def patch_tempdir(cls):
+        """Decorator to patch all temp directory creation in BuildExtension"""
+        original_build_ext = cls.build_extension
+
+        @wraps(original_build_ext)
+        def new_build_ext(self, ext):
+            # Set our fixed build directory
+            build_cache = Path(__file__).parent / ".build_cache"
+            build_cache.mkdir(exist_ok=True)
+
+            # Patch both tempfile and os.environ
+            original_tempdir = tempfile.gettempdir()
+            original_tmpdir = os.environ.get("TMPDIR", "")
+
+            try:
+                tempfile.tempdir = str(build_cache)
+                os.environ["TMPDIR"] = str(build_cache)
+
+                # Also patch ninja's temp dir if used
+                if hasattr(self, "build_temp"):
+                    self.build_temp = str(build_cache / "ninja_temp")
+
+                return original_build_ext(self, ext)
+            finally:
+                tempfile.tempdir = original_tempdir
+                if original_tmpdir:
+                    os.environ["TMPDIR"] = original_tmpdir
+                else:
+                    os.environ.pop("TMPDIR", None)
+
+        cls.build_extension = new_build_ext
+        return cls
+
+    @patch_tempdir
+    class FixedTempBuildExtension(torch_cpp_ext.BuildExtension):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Force ninja to use our directory
+            self.build_temp = str(Path(__file__).parent / ".build_cache" / "ninja_temp")
+
     # cuda arch check for fp8 at the moment.
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
         arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
@@ -177,7 +236,8 @@ if enable_aot:
     cuda_version = get_cuda_version()
     torch_full_version = Version(torch.__version__)
     torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
-    cmdclass["build_ext"] = NinjaBuildExtension
+    # cmdclass["build_ext"] = NinjaBuildExtension
+    cmdclass["build_ext"] = FixedTempBuildExtension
     install_requires = [f"torch == {torch_version}.*"]
 
     aot_build_meta = {}
@@ -230,6 +290,7 @@ if enable_aot:
         "-DPy_LIMITED_API=0x03080000",
     ]
     libraries = [
+        "cuda",
         "cublas",
         "cublasLt",
     ]

@@ -1400,3 +1400,14 @@ def gen_fmha_cutlass_sm100a_module(
         source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
+
+
+def trtllm_fmha_gen_module():
+    return load_cuda_ops(
+        "fmha_gen",
+        [
+            FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
+            FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
+        ],
+        extra_ldflags=["-lcuda"],
+    )

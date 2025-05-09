@@ -6,7 +6,7 @@ from setuptools.build_meta import *  # noqa: F403
 
 
 def _get_requires_for_build():
-    requires = []
+    requires = ["pybind11"]
     if os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1":
         requires += ["torch", "ninja", "numpy"]
     return requires
