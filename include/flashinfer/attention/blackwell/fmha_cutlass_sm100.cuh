@@ -48,11 +48,13 @@ struct FwdRunner {
   using ProblemShapeVarlen =
       cute::tuple<VariableLength, VariableLength, int, cute::tuple<cute::tuple<int, int>, int>>;
 
-  using StrideQ = cute::tuple<int, _1, cute::tuple<int, int>>;  // Q D (H_G H_R B)
-  using StrideK = cute::tuple<int, _1, cute::tuple<_0, int>>;   // K D (H_G H_R B)
-  using StrideV = cute::tuple<_1, int, cute::tuple<_0, int>>;   // D V (H_G H_R B)
-  using StrideO = cute::tuple<int, _1, cute::tuple<int, int>>;
-  using StrideLSE = cute::tuple<_1, cute::tuple<int, int>>;  // Q (H_G H_R)
+  using StrideQ = cute::tuple<int, _1, cute::tuple<int, int>>;  // Q D (H_G H_R)
+  using StrideK = cute::tuple<int, _1, cute::tuple<_0, int>>;   // K D (H_G H_R)
+  using StrideV = cute::tuple<_1, int, cute::tuple<_0, int>>;   // D V (H_G H_R)
+  // NOTE(Zihao): use markus's trick for tma store
+  using StrideO =
+      cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;  // Q D (H_G H_R) CUMULATIVE_Q
+  using StrideLSE = cute::tuple<_1, cute::tuple<int, int>>;           // Q (H_G H_R)
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShape, StrideQ, StrideK, StrideV,
@@ -94,27 +96,31 @@ struct FwdRunner {
         head_dim, cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
 
     stride_Q = make_stride(num_qo_heads * head_dim, _1{}, make_stride(head_dim, h_r * head_dim));
-    stride_O = stride_Q;
+    stride_O =
+        make_stride(num_qo_heads * head_dim, _1{},
+                    make_stride(make_stride(head_dim, h_r * head_dim), num_qo_heads * head_dim));
     stride_K = make_stride(num_kv_heads * head_dim, _1{}, make_stride(_0{}, head_dim));
     stride_V = make_stride(_1{}, num_kv_heads * head_dim, make_stride(_0{}, head_dim));
     stride_LSE = make_stride(_1{}, make_stride(total_qo_len, total_qo_len * h_r));
 
-    LayoutQ layout_Q =
-        make_layout(make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads)), stride_Q);
-    LayoutK layout_K =
-        make_layout(make_shape(total_kv_len, head_dim, make_shape(h_r, num_kv_heads)), stride_K);
-    LayoutV layout_V =
-        make_layout(make_shape(head_dim, total_kv_len, make_shape(h_r, num_kv_heads)), stride_V);
-    LayoutO layout_O =
-        make_layout(make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads)), stride_O);
-    LayoutLSE layout_LSE =
-        make_layout(make_shape(total_qo_len, make_shape(h_r, num_kv_heads)), stride_LSE);
+    auto shape_Q = make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads));
+    auto shape_O = make_shape(max_qo_len, head_dim,
+                              make_shape(make_shape(h_r, num_kv_heads), max_qo_len + total_qo_len));
+    auto shape_K = make_shape(total_kv_len, head_dim, make_shape(h_r, num_kv_heads));
+    auto shape_V = make_shape(head_dim, total_kv_len, make_shape(h_r, num_kv_heads));
+    auto shape_LSE = make_shape(total_qo_len, make_shape(h_r, num_kv_heads));
+
+    LayoutQ layout_Q = make_layout(shape_Q, stride_Q);
+    LayoutK layout_K = make_layout(shape_K, stride_K);
+    LayoutV layout_V = make_layout(shape_V, stride_V);
+    LayoutO layout_O = make_layout(shape_O, stride_O);
+    LayoutLSE layout_LSE = make_layout(shape_LSE, stride_LSE);
 
     typename Operation::Arguments arguments{
         problem_shape,
         {static_cast<Element*>(q.data_ptr()), layout_Q, static_cast<Element*>(k.data_ptr()),
          layout_K, static_cast<Element*>(v.data_ptr()), layout_V},
-        {static_cast<ElementOut*>(o.data_ptr()), layout_O,
+        {static_cast<ElementOut*>(o.data_ptr()) - max_qo_len * get<0>(stride_O), layout_O,
          static_cast<ElementAccumulatorPV*>(maybe_lse.value().data_ptr()), layout_LSE},
         hw_info};
 

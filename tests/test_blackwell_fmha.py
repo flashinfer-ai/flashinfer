@@ -86,12 +86,17 @@ def test_blackwell_cutlass_fmha(
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
     )
 
-    k = torch.zeros(
+    k = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
     v = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
+    # v = torch.arange(
+    #     head_dim,
+    #     dtype=dtype,
+    #     device="cuda",
+    # ).repeat(batch_size * kv_len, num_kv_heads, 1)
     kv_indptr = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
     )
@@ -125,9 +130,6 @@ def test_blackwell_cutlass_fmha(
     )
 
     lse_ref = lse_ref.flatten(0, 1)
-    print(o.shape)
-    print(o[:, :, :64])
-    print(o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
     # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
@@ -145,8 +147,8 @@ def test_blackwell_cutlass_fmha(
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         3,
+        1,
         17,
-        19,
         16,
         8,
         128,

@@ -41,8 +41,11 @@ namespace cutlass::fmha::collective {
 template <class Element, class ElementAcc, class TileShape>
 struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using Pipeline = cutlass::PipelineAsync<2>;
-  using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
-  using StrideO = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
+  // using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
+  // using StrideO = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
+  // using LayoutO = cute::Layout<ShapeT, StrideO>;
+  using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t>>;
+  using StrideO = cute::Shape<int32_t, _1, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t>>;
   using LayoutO = cute::Layout<ShapeT, StrideO>;
 
   using ShapeLSE = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>>;
@@ -120,11 +123,22 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     // Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), params.layout_LSE);
     // Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
     //                                         qo_len)(_, qo_tile_idx);
+    int max_length_q = get<0>(params_problem_shape).max_length;
+    int offs_0 = max_length_q - qo_len;
+    int offs_2_1 = qo_segment_offset + qo_len;
+    BlkCoord blk_coord_updated = blk_coord;
+    get<2, 1>(blk_coord_updated) = 0;
 
     Tensor mO = params.tma_store_o.get_tma_tensor(params.layout_O.shape());
 
-    auto gO = get_local_tile_tensor(mO, select<0, 1>(TileShape{}), qo_head_idx, qo_segment_offset,
-                                    qo_len);
+    Tensor mO_qdl = domain_offset(make_coord(offs_0, _0{}, make_coord(_0{}, offs_2_1)), mO);
+
+    Tensor gO_qdl = local_tile(mO_qdl, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
+    Tensor gO = gO_qdl(_, _, _, _0{}, get<2>(blk_coord_updated));
+
+    // auto gO = get_local_tile_tensor(mO, select<0, 1>(TileShape{}), qo_head_idx,
+    // qo_segment_offset,
+    //                                 qo_len);
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto block_tma = params.tma_store_o.get_slice(0);
     Tensor tOsO = block_tma.partition_S(sO);

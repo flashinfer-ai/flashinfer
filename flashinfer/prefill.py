@@ -2647,12 +2647,12 @@ def fmha_varlen(
 
     if out is None:
         out = torch.empty(
-            qo_total_len,
+            qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
             head_dim_vo,
             device=q.device,
             dtype=q.dtype,
-        )
+        )[max(max_qo_len, 128) :]
 
     if lse is None:
         lse = torch.empty(
