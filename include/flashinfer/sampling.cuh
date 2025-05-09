@@ -1226,7 +1226,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
                                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
         logits, row_idx, d, temp_storage);
 
-    double low = (min_val == -cuda::std::numeric_limits<DType>::infinity())
+    double low = (min_val == -cuda::std::numeric_limits<float>::infinity())
                      ? cuda::std::numeric_limits<DType>::lowest()
                      : min_val - 1,
            high = max_val;
