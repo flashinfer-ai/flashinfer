@@ -17,6 +17,8 @@ limitations under the License.
 import ctypes
 import os
 
+from . import cubin_loader
+
 # Re-export
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
@@ -55,6 +57,7 @@ from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
+from .attention import trtllm_fmha_gen_module as trtllm_fmha_gen_module
 from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
