@@ -1227,7 +1227,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
         logits, row_idx, d, temp_storage);
 
     double low = (min_val == -cuda::std::numeric_limits<float>::infinity())
-                     ? cuda::std::numeric_limits<DType>::lowest()
+                     ? cuda::std::numeric_limits<float>::lowest()
                      : min_val - 1,
            high = max_val;
     float min_gt_low, max_le_high;
