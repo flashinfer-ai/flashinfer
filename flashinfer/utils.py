@@ -361,8 +361,8 @@ def is_sm90a_supported(device: torch.device) -> bool:
 
 
 def is_sm100a_supported(device: torch.device) -> bool:
-    major, minor = get_compute_capability(device)
-    return major == 10 and minor == 0 and torch.version.cuda >= "12.9"
+    major, _ = get_compute_capability(device)
+    return major == 10 and torch.version.cuda >= "12.8"
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -388,3 +388,7 @@ def _check_shape_dtype_device(
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
+
+
+def pad_to_multiple_of(x: torch.Tensor, multiple_of: int) -> torch.Tensor:
+    return (x + multiple_of - 1) // multiple_of * multiple_of

@@ -43,6 +43,7 @@ from .attention import (
 from .attention import (
     gen_customize_single_prefill_module as gen_customize_single_prefill_module,
 )
+from .attention import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_module
 from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_sampling_tvm_binding as gen_sampling_tvm_binding
 from .attention import gen_single_decode_module as gen_single_decode_module
