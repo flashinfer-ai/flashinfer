@@ -1340,3 +1340,14 @@ def gen_customize_batch_prefill_module(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+
+
+def trtllm_fmha_gen_module():
+    return load_cuda_ops(
+        "fmha_gen",
+        [
+            FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
+            FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
