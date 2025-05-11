@@ -46,13 +46,6 @@ def run_bench(
         device, dtype=torch.bfloat16
     )
 
-    if page_block_size == 1:
-        q_d = q[: d_q_indptr[-1]]
-        kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
-        q_p = q[d_q_indptr[-1] :]
-        k_p, v_p = kv_data[d_kv_indptr[-1] :].unbind(1)
-        k_p, v_p = k_p.squeeze(1), v_p.squeeze(1)
-
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     kv_layout = "NHD"
 
@@ -78,6 +71,12 @@ def run_bench(
     ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
 
     if len(p_kv_lens) > 0:
+        q_d = q[: d_q_indptr[-1]]
+        kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
+        q_p = q[d_q_indptr[-1] :]
+        k_p, v_p = kv_data[d_kv_indptr[-1] :].unbind(1)
+        k_p, v_p = k_p.squeeze(1), v_p.squeeze(1)
+
         last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
         wrapper_pod = flashinfer.PODWithPagedKVCacheWrapper(
             workspace_buffer,
