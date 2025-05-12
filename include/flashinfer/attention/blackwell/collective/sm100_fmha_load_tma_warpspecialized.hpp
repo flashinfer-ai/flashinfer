@@ -45,13 +45,14 @@ using namespace cute;
 
 template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
-          class PipelineKV, class Mask, class TileShape>
+          class PipelineK, class PipelineV, class Mask, class TileShape>
 struct Sm100FmhaLoadTmaWarpspecialized {
   using TileShapeQK = typename CollectiveMmaQK::TileShape;
   using TileShapePV = typename CollectiveMmaPV::TileShape;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
   using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
+  static constexpr uint32_t NumStagesQ = PipelineQ::Stages;
 
   // (N, D, (H_R, H_G))
   using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
@@ -135,8 +136,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                            Params const& params, ParamsProblemShape const& params_problem_shape,
                            TensorStorage& storage, PipelineQ& pipeline_q,
                            typename PipelineQ::PipelineState& pipeline_q_producer_state,
-                           PipelineKV& pipeline_kv,
-                           typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
+                           PipelineK& pipeline_k,
+                           typename PipelineK::PipelineState& pipeline_k_producer_state,
+                           PipelineV& pipeline_v,
+                           typename PipelineV::PipelineState& pipeline_v_producer_state) {
     int qo_tile_idx = get<0>(blk_coord);
     int qo_head_idx = get<2, 0>(blk_coord);
     int batch_idx = get<2, 1>(blk_coord);
@@ -204,13 +207,14 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
     // K1
     int k_index = 0;
-    pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+    pipeline_k.producer_acquire(pipeline_k_producer_state);
     if (lane_predicate) {
-      auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
+      auto tma_barrier = pipeline_k.producer_get_barrier(pipeline_k_producer_state);
       copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
-           tKsK(_, pipeline_kv_producer_state.index()));
+           tKsK(_, pipeline_k_producer_state.index()));
     }
-    ++pipeline_kv_producer_state;
+    ++pipeline_k_producer_state;
+    k_index += 1;
 
     // Q2
     pipeline_q.producer_acquire(pipeline_q_producer_state);
@@ -222,36 +226,38 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // V1
-    pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+    int v_index = 0;
+    pipeline_v.producer_acquire(pipeline_v_producer_state);
     if (lane_predicate) {
-      auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-      copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, k_index),
-           tVsV(_, pipeline_kv_producer_state.index()));
+      auto tma_barrier = pipeline_v.producer_get_barrier(pipeline_v_producer_state);
+      copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, v_index),
+           tVsV(_, pipeline_v_producer_state.index()));
     }
-    ++pipeline_kv_producer_state;
-    k_index += 1;
+    ++pipeline_v_producer_state;
+    v_index += 1;
 
     // loop:
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       // Ki
-      pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+      pipeline_k.producer_acquire(pipeline_k_producer_state);
       if (lane_predicate) {
-        auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
+        auto tma_barrier = pipeline_k.producer_get_barrier(pipeline_k_producer_state);
         copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
-             tKsK(_, pipeline_kv_producer_state.index()));
+             tKsK(_, pipeline_k_producer_state.index()));
       }
-      ++pipeline_kv_producer_state;
+      ++pipeline_k_producer_state;
+      k_index += 1;
 
       // Vi
-      pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+      pipeline_v.producer_acquire(pipeline_v_producer_state);
       if (lane_predicate) {
-        auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-        copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, k_index),
-             tVsV(_, pipeline_kv_producer_state.index()));
+        auto tma_barrier = pipeline_v.producer_get_barrier(pipeline_v_producer_state);
+        copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, v_index),
+             tVsV(_, pipeline_v_producer_state.index()));
       }
-      ++pipeline_kv_producer_state;
-      k_index += 1;
+      ++pipeline_v_producer_state;
+      v_index += 1;
     }
   }
 };

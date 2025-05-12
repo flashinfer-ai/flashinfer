@@ -102,12 +102,15 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   using TmemAllocator = cute::TMEM::Allocator1Sm;
 
   struct SharedStorage {
-    typename CollectiveMainloop::TensorStorage mainloop;
-    typename CollectiveEpilogue::TensorStorage epilogue;
+    union {
+      typename CollectiveMainloop::TensorStorage mainloop;
+      typename CollectiveEpilogue::TensorStorage epilogue;
+    };
 
     struct PipelineStorage {
       alignas(16) typename CollectiveMainloop::PipelineQ::SharedStorage load_q;
-      alignas(16) typename CollectiveMainloop::PipelineKV::SharedStorage load_kv;
+      alignas(16) typename CollectiveMainloop::PipelineK::SharedStorage load_k;
+      alignas(16) typename CollectiveMainloop::PipelineV::SharedStorage load_v;
       alignas(16) typename CollectiveMainloop::PipelineS::SharedStorage mma_s0;
       alignas(16) typename CollectiveMainloop::PipelineS::SharedStorage mma_s1;
       alignas(16) typename CollectiveMainloop::PipelineC::SharedStorage s0_corr;
@@ -117,6 +120,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       alignas(16) typename CollectiveMainloop::OrderBarrierSoftmax::SharedStorage order_s01;
     } pipelines;
 
+    cutlass::arch::ClusterBarrier barrier_O;
     uint32_t tmem_base_ptr;
   };
 
@@ -202,17 +206,25 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         shared_storage.pipelines.load_q, pipeline_load_q_params, ClusterShape{}, cute::true_type{},
         /*mask calc*/ cute::false_type{});
 
-    typename CollectiveMainloop::PipelineKV::Params pipeline_load_kv_params;
+    typename CollectiveMainloop::PipelineK::Params pipeline_load_k_params;
+    typename CollectiveMainloop::PipelineV::Params pipeline_load_v_params;
     if (role == WarpRole::Load) {
-      pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Producer;
+      pipeline_load_k_params.role = CollectiveMainloop::PipelineK::ThreadCategory::Producer;
+      pipeline_load_v_params.role = CollectiveMainloop::PipelineV::ThreadCategory::Producer;
     }
     if (role == WarpRole::MMA) {
-      pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Consumer;
+      pipeline_load_k_params.role = CollectiveMainloop::PipelineK::ThreadCategory::Consumer;
+      pipeline_load_v_params.role = CollectiveMainloop::PipelineV::ThreadCategory::Consumer;
     }
-    pipeline_load_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
-    pipeline_load_kv_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadKV;
-    typename CollectiveMainloop::PipelineKV pipeline_load_kv(
-        shared_storage.pipelines.load_kv, pipeline_load_kv_params, ClusterShape{},
+    pipeline_load_k_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    pipeline_load_v_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    pipeline_load_k_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadK;
+    pipeline_load_v_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadV;
+    typename CollectiveMainloop::PipelineK pipeline_load_k(
+        shared_storage.pipelines.load_k, pipeline_load_k_params, ClusterShape{},
+        /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
+    typename CollectiveMainloop::PipelineV pipeline_load_v(
+        shared_storage.pipelines.load_v, pipeline_load_v_params, ClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s0_params;
@@ -298,10 +310,15 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     TmemAllocator tmem_allocator;
 
+    if (role == WarpRole::Load && lane_predicate) {
+      shared_storage.barrier_O.init(/*num_threads=*/1);
+    }
+
     __syncthreads();
 
     pipeline_load_q.init_masks(ClusterShape{});
-    pipeline_load_kv.init_masks(ClusterShape{});
+    pipeline_load_k.init_masks(ClusterShape{});
+    pipeline_load_v.init_masks(ClusterShape{});
     pipeline_mma_s0.init_masks(ClusterShape{});
     pipeline_mma_s1.init_masks(ClusterShape{});
     pipeline_mma_corr.init_masks(ClusterShape{});
@@ -310,9 +327,13 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_producer_state =
         cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineQ>();
 
-    typename CollectiveMainloop::PipelineKV::PipelineState pipeline_load_kv_consumer_state;
-    typename CollectiveMainloop::PipelineKV::PipelineState pipeline_load_kv_producer_state =
-        cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineKV>();
+    typename CollectiveMainloop::PipelineK::PipelineState pipeline_load_k_consumer_state;
+    typename CollectiveMainloop::PipelineK::PipelineState pipeline_load_k_producer_state =
+        cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineK>();
+
+    typename CollectiveMainloop::PipelineV::PipelineState pipeline_load_v_consumer_state;
+    typename CollectiveMainloop::PipelineV::PipelineState pipeline_load_v_producer_state =
+        cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineV>();
 
     typename CollectiveMainloop::PipelineS::PipelineState pipeline_mma_s0_consumer_state;
     typename CollectiveMainloop::PipelineS::PipelineState pipeline_mma_s0_producer_state =
@@ -411,18 +432,21 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        mainloop.mma(blk_coord, params.mainloop, logical_problem_shape, shared_storage.mainloop,
-                     pipeline_load_q, pipeline_load_q_consumer_state, pipeline_load_kv,
-                     pipeline_load_kv_consumer_state, pipeline_mma_s0,
-                     pipeline_mma_s0_producer_state, pipeline_mma_s1,
-                     pipeline_mma_s1_producer_state, pipeline_mma_corr,
-                     pipeline_mma_corr_producer_state);
+        mainloop.mma(
+            blk_coord, params.mainloop, logical_problem_shape, shared_storage.mainloop,
+            pipeline_load_q, pipeline_load_q_consumer_state, pipeline_load_k,
+            pipeline_load_k_consumer_state, pipeline_load_v, pipeline_load_v_consumer_state,
+            pipeline_mma_s0, pipeline_mma_s0_producer_state, pipeline_mma_s1,
+            pipeline_mma_s1_producer_state, pipeline_mma_corr, pipeline_mma_corr_producer_state);
       }
     } else if (role == WarpRole::Load) {
       warpgroup_reg_set<NumRegsOther>();
 
+      int work_idx = 0;
+
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+        shared_storage.barrier_O.wait((work_idx + 1) % 2);
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape =
@@ -434,13 +458,22 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         mainloop.load(blk_coord, logical_problem_shape, params.mainloop, params.problem_shape,
                       shared_storage.mainloop, pipeline_load_q, pipeline_load_q_producer_state,
-                      pipeline_load_kv, pipeline_load_kv_producer_state);
+                      pipeline_load_k, pipeline_load_k_producer_state, pipeline_load_v,
+                      pipeline_load_v_producer_state);
+
+        work_idx++;
       }
     } else if (role == WarpRole::Epilogue) {
       warpgroup_reg_set<NumRegsOther>();
 
+      int work_idx = 0;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+        if (work_idx != 0) {
+          if (lane_predicate) {
+            shared_storage.barrier_O.arrive(0, lane_predicate);
+          }
+        }
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape =
@@ -453,6 +486,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         epilogue.store(blk_coord, logical_problem_shape, params.epilogue, params.problem_shape,
                        shared_storage.epilogue, pipeline_corr_epi,
                        pipeline_corr_epi_consumer_state);
+        work_idx++;
       }
 
       static_assert(NumWarpsEpilogue <= 1);

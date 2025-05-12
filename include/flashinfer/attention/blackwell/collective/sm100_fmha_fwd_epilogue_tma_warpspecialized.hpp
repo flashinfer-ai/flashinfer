@@ -123,6 +123,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     // Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), params.layout_LSE);
     // Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
     //                                         qo_len)(_, qo_tile_idx);
+
     int max_length_q = get<0>(params_problem_shape).max_length;
     int offs_0 = max_length_q - qo_len;
     int offs_2_1 = qo_segment_offset + qo_len;

@@ -2674,6 +2674,7 @@ def fmha_varlen(
         num_qo_heads,
         num_kv_heads,
         head_dim_qk,
+        head_dim_vo,
         batch_size,
         nnz_qo,
         nnz_kv,

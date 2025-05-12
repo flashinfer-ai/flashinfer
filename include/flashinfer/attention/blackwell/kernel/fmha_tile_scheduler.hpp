@@ -80,6 +80,53 @@ struct IndividualTileScheduler {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct NaiveTileScheduler {
+  struct Params {
+    int num_qo_tiles;
+    int batch_size;
+    int num_qo_heads;
+  };
+
+  int qo_tile_idx;
+  int batch_idx;
+  int qo_head_idx;
+  bool is_valid_tile;
+
+  CUTLASS_DEVICE
+  NaiveTileScheduler(Params const& params)
+      : qo_tile_idx(blockIdx.x),
+        batch_idx(blockIdx.y),
+        qo_head_idx(blockIdx.z),
+        is_valid_tile(true) {}
+
+  template <class ProblemSize, class ClusterShape, class TileShape>
+  static Params to_underlying_arguments(ProblemSize const& problem_size, KernelHardwareInfo hw_info,
+                                        ClusterShape const& cluster_shape,
+                                        TileShape const& tile_shape) {
+    return Params{ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<3, 0>(problem_size),
+                  size<3, 1>(problem_size)};
+  }
+
+  static dim3 get_grid_shape(Params const& params) {
+    dim3 grid(params.num_qo_tiles, params.batch_size, params.num_qo_heads);
+    return grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() { return is_valid_tile; }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    return make_coord(qo_tile_idx, _0{}, make_coord(batch_idx, qo_head_idx));
+  }
+
+  CUTLASS_DEVICE
+  NaiveTileScheduler& operator++() {
+    is_valid_tile = false;
+    return *this;
+  }
+};
+
 struct PersistentTileScheduler {
   struct Params {
     int num_blocks;

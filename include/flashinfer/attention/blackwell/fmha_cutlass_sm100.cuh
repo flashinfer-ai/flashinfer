@@ -37,12 +37,13 @@ using namespace cutlass::fmha::collective;
 using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::device;
 
-template <class TileShape, class DispatchPolicy, class ActiveMask>
+template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
+          class DispatchPolicy, class ActiveMask>
 struct FwdRunner {
-  using Element = cutlass::half_t;
+  using Element = DTypeIn;
   using ElementAccumulatorQK = float;
   using ElementAccumulatorPV = float;
-  using ElementOut = cutlass::half_t;
+  using ElementOut = DTypeOut;
 
   // Q K D ((H_R, H_KV), B)
   using ProblemShapeVarlen =
@@ -57,8 +58,8 @@ struct FwdRunner {
   using StrideLSE = cute::tuple<_1, cute::tuple<int, int>>;           // Q (H_G H_R)
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
-      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShape, StrideQ, StrideK, StrideV,
-      ActiveMask>;
+      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
+      StrideK, StrideV, ActiveMask>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV>;
   using Operation =
@@ -73,8 +74,8 @@ struct FwdRunner {
   void run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens, at::Tensor kv_lens,
            at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets, at::Tensor o,
            std::optional<at::Tensor> maybe_lse, int mask_mode_code, double sm_scale,
-           int num_qo_heads, int num_kv_heads, int head_dim, int batch_size, int total_qo_len,
-           int total_kv_len, int max_qo_len, int max_kv_len) {
+           int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo, int batch_size,
+           int total_qo_len, int total_kv_len, int max_qo_len, int max_kv_len) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -93,21 +94,22 @@ struct FwdRunner {
                        static_cast<int*>(qo_lens.data_ptr())},
         VariableLength{max_kv_len, static_cast<int*>(kv_segment_offsets.data_ptr()),
                        static_cast<int*>(kv_lens.data_ptr())},
-        head_dim, cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
+        head_dim_qk, cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
 
-    stride_Q = make_stride(num_qo_heads * head_dim, _1{}, make_stride(head_dim, h_r * head_dim));
-    stride_O =
-        make_stride(num_qo_heads * head_dim, _1{},
-                    make_stride(make_stride(head_dim, h_r * head_dim), num_qo_heads * head_dim));
-    stride_K = make_stride(num_kv_heads * head_dim, _1{}, make_stride(_0{}, head_dim));
-    stride_V = make_stride(_1{}, num_kv_heads * head_dim, make_stride(_0{}, head_dim));
+    stride_Q =
+        make_stride(num_qo_heads * head_dim_qk, _1{}, make_stride(head_dim_qk, h_r * head_dim_qk));
+    stride_O = make_stride(
+        num_qo_heads * head_dim_vo, _1{},
+        make_stride(make_stride(head_dim_vo, h_r * head_dim_vo), num_qo_heads * head_dim_vo));
+    stride_K = make_stride(num_kv_heads * head_dim_qk, _1{}, make_stride(_0{}, head_dim_qk));
+    stride_V = make_stride(_1{}, num_kv_heads * head_dim_vo, make_stride(_0{}, head_dim_vo));
     stride_LSE = make_stride(_1{}, make_stride(total_qo_len, total_qo_len * h_r));
 
-    auto shape_Q = make_shape(total_qo_len, head_dim, make_shape(h_r, num_kv_heads));
-    auto shape_O = make_shape(max_qo_len, head_dim,
+    auto shape_Q = make_shape(total_qo_len, head_dim_qk, make_shape(h_r, num_kv_heads));
+    auto shape_O = make_shape(max_qo_len, head_dim_vo,
                               make_shape(make_shape(h_r, num_kv_heads), max_qo_len + total_qo_len));
-    auto shape_K = make_shape(total_kv_len, head_dim, make_shape(h_r, num_kv_heads));
-    auto shape_V = make_shape(head_dim, total_kv_len, make_shape(h_r, num_kv_heads));
+    auto shape_K = make_shape(total_kv_len, head_dim_qk, make_shape(h_r, num_kv_heads));
+    auto shape_V = make_shape(head_dim_vo, total_kv_len, make_shape(h_r, num_kv_heads));
     auto shape_LSE = make_shape(total_qo_len, make_shape(h_r, num_kv_heads));
 
     LayoutQ layout_Q = make_layout(shape_Q, stride_Q);

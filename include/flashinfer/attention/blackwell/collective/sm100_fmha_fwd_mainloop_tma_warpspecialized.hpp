@@ -44,8 +44,8 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
-template <class Element_, class ElementQK_, class ElementPV_, class TileShape_, class StrideQ_,
-          class StrideK_, class StrideV_, class Mask_,
+template <class Element_, class ElementQK_, class ElementPV_, class TileShapeQK_,
+          class TileShapePV_, class StrideQ_, class StrideK_, class StrideV_, class Mask_,
           // shape here is QG K H
           // and referes to the two softmax warps
           // (2, 1, 1) means that they are stacked (best for large Q since it loads the least K/V)
@@ -55,14 +55,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using Element = Element_;
   using ElementQK = ElementQK_;
   using ElementPV = ElementPV_;
-  using TileShape = TileShape_;
+  using TileShape = decltype(select<0, 1>(TileShapeQK_{}));
+  using TileShapeQK = decltype(shape_div(TileShapeQK_{}, ThreadShape{}));
+  using TileShapePV = decltype(shape_div(TileShapePV_{}, ThreadShape{}));
   using StrideQ = StrideQ_;
   using StrideK = StrideK_;
   using StrideV = StrideV_;
   using Mask = Mask_;
 
   static constexpr int StageCountQ = 2;
-  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
+  static constexpr int StageCountKV = 1;  // sizeof(Element_) == 1 ? 2 : 2;
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
@@ -70,10 +72,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using ClusterShape = Shape<_1, _1, _1>;
 
   static const int Alignment = 128 / sizeof_bits_v<Element>;
-
-  using TileShapeQK = decltype(shape_div(TileShape{}, ThreadShape{}));
-
-  using TileShapePV = decltype(select<0, 2, 1>(TileShapeQK{}));
 
   using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Element, StrideQ, Alignment, Element,
@@ -97,10 +95,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
   struct TensorStorage {
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
-    union {
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
-    };
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
   };
 
   enum class TmemAllocation : uint32_t {
@@ -126,8 +122,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       cutlass::PipelineTmaUmmaAsync<StageCountQ, typename CollectiveMmaQK::AtomThrShapeMNK>;
 
   // from load to mma warp, protects k/v in smem
-  using PipelineKV =
+  using PipelineK =
       cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaQK::AtomThrShapeMNK>;
+
+  using PipelineV =
+      cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaPV::AtomThrShapeMNK>;
 
   // from mma to softmax0/1 warp, protects S in tmem
   // (not sure yet about the reverse direction)
@@ -149,17 +148,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static const int TransactionBytesLoadQ =
       cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
 
-  static const int TransactionBytesLoadKV =
+  static const int TransactionBytesLoadK =
       cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
 
-  static_assert(
-      cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>) ==
-          cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>),
-      "K and V smem layouts must be of equal size");
+  static const int TransactionBytesLoadV =
+      cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
+
+  // static_assert(
+  //     cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>) ==
+  //         cutlass::bits_to_bytes(cosize(take<0, 3>(SmemLayoutV{})) *
+  //         cute::sizeof_bits_v<Element>),
+  //     "K and V smem layouts must be of equal size");
 
   using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
-                                               PipelineQ, PipelineKV, Mask, TileShape>;
+                                               PipelineQ, PipelineK, PipelineV, Mask, TileShape>;
   using LayoutQ = typename Load::LayoutQ;
   using LayoutK = typename Load::LayoutK;
   using LayoutV = typename Load::LayoutV;
@@ -218,24 +221,29 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                            Params const& params, ParamsProblemShape const& params_problem_shape,
                            TensorStorage& storage, PipelineQ& pipeline_q,
                            typename PipelineQ::PipelineState& pipeline_q_producer_state,
-                           PipelineKV& pipeline_kv,
-                           typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
+                           PipelineK& pipeline_k,
+                           typename PipelineK::PipelineState& pipeline_k_producer_state,
+                           PipelineV& pipeline_v,
+                           typename PipelineV::PipelineState& pipeline_v_producer_state) {
     Load load;
     load.load(blk_coord, problem_shape, params.load, params_problem_shape, storage, pipeline_q,
-              pipeline_q_producer_state, pipeline_kv, pipeline_kv_producer_state);
+              pipeline_q_producer_state, pipeline_k, pipeline_k_producer_state, pipeline_v,
+              pipeline_v_producer_state);
   }
 
   template <class BlkCoord, class ProblemShape>
   CUTLASS_DEVICE auto mma(
       BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
       TensorStorage& storage, PipelineQ& pipeline_q,
-      typename PipelineQ::PipelineState& pipeline_q_consumer_state, PipelineKV& pipeline_kv,
-      typename PipelineKV::PipelineState& pipeline_kv_consumer_state, PipelineS& pipeline_s0,
+      typename PipelineQ::PipelineState& pipeline_q_consumer_state, PipelineK& pipeline_k,
+      typename PipelineK::PipelineState& pipeline_k_consumer_state, PipelineV& pipeline_v,
+      typename PipelineV::PipelineState& pipeline_v_consumer_state, PipelineS& pipeline_s0,
       typename PipelineS::PipelineState& pipeline_s0_producer_state, PipelineS& pipeline_s1,
       typename PipelineS::PipelineState& pipeline_s1_producer_state, PipelineO& pipeline_corr,
       typename PipelineO::PipelineState& pipeline_corr_producer_state) {
     auto pipeline_q_release_state = pipeline_q_consumer_state;
-    auto pipeline_kv_release_state = pipeline_kv_consumer_state;
+    auto pipeline_k_release_state = pipeline_k_consumer_state;
+    auto pipeline_v_release_state = pipeline_v_consumer_state;
 
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
@@ -292,9 +300,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tSrQ0 = tSrQ(_, _, _, q_index);
 
     // wait for K1
-    k_index = pipeline_kv_consumer_state.index();
-    pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-    ++pipeline_kv_consumer_state;
+    k_index = pipeline_k_consumer_state.index();
+    pipeline_k.consumer_wait(pipeline_k_consumer_state);
+    ++pipeline_k_consumer_state;
 
     // gemm Q1 * K1 -> S1
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
@@ -306,8 +314,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // release K1
     if constexpr (get<1>(ThreadShape{}) > 1) {
-      pipeline_kv.consumer_release(pipeline_kv_release_state);
-      ++pipeline_kv_release_state;
+      pipeline_k.consumer_release(pipeline_k_release_state);
+      ++pipeline_k_release_state;
     }
 
     // wait for Q2
@@ -320,9 +328,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tSrQ1 = tSrQ(_, _, _, q_index);
 
     if constexpr (get<1>(ThreadShape{}) > 1) {
-      k_index = pipeline_kv_consumer_state.index();
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
+      k_index = pipeline_k_consumer_state.index();
+      pipeline_k.consumer_wait(pipeline_k_consumer_state);
+      ++pipeline_k_consumer_state;
     }
 
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
@@ -334,13 +342,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_s1_producer_state;
 
     // release K1
-    pipeline_kv.consumer_release(pipeline_kv_release_state);
-    ++pipeline_kv_release_state;
+    pipeline_k.consumer_release(pipeline_k_release_state);
+    ++pipeline_k_release_state;
 
     // wait for V1
-    v_index = pipeline_kv_consumer_state.index();
-    pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-    ++pipeline_kv_consumer_state;
+    v_index = pipeline_v_consumer_state.index();
+    pipeline_v.consumer_wait(pipeline_v_consumer_state);
+    ++pipeline_v_consumer_state;
 
     // this acquire returns the ownership of all of S0 to the mma warp
     // including the P0 part
@@ -356,8 +364,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_corr_producer_state;
 
     if constexpr (get<1>(ThreadShape{}) > 1) {
-      pipeline_kv.consumer_release(pipeline_kv_release_state);
-      ++pipeline_kv_release_state;
+      pipeline_v.consumer_release(pipeline_v_release_state);
+      ++pipeline_v_release_state;
     }
 
     mma_pv_ts.accumulate_ = UMMA::ScaleOut::Zero;
@@ -366,9 +374,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       // wait for Ki
-      k_index = (pipeline_kv_consumer_state.index());
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
+      k_index = (pipeline_k_consumer_state.index());
+      pipeline_k.consumer_wait(pipeline_k_consumer_state);
+      ++pipeline_k_consumer_state;
 
       // gemm Q1 * Ki -> S1
       gemm_zero_acc(mma_qk, tSrQ0, tSrK(_, _, _, k_index), tStS0);
@@ -377,15 +385,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_s0_producer_state;
 
       if constexpr (get<1>(ThreadShape{}) > 1) {
-        pipeline_kv.consumer_release(pipeline_kv_release_state);
-        ++pipeline_kv_release_state;
+        pipeline_k.consumer_release(pipeline_k_release_state);
+        ++pipeline_k_release_state;
       }
 
       // gemm P2 * V(i-1) -> O2
       if constexpr (get<1>(ThreadShape{}) > 1) {
-        v_index = pipeline_kv_consumer_state.index();
-        pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-        ++pipeline_kv_consumer_state;
+        v_index = pipeline_v_consumer_state.index();
+        pipeline_v.consumer_wait(pipeline_v_consumer_state);
+        ++pipeline_v_consumer_state;
       }
 
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
@@ -397,13 +405,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_corr_producer_state;
 
       // release V(i-1)
-      pipeline_kv.consumer_release(pipeline_kv_release_state);
-      ++pipeline_kv_release_state;
+      pipeline_v.consumer_release(pipeline_v_release_state);
+      ++pipeline_v_release_state;
 
       if constexpr (get<1>(ThreadShape{}) > 1) {
-        k_index = (pipeline_kv_consumer_state.index());
-        pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-        ++pipeline_kv_consumer_state;
+        k_index = (pipeline_k_consumer_state.index());
+        pipeline_k.consumer_wait(pipeline_k_consumer_state);
+        ++pipeline_k_consumer_state;
       }
 
       // gemm Q2 * Ki -> S2
@@ -413,13 +421,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_s1_producer_state;
 
       // release Ki
-      pipeline_kv.consumer_release(pipeline_kv_release_state);
-      ++pipeline_kv_release_state;
+      pipeline_k.consumer_release(pipeline_k_release_state);
+      ++pipeline_k_release_state;
 
       // wait for Vi
-      v_index = (pipeline_kv_consumer_state.index());
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
+      v_index = (pipeline_v_consumer_state.index());
+      pipeline_v.consumer_wait(pipeline_v_consumer_state);
+      ++pipeline_v_consumer_state;
 
       // gemm P1 * Vi -> O1
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
@@ -432,8 +440,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_corr_producer_state;
 
       if constexpr (get<1>(ThreadShape{}) > 1) {
-        pipeline_kv.consumer_release(pipeline_kv_release_state);
-        ++pipeline_kv_release_state;
+        pipeline_v.consumer_release(pipeline_v_release_state);
+        ++pipeline_v_release_state;
       }
     }
 
@@ -449,9 +457,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // wait for Vi
     if constexpr (get<1>(ThreadShape{}) > 1) {
-      v_index = pipeline_kv_consumer_state.index();
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
+      v_index = pipeline_v_consumer_state.index();
+      pipeline_v.consumer_wait(pipeline_v_consumer_state);
+      ++pipeline_v_consumer_state;
     }
 
     // gemm P2 * Vi -> O2
@@ -464,8 +472,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_corr_producer_state;
 
     // release Vi
-    pipeline_kv.consumer_release(pipeline_kv_release_state);
-    ++pipeline_kv_release_state;
+    pipeline_v.consumer_release(pipeline_v_release_state);
+    ++pipeline_v_release_state;
 
     pipeline_s0.producer_commit(pipeline_s0_producer_state);
     ++pipeline_s0_producer_state;
@@ -777,7 +785,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // loop:
     //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < get<2>(TileShape{}) / kCorrectionTileSize; i++) {
+    for (int i = 0; i < get<1>(TileShapePV{}) / kCorrectionTileSize; i++) {
       Tensor tTMEM_LOADtO_i = tTMEM_LOADtO(_, _0{}, _0{}, i);
       Tensor tTMEM_LOADsO_i = tTMEM_LOADsO(_, _0{}, _0{}, i);
 
@@ -875,7 +883,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
     copy_in(0);
 
-    int count = get<2>(TileShape{}) / kCorrectionTileSize;
+    int count = get<1>(TileShapePV{}) / kCorrectionTileSize;
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < count; i++) {

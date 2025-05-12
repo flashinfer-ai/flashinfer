@@ -20,7 +20,8 @@ void FMHACutlassSM100Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo
                          at::Tensor kv_segment_offsets, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim, int64_t batch_size, int64_t total_qo_len,
-                         int64_t total_kv_len, int64_t max_qo_len, int64_t max_kv_len);
+                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t batch_size,
+                         int64_t total_qo_len, int64_t total_kv_len, int64_t max_qo_len,
+                         int64_t max_kv_len);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) { m.def("run", FMHACutlassSM100Run); }

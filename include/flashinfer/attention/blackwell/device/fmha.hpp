@@ -151,6 +151,7 @@ class FMHA {
 
     // account for dynamic smem capacity if needed
     int smem_size = Kernel::SharedStorageSize;
+    std::cout << "smem_size: " << smem_size << std::endl;
     if (smem_size >= (48 << 10)) {
       CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
       cudaError_t result = cudaFuncSetAttribute(
