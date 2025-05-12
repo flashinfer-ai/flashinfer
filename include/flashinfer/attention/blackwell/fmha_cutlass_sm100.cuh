@@ -64,7 +64,10 @@ struct FwdRunner {
       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV>;
   using Operation =
       cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
-          ProblemShapeVarlen, Mainloop, Epilogue, cutlass::fmha::kernel::PersistentTileScheduler>>;
+          ProblemShapeVarlen, Mainloop, Epilogue,
+          typename std::conditional<std::is_same<ActiveMask, CausalMask>::value,
+                                    cutlass::fmha::kernel::NaiveTileScheduler,
+                                    cutlass::fmha::kernel::PersistentTileScheduler>::type>>;
   using LayoutQ = typename Mainloop::LayoutQ;
   using LayoutK = typename Mainloop::LayoutK;
   using LayoutV = typename Mainloop::LayoutV;
