@@ -1,7 +1,8 @@
-import torch
-import flashinfer
-import triton
 import numpy as np
+import torch
+import triton
+
+import flashinfer
 
 page_size = 16
 num_kv_heads = 4
@@ -12,6 +13,7 @@ scale = float(1.0 / (head_dim**0.5))
 k_scale = v_scale = 1.0
 
 workspace_buffer = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+
 
 def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     np.random.seed(42)
@@ -29,17 +31,30 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
 
     q = torch.rand(batch_size, num_qo_heads, head_dim).half().to(0)
     kv_data = (
-        torch.randn(num_blocks, 2, num_kv_heads, page_size, head_dim).to(0).to(torch.float8_e4m3fn)
+        torch.randn(num_blocks, 2, num_kv_heads, page_size, head_dim)
+        .to(0)
+        .to(torch.float8_e4m3fn)
     )
 
     ms = triton.testing.do_bench_cudagraph(
-        lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache(q, kv_data,
-              workspace_buffer,
-              num_qo_heads, num_kv_heads,
-              scale, block_tables, seq_lens_gpu, page_size, seq_len, kv_cache_dtype, k_scale, v_scale),
+        lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            q,
+            kv_data,
+            workspace_buffer,
+            num_qo_heads,
+            num_kv_heads,
+            scale,
+            block_tables,
+            seq_lens_gpu,
+            page_size,
+            seq_len,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        ),
         rep=4,
     )
-    io = (q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size())
+    io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     print(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
@@ -50,5 +65,5 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
 if __name__ == "__main__":
     for batch_size in [4, 8, 16, 32, 64, 128, 256, 512]:
         for seq_len in [1024, 4096, 8192, 16384]:
-            for kv_cache_dtype in ['fp8', 'auto']:
+            for kv_cache_dtype in ["fp8", "auto"]:
                 bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype)

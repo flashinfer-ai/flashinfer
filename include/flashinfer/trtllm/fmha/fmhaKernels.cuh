@@ -438,7 +438,9 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path = std::string("59ade93418f3fa054f6e6d62833fb39d8bd46706/fmha/trtllm-gen/") + kernelMeta.mFuncName;
+      std::string cubin_path =
+          std::string("59ade93418f3fa054f6e6d62833fb39d8bd46706/fmha/trtllm-gen/") +
+          kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       cuErrCheck(cuModuleLoadData(&hmod, cubin.data()));
       mModules[kernelName] = hmod;
