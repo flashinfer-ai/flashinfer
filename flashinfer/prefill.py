@@ -2684,6 +2684,7 @@ def fmha_varlen(
     return out, lse
 
 
+@functools.cache
 def get_cutlass_mha_module():
     def backend_module(*args):
         modules_dict = _batch_prefill_modules
@@ -2847,7 +2848,7 @@ def get_cutlass_mha_module():
                 pass
 
             def plan(*args):
-                pass
+                return None
 
             # Register the module.
             #
@@ -2858,6 +2859,7 @@ def get_cutlass_mha_module():
                 ragged_run=ragged_run,
                 paged_run=paged_run,
             )
-            return modules_dict[args]
+
+        return modules_dict[args]
 
     return backend_module
