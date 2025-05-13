@@ -1353,17 +1353,19 @@ def get_fmha_cutlass_sm100a_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    return (
-        f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
-        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_qk_{head_dim_qk}_"
-        f"head_dim_vo_{head_dim_vo}_"
-        f"posenc_{pos_encoding_mode}_"
-        f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}"
-    )
+    # NOTE(Zihao): use different uri after when support customize attention
+    return "fmha_cutlass_sm100a"
+    # return (
+    #     f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+    #     f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+    #     f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+    #     f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+    #     f"head_dim_qk_{head_dim_qk}_"
+    #     f"head_dim_vo_{head_dim_vo}_"
+    #     f"posenc_{pos_encoding_mode}_"
+    #     f"use_swa_{use_sliding_window}_"
+    #     f"use_logits_cap_{use_logits_soft_cap}"
+    # )
 
 
 def gen_fmha_cutlass_sm100a_module(

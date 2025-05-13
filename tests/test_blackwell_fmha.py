@@ -94,25 +94,10 @@ def test_blackwell_cutlass_fmha(
     v = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim_vo, dtype=dtype, device="cuda"
     )
-    # v = torch.arange(
-    #     head_dim,
-    #     dtype=dtype,
-    #     device="cuda",
-    # ).repeat(batch_size * kv_len, num_kv_heads, 1)
     kv_indptr = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
     )
 
-    # workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    # wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-    #     workspace_buffer, kv_layout, backend="cutlass"
-    # )
-
-    # wrapper.plan(
-    #     qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, causal=causal
-    # )
-
-    # o, lse = wrapper.run(q, k, v, return_lse=True)
     sm_scale = 1.0 / (head_dim_qk**0.5)
     o, lse = flashinfer.prefill.fmha_varlen(
         q,
@@ -130,8 +115,6 @@ def test_blackwell_cutlass_fmha(
     o_ref, lse_ref = attention_ref(
         batch_size, q, k_repeated, v_repeated, causal, sm_scale
     )
-
-    print(o, o_ref)
 
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
@@ -155,7 +138,7 @@ if __name__ == "__main__":
         17,
         16,
         8,
-        64,
+        128,
         128,
         False,
         torch.half,
