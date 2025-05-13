@@ -49,7 +49,6 @@ from .utils import (
     determine_attention_backend,
     is_float8,
     is_sm100a_supported,
-    pad_to_multiple_of,
     register_custom_op,
     register_fake_op,
 )

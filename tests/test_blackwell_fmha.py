@@ -62,7 +62,7 @@ def attention_ref(
 @pytest.mark.parametrize("head_dim_qk", [192])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.half])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_blackwell_cutlass_fmha(
     batch_size,
     qo_len,
