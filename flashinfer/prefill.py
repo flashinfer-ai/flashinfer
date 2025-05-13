@@ -2718,109 +2718,26 @@ def get_cutlass_mha_module():
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
-                nnz_qo, num_qo_heads, head_dim_qk = q.shape
-                nnz_kv, num_kv_heads, head_dim_vo = v.shape
-
-                sm_scale = 1.0 / math.sqrt(head_dim_qk)
-
-                qo_lens = qo_indptr[1:] - qo_indptr[:-1]
-                kv_lens = kv_indptr[1:] - kv_indptr[:-1]
-                batch_size = qo_lens.shape[0]
-                max_qo_len = qo_lens.max()
-                max_kv_len = kv_lens.max()
-
-                q_padded = torch.cat(
-                    [
-                        torch.zeros(
-                            max(max_qo_len, 128),
-                            q.shape[1],
-                            q.shape[2],
-                            device=q.device,
-                            dtype=q.dtype,
-                        ),
-                        q,
-                    ],
-                    dim=0,
-                )[max(max_qo_len, 128) :]
-
-                qo_total_len = nnz_qo
-
-                k_padded = torch.cat(
-                    [
-                        torch.zeros(
-                            max(max_kv_len, 128),
-                            k.shape[1],
-                            k.shape[2],
-                            device=k.device,
-                            dtype=k.dtype,
-                        ),
-                        k,
-                    ],
-                    dim=0,
-                )[max(max_kv_len, 128) :]
-                v_padded = torch.cat(
-                    [
-                        torch.zeros(
-                            max(max_kv_len, 128),
-                            v.shape[1],
-                            v.shape[2],
-                            device=v.device,
-                            dtype=v.dtype,
-                        ),
-                        v,
-                    ],
-                    dim=0,
-                )[max(max_kv_len, 128) :]
-
-                if o is None:
-                    out_padded = torch.empty(
-                        qo_total_len + max(max_qo_len, 128),
-                        num_qo_heads,
-                        head_dim_vo,
-                        device=q.device,
-                        dtype=q.dtype,
-                    )[max(max_qo_len, 128) :]
-                else:
-                    out_padded = o
-
-                if maybe_lse is None:
-                    lse_padded = torch.empty(
-                        qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
-                    )
-                else:
-                    lse_padded = maybe_lse
-
-                module.run(
-                    q_padded,
-                    k_padded,
-                    v_padded,
-                    qo_lens,
-                    kv_lens,
+                return fmha_varlen(
+                    q,
+                    k,
+                    v,
                     qo_indptr,
                     kv_indptr,
-                    out_padded,
-                    lse_padded,
-                    mask_mode,
+                    o,
+                    maybe_lse,
+                    mask_mode == MaskMode.CAUSAL.value,
                     sm_scale,
-                    num_qo_heads,
-                    num_kv_heads,
-                    head_dim_qk,
-                    batch_size,
-                    nnz_qo,
-                    nnz_kv,
-                    max_qo_len,
-                    max_kv_len,
                 )
-
-                o = out_padded
-                maybe_lse = lse_padded
-
-                return o, maybe_lse
 
             @register_custom_op(
                 f"flashinfer::{uri}_paged_run",
@@ -2852,10 +2769,17 @@ def get_cutlass_mha_module():
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
+                scale_q: Optional[torch.Tensor],
+                scale_k: Optional[torch.Tensor],
+                scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -2877,10 +2801,14 @@ def get_cutlass_mha_module():
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
@@ -2904,10 +2832,17 @@ def get_cutlass_mha_module():
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
+                maybe_prefix_len_ptr: Optional[torch.Tensor],
+                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+                maybe_max_item_len_ptr: Optional[torch.Tensor],
                 logits_soft_cap: float,
                 sm_scale: float,
+                scale_q: Optional[torch.Tensor],
+                scale_k: Optional[torch.Tensor],
+                scale_v: Optional[torch.Tensor],
                 rope_scale: float,
                 rope_theta: float,
+                token_pos_in_items_len: int,
             ) -> None:
                 pass
 
