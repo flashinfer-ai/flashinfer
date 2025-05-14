@@ -15,7 +15,8 @@
  */
 #include "pytorch_extension_utils.h"
 
-void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A,
+void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
+                                          at::Tensor float_workspace_buffer, at::Tensor A,
                                           at::Tensor B, at::Tensor SFA, at::Tensor SFB,
                                           at::Tensor C, at::Tensor m_indptr, int64_t cum_m,
                                           int64_t n, int64_t k, int64_t scale_granularity_m,
