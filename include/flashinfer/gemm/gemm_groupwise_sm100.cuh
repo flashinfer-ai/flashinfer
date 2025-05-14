@@ -131,7 +131,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
-  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 32 * 1024 * 1024,
+  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 16,
                                                            "sm100_groupwise_gemm_float_workspace");
 
   CUTLASS_CHECK(gemm.can_implement(arguments));

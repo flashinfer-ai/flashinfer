@@ -2620,6 +2620,9 @@ def fmha_varlen(
     causal: bool = False,
     sm_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    workspace_buffer = _get_cache_buf(
+        "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
+    )
     module = get_fmha_module(
         q.dtype,
         k.dtype,
@@ -2659,6 +2662,7 @@ def fmha_varlen(
         )
 
     module.run(
+        workspace_buffer,
         q,
         k,
         v,

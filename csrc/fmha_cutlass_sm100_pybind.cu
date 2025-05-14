@@ -15,8 +15,8 @@
  */
 #include "pytorch_extension_utils.h"
 
-void FMHACutlassSM100Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens,
-                         at::Tensor kv_lens, at::Tensor qo_segment_offsets,
+void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
+                         at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
                          at::Tensor kv_segment_offsets, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,

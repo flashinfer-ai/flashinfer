@@ -48,7 +48,8 @@ using namespace flashinfer;
     return false;                                                                                 \
   }()
 
-void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A,
+void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
+                                          at::Tensor float_workspace_buffer, at::Tensor A,
                                           at::Tensor B, at::Tensor SFA, at::Tensor SFB,
                                           at::Tensor C, at::Tensor m_indptr, int64_t cum_m,
                                           int64_t n, int64_t k, int64_t scale_granularity_m,
@@ -65,6 +66,8 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at:
           using cutlass_t_out = cutlass_dtype_t<c_type_out>;
           auto status = flashinfer::gemm::CutlassGroupwiseScaledGroupGEMMSM100<
               SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K>(
+              static_cast<int*>(int_workspace_buffer.data_ptr()),
+              int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
               static_cast<float*>(float_workspace_buffer.data_ptr()),
               float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
               static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),

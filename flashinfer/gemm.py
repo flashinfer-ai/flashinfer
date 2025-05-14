@@ -844,8 +844,11 @@ def group_gemm_fp8_nt_groupwise(
 ) -> torch.Tensor:
     from .triton.gemm import compute_padding_mapping
 
-    workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a[0].device
+    int_workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a[0].device
+    )
+    float_workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a[0].device
     )
 
     batch_size = m_indptr.shape[0] - 1
@@ -860,7 +863,8 @@ def group_gemm_fp8_nt_groupwise(
 
     if (m_indptr % 4 == 0).all():
         get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-            workspace_buffer,
+            int_workspace_buffer,
+            float_workspace_buffer,
             a,
             b,
             a_scale,
@@ -902,7 +906,8 @@ def group_gemm_fp8_nt_groupwise(
     padded_a_scale[::, padded_m_rank] = a_scale[::, m_rank]
 
     get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-        workspace_buffer,
+        int_workspace_buffer,
+        float_workspace_buffer,
         padded_a,
         b,
         padded_a_scale,
