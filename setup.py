@@ -265,11 +265,11 @@ if enable_aot:
         "csrc/group_gemm_e4m3_bf16_sm90.cu",
         "csrc/group_gemm_e5m2_bf16_sm90.cu",
     ]
-    decode_sources = list(gen_dir.glob("*decode_head*.cu"))
+    decode_sources = [str(path) for path in gen_dir.glob("*decode_head*.cu")]
     prefill_sources = [
-        f for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
+        str(f) for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
     ]
-    prefill_sm90_sources = list(gen_dir.glob("*prefill_head*_sm90.cu"))
+    prefill_sm90_sources = [str(path) for path in gen_dir.glob("*prefill_head*_sm90.cu")]
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer.flashinfer_kernels",
