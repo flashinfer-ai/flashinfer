@@ -845,10 +845,10 @@ def group_gemm_fp8_nt_groupwise(
     from .triton.gemm import compute_padding_mapping
 
     int_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a[0].device
+        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
     )
     float_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a[0].device
+        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
     )
 
     batch_size = m_indptr.shape[0] - 1
