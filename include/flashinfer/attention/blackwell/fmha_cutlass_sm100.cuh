@@ -15,6 +15,7 @@
  */
 #include <cstdint>
 
+#include "../../allocator.h"
 #include "collective/fmha_fusion.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
@@ -74,12 +75,12 @@ struct FwdRunner {
   using LayoutO = typename Epilogue::LayoutO;
   using LayoutLSE = typename Epilogue::LayoutLSE;
 
-  static void run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens, at::Tensor kv_lens,
-                  at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets, at::Tensor o,
-                  std::optional<at::Tensor> maybe_lse, int mask_mode_code, double sm_scale,
-                  int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo,
-                  int batch_size, int total_qo_len, int total_kv_len, int max_qo_len,
-                  int max_kv_len) {
+  static void run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
+                  at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
+                  at::Tensor kv_segment_offsets, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+                  int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
+                  int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
+                  int total_kv_len, int max_qo_len, int max_kv_len) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -132,9 +133,12 @@ struct FwdRunner {
 
     Operation op;
 
+    // NOTE(Zihao): workspace size is not used at this moment
     size_t workspace_size = 0;
     workspace_size = Operation::get_workspace_size(arguments);
-    cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
+    AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_size);
+    uint8_t* workspace_ptr =
+        allocator.aligned_alloc<uint8_t>(workspace_size, 16, "fmha_cutlass_sm100_workspace");
 
     cutlass::Status status = cutlass::Status::kSuccess;
     status = op.can_implement(arguments);
@@ -143,7 +147,7 @@ struct FwdRunner {
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
     }
 
-    status = op.initialize(arguments, workspace.get());
+    status = op.initialize(arguments, workspace_ptr);
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to initialize the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
@@ -166,16 +170,16 @@ struct FwdRunner {
 
 template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
           class ActiveMask>
-void run_fmha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens, at::Tensor kv_lens,
-                  at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets, at::Tensor o,
-                  std::optional<at::Tensor> maybe_lse, int mask_mode_code, double sm_scale,
-                  int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo,
-                  int batch_size, int total_qo_len, int total_kv_len, int max_qo_len,
-                  int max_kv_len) {
+void run_fmha_fwd(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
+                  at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
+                  at::Tensor kv_segment_offsets, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+                  int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
+                  int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
+                  int total_kv_len, int max_qo_len, int max_kv_len) {
   FwdRunner<DTypeIn, DTypeOut, TileShapeQK, TileShapePV, ActiveMask>::run(
-      q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o, maybe_lse,
-      mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size,
-      total_qo_len, total_kv_len, max_qo_len, max_kv_len);
+      workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o,
+      maybe_lse, mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+      batch_size, total_qo_len, total_kv_len, max_qo_len, max_kv_len);
 }
 
 };  // namespace flashinfer
