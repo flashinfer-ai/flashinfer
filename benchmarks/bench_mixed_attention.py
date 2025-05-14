@@ -71,14 +71,14 @@ def run_bench(
     o = wrapper_old.run(q, kv_data)
     ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
 
-    if len(p_kv_lens) > 0:
+    if len(p_kv_lens) == 1:
         q_d = q[: d_q_indptr[-1]]
         kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
         q_p = q[d_q_indptr[-1] :]
         k_p, v_p = kv_data[d_kv_indptr[-1] :].unbind(1)
         k_p, v_p = k_p.squeeze(1), v_p.squeeze(1)
         kv_indices_d = torch.arange(
-            0, d_kv_indptr[-1], device="cuda:0", dtype=torch.int32
+            0, d_kv_indptr[-1], device=device, dtype=torch.int32
         )
 
         last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
@@ -107,8 +107,9 @@ def run_bench(
         )
         o_pod = torch.cat([o_d, o_p], dim=0)
         # Verify output matches
-        if not torch.allclose(o, o_pod, rtol=1e-3, atol=1e-3):
-            print("POD-Attention output mismatch!")
+        torch.testing.assert_close(
+            o, o_pod, rtol=1e-3, atol=1e-3, msg="POD-Attention output mismatch!"
+        )
         ms_pod = do_bench(
             lambda: wrapper_pod.run(
                 q_p,
@@ -122,7 +123,7 @@ def run_bench(
         )
 
     print(f"Elapsed time (Batched Prefill): {ms_old:.2f} ms")
-    if len(p_kv_lens) > 0:
+    if len(p_kv_lens) == 1:
         print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
@@ -132,7 +133,7 @@ def run_bench(
     bandwidth_old_gb_s = total_bytes / (ms_old * 1e-3) / (1024**3)
 
     print(f"Memory bandwidth (Batched Prefill): {bandwidth_old_gb_s:.2f} GB/s")
-    if len(p_kv_lens) > 0:
+    if len(p_kv_lens) == 1:
         bandwidth_pod_gb_s = total_bytes / (ms_pod * 1e-3) / (1024**3)
         print(f"Memory bandwidth (POD Attention): {bandwidth_pod_gb_s:.2f} GB/s")
 
