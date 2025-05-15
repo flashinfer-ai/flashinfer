@@ -3,13 +3,14 @@
 #pragma once
 // #include <NvInferRuntime.h>
 #include "include/types.h"
+#include "include/quantization.h"
 
 // #include "tensorrt_llm/common/assert.h"
 // #include "tensorrt_llm/common/cudaUtils.h"
 // #include "tensorrt_llm/kernels/quantization.h"
 // #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+namespace trtllm::kernels::ar_fusion
 {
 template <typename DType>
 struct ElemsPerAccess;
@@ -123,4 +124,4 @@ struct AllReduceFusionParams
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
-} // namespace tensorrt_llm::kernels::ar_fusion
+} // namespace trtllm::kernels::ar_fusion

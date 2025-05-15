@@ -5,10 +5,10 @@
 // #include "tensorrt_llm/kernels/quantization.cuh"
 #include "include/check.h"
 #include "include/types.h"
-#include "include/moeAllReduceFusionKernels.h"
+#include "moeAllReduceFusionKernels.h"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+namespace trtllm::kernels::ar_fusion::moe
 {
 template <int NRanks>
 struct LamportComm
@@ -425,11 +425,11 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 #define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
     return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
-    if (params.nranks == NRANKS && params.dtype == DataType::kHALF)                                          \
+    if (params.nranks == NRANKS && params.dtype == DataType::kFP16)                                          \
     {                                                                                                                  \
         MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == DataType::kBf16)                                     \
+    else if (params.nranks == NRANKS && params.dtype == DataType::kBF16)                                     \
     {                                                                                                                  \
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }

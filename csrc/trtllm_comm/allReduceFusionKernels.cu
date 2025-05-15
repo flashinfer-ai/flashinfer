@@ -9,12 +9,12 @@
 // #include "tensorrt_llm/common/envUtils.h"
 #include "include/check.h"
 #include "include/types.h"
-#include "include/allReduceFusionKernels.h"
+#include "allReduceFusionKernels.h"
 #include <cooperative_groups.h>
 #include <tuple>
 #include <type_traits>
 
-namespace tensorrt_llm::kernels::ar_fusion
+namespace trtllm::kernels::ar_fusion
 {
 template <int NRanks>
 struct SyncComm
@@ -752,15 +752,15 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     }
 
 #define DISPATCH_DTYPE(NRanks)                                                                                         \
-    if (params.dtype == DataType::kHALF)                                                                     \
+    if (params.dtype == DataType::kFP16)                                                                     \
     {                                                                                                                  \
         DISPATCH_PATTERN(half, NRanks);                                                                                \
     }                                                                                                                  \
-    else if (params.dtype == DataType::kBf16)                                                                          \
+    else if (params.dtype == DataType::kBF16)                                                                          \
     {                                                                                                                  \
         DISPATCH_PATTERN(__nv_bfloat16, NRanks);                                                                       \
     }                                                                                                                  \
-    else if (params.dtype == DataType::kFLOAT)                                                                          \
+    else if (params.dtype == DataType::kFP32)                                                                          \
     {                                                                                                                  \
         DISPATCH_PATTERN(float, NRanks);                                                                               \
     }                                                                                                                  \

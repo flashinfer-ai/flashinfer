@@ -3,13 +3,13 @@
 #pragma once
 // #include <NvInferRuntime.h>
 #include "include/types.h"
-
+#include "include/quantization.h"
 // #include "tensorrt_llm/common/assert.h"
 // #include "tensorrt_llm/common/cudaUtils.h"
 // #include "tensorrt_llm/kernels/quantization.h"
 // #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+namespace trtllm::kernels::ar_fusion::moe
 {
 static constexpr int kElemsPerAccess = 8;
 static constexpr int kOneShotMaxToken = 128;

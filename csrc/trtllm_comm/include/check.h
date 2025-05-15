@@ -20,10 +20,10 @@
 // target macro: TLLM_CUDA_CHECK, TLLM_CHECK, TLLM_CHECK_WITH_INFO
 
 #define NEW_TLLM_EXCEPTION(...)                           \
-  tensorrt_llm::common::TllmException(__FILE__, __LINE__, \
-                                      tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
+  trtllm::TllmException(__FILE__, __LINE__, \
+                                      trtllm::fmtstr(__VA_ARGS__).c_str())
 
-namespace tensorrt_llm {
+namespace trtllm {
 
 // string utils
 inline std::string fmtstr(std::string const& s) { return s; }
@@ -125,4 +125,4 @@ void check(T ptr, char const* const func, char const* const file, int const line
             __FILE__, __LINE__, fmtstr(info, ##__VA_ARGS__));                                    \
     } while (0)
 
-}  // namespace tensorrt_llm
+}  // namespace trtllm
