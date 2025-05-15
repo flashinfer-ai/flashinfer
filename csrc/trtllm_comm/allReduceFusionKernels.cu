@@ -1,12 +1,15 @@
 // adapted from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.cu#L440
 
-#include "customAllReduceKernels.h"
-#include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
-#include "tensorrt_llm/common/cudaTypeUtils.cuh"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/customAllReduceUtils.h"
-#include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/envUtils.h"
+// #include "customAllReduceKernels.h"
+// #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
+// #include "tensorrt_llm/common/cudaTypeUtils.cuh"
+// #include "tensorrt_llm/common/cudaUtils.h"
+// #include "tensorrt_llm/common/customAllReduceUtils.h"
+// #include "tensorrt_llm/common/dataType.h"
+// #include "tensorrt_llm/common/envUtils.h"
+#include "include/check.h"
+#include "include/types.h"
+#include "include/allReduceFusionKernels.h"
 #include <cooperative_groups.h>
 #include <tuple>
 #include <type_traits>
@@ -749,15 +752,15 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     }
 
 #define DISPATCH_DTYPE(NRanks)                                                                                         \
-    if (params.dtype == nvinfer1::DataType::kHALF)                                                                     \
+    if (params.dtype == DataType::kHALF)                                                                     \
     {                                                                                                                  \
         DISPATCH_PATTERN(half, NRanks);                                                                                \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kBF16)                                                                \
+    else if (params.dtype == DataType::kBf16)                                                                          \
     {                                                                                                                  \
         DISPATCH_PATTERN(__nv_bfloat16, NRanks);                                                                       \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kFLOAT)                                                               \
+    else if (params.dtype == DataType::kFLOAT)                                                                          \
     {                                                                                                                  \
         DISPATCH_PATTERN(float, NRanks);                                                                               \
     }                                                                                                                  \

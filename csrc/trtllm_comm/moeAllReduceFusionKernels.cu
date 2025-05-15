@@ -1,8 +1,11 @@
 // adapated from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.cu#L213
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
-#include "tensorrt_llm/kernels/quantization.cuh"
+// #include "tensorrt_llm/common/envUtils.h"
+// #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+// #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
+// #include "tensorrt_llm/kernels/quantization.cuh"
+#include "include/check.h"
+#include "include/types.h"
+#include "include/moeAllReduceFusionKernels.h"
 #include <cooperative_groups.h>
 
 namespace tensorrt_llm::kernels::ar_fusion::moe
@@ -422,11 +425,11 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 #define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
     return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
-    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF)                                          \
+    if (params.nranks == NRANKS && params.dtype == DataType::kHALF)                                          \
     {                                                                                                                  \
         MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.nranks == NRANKS && params.dtype == DataType::kBf16)                                     \
     {                                                                                                                  \
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }

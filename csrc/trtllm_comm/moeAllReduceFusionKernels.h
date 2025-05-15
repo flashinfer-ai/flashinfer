@@ -1,9 +1,8 @@
 // adapted from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h
 
 #pragma once
-#include <NvInferRuntime.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+// #include <NvInferRuntime.h>
+#include "include/types.h"
 
 // #include "tensorrt_llm/common/assert.h"
 // #include "tensorrt_llm/common/cudaUtils.h"
@@ -27,7 +26,7 @@ struct AllReduceFusionParams
 {
     int nranks;
     int rank;
-    nvinfer1::DataType dtype;
+    DataType dtype;
     // size = token_num * hidden_dim
     int size;
     int hidden_dim;
