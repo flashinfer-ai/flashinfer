@@ -269,7 +269,9 @@ if enable_aot:
     prefill_sources = [
         str(f) for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
     ]
-    prefill_sm90_sources = [str(path) for path in gen_dir.glob("*prefill_head*_sm90.cu")]
+    prefill_sm90_sources = [
+        str(path) for path in gen_dir.glob("*prefill_head*_sm90.cu")
+    ]
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer.flashinfer_kernels",
