@@ -19,9 +19,8 @@
 // tentative: to be compatible with trtllm's assertion, we need to do a paper cut of trtllm's check
 // target macro: TLLM_CUDA_CHECK, TLLM_CHECK, TLLM_CHECK_WITH_INFO
 
-#define NEW_TLLM_EXCEPTION(...)                           \
-  trtllm::TllmException(__FILE__, __LINE__, \
-                                      trtllm::fmtstr(__VA_ARGS__).c_str())
+#define NEW_TLLM_EXCEPTION(...) \
+  trtllm::TllmException(__FILE__, __LINE__, trtllm::fmtstr(__VA_ARGS__).c_str())
 
 namespace trtllm {
 
@@ -88,9 +87,10 @@ void check(T ptr, char const* const func, char const* const file, int const line
   }
 }
 
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
-{
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
+[[noreturn]] inline void throwRuntimeError(char const* const file, int const line,
+                                           std::string const& info = "") {
+  throw TllmException(file, line,
+                      fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
 }
 
 /*
@@ -109,20 +109,15 @@ void check(T ptr, char const* const func, char const* const file, int const line
 #define TLLM_UNLIKELY(x) __builtin_expect((x), 0)
 #endif
 
-#define TLLM_CHECK(val)                                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                               \
-                                            : throwRuntimeError(__FILE__, __LINE__, #val);       \
-    } while (0)
+#define TLLM_CHECK(val)                                                                            \
+  do {                                                                                             \
+    TLLM_LIKELY(static_cast<bool>(val)) ? ((void)0) : throwRuntimeError(__FILE__, __LINE__, #val); \
+  } while (0)
 
-#define TLLM_CHECK_WITH_INFO(val, info, ...)                                                                           \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        TLLM_LIKELY(static_cast<bool>(val))                                                                            \
-        ? ((void) 0)                                                                                                   \
-        : throwRuntimeError(                                                                     \
-            __FILE__, __LINE__, fmtstr(info, ##__VA_ARGS__));                                    \
-    } while (0)
+#define TLLM_CHECK_WITH_INFO(val, info, ...)                                          \
+  do {                                                                                \
+    TLLM_LIKELY(static_cast<bool>(val))                                               \
+    ? ((void)0) : throwRuntimeError(__FILE__, __LINE__, fmtstr(info, ##__VA_ARGS__)); \
+  } while (0)
 
 }  // namespace trtllm
