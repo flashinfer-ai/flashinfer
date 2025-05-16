@@ -13,7 +13,7 @@
 #include <tuple>
 #include <type_traits>
 
-#include "allReduceFusionKernels.h"
+#include "flashinfer/distributed/allReduceFusionKernels.cuh"
 // #include "include/check.h"
 #include "include/types.h"
 #include "pytorch_extension_utils.h"

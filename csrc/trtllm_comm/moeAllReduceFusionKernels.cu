@@ -8,7 +8,7 @@
 
 // #include "include/check.h"
 #include "include/types.h"
-#include "moeAllReduceFusionKernels.h"
+#include "flashinfer/distributed/moeAllReduceFusionKernels.cuh"
 #include "pytorch_extension_utils.h"
 
 namespace trtllm::kernels::ar_fusion::moe {
