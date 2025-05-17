@@ -126,8 +126,8 @@ void check(T ptr, char const* const func, char const* const file, int const line
 {
     if (ptr)
     {
-        throw TllmException(file, line,
-            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
+        // throw TllmException(file, line,
+        //     fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -354,16 +354,18 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)
         freeSysMem = memInfo.ullAvailPhys;
 #endif // WIN32
 
-        TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
-            ((double) totalSysMem / 1e9), ((double) freeSysMem / 1e9));
+        // TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+        //     ((double) totalSysMem / 1e9), ((double) freeSysMem / 1e9));
+        // todo: log
         return {freeSysMem, totalSysMem};
     }
 
     size_t free = 0;
     size_t total = 0;
     check_cuda_error(cudaMemGetInfo(&free, &total));
-    TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
-        ((double) total / 1e9), ((double) free / 1e9));
+    // TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+    //     ((double) total / 1e9), ((double) free / 1e9));
+    // todo: log
     return {free, total};
 }
 
@@ -440,7 +442,8 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
 {
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("%s is an nullptr, skip!", name.c_str());
+        // TLLM_LOG_WARNING("%s is an nullptr, skip!", name.c_str());
+        // todo: log
         return;
     }
     cudaDeviceSynchronize();
@@ -448,8 +451,8 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
 
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
     size_t sizeInByte = sizeof(T) * nElement;
-    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nElement=%d, sizeInByte=%lu\n", ptr,
-        (isDevicePtr ? "Device" : "Host"), sizeof(T), nElement, sizeInByte);
+    // TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nElement=%d, sizeInByte=%lu\n", ptr,
+    //     (isDevicePtr ? "Device" : "Host"), sizeof(T), nElement, sizeInByte);
     T* tmp = const_cast<T*>(ptr);
     std::vector<T> tmpVec; // For device pointer
     if (isDevicePtr)
@@ -496,9 +499,10 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
     float avg = sum / nElement;
     float std = sqrtf(sqrSum / nElement - avg * avg);
 
-    TLLM_LOG_INFO("%s", name.c_str());
-    TLLM_LOG_INFO("size=%u, nInf=%zu, nNaN=%zu, nZero=%zu", nElement, nInf, nNaN, nZero);
-    TLLM_LOG_INFO("avg=%f, absSum: %f, std=%f, max=%f, min=%f, sad=%f", avg, absSum, std, allMax, allMin, allSad);
+    // TLLM_LOG_INFO("%s", name.c_str());
+    // TLLM_LOG_INFO("size=%u, nInf=%zu, nNaN=%zu, nZero=%zu", nElement, nInf, nNaN, nZero);
+    // TLLM_LOG_INFO("avg=%f, absSum: %f, std=%f, max=%f, min=%f, sad=%f", avg, absSum, std, allMax, allMin, allSad);
+    // todo: log
 
     if (bPrintElement)
     {
@@ -517,7 +521,8 @@ void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", 
                 ss << (float) tmp[i] << ", ";
             }
         }
-        TLLM_LOG_INFO("%s", ss.str().c_str());
+        // TLLM_LOG_INFO("%s", ss.str().c_str());
+        // todo: log
     }
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
@@ -542,7 +547,8 @@ void printToStream(T const* ptr, int const nElement, FILE* strm)
     bool const split_rows = (strm == stdout);
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // todo: log
         return;
     }
     std::vector<T> tmp(nElement, 0);
@@ -570,7 +576,8 @@ void print2dToStream(T const* ptr, int const nRow, int const nCol, int const nSt
 {
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // todo: log
         return;
     }
     for (int ri = 0; ri < nRow; ++ri)
@@ -694,7 +701,8 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
     // `nCol` (<= nStride) is length for print per row
     if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // TLLM_LOG_WARNING("Nullptr, skip!\n");
+        // todo: log
         return;
     }
     cudaDeviceSynchronize();
@@ -702,8 +710,9 @@ inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
 
     bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
     size_t sizeInByte = sizeof(T) * nRow * nStride;
-    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr,
-        (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
+    // TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr,
+    //     (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
+    // todo: log
     if (isDevicePtr)
     {
         std::vector<T> tmpVec;

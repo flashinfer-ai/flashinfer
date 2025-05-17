@@ -22,7 +22,7 @@ import ctypes
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops, sm100a_nvcc_flags
 from .utils import register_custom_op
 
 class DataType(IntEnum):
@@ -104,6 +104,7 @@ def get_trtllm_comm_module():
                     FLASHINFER_CSRC_DIR / "trtllm_comm/allReduceFusionKernels.cu", # allreduce_fusion_kernel_oneshot_lamport
                     FLASHINFER_CSRC_DIR / "trtllm_comm/moeAllReduceFusionKernels.cu", # moereduce_allreduce_fusion_kernel_oneshot_lamport
                 ],
+                extra_cuda_cflags=sm100a_nvcc_flags,
             )
 
         # torch library for all
