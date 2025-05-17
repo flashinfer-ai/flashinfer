@@ -4,13 +4,16 @@
 #include <cooperative_groups.h>
 
 #include "flashinfer/distributed/allReduceFusionKernels.cuh"
-
 #include "pytorch_extension_utils.h"
 
-// #include "tensorrt_llm/common/envUtils.h"
+// #include "tensorrt_llm/common/envUtils.h" // use trtllm_enable_pdl local var instead
 // #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-// #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
-// #include "tensorrt_llm/kernels/quantization.cuh"
+#include "flashinfer/distributed/trtllm/kernels/quantization.cuh" // to delete redundant dependencies
+#include "flashinfer/distributed/trtllm/kernels/quantization.h" // to delete redundant dependencies
+
+static bool trtllm_enable_pdl = true;  // temp env var for easier compilation
+
+namespace cg = cooperative_groups;
 
 namespace tensorrt_llm::kernels::ar_fusion {
 template <int NRanks>
@@ -573,8 +576,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params) {
   cfg.dynamicSmemBytes = 0;
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed =
-      tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+  attribute[0].val.programmaticStreamSerializationAllowed = trtllm_enable_pdl ? 1 : 0;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
@@ -640,11 +642,11 @@ void allreduce_fusion_op(AllReduceFusionParams const& params) {
   }
 
 #define DISPATCH_DTYPE(NRanks)                                         \
-  if (params.dtype == nvinfer1::DataType::kHALF) {                     \
+  if (params.dtype == DataType::kFP16) {                               \
     DISPATCH_PATTERN(half, NRanks);                                    \
-  } else if (params.dtype == nvinfer1::DataType::kBF16) {              \
+  } else if (params.dtype == DataType::kBF16) {                        \
     DISPATCH_PATTERN(__nv_bfloat16, NRanks);                           \
-  } else if (params.dtype == nvinfer1::DataType::kFLOAT) {             \
+  } else if (params.dtype == DataType::kFP32) {                        \
     DISPATCH_PATTERN(float, NRanks);                                   \
   } else {                                                             \
     TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported dtype!"); \

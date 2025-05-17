@@ -3,13 +3,13 @@
 
 #pragma once
 // #include <NvInferRuntime.h> // we can remove this since it's about datatype
-#include "flashinfer/distributed/trtllm/types.h"
+#include "flashinfer/distributed/trtllm/types.h" // to delete redundant dependencies
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 // #include "flashinfer/distributed/trtllm/common/assert.h"
 // #include "flashinfer/distributed/trtllm/common/cudaUtils.h"
-// #include "flashinfer/distributed/trtllm/kernels/quantization.h"
+#include "flashinfer/distributed/trtllm/kernels/quantization.h"
 // #include "flashinfer/distributed/trtllm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::ar_fusion {
@@ -98,7 +98,7 @@ constexpr QuantType GetQuantType = FusionPatternTraits<Pattern>::kQuantType;
 struct AllReduceFusionParams {
   int nranks;
   int rank;
-  nvinfer1::DataType dtype;
+  DataType dtype;
   int size;
   int hidden_dim;
   void** workspace;

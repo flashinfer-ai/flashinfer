@@ -6,10 +6,14 @@
 
 #include "pytorch_extension_utils.h"
 
-// #include "tensorrt_llm/common/envUtils.h"
+namespace cg = cooperative_groups;
+
+// #include "tensorrt_llm/common/envUtils.h" // use trtllm_enable_pdl local var instead
 // #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-// #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
-// #include "tensorrt_llm/kernels/quantization.cuh"
+#include "flashinfer/distributed/trtllm/kernels/quantization.h"
+#include "flashinfer/distributed/trtllm/kernels/quantization.cuh"
+
+static bool trtllm_enable_pdl = true; // temp env var for easier compilation
 
 namespace tensorrt_llm::kernels::ar_fusion::moe {
 template <int NRanks>
@@ -182,7 +186,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #endif
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
 
@@ -383,8 +386,7 @@ void moereduction_allreduce_fusion_kernel_launcher(
   cfg.dynamicSmemBytes = 0;
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed =
-      tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+  attribute[0].val.programmaticStreamSerializationAllowed = trtllm_enable_pdl ? 1 : 0;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;

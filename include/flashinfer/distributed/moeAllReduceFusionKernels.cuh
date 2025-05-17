@@ -9,7 +9,7 @@
 
 // #include "flashinfer/distributed/trtllm/common/assert.h"
 // #include "flashinfer/distributed/trtllm/common/cudaUtils.h"
-// #include "flashinfer/distributed/trtllm/kernels/quantization.h"
+#include "flashinfer/distributed/trtllm/kernels/quantization.h"
 // #include "flashinfer/distributed/trtllm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::ar_fusion::moe
