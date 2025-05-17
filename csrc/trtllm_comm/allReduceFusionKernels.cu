@@ -1,24 +1,18 @@
 // adapted from
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.cu#L440
 
-// #include "customAllReduceKernels.h"
-// #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
-// #include "tensorrt_llm/common/cudaTypeUtils.cuh"
-// #include "tensorrt_llm/common/cudaUtils.h"
-// #include "tensorrt_llm/common/customAllReduceUtils.h"
-// #include "tensorrt_llm/common/dataType.h"
-// #include "tensorrt_llm/common/envUtils.h"
 #include <cooperative_groups.h>
 
-#include <tuple>
-#include <type_traits>
-
 #include "flashinfer/distributed/allReduceFusionKernels.cuh"
-// #include "include/check.h"
-#include "include/types.h"
+
 #include "pytorch_extension_utils.h"
 
-namespace trtllm::kernels::ar_fusion {
+// #include "tensorrt_llm/common/envUtils.h"
+// #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+// #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+// #include "tensorrt_llm/kernels/quantization.cuh"
+
+namespace tensorrt_llm::kernels::ar_fusion {
 template <int NRanks>
 struct SyncComm {
   __device__ __forceinline__ SyncComm(void** workspace) {
@@ -613,69 +607,59 @@ void allreduce_fusion_op(AllReduceFusionParams const& params) {
     }                                                                                 \
   }
 
-#define DISPATCH_PATTERN(DType, NRanks)                                                     \
-  if (params.pattern == AllReduceFusionPattern::kAllReduce) {                               \
-    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                   \
-  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNorm) {                \
-    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);           \
-  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP8Quant) {        \
-    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);   \
-  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP4Quant) {        \
-    if constexpr (!std::is_same_v<DType, float>) {                                          \
-      DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks); \
-    } else {                                                                                \
-  // TLLM_CHECK_WITH_INFO(false,                                                                                \
-            //     "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormFP4Quant can not work with "        \
-            //     "DType=float!");
-  TORCH_CHECK(false,
-              "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormFP4Quant can not "
-              "work with "
-              "DType=float!");
-}
-}
-else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant) {
-  DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);
-}
-else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant) {
-  if constexpr (!std::is_same_v<DType, float>) {
-    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks);
-  } else {  // TLLM_CHECK_WITH_INFO(false,                                                                                \
-            //     "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutFP4Quant can not work with "     \
-            //     "DType=float!");
-    TORCH_CHECK(false,
-                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutFP4Quant can "
-                "not work with "
-                "DType=float!");
+#define DISPATCH_PATTERN(DType, NRanks)                                                            \
+  if (params.pattern == AllReduceFusionPattern::kAllReduce) {                                      \
+    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                          \
+  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNorm) {                       \
+    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                  \
+  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP8Quant) {               \
+    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);          \
+  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP4Quant) {               \
+    if constexpr (!std::is_same_v<DType, float>) {                                                 \
+      DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);        \
+    } else {                                                                                       \
+      TORCH_CHECK(false,                                                                           \
+                  "allreduce_fusion_kernel: "                                                      \
+                  "AllReduceFusionPattern=kARResidualRMSNormFP4Quant can not work with "           \
+                  "DType=float!");                                                                 \
+    }                                                                                              \
+  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant) {            \
+    DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);       \
+  } else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant) {            \
+    if constexpr (!std::is_same_v<DType, float>) {                                                 \
+      DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks);     \
+    } else {                                                                                       \
+      TORCH_CHECK(                                                                                 \
+          false,                                                                                   \
+          "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutFP4Quant can not " \
+          "work with "                                                                             \
+          "DType=float!");                                                                         \
+    }                                                                                              \
+  } else {                                                                                         \
+    TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");                           \
   }
-}
-else {  // TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \
-        TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \
-    }
 
-#define DISPATCH_DTYPE(NRanks)                  \
-  if (params.dtype == DataType::kFP16) {        \
-    DISPATCH_PATTERN(half, NRanks);             \
-  } else if (params.dtype == DataType::kBF16) { \
-    DISPATCH_PATTERN(__nv_bfloat16, NRanks);    \
-  } else if (params.dtype == DataType::kFP32) { \
-    DISPATCH_PATTERN(float, NRanks);            \
-  } else {                                      \
-  // TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported dtype!");
-  TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported dtype!");
-}
+#define DISPATCH_DTYPE(NRanks)                                         \
+  if (params.dtype == nvinfer1::DataType::kHALF) {                     \
+    DISPATCH_PATTERN(half, NRanks);                                    \
+  } else if (params.dtype == nvinfer1::DataType::kBF16) {              \
+    DISPATCH_PATTERN(__nv_bfloat16, NRanks);                           \
+  } else if (params.dtype == nvinfer1::DataType::kFLOAT) {             \
+    DISPATCH_PATTERN(float, NRanks);                                   \
+  } else {                                                             \
+    TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported dtype!"); \
+  }
 
 #define DISPATCH_RANKS(NRanks)   \
   if (params.nranks == NRanks) { \
     DISPATCH_DTYPE(NRanks);      \
   }
 
-bool fp32_acc = use_fp32_acc();
-DISPATCH_RANKS(2);
-DISPATCH_RANKS(4);
-DISPATCH_RANKS(8);
-DISPATCH_RANKS(16);
-// TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
-TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported ranks number!");
+  bool fp32_acc = use_fp32_acc();
+  DISPATCH_RANKS(2);
+  DISPATCH_RANKS(4);
+  DISPATCH_RANKS(8);
+  DISPATCH_RANKS(16);
+  TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
-}
-;  // namespace tensorrt_llm::kernels::ar_fusion
+};  // namespace tensorrt_llm::kernels::ar_fusion

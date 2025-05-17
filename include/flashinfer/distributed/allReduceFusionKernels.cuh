@@ -2,16 +2,17 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h
 
 #pragma once
-// #include <NvInferRuntime.h>
-#include "include/quantization.h"
-#include "include/types.h"
+// #include <NvInferRuntime.h> // we can remove this since it's about datatype
+#include "flashinfer/distributed/trtllm/types.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
-// #include "tensorrt_llm/common/assert.h"
-// #include "tensorrt_llm/common/cudaUtils.h"
-// #include "tensorrt_llm/kernels/quantization.h"
-// #include "tensorrt_llm/runtime/ipcUtils.h"
+// #include "flashinfer/distributed/trtllm/common/assert.h"
+// #include "flashinfer/distributed/trtllm/common/cudaUtils.h"
+// #include "flashinfer/distributed/trtllm/kernels/quantization.h"
+// #include "flashinfer/distributed/trtllm/runtime/ipcUtils.h"
 
-namespace trtllm::kernels::ar_fusion {
+namespace tensorrt_llm::kernels::ar_fusion {
 template <typename DType>
 struct ElemsPerAccess;
 
@@ -97,7 +98,7 @@ constexpr QuantType GetQuantType = FusionPatternTraits<Pattern>::kQuantType;
 struct AllReduceFusionParams {
   int nranks;
   int rank;
-  DataType dtype;
+  nvinfer1::DataType dtype;
   int size;
   int hidden_dim;
   void** workspace;
@@ -118,4 +119,4 @@ struct AllReduceFusionParams {
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
-}  // namespace trtllm::kernels::ar_fusion
+}  // namespace tensorrt_llm::kernels::ar_fusion

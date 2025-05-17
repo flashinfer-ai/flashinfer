@@ -1,5 +1,3 @@
-# flashinfer: adapted from sglang + vllm code
-# refer to sgl-kernel/python/sgl_kernel/allreduce.py from sglang
 """
 Copyright (c) 2024 by FlashInfer team.
 

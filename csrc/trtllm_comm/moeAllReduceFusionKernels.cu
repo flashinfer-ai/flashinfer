@@ -1,17 +1,17 @@
 // adapated from
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.cu#L213
+#include <cooperative_groups.h>
+
+#include "flashinfer/distributed/moeAllReduceFusionKernels.cuh"
+
+#include "pytorch_extension_utils.h"
+
 // #include "tensorrt_llm/common/envUtils.h"
 // #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 // #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 // #include "tensorrt_llm/kernels/quantization.cuh"
-#include <cooperative_groups.h>
 
-// #include "include/check.h"
-#include "include/types.h"
-#include "flashinfer/distributed/moeAllReduceFusionKernels.cuh"
-#include "pytorch_extension_utils.h"
-
-namespace trtllm::kernels::ar_fusion::moe {
+namespace tensorrt_llm::kernels::ar_fusion::moe {
 template <int NRanks>
 struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
@@ -451,4 +451,4 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
   TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
 }
 
-};  // namespace trtllm::kernels::ar_fusion::moe
+};  // namespace tensorrt_llm::kernels::ar_fusion::moe
