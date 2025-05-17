@@ -16,11 +16,12 @@
  */
 #pragma once
 
-#include "flashinfer/distributed/trtllm/common/cudaBf16Wrapper.h"
 #include "flashinfer/distributed/trtllm/common/cudaDriverWrapper.h"
 #include "flashinfer/distributed/trtllm/common/cudaFp8Utils.h"
 #include "flashinfer/distributed/trtllm/common/logger.h"
 #include "flashinfer/distributed/trtllm/common/tllmException.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>

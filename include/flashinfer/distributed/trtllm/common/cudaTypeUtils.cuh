@@ -17,14 +17,9 @@
 #pragma once
 
 #include "flashinfer/distributed/trtllm/common/cudaBf16Fallbacks.cuh"
-#include "flashinfer/distributed/trtllm/common/cudaBf16Wrapper.h"
 #include "flashinfer/distributed/trtllm/common/cudaFp8Utils.h"
 #include <assert.h>
 #include <cuda.h>
-#include <cuda_fp16.h>
-#if ENABLE_BF16
-#include <cuda_bf16.h>
-#endif
 
 namespace tensorrt_llm
 {
@@ -37,7 +32,7 @@ inline __device__ T ldg(T const* val)
     return __ldg(val);
 }
 
-#if ENABLE_BF16
+
 template <>
 inline __device__ __nv_bfloat162 ldg(__nv_bfloat162 const* val)
 {
@@ -57,7 +52,6 @@ inline __device__ __nv_bfloat16 ldg(__nv_bfloat16 const* val)
     return __ldg(val);
 #endif
 }
-#endif // ENABLE_BF16
 
 // Get type2 from type or vice versa (applied to half and bfloat16)
 template <typename T>
@@ -78,7 +72,6 @@ struct TypeConverter<half>
     using Type = half2;
 };
 
-#if ENABLE_BF16
 template <>
 struct TypeConverter<__nv_bfloat162>
 {
@@ -90,7 +83,6 @@ struct TypeConverter<__nv_bfloat16>
 {
     using Type = __nv_bfloat162;
 };
-#endif // ENABLE_BF16
 
 // Defined math operations (bfloat16 fallback to fp32 when it is not supported)
 template <typename T>
@@ -99,13 +91,11 @@ inline __device__ T hadd2(T a, T b)
     return __hadd2(a, b);
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 hadd2(__nv_bfloat162 a, __nv_bfloat162 b)
 {
     return bf16hadd2(a, b);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T add(T a, T b)
@@ -125,7 +115,6 @@ inline __device__ half add(half a, half b)
     return __hadd(a, b);
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 add(__nv_bfloat162 a, __nv_bfloat162 b)
 {
@@ -142,7 +131,6 @@ inline __device__ __nv_bfloat16 add(__nv_bfloat16 a, float b)
 {
     return bf16hadd(a, __float2bfloat16(b));
 }
-#endif // ENABLE_BF16
 
 // applies to all 4 values addition
 template <typename T>
@@ -151,7 +139,6 @@ inline __device__ T add(T a, T b, T c)
     return a + b + c;
 }
 
-#if ENABLE_BF16
 inline __device__ __nv_bfloat16 add(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c)
 {
     return bf16hadd(a, b, c);
@@ -161,7 +148,6 @@ inline __device__ __nv_bfloat162 add(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bf
 {
     return bf16hadd2(a, b, c);
 }
-#endif // ENABLE_BF16
 
 // applies to all 4 values addition
 template <typename T>
@@ -170,12 +156,10 @@ inline __device__ T add(T a, T b, T c, T d)
     return (T) ((float) a + (float) b + (float) c + (float) d);
 }
 
-#if ENABLE_BF16
 inline __device__ __nv_bfloat16 add(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c, __nv_bfloat16 d)
 {
     return bf16hadd(a, b, c, d);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T hsub2(T a, T b)
@@ -183,13 +167,11 @@ inline __device__ T hsub2(T a, T b)
     return __hsub2(a, b);
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 hsub2(__nv_bfloat162 a, __nv_bfloat162 b)
 {
     return bf16hsub2(a, b);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T hmul2(T a, T b)
@@ -197,13 +179,11 @@ inline __device__ T hmul2(T a, T b)
     return __hmul2(a, b);
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 hmul2(__nv_bfloat162 a, __nv_bfloat162 b)
 {
     return bf16hmul2(a, b);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T hmul2(T a, T b, T c)
@@ -211,13 +191,11 @@ inline __device__ T hmul2(T a, T b, T c)
     return a * b * c;
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 hmul2(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c)
 {
     return bf16hmul2(a, b, c);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T mul(T a, T b, T c)
@@ -225,7 +203,6 @@ inline __device__ T mul(T a, T b, T c)
     return a * b * c;
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat16 mul(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c)
 {
@@ -236,7 +213,6 @@ inline __device__ __nv_bfloat162 mul(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bf
 {
     return bf16hmul2(a, b, c);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T fma(T a, T b, T c, T d)
@@ -244,12 +220,10 @@ inline __device__ T fma(T a, T b, T c, T d)
     return a * b * c + d;
 }
 
-#if ENABLE_BF16
 inline __device__ __nv_bfloat162 fma(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c, __nv_bfloat162 d)
 {
     return bf16hfma2(a, b, c, d);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T fma(T a, T b, T c)
@@ -257,7 +231,6 @@ inline __device__ T fma(T a, T b, T c)
     return a * b + c;
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 fma(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c)
 {
@@ -269,7 +242,6 @@ inline __device__ __nv_bfloat16 fma(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloa
 {
     return bf16hfma(a, b, c);
 }
-#endif // ENABLE_BF16
 
 template <typename T>
 inline __device__ T hexp2(T a)
@@ -277,13 +249,11 @@ inline __device__ T hexp2(T a)
     return h2exp(a);
 }
 
-#if ENABLE_BF16
 template <>
 inline __device__ __nv_bfloat162 hexp2(__nv_bfloat162 a)
 {
     return bf16exp2(a);
 }
-#endif // ENABLE_BF16
 
 template <typename T_OUT, typename T_IN>
 __device__ inline T_OUT cuda_cast(T_IN val)

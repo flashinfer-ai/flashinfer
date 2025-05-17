@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "flashinfer/distributed/trtllm/common/cudaBf16Wrapper.h"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
 namespace tensorrt_llm
@@ -25,7 +25,7 @@ namespace tensorrt_llm
 namespace common
 {
 
-#ifdef ENABLE_BF16
+
 inline __device__ float2 bf1622float2(const __nv_bfloat162 val)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -287,8 +287,6 @@ inline __device__ __nv_bfloat162 bf16hfma2(__nv_bfloat162 a, __nv_bfloat162 b, _
     return a * b * c + d;
 #endif
 }
-
-#endif // ENABLE_BF16
 
 } // namespace common
 } // namespace tensorrt_llm
