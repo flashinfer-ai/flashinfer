@@ -55,7 +55,7 @@ from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
-from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
+from .core import clear_cache_dir, load_cuda_ops, sm100a_nvcc_flags  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
