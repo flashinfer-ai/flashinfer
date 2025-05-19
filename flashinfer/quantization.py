@@ -19,10 +19,20 @@ from typing import Any, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _quantization_module = None
+
+
+def gen_quantization_module() -> JitSpec:
+    return gen_jit_spec(
+        "quantization",
+        [
+            FLASHINFER_CSRC_DIR / "quantization.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
+        ],
+    )
 
 
 def get_quantization_module():
@@ -33,13 +43,7 @@ def get_quantization_module():
 
             _quantization_module = _kernels
         else:
-            _quantization_module = gen_jit_spec(
-                "quantization",
-                [
-                    FLASHINFER_CSRC_DIR / "quantization.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
-                ],
-            ).build_and_load()
+            _quantization_module = gen_quantization_module().build_and_load()
     return _quantization_module
 
 

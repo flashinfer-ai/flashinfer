@@ -21,10 +21,20 @@ from typing import List, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op
 
 _comm_module = None
+
+
+def gen_comm_module() -> JitSpec:
+    return gen_jit_spec(
+        "comm",
+        [
+            FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+            FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+        ],
+    )
 
 
 def get_comm_module():
@@ -34,13 +44,7 @@ def get_comm_module():
             _kernels = torch.ops.flashinfer_kernels
             module = _kernels
         else:
-            module = gen_jit_spec(
-                "comm",
-                [
-                    FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
-                    FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
-                ],
-            ).build_and_load()
+            module = gen_comm_module().build_and_load()
 
         # torch library for all
         @register_custom_op(
