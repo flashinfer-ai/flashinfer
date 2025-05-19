@@ -17,105 +17,91 @@ limitations under the License.
 import torch
 
 import flashinfer
-from flashinfer.jit import parallel_load_modules
 from flashinfer.utils import PosEncodingMode
 
 
 def test_warmpup_llama():
-    parallel_load_modules(
+    flashinfer.jit.build_jit_specs(
         [
-            (flashinfer.activation.get_act_and_mul_module, ["silu"]),
-            (flashinfer.norm.get_norm_module, []),
-            (flashinfer.sampling.get_sampling_module, []),
-            (flashinfer.quantization.get_quantization_module, []),
-            (flashinfer.page.get_page_module, []),
-            (
-                flashinfer.decode.get_batch_decode_module,
-                [
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    128,  # head_dim_qk
-                    128,  # head_dim_vo
-                    PosEncodingMode.NONE.value,
-                    False,  # use_sliding_window
-                    False,  # use_logits_soft_cap
-                ],
+            flashinfer.activation.gen_act_and_mul_module("silu"),
+            flashinfer.norm.gen_norm_module(),
+            flashinfer.sampling.gen_sampling_module(),
+            flashinfer.quantization.gen_quantization_module(),
+            flashinfer.page.gen_page_module(),
+            flashinfer.decode.gen_batch_decode_module(
+                torch.float16,
+                torch.float16,
+                torch.float16,
+                torch.int32,
+                128,  # head_dim_qk
+                128,  # head_dim_vo
+                PosEncodingMode.NONE.value,
+                False,  # use_sliding_window
+                False,  # use_logits_soft_cap
             ),
-            (
-                flashinfer.prefill.gen_batch_prefill_module,
-                [
-                    "fa2",  # backend
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    128,  # head_dim_qk
-                    128,  # head_dim_vo
-                    PosEncodingMode.NONE.value,
-                    False,  # use_sliding_window
-                    False,  # use_logits_soft_cap
-                    False,  # use_fp16_qk_reduction
-                ],
+            flashinfer.prefill.gen_batch_prefill_module(
+                "fa2",  # backend
+                torch.float16,
+                torch.float16,
+                torch.float16,
+                torch.int32,
+                128,  # head_dim_qk
+                128,  # head_dim_vo
+                PosEncodingMode.NONE.value,
+                False,  # use_sliding_window
+                False,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
             ),
-        ]
+        ],
+        verbose=False,
     )
 
 
 def test_warmpup_llama_sm90():
-    parallel_load_modules(
+    flashinfer.jit.build_jit_specs(
         [
-            (flashinfer.activation.get_act_and_mul_module, ["silu"]),
-            (flashinfer.norm.get_norm_module, []),
-            (flashinfer.sampling.get_sampling_module, []),
-            (flashinfer.quantization.get_quantization_module, []),
-            (flashinfer.page.get_page_module, []),
-            (
-                flashinfer.decode.get_batch_decode_module,
-                [
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    128,  # head_dim_qk
-                    128,  # head_dim_vo
-                    PosEncodingMode.NONE.value,
-                    False,  # use_sliding_window
-                    False,  # use_logits_soft_cap
-                ],
+            flashinfer.activation.gen_act_and_mul_module("silu"),
+            flashinfer.norm.gen_norm_module(),
+            flashinfer.sampling.gen_sampling_module(),
+            flashinfer.quantization.gen_quantization_module(),
+            flashinfer.page.gen_page_module(),
+            flashinfer.decode.gen_batch_decode_module(
+                torch.float16,
+                torch.float16,
+                torch.float16,
+                torch.int32,
+                128,  # head_dim_qk
+                128,  # head_dim_vo
+                PosEncodingMode.NONE.value,
+                False,  # use_sliding_window
+                False,  # use_logits_soft_cap
             ),
-            (
-                flashinfer.prefill.gen_batch_prefill_module,
-                [
-                    "fa2",  # backend
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    128,  # head_dim_qk
-                    128,  # head_dim_vo
-                    PosEncodingMode.NONE.value,
-                    False,  # use_sliding_window
-                    False,  # use_logits_soft_cap
-                    False,  # use_fp16_qk_reduction
-                ],
+            flashinfer.prefill.gen_batch_prefill_module(
+                "fa2",  # backend
+                torch.float16,
+                torch.float16,
+                torch.float16,
+                torch.int32,
+                128,  # head_dim_qk
+                128,  # head_dim_vo
+                PosEncodingMode.NONE.value,
+                False,  # use_sliding_window
+                False,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
             ),
-            (
-                flashinfer.prefill.gen_batch_prefill_module,
-                [
-                    "fa3",  # backend
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    128,  # head_dim_qk
-                    128,  # head_dim_vo
-                    PosEncodingMode.NONE.value,
-                    False,  # use_sliding_window
-                    False,  # use_logits_soft_cap
-                    False,  # use_fp16_qk_reduction
-                ],
+            flashinfer.prefill.gen_batch_prefill_module(
+                "fa3",  # backend
+                torch.float16,
+                torch.float16,
+                torch.float16,
+                torch.int32,
+                128,  # head_dim_qk
+                128,  # head_dim_vo
+                PosEncodingMode.NONE.value,
+                False,  # use_sliding_window
+                False,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
             ),
-        ]
+        ],
+        verbose=False,
     )

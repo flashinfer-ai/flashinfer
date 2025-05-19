@@ -62,7 +62,6 @@ from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .env import *
-from .parallel_load_modules import parallel_load_modules as parallel_load_modules
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
