@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -43,7 +43,7 @@ def get_gemm_module():
 
             module = _kernels
         else:
-            module = load_cuda_ops(
+            module = gen_jit_spec(
                 "gemm",
                 [
                     FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
@@ -51,7 +51,7 @@ def get_gemm_module():
                     FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
                 ],
                 extra_ldflags=["-lcublas", "-lcublasLt"],
-            )
+            ).build_and_load()
 
         # torch library for bmm_fp8
 
@@ -148,7 +148,7 @@ def get_gemm_sm100_module():
         _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
         module = _kernels_sm100
     else:
-        module = load_cuda_ops(
+        module = gen_jit_spec(
             "gemm_sm100",
             [
                 FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
@@ -157,7 +157,7 @@ def get_gemm_sm100_module():
                 FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
             ],
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
-        )
+        ).build_and_load()
 
     return module
 
@@ -170,7 +170,7 @@ def get_gemm_sm90_module():
 
             module = _kernels_sm90
         else:
-            module = load_cuda_ops(
+            module = gen_jit_spec(
                 "gemm_sm90",
                 [
                     FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
@@ -183,7 +183,7 @@ def get_gemm_sm90_module():
                     FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
                 ],
                 extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
-            )
+            ).build_and_load()
 
         # torch library for cutlass_segment_gemm_sm90
 

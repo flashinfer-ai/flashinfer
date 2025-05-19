@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.jit import build_jit_specs
 from flashinfer.jit.attention import (
     gen_batch_mla_module,
     gen_batch_prefill_module,
@@ -37,20 +38,17 @@ def warmup_jit():
                 continue
 
             modules.append(
-                (
-                    gen_single_prefill_module,
-                    [
-                        backend,
-                        torch.float16,
-                        torch.float16,
-                        torch.float16,
-                        192,
-                        128,
-                        0,
-                        False,
-                        False,
-                        False,
-                    ],
+                gen_single_prefill_module(
+                    backend,
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    192,
+                    128,
+                    0,
+                    False,
+                    False,
+                    False,
                 )
             )
 
@@ -59,21 +57,18 @@ def warmup_jit():
                 continue
 
             modules.append(
-                (
-                    gen_batch_prefill_module,
-                    [
-                        backend,
-                        torch.float16,
-                        torch.float16,
-                        torch.float16,
-                        torch.int32,
-                        192,
-                        128,
-                        0,
-                        False,
-                        False,
-                        False,
-                    ],
+                gen_batch_prefill_module(
+                    backend,
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    192,
+                    128,
+                    0,
+                    False,
+                    False,
+                    False,
                 )
             )
 
@@ -82,22 +77,19 @@ def warmup_jit():
                 continue
 
             modules.append(
-                (
-                    gen_batch_mla_module,
-                    [
-                        backend,
-                        torch.float16,
-                        torch.float16,
-                        torch.float16,
-                        torch.int32,
-                        512,
-                        64,
-                        False,
-                    ],
+                gen_batch_mla_module(
+                    backend,
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    512,
+                    64,
+                    False,
                 )
             )
 
-        flashinfer.jit.parallel_load_modules(modules)
+        build_jit_specs(modules, verbose=False)
     except Exception as e:
         # abort the test session if warmup fails
         pytest.exit(str(e))

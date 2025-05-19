@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _norm_module = None
@@ -33,13 +33,13 @@ def get_norm_module():
 
             _norm_module = _kernels
         else:
-            _norm_module = load_cuda_ops(
+            _norm_module = gen_jit_spec(
                 "norm",
                 [
                     FLASHINFER_CSRC_DIR / "norm.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
                 ],
-            )
+            ).build_and_load()
     return _norm_module
 
 

@@ -84,7 +84,7 @@ def get_fmha_module(
             pos_encoding_mode,
             use_sliding_window,
             use_logits_soft_cap,
-        )
+        ).build_and_load()
     else:
         raise ValueError(f"SM100A is not supported on this device")
 
@@ -109,7 +109,8 @@ def get_single_prefill_module(backend):
 
                     run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90.default
             else:
-                run_func = gen_single_prefill_module(backend, *args).run.default
+                module = gen_single_prefill_module(backend, *args).build_and_load()
+                run_func = module.run.default
 
             # torch library for single_prefill_with_kv_cache
 
@@ -248,7 +249,7 @@ def get_batch_prefill_module(backend):
                         _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run.default
                     )
             else:
-                module = gen_batch_prefill_module(backend, *args)
+                module = gen_batch_prefill_module(backend, *args).build_and_load()
                 plan_func = module.plan.default
                 ragged_run_func = module.ragged_run.default
                 paged_run_func = module.paged_run.default
@@ -1221,7 +1222,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args),
+                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
             )
         else:
             self._jit_module = None
@@ -2066,7 +2067,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args),
+                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
             )
         else:
             self._jit_module = None
