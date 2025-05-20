@@ -207,25 +207,27 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
 
   uint32_t cta_tile_q_p = 0;
-  int64_t unpacked_qo_len = qo_len * group_size;
-  if (unpacked_qo_len > 64 && HEAD_DIM_VO < 256) {
-    cta_tile_q_p = 128;
-  } else {
-    auto compute_capacity = GetCudaComputeCapability();
-    if (compute_capacity.first >= 8) {
-      // Ampere or newer
-      if (unpacked_qo_len > 16) {
-        // avg_packed_qo_len <= 64
-        cta_tile_q_p = 64;
-      } else {
-        // avg_packed_qo_len <= 16
-        cta_tile_q_p = 16;
-      }
-    } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-      cta_tile_q_p = 64;
-    }
-  }
+  int64_t unpacked_qo_len =
+      qo_len * group_size;  // TODO(@Wenxuan): Include batch size in calculation
+  // if (unpacked_qo_len > 64 && HEAD_DIM_VO < 256) {
+  //   cta_tile_q_p = 128;
+  // } else {
+  //   auto compute_capacity = GetCudaComputeCapability();
+  //   if (compute_capacity.first >= 8) {
+  //     // Ampere or newer
+  //     if (unpacked_qo_len > 16) {
+  //       // avg_packed_qo_len <= 64
+  //       cta_tile_q_p = 64;
+  //     } else {
+  //       // avg_packed_qo_len <= 16
+  //       cta_tile_q_p = 16;
+  //     }
+  //   } else {
+  //     // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+  //     cta_tile_q_p = 64;
+  //   }
+  // }
+  cta_tile_q_p = FA2DetermineCtaTileQ(unpacked_qo_len, HEAD_DIM_VO);
 
   // Decode vars setup
   using DTypeQ_D = typename DecodeParams::DTypeQ;

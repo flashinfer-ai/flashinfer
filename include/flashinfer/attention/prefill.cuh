@@ -2560,7 +2560,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
     return cudaSuccess;
   }
-
+  // bs = num_qo_tiles * num_kv_tiles * gqa_group_size
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
