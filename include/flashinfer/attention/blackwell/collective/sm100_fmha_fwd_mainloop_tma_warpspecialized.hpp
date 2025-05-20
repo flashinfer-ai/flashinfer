@@ -1027,12 +1027,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //    store to smem
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
                             typename TensorStorageEpi::SmemLayoutO{});
-    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE),
-                              repeat_like(typename CollectiveEpilogue::StrideLSE{}, _1{}),
-                              epilogue.params.layout_LSE.stride());
+    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
     if (epilogue.params.ptr_LSE != nullptr) {
       int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
       int qo_len = get<0>(problem_shape);
       int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
@@ -1042,7 +1041,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                       params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
       if (row_idx < qo_len) {
-        gLSE(segment_offset + row_idx, get<2>(blk_coord)) = lse;
+        gLSE(segment_offset + row_idx, qo_head_idx) = lse;
       }
     }
     // correction_epilogue(params.scale_output, _0{}, sO);
@@ -1070,6 +1069,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     if (epilogue.params.ptr_LSE != nullptr) {
       int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
       int qo_len = get<0>(problem_shape);
       int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
@@ -1080,7 +1080,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                       params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
       if (row_idx < qo_len) {
-        gLSE(segment_offset + row_idx, get<2>(blk_coord)) = lse;
+        gLSE(segment_offset + row_idx, qo_head_idx) = lse;
       }
     }
     // correction_epilogue(params.scale_output, _1{}, sO);
