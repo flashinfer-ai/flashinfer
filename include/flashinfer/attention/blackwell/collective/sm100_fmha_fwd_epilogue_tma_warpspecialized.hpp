@@ -49,7 +49,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using LayoutO = cute::Layout<ShapeT, StrideO>;
 
   using ShapeLSE = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>>;
-  using StrideLSE = cute::Shape<int32_t, cute::Shape<_1, int32_t>>;
+  using StrideLSE = cute::Shape<int32_t, cute::Shape<_0, int32_t>>;
   using LayoutLSE = cute::Layout<ShapeLSE, StrideLSE>;
 
   //  using SmemLayoutO = decltypa(make_layout(append<3>(select<0,1>(TileShape_WG{}), _2{})));

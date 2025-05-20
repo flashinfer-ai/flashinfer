@@ -56,7 +56,7 @@ struct FwdRunner {
   // NOTE(Zihao): use markus's trick for tma store
   using StrideO =
       cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;  // Q D (H_G H_R) CUMULATIVE_Q
-  using StrideLSE = cute::tuple<int, cute::tuple<_1, int>>;           // Q (H_G H_R)
+  using StrideLSE = cute::tuple<int, cute::tuple<_0, int>>;           // Q (H_G H_R)
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
@@ -108,7 +108,7 @@ struct FwdRunner {
         make_stride(make_stride(head_dim_vo, h_r * head_dim_vo), num_qo_heads * head_dim_vo));
     stride_K = make_stride(num_kv_heads * head_dim_qk, _1{}, make_stride(_0{}, head_dim_qk));
     stride_V = make_stride(_1{}, num_kv_heads * head_dim_vo, make_stride(_0{}, head_dim_vo));
-    stride_LSE = make_stride(num_qo_heads, make_stride(_1{}, h_r));
+    stride_LSE = make_stride(num_qo_heads, make_stride(_0{}, h_r));
 
     auto shape_Q = make_shape(total_qo_len, head_dim_qk, make_shape(h_r, num_kv_heads));
     auto shape_O = make_shape(max_qo_len, head_dim_vo,
