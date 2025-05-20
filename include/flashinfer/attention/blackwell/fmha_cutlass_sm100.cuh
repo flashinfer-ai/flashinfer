@@ -126,7 +126,7 @@ struct FwdRunner {
     typename Operation::Arguments arguments{
         problem_shape,
         {static_cast<Element*>(q.data_ptr()), layout_Q, static_cast<Element*>(k.data_ptr()),
-         layout_K, static_cast<Element*>(v.data_ptr()), layout_V},
+         layout_K, static_cast<Element*>(v.data_ptr()), layout_V, float(sm_scale)},
         {static_cast<ElementOut*>(o.data_ptr()) - max_qo_len * get<0>(stride_O), layout_O,
          static_cast<ElementAccumulatorPV*>(maybe_lse.value().data_ptr()), layout_LSE},
         hw_info};
