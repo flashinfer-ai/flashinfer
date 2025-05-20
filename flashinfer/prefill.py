@@ -2638,7 +2638,8 @@ def fmha_varlen(
     nnz_kv, num_kv_heads, head_dim_vo = v.shape
 
     mask_mode_code = 1 if causal else 0
-    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
     qo_lens = qo_segment_offsets[1:] - qo_segment_offsets[:-1]
     kv_lens = kv_segment_offsets[1:] - kv_segment_offsets[:-1]

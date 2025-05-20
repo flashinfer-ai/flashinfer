@@ -171,8 +171,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   struct Arguments {
     typename Load::Arguments load;
 
-    // if zero, defaults to 1/sqrt(D)
-    float scale_softmax = 0.0f;
+    float scale_softmax;
 
     // scaling factors to dequantize QKV
     float scale_q = 1.0f;
@@ -201,9 +200,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args,
                                         void* workspace) {
     float scale_softmax = args.scale_softmax;
-    if (scale_softmax == 0.0f) {
-      scale_softmax = 1.0f / (float)std::sqrt(get<2>(problem_shape));
-    }
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
     return Params{Load::to_underlying_arguments(problem_shape, args.load, workspace),
