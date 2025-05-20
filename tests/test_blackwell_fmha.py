@@ -132,15 +132,6 @@ def test_blackwell_cutlass_fmha(
 
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
-    # test with pre-allocated output
-    # o_buffer = torch.empty_like(o)
-    # lse_buffer = torch.empty_like(lse)
-    # flashinfer.prefill.fmha(
-    #     q, k, v, qo_lens, kv_lens, out=o_buffer, lse=lse_buffer, causal=causal
-    # )
-    # torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
-    # torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
-
 
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(

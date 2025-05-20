@@ -1032,8 +1032,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     if (epilogue.params.ptr_LSE != nullptr) {
       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
 
-      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) +
-                      params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+      ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
       if (row_idx < get<0>(problem_shape)) {
         gLSE(row_idx, get<2>(blk_coord)) = lse;
@@ -1066,8 +1066,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) +
                     get<0>(TileShapeQK{});
 
-      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) +
-                      params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+      ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
       if (row_idx < get<0>(problem_shape)) {
         gLSE(row_idx, get<2>(blk_coord)) = lse;
