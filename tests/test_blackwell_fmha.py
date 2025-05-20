@@ -117,20 +117,20 @@ def test_blackwell_cutlass_fmha(
     )
     o, lse = wrapper.run(q, k, v, return_lse=True)
 
-    # gqa_group_ratio = num_qo_heads // num_kv_heads
-    # k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    # v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
-    # o_ref, lse_ref = attention_ref(
-    #     batch_size, q, k_repeated, v_repeated, causal, sm_scale
-    # )
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref, lse_ref = attention_ref(
+        batch_size, q, k_repeated, v_repeated, causal, sm_scale
+    )
 
-    # lse_ref = lse_ref.flatten(0, 1)
-    # if dtype == torch.half:
-    #     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    # else:
-    #     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    lse_ref = lse_ref.flatten(0, 1)
+    if dtype == torch.half:
+        torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    else:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
-    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
     # test with pre-allocated output
     # o_buffer = torch.empty_like(o)
@@ -145,13 +145,13 @@ def test_blackwell_cutlass_fmha(
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         1,
-        1,
-        1,
         32,
+        32,
+        4,
         4,
         192,
         128,
-        False,
+        True,
         torch.bfloat16,
         # 3,
         # 999,

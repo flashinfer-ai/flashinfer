@@ -906,14 +906,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
   }
 
-  template <class BlkCoord, class ProblemShape, class TensorStorageEpi>
+  template <class BlkCoord, class ProblemShape, class TensorStorageEpi, class CollectiveEpilogue>
   CUTLASS_DEVICE auto correction(
       BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
       TensorStorageEpi& shared_storage_epi, PipelineC& pipeline_s0_c,
       typename PipelineC::PipelineState& pipeline_s0_c_consumer_state, PipelineC& pipeline_s1_c,
       typename PipelineC::PipelineState& pipeline_s1_c_consumer_state, PipelineO& pipeline_o,
       typename PipelineO::PipelineState& pipeline_o_consumer_state, PipelineE& pipeline_epi,
-      typename PipelineE::PipelineState& pipeline_epi_producer_state) {
+      typename PipelineE::PipelineState& pipeline_epi_producer_state,
+      CollectiveEpilogue& epilogue) {
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
@@ -1024,7 +1025,20 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //    store to smem
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
                             typename TensorStorageEpi::SmemLayoutO{});
+    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE),
+                              repeat_like(typename CollectiveEpilogue::StrideLSE{}, _1{}),
+                              epilogue.params.layout_LSE.stride());
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
+
+      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+
+      if (row_idx < get<0>(problem_shape)) {
+        gLSE(row_idx, get<2>(blk_coord)) = lse;
+      }
+    }
     // correction_epilogue(params.scale_output, _0{}, sO);
 
     cutlass::arch::fence_view_async_tmem_load();
@@ -1047,6 +1061,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) +
+                    get<0>(TileShapeQK{});
+
+      ElementPV lse = cutlass::fast_log(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax * tTMEM_LOADVrS(kIdxFinalRowMax);
+
+      if (row_idx < get<0>(problem_shape)) {
+        gLSE(row_idx, get<2>(blk_coord)) = lse;
+      }
+    }
     // correction_epilogue(params.scale_output, _1{}, sO);
     cutlass::arch::fence_view_async_tmem_load();
 

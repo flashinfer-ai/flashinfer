@@ -103,6 +103,10 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     cute::prefetch_tma_descriptor(params.tma_store_o.get_tma_descriptor());
   }
 
+  const Params& params;
+
+  CUTLASS_DEVICE Sm100FmhaFwdEpilogueTmaWarpspecialized(const Params& params) : params(params) {}
+
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
   CUTLASS_DEVICE auto store(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                             Params const& params, ParamsProblemShape const& params_problem_shape,
