@@ -19,7 +19,9 @@ from typing import Any, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _quantization_module = None
@@ -29,8 +31,8 @@ def gen_quantization_module() -> JitSpec:
     return gen_jit_spec(
         "quantization",
         [
-            FLASHINFER_CSRC_DIR / "quantization.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "quantization.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
         ],
     )
 

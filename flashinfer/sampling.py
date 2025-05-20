@@ -19,7 +19,9 @@ from typing import Optional, Union
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _sampling_module = None
@@ -29,9 +31,9 @@ def gen_sampling_module() -> JitSpec:
     return gen_jit_spec(
         "sampling",
         [
-            FLASHINFER_CSRC_DIR / "sampling.cu",
-            FLASHINFER_CSRC_DIR / "renorm.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sampling.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "renorm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
         ],
     )
 

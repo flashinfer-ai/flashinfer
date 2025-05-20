@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# NOTE(lequn): Do not "from .jit.env import xxx".
+# Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
+# This helps AOT script to override envs.
+
 import os
 import pathlib
 import re

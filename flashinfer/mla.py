@@ -20,14 +20,9 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import (
-    FLASHINFER_CSRC_DIR,
-    JitSpec,
-    gen_batch_mla_module,
-    gen_jit_spec,
-    sm100a_nvcc_flags,
-)
-from .jit.env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
@@ -73,12 +68,12 @@ def gen_mla_module() -> JitSpec:
     return gen_jit_spec(
         "mla",
         [
-            FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
         ],
         extra_include_paths=[
-            CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "77_blackwell_fmha",
-            CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
+            jit_env.CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "77_blackwell_fmha",
+            jit_env.CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
         ],
         extra_cuda_cflags=sm100a_nvcc_flags,
     )

@@ -18,8 +18,8 @@ import os
 
 import jinja2
 
+from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
-from .env import FLASHINFER_GEN_SRC_DIR
 from .utils import write_if_different
 
 activation_templ = r"""
@@ -77,7 +77,7 @@ def get_act_and_mul_cu_str(act_func_name: str, act_func_def: str) -> str:
 
 
 def gen_act_and_mul_module(act_func_name: str, act_func_def: str) -> JitSpec:
-    gen_directory = FLASHINFER_GEN_SRC_DIR
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR
     os.makedirs(gen_directory, exist_ok=True)
     sources = [gen_directory / f"{act_func_name}_and_mul.cu"]
     write_if_different(

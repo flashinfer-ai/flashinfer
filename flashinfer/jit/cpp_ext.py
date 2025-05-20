@@ -16,7 +16,7 @@ from torch.utils.cpp_extension import (
     _get_pybind11_abi_build_flags,
 )
 
-from .env import FLASHINFER_DATA
+from . import env as jit_env
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -105,7 +105,7 @@ def generate_ninja_build_for_op(
         f"name = {name}",
         f"cuda_home = {cuda_home}",
         f"torch_home = {_TORCH_PATH}",
-        f"flashinfer_data = {FLASHINFER_DATA.resolve()}",
+        f"flashinfer_data = {jit_env.FLASHINFER_DATA.resolve()}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
         "",

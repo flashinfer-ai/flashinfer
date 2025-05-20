@@ -19,7 +19,9 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, has_prebuilt_ops
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -35,8 +37,8 @@ def gen_page_module() -> JitSpec:
     return gen_jit_spec(
         "page",
         [
-            FLASHINFER_CSRC_DIR / "page.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "page.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
         ],
     )
 
