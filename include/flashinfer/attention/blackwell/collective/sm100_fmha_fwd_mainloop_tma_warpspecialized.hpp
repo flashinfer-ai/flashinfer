@@ -906,9 +906,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
   }
 
-  template <class BlkCoord, class ProblemShape, class TensorStorageEpi, class CollectiveEpilogue>
+  template <class BlkCoord, class ParamsProblemShape, class ProblemShape, class TensorStorageEpi,
+            class CollectiveEpilogue>
   CUTLASS_DEVICE auto correction(
-      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
+      BlkCoord const& blk_coord, Params const& params,
+      ParamsProblemShape const& params_problem_shape, ProblemShape const& problem_shape,
       TensorStorageEpi& shared_storage_epi, PipelineC& pipeline_s0_c,
       typename PipelineC::PipelineState& pipeline_s0_c_consumer_state, PipelineC& pipeline_s1_c,
       typename PipelineC::PipelineState& pipeline_s1_c_consumer_state, PipelineO& pipeline_o,
@@ -1030,13 +1032,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                               epilogue.params.layout_LSE.stride());
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
     if (epilogue.params.ptr_LSE != nullptr) {
-      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
+      int qo_tile_idx = get<0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx;
 
       ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
                       params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
-      if (row_idx < get<0>(problem_shape)) {
-        gLSE(row_idx, get<2>(blk_coord)) = lse;
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, get<2>(blk_coord)) = lse;
       }
     }
     // correction_epilogue(params.scale_output, _0{}, sO);
@@ -1063,14 +1069,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
 
     if (epilogue.params.ptr_LSE != nullptr) {
-      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) +
-                    get<0>(TileShapeQK{});
+      int qo_tile_idx = get<0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx =
+          get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx + get<0>(TileShapeQK{});
 
       ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
                       params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
 
-      if (row_idx < get<0>(problem_shape)) {
-        gLSE(row_idx, get<2>(blk_coord)) = lse;
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, get<2>(blk_coord)) = lse;
       }
     }
     // correction_epilogue(params.scale_output, _1{}, sO);
