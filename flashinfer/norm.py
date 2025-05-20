@@ -21,7 +21,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
 
 _norm_module = None
@@ -40,12 +40,7 @@ def gen_norm_module() -> JitSpec:
 def get_norm_module():
     global _norm_module
     if _norm_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            _norm_module = _kernels
-        else:
-            _norm_module = gen_norm_module().build_and_load()
+        _norm_module = gen_norm_module().build_and_load()
     return _norm_module
 
 

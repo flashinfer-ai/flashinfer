@@ -21,7 +21,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
 
 _sampling_module = None
@@ -41,12 +41,7 @@ def gen_sampling_module() -> JitSpec:
 def get_sampling_module():
     global _sampling_module
     if _sampling_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            module = _kernels
-        else:
-            module = gen_sampling_module().build_and_load()
+        module = gen_sampling_module().build_and_load()
 
         # torch library for sampling_from_logits
         @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())

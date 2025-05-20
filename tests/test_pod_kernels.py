@@ -24,48 +24,45 @@ from flashinfer.jit.attention.pytorch import gen_pod_module
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    if flashinfer.jit.has_prebuilt_ops:
-        yield
-    else:
-        flashinfer.jit.build_jit_specs(
-            gen_decode_attention_modules(
-                [torch.float16],  # q_dtypes
-                [torch.float16],  # kv_dtypes
-                [128],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False],  # use_fp16_qk_reductions
-            )
-            + gen_prefill_attention_modules(
-                [torch.float16],  # q_dtypes
-                [
-                    torch.float16,
-                ],  # kv_dtypes
-                [128],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False],  # use_logits_soft_cap
-                [False],  # use_fp16_qk_reductions
-            )
-            + [
-                gen_pod_module(
-                    torch.float16,  # dtype_q
-                    torch.float16,  # dtype_kv
-                    torch.float16,  # dtype_o
-                    128,  # head_dim
-                    0,  # pos_encoding_mode_p
-                    False,  # use_sliding_window_p
-                    False,  # use_logits_soft_cap_p
-                    False,  # use_fp16_qk_reduction
-                    torch.int32,  # dtype_idx
-                    0,  # pos_encoding_mode_d
-                    False,  # use_sliding_window_d
-                    False,  # use_logits_soft_cap_d
-                )
-            ],
-            verbose=False,
+    flashinfer.jit.build_jit_specs(
+        gen_decode_attention_modules(
+            [torch.float16],  # q_dtypes
+            [torch.float16],  # kv_dtypes
+            [128],  # head_dims
+            [0],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_fp16_qk_reductions
         )
-        yield
+        + gen_prefill_attention_modules(
+            [torch.float16],  # q_dtypes
+            [
+                torch.float16,
+            ],  # kv_dtypes
+            [128],  # head_dims
+            [0],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_logits_soft_cap
+            [False],  # use_fp16_qk_reductions
+        )
+        + [
+            gen_pod_module(
+                torch.float16,  # dtype_q
+                torch.float16,  # dtype_kv
+                torch.float16,  # dtype_o
+                128,  # head_dim
+                0,  # pos_encoding_mode_p
+                False,  # use_sliding_window_p
+                False,  # use_logits_soft_cap_p
+                False,  # use_fp16_qk_reduction
+                torch.int32,  # dtype_idx
+                0,  # pos_encoding_mode_d
+                False,  # use_sliding_window_d
+                False,  # use_logits_soft_cap_d
+            )
+        ],
+        verbose=False,
+    )
+    yield
 
 
 @pytest.mark.parametrize("kv_len_p", [127, 12288])

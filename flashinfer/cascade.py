@@ -22,7 +22,7 @@ import torch
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
 
@@ -42,12 +42,7 @@ def gen_cascade_module() -> JitSpec:
 def get_cascade_module():
     global _cascade_module
     if _cascade_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            _cascade_module = _kernels
-        else:
-            _cascade_module = gen_cascade_module().build_and_load()
+        _cascade_module = gen_cascade_module().build_and_load()
     return _cascade_module
 
 
