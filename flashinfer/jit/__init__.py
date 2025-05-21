@@ -55,9 +55,13 @@ from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
-from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
+from .core import JitSpec as JitSpec
+from .core import build_jit_specs as build_jit_specs
+from .core import clear_cache_dir as clear_cache_dir
+from .core import gen_jit_spec as gen_jit_spec
+from .core import load_cuda_ops as load_cuda_ops
 from .env import *
-from .utils import parallel_load_modules as parallel_load_modules
+from .parallel_load_modules import parallel_load_modules as parallel_load_modules
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"

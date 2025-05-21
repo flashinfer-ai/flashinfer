@@ -1,7 +1,7 @@
+import dataclasses
 import logging
 import os
 import re
-from contextlib import suppress
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -9,12 +9,14 @@ import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
 
+from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
 from .env import FLASHINFER_GEN_SRC_DIR as FLASHINFER_GEN_SRC_DIR
 from .env import FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR
 from .env import FLASHINFER_JIT_DIR as FLASHINFER_JIT_DIR
 from .env import FLASHINFER_WORKSPACE_DIR as FLASHINFER_WORKSPACE_DIR
+from .utils import write_if_different
 
 os.makedirs(FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -61,47 +63,68 @@ def clear_cache_dir():
         shutil.rmtree(FLASHINFER_JIT_DIR)
 
 
-def remove_unwanted_pytorch_nvcc_flags():
-    REMOVE_NVCC_FLAGS = [
-        "-D__CUDA_NO_HALF_OPERATORS__",
-        "-D__CUDA_NO_HALF_CONVERSIONS__",
-        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-D__CUDA_NO_HALF2_OPERATORS__",
-    ]
-    for flag in REMOVE_NVCC_FLAGS:
-        try:
-            torch_cpp_ext.COMMON_NVCC_FLAGS.remove(flag)
-        except ValueError:
-            suppress(ValueError)
+sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"]
+sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"]
 
 
-remove_unwanted_pytorch_nvcc_flags()
+@dataclasses.dataclass
+class JitSpec:
+    name: str
+    sources: List[Path]
+    extra_cflags: Optional[List[str]]
+    extra_cuda_cflags: Optional[List[str]]
+    extra_ldflags: Optional[List[str]]
+    extra_include_dirs: Optional[List[Path]]
 
-sm90a_nvcc_flags = ["-gencode", "arch=compute_90a,code=sm_90a"]
-sm100a_nvcc_flags = ["-gencode", "arch=compute_100a,code=sm_100a"]
+    @property
+    def ninja_path(self) -> Path:
+        return FLASHINFER_JIT_DIR / self.name / "build.ninja"
+
+    @property
+    def library_path(self) -> Path:
+        return FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+
+    def write_ninja(self) -> None:
+        ninja_path = self.ninja_path
+        ninja_path.parent.mkdir(parents=True, exist_ok=True)
+        content = generate_ninja_build_for_op(
+            name=self.name,
+            sources=self.sources,
+            extra_cflags=self.extra_cflags,
+            extra_cuda_cflags=self.extra_cuda_cflags,
+            extra_ldflags=self.extra_ldflags,
+            extra_include_dirs=self.extra_include_dirs,
+        )
+        write_if_different(ninja_path, content)
+
+    def build(self, verbose: bool) -> None:
+        tmpdir = get_tmpdir()
+        with FileLock(tmpdir / f"{self.name}.lock", thread_local=False):
+            run_ninja(FLASHINFER_JIT_DIR, self.ninja_path, verbose)
+
+    def build_and_load(self):
+        verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+        self.build(verbose)
+        torch.ops.load_library(self.library_path)
+        return getattr(torch.ops, self.name)
 
 
-def load_cuda_ops(
+def gen_jit_spec(
     name: str,
     sources: List[Union[str, Path]],
     extra_cflags: Optional[List[str]] = None,
     extra_cuda_cflags: Optional[List[str]] = None,
-    extra_ldflags=None,
-    extra_include_paths=None,
-):
+    extra_ldflags: Optional[List[Union[str]]] = None,
+    extra_include_paths: Optional[List[Union[str, Path]]] = None,
+) -> JitSpec:
+    check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
-    if extra_cflags is None:
-        extra_cflags = []
-    if extra_cuda_cflags is None:
-        extra_cuda_cflags = []
-
-    cflags = ["-O3", "-Wno-switch-bool"]
+    cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
         "-O3",
         "-std=c++17",
-        "--threads",
-        "4",
+        "--threads=4",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
@@ -120,33 +143,62 @@ def load_cuda_ops(
         # non debug mode
         cuda_cflags += ["-DNDEBUG"]
 
-    cflags += extra_cflags
-    cuda_cflags += extra_cuda_cflags
-    logger.info(f"Loading JIT ops: {name}")
-    check_cuda_arch()
-    build_directory = FLASHINFER_JIT_DIR / name
-    os.makedirs(build_directory, exist_ok=True)
-    if extra_include_paths is None:
-        extra_include_paths = []
-    extra_include_paths += [
-        FLASHINFER_INCLUDE_DIR,
-        FLASHINFER_CSRC_DIR,
-    ] + CUTLASS_INCLUDE_DIRS
-    lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", thread_local=False)
-    with lock:
-        torch_cpp_ext.load(
-            name,
-            list(map(lambda _: str(_), sources)),
-            extra_cflags=cflags,
-            extra_cuda_cflags=cuda_cflags,
-            extra_ldflags=extra_ldflags,
-            extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
-            build_directory=build_directory,
-            verbose=verbose,
-            with_cuda=True,
-            # We switched to torch.library, so will be loaded into torch.ops
-            # instead of into a separate module.
-            is_python_module=False,
-        )
-    logger.info(f"Finished loading JIT ops: {name}")
-    return getattr(torch.ops, name)
+    if extra_cflags is not None:
+        cflags += extra_cflags
+    if extra_cuda_cflags is not None:
+        cuda_cflags += extra_cuda_cflags
+    if extra_include_paths is not None:
+        extra_include_paths = [Path(x) for x in extra_include_paths]
+    sources = [Path(x) for x in sources]
+
+    spec = JitSpec(
+        name=name,
+        sources=sources,
+        extra_cflags=cflags,
+        extra_cuda_cflags=cuda_cflags,
+        extra_ldflags=extra_ldflags,
+        extra_include_dirs=extra_include_paths,
+    )
+    spec.write_ninja()
+    return spec
+
+
+def get_tmpdir() -> Path:
+    # TODO(lequn): Try /dev/shm first. This should help Lock on NFS.
+    tmpdir = FLASHINFER_JIT_DIR / "tmp"
+    if not tmpdir.exists():
+        tmpdir.mkdir(parents=True, exist_ok=True)
+    return tmpdir
+
+
+def build_jit_specs(specs: List[JitSpec], verbose: bool) -> None:
+    lines = ["ninja_required_version = 1.3"]
+    for spec in specs:
+        lines.append(f"subninja {spec.ninja_path}")
+    lines.append("")
+
+    tmpdir = get_tmpdir()
+    with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
+        ninja_path = tmpdir / "flashinfer_jit.ninja"
+        ninja_path.write_text("\n".join(lines))
+        run_ninja(FLASHINFER_JIT_DIR, ninja_path, verbose)
+
+
+def load_cuda_ops(
+    name: str,
+    sources: List[Union[str, Path]],
+    extra_cflags: Optional[List[str]] = None,
+    extra_cuda_cflags: Optional[List[str]] = None,
+    extra_ldflags=None,
+    extra_include_paths=None,
+):
+    # TODO(lequn): Remove this function and use JitSpec directly.
+    spec = gen_jit_spec(
+        name=name,
+        sources=sources,
+        extra_cflags=extra_cflags,
+        extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=extra_ldflags,
+        extra_include_paths=extra_include_paths,
+    )
+    return spec.build_and_load()
