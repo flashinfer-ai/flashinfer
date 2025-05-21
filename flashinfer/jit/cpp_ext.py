@@ -7,16 +7,23 @@ import sysconfig
 from pathlib import Path
 from typing import List, Optional
 
+import torch
 from torch.utils.cpp_extension import (
     _TORCH_PATH,
     CUDA_HOME,
     _get_cuda_arch_flags,
-    _get_glibcxx_abi_build_flags,
     _get_num_workers,
     _get_pybind11_abi_build_flags,
 )
 
 from .env import FLASHINFER_DATA
+
+
+def _get_glibcxx_abi_build_flags() -> List[str]:
+    glibcxx_abi_cflags = [
+        "-D_GLIBCXX_USE_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI))
+    ]
+    return glibcxx_abi_cflags
 
 
 def join_multiline(vs: List[str]) -> str:
