@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import torch
 
-from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops  # noqa: F401
+from .jit import gen_act_and_mul_module, has_prebuilt_ops  # noqa: F401
 from .utils import register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
@@ -63,7 +63,7 @@ def get_act_and_mul_module(act_func_name: str):
         else:
             module = gen_act_and_mul_module(
                 act_func_name, act_func_def_str[act_func_name]
-            )
+            ).build_and_load()
 
         # torch library for act_and_mul
         fname = f"{act_func_name}_and_mul"

@@ -20,7 +20,7 @@ from typing import List
 import jinja2
 import torch
 
-from ..core import load_cuda_ops, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
 from ..utils import (
     dtype_map,
@@ -108,7 +108,7 @@ def gen_batch_mla_module(
     head_dim_ckv: int,
     head_dim_kpe: int,
     use_profiler: bool,
-):
+) -> JitSpec:
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     uri = get_batch_mla_uri(
@@ -182,13 +182,16 @@ def gen_batch_mla_module(
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 
-    return load_cuda_ops(
+    extra_cuda_cflags = []
+    if backend == "fa3":
+        extra_cuda_cflags += sm90a_nvcc_flags
+    if use_profiler:
+        extra_cuda_cflags += ["-DFLASHINFER_ENABLE_PROFILER"]
+
+    return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=(
-            ["-gencode=arch=compute_90a,code=sm_90a"] if backend == "fa3" else []
-        )
-        + (["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
+        extra_cuda_cflags=extra_cuda_cflags,
     )
 
 
@@ -224,7 +227,7 @@ def gen_batch_decode_mla_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_tensor_cores: bool,
-):
+) -> JitSpec:
     cuda_arch_major = torch.cuda.get_device_properties(0).major
 
     if cuda_arch_major >= 9:  # smem size of SM90 can accommodate all 128 qo-heads data
@@ -299,7 +302,7 @@ def gen_batch_decode_mla_module(
             source = f.read()
         write_if_different(dest_path, source)
 
-    return load_cuda_ops(uri, source_paths)
+    return gen_jit_spec(uri, source_paths)
 
 
 def get_single_prefill_uri(
@@ -393,7 +396,7 @@ def gen_single_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-):
+) -> JitSpec:
     uri = get_single_decode_uri(
         dtype_q,
         dtype_kv,
@@ -439,7 +442,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-):
+) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
         dtype_q,
@@ -522,7 +525,7 @@ def gen_pod_module(
     pos_encoding_mode_d: int,
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
-):
+) -> JitSpec:
     uri = get_pod_uri(
         dtype_q,
         dtype_kv,
@@ -595,7 +598,7 @@ def gen_customize_pod_module(
     use_sliding_window_d: bool = False,
     use_logits_soft_cap_d: bool = False,
     use_fp16_qk_reduction: bool = False,
-):
+) -> JitSpec:
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
 
     (
@@ -671,7 +674,7 @@ def gen_customize_pod_module(
 
     generated_config_path = gen_directory / "pod_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
-    return load_cuda_ops(uri, source_paths)
+    return gen_jit_spec(uri, source_paths)
 
 
 def gen_batch_decode_module(
@@ -684,7 +687,7 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-):
+) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
         dtype_kv,
@@ -733,7 +736,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-):
+) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
         dtype_q,
@@ -844,7 +847,7 @@ def gen_customize_single_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
-):
+) -> JitSpec:
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
 
     (
@@ -909,7 +912,7 @@ def gen_customize_single_decode_module(
     generated_config_path = gen_directory / "single_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
 
-    return load_cuda_ops(uri, source_paths)
+    return gen_jit_spec(uri, source_paths)
 
 
 def gen_customize_single_prefill_module(
@@ -931,7 +934,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
-):
+) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1000,7 +1003,7 @@ def gen_customize_single_prefill_module(
         generated_config_path = gen_directory / "single_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
 
-        return load_cuda_ops(uri, source_paths)
+        return gen_jit_spec(uri, source_paths)
     elif backend == "fa3":
         gen_directory = FLASHINFER_GEN_SRC_DIR / uri
 
@@ -1063,10 +1066,10 @@ def gen_customize_single_prefill_module(
 
         generated_config_path = gen_directory / "single_prefill_sm90_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return load_cuda_ops(
+        return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+            extra_cuda_cflags=sm90a_nvcc_flags,
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
@@ -1089,7 +1092,7 @@ def gen_customize_batch_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
-):
+) -> JitSpec:
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
@@ -1149,10 +1152,7 @@ def gen_customize_batch_decode_module(
 
     generated_config_path = gen_directory / "batch_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
-    return load_cuda_ops(
-        uri,
-        source_paths,
-    )
+    return gen_jit_spec(uri, source_paths)
 
 
 def gen_customize_batch_prefill_module(
@@ -1175,7 +1175,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
-):
+) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1258,10 +1258,7 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return load_cuda_ops(
-            uri,
-            source_paths,
-        )
+        return gen_jit_spec(uri, source_paths)
     elif backend == "fa3":
         gen_directory = FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
@@ -1333,10 +1330,10 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_sm90_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return load_cuda_ops(
+        return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+            extra_cuda_cflags=sm90a_nvcc_flags,
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
@@ -1378,7 +1375,7 @@ def gen_fmha_cutlass_sm100a_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-):
+) -> JitSpec:
     uri = get_fmha_cutlass_sm100a_uri(
         dtype_q,
         dtype_kv,
@@ -1395,7 +1392,7 @@ def gen_fmha_cutlass_sm100a_module(
         FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
         FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
     ]
-    return load_cuda_ops(
+    return gen_jit_spec(
         uri,
         source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,

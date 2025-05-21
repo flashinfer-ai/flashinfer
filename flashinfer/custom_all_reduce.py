@@ -21,7 +21,7 @@ from typing import List, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op
 
 _comm_module = None
@@ -34,13 +34,13 @@ def get_comm_module():
             _kernels = torch.ops.flashinfer_kernels
             module = _kernels
         else:
-            module = load_cuda_ops(
+            module = gen_jit_spec(
                 "comm",
                 [
                     FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
                     FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
                 ],
-            )
+            ).build_and_load()
 
         # torch library for all
         @register_custom_op(

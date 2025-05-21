@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 import re
+import warnings
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -193,6 +194,11 @@ def load_cuda_ops(
     extra_include_paths=None,
 ):
     # TODO(lequn): Remove this function and use JitSpec directly.
+    warnings.warn(
+        "load_cuda_ops is deprecated. Use JitSpec directly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     spec = gen_jit_spec(
         name=name,
         sources=sources,

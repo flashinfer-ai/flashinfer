@@ -20,7 +20,7 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_batch_mla_module, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, gen_batch_mla_module, gen_jit_spec
 from .jit.env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .utils import (
     MaskMode,
@@ -66,7 +66,7 @@ _mla_module = None
 def get_mla_module():
     global _mla_module
     if _mla_module is None:
-        _mla_module = load_cuda_ops(
+        _mla_module = gen_jit_spec(
             "mla",
             [
                 FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
@@ -77,7 +77,7 @@ def get_mla_module():
                 CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
             ],
             extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
-        )
+        ).build_and_load()
     return _mla_module
 
 
@@ -92,7 +92,7 @@ def get_batch_mla_module(backend):
             _batch_mla_modules if backend == "fa2" else _batch_mla_sm90_modules
         )
         if args not in modules_dict:
-            modules_dict[args] = gen_batch_mla_module(backend, *args)
+            modules_dict[args] = gen_batch_mla_module(backend, *args).build_and_load()
         return modules_dict[args]
 
     return backend_module

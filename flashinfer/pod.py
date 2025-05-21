@@ -68,7 +68,8 @@ def get_pod_module(*args):
             # No tensor deprecated due to poor performance. Just use tensor cores for both.
             run_tensor = _kernels.pod_with_kv_cache_tensor.default
         else:
-            run_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor.default
+            module = gen_pod_module(*args).build_and_load()
+            run_tensor = module.pod_with_kv_cache_tensor.default
         # Register the module
         _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
     return _pod_modules[args]

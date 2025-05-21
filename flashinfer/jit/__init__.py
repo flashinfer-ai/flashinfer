@@ -59,7 +59,6 @@ from .core import JitSpec as JitSpec
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
-from .core import load_cuda_ops as load_cuda_ops
 from .env import *
 from .parallel_load_modules import parallel_load_modules as parallel_load_modules
 
