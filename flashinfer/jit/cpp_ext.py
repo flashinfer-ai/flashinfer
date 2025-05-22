@@ -39,15 +39,14 @@ def generate_ninja_build_for_op(
     extra_include_dirs: Optional[List[Path]],
 ) -> str:
     system_includes = [
+        sysconfig.get_path("include"),
         "$torch_home/include",
         "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
-        "$flashinfer_data/include",
-        "$flashinfer_data/csrc",
-        "$flashinfer_data/cutlass/include",
-        "$flashinfer_data/cutlass/tools/util/include",
-        sysconfig.get_path("include"),
+        jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
+        jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
+    system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
 
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
@@ -105,7 +104,6 @@ def generate_ninja_build_for_op(
         f"name = {name}",
         f"cuda_home = {cuda_home}",
         f"torch_home = {_TORCH_PATH}",
-        f"flashinfer_data = {jit_env.FLASHINFER_DATA.resolve()}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
         "",
