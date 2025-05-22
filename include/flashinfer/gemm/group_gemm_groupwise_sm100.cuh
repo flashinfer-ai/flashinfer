@@ -53,6 +53,9 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   D_ptr[i] = C + m_indptr[i] * n;
   SFA_ptr[i] = SFA + m_indptr[i] / scale_granularity_m;
   SFB_ptr[i] = SFB + i * k * n / scale_granularity_n / scale_granularity_k;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
@@ -158,10 +161,26 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   auto layout_SFB = allocator.aligned_alloc<LayoutSFB>(batch_size * sizeof(LayoutSFB), 16,
                                                        "sm100_groupwise_group_gemm_layout_SFB");
 
-  compute_sm100_cutlass_group_gemm_args<ScaleConfig><<<batch_size, 1, 0, stream>>>(
-      A, B, SFA, SFB, C, m_indptr, n, k, batch_size, ScaleGranularityM, ScaleGranularityN,
-      ScaleGranularityK, problem_sizes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, D_ptr, stride_A,
-      stride_B, stride_C, layout_SFA, layout_SFB);
+  cudaLaunchConfig_t config;
+  config.gridDim = batch_size;
+  config.blockDim = 1;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = true;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  auto prepare_args_kernel =
+      compute_sm100_cutlass_group_gemm_args<ScaleConfig, ElementA, float, ElementC,
+                                            ProblemShape::UnderlyingProblemShape, StrideA, StrideB,
+                                            StrideC, LayoutSFA, LayoutSFB>;
+
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+      &config, prepare_args_kernel, A, B, SFA, SFB, C, m_indptr, n, k, batch_size,
+      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, problem_sizes, A_ptr, B_ptr, SFA_ptr,
+      SFB_ptr, C_ptr, D_ptr, stride_A, stride_B, stride_C, layout_SFA, layout_SFB));
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
@@ -201,7 +220,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-  CUTLASS_CHECK(gemm.run(stream));
+  CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/true));
   return cudaSuccess;
 }
 
