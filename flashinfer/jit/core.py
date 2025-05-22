@@ -80,6 +80,10 @@ class JitSpec:
     def library_path(self) -> Path:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
+    @property
+    def aot_path(self) -> Path:
+        return jit_env.FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
+
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         ninja_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,9 +103,13 @@ class JitSpec:
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def build_and_load(self):
-        verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-        self.build(verbose)
-        torch.ops.load_library(self.library_path)
+        if self.aot_path.exists():
+            so_path = self.aot_path
+        else:
+            so_path = self.library_path
+            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+            self.build(verbose)
+        torch.ops.load_library(so_path)
         return getattr(torch.ops, self.name)
 
 
@@ -110,7 +118,7 @@ def gen_jit_spec(
     sources: List[Union[str, Path]],
     extra_cflags: Optional[List[str]] = None,
     extra_cuda_cflags: Optional[List[str]] = None,
-    extra_ldflags: Optional[List[Union[str]]] = None,
+    extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
 ) -> JitSpec:
     check_cuda_arch()
@@ -167,11 +175,20 @@ def get_tmpdir() -> Path:
     return tmpdir
 
 
-def build_jit_specs(specs: List[JitSpec], verbose: bool) -> None:
-    lines = ["ninja_required_version = 1.3"]
+def build_jit_specs(
+    specs: List[JitSpec],
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    lines: List[str] = []
     for spec in specs:
+        if skip_prebuilt and spec.aot_path.exists():
+            continue
         lines.append(f"subninja {spec.ninja_path}")
-    lines.append("")
+    if not lines:
+        return
+
+    lines = ["ninja_required_version = 1.3"] + lines + [""]
 
     tmpdir = get_tmpdir()
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):

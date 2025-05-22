@@ -51,6 +51,7 @@ def generate_ninja_build_for_op(
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
         "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DPy_LIMITED_API=0x03090000",
     ]
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
@@ -88,7 +89,6 @@ def generate_ninja_build_for_op(
         "-ltorch_cpu",
         "-ltorch_cuda",
         "-ltorch",
-        "-ltorch_python",
         "-L$cuda_home/lib64",
         "-lcudart",
     ]

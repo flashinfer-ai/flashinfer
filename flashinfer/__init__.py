@@ -14,8 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+try:
+    from ._build_meta import __version__ as __version__
+except ModuleNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+
 from . import jit as jit
-from ._build_meta import __version__ as __version__
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul

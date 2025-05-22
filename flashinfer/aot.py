@@ -506,7 +506,7 @@ def main():
     print("Total ops:", len(jit_specs))
 
     # Build
-    build_jit_specs(jit_specs, verbose=True)
+    build_jit_specs(jit_specs, verbose=True, skip_prebuilt=False)
 
     # Copy built kernels
     copy_built_kernels(jit_specs, out_dir)

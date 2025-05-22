@@ -15,9 +15,9 @@
 [project]
 name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
-requires-python = ">=3.8,<4.0"
+requires-python = ">=3.9,<4.0"
 authors = [{ name = "FlashInfer team" }]
-license = { text = "Apache License 2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
@@ -40,6 +40,7 @@ skip = [
 packages = [
     "flashinfer",
     "flashinfer.data",
+    "flashinfer.data.aot",
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
     "flashinfer.data.tvm_binding",
@@ -53,6 +54,7 @@ include-package-data = false
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
+"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 
 [tool.setuptools.package-data]
@@ -61,6 +63,9 @@ include-package-data = false
     "include/**",
     "tvm_binding/**",
     "version.txt"
+]
+"flashinfer.data.aot" = [
+    "**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
