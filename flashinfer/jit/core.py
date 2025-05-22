@@ -181,7 +181,7 @@ def build_jit_specs(specs: List[JitSpec], verbose: bool) -> None:
     tmpdir = get_tmpdir()
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
-        ninja_path.write_text("\n".join(lines))
+        write_if_different(ninja_path, "\n".join(lines))
         run_ninja(FLASHINFER_JIT_DIR, ninja_path, verbose)
 
 

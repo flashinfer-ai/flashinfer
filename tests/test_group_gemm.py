@@ -29,18 +29,11 @@ def warmup_jit():
     if flashinfer.jit.has_prebuilt_ops:
         yield
     else:
-        modules = [
-            (flashinfer.gemm.get_gemm_module, []),
-        ]
+        jit_specs = [flashinfer.gemm.gen_gemm_module()]
         if is_sm90a_supported(torch.device("cuda:0")):
-            modules.append((flashinfer.gemm.get_gemm_sm90_module, []))
-        try:
-            flashinfer.jit.parallel_load_modules(modules)
-        except Exception as e:
-            # abort the test session if warmup fails
-            pytest.exit(str(e))
-        finally:
-            yield
+            jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
+        flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
+        yield
 
 
 @pytest.mark.parametrize("batch_size", [1, 77, 199])
