@@ -14,14 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from functools import cache
 from types import SimpleNamespace
 
 import torch
 
 from .jit import JitSpec
 from .jit import gen_act_and_mul_module as gen_act_and_mul_module_impl
-from .jit import has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
@@ -62,12 +60,7 @@ def gen_act_and_mul_module(act_func_name: str) -> JitSpec:
 def get_act_and_mul_module(act_func_name: str):
     global _jit_modules
     if act_func_name not in _jit_modules:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            module = _kernels
-        else:
-            module = gen_act_and_mul_module(act_func_name).build_and_load()
+        module = gen_act_and_mul_module(act_func_name).build_and_load()
 
         # torch library for act_and_mul
         fname = f"{act_func_name}_and_mul"

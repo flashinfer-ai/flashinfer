@@ -23,7 +23,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import register_custom_op
 
 _comm_module = None
@@ -42,11 +42,7 @@ def gen_comm_module() -> JitSpec:
 def get_comm_module():
     global _comm_module
     if _comm_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-            module = _kernels
-        else:
-            module = gen_comm_module().build_and_load()
+        module = gen_comm_module().build_and_load()
 
         # torch library for all
         @register_custom_op(

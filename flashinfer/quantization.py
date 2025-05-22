@@ -21,7 +21,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
 
 _quantization_module = None
@@ -40,12 +40,7 @@ def gen_quantization_module() -> JitSpec:
 def get_quantization_module():
     global _quantization_module
     if _quantization_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            _quantization_module = _kernels
-        else:
-            _quantization_module = gen_quantization_module().build_and_load()
+        _quantization_module = gen_quantization_module().build_and_load()
     return _quantization_module
 
 

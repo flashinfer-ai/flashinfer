@@ -30,8 +30,6 @@ from .jit import (
     gen_pod_module,
     gen_single_prefill_module,
     get_pod_uri,
-    has_prebuilt_ops,
-    prebuilt_ops_uri,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .prefill import get_batch_prefill_module
@@ -60,16 +58,8 @@ _pod_modules = {}
 def get_pod_module(*args):
     global _pod_modules
     if args not in _pod_modules:
-        uri = get_pod_uri(*args)
-
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            _kernels = torch.ops.flashinfer_kernels
-            # torch library for pod_with_kv_cache
-            # No tensor deprecated due to poor performance. Just use tensor cores for both.
-            run_tensor = _kernels.pod_with_kv_cache_tensor.default
-        else:
-            module = gen_pod_module(*args).build_and_load()
-            run_tensor = module.pod_with_kv_cache_tensor.default
+        module = gen_pod_module(*args).build_and_load()
+        run_tensor = module.pod_with_kv_cache_tensor.default
         # Register the module
         _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
     return _pod_modules[args]

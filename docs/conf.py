@@ -17,7 +17,6 @@ os.environ["BUILD_DOC"] = "1"
 autodoc_mock_imports = [
     "torch",
     "triton",
-    "flashinfer.jit.aot_config",
     "flashinfer._build_meta",
 ]
 

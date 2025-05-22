@@ -21,7 +21,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
 
 _rope_module = None
@@ -40,12 +40,7 @@ def gen_rope_module() -> JitSpec:
 def get_rope_module():
     global _rope_module
     if _rope_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            _rope_module = _kernels
-        else:
-            _rope_module = gen_rope_module().build_and_load()
+        _rope_module = gen_rope_module().build_and_load()
     return _rope_module
 
 

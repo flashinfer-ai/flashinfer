@@ -21,7 +21,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops
+from .jit import gen_jit_spec
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -46,12 +46,7 @@ def gen_page_module() -> JitSpec:
 def get_page_module():
     global _page_module
     if _page_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            _page_module = _kernels
-        else:
-            _page_module = gen_page_module().build_and_load()
+        _page_module = gen_page_module().build_and_load()
     return _page_module
 
 

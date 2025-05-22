@@ -26,14 +26,11 @@ CUDA_DEVICES = ["cuda:0"]
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    if flashinfer.jit.has_prebuilt_ops:
-        yield
-    else:
-        jit_specs = [flashinfer.gemm.gen_gemm_module()]
-        if is_sm90a_supported(torch.device("cuda:0")):
-            jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
-        flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
-        yield
+    jit_specs = [flashinfer.gemm.gen_gemm_module()]
+    if is_sm90a_supported(torch.device("cuda:0")):
+        jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
+    flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
+    yield
 
 
 @pytest.mark.parametrize("batch_size", [1, 77, 199])

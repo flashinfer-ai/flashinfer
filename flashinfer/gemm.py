@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, has_prebuilt_ops, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -52,12 +52,7 @@ def gen_gemm_module() -> JitSpec:
 def get_gemm_module():
     global _gemm_module
     if _gemm_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            module = _kernels
-        else:
-            module = gen_gemm_module().build_and_load()
+        module = gen_gemm_module().build_and_load()
 
         # torch library for bmm_fp8
 
@@ -163,11 +158,7 @@ def gen_gemm_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_gemm_sm100_module():
-    if has_prebuilt_ops:
-        _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
-        module = _kernels_sm100
-    else:
-        module = gen_gemm_sm100_module().build_and_load()
+    module = gen_gemm_sm100_module().build_and_load()
 
     return module
 
@@ -192,12 +183,7 @@ def gen_gemm_sm90_module() -> JitSpec:
 def get_gemm_sm90_module():
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
-        if has_prebuilt_ops:
-            _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
-
-            module = _kernels_sm90
-        else:
-            module = gen_gemm_sm90_module().build_and_load()
+        module = gen_gemm_sm90_module().build_and_load()
 
         # torch library for cutlass_segment_gemm_sm90
 
