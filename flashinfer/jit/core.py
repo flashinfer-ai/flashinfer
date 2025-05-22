@@ -10,17 +10,12 @@ import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
 
+from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
-from .env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
-from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
-from .env import FLASHINFER_GEN_SRC_DIR as FLASHINFER_GEN_SRC_DIR
-from .env import FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR
-from .env import FLASHINFER_JIT_DIR as FLASHINFER_JIT_DIR
-from .env import FLASHINFER_WORKSPACE_DIR as FLASHINFER_WORKSPACE_DIR
 from .utils import write_if_different
 
-os.makedirs(FLASHINFER_WORKSPACE_DIR, exist_ok=True)
-os.makedirs(FLASHINFER_CSRC_DIR, exist_ok=True)
+os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
+os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
 class FlashInferJITLogger(logging.Logger):
@@ -28,7 +23,7 @@ class FlashInferJITLogger(logging.Logger):
         super().__init__(name)
         self.setLevel(logging.INFO)
         self.addHandler(logging.StreamHandler())
-        log_path = FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
+        log_path = jit_env.FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
         if not os.path.exists(log_path):
             # create an empty file
             with open(log_path, "w") as f:  # noqa: F841
@@ -58,10 +53,10 @@ def check_cuda_arch():
 
 
 def clear_cache_dir():
-    if os.path.exists(FLASHINFER_JIT_DIR):
+    if os.path.exists(jit_env.FLASHINFER_JIT_DIR):
         import shutil
 
-        shutil.rmtree(FLASHINFER_JIT_DIR)
+        shutil.rmtree(jit_env.FLASHINFER_JIT_DIR)
 
 
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"]
@@ -79,11 +74,11 @@ class JitSpec:
 
     @property
     def ninja_path(self) -> Path:
-        return FLASHINFER_JIT_DIR / self.name / "build.ninja"
+        return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
 
     @property
     def library_path(self) -> Path:
-        return FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
@@ -101,7 +96,7 @@ class JitSpec:
     def build(self, verbose: bool) -> None:
         tmpdir = get_tmpdir()
         with FileLock(tmpdir / f"{self.name}.lock", thread_local=False):
-            run_ninja(FLASHINFER_JIT_DIR, self.ninja_path, verbose)
+            run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def build_and_load(self):
         verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
@@ -166,7 +161,7 @@ def gen_jit_spec(
 
 def get_tmpdir() -> Path:
     # TODO(lequn): Try /dev/shm first. This should help Lock on NFS.
-    tmpdir = FLASHINFER_JIT_DIR / "tmp"
+    tmpdir = jit_env.FLASHINFER_JIT_DIR / "tmp"
     if not tmpdir.exists():
         tmpdir.mkdir(parents=True, exist_ok=True)
     return tmpdir
@@ -182,7 +177,7 @@ def build_jit_specs(specs: List[JitSpec], verbose: bool) -> None:
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(FLASHINFER_JIT_DIR, ninja_path, verbose)
+        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
 
 
 def load_cuda_ops(

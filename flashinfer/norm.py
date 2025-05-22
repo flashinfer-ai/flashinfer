@@ -19,7 +19,9 @@ from typing import Any, Optional
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _norm_module = None
@@ -29,8 +31,8 @@ def gen_norm_module() -> JitSpec:
     return gen_jit_spec(
         "norm",
         [
-            FLASHINFER_CSRC_DIR / "norm.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "norm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
         ],
     )
 

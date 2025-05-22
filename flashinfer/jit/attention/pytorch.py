@@ -20,8 +20,8 @@ from typing import List
 import jinja2
 import torch
 
+from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
-from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -121,11 +121,11 @@ def gen_batch_mla_module(
         head_dim_kpe,
         use_profiler,
     )
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
     if backend == "fa2":
-        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
             config_templ = jinja2.Template(f.read())
         generated_config_path = gen_directory / "batch_mla_config.inc"
         write_if_different(
@@ -146,14 +146,14 @@ def gen_batch_mla_module(
             "batch_mla_run.cu",
             "batch_mla_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
                 source = f.read()
             write_if_different(dest_path, source)
     elif backend == "fa3":
-        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
             config_templ = jinja2.Template(f.read())
         generated_config_path = gen_directory / "batch_mla_sm90_config.inc"
         write_if_different(
@@ -173,7 +173,7 @@ def gen_batch_mla_module(
             "batch_mla_sm90_run.cu",
             "batch_mla_sm90_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -259,10 +259,10 @@ def gen_batch_decode_mla_module(
         use_logits_soft_cap,
         arc,
     )
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
     generated_config_path = gen_directory / "mla_config.inc"
     write_if_different(
@@ -295,7 +295,7 @@ def gen_batch_decode_mla_module(
 
     source_paths = []
     for filename in filenames:
-        src_path = FLASHINFER_CSRC_DIR / filename
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -599,7 +599,7 @@ def gen_customize_pod_module(
     use_logits_soft_cap_d: bool = False,
     use_fp16_qk_reduction: bool = False,
 ) -> JitSpec:
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
     (
         additional_params_decl,
@@ -612,10 +612,10 @@ def gen_customize_pod_module(
         additional_scalar_dtypes,
     )
 
-    with open(FLASHINFER_CSRC_DIR / "pod_customize_config.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "pod_customize_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "pod_kernel_inst.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "pod_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs = {
@@ -665,7 +665,7 @@ def gen_customize_pod_module(
         "pod.cu",
         "pod_jit_pybind.cu",
     ]:
-        src_path = FLASHINFER_CSRC_DIR / filename
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -848,7 +848,7 @@ def gen_customize_single_decode_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
 ) -> JitSpec:
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
     (
         additional_params_decl,
@@ -861,10 +861,12 @@ def gen_customize_single_decode_module(
         additional_scalar_dtypes,
     )
 
-    with open(FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja") as f:
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja"
+    ) as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs = {
@@ -902,7 +904,7 @@ def gen_customize_single_decode_module(
         "single_decode.cu",
         "single_decode_jit_pybind.cu",
     ]:
-        src_path = FLASHINFER_CSRC_DIR / filename
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -951,7 +953,7 @@ def gen_customize_single_prefill_module(
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         additional_params_decl, additional_func_params, additional_params_setter = (
             generate_additional_params(
                 additional_tensor_names,
@@ -961,10 +963,14 @@ def gen_customize_single_prefill_module(
             )
         )
 
-        with open(FLASHINFER_CSRC_DIR / "single_prefill_customize_config.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "single_prefill_customize_config.jinja"
+        ) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "single_prefill_kernel_inst.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "single_prefill_kernel_inst.jinja"
+        ) as f:
             kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -993,7 +999,7 @@ def gen_customize_single_prefill_module(
             "single_prefill.cu",
             "single_prefill_jit_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -1005,7 +1011,7 @@ def gen_customize_single_prefill_module(
 
         return gen_jit_spec(uri, source_paths)
     elif backend == "fa3":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
@@ -1025,10 +1031,10 @@ def gen_customize_single_prefill_module(
             _file_kernel_inst = "single_prefill_sm90_kernel_inst.jinja"
             _file_csrc = "single_prefill_sm90.cu"
 
-        with open(FLASHINFER_CSRC_DIR / _file_config) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / _file_kernel_inst) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_kernel_inst) as f:
             kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -1057,7 +1063,7 @@ def gen_customize_single_prefill_module(
             _file_csrc,
             "single_prefill_sm90_jit_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -1093,7 +1099,7 @@ def gen_customize_batch_decode_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
 ) -> JitSpec:
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
             additional_tensor_names,
@@ -1120,10 +1126,10 @@ def gen_customize_batch_decode_module(
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     generated_inc_str = config_templ.render(
@@ -1143,7 +1149,7 @@ def gen_customize_batch_decode_module(
         "batch_decode.cu",
         "batch_decode_jit_pybind.cu",
     ]:
-        src_path = FLASHINFER_CSRC_DIR / filename
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -1193,7 +1199,7 @@ def gen_customize_batch_prefill_module(
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
                 additional_tensor_names,
@@ -1203,13 +1209,19 @@ def gen_customize_batch_prefill_module(
             )
         )
 
-        with open(FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja"
+        ) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja"
+        ) as f:
             paged_kernel_inst_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja"
+        ) as f:
             ragged_kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -1249,7 +1261,7 @@ def gen_customize_batch_prefill_module(
             "batch_prefill.cu",
             "batch_prefill_jit_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -1260,7 +1272,7 @@ def gen_customize_batch_prefill_module(
         write_if_different(generated_config_path, generated_inc_str)
         return gen_jit_spec(uri, source_paths)
     elif backend == "fa3":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
                 additional_tensor_names,
@@ -1281,13 +1293,13 @@ def gen_customize_batch_prefill_module(
             _file_ragged_kernel_inst = "batch_prefill_ragged_sm90_kernel_inst.jinja"
             _file_csrc = "batch_prefill_sm90.cu"
 
-        with open(FLASHINFER_CSRC_DIR / _file_config) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / _file_paged_kernel_inst) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_paged_kernel_inst) as f:
             paged_kernel_inst_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / _file_ragged_kernel_inst) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / _file_ragged_kernel_inst) as f:
             ragged_kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -1321,7 +1333,7 @@ def gen_customize_batch_prefill_module(
             _file_csrc,
             "batch_prefill_sm90_jit_pybind.cu",
         ]:
-            src_path = FLASHINFER_CSRC_DIR / filename
+            src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -1389,8 +1401,8 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
     source_paths = [
-        FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
-        FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
     ]
     return gen_jit_spec(
         uri,

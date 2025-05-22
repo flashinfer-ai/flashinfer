@@ -21,14 +21,9 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .jit import (
-    FLASHINFER_CSRC_DIR,
-    JitSpec,
-    gen_jit_spec,
-    has_prebuilt_ops,
-    sm90a_nvcc_flags,
-    sm100a_nvcc_flags,
-)
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, has_prebuilt_ops, sm90a_nvcc_flags, sm100a_nvcc_flags
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -46,9 +41,9 @@ def gen_gemm_module() -> JitSpec:
     return gen_jit_spec(
         "gemm",
         [
-            FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
         ],
         extra_ldflags=["-lcublas", "-lcublasLt"],
     )
@@ -157,10 +152,10 @@ def gen_gemm_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm100",
         [
-            FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_groupwise_sm100.cu",
-            FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_groupwise_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
         ],
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
@@ -181,14 +176,14 @@ def gen_gemm_sm90_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm90",
         [
-            FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
-            FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
         ],
         extra_cuda_cflags=sm90a_nvcc_flags,
     )
