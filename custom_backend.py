@@ -1,6 +1,7 @@
 import shutil
 from pathlib import Path
 
+from setuptools import build_meta as orig
 from setuptools.build_meta import *  # noqa: F403
 
 _root = Path(__file__).parent.resolve()
@@ -37,18 +38,32 @@ def _create_data_dir():
     ln("tvm_binding", "tvm_binding")
 
 
-def get_requires_for_build_wheel(config_settings=None):
+def _prepare_for_wheel():
     # Remove data directory
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
 
     # Link AOT ops directory to "aot-ops"
     _rm_aot_ops_package_dir()
-    if len(list(_aot_ops_dir.glob("*/*.so"))) == 0:
-        raise RuntimeError(f"No AOT ops found in {_aot_ops_dir}")
+    if not _aot_ops_dir.exists():
+        _aot_ops_dir.mkdir()
+    num_ops = len(list(_aot_ops_dir.glob("*/*.so")))
+    print(f"{num_ops} AOT ops found in {_aot_ops_dir}")
     _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
     _aot_ops_package_dir.symlink_to(_aot_ops_dir)
 
+
+def _prepare_for_editable():
+    _create_data_dir()
+
+    _rm_aot_ops_package_dir()
+    _aot_ops_dir.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.symlink_to(_aot_ops_dir)
+
+
+def get_requires_for_build_wheel(config_settings=None):
+    _prepare_for_wheel()
     return _requires_for_aot
 
 
@@ -66,11 +81,15 @@ def get_requires_for_build_sdist(config_settings=None):
 
 
 def get_requires_for_build_editable(config_settings=None):
-    _create_data_dir()
-
-    _rm_aot_ops_package_dir()
-    _aot_ops_dir.mkdir(parents=True, exist_ok=True)
-    _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
-    _aot_ops_package_dir.symlink_to(_aot_ops_dir)
-
+    _prepare_for_editable()
     return _requires_for_aot
+
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    _prepare_for_wheel()
+    return orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+
+
+def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    _prepare_for_editable()
+    return orig.prepare_metadata_for_build_editable(metadata_directory, config_settings)
