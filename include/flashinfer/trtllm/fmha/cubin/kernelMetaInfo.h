@@ -88,7 +88,7 @@ static const struct TllmGenFmhaKernelMetaInfo {
     std::cout << "}\n";
   }
 } sTllmGenFmhaKernelMetaInfos[] = {
-    // clang-format off
+// clang-format off
 { DATA_TYPE_FP16, DATA_TYPE_FP16, DATA_TYPE_FP16, 8, 128, 8, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvFp16AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP64VarSeqLenTileSizeQ8TileSizeKv128StaticSwapsMmaAbForGeneration", 141968, 512, 2, 64, 0, 2, 8, 0, true, false, false, false, "12415769d9b85f0d8cce3dd8f4e6ec0d24a0e863d73ca75d5f1bab3ebf07688a"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, DATA_TYPE_FP16, 8, 128, 8, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvFp16AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP16VarSeqLenTileSizeQ8TileSizeKv128StaticSwapsMmaAbForGeneration", 141968, 512, 2, 16, 0, 2, 8, 0, true, false, false, false, "7b3c9397803282ff6ccb20a11b741041f8fdb2433b58a20ae59dc0599b0f414b"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, DATA_TYPE_FP16, 8, 128, 8, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvFp16AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP32VarSeqLenTileSizeQ8TileSizeKv128StaticSwapsMmaAbForGeneration", 141968, 512, 2, 32, 0, 2, 8, 0, true, false, false, false, "fe72f3b2f0b73d72d81441b0573c7193b37d8f01fe28c7396146fea495e024d2"},
@@ -125,5 +125,5 @@ static const struct TllmGenFmhaKernelMetaInfo {
 { DATA_TYPE_FP16, DATA_TYPE_E4M3, DATA_TYPE_FP16, 128, 128, 128, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvE4m3AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP64MultiCtasKvModeVarSeqLenTileSizeQ128TileSizeKv128StaticKeepsMmaAbForGeneration", 168992, 512, 2, 64, 0, 3, 128, 0, true, true, false, false, "93ed4516663f413d700e8061a82776c8b728db59535a16a42cf1ac3488e7287b"},
 { DATA_TYPE_FP16, DATA_TYPE_E4M3, DATA_TYPE_FP16, 128, 128, 128, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvE4m3AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP32MultiCtasKvModeVarSeqLenTileSizeQ128TileSizeKv128StaticKeepsMmaAbForGeneration", 168992, 512, 2, 32, 0, 3, 128, 0, true, true, false, false, "134b40197b618d922e09640130830f0107055590bfe658bd3b6e11acbfc85dad"},
 { DATA_TYPE_FP16, DATA_TYPE_E4M3, DATA_TYPE_FP16, 128, 128, 128, 256, 128, 128, 128, kSM_100, "fmhaSm100Kernel_QFp16KvE4m3AccFp32OFp16HQk128HV128LayoutPagedKvMaskDenseP16MultiCtasKvModeVarSeqLenTileSizeQ128TileSizeKv128StaticKeepsMmaAbForGeneration", 168992, 512, 2, 16, 0, 3, 128, 0, true, true, false, false, "48e8f61657a02ff5550f1b4bd733fd94b6272f997b5bb0f1f4b5cbf04c3154e2"},
-    // clang-format on
-};
+// clang-format on
+    };

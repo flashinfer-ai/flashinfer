@@ -119,6 +119,8 @@ def load_cubin(cubin_path, sha256):
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
+            if os.getenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED"):
+                return cubin
             m = hashlib.sha256()
             m.update(cubin)
             actual_sha = m.hexdigest()
@@ -130,7 +132,7 @@ def load_cubin(cubin_path, sha256):
     except:
         pass
     logger.info(f"Failed loading {cubin_path}")
-    return None
+    return ""
 
 
 def get_cubin(name, sha256):
