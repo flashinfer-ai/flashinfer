@@ -20,11 +20,21 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
-from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
 
 _cascade_module = None
+
+
+def gen_cascade_module() -> JitSpec:
+    return gen_jit_spec(
+        "cascade",
+        [
+            FLASHINFER_CSRC_DIR / "cascade.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
+        ],
+    )
 
 
 def get_cascade_module():
@@ -35,13 +45,7 @@ def get_cascade_module():
 
             _cascade_module = _kernels
         else:
-            _cascade_module = gen_jit_spec(
-                "cascade",
-                [
-                    FLASHINFER_CSRC_DIR / "cascade.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
-                ],
-            ).build_and_load()
+            _cascade_module = gen_cascade_module().build_and_load()
     return _cascade_module
 
 

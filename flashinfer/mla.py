@@ -20,7 +20,13 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_batch_mla_module, gen_jit_spec
+from .jit import (
+    FLASHINFER_CSRC_DIR,
+    JitSpec,
+    gen_batch_mla_module,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+)
 from .jit.env import CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS
 from .utils import (
     MaskMode,
@@ -63,21 +69,25 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
 _mla_module = None
 
 
+def gen_mla_module() -> JitSpec:
+    return gen_jit_spec(
+        "mla",
+        [
+            FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
+        ],
+        extra_include_paths=[
+            CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "77_blackwell_fmha",
+            CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
+        ],
+        extra_cuda_cflags=sm100a_nvcc_flags,
+    )
+
+
 def get_mla_module():
     global _mla_module
     if _mla_module is None:
-        _mla_module = gen_jit_spec(
-            "mla",
-            [
-                FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
-            ],
-            extra_include_paths=[
-                CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "77_blackwell_fmha",
-                CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
-            ],
-            extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
-        ).build_and_load()
+        _mla_module = gen_mla_module().build_and_load()
     return _mla_module
 
 

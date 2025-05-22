@@ -19,7 +19,7 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -31,6 +31,16 @@ from .utils import (
 _page_module = None
 
 
+def gen_page_module() -> JitSpec:
+    return gen_jit_spec(
+        "page",
+        [
+            FLASHINFER_CSRC_DIR / "page.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
+        ],
+    )
+
+
 def get_page_module():
     global _page_module
     if _page_module is None:
@@ -39,13 +49,7 @@ def get_page_module():
 
             _page_module = _kernels
         else:
-            _page_module = gen_jit_spec(
-                "page",
-                [
-                    FLASHINFER_CSRC_DIR / "page.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
-                ],
-            ).build_and_load()
+            _page_module = gen_page_module().build_and_load()
     return _page_module
 
 

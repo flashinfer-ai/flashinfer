@@ -19,10 +19,20 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, gen_jit_spec, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, JitSpec, gen_jit_spec, has_prebuilt_ops
 from .utils import register_custom_op, register_fake_op
 
 _rope_module = None
+
+
+def gen_rope_module() -> JitSpec:
+    return gen_jit_spec(
+        "rope",
+        [
+            FLASHINFER_CSRC_DIR / "rope.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
+        ],
+    )
 
 
 def get_rope_module():
@@ -33,13 +43,7 @@ def get_rope_module():
 
             _rope_module = _kernels
         else:
-            _rope_module = gen_jit_spec(
-                "rope",
-                [
-                    FLASHINFER_CSRC_DIR / "rope.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
-                ],
-            ).build_and_load()
+            _rope_module = gen_rope_module().build_and_load()
     return _rope_module
 
 
