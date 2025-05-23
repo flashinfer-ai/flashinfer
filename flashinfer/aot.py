@@ -40,6 +40,8 @@ def gen_fa2(
 ) -> List[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return []
+    if dtype_qo.itemsize == 1:
+        return []  # fp8 tensor cores not supported in fa2
     return [
         gen_single_prefill_module(
             backend="fa2",
@@ -91,24 +93,30 @@ def gen_fa2(
 
 
 def gen_fa3(
-    dtype_qo: torch.dtype,
+    dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> List[JitSpec]:
-    if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
-        return []
+    if dtype_q != dtype_kv:
+        return []  # fa3 template do not support mixed precision
+    if dtype_q.itemsize == 2:
+        if dtype_q != dtype_o:
+            return []  # for fp16, dtype_o must be the same as dtype_q/dtype_kv
+
     if dtype_kv.itemsize == 1:
-        # fp8 kv not supported in FA3
-        return []
+        if head_dim_qk == 192 or head_dim_qk == 64:
+            return []  # (192, 128) & (64, 64) not supported for fp8 yet.
+
     return [
         gen_single_prefill_module(
             backend="fa3",
-            dtype_q=dtype_qo,
+            dtype_q=dtype_q,
             dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
+            dtype_o=dtype_o,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             pos_encoding_mode=0,
@@ -118,9 +126,9 @@ def gen_fa3(
         ),
         gen_batch_prefill_module(
             backend="fa3",
-            dtype_q=dtype_qo,
+            dtype_q=dtype_q,
             dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
+            dtype_o=dtype_o,
             dtype_idx=torch.int32,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
@@ -174,20 +182,21 @@ def gen_attention(
     if has_sm90:
         for (
             (head_dim_qk, head_dim_vo),
-            dtype_qo,
-            dtype_kv,
+            dtype_qkv,
+            dtype_o,
             use_sliding_window,
             use_logits_soft_cap,
         ) in product(
             fa3_head_dim_,
-            f16_dtype_,
             f16_dtype_ + f8_dtype_,
+            f16_dtype_,
             use_sliding_window_,
             use_logits_soft_cap_,
         ):
             jit_specs += gen_fa3(
-                dtype_qo=dtype_qo,
-                dtype_kv=dtype_kv,
+                dtype_q=dtype_qkv,
+                dtype_kv=dtype_qkv,
+                dtype_o=dtype_o,
                 head_dim_qk=head_dim_qk,
                 head_dim_vo=head_dim_vo,
                 use_sliding_window=use_sliding_window,
@@ -203,7 +212,7 @@ def gen_attention(
         ) in product(
             f16_dtype_,
             f16_dtype_ + f8_dtype_,
-            [(False, False), (True, True)],
+            [(True, True)],
         ):
             jit_specs += gen_fa2(
                 dtype_qo=dtype_qo,
@@ -213,10 +222,20 @@ def gen_attention(
                 use_sliding_window=use_sliding_window,
                 use_logits_soft_cap=use_logits_soft_cap,
             )
-            if has_sm90:
+        if has_sm90:
+            for (
+                dtype_qkv,
+                dtype_o,
+                (use_sliding_window, use_logits_soft_cap),
+            ) in product(
+                f16_dtype_ + f8_dtype_,
+                f16_dtype_,
+                [(True, True)],
+            ):
                 jit_specs += gen_fa3(
-                    dtype_qo=dtype_qo,
-                    dtype_kv=dtype_kv,
+                    dtype_q=dtype_qkv,
+                    dtype_kv=dtype_qkv,
+                    dtype_o=dtype_o,
                     head_dim_qk=256,
                     head_dim_vo=256,
                     use_sliding_window=use_sliding_window,
