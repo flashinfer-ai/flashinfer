@@ -839,11 +839,50 @@ def group_gemm_fp8_nt_groupwise(
     b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    from .triton.gemm import compute_padding_mapping
+    r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
+    Blackwell architecture.
 
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor shape ``(cum_m, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+        ``cum_m`` is the cumulative sum of the segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor shape ``(batch_size, n, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape ``(k // block_size, cum_m)``.
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape ``(batch_size, k // block_size, n // block_size)``.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(batch_size + 1,)``.
+        Element element in ``m_indptr`` must be a multiple of 4.
+
+    scale_granularity_mnk: Tuple[int, int, int]
+        The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    mma_sm: int
+        How many SMs to use for the MMA operation, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+    """
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
     )
@@ -861,22 +900,29 @@ def group_gemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
 
-    if (m_indptr % 4 == 0).all():
-        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-            int_workspace_buffer,
-            float_workspace_buffer,
-            a,
-            b,
-            a_scale,
-            b_scale,
-            out,
-            m_indptr,
-            n,
-            k,
-            *scale_granularity_mnk,
-        )
-        return out
+    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        int_workspace_buffer,
+        float_workspace_buffer,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        m_indptr,
+        n,
+        k,
+        *scale_granularity_mnk,
+        mma_sm,
+    )
+    return out
 
+
+def pad_indptr_to_multiple_of_4(
+    m_indptr: torch.Tensor,
+):
+    from .triton.gemm import compute_padding_mapping
+
+    batch_size = m_indptr.shape[0] - 1
     m = m_indptr[1:] - m_indptr[:-1]
     m = m + 3 - (m + 3) % 4
     padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
@@ -891,33 +937,4 @@ def group_gemm_fp8_nt_groupwise(
         m_indptr, padded_m_indptr, m_rank, padded_m_rank
     )
 
-    padded_a = torch.zeros((padded_m_indptr[-1], k), dtype=a.dtype, device=a.device)
-    padded_out = torch.zeros(
-        (padded_m_indptr[-1], n), dtype=out.dtype, device=out.device
-    )
-    padded_a_scale = torch.zeros(
-        (k // scale_granularity_mnk[2], padded_m_indptr[-1]),
-        dtype=a_scale.dtype,
-        device=a_scale.device,
-    )
-
-    padded_a[padded_m_rank] = a[m_rank]
-    padded_a_scale[::, padded_m_rank] = a_scale[::, m_rank]
-
-    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-        int_workspace_buffer,
-        float_workspace_buffer,
-        padded_a,
-        b,
-        padded_a_scale,
-        b_scale,
-        padded_out,
-        padded_m_indptr,
-        n,
-        k,
-        *scale_granularity_mnk,
-    )
-
-    out[m_rank] = padded_out[padded_m_rank]
-
-    return out
+    return padded_m_indptr, padded_m_rank

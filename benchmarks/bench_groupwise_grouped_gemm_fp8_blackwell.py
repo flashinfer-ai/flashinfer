@@ -41,7 +41,7 @@ def bench_groupwise_grouped_gemm_fp8_blackwell(
 
     ms = do_bench(
         lambda: flashinfer.gemm.group_gemm_fp8_nt_groupwise(
-            a, b, a_scale, b_scale, segment_offsets, out=out
+            a, b, a_scale, b_scale, segment_offsets, out=out, mma_sm=2
         ),
         warmup=100,
         rep=1000,
