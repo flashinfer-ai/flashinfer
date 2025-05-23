@@ -47,19 +47,20 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   stride_C[i] = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
   layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m_indptr[batch_size], n, k, 1));
   layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-  A_ptr[i] = A + m_indptr[i] * k;
-  B_ptr[i] = B + i * k * n;
-  C_ptr[i] = C + m_indptr[i] * n;
-  D_ptr[i] = C + m_indptr[i] * n;
-  SFA_ptr[i] = SFA + m_indptr[i] / scale_granularity_m;
-  SFB_ptr[i] = SFB + i * k * n / scale_granularity_n / scale_granularity_k;
+  A_ptr[i] = A + int64_t(m_indptr[i]) * int64_t(k);
+  B_ptr[i] = B + int64_t(i) * int64_t(k) * int64_t(n);
+  C_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
+  D_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
+  SFA_ptr[i] = SFA + int64_t(m_indptr[i]) / int64_t(scale_granularity_m);
+  SFB_ptr[i] = SFB + int64_t(i) * int64_t(k) * int64_t(n) / int64_t(scale_granularity_n) /
+                         int64_t(scale_granularity_k);
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
-template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
-          typename DTypeOut>
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, int MmaSM,
+          typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_buffer_size_in_bytes,
                                                  void* float_buffer,
                                                  size_t float_buffer_size_in_bytes, DTypeIn* A,
@@ -93,8 +94,8 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   using ElementAccumulator = float;
   using ElementCompute = float;
 
-  using MmaTileShape_MNK = Shape<_256, _128, _128>;
-  using ClusterShape_MNK = Shape<_2, _1, _1>;
+  using MmaTileShape_MNK = Shape<cute::Int<MmaSM * 128>, _128, _128>;
+  using ClusterShape_MNK = Shape<cute::Int<MmaSM>, _1, _1>;
 
   using ScaleConfig =
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
@@ -103,11 +104,19 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
+  using EpilogueSchedule =
+      std::conditional_t<MmaSM == 1, cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm,
+                         cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTileShape_MNK, ClusterShape_MNK,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
-      LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,
-      cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
+      LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD, EpilogueSchedule>::CollectiveOp;
+
+  using MainloopSchedule =
+      std::conditional_t<MmaSM == 1,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm100>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementA,
@@ -115,7 +124,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
       AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm100>::CollectiveOp;
+      MainloopSchedule>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
                                                           CollectiveEpilogue, void>;

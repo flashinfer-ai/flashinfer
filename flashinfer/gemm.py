@@ -839,6 +839,7 @@ def group_gemm_fp8_nt_groupwise(
     b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -866,6 +867,10 @@ def group_gemm_fp8_nt_groupwise(
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    mma_sm: int
+        How many SMs to use for the MMA operation, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
 
     out: Optional[torch.Tensor]
         The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
@@ -907,6 +912,7 @@ def group_gemm_fp8_nt_groupwise(
         n,
         k,
         *scale_granularity_mnk,
+        mma_sm,
     )
     return out
 
