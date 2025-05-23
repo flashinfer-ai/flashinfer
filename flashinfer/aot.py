@@ -40,6 +40,8 @@ def gen_fa2(
 ) -> List[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return []
+    if dtype_qo.itemsize == 1:
+        return []  # fp8 tensor cores not supported in fa2
     return [
         gen_single_prefill_module(
             backend="fa2",
@@ -100,9 +102,8 @@ def gen_fa3(
 ) -> List[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return []
-    if dtype_kv.itemsize == 1:
-        # fp8 kv not supported in FA3
-        return []
+    if dtype_kv.itemsize != dtype_qo.itemsize:
+        return []  # mixed precision not supported
     return [
         gen_single_prefill_module(
             backend="fa3",
@@ -180,7 +181,7 @@ def gen_attention(
             use_logits_soft_cap,
         ) in product(
             fa3_head_dim_,
-            f16_dtype_,
+            f16_dtype_ + f8_dtype_,
             f16_dtype_ + f8_dtype_,
             use_sliding_window_,
             use_logits_soft_cap_,
@@ -201,9 +202,9 @@ def gen_attention(
             dtype_kv,
             (use_sliding_window, use_logits_soft_cap),
         ) in product(
-            f16_dtype_,
             f16_dtype_ + f8_dtype_,
-            [(False, False), (True, True)],
+            f16_dtype_ + f8_dtype_,
+            [(True, True)],
         ):
             jit_specs += gen_fa2(
                 dtype_qo=dtype_qo,
