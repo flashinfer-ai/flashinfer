@@ -1,5 +1,13 @@
 <!-- .github/pull_request_template.md -->
 
+## 📌 Description
+
+<!-- What does this PR do? Briefly describe the changes and why they’re needed. -->
+
+## 🔍 Related Issues
+
+<!-- Link any related issues here -->
+
 ## 🚀 Pull Request Checklist
 
 Thank you for contributing to FlashInfer! Before we review your pull request, please make sure the following items are complete.
@@ -12,24 +20,10 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
 
 > If you are unsure about how to set up `pre-commit`, see [the pre-commit documentation](https://pre-commit.com/).
 
----
-
-## 📌 Description
-
-<!-- What does this PR do? Briefly describe the changes and why they’re needed. -->
-
-## 🔍 Related Issues
-
-<!-- Link any related issues here -->
-
----
-
 ## 🧪 Tests
 
 - [ ] Tests have been added or updated as needed.
 - [ ] All tests are passing (`unittest`, etc.).
-
----
 
 ## Reviewer Notes
 
