@@ -70,6 +70,7 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   int batch_size = m_indptr.size(0) - 1;
+  int max_m = SFA.size(1);
   DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(A.scalar_type(), C.scalar_type(), c_type_in, c_type_out, [&] {
     return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
       return DISPATCH_SCALE_GRANULARITY(
@@ -86,7 +87,7 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                 static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
                 static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
                 static_cast<cutlass_t_out*>(C.data_ptr()), static_cast<int*>(m_indptr.data_ptr()),
-                n, k, batch_size, stream);
+                max_m, n, k, batch_size, stream);
             return true;
           });
     });
