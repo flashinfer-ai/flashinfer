@@ -39,4 +39,9 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     ln("csrc", "csrc")
     ln("include", "include")
     ln("tvm_binding", "tvm_binding")
+
+    # Create cudnn package directory if it doesn't exist
+    cudnn_dir = root / "flashinfer" / "cudnn"
+    cudnn_dir.mkdir(parents=True, exist_ok=True)
+
     return orig.build_editable(wheel_directory, config_settings, metadata_directory)

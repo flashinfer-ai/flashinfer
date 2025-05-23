@@ -48,12 +48,14 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
+    "flashinfer.cudnn"
 ]
 include-package-data = false
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
+"flashinfer.cudnn" = "flashinfer/cudnn"
 
 [tool.setuptools.package-data]
 "flashinfer.data" = [
@@ -65,6 +67,11 @@ include-package-data = false
 "flashinfer.data.cutlass" = [
     "include/**",
     "tools/util/include/**"
+]
+
+"flashinfer.cudnn" = [
+    "*.py",
+    "*.pyi"
 ]
 
 [tool.mypy]

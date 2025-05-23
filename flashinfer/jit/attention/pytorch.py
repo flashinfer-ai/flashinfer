@@ -1411,3 +1411,11 @@ def trtllm_fmha_gen_module():
         ],
         extra_ldflags=["-lcuda"],
     )
+
+
+def cudnn_fmha_gen_module():
+    return load_cuda_ops(
+        "fmha_gen",
+        [FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
+        extra_ldflags=["-lcuda"],
+    )
