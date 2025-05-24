@@ -171,8 +171,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   struct Arguments {
     typename Load::Arguments load;
 
-    // if zero, defaults to 1/sqrt(D)
-    float scale_softmax = 0.0f;
+    float scale_softmax;
 
     // scaling factors to dequantize QKV
     float scale_q = 1.0f;
@@ -201,9 +200,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args,
                                         void* workspace) {
     float scale_softmax = args.scale_softmax;
-    if (scale_softmax == 0.0f) {
-      scale_softmax = 1.0f / (float)std::sqrt(get<2>(problem_shape));
-    }
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
     return Params{Load::to_underlying_arguments(problem_shape, args.load, workspace),
@@ -906,14 +902,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
   }
 
-  template <class BlkCoord, class ProblemShape, class TensorStorageEpi>
+  template <class BlkCoord, class ParamsProblemShape, class ProblemShape, class TensorStorageEpi,
+            class CollectiveEpilogue>
   CUTLASS_DEVICE auto correction(
-      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
+      BlkCoord const& blk_coord, Params const& params,
+      ParamsProblemShape const& params_problem_shape, ProblemShape const& problem_shape,
       TensorStorageEpi& shared_storage_epi, PipelineC& pipeline_s0_c,
       typename PipelineC::PipelineState& pipeline_s0_c_consumer_state, PipelineC& pipeline_s1_c,
       typename PipelineC::PipelineState& pipeline_s1_c_consumer_state, PipelineO& pipeline_o,
       typename PipelineO::PipelineState& pipeline_o_consumer_state, PipelineE& pipeline_epi,
-      typename PipelineE::PipelineState& pipeline_epi_producer_state) {
+      typename PipelineE::PipelineState& pipeline_epi_producer_state,
+      CollectiveEpilogue& epilogue) {
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
@@ -1024,7 +1023,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //    store to smem
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
                             typename TensorStorageEpi::SmemLayoutO{});
+    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx;
+
+      ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, qo_head_idx) = lse;
+      }
+    }
     // correction_epilogue(params.scale_output, _0{}, sO);
 
     cutlass::arch::fence_view_async_tmem_load();
@@ -1047,6 +1062,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx =
+          get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx + get<0>(TileShapeQK{});
+
+      ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                      params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, qo_head_idx) = lse;
+      }
+    }
     // correction_epilogue(params.scale_output, _1{}, sO);
     cutlass::arch::fence_view_async_tmem_load();
 

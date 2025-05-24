@@ -49,7 +49,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using LayoutO = cute::Layout<ShapeT, StrideO>;
 
   using ShapeLSE = cute::Shape<int32_t, cute::Shape<int32_t, int32_t>>;
-  using StrideLSE = cute::Shape<_1, cute::Shape<int32_t, int32_t>>;
+  using StrideLSE = cute::Shape<int32_t, cute::Shape<_1, int32_t>>;
   using LayoutLSE = cute::Layout<ShapeLSE, StrideLSE>;
 
   //  using SmemLayoutO = decltypa(make_layout(append<3>(select<0,1>(TileShape_WG{}), _2{})));
@@ -103,6 +103,10 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     cute::prefetch_tma_descriptor(params.tma_store_o.get_tma_descriptor());
   }
 
+  const Params& params;
+
+  CUTLASS_DEVICE Sm100FmhaFwdEpilogueTmaWarpspecialized(const Params& params) : params(params) {}
+
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
   CUTLASS_DEVICE auto store(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                             Params const& params, ParamsProblemShape const& params_problem_shape,
@@ -119,10 +123,6 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     int o0_index = 2 * get<0>(blk_coord);
     int o1_index = 2 * get<0>(blk_coord) + 1;
-
-    // Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE), params.layout_LSE);
-    // Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
-    //                                         qo_len)(_, qo_tile_idx);
 
     int max_length_q = get<0>(params_problem_shape).max_length;
     int offs_0 = max_length_q - qo_len;

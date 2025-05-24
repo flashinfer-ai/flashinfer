@@ -351,10 +351,15 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
       });
 
   typename Scheduler::Arguments scheduler_args = {
-      params.work_indptr,     params.head_indices,
-      params.qo_tile_indices, params.qo_indptr,
-      params.kv_indptr,       params.qo_lens,
-      params.kv_lens,         cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      params.work_indptr,
+      params.head_indices,
+      params.qo_tile_indices,
+      params.qo_indptr,
+      params.kv_indptr,
+      params.qo_lens,
+      params.kv_lens,
+      params.batch_indices,
+      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
       params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 

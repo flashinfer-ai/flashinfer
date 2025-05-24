@@ -151,6 +151,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
         params.qo_lens = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_len_offset);
         params.kv_lens = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
         params.head_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =

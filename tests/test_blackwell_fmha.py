@@ -61,8 +61,9 @@ def attention_ref(
 @pytest.mark.parametrize("num_kv_heads", [4, 32])
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
 @pytest.mark.parametrize("head_dim_vo", [128])
+@pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.half])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_blackwell_cutlass_fmha(
     batch_size,
     qo_len,
@@ -71,6 +72,7 @@ def test_blackwell_cutlass_fmha(
     num_kv_heads,
     head_dim_qk,
     head_dim_vo,
+    sm_scale,
     causal,
     dtype,
 ):
@@ -102,7 +104,6 @@ def test_blackwell_cutlass_fmha(
         kv_layout="NHD",
         backend="cutlass",
     )
-    sm_scale = 1.0 / (head_dim_qk**0.5)
     wrapper.plan(
         qo_indptr,
         kv_indptr,
@@ -117,41 +118,33 @@ def test_blackwell_cutlass_fmha(
     )
     o, lse = wrapper.run(q, k, v, return_lse=True)
 
-    # gqa_group_ratio = num_qo_heads // num_kv_heads
-    # k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    # v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
-    # o_ref, lse_ref = attention_ref(
-    #     batch_size, q, k_repeated, v_repeated, causal, sm_scale
-    # )
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref, lse_ref = attention_ref(
+        batch_size, q, k_repeated, v_repeated, causal, sm_scale
+    )
 
-    # lse_ref = lse_ref.flatten(0, 1)
-    # if dtype == torch.half:
-    #     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    # else:
-    #     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    lse_ref = lse_ref.flatten(0, 1)
+    if dtype == torch.half:
+        torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    else:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
-    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
-
-    # test with pre-allocated output
-    # o_buffer = torch.empty_like(o)
-    # lse_buffer = torch.empty_like(lse)
-    # flashinfer.prefill.fmha(
-    #     q, k, v, qo_lens, kv_lens, out=o_buffer, lse=lse_buffer, causal=causal
-    # )
-    # torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
-    # torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         1,
-        1,
-        1,
         32,
+        32,
+        4,
         4,
         192,
         128,
-        False,
+        1,
+        True,
         torch.bfloat16,
         # 3,
         # 999,

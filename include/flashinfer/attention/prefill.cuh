@@ -797,8 +797,8 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring(
     const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end,
     const uint_fastdiv group_size, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     // new arguments for compact description of mask
-    const uint32_t prefix_len, uint16_t* token_pos_in_items) {
-  const uint32_t lane_idx = threadIdx.x, kv_head_idx = blockIdx.z;
+    const uint32_t prefix_len, uint16_t* token_pos_in_items, const uint32_t lane_idx = threadIdx.x,
+    const uint32_t kv_head_idx = blockIdx.z) {
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
@@ -2285,23 +2285,26 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           if (iter >= mask_iteration || iter < window_iteration) {
             logits_mask<KTraits>(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                chunk_start +
+                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
                 qo_len, kv_len, chunk_end, group_size, s_frag);
           }
         } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
           if (iter + 1 >= num_iterations_prefix) {
             logits_mask_multi_item_scoring<KTraits>(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                chunk_start +
+                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
                 qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
-                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len);
+                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
+                kv_head_idx);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(
                   params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                   chunk_start +
-                      (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+                      (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
                   qo_len, kv_len, chunk_end, group_size, s_frag);
             }
           }

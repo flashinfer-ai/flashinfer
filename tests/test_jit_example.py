@@ -55,7 +55,7 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
         ["double"],  # additional_scalar_dtypes
         "SingleDecodeWithCustomMask",
         variant_decl,
-    )
+    ).build_and_load()
 
     f = functools.partial(single_decode_with_kv_cache_with_jit_module, jit_module)
 
@@ -140,7 +140,7 @@ def test_flash_sigmoid():
         ["double", "double"],  # additional_scalar_dtypes
         "FlashSigmoid",
         variant_decl,
-    )
+    ).build_and_load()
 
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
@@ -199,7 +199,7 @@ struct DumpLogits : AttentionVariantBase {
         ["double"],  # additional_scalar_dtypes
         "DumpLogits",
         variant_decl,
-    )
+    ).build_and_load()
 
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
@@ -606,7 +606,7 @@ struct DebugPrintLogits : AttentionVariantBase {
         ["double"],  # additional_scalar_dtypes
         "DebugPrintLogits",
         variant_decl,
-    )
+    ).build_and_load()
 
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
@@ -682,7 +682,7 @@ struct DebugPrintLogits : AttentionVariantBase {
         ["double"],  # additional_scalar_dtypes
         "DebugPrintLogits",
         variant_decl,
-    )
+    ).build_and_load()
 
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 

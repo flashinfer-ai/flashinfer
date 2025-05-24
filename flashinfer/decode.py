@@ -29,8 +29,6 @@ from .jit import (
     gen_single_decode_module,
     get_batch_decode_uri,
     get_single_decode_uri,
-    has_prebuilt_ops,
-    prebuilt_ops_uri,
 )
 from .page import get_seq_lens
 from .prefill import (
@@ -65,12 +63,8 @@ def get_single_decode_module(*args):
     global _single_decode_modules
     if args not in _single_decode_modules:
         uri = get_single_decode_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            _kernels = torch.ops.flashinfer_kernels
-
-            run_func = _kernels.single_decode_with_kv_cache.default
-        else:
-            run_func = gen_single_decode_module(*args).run.default
+        module = gen_single_decode_module(*args).build_and_load()
+        run_func = module.run.default
 
         # torch library for single_decode_with_kv_cache
 
@@ -211,15 +205,9 @@ def get_batch_decode_module(*args):
     global _batch_decode_modules
     if args not in _batch_decode_modules:
         uri = get_batch_decode_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            _kernels = torch.ops.flashinfer_kernels
-
-            plan_func = _kernels.batch_decode_with_paged_kv_cache_plan.default
-            run_func = _kernels.batch_decode_with_paged_kv_cache_run.default
-        else:
-            mod = gen_batch_decode_module(*args)
-            plan_func = mod.plan.default
-            run_func = mod.run.default
+        mod = gen_batch_decode_module(*args).build_and_load()
+        plan_func = mod.plan.default
+        run_func = mod.run.default
 
         # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -343,7 +331,9 @@ def single_decode_with_kv_cache_with_jit_module(
 def get_batch_decode_mla_module(*args):
     global _batch_decode_mla_modules
     if args not in _batch_decode_mla_modules:
-        _batch_decode_mla_modules[args] = gen_batch_decode_mla_module(*args)
+        _batch_decode_mla_modules[args] = gen_batch_decode_mla_module(
+            *args
+        ).build_and_load()
     return _batch_decode_mla_modules[args]
 
 
@@ -697,11 +687,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if jit_args is not None:
             if use_tensor_cores:
                 self._jit_module = get_batch_prefill_jit_module(
-                    jit_args[0], gen_customize_batch_prefill_module("fa2", *jit_args)
+                    jit_args[0],
+                    gen_customize_batch_prefill_module(
+                        "fa2", *jit_args
+                    ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
-                    jit_args[0], gen_customize_batch_decode_module(*jit_args)
+                    jit_args[0],
+                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
                 )
         else:
             self._jit_module = None

@@ -29,8 +29,6 @@ from .jit import (
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
-    has_prebuilt_ops,
-    prebuilt_ops_uri,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -84,7 +82,7 @@ def get_fmha_module(
             pos_encoding_mode,
             use_sliding_window,
             use_logits_soft_cap,
-        )
+        ).build_and_load()
     else:
         raise ValueError(f"SM100A is not supported on this device")
 
@@ -99,17 +97,8 @@ def get_single_prefill_module(backend):
         )
         if args not in modules_dict:
             uri = get_single_prefill_uri(backend, *args)
-            if has_prebuilt_ops and uri in prebuilt_ops_uri:
-                if backend == "fa2":
-                    _kernels = torch.ops.flashinfer_kernels
-
-                    run_func = _kernels.single_prefill_with_kv_cache.default
-                else:
-                    _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
-
-                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90.default
-            else:
-                run_func = gen_single_prefill_module(backend, *args).run.default
+            module = gen_single_prefill_module(backend, *args).build_and_load()
+            run_func = module.run.default
 
             # torch library for single_prefill_with_kv_cache
 
@@ -224,34 +213,10 @@ def get_batch_prefill_module(backend):
         )
         if args not in modules_dict:
             uri = get_batch_prefill_uri(backend, *args)
-            if has_prebuilt_ops and uri in prebuilt_ops_uri:
-                if backend == "fa2":
-                    _kernels = torch.ops.flashinfer_kernels
-
-                    plan_func = _kernels.batch_prefill_with_kv_cache_plan.default
-                    ragged_run_func = (
-                        _kernels.batch_prefill_with_ragged_kv_cache_run.default
-                    )
-                    paged_run_func = (
-                        _kernels.batch_prefill_with_paged_kv_cache_run.default
-                    )
-                else:
-                    _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
-
-                    plan_func = (
-                        _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan.default
-                    )
-                    ragged_run_func = (
-                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run.default
-                    )
-                    paged_run_func = (
-                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run.default
-                    )
-            else:
-                module = gen_batch_prefill_module(backend, *args)
-                plan_func = module.plan.default
-                ragged_run_func = module.ragged_run.default
-                paged_run_func = module.paged_run.default
+            module = gen_batch_prefill_module(backend, *args).build_and_load()
+            plan_func = module.plan.default
+            ragged_run_func = module.ragged_run.default
+            paged_run_func = module.paged_run.default
 
             # torch library for ragged_run
 
@@ -1221,7 +1186,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args),
+                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
             )
         else:
             self._jit_module = None
@@ -2066,7 +2031,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args),
+                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
             )
         else:
             self._jit_module = None
@@ -2620,6 +2585,9 @@ def fmha_varlen(
     causal: bool = False,
     sm_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    workspace_buffer = _get_cache_buf(
+        "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
+    )
     module = get_fmha_module(
         q.dtype,
         k.dtype,
@@ -2635,7 +2603,8 @@ def fmha_varlen(
     nnz_kv, num_kv_heads, head_dim_vo = v.shape
 
     mask_mode_code = 1 if causal else 0
-    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
     qo_lens = qo_segment_offsets[1:] - qo_segment_offsets[:-1]
     kv_lens = kv_segment_offsets[1:] - kv_segment_offsets[:-1]
@@ -2659,6 +2628,7 @@ def fmha_varlen(
         )
 
     module.run(
+        workspace_buffer,
         q,
         k,
         v,

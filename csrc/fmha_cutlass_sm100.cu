@@ -68,8 +68,8 @@
 
 using namespace flashinfer;
 
-void FMHACutlassSM100Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_lens,
-                         at::Tensor kv_lens, at::Tensor qo_segment_offsets,
+void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
+                         at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
                          at::Tensor kv_segment_offsets, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
@@ -92,9 +92,9 @@ void FMHACutlassSM100Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo
     using CutlassMaskMode =
         typename std::conditional<MASK_MODE == MaskMode::kCausal, CausalMask, ResidualMask>::type;
     run_fmha_fwd<cutlass_type_in, cutlass_type_out, TileShapeQK, TileShapePV, CutlassMaskMode>(
-        q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o, maybe_lse,
-        mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size,
-        total_qo_len, total_kv_len, max_qo_len, max_kv_len);
+        workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o,
+        maybe_lse, mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+        batch_size, total_qo_len, total_kv_len, max_qo_len, max_kv_len);
 
     return true;
   });

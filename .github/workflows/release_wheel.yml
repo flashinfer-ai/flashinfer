@@ -25,19 +25,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["11.8", "12.1", "12.4", "12.6"]
-        torch: ["2.4", "2.5", "2.6"]
+        cuda: ["11.8", "12.1", "12.4", "12.6", "12.8"]
+        torch: ["2.5", "2.6", "2.7"]
         exclude: # We use release_wheel_sglang.yml for faster release and verification. If everything is okay, then we trigger release_wheel.yml. This combination (cuda 12.4 or 11.8 + torch 2.5) is already handled in release_wheel_sglang.yml
-          - cuda: "12.4"
-            torch: "2.5"
           - cuda: "11.8"
             torch: "2.5"
-          - cuda: "12.1"
-            torch: "2.6"
-          - cuda: "12.6"
-            torch: "2.4"
+          - cuda: "12.4"
+            torch: "2.5"
+          # 2.5 supports 11.8, 12.1, and 12.4
           - cuda: "12.6"
             torch: "2.5"
+          - cuda: "12.8"
+            torch: "2.5"
+          # 2.6 supports 11.8, 12.4, and 12.6
+          - cuda: "12.1"
+            torch: "2.6"
+          - cuda: "12.8"
+            torch: "2.6"
+          # 2.7 supports 11.8, 12.6, and 12.8
+          - cuda: "12.1"
+            torch: "2.7"
+          - cuda: "12.4"
+            torch: "2.7"
 
 
     runs-on: [self-hosted]

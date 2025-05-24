@@ -360,7 +360,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineO>();
 
     CollectiveMainloop mainloop;
-    CollectiveEpilogue epilogue;
+    CollectiveEpilogue epilogue{params.epilogue};
 
     if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
       warpgroup_reg_set<NumRegsSoftmax>();
@@ -400,11 +400,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        mainloop.correction(
-            blk_coord, params.mainloop, logical_problem_shape, shared_storage.epilogue,
-            pipeline_s0_corr, pipeline_s0_corr_consumer_state, pipeline_s1_corr,
-            pipeline_s1_corr_consumer_state, pipeline_mma_corr, pipeline_mma_corr_consumer_state,
-            pipeline_corr_epi, pipeline_corr_epi_producer_state);
+        mainloop.correction(blk_coord, params.mainloop, params.problem_shape, logical_problem_shape,
+                            shared_storage.epilogue, pipeline_s0_corr,
+                            pipeline_s0_corr_consumer_state, pipeline_s1_corr,
+                            pipeline_s1_corr_consumer_state, pipeline_mma_corr,
+                            pipeline_mma_corr_consumer_state, pipeline_corr_epi,
+                            pipeline_corr_epi_producer_state, epilogue);
       }
 
       if constexpr (NumWarpsEpilogue == 0) {

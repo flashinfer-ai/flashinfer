@@ -21,26 +21,28 @@ from typing import List, Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec
 from .utils import register_custom_op
 
 _comm_module = None
 
 
+def gen_comm_module() -> JitSpec:
+    return gen_jit_spec(
+        "comm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+        ],
+    )
+
+
 def get_comm_module():
     global _comm_module
     if _comm_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-            module = _kernels
-        else:
-            module = load_cuda_ops(
-                "comm",
-                [
-                    FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
-                    FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
-                ],
-            )
+        module = gen_comm_module().build_and_load()
 
         # torch library for all
         @register_custom_op(
