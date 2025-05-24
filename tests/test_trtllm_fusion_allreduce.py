@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+# import flashinfer.trtllm_all_reduce as trtllm_all_reduce
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port):
@@ -137,5 +138,20 @@ if __name__ == "__main__":
         size=1024,
         hidden_dim=1024,
     )
+    moe_params = comm.MoeReductionAllReduceFusionParams(
+        workspace=torch.zeros(1),  # todo
+        allreduce_in=torch.zeros(1),  # todo
+        nranks=2,
+        rank=0,
+        dtype=comm.DataType.FP16,
+        size=1024,
+        hidden_dim=1024,
+        residual_in=torch.zeros(1),  # todo
+        rms_gamma=torch.zeros(1),  # todo
+        moe_reduction_device_num_experts=torch.zeros(1),  # todo
+        moe_reduction_scale_input=torch.zeros(1),  # todo
+        moe_reduction_active_experts_token_input=torch.zeros(1),  # todo
+        moe_reduction_token_input=torch.zeros(1),  # todo
+    )
     comm.trtllm_allreduce_fusion_op(params)
-    comm.trtllm_moereduction_allreduce_fusion_op(params)
+    comm.trtllm_moereduction_allreduce_fusion_op(moe_params)

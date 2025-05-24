@@ -119,6 +119,6 @@ struct AllReduceFusionParams {
   AllReduceFusionPattern pattern;
 };
 
-void allreduce_fusion_op(AllReduceFusionParams& params);
+void allreduce_fusion_op(AllReduceFusionParams const & params);
 
 }  // namespace tensorrt_llm::kernels::ar_fusion
