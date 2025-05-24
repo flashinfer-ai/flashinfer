@@ -21,7 +21,7 @@ import flashinfer.comm as comm
 logger = logging.getLogger(__name__)
 
 
-def _run_correctness_worker(world_size, rank, distributed_init_port, num_cta, dtype):
+def _run_correctness_worker(world_size, rank, distributed_init_port):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
@@ -44,8 +44,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, num_cta, dt
         custom_ptr = comm.init_custom_ar(meta_ptrs, rank_data, rank, True)
         comm.register_buffer(custom_ptr, buffer_ptrs)
 
-        test_loop = 10
-        for test_size in [
+        test_sizes = [
             512,
             2560,
             4096,
@@ -56,24 +55,31 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, num_cta, dt
             524288,
             1048576,
             2097152,
-        ]:
-            for _ in range(test_loop):
-                inp1 = torch.randint(1, 16, (test_size,), dtype=dtype, device=device)
-                inp1_ref = inp1.clone()
-                out1 = torch.empty_like(inp1)
+        ]
+        num_ctas = [1, 2, 4, 8, 16, 32, 36]
+        dtypes = [torch.float32, torch.float16, torch.bfloat16]
+        test_loop = 10
 
-                comm.all_reduce(
-                    custom_ptr,
-                    inp1,
-                    out1,
-                    buffer_ptrs[rank],
-                    max_size,
-                    num_cta,
-                )
+        for test_size in test_sizes:
+            for num_cta in num_ctas:
+                for dtype in dtypes:
+                    for _ in range(test_loop):
+                        inp1 = torch.randint(1, 16, (test_size,), dtype=dtype, device=device)
+                        inp1_ref = inp1.clone()
+                        out1 = torch.empty_like(inp1)
 
-                dist.all_reduce(inp1_ref, group=group)
+                        comm.all_reduce(
+                            custom_ptr,
+                            inp1,
+                            out1,
+                            buffer_ptrs[rank],
+                            max_size,
+                            num_cta,
+                        )
 
-                torch.testing.assert_close(out1, inp1_ref)
+                        dist.all_reduce(inp1_ref, group=group)
+
+                        torch.testing.assert_close(out1, inp1_ref)
     finally:
         dist.barrier(group=group)
         if custom_ptr is not None:
@@ -118,19 +124,14 @@ def multi_process_parallel(
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("num_cta", [1, 2, 4, 8, 16, 32, 36])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_vllm_custom_allreduce(world_size, num_cta, dtype):
+def test_vllm_custom_allreduce(world_size):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        pytest.skip(
-            f"Skipping world_size={world_size}, requires {world_size} GPUs, found {available_gpus}"
-        )
-
+        raise ValueError(f"world_size {world_size} is greater than available_gpus {available_gpus}")
     print(f"Running test for world_size={world_size}")
     multi_process_parallel(
         world_size,
         _run_correctness_worker,
-        target_args=(num_cta, dtype),
+        target_args=(),
     )
     print(f"custom allreduce tp = {world_size}: OK")
