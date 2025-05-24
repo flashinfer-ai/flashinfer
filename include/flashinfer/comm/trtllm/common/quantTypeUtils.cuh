@@ -16,40 +16,38 @@
 
 #pragma once
 
-#include "flashinfer/distributed/trtllm/common/cudaBf16Fallbacks.cuh"
-#include "flashinfer/distributed/trtllm/common/cudaFp8Utils.h"
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <float.h>
 
-namespace tensorrt_llm
-{
-namespace common
-{
+#include "flashinfer/comm/trtllm/common/cudaBf16Fallbacks.cuh"
+#include "flashinfer/comm/trtllm/common/cudaFp8Utils.h"
+
+namespace tensorrt_llm {
+namespace common {
 
 template <typename T>
 struct QuantTypeStaticVals;
 
 template <>
-struct QuantTypeStaticVals<int8_t>
-{
-    static constexpr float MAX_VAL = 127.f;
-    static constexpr float MIN_SCALING_FACTOR = 0.f;
-    static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
+struct QuantTypeStaticVals<int8_t> {
+  static constexpr float MAX_VAL = 127.f;
+  static constexpr float MIN_SCALING_FACTOR = 0.f;
+  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
 };
 
 #ifdef ENABLE_FP8
 
 template <>
-struct QuantTypeStaticVals<__nv_fp8_e4m3>
-{
-    static constexpr float MAX_VAL = 448.f;
-    // Ref: https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu#L720
-    static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
-    static constexpr float MIN_SCALING_FACTOR_RCP = (448.f * 512.f);
+struct QuantTypeStaticVals<__nv_fp8_e4m3> {
+  static constexpr float MAX_VAL = 448.f;
+  // Ref:
+  // https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu#L720
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = (448.f * 512.f);
 };
 
-#endif // ENABLE_FP8
+#endif  // ENABLE_FP8
 
-} // namespace common
-} // namespace tensorrt_llm
+}  // namespace common
+}  // namespace tensorrt_llm

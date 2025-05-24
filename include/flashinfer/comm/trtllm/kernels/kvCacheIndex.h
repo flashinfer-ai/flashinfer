@@ -16,41 +16,37 @@
 
 #pragma once
 
-#include "flashinfer/distributed/trtllm/common/assert.h"
-
-#include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels
-{
+#include <cstdint>
 
-class KVCacheIndex
-{
-public:
-    using UnderlyingType = std::int32_t;
+#include "flashinfer/comm/trtllm/common/assert.h"
 
-    // Flag indicating KVCacheIndex refers to secondary pool
-    static constexpr UnderlyingType kSecondaryPoolFlag = static_cast<UnderlyingType>(1)
-        << (8 * sizeof(UnderlyingType) - 1);
+namespace tensorrt_llm::kernels {
 
-    explicit KVCacheIndex(UnderlyingType value, bool isSecondary = false)
-        : value{isSecondary ? value | kSecondaryPoolFlag : value}
-    {
-        TLLM_CHECK_DEBUG(value >= 0);
-    }
+class KVCacheIndex {
+ public:
+  using UnderlyingType = std::int32_t;
 
-    __host__ __device__ [[nodiscard]] UnderlyingType get() const
-    {
-        return value & (~kSecondaryPoolFlag);
-    }
+  // Flag indicating KVCacheIndex refers to secondary pool
+  static constexpr UnderlyingType kSecondaryPoolFlag = static_cast<UnderlyingType>(1)
+                                                       << (8 * sizeof(UnderlyingType) - 1);
 
-    __host__ __device__ [[nodiscard]] bool isPrimary() const
-    {
-        return (value & kSecondaryPoolFlag) == 0;
-    }
+  explicit KVCacheIndex(UnderlyingType value, bool isSecondary = false)
+      : value{isSecondary ? value | kSecondaryPoolFlag : value} {
+    TLLM_CHECK_DEBUG(value >= 0);
+  }
 
-private:
-    UnderlyingType value;
+  __host__ __device__ [[nodiscard]] UnderlyingType get() const {
+    return value & (~kSecondaryPoolFlag);
+  }
+
+  __host__ __device__ [[nodiscard]] bool isPrimary() const {
+    return (value & kSecondaryPoolFlag) == 0;
+  }
+
+ private:
+  UnderlyingType value;
 };
 
-} // namespace tensorrt_llm::kernels
+}  // namespace tensorrt_llm::kernels

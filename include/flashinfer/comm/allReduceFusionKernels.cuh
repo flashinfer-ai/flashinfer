@@ -3,14 +3,15 @@
 
 #pragma once
 // #include <NvInferRuntime.h> // we can remove this since it's about datatype
-#include "flashinfer/distributed/trtllm/types.h" // to delete redundant dependencies
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-// #include "flashinfer/distributed/trtllm/common/assert.h"
-// #include "flashinfer/distributed/trtllm/common/cudaUtils.h"
-#include "flashinfer/distributed/trtllm/kernels/quantization.h"
-// #include "flashinfer/distributed/trtllm/runtime/ipcUtils.h"
+#include "flashinfer/comm/trtllm/types.h"  // to delete redundant dependencies
+
+// #include "flashinfer/comm/trtllm/common/assert.h"
+// #include "flashinfer/comm/trtllm/common/cudaUtils.h"
+#include "flashinfer/comm/trtllm/kernels/quantization.h"
+// #include "flashinfer/comm/trtllm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::ar_fusion {
 template <typename DType>
@@ -118,5 +119,6 @@ struct AllReduceFusionParams {
   AllReduceFusionPattern pattern;
 };
 
-void allreduce_fusion_op(AllReduceFusionParams const& params);
+void allreduce_fusion_op(AllReduceFusionParams& params);
+
 }  // namespace tensorrt_llm::kernels::ar_fusion

@@ -18,61 +18,57 @@
 #pragma once
 
 #include "common.h"
-#include "flashinfer/distributed/trtllm/kernels/customAllReduceKernels.h"
-#include "flashinfer/distributed/trtllm/runtime/bufferManager.h"
-#include "flashinfer/distributed/trtllm/runtime/iTensor.h"
-#include "flashinfer/distributed/trtllm/runtime/worldConfig.h"
+#include "flashinfer/comm/trtllm/kernels/customAllReduceKernels.h"
+#include "flashinfer/comm/trtllm/runtime/bufferManager.h"
+#include "flashinfer/comm/trtllm/runtime/iTensor.h"
+#include "flashinfer/comm/trtllm/runtime/worldConfig.h"
 
-namespace tensorrt_llm::runtime
-{
+namespace tensorrt_llm::runtime {
 
-class IpcMemory
-{
-public:
-    using BufferPtr = IBuffer::SharedPtr;
+class IpcMemory {
+ public:
+  using BufferPtr = IBuffer::SharedPtr;
 
-    // MAX_ALL_REDUCE_BLOCKS for block_barrier, 1 for multi_gpu_barrier
-    size_t static constexpr FLAGS_SIZE = (tensorrt_llm::kernels::MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t);
+  // MAX_ALL_REDUCE_BLOCKS for block_barrier, 1 for multi_gpu_barrier
+  size_t static constexpr FLAGS_SIZE =
+      (tensorrt_llm::kernels::MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t);
 
-    IpcMemory(
-        std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc = true);
-    ~IpcMemory();
+  IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig,
+            bool openIpc = true);
+  ~IpcMemory();
 
-    IpcMemory(IpcMemory const&) = delete;
-    IpcMemory& operator=(IpcMemory const&) = delete;
+  IpcMemory(IpcMemory const&) = delete;
+  IpcMemory& operator=(IpcMemory const&) = delete;
 
-    IpcMemory(IpcMemory&&) = default;
-    IpcMemory& operator=(IpcMemory&&) = default;
+  IpcMemory(IpcMemory&&) = default;
+  IpcMemory& operator=(IpcMemory&&) = default;
 
-    [[nodiscard]] std::vector<void*> const& getCommPtrs() const
-    {
-        return mCommPtrs;
-    }
+  [[nodiscard]] std::vector<void*> const& getCommPtrs() const { return mCommPtrs; }
 
-private:
-    void allocateIpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig);
-    void destroyIpcMemory();
+ private:
+  void allocateIpcMemory(std::size_t bufferSize, BufferManager const& manager,
+                         WorldConfig const& worldConfig);
+  void destroyIpcMemory();
 
-    SizeType32 mTpRank;
-    std::vector<void*> mCommPtrs;
-    BufferPtr mBuffer;
-    bool mOpenIpc;
+  SizeType32 mTpRank;
+  std::vector<void*> mCommPtrs;
+  BufferPtr mBuffer;
+  bool mOpenIpc;
 };
 
-class AllReduceBuffers
-{
-public:
-    using TensorPtr = ITensor::SharedPtr;
+class AllReduceBuffers {
+ public:
+  using TensorPtr = ITensor::SharedPtr;
 
-    AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
-        SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig,
-        bool const fakeBuffers = false);
+  AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
+                   SizeType32 hiddenSize, BufferManager const& manager,
+                   WorldConfig const& worldConfig, bool const fakeBuffers = false);
 
-    TensorPtr mAllReduceCommPtrs;
-    std::vector<runtime::IpcMemory> mIpcMemoryHandles;
+  TensorPtr mAllReduceCommPtrs;
+  std::vector<runtime::IpcMemory> mIpcMemoryHandles;
 };
 
 void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
 bool canAccessPeer(WorldConfig const& worldConfig);
 
-} // namespace tensorrt_llm::runtime
+}  // namespace tensorrt_llm::runtime

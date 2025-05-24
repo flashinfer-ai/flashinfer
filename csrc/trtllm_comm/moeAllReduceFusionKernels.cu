@@ -2,18 +2,17 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.cu#L213
 #include <cooperative_groups.h>
 
-#include "flashinfer/distributed/moeAllReduceFusionKernels.cuh"
-
+#include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
 #include "pytorch_extension_utils.h"
 
 namespace cg = cooperative_groups;
 
 // #include "tensorrt_llm/common/envUtils.h" // use trtllm_enable_pdl local var instead
 // #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "flashinfer/distributed/trtllm/kernels/quantization.h"
-#include "flashinfer/distributed/trtllm/kernels/quantization.cuh"
+#include "flashinfer/comm/trtllm/kernels/quantization.cuh"
+#include "flashinfer/comm/trtllm/kernels/quantization.h"
 
-static bool trtllm_enable_pdl = true; // temp env var for easier compilation
+static bool trtllm_enable_pdl = true;  // temp env var for easier compilation
 
 namespace tensorrt_llm::kernels::ar_fusion::moe {
 template <int NRanks>
@@ -409,48 +408,47 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
     MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT); \
   }
 
-  // TLLM_CHECK(params.residual_in && params.rms_gamma);
-  // TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
-  //     && params.moe_reduction_token_input);
-  // TLLM_CHECK(params.size % params.hidden_dim == 0);
-  // TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
-  TORCH_CHECK(params.residual_in && params.rms_gamma, "params.residual_in && params.rms_gamma");
-  TORCH_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input &&
-                  params.moe_reduction_token_input,
-              "params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input "
-              "&& params.moe_reduction_token_input");
-  TORCH_CHECK(params.size % params.hidden_dim == 0, "params.size % params.hidden_dim == 0");
-  TORCH_CHECK(params.hidden_dim % kElemsPerAccess == 0, "params.hidden_dim % kElemsPerAccess == 0");
-  if (params.residual_out && not params.norm_out && params.quant_out) {
-    // pattern1: AR+Add_RMS+Quant
-    // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-    // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-    MOE_DISPATCH0(2, true, false, true);
-    MOE_DISPATCH0(4, true, false, true);
-    MOE_DISPATCH0(8, true, false, true);
-    MOE_DISPATCH0(16, true, false, true);
-  } else if (not params.residual_out && params.norm_out && not params.quant_out) {
-    // pattern2: AR+AddRMS
-    // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-    // [m, 7168] bf16 norm_out
-    MOE_DISPATCH0(2, false, true, false);
-    MOE_DISPATCH0(4, false, true, false);
-    MOE_DISPATCH0(8, false, true, false);
-    MOE_DISPATCH0(16, false, true, false);
-  } else if (params.residual_out && params.norm_out && not params.quant_out) {
-    MOE_DISPATCH0(2, true, true, false);
-    MOE_DISPATCH0(4, true, true, false);
-    MOE_DISPATCH0(8, true, true, false);
-    MOE_DISPATCH0(16, true, true, false);
-  } else if (params.residual_out && params.norm_out && params.quant_out) {
-    // for test
-    MOE_DISPATCH0(2, true, true, true);
-    MOE_DISPATCH0(4, true, true, true);
-    MOE_DISPATCH0(8, true, true, true);
-    MOE_DISPATCH0(16, true, true, true);
-  }
-  // TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");
-  TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
+    TORCH_CHECK(params.residual_in && params.rms_gamma, "params.residual_in && params.rms_gamma");
+    TORCH_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input &&
+                    params.moe_reduction_token_input,
+                "params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input "
+                "&& params.moe_reduction_token_input");
+    TORCH_CHECK(params.size % params.hidden_dim == 0, "params.size % params.hidden_dim == 0");
+    TORCH_CHECK(params.hidden_dim % kElemsPerAccess == 0, "params.hidden_dim % kElemsPerAccess == 0");
+
+    if (params.residual_out && !params.norm_out && params.quant_out) {
+        // pattern1: AR+Add_RMS+Quant
+        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
+        // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
+        MOE_DISPATCH0(2, true, false, true);
+        MOE_DISPATCH0(4, true, false, true);
+        MOE_DISPATCH0(8, true, false, true);
+        MOE_DISPATCH0(16, true, false, true);
+    } else if (!params.residual_out && params.norm_out && !params.quant_out) {
+        // pattern2: AR+AddRMS
+        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
+        // [m, 7168] bf16 norm_out
+        MOE_DISPATCH0(2, false, true, false);
+        MOE_DISPATCH0(4, false, true, false);
+        MOE_DISPATCH0(8, false, true, false);
+        MOE_DISPATCH0(16, false, true, false);
+    } else if (params.residual_out && params.norm_out && !params.quant_out) {
+        MOE_DISPATCH0(2, true, true, false);
+        MOE_DISPATCH0(4, true, true, false);
+        MOE_DISPATCH0(8, true, true, false);
+        MOE_DISPATCH0(16, true, true, false);
+    } else if (params.residual_out && params.norm_out && params.quant_out) {
+        // for test
+        MOE_DISPATCH0(2, true, true, true);
+        MOE_DISPATCH0(4, true, true, true);
+        MOE_DISPATCH0(8, true, true, true);
+        MOE_DISPATCH0(16, true, true, true);
+    }
+
+    TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
+
+    #undef MOE_DISPATCH0
+    #undef MOE_DISPATCH1
 }
 
 };  // namespace tensorrt_llm::kernels::ar_fusion::moe

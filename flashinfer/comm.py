@@ -17,6 +17,7 @@ limitations under the License.
 import ctypes
 import functools
 from dataclasses import dataclass
+from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,7 +26,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .jit import JitSpec
-from .jit import env as jit_env
+from .jit import env as jit_env, sm100a_nvcc_flags
 from .jit import gen_jit_spec
 from .utils import register_custom_op
 
@@ -47,6 +48,74 @@ class Function:
     name: str
     restype: Any
     argtypes: List[Any]
+
+
+class DataType(IntEnum):
+    BOOL = 0
+    UINT8 = 1
+    INT8 = 2
+    INT32 = 3
+    INT64 = 4
+    BF16 = 5
+    FP8 = 6
+    FP16 = 7
+    FP32 = 8
+    UNKNOWN = 9
+
+
+class AllReduceFusionPattern(IntEnum):
+    ALL_REDUCE = 0
+    AR_RESIDUAL_RMS_NORM = 1
+    AR_RESIDUAL_RMS_NORM_FP8_QUANT = 2
+    AR_RESIDUAL_RMS_NORM_FP4_QUANT = 3
+    AR_RESIDUAL_RMS_NORM_OUT_FP8_QUANT = 4
+    AR_RESIDUAL_RMS_NORM_OUT_FP4_QUANT = 5
+
+
+class FP4QuantizationSFLayout(IntEnum):
+    SWIZZLED = 0
+    LINEAR = 1
+
+
+@dataclass
+class AllReduceFusionParams:
+    nranks: int
+    rank: int
+    dtype: DataType
+    size: int
+    hidden_dim: int
+    workspace: torch.Tensor  # void**
+    allreduce_in: torch.Tensor  # void*
+    residual_in: Optional[torch.Tensor] = None  # void*
+    allreduce_out: Optional[torch.Tensor] = None  # void*
+    residual_out: Optional[torch.Tensor] = None  # void*
+    norm_out: Optional[torch.Tensor] = None  # void*
+    quant_out: Optional[torch.Tensor] = None  # void*
+    scale_out: Optional[torch.Tensor] = None  # void*
+    rms_gamma: Optional[torch.Tensor] = None  # void*
+    rms_eps: float = 1e-6
+    scale_factor: Optional[torch.Tensor] = None  # float*
+    use_oneshot: bool = True  # non-moe reduction only
+    layout: FP4QuantizationSFLayout = FP4QuantizationSFLayout.SWIZZLED
+    stream: Optional[torch.cuda.Stream] = None
+    pattern: AllReduceFusionPattern = AllReduceFusionPattern.ALL_REDUCE
+
+    def __post_init__(self):
+        if self.stream is None:
+            self.stream = torch.cuda.current_stream()
+
+
+@dataclass
+class MoeReductionAllReduceFusionParams(AllReduceFusionParams):
+    """Parameters for MoE reduction + all-reduce fusion operation.
+
+    This extends AllReduceFusionParams with MoE-specific parameters.
+    """
+
+    moe_reduction_device_num_experts: Optional[torch.Tensor] = None  # int*
+    moe_reduction_scale_input: Optional[torch.Tensor] = None  # float*
+    moe_reduction_active_experts_token_input: Optional[torch.Tensor] = None  # void*
+    moe_reduction_token_input: Optional[torch.Tensor] = None  # void*
 
 
 def find_loaded_library(lib_name) -> Optional[str]:
@@ -207,7 +276,10 @@ def gen_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/allReduceFusionKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/moeAllReduceFusionKernels.cu",
         ],
+        extra_cuda_cflags=sm100a_nvcc_flags,
     )
 
 
@@ -266,6 +338,124 @@ def get_comm_module():
     ) -> None:
         module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
+    @register_custom_op(
+        "flashinfer::allreduce_fusion_op",
+        mutates_args=["params"],
+    )
+    def trtllm_allreduce_fusion_op(params: AllReduceFusionParams) -> None:
+        """Performs an all-reduce operation with optional fusion patterns.
+
+        Args:
+            params: AllReduceFusionParams object for the all-reduce operation.
+        """
+        # Convert Python params to C++ struct format
+        tensors = {
+            "workspace": params.workspace,
+            "allreduce_in": params.allreduce_in,
+            "residual_in": params.residual_in,
+            "allreduce_out": params.allreduce_out,
+            "residual_out": params.residual_out,
+            "norm_out": params.norm_out,
+            "quant_out": params.quant_out,
+            "scale_out": params.scale_out,
+            "rms_gamma": params.rms_gamma,
+            "scale_factor": params.scale_factor,
+        }
+
+        # Filter out None tensors and get their data pointers
+        tensor_ptrs = {
+            k: (v.data_ptr() if v is not None else 0) for k, v in tensors.items()
+        }
+
+        return module.allreduce_fusion_op(
+            params.nranks,
+            params.rank,
+            int(params.dtype),
+            params.size,
+            params.hidden_dim,
+            tensor_ptrs["workspace"],
+            tensor_ptrs["allreduce_in"],
+            tensor_ptrs["residual_in"],
+            tensor_ptrs["allreduce_out"],
+            tensor_ptrs["residual_out"],
+            tensor_ptrs["norm_out"],
+            tensor_ptrs["quant_out"],
+            tensor_ptrs["scale_out"],
+            tensor_ptrs["rms_gamma"],
+            params.rms_eps,
+            tensor_ptrs["scale_factor"],
+            params.use_oneshot,
+            int(params.layout),
+            (
+                params.stream.cuda_stream
+                if params.stream
+                else torch.cuda.current_stream().cuda_stream
+            ),
+            int(params.pattern),
+        )
+
+    @register_custom_op(
+        "flashinfer::moereduction_allreduce_fusion_op",
+        mutates_args=["params"],
+    )
+    def trtllm_moereduction_allreduce_fusion_op(
+        params: MoeReductionAllReduceFusionParams,
+    ) -> None:
+        """Performs a MoE reduction + all-reduce operation with optional fusion patterns.
+
+        Args:
+            params: MoeReductionAllReduceFusionParams object for the MoE reduction + all-reduce operation.
+        """
+        # Convert Python params to C++ struct format
+        tensors = {
+            "workspace": params.workspace,
+            "allreduce_in": params.allreduce_in,
+            "residual_in": params.residual_in,
+            "residual_out": params.residual_out,
+            "norm_out": params.norm_out,
+            "quant_out": params.quant_out,
+            "scale_out": params.scale_out,
+            "rms_gamma": params.rms_gamma,
+            "scale_factor": params.scale_factor,
+            "moe_reduction_device_num_experts": params.moe_reduction_device_num_experts,
+            "moe_reduction_scale_input": params.moe_reduction_scale_input,
+            "moe_reduction_active_experts_token_input": params.moe_reduction_active_experts_token_input,
+            "moe_reduction_token_input": params.moe_reduction_token_input,
+        }
+
+        # Filter out None tensors and get their data pointers
+        tensor_ptrs = {
+            k: (v.data_ptr() if v is not None else 0) for k, v in tensors.items()
+        }
+
+        return module.moereduction_allreduce_fusion_op(
+            params.nranks,
+            params.rank,
+            int(params.dtype),
+            params.size,
+            params.hidden_dim,
+            tensor_ptrs["workspace"],
+            tensor_ptrs["allreduce_in"],
+            tensor_ptrs["residual_in"],
+            tensor_ptrs["residual_out"],
+            tensor_ptrs["norm_out"],
+            tensor_ptrs["quant_out"],
+            tensor_ptrs["scale_out"],
+            tensor_ptrs["rms_gamma"],
+            params.rms_eps,
+            tensor_ptrs["scale_factor"],
+            int(params.layout),
+            (
+                params.stream.cuda_stream
+                if params.stream
+                else torch.cuda.current_stream().cuda_stream
+            ),
+            tensor_ptrs["moe_reduction_device_num_experts"],
+            tensor_ptrs["moe_reduction_scale_input"],
+            tensor_ptrs["moe_reduction_active_experts_token_input"],
+            tensor_ptrs["moe_reduction_token_input"],
+        )
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -274,6 +464,8 @@ def get_comm_module():
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
         all_reduce=all_reduce,
+        trtllm_allreduce_fusion_op=trtllm_allreduce_fusion_op,
+        trtllm_moereduction_allreduce_fusion_op=trtllm_moereduction_allreduce_fusion_op,
     )
 
 
@@ -309,6 +501,16 @@ def all_reduce(
     get_comm_module().all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
+
+
+def trtllm_allreduce_fusion_op(params: AllReduceFusionParams) -> None:
+    get_comm_module().trtllm_allreduce_fusion_op(params)
+
+
+def trtllm_moereduction_allreduce_fusion_op(
+    params: MoeReductionAllReduceFusionParams,
+) -> None:
+    get_comm_module().trtllm_moereduction_allreduce_fusion_op(params)
 
 
 def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:

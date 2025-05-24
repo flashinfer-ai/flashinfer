@@ -3,13 +3,13 @@
 
 #include <cooperative_groups.h>
 
-#include "flashinfer/distributed/allReduceFusionKernels.cuh"
+#include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "pytorch_extension_utils.h"
 
 // #include "tensorrt_llm/common/envUtils.h" // use trtllm_enable_pdl local var instead
 // #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "flashinfer/distributed/trtllm/kernels/quantization.cuh" // to delete redundant dependencies
-#include "flashinfer/distributed/trtllm/kernels/quantization.h" // to delete redundant dependencies
+#include "flashinfer/comm/trtllm/kernels/quantization.cuh"  // to delete redundant dependencies
+#include "flashinfer/comm/trtllm/kernels/quantization.h"    // to delete redundant dependencies
 
 static bool trtllm_enable_pdl = true;  // temp env var for easier compilation
 
@@ -664,4 +664,5 @@ void allreduce_fusion_op(AllReduceFusionParams const& params) {
   DISPATCH_RANKS(16);
   TORCH_CHECK(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
+
 };  // namespace tensorrt_llm::kernels::ar_fusion
