@@ -1,6 +1,6 @@
 // flashinfer: adapted from sglang + vllm code
 // refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cu
-#include "flashinfer/distributed/custom_all_reduce.cuh"
+#include "flashinfer/comm/custom_all_reduce.cuh"
 #include "pytorch_extension_utils.h"
 
 // Fake pointer type, must match fptr_t type in ops.h.

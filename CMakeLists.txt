@@ -49,9 +49,6 @@ flashinfer_option(
 flashinfer_option(
   FLASHINFER_NORM
   "Whether to compile normalization kernel tests/benchmarks or not." OFF)
-flashinfer_option(
-  FLASHINFER_DISTRIBUTED
-  "Whether to compile distributed kernel tests/benchmarks or not." OFF)
 flashinfer_option(FLASHINFER_FASTDIV_TEST
                   "Whether to compile fastdiv kernel tests or not." OFF)
 flashinfer_option(FLASHINFER_FASTDEQAUNT_TEST
@@ -83,11 +80,7 @@ if(FLASHINFER_PREFILL
    OR FLASHINFER_NORM)
   message(STATUS "NVBench and GoogleTest enabled")
   add_subdirectory(3rdparty/nvbench)
-  if(FLASHINFER_DISTRIBUTED)
-    add_subdirectory(3rdparty/mscclpp)
-  else(FLASHINFER_DISTRIBUTED)
-    add_subdirectory(3rdparty/googletest)
-  endif(FLASHINFER_DISTRIBUTED)
+  add_subdirectory(3rdparty/googletest)
 endif(
   FLASHINFER_PREFILL
   OR FLASHINFER_DECODE
@@ -457,29 +450,3 @@ if(FLASHINFER_FASTDEQUANT_TEST)
     test_fast_dequant PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_fast_dequant PRIVATE gtest gtest_main)
 endif(FLASHINFER_FASTDEQUANT_TEST)
-
-if(FLASHINFER_DISTRIBUTED)
-  find_package(MPI REQUIRED)
-
-  message(STATUS "Compile sum all-reduce kernel tests.")
-  file(GLOB_RECURSE TEST_DIST_SUM_ALL_REDUCE_SRCS
-       ${PROJECT_SOURCE_DIR}/src/test_sum_all_reduce.cu)
-  add_executable(test_sum_all_reduce ${TEST_DIST_SUM_ALL_REDUCE_SRCS})
-  target_include_directories(
-    test_sum_all_reduce
-    PRIVATE ${FLASHINFER_INCLUDE_DIR} 3rdparty/mscclpp/include
-            3rdparty/spdlog/include)
-  target_link_libraries(test_sum_all_reduce PRIVATE MPI::MPI_CXX mscclpp)
-  target_compile_definitions(test_sum_all_reduce PRIVATE -DENABLE_MPI)
-
-  message(STATUS "Compile attention allreduce kernel tests.")
-  file(GLOB_RECURSE TEST_DIST_ATTN_ALL_REDUCE_SRCS
-       ${PROJECT_SOURCE_DIR}/src/test_attn_all_reduce.cu)
-  add_executable(test_attn_all_reduce ${TEST_DIST_ATTN_ALL_REDUCE_SRCS})
-  target_include_directories(
-    test_attn_all_reduce
-    PRIVATE ${FLASHINFER_INCLUDE_DIR} 3rdparty/mscclpp/include
-            3rdparty/spdlog/include)
-  target_link_libraries(test_attn_all_reduce PRIVATE MPI::MPI_CXX mscclpp)
-  target_compile_definitions(test_attn_all_reduce PRIVATE -DENABLE_MPI)
-endif(FLASHINFER_DISTRIBUTED)
