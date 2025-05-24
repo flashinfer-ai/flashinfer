@@ -64,7 +64,9 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
             for num_cta in num_ctas:
                 for dtype in dtypes:
                     for _ in range(test_loop):
-                        inp1 = torch.randint(1, 16, (test_size,), dtype=dtype, device=device)
+                        inp1 = torch.randint(
+                            1, 16, (test_size,), dtype=dtype, device=device
+                        )
                         inp1_ref = inp1.clone()
                         out1 = torch.empty_like(inp1)
 
@@ -127,7 +129,9 @@ def multi_process_parallel(
 def test_vllm_custom_allreduce(world_size):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(f"world_size {world_size} is greater than available_gpus {available_gpus}")
+        raise ValueError(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
     print(f"Running test for world_size={world_size}")
     multi_process_parallel(
         world_size,
