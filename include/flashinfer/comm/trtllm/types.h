@@ -4,6 +4,8 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <cstdint>
+
 enum class DataType { kBOOL, kUINT8, kINT8, kINT32, kINT64, kBF16, kFP8, kFP16, kFP32, kUNKNOWN };
 
 //! \brief For converting a C++ data type to a `DataType`.
@@ -21,17 +23,17 @@ struct TypeTraits<half> {
 };
 
 template <>
-struct TypeTraits<std::int8_t> {
+struct TypeTraits<int8_t> {
   static constexpr auto value = DataType::kINT8;
 };
 
 template <>
-struct TypeTraits<std::int32_t> {
+struct TypeTraits<int32_t> {
   static constexpr auto value = DataType::kINT32;
 };
 
 template <>
-struct TypeTraits<std::int64_t> {
+struct TypeTraits<int64_t> {
   static constexpr auto value = DataType::kINT64;
 };
 
@@ -41,7 +43,7 @@ struct TypeTraits<bool> {
 };
 
 template <>
-struct TypeTraits<std::uint8_t> {
+struct TypeTraits<uint8_t> {
   static constexpr auto value = DataType::kUINT8;
 };
 
@@ -60,5 +62,3 @@ struct TypeTraits<T*> {
   // Pointers are stored as int64_t.
   static constexpr auto value = DataType::kINT64;
 };
-
-

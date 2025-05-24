@@ -16,128 +16,94 @@
 
 #pragma once
 
-#include "flashinfer/distributed/trtllm/common/assert.h"
-#include "flashinfer/distributed/trtllm/common/cudaUtils.h"
-#include "flashinfer/distributed/trtllm/common/logger.h"
-#include "flashinfer/distributed/trtllm/runtime/cudaEvent.h"
-
 #include <cuda_runtime_api.h>
 
 #include <memory>
 
-namespace tensorrt_llm::runtime
-{
+#include "flashinfer/comm/trtllm/common/assert.h"
+#include "flashinfer/comm/trtllm/common/cudaUtils.h"
+#include "flashinfer/comm/trtllm/common/logger.h"
+#include "flashinfer/comm/trtllm/runtime/cudaEvent.h"
 
-class CudaStream
-{
-public:
-    //! Creates a new cuda stream on the current device. The stream will be destroyed in the destructor.
-    //!
-    //! \param flags Flags for stream creation. See ::cudaStreamCreateWithFlags for a list of valid flags that can be
-    //! passed.
-    //! \param priority Priority of the stream. Lower numbers represent higher priorities. See
-    //! ::cudaDeviceGetStreamPriorityRange for more information about the meaningful stream priorities that can be
-    //! passed.
-    explicit CudaStream(unsigned int flags = cudaStreamNonBlocking, int priority = 0)
-        : mDevice{tensorrt_llm::common::getDevice()}
-    {
-        cudaStream_t stream;
-        TLLM_CUDA_CHECK(::cudaStreamCreateWithPriority(&stream, flags, priority));
-        TLLM_LOG_TRACE("Created stream %p", stream);
-        bool constexpr ownsStream{true};
-        mStream = StreamPtr{stream, Deleter{ownsStream}};
+namespace tensorrt_llm::runtime {
+
+class CudaStream {
+ public:
+  //! Creates a new cuda stream on the current device. The stream will be destroyed in the
+  //! destructor.
+  //!
+  //! \param flags Flags for stream creation. See ::cudaStreamCreateWithFlags for a list of valid
+  //! flags that can be passed.
+  //! \param priority Priority of the stream. Lower numbers represent higher priorities. See
+  //! ::cudaDeviceGetStreamPriorityRange for more information about the meaningful stream priorities
+  //! that can be passed.
+  explicit CudaStream(unsigned int flags = cudaStreamNonBlocking, int priority = 0)
+      : mDevice{tensorrt_llm::common::getDevice()} {
+    cudaStream_t stream;
+    TLLM_CUDA_CHECK(::cudaStreamCreateWithPriority(&stream, flags, priority));
+    TLLM_LOG_TRACE("Created stream %p", stream);
+    bool constexpr ownsStream{true};
+    mStream = StreamPtr{stream, Deleter{ownsStream}};
+  }
+
+  //! Pass an existing cuda stream to this object.
+  //!
+  //! \param stream The stream to pass to this object.
+  //! \param device The device on which the stream was created.
+  //! \param ownsStream Whether this object owns the stream and destroys it in the destructor.
+  explicit CudaStream(cudaStream_t stream, int device, bool ownsStream = true) : mDevice{device} {
+    mStream = StreamPtr{stream, Deleter{ownsStream}};
+  }
+
+  //! Construct with an existing cuda stream or the default stream by passing nullptr.
+  explicit CudaStream(cudaStream_t stream)
+      : CudaStream{stream, tensorrt_llm::common::getDevice(), false} {}
+
+  //! Returns the device on which the stream was created.
+  [[nodiscard]] int getDevice() const { return mDevice; }
+
+  //! Returns the stream associated with this object.
+  [[nodiscard]] cudaStream_t get() const { return mStream.get(); }
+
+  //! \brief Synchronizes the stream.
+  void synchronize() const { TLLM_CUDA_CHECK(::cudaStreamSynchronize(get())); }
+
+  //! \brief Record an event on the stream.
+  void record(CudaEvent::pointer event) const { TLLM_CUDA_CHECK(::cudaEventRecord(event, get())); }
+
+  //! \brief Record an event on the stream.
+  void record(CudaEvent const& event) const { record(event.get()); }
+
+  //! \brief Wait for an event.
+  void wait(CudaEvent::pointer event) const {
+    TLLM_CUDA_CHECK(::cudaStreamWaitEvent(get(), event));
+  }
+
+  //! \brief Wait for an event.
+  void wait(CudaEvent const& event) const { wait(event.get()); }
+
+ private:
+  class Deleter {
+   public:
+    explicit Deleter(bool ownsStream) : mOwnsStream{ownsStream} {}
+
+    explicit Deleter() : Deleter{true} {}
+
+    constexpr void operator()(cudaStream_t stream) const {
+      if (mOwnsStream && stream != nullptr) {
+        TLLM_CUDA_CHECK(::cudaStreamDestroy(stream));
+        TLLM_LOG_TRACE("Destroyed stream %p", stream);
+      }
     }
 
-    //! Pass an existing cuda stream to this object.
-    //!
-    //! \param stream The stream to pass to this object.
-    //! \param device The device on which the stream was created.
-    //! \param ownsStream Whether this object owns the stream and destroys it in the destructor.
-    explicit CudaStream(cudaStream_t stream, int device, bool ownsStream = true)
-        : mDevice{device}
-    {
-        mStream = StreamPtr{stream, Deleter{ownsStream}};
-    }
+   private:
+    bool mOwnsStream;
+  };
 
-    //! Construct with an existing cuda stream or the default stream by passing nullptr.
-    explicit CudaStream(cudaStream_t stream)
-        : CudaStream{stream, tensorrt_llm::common::getDevice(), false}
-    {
-    }
+  using StreamPtr = std::unique_ptr<std::remove_pointer_t<cudaStream_t>, Deleter>;
 
-    //! Returns the device on which the stream was created.
-    [[nodiscard]] int getDevice() const
-    {
-        return mDevice;
-    }
-
-    //! Returns the stream associated with this object.
-    [[nodiscard]] cudaStream_t get() const
-    {
-        return mStream.get();
-    }
-
-    //! \brief Synchronizes the stream.
-    void synchronize() const
-    {
-        TLLM_CUDA_CHECK(::cudaStreamSynchronize(get()));
-    }
-
-    //! \brief Record an event on the stream.
-    void record(CudaEvent::pointer event) const
-    {
-        TLLM_CUDA_CHECK(::cudaEventRecord(event, get()));
-    }
-
-    //! \brief Record an event on the stream.
-    void record(CudaEvent const& event) const
-    {
-        record(event.get());
-    }
-
-    //! \brief Wait for an event.
-    void wait(CudaEvent::pointer event) const
-    {
-        TLLM_CUDA_CHECK(::cudaStreamWaitEvent(get(), event));
-    }
-
-    //! \brief Wait for an event.
-    void wait(CudaEvent const& event) const
-    {
-        wait(event.get());
-    }
-
-private:
-    class Deleter
-    {
-    public:
-        explicit Deleter(bool ownsStream)
-            : mOwnsStream{ownsStream}
-        {
-        }
-
-        explicit Deleter()
-            : Deleter{true}
-        {
-        }
-
-        constexpr void operator()(cudaStream_t stream) const
-        {
-            if (mOwnsStream && stream != nullptr)
-            {
-                TLLM_CUDA_CHECK(::cudaStreamDestroy(stream));
-                TLLM_LOG_TRACE("Destroyed stream %p", stream);
-            }
-        }
-
-    private:
-        bool mOwnsStream;
-    };
-
-    using StreamPtr = std::unique_ptr<std::remove_pointer_t<cudaStream_t>, Deleter>;
-
-    StreamPtr mStream;
-    int mDevice{-1};
+  StreamPtr mStream;
+  int mDevice{-1};
 };
 
-} // namespace tensorrt_llm::runtime
+}  // namespace tensorrt_llm::runtime

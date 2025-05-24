@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cpplint include/flashinfer/* include/flashinfer/attention/* include/flashinfer/distributed/* include/flashinfer/group_gemm/*
+cpplint include/flashinfer/* include/flashinfer/attention/* include/flashinfer/comm/* include/flashinfer/group_gemm/*

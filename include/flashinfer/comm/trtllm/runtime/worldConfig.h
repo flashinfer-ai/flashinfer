@@ -16,168 +16,131 @@
 
 #pragma once
 
-#include "flashinfer/distributed/trtllm/runtime/common.h"
+#include "flashinfer/comm/trtllm/runtime/common.h"
 
 // #include <NvInferRuntime.h>
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::runtime
-{
-class WorldConfig
-{
-public:
+namespace tensorrt_llm::runtime {
+class WorldConfig {
+ public:
 #if ENABLE_MULTI_DEVICE
-    static SizeType32 constexpr kDefaultGpusPerNode = 8;
+  static SizeType32 constexpr kDefaultGpusPerNode = 8;
 #else
-    static SizeType32 constexpr kDefaultGpusPerNode = 1;
+  static SizeType32 constexpr kDefaultGpusPerNode = 1;
 #endif
 
-    explicit WorldConfig(SizeType32 tensorParallelism = 1, SizeType32 pipelineParallelism = 1,
-        SizeType32 contextParallelism = 1, SizeType32 rank = 0, SizeType32 gpusPerNode = kDefaultGpusPerNode,
-        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt, bool enableAttentionDP = false);
+  explicit WorldConfig(SizeType32 tensorParallelism = 1, SizeType32 pipelineParallelism = 1,
+                       SizeType32 contextParallelism = 1, SizeType32 rank = 0,
+                       SizeType32 gpusPerNode = kDefaultGpusPerNode,
+                       std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
+                       bool enableAttentionDP = false);
 
-    [[nodiscard]] SizeType32 constexpr getSize() const noexcept
-    {
-        return mTensorParallelism * mPipelineParallelism * mContextParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getSize() const noexcept {
+    return mTensorParallelism * mPipelineParallelism * mContextParallelism;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getTensorParallelism() const noexcept
-    {
-        return mTensorParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getTensorParallelism() const noexcept {
+    return mTensorParallelism;
+  }
 
-    [[nodiscard]] bool constexpr isTensorParallel() const noexcept
-    {
-        return mTensorParallelism > 1;
-    }
+  [[nodiscard]] bool constexpr isTensorParallel() const noexcept { return mTensorParallelism > 1; }
 
-    [[nodiscard]] SizeType32 constexpr getPipelineParallelism() const noexcept
-    {
-        return mPipelineParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getPipelineParallelism() const noexcept {
+    return mPipelineParallelism;
+  }
 
-    [[nodiscard]] bool constexpr isPipelineParallel() const noexcept
-    {
-        return mPipelineParallelism > 1;
-    }
+  [[nodiscard]] bool constexpr isPipelineParallel() const noexcept {
+    return mPipelineParallelism > 1;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getContextParallelism() const noexcept
-    {
-        return mContextParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getContextParallelism() const noexcept {
+    return mContextParallelism;
+  }
 
-    [[nodiscard]] bool constexpr isContextParallel() const noexcept
-    {
-        return mContextParallelism > 1;
-    }
+  [[nodiscard]] bool constexpr isContextParallel() const noexcept {
+    return mContextParallelism > 1;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getRank() const noexcept
-    {
-        return mRank;
-    }
+  [[nodiscard]] SizeType32 constexpr getRank() const noexcept { return mRank; }
 
-    [[nodiscard]] SizeType32 constexpr getGpusPerNode() const noexcept
-    {
-        return mGpusPerNode;
-    }
+  [[nodiscard]] SizeType32 constexpr getGpusPerNode() const noexcept { return mGpusPerNode; }
 
-    [[nodiscard]] SizeType32 getGpusPerGroup() const noexcept
-    {
-        return static_cast<SizeType32>(mDeviceIds.size());
-    }
+  [[nodiscard]] SizeType32 getGpusPerGroup() const noexcept {
+    return static_cast<SizeType32>(mDeviceIds.size());
+  }
 
-    [[nodiscard]] SizeType32 getDevice() const noexcept
-    {
-        return mDeviceIds[mRank % getGpusPerGroup()];
-    }
+  [[nodiscard]] SizeType32 getDevice() const noexcept {
+    return mDeviceIds[mRank % getGpusPerGroup()];
+  }
 
-    [[nodiscard]] SizeType32 getDeviceOf(SizeType32 rank) const noexcept
-    {
-        return mDeviceIds[rank % getGpusPerGroup()];
-    }
+  [[nodiscard]] SizeType32 getDeviceOf(SizeType32 rank) const noexcept {
+    return mDeviceIds[rank % getGpusPerGroup()];
+  }
 
-    [[nodiscard]] SizeType32 constexpr getPipelineParallelRank() const noexcept
-    {
-        return mRank / (mTensorParallelism * mContextParallelism);
-    }
+  [[nodiscard]] SizeType32 constexpr getPipelineParallelRank() const noexcept {
+    return mRank / (mTensorParallelism * mContextParallelism);
+  }
 
-    [[nodiscard]] SizeType32 constexpr getTensorParallelRank() const noexcept
-    {
-        return mRank % mTensorParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getTensorParallelRank() const noexcept {
+    return mRank % mTensorParallelism;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getContextParallelRank() const noexcept
-    {
-        return (mRank % (mTensorParallelism * mContextParallelism)) / mTensorParallelism;
-    }
+  [[nodiscard]] SizeType32 constexpr getContextParallelRank() const noexcept {
+    return (mRank % (mTensorParallelism * mContextParallelism)) / mTensorParallelism;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getLocalRank() const noexcept
-    {
-        return mRank % mGpusPerNode;
-    }
+  [[nodiscard]] SizeType32 constexpr getLocalRank() const noexcept { return mRank % mGpusPerNode; }
 
-    [[nodiscard]] SizeType32 constexpr getNodeRank() const noexcept
-    {
-        return mRank / mGpusPerNode;
-    }
+  [[nodiscard]] SizeType32 constexpr getNodeRank() const noexcept { return mRank / mGpusPerNode; }
 
-    [[nodiscard]] SizeType32 constexpr getNodeRankOf(SizeType32 rank) const noexcept
-    {
-        return rank / mGpusPerNode;
-    }
+  [[nodiscard]] SizeType32 constexpr getNodeRankOf(SizeType32 rank) const noexcept {
+    return rank / mGpusPerNode;
+  }
 
-    [[nodiscard]] bool constexpr isFirstPipelineParallelRank() const noexcept
-    {
-        return getPipelineParallelRank() == 0;
-    }
+  [[nodiscard]] bool constexpr isFirstPipelineParallelRank() const noexcept {
+    return getPipelineParallelRank() == 0;
+  }
 
-    //! \brief Is my rank the last rank in its pipeline?
-    [[nodiscard]] bool constexpr isLastPipelineParallelRank() const noexcept
-    {
-        return getPipelineParallelRank() == getPipelineParallelism() - 1;
-    }
+  //! \brief Is my rank the last rank in its pipeline?
+  [[nodiscard]] bool constexpr isLastPipelineParallelRank() const noexcept {
+    return getPipelineParallelRank() == getPipelineParallelism() - 1;
+  }
 
-    [[nodiscard]] bool constexpr isFirstTensorParallelRank() const noexcept
-    {
-        return getTensorParallelRank() == 0;
-    }
+  [[nodiscard]] bool constexpr isFirstTensorParallelRank() const noexcept {
+    return getTensorParallelRank() == 0;
+  }
 
-    [[nodiscard]] bool constexpr isFirstContextParallelRank() const noexcept
-    {
-        return getContextParallelRank() == 0;
-    }
+  [[nodiscard]] bool constexpr isFirstContextParallelRank() const noexcept {
+    return getContextParallelRank() == 0;
+  }
 
-    [[nodiscard]] SizeType32 constexpr getLastRank() const noexcept
-    {
-        return getSize() - 1;
-    }
+  [[nodiscard]] SizeType32 constexpr getLastRank() const noexcept { return getSize() - 1; }
 
-    [[nodiscard]] bool constexpr enableAttentionDP() const noexcept
-    {
-        return mEnableAttentionDP;
-    }
+  [[nodiscard]] bool constexpr enableAttentionDP() const noexcept { return mEnableAttentionDP; }
 
-    [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
-    [[nodiscard]] std::vector<SizeType32> getTensorParallelGroup() const;
-    [[nodiscard]] std::vector<SizeType32> getContextParallelGroup() const;
+  [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
+  [[nodiscard]] std::vector<SizeType32> getTensorParallelGroup() const;
+  [[nodiscard]] std::vector<SizeType32> getContextParallelGroup() const;
 
-    static WorldConfig mpi(SizeType32 gpusPerNode = kDefaultGpusPerNode,
-        std::optional<SizeType32> tensorParallelism = std::nullopt,
-        std::optional<SizeType32> pipelineParallelism = std::nullopt,
-        std::optional<SizeType32> contextParallelism = std::nullopt,
-        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt, bool enableAttentionDP = false);
+  static WorldConfig mpi(SizeType32 gpusPerNode = kDefaultGpusPerNode,
+                         std::optional<SizeType32> tensorParallelism = std::nullopt,
+                         std::optional<SizeType32> pipelineParallelism = std::nullopt,
+                         std::optional<SizeType32> contextParallelism = std::nullopt,
+                         std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
+                         bool enableAttentionDP = false);
 
-    [[nodiscard]] bool validMpiConfig() const;
+  [[nodiscard]] bool validMpiConfig() const;
 
-private:
-    SizeType32 mTensorParallelism;
-    SizeType32 mPipelineParallelism;
-    SizeType32 mContextParallelism;
-    SizeType32 mRank;
-    SizeType32 mGpusPerNode;
-    bool mEnableAttentionDP;
-    std::vector<SizeType32> mDeviceIds;
+ private:
+  SizeType32 mTensorParallelism;
+  SizeType32 mPipelineParallelism;
+  SizeType32 mContextParallelism;
+  SizeType32 mRank;
+  SizeType32 mGpusPerNode;
+  bool mEnableAttentionDP;
+  std::vector<SizeType32> mDeviceIds;
 };
 
-} // namespace tensorrt_llm::runtime
+}  // namespace tensorrt_llm::runtime

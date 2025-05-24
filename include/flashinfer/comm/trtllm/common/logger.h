@@ -21,8 +21,8 @@
 // #include <stdexcept>
 // #include <string>
 
-// #include "flashinfer/distributed/trtllm/common/assert.h"
-// #include "flashinfer/distributed/trtllm/common/stringUtils.h"
+// #include "flashinfer/comm/trtllm/common/assert.h"
+// #include "flashinfer/comm/trtllm/common/stringUtils.h"
 
 // namespace tensorrt_llm::common
 // {
@@ -60,10 +60,12 @@
 //     void log(Level level, int rank, char const* format, Args const&... args);
 // #else
 //     template <typename... Args>
-//     void log(Level level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
+//     void log(Level level, char const* format, Args const&... args) __attribute__((format(printf,
+//     3, 0)));
 
 //     template <typename... Args>
-//     void log(Level level, int rank, char const* format, Args const&... args) __attribute__((format(printf, 4, 0)));
+//     void log(Level level, int rank, char const* format, Args const&... args)
+//     __attribute__((format(printf, 4, 0)));
 // #endif
 
 //     template <typename... Args>
@@ -154,7 +156,8 @@
 // }
 
 // template <typename... Args>
-// void Logger::log(Logger::Level const level, int const rank, char const* format, Args const&... args)
+// void Logger::log(Logger::Level const level, int const rank, char const* format, Args const&...
+// args)
 // {
 //     if (isEnabled(level))
 //     {
@@ -187,5 +190,5 @@
 // #define TLLM_LOG_INFO(...) TLLM_LOG(tensorrt_llm::common::Logger::INFO, __VA_ARGS__)
 // #define TLLM_LOG_WARNING(...) TLLM_LOG(tensorrt_llm::common::Logger::WARNING, __VA_ARGS__)
 // #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
-// #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)
-// } // namespace tensorrt_llm::common
+// #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex,
+// ##__VA_ARGS__) } // namespace tensorrt_llm::common
