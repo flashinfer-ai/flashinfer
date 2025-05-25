@@ -43,7 +43,7 @@
 
 #if ENABLE_MULTI_DEVICE
 #endif  // ENABLE_MULTI_DEVICE
-// #include <nvml.h> // todo: might be used
+#include <nvml.h> // todo: might be used
  
 #include <cstddef>
 #include <cstdint>
