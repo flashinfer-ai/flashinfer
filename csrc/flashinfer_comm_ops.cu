@@ -43,8 +43,8 @@
 
 #if ENABLE_MULTI_DEVICE
 #endif  // ENABLE_MULTI_DEVICE
-#include <nvml.h>
-
+// #include <nvml.h> // todo: might be used
+ 
 #include <cstddef>
 #include <cstdint>
 #include <unordered_set>
@@ -52,7 +52,6 @@
 // using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
-using tensorrt_llm::mpi::MpiTag;
 
 namespace torch_ext {
 
@@ -60,12 +59,6 @@ namespace torch_ext {
 
 namespace {
 
-class NvmlManager {
- public:
-  NvmlManager() { NVML_CHECK(nvmlInit()); }
-
-  ~NvmlManager() { NVML_CHECK(nvmlShutdown()); }
-};
 
 std::set<int> getLocalGroup(std::set<int> const& group) {
   auto const myRank = COMM_SESSION.getRank();
@@ -84,32 +77,32 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
       int rank;
       ranks.push_back(myRank);
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
-        LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
+        LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
         ranks.push_back(rank);
       }
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
         LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it,
-                                MpiTag::kDefault);
+                                0);
       }
 
       localRanks.clear();
       localRanks.push_back(myLocalRank);
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
-        LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
+        LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
         localRanks.push_back(rank);
       }
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
         LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                                *it, MpiTag::kDefault);
+                                *it, 0);
       }
     } else {
-      LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), MpiTag::kDefault);
+      LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                              *group.begin(), MpiTag::kDefault);
+                              *group.begin(), 0);
 
-      LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), MpiTag::kDefault);
+      LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                              *group.begin(), MpiTag::kDefault);
+                              *group.begin(), 0);
     }
   }
 
@@ -433,7 +426,6 @@ class AllreduceOp {
     }
     // TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
-    NvmlManager nvml_manager;
     std::unordered_set<int> visited_device;
     mIsP2PSupported = true;
     mIsNVLINKSupported = true;
@@ -515,36 +507,6 @@ class AllreduceOp {
       }
       visited_device.insert(first_device_id);
     }
-  }
-
-  bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size,
-                        bool is_auto) noexcept {
-    // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
-    if (message_size_bytes > max_workspace_size) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING(
-            "Since messageSize is greater than maxWorkspaceSize, fallback to AllReduceStrategy: "
-            "NCCL");
-      }
-      return true;
-    }
-
-    // If Peer to Peer is not supported, fallback to NCCL.
-    if (!mIsP2PSupported) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
-      }
-      return true;
-    }
-
-    // If NVLINK is not supported, fallback to NCCL.
-    if (!mIsNVLINKSupported) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING("Since NVLINK not supported, fallback to AllReduceStrategy: NCCL");
-      }
-      return true;
-    }
-    return false;
   }
 
  private:

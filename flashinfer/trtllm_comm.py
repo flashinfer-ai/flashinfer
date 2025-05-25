@@ -25,12 +25,6 @@ from flashinfer.comm import allreduce, moe_allreduce
 '''
 Some functions used for trtllm allreduce params
 '''
-net = None
-
-# todo(yingyi): Network dependency????
-# def default_net() -> Network:
-#     assert net, "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
-#     return net
 
 class AllReduceStrategy(IntEnum):
     NCCL = 0
@@ -351,10 +345,6 @@ class AllReduceParams():
     def has_scale(self):
         return 1 if self.scale is not None else 0
 
-    # def update_strategy(self):
-    #     if self.strategy == AllReduceStrategy.AUTO and default_net(
-    #     ).plugin_config.user_buffer:
-    #         self.strategy = AllReduceStrategy.UB
 
 # layer might be removed later
 _thread_local = threading.local()
@@ -424,9 +414,7 @@ class AllReduce(nn.module):
         self.strategy = strategy
 
         if self.mapping.tp_size > 1:
-            # When Strategy is UB, it is guaranteed that the workspace is not used.
-            if self.strategy != AllReduceStrategy.UB:
-                self.workspace = get_allreduce_workspace(self.mapping)
+            self.workspace = get_allreduce_workspace(self.mapping)
 
     def forward(
         self,
