@@ -17,7 +17,7 @@
 #include <numeric>
 #include <unordered_set>
 
-#include "flashinfer/comm/trtllm/runtime/utils/mpiUtils.h"
+#include "flashinfer/comm/trtllm/runtime/mpiUtils.h"
 
 // #include "flashinfer/comm/trtllm/common/assert.h"
 // #include "flashinfer/comm/trtllm/common/logger.h"
@@ -29,9 +29,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
-#ifndef _WIN32
 #include <unistd.h>
-#endif
 
 // We rely on SizeType32 being int32_t in some places with weak type checking,
 // i.e. we're passing void ptr to some function. To prevent mysterious errors
