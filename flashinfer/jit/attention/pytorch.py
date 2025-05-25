@@ -243,10 +243,10 @@ def gen_batch_decode_mla_module(
         and dtype_kv == torch.float16
         and dtype_o == torch.float16
     ):
-        logger.info(f"Use tensor-core SM80 version of MLA decode kernel.")
+        logger.info("Use tensor-core SM80 version of MLA decode kernel.")
         arc = "sm80"
     else:
-        logger.info(f"Fall back to cuda-core version of MLA decode kernel.")
+        logger.info("Fall back to cuda-core version of MLA decode kernel.")
         arc = "cuda_core"
 
     uri = get_batch_decode_mla_uri(
@@ -424,7 +424,7 @@ def gen_single_decode_module(
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
-        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
@@ -473,7 +473,7 @@ def gen_single_prefill_module(
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+        variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
             additional_tensor_names = []
@@ -481,14 +481,14 @@ def gen_single_prefill_module(
             additional_scalar_names = ["logits_soft_cap", "sm_scale"]
             additional_scalar_dtypes = ["double", "double"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
             additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
             additional_tensor_dtypes = ["float", "float", "float"]
             additional_scalar_names = ["sm_scale"]
             additional_scalar_dtypes = ["double"]
-            variant_name = f"DefaultFP8Attention"
-            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+            variant_name = "DefaultFP8Attention"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_single_prefill_module(
         backend,
@@ -551,7 +551,7 @@ def gen_pod_module(
     additional_scalar_dtypes = ["float", "float", "float", "float"]
     variant_name_p = f"DefaultAttention<use_custom_mask_p, {str(use_sliding_window_p).lower()}, {str(use_logits_soft_cap_p).lower()}, {str(pos_encoding_mode_p == 2).lower()}>"
     variant_name_d = f"DefaultAttention<use_custom_mask_d, {str(use_sliding_window_d).lower()}, {str(use_logits_soft_cap_d).lower()}, {str(pos_encoding_mode_d == 2).lower()}>"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_pod_module(
         uri,
@@ -717,7 +717,7 @@ def gen_batch_decode_module(
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
-        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
@@ -799,14 +799,14 @@ def gen_batch_prefill_module(
             ]
             additional_scalar_dtypes = ["double", "double", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
             additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
             additional_tensor_dtypes = ["float", "float", "float"]
             additional_scalar_names = ["sm_scale"]
             additional_scalar_dtypes = ["double"]
-            variant_name = f"DefaultFP8Attention"
-            variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+            variant_name = "DefaultFP8Attention"
+            variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_batch_prefill_module(
         backend,
