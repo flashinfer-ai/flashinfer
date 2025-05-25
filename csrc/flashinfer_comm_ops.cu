@@ -32,13 +32,9 @@
 #include "pytorch_extension_utils.h"
 // #include "flashinfer/comm/trtllm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "flashinfer/comm/trtllm/kernels/quantization.h"
-// #include "flashinfer/comm/trtllm/kernels/userbuffers/ub_interface.h"
 // #include "flashinfer/comm/trtllm/runtime/torchUtils.h"
 #include "flashinfer/comm/trtllm/runtime/mpiUtils.h"
-// #include "flashinfer/comm/trtllm/thop/fp4Quantize.h"
 // #include "flashinfer/comm/trtllm/thop/fp8Op.h"
-// #include "flashinfer/comm/trtllm/thop/thUtils.h"
-// #include "flashinfer/comm/trtllm/thop/userbuffersTensor.h"
 
 #define ENABLE_MULTI_DEVICE 1
 
