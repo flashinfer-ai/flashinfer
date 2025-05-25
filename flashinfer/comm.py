@@ -16,17 +16,21 @@ limitations under the License.
 
 import ctypes
 import functools
+import threading
 from dataclasses import dataclass
+from enum import IntEnum
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from flashinfer.mapping import Mapping
+
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import register_custom_op
 
 # NOTE(Zihao): we should use cuda-python instead of ctypes cuda runtime bindings.
@@ -201,13 +205,57 @@ class CudaRTLibrary:
 cudart = CudaRTLibrary()
 
 
+def get_mpi_include_lib_path():
+    import pathlib
+    import shlex
+    import subprocess
+
+    cmd = ["mpicc", "-show"]
+    output = subprocess.check_output(cmd, text=True)
+    # Parse the output to extract include and library paths
+    parts = shlex.split(output)
+    include_dirs = []
+    lib_dirs = []
+
+    i = 0
+    while i < len(parts):
+        if parts[i] == "-I" and i + 1 < len(parts):
+            include_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-I"):
+            include_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        elif parts[i] == "-L" and i + 1 < len(parts):
+            lib_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-L"):
+            lib_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        else:
+            i += 1
+
+    # Return the first include directory found, or None if none found
+    include_dir = include_dirs[0] if include_dirs else None
+
+    return include_dir, lib_dirs
+
+
 def gen_comm_module() -> JitSpec:
+    mpi_include_path, mpi_lib_path = get_mpi_include_lib_path()
+    print(mpi_include_path, mpi_lib_path)
     return gen_jit_spec(
         "comm",
         [
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+            # jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/customAllReduceKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/allReduceFusionKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/moeAllReduceFusionKernels.cu",
         ],
+        extra_include_paths=[mpi_include_path],
+        extra_ldflags=[f"-L{mpi_lib_path}", "-lmpi"],
+        extra_cflags=["-DENABLE_MULTI_DEVICE"],
+        extra_cuda_cflags=sm100a_nvcc_flags + ["-DENABLE_MULTI_DEVICE"],
     )
 
 
@@ -253,18 +301,112 @@ def get_comm_module():
         return module.meta_size()
 
     @register_custom_op(
-        "flashinfer::all_reduce",
-        mutates_args=["out", "reg_buffer", "reg_buffer_sz_bytes"],
+        "flashinfer::allreduce",
+        mutates_args=[
+            "input",
+            "residual",
+            "norm_weight",
+            "scale",
+            "bias",
+            "workspace",
+            "group",
+        ],
     )
-    def all_reduce(
-        fa: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        reg_buffer: int,
-        reg_buffer_sz_bytes: int,
-        num_ctas: int,
-    ) -> None:
-        module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
+    def allreduce(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        strategy: int,
+        op: int,
+        eps: float,
+    ) -> List[torch.Tensor]:
+        """Performs an all-reduce operation with optional fusion patterns.
+
+        Args:
+            input: Input tensor to all-reduce
+            residual: Optional residual tensor for fusion
+            norm_weight: Optional normalization weights
+            scale: Optional scale factors for quantization
+            bias: Optional bias tensor
+            workspace: Optional workspace tensor
+            group: List of ranks in the process group
+            strategy: AllReduceStrategy type (0=NCCL, 1=MIN_LATENCY, etc)
+            op: AllReduceFusionOp type (0=NONE, 1=RESIDUAL_RMS_NORM, etc)
+            eps: Epsilon value for normalization
+
+        Returns:
+            List of output tensors depending on the fusion pattern
+        """
+        return module.allreduce(
+            input,
+            residual,
+            norm_weight,
+            scale,
+            bias,
+            workspace,
+            group,
+            strategy,
+            op,
+            eps,
+        )
+
+    @register_custom_op(
+        "flashinfer::moe_allreduce",
+        mutates_args=[
+            "residual",
+            "norm_weight",
+            "device_num_experts",
+            "scale_input",
+            "active_experts_token_input",
+            "token_input",
+            "workspace",
+        ],
+    )
+    def moe_allreduce(
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        device_num_experts: torch.Tensor,
+        scale_input: torch.Tensor,
+        active_experts_token_input: torch.Tensor,
+        token_input: torch.Tensor,
+        workspace: torch.Tensor,
+        rank: int,
+        nranks: int,
+        eps: float,
+    ) -> List[torch.Tensor]:
+        """Performs MoE reduction + all-reduce operation with fusion.
+
+        Args:
+            residual: Residual tensor [m, hidden_dim]
+            norm_weight: Normalization weights [hidden_dim]
+            device_num_experts: Number of experts per device [1]
+            scale_input: Scale factors [global_num_experts, m]
+            active_experts_token_input: Active expert tokens [device_num_experts, m, hidden_dim]
+            token_input: Input tokens [m, hidden_dim]
+            workspace: Workspace tensor
+            rank: Current process rank
+            nranks: Total number of ranks
+            eps: Epsilon for normalization
+
+        Returns:
+            List containing [norm_out, residual_out]
+        """
+        return module.moe_allreduce(
+            residual,
+            norm_weight,
+            device_num_experts,
+            scale_input,
+            active_experts_token_input,
+            token_input,
+            workspace,
+            rank,
+            nranks,
+            eps,
+        )
 
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
@@ -273,7 +415,9 @@ def get_comm_module():
         register_buffer=register_buffer,
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
-        all_reduce=all_reduce,
+        all_reduce=all_reduce,  # vllm
+        allreduce=allreduce,  # trtllm
+        moe_allreduce=moe_allreduce,  # trtllm
     )
 
 
@@ -379,3 +523,86 @@ def free_shared_buffer(
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)
+
+
+def allreduce(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    group: Optional[List[int]] = None,
+    strategy: int = 0,  # NCCL by default
+    op: int = 0,  # NONE by default
+    eps: float = 1e-6,
+) -> List[torch.Tensor]:
+    """Performs an all-reduce operation with optional fusion patterns. (from trtllm)
+
+    Args:
+        input: Input tensor to all-reduce
+        residual: Optional residual tensor for fusion
+        norm_weight: Optional normalization weights
+        scale: Optional scale factors for quantization
+        bias: Optional bias tensor
+        workspace: Optional workspace tensor
+        group: List of ranks in the process group (defaults to all ranks)
+        strategy: AllReduceStrategy type (0=NCCL, 1=MIN_LATENCY, etc)
+        op: AllReduceFusionOp type (0=NONE, 1=RESIDUAL_RMS_NORM, etc)
+        eps: Epsilon value for normalization
+
+    Returns:
+        List of output tensors depending on the fusion pattern
+    """
+    if group is None:
+        group = list(range(dist.get_world_size()))
+    return get_comm_module().allreduce(
+        input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps
+    )
+
+
+def moe_allreduce(
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    device_num_experts: torch.Tensor,
+    scale_input: torch.Tensor,
+    active_experts_token_input: torch.Tensor,
+    token_input: torch.Tensor,
+    workspace: torch.Tensor,
+    rank: Optional[int] = None,
+    nranks: Optional[int] = None,
+    eps: float = 1e-6,
+) -> List[torch.Tensor]:
+    """Performs MoE reduction + all-reduce operation with fusion. (from trtllm)
+
+    Args:
+        residual: Residual tensor [m, hidden_dim]
+        norm_weight: Normalization weights [hidden_dim]
+        device_num_experts: Number of experts per device [1]
+        scale_input: Scale factors [global_num_experts, m]
+        active_experts_token_input: Active expert tokens [device_num_experts, m, hidden_dim]
+        token_input: Input tokens [m, hidden_dim]
+        workspace: Workspace tensor
+        rank: Current process rank (defaults to current rank)
+        nranks: Total number of ranks (defaults to world size)
+        eps: Epsilon for normalization
+
+    Returns:
+        List containing [norm_out, residual_out]
+    """
+    if rank is None:
+        rank = dist.get_rank()
+    if nranks is None:
+        nranks = dist.get_world_size()
+    return get_comm_module().moe_allreduce(
+        residual,
+        norm_weight,
+        device_num_experts,
+        scale_input,
+        active_experts_token_input,
+        token_input,
+        workspace,
+        rank,
+        nranks,
+        eps,
+    )
