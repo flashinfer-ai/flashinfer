@@ -15,22 +15,22 @@ limitations under the License.
 """
 
 import ctypes
-import threading
 import functools
+import threading
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
-from typing import Optional, Tuple, Union
-from flashinfer.mapping import Mapping
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from flashinfer.mapping import Mapping
+
 from .jit import JitSpec
-from .jit import env as jit_env, sm100a_nvcc_flags
-from .jit import gen_jit_spec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import register_custom_op
 
 # NOTE(Zihao): we should use cuda-python instead of ctypes cuda runtime bindings.
@@ -205,7 +205,44 @@ class CudaRTLibrary:
 cudart = CudaRTLibrary()
 
 
+def get_mpi_include_lib_path():
+    import pathlib
+    import shlex
+    import subprocess
+
+    cmd = ["mpicc", "-show"]
+    output = subprocess.check_output(cmd, text=True)
+    # Parse the output to extract include and library paths
+    parts = shlex.split(output)
+    include_dirs = []
+    lib_dirs = []
+
+    i = 0
+    while i < len(parts):
+        if parts[i] == "-I" and i + 1 < len(parts):
+            include_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-I"):
+            include_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        elif parts[i] == "-L" and i + 1 < len(parts):
+            lib_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-L"):
+            lib_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        else:
+            i += 1
+
+    # Return the first include directory found, or None if none found
+    include_dir = include_dirs[0] if include_dirs else None
+
+    return include_dir, lib_dirs
+
+
 def gen_comm_module() -> JitSpec:
+    mpi_include_path, mpi_lib_path = get_mpi_include_lib_path()
+    print(mpi_include_path, mpi_lib_path)
     return gen_jit_spec(
         "comm",
         [
@@ -215,7 +252,10 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/allReduceFusionKernels.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/moeAllReduceFusionKernels.cu",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_include_paths=[mpi_include_path],
+        extra_ldflags=[f"-L{mpi_lib_path}", "-lmpi"],
+        extra_cflags=["-DENABLE_MULTI_DEVICE"],
+        extra_cuda_cflags=sm100a_nvcc_flags + ["-DENABLE_MULTI_DEVICE"],
     )
 
 
@@ -262,7 +302,15 @@ def get_comm_module():
 
     @register_custom_op(
         "flashinfer::allreduce",
-        mutates_args=["input", "residual", "norm_weight", "scale", "bias", "workspace", "group"],
+        mutates_args=[
+            "input",
+            "residual",
+            "norm_weight",
+            "scale",
+            "bias",
+            "workspace",
+            "group",
+        ],
     )
     def allreduce(
         input: torch.Tensor,
@@ -294,13 +342,29 @@ def get_comm_module():
             List of output tensors depending on the fusion pattern
         """
         return module.allreduce(
-            input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps
+            input,
+            residual,
+            norm_weight,
+            scale,
+            bias,
+            workspace,
+            group,
+            strategy,
+            op,
+            eps,
         )
 
     @register_custom_op(
         "flashinfer::moe_allreduce",
-        mutates_args=["residual", "norm_weight", "device_num_experts", "scale_input", 
-                     "active_experts_token_input", "token_input", "workspace"],
+        mutates_args=[
+            "residual",
+            "norm_weight",
+            "device_num_experts",
+            "scale_input",
+            "active_experts_token_input",
+            "token_input",
+            "workspace",
+        ],
     )
     def moe_allreduce(
         residual: torch.Tensor,
@@ -333,7 +397,7 @@ def get_comm_module():
         """
         return module.moe_allreduce(
             residual,
-            norm_weight, 
+            norm_weight,
             device_num_experts,
             scale_input,
             active_experts_token_input,
@@ -341,7 +405,7 @@ def get_comm_module():
             workspace,
             rank,
             nranks,
-            eps
+            eps,
         )
 
     return SimpleNamespace(
@@ -351,9 +415,9 @@ def get_comm_module():
         register_buffer=register_buffer,
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
-        all_reduce=all_reduce, # vllm
-        allreduce=allreduce, # trtllm
-        moe_allreduce=moe_allreduce, # trtllm
+        all_reduce=all_reduce,  # vllm
+        allreduce=allreduce,  # trtllm
+        moe_allreduce=moe_allreduce,  # trtllm
     )
 
 
@@ -389,7 +453,6 @@ def all_reduce(
     get_comm_module().all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
-
 
 
 def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:
@@ -541,5 +604,5 @@ def moe_allreduce(
         workspace,
         rank,
         nranks,
-        eps
+        eps,
     )

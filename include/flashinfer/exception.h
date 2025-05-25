@@ -36,11 +36,13 @@ class Error : public std::exception {
   virtual const char* what() const noexcept override { return message_.c_str(); }
 };
 
-#define FLASHINFER_ERROR(message) throw Error(__FUNCTION__, __FILE__, __LINE__, message)
+#define FLASHINFER_ERROR(message) throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, message)
 
-#define FLASHINFER_CHECK(condition, message) \
-  if (!(condition)) {                        \
-    FLASHINFER_ERROR(message);               \
+#define FLASHINFER_CHECK(condition, ...) \
+  if (!(condition)) {                    \
+    std::ostringstream oss;              \
+    oss << __VA_ARGS__;                  \
+    FLASHINFER_ERROR(oss.str());         \
   }
 
 }  // namespace flashinfer

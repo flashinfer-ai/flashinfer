@@ -16,12 +16,23 @@
 
 #pragma once
 
-#include <mpi.h>
-#include "pytorch_extension_utils.h"
+// #include "assert.h"
+// #include "stringUtils.h"
 
-#define TLLM_MPI_CHECK(cmd)                                                                                            \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        auto e = cmd;                                                                                                  \
-        TORCH_CHECK(e == MPI_SUCCESS, "Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e);                 \
-    } while (0)
+#include <mpi.h>
+#include <nccl.h>
+
+#include "../../../exception.h"
+
+#define TLLM_MPI_CHECK(cmd)                                                                    \
+  do {                                                                                         \
+    auto e = cmd;                                                                              \
+    FLASHINFER_CHECK(e == MPI_SUCCESS, "Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e); \
+  } while (0)
+
+#define TLLM_NCCL_CHECK(cmd)                                                                  \
+  do {                                                                                        \
+    ncclResult_t r = cmd;                                                                     \
+    FLASHINFER_CHECK(r == ncclSuccess, "Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, \
+                     ncclGetErrorString(r));                                                  \
+  } while (0)
