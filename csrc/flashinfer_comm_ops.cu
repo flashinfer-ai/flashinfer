@@ -26,7 +26,7 @@
 #include "flashinfer/comm/trtllm/common/customAllReduceUtils.h"
 #include "flashinfer/comm/trtllm/common/dataType.h"
 #include "pytorch_extension_utils.h"
-// #include "flashinfer/comm/trtllm/common/opUtils.h"
+#include "flashinfer/comm/trtllm/common/opUtils.h"
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
 #include "flashinfer/comm/customAllReduceKernels.cuh"
@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <unordered_set>
 
+using namespace tensorrt_llm::mpi::MpiTag;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 
@@ -144,7 +145,7 @@ class AllreduceOp {
 
   int initialize() noexcept {
     // TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-    mNcclComm = getComm(mGroup);
+    // mNcclComm = getComm(mGroup);
     if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB) {
       initGroupTopology();
     }
@@ -517,7 +518,7 @@ class AllreduceOp {
   AllReduceStrategyType mStrategy;
   AllReduceFusionOp mOp;
   float mEps;
-  std::shared_ptr<ncclComm_t> mNcclComm;
+  // std::shared_ptr<ncclComm_t> mNcclComm;
 };
 
 }  // namespace

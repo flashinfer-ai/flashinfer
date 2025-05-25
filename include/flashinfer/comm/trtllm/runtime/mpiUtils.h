@@ -35,7 +35,6 @@
 #include <thread>
 
 #include <mpi.h>
-#else
 // Dummy defines to avoid #if in wider places.
 typedef void* MPI_Datatype;
 typedef void* MPI_Comm;
@@ -225,7 +224,7 @@ public:
         // TODO: Don't ignore return status
         TLLM_MPI_CHECK(MPI_Wait(&mRequest, MPI_STATUS_IGNORE));
 #else
-        TLLM_THROW("Multi device support is disabled.");
+        TORCH_CHECK(false, "Multi device support is disabled.");
 #endif
     }
 
@@ -234,7 +233,7 @@ public:
 #if ENABLE_MULTI_DEVICE
         TLLM_MPI_CHECK(MPI_Cancel(&mRequest));
 #else
-        TLLM_THROW("Multi device support is disabled.");
+        TORCH_CHECK(false, "Multi device support is disabled.");
 #endif
     }
 
@@ -387,7 +386,7 @@ public:
             return recv(&value, sizeof(T), MpiType::kBYTE, source, tag);
         }
 #else
-        TLLM_THROW("Multi device support is disabled.");
+        TORCH_CHECK(false, "Multi device support is disabled.");
 #endif
     }
 
