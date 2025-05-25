@@ -134,7 +134,7 @@ class GitHubRepo:
         logging.info(f"Got response from {full_url}: {content}")
         try:
             response = json.loads(content)
-        except json.decoder.JSONDecodeError as e:
+        except json.decoder.JSONDecodeError:
             return content
 
         return response

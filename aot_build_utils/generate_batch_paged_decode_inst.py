@@ -71,7 +71,6 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_
 }}
     """.format(
         head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],

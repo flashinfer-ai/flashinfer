@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 from einops import einsum, rearrange
 
-import flashinfer
 from flashinfer.gemm import (
     gemm_fp8_nt_blockscaled,
     gemm_fp8_nt_groupwise,
