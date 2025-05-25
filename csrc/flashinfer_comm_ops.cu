@@ -50,7 +50,6 @@
 #include <cstdint>
 #include <unordered_set>
 
-// using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 
@@ -119,7 +118,7 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
 
 class AllreduceOp {
  public:
-  AllreduceOp(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy,
+  AllreduceOp(std::set<int> group, DataType type, AllReduceStrategyType strategy,
               AllReduceFusionOp op, float eps)
       : mGroup(std::move(group)), mType(type), mStrategy(strategy), mOp(op), mEps(eps) {}
 
@@ -514,7 +513,7 @@ class AllreduceOp {
   std::set<int> mGroup;
   bool mIsNVLINKSupported;
   bool mIsP2PSupported;
-  nvinfer1::DataType mType;
+  DataType mType;
   AllReduceStrategyType mStrategy;
   AllReduceFusionOp mOp;
   float mEps;
