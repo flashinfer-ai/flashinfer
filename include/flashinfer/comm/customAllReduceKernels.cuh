@@ -140,18 +140,18 @@ struct AllReduceParams
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, DataType dataType,
         int token_num, int hidden_size, AllReduceFusionOp op);
 };
 
-bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, DataType type);
 
-void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
+void customAllReduce(kernels::AllReduceParams& params, DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
 
 void residualRmsNorm(
-    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
+    kernels::AllReduceParams& params, DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
 
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
+void lamportInitialize(void* buffer, size_t size, DataType dataType, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

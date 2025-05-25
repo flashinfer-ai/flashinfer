@@ -18,6 +18,7 @@
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
 #include "pytorch_extension_utils.h"
+#include "flashinfer/comm/trtllm/types.h"
 
 // ============ start cpp/tensorrt_llm/thop/allreduceOp.cpp ============
 
@@ -28,12 +29,12 @@
 // #include "flashinfer/comm/trtllm/common/opUtils.h"
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
-// #include "flashinfer/comm/customAllReduceKernels.cuh"
+#include "flashinfer/comm/customAllReduceKernels.cuh"
 // #include "flashinfer/comm/trtllm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "flashinfer/comm/trtllm/kernels/quantization.h"
 // #include "flashinfer/comm/trtllm/kernels/userbuffers/ub_interface.h"
 // #include "flashinfer/comm/trtllm/runtime/torchUtils.h"
-// #include "flashinfer/comm/trtllm/runtime/utils/mpiUtils.h"
+#include "flashinfer/comm/trtllm/runtime/mpiUtils.h"
 // #include "flashinfer/comm/trtllm/thop/fp4Quantize.h"
 // #include "flashinfer/comm/trtllm/thop/fp8Op.h"
 // #include "flashinfer/comm/trtllm/thop/thUtils.h"
@@ -77,12 +78,12 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
       int rank;
       ranks.push_back(myRank);
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
-        LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+        LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
         ranks.push_back(rank);
       }
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
         LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it,
-                                0);
+                                MpiTag::kDefault);
       }
 
       localRanks.clear();
@@ -93,16 +94,16 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
       }
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
         LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                                *it, 0);
+                                *it, MpiTag::kDefault);
       }
     } else {
       LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                              *group.begin(), 0);
+                              *group.begin(), MpiTag::kDefault);
 
       LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
-                              *group.begin(), 0);
+                              *group.begin(), MpiTag::kDefault);
     }
   }
 
