@@ -24,6 +24,7 @@
 #include "flashinfer/comm/trtllm/common/cudaUtils.h"
 #include "flashinfer/comm/trtllm/common/customAllReduceUtils.h"
 #include "flashinfer/comm/trtllm/common/dataType.h"
+#include "pytorch_extension_utils.h"
 // #include "flashinfer/comm/trtllm/common/opUtils.h"
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
@@ -41,11 +42,8 @@
 #define ENABLE_MULTI_DEVICE 1
 
 #if ENABLE_MULTI_DEVICE
-// #include <ATen/cuda/EmptyTensor.h>
-// #include <nccl.h>
 #endif  // ENABLE_MULTI_DEVICE
 #include <nvml.h>
-// #include <torch/extension.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -158,115 +156,11 @@ class AllreduceOp {
       initGroupTopology();
     }
 
-    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+    // TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     return 0;
   }
 
  private:
-  std::vector<at::Tensor> runUBAllReduce(at::Tensor const& input,
-                                         at::optional<at::Tensor> const& residual,
-                                         at::optional<at::Tensor> const& norm_weight,
-                                         at::optional<at::Tensor> const& scale,
-                                         at::optional<at::Tensor> const& bias) noexcept {
-    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    int size = input.numel();
-    int hidden_size = input.size(-1);
-
-    at::Tensor residual_out = torch::empty_like(input);
-
-    TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM ||
-               mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8 ||
-               mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
-    TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
-                         "UserBuffer has not been initialized!");
-    auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
-    auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
-    TLLM_CHECK(!ub_buffer0.invalid());
-
-    auto ub_comm = ub_manager.comm();
-    int m = size / hidden_size;
-
-    if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-      TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
-      TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
-      TORCH_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
-      auto [norm_out, ub_buffer1] =
-          torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
-      tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(
-          ub_buffer0.handle, 0, ub_buffer1.handle, 0, size, hidden_size, nullptr,
-          norm_weight.value().data_ptr(), mEps, residual.value().data_ptr(),
-          residual_out.data_ptr(), mType, ub_comm, stream);
-
-      return {norm_out, residual_out};
-    } else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8) {
-      TORCH_CHECK(scale, "scale is required for FP8 allreduce");
-      TORCH_CHECK(norm_weight, "norm_weight is required for FP8 allreduce");
-      TORCH_CHECK(!bias, "bias is not supported for FP8 allreduce");
-      auto [norm_out, ub_buffer1] =
-          torch_ext::create_userbuffers_tensor(input.sizes(), torch::kFloat8_e4m3fn);
-      tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(
-          ub_buffer0.handle, 0, ub_buffer1.handle, 0, size, hidden_size, nullptr,
-          norm_weight.value().data_ptr(), mEps, static_cast<float*>(scale.value().data_ptr()),
-          residual.value().data_ptr(), residual_out.data_ptr(), mType, ub_comm, stream);
-
-      return {norm_out, residual_out};
-    } else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4) {
-      TORCH_CHECK(scale, "scale is required for FP4 allreduce");
-      TORCH_CHECK(norm_weight, "norm_weight is required for FP4 allreduce");
-      TORCH_CHECK(!bias, "bias is not supported for FP4 allreduce");
-
-      int const sfVecSize = 16;
-      int scale_size = tensorrt_llm::common::roundUp(m, 128) *
-                       tensorrt_llm::common::roundUp(hidden_size / sfVecSize, 4);
-
-      TORCH_CHECK(hidden_size % sfVecSize == 0,
-                  "hidden_size must be divisible by 16 for FP4 allreduce");
-
-      auto output_shape = input.sizes().vec();
-      output_shape.back() /= 2;
-      auto output_strides = input.strides().vec();
-      for (size_t i = 0; i < output_shape.size() - 1; i++) {
-        output_strides[i] /= 2;
-      }
-
-      auto [quant_out, ub_buffer1] =
-          torch_ext::create_userbuffers_tensor(output_shape, torch::kByte);
-      auto [scale_out, ub_buffer2] =
-          torch_ext::create_userbuffers_tensor({scale_size}, torch::kByte);
-
-      tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(
-          ub_buffer0.handle, 0, ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size,
-          nullptr, norm_weight.value().data_ptr(), mEps,
-          static_cast<float*>(scale.value().data_ptr()), residual.value().data_ptr(),
-          residual_out.data_ptr(), mType, ub_comm, stream);
-
-      return {quant_out, scale_out, residual_out};
-    }
-    TORCH_CHECK(false, "UBAllreduce does not support the fusion operation: " +
-                           tensorrt_llm::kernels::toString(mOp));
-    return {};
-  }
-
-  std::vector<at::Tensor> runNCCLAllReduce(at::Tensor const& input,
-                                           at::optional<at::Tensor> const& residual,
-                                           at::optional<at::Tensor> const& norm_weight,
-                                           at::optional<at::Tensor> const& scale,
-                                           at::optional<at::Tensor> const& bias) noexcept {
-    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    int size = input.numel();
-
-    at::Tensor reduce_output = torch::empty_like(input);
-    NCCLCHECK(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
-                            (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
-
-    if (mOp == AllReduceFusionOp::NONE) {
-      return {reduce_output};
-    }
-
-    // Treat any other patterns as fallback cases.
-    return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
-  }
-
   std::vector<at::Tensor> runFusionAllReduce(at::Tensor const& input,
                                              at::optional<at::Tensor> const& residual,
                                              at::optional<at::Tensor> const& norm_weight,
@@ -513,46 +407,6 @@ class AllreduceOp {
     return {};
   }
 
-  AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size) noexcept {
-    static char* force_nccl_all_reduce_strategy_char =
-        std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
-    bool force_nccl_all_reduce_strategy = (force_nccl_all_reduce_strategy_char != nullptr);
-    AllReduceStrategyType runtime_strategy;
-    if (mStrategy == AllReduceStrategyType::UB) {
-      runtime_strategy = AllReduceStrategyType::UB;
-    } else if (force_nccl_all_reduce_strategy || mStrategy == AllReduceStrategyType::NCCL) {
-      runtime_strategy = AllReduceStrategyType::NCCL;
-    } else {
-      // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
-      static char* ifForBenchMark = std::getenv("OVERRIDE_HEURISTIC_ALLREDUCE_STRATEGY");
-      if (ifForBenchMark != nullptr) {
-        runtime_strategy = mStrategy;
-      } else {
-        runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
-      }
-    }
-    return runtime_strategy;
-  }
-
-  void logRunTimeStrategy(AllReduceStrategyType strategy, int rank) noexcept {
-    switch (strategy) {
-      case AllReduceStrategyType::NCCL: {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
-        break;
-      }
-      case AllReduceStrategyType::MIN_LATENCY: {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
-        break;
-      }
-      case AllReduceStrategyType::UB: {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
   bool Fusable() noexcept { return mOp != AllReduceFusionOp::NONE; }
 
   void initGroupTopology() noexcept {
@@ -569,15 +423,15 @@ class AllreduceOp {
 
   void setGroupTopology() noexcept {
     auto const rank = COMM_SESSION.getRank();
-    TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
+    // TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
     std::set<int> local_group = getLocalGroup(mGroup);
     if (mGroup.size() != local_group.size()) {
       mIsP2PSupported = false;
       mIsNVLINKSupported = false;
-      TLLM_LOG_INFO("Found inter-node TP group for rank %d", rank);
+      // TLLM_LOG_INFO("Found inter-node TP group for rank %d", rank);
       return;
     }
-    TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
+    // TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
     NvmlManager nvml_manager;
     std::unordered_set<int> visited_device;
@@ -691,75 +545,6 @@ class AllreduceOp {
       return true;
     }
     return false;
-  }
-
-  AllReduceStrategyType selectImplementation(size_t seq_len, size_t message_size, int world_size,
-                                             nvinfer1::DataType type) noexcept {
-    // Check that heuristic is only applied when AUTO is set.
-    bool const is_auto = (mStrategy == AllReduceStrategyType::AUTO);
-    auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(type);
-    auto const max_workspace_size =
-        tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(world_size);
-
-    if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size, is_auto)) {
-      return AllReduceStrategyType::NCCL;
-    }
-
-    // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
-
-    // Heurisitic will only be applied on NONE and RESIDUAL_RMS_NORM fusion types.
-    // Because NCCL might be faster on some large messageSize cases.
-    // Otherwise, MIN_LATENCY strategy will be directly returned due to more fusions it can support.
-    // TODO: NCCL AllReduce + subsequent quantization ops (as fallback) can also support the fusion
-    // types. This should be compared with MIN_LATENCY fused kernels to determine the best strategy.
-    switch (mOp) {
-      case AllReduceFusionOp::NONE:
-      case AllReduceFusionOp::RESIDUAL_RMS_NORM:
-        break;
-      case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
-      case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-      case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
-      case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-        return AllReduceStrategyType::MIN_LATENCY;
-      // Suppose NCCL has fallback implementations for all fusion types.
-      default:
-        return AllReduceStrategyType::NCCL;
-    }
-
-    // Check mOp to be supported by the heuristic.
-    TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
-                "Only NONE and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
-
-    // Default to NCCL.
-    AllReduceStrategyType strategy = AllReduceStrategyType::NCCL;
-
-    // Currently we will not remove ONESHOT and TWOSHOT from the strategy list
-    // But torch flow user should not use them, but use AUTO or MIN_LATENCY instead.
-    // NOTICE: When a fusion type is not supported by the corresponding strategy but strategy is not
-    // AUTO, user should guarantee the correctness of the fusion pattern dispatching.
-    if (!is_auto) {
-      if (mStrategy == AllReduceStrategyType::ONESHOT ||
-          mStrategy == AllReduceStrategyType::TWOSHOT) {
-        strategy = AllReduceStrategyType::MIN_LATENCY;
-      } else {
-        strategy = mStrategy;
-      }
-    } else if (world_size <= 2) {
-      strategy = AllReduceStrategyType::MIN_LATENCY;
-    } else if (world_size <= 4) {
-      if (message_size_bytes < 1 * 1000 * 1000) {
-        strategy = AllReduceStrategyType::MIN_LATENCY;
-      } else {
-        strategy = AllReduceStrategyType::NCCL;
-      }
-    } else {
-      if (message_size_bytes < 500 * 1000) {
-        strategy = AllReduceStrategyType::MIN_LATENCY;
-      } else {
-        strategy = AllReduceStrategyType::NCCL;
-      }
-    }
-    return strategy;
   }
 
  private:
@@ -882,7 +667,7 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("dispose", &dispose);
   m.def("meta_size", &meta_size);
   m.def("register_buffer", &register_buffer);
-  m.def("init_custom_ar", &init_cuscom_ar);
+  m.def("init_custom_ar", &init_custom_ar);
   m.def("all_reduce", &all_reduce);  // vllm
   m.def("allreduce", &torch_ext::allreduce);
   m.def("moe_allreduce", &torch_ext::moe_allreduce);
