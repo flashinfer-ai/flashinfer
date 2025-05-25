@@ -18,6 +18,7 @@
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
 #include "pytorch_extension_utils.h"
+#include "flashinfer/comm/trtllm/types.h"
 
 // ============ start cpp/tensorrt_llm/thop/allreduceOp.cpp ============
 
@@ -25,15 +26,15 @@
 #include "flashinfer/comm/trtllm/common/customAllReduceUtils.h"
 #include "flashinfer/comm/trtllm/common/dataType.h"
 #include "pytorch_extension_utils.h"
-// #include "flashinfer/comm/trtllm/common/opUtils.h"
+#include "flashinfer/comm/trtllm/common/opUtils.h"
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
-// #include "flashinfer/comm/customAllReduceKernels.cuh"
+#include "flashinfer/comm/customAllReduceKernels.cuh"
 // #include "flashinfer/comm/trtllm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "flashinfer/comm/trtllm/kernels/quantization.h"
 // #include "flashinfer/comm/trtllm/kernels/userbuffers/ub_interface.h"
 // #include "flashinfer/comm/trtllm/runtime/torchUtils.h"
-// #include "flashinfer/comm/trtllm/runtime/utils/mpiUtils.h"
+#include "flashinfer/comm/trtllm/runtime/mpiUtils.h"
 // #include "flashinfer/comm/trtllm/thop/fp4Quantize.h"
 // #include "flashinfer/comm/trtllm/thop/fp8Op.h"
 // #include "flashinfer/comm/trtllm/thop/thUtils.h"
@@ -43,16 +44,15 @@
 
 #if ENABLE_MULTI_DEVICE
 #endif  // ENABLE_MULTI_DEVICE
-#include <nvml.h>
-
+#include <nvml.h> // todo: might be used
+ 
 #include <cstddef>
 #include <cstdint>
 #include <unordered_set>
 
-// using namespace nvinfer1;
+using namespace tensorrt_llm::mpi::MpiTag;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
-using tensorrt_llm::mpi::MpiTag;
 
 namespace torch_ext {
 
@@ -60,12 +60,6 @@ namespace torch_ext {
 
 namespace {
 
-class NvmlManager {
- public:
-  NvmlManager() { NVML_CHECK(nvmlInit()); }
-
-  ~NvmlManager() { NVML_CHECK(nvmlShutdown()); }
-};
 
 std::set<int> getLocalGroup(std::set<int> const& group) {
   auto const myRank = COMM_SESSION.getRank();
@@ -95,7 +89,7 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
       localRanks.clear();
       localRanks.push_back(myLocalRank);
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
-        LOCAL_COMM_SESSION.recvValue(rank, *it, MpiTag::kDefault);
+        LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
         localRanks.push_back(rank);
       }
       for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it) {
@@ -103,11 +97,11 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
                                 *it, MpiTag::kDefault);
       }
     } else {
-      LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), MpiTag::kDefault);
+      LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
                               *group.begin(), MpiTag::kDefault);
 
-      LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), MpiTag::kDefault);
+      LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
       LOCAL_COMM_SESSION.recv(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32,
                               *group.begin(), MpiTag::kDefault);
     }
@@ -125,7 +119,7 @@ std::set<int> getLocalGroup(std::set<int> const& group) {
 
 class AllreduceOp {
  public:
-  AllreduceOp(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy,
+  AllreduceOp(std::set<int> group, DataType type, AllReduceStrategyType strategy,
               AllReduceFusionOp op, float eps)
       : mGroup(std::move(group)), mType(type), mStrategy(strategy), mOp(op), mEps(eps) {}
 
@@ -155,7 +149,7 @@ class AllreduceOp {
 
   int initialize() noexcept {
     // TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-    mNcclComm = getComm(mGroup);
+    // mNcclComm = getComm(mGroup);
     if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB) {
       initGroupTopology();
     }
@@ -448,7 +442,6 @@ class AllreduceOp {
     }
     // TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
-    NvmlManager nvml_manager;
     std::unordered_set<int> visited_device;
     mIsP2PSupported = true;
     mIsNVLINKSupported = true;
@@ -532,45 +525,15 @@ class AllreduceOp {
     }
   }
 
-  bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size,
-                        bool is_auto) noexcept {
-    // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
-    if (message_size_bytes > max_workspace_size) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING(
-            "Since messageSize is greater than maxWorkspaceSize, fallback to AllReduceStrategy: "
-            "NCCL");
-      }
-      return true;
-    }
-
-    // If Peer to Peer is not supported, fallback to NCCL.
-    if (!mIsP2PSupported) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
-      }
-      return true;
-    }
-
-    // If NVLINK is not supported, fallback to NCCL.
-    if (!mIsNVLINKSupported) {
-      if (!is_auto) {
-        TLLM_LOG_WARNING("Since NVLINK not supported, fallback to AllReduceStrategy: NCCL");
-      }
-      return true;
-    }
-    return false;
-  }
-
  private:
   std::set<int> mGroup;
   bool mIsNVLINKSupported;
   bool mIsP2PSupported;
-  nvinfer1::DataType mType;
+  DataType mType;
   AllReduceStrategyType mStrategy;
   AllReduceFusionOp mOp;
   float mEps;
-  std::shared_ptr<ncclComm_t> mNcclComm;
+  // std::shared_ptr<ncclComm_t> mNcclComm;
 };
 
 }  // namespace

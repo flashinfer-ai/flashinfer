@@ -58,15 +58,13 @@ void read(char const*& buffer, T& val)
     buffer += sizeof(T);
 }
 
-inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
+inline cudaDataType_t trtToCublasDtype(DataType type)
 {
     switch (type)
     {
-    case DataType::kFLOAT: return CUDA_R_32F;
-    case DataType::kHALF: return CUDA_R_16F;
-#if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
+    case DataType::kFP32: return CUDA_R_32F;
+    case DataType::kFP16: return CUDA_R_16F;
     case DataType::kBF16: return CUDA_R_16BF;
-#endif
     default: TORCH_CHECK(false, "Not supported data type for cuBLAS");
     }
 }
@@ -188,23 +186,6 @@ inline bool isBuilding()
     return val != nullptr && std::string(val) == "1";
 }
 
-#if ENABLE_MULTI_DEVICE
-#define NCCLCHECK(cmd)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        ncclResult_t r = cmd;                                                                                          \
-        if (r != ncclSuccess)                                                                                          \
-        {                                                                                                              \
-            printf("Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r));                      \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
-
-std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
-
-std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
-
-#endif // ENABLE_MULTI_DEVICE
 
 //! To save GPU memory, all the plugins share the same cublas and cublasLt handle globally.
 //! Get cublas and cublasLt handle for current cuda context
