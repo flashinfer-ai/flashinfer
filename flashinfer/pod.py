@@ -20,9 +20,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
-from .jit import (
-    gen_pod_module,
-)
+from .jit import gen_pod_module
 from .page import get_seq_lens
 from .prefill import get_batch_prefill_module
 from .quantization import packbits

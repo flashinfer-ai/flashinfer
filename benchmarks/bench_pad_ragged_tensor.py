@@ -1,6 +1,3 @@
-import argparse
-from typing import cast
-
 import torch
 from triton.testing import do_bench
 

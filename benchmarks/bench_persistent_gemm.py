@@ -1,4 +1,3 @@
-import pytest
 import torch
 import triton
 from triton.testing import do_bench

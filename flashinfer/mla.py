@@ -21,11 +21,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
-from .utils import (
-    MaskMode,
-    _check_shape_dtype_device,
-    determine_mla_backend,
-)
+from .utils import MaskMode, _check_shape_dtype_device, determine_mla_backend
 
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):

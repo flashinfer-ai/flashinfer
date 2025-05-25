@@ -14,14 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 import torch
 import triton
 import triton.language as tl
 from triton.testing import do_bench
 
-import flashinfer
-from flashinfer.gemm import gemm_fp8_nt_blockscaled, gemm_fp8_nt_groupwise
+from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 @triton.jit

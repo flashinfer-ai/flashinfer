@@ -41182,20 +41182,20 @@ cython_debug/
 ## File: .gitmodules
 ````
 [submodule "3rdparty/nvbench"]
-	path = 3rdparty/nvbench
-	url = https://github.com/NVIDIA/nvbench.git
+    path = 3rdparty/nvbench
+    url = https://github.com/NVIDIA/nvbench.git
 [submodule "3rdparty/googletest"]
-	path = 3rdparty/googletest
-	url = https://github.com/google/googletest.git
+    path = 3rdparty/googletest
+    url = https://github.com/google/googletest.git
 [submodule "3rdparty/cutlass"]
-	path = 3rdparty/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+    path = 3rdparty/cutlass
+    url = https://github.com/NVIDIA/cutlass.git
 [submodule "3rdparty/composable_kernels"]
-	path = 3rdparty/composable_kernels
-	url = https://github.com/ROCm/composable_kernel.git
+    path = 3rdparty/composable_kernels
+    url = https://github.com/ROCm/composable_kernel.git
 [submodule "3rdparty/spdlog"]
-	path = 3rdparty/spdlog
-	url = https://github.com/gabime/spdlog.git
+    path = 3rdparty/spdlog
+    url = https://github.com/gabime/spdlog.git
 ````
 
 ## File: .github/pull_request_template.md
