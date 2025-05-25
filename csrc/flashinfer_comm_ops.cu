@@ -17,19 +17,19 @@
  */
 #include "flashinfer/comm/allReduceFusionKernels.cuh"
 #include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
-#include "pytorch_extension_utils.h"
 #include "flashinfer/comm/trtllm/types.h"
+#include "pytorch_extension_utils.h"
 
 // ============ start cpp/tensorrt_llm/thop/allreduceOp.cpp ============
 
+#include "flashinfer/comm/allReduceFusionKernels.cuh"
+#include "flashinfer/comm/customAllReduceKernels.cuh"
+#include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
 #include "flashinfer/comm/trtllm/common/cudaUtils.h"
 #include "flashinfer/comm/trtllm/common/customAllReduceUtils.h"
 #include "flashinfer/comm/trtllm/common/dataType.h"
-#include "pytorch_extension_utils.h"
 #include "flashinfer/comm/trtllm/common/opUtils.h"
-#include "flashinfer/comm/allReduceFusionKernels.cuh"
-#include "flashinfer/comm/moeAllReduceFusionKernels.cuh"
-#include "flashinfer/comm/customAllReduceKernels.cuh"
+#include "pytorch_extension_utils.h"
 // #include "flashinfer/comm/trtllm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "flashinfer/comm/trtllm/kernels/quantization.h"
 // #include "flashinfer/comm/trtllm/kernels/userbuffers/ub_interface.h"
@@ -43,9 +43,9 @@
 #define ENABLE_MULTI_DEVICE 1
 
 #if ENABLE_MULTI_DEVICE
-#endif  // ENABLE_MULTI_DEVICE
-#include <nvml.h> // todo: might be used
- 
+#endif             // ENABLE_MULTI_DEVICE
+#include <nvml.h>  // todo: might be used
+
 #include <cstddef>
 #include <cstdint>
 #include <unordered_set>
@@ -56,10 +56,88 @@ using tensorrt_llm::kernels::AllReduceStrategyType;
 
 namespace torch_ext {
 
+// self: [M, K], fp16/bf16/fp8_quantized
+// globalScale: [1] float, = (448 * 6) / self.abs().max()
+// nvfp4: sfVecSize = 16, sfUseUE8M0 = false
+// mxfp4: sfVecSize = 32 (not supported yet), sfUseUE8M0 = true
+// alignment: sfVecSize
+// isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
+// linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts. returns
+// self_fp4, self_block_scale_factors self_fp4: [M, K / 2], FLOAT4_E2M1X2 self_block_scale_factors:
+// ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
+std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
+                                                at::Tensor const& globalScale, int64_t sfVecSize,
+                                                bool sfUseUE8M0, bool isSfSwizzledLayout) {
+  TORCH_CHECK(self.is_cuda(), "self must be a CUDA tensor");
+  TORCH_CHECK(self.is_contiguous(), "self must be contiguous");
+  TORCH_CHECK(globalScale.is_cuda() && globalScale.is_contiguous() && globalScale.scalar_type() == at::ScalarType::Float,
+              "globalScale must be a CUDA tensor and a contiguous float tensor");
+  TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16");
+
+  auto const& inputShape = self.sizes();
+  auto const& rank = inputShape.size();
+
+  TORCH_CHECK(rank >= 2, "Input should be >=2D tensor.");
+  int64_t m = 1;
+  for (size_t i = 0; i < rank - 1; i++) {
+    m *= inputShape[i];
+  }
+  auto const k = inputShape[rank - 1];
+  TORCH_CHECK(k % sfVecSize == 0);
+
+  std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+  outputShape[rank - 1] = k / 2;
+
+  at::Tensor valueE2M1 =
+      at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
+
+  int64_t SFSize = isSfSwizzledLayout
+                       ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
+                       : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
+
+  at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
+                                                 /* stride */ std::nullopt);  // 1D tensor
+
+  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+
+  auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
+                                         : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T)                                                              \
+  tensorrt_llm::kernels::invokeFP4Quantization(                                                    \
+      m, k, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(),                  \
+      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
+      at::cuda::getCurrentCUDAStream(self.get_device()));
+
+  if (self.scalar_type() == at::ScalarType::Half) {
+    LAUNCH_FP4_QUANTIZE_KERNEL(half)
+  } else if (self.scalar_type() == at::ScalarType::BFloat16) {
+#ifdef ENABLE_BF16
+    LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16)
+#else
+    C10_THROW_ERROR(NotImplementedError,
+                    "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
+#endif
+  } else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+#ifdef ENABLE_FP8
+    LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3)
+#else
+    C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
+#endif
+  } else {
+    C10_THROW_ERROR(NotImplementedError,
+                    "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
+  }
+
+#undef LAUNCH_FP4_QUANTIZE_KERNEL
+
+  return {valueE2M1, scaleFP8SF};
+}
+
 #if ENABLE_MULTI_DEVICE
 
 namespace {
-
 
 std::set<int> getLocalGroup(std::set<int> const& group) {
   auto const myRank = COMM_SESSION.getRank();
