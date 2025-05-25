@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-enum class DataType { kBOOL, kUINT8, kINT8, kINT32, kINT64, kBF16, kFP8, kFP16, kFP32, kUNKNOWN };
+enum class DataType { kBOOL, kUINT8, kINT8, kINT32, kINT64, kBF16, kFP8, kFP16, kFP32, kINT4, kFP4, kUNKNOWN };
 
 //! \brief For converting a C++ data type to a `DataType`.
 template <typename T, bool = false>

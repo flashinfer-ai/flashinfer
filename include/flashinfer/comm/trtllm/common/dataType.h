@@ -30,11 +30,11 @@ constexpr static size_t getDTypeSize(DataType type) {
       return 8;
     case DataType::kINT32:
       [[fallthrough]];
-    case DataType::kFLOAT:
+    case DataType::kFP32:
       return 4;
     case DataType::kBF16:
       [[fallthrough]];
-    case DataType::kHALF:
+    case DataType::kFP16:
       return 2;
     case DataType::kBOOL:
       [[fallthrough]];
@@ -44,12 +44,13 @@ constexpr static size_t getDTypeSize(DataType type) {
       [[fallthrough]];
     case DataType::kFP8:
       return 1;
-    case DataType::kINT4:
-      TLLM_THROW("Cannot determine size of INT4 data type");
-    case DataType::kFP4:
-      TLLM_THROW("Cannot determine size of FP4 data type");
+    // case DataType::kINT4:
+    //   TLLM_THROW("Cannot determine size of INT4 data type");
+    // case DataType::kFP4:
+    //   TLLM_THROW("Cannot determine size of FP4 data type");
     default:
-      TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+      // TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+      assert(false);
   }
   return 0;
 }
@@ -60,11 +61,11 @@ constexpr static size_t getDTypeSizeInBits(DataType type) {
       return 64;
     case DataType::kINT32:
       [[fallthrough]];
-    case DataType::kFLOAT:
+    case DataType::kFP32:
       return 32;
     case DataType::kBF16:
       [[fallthrough]];
-    case DataType::kHALF:
+    case DataType::kFP16:
       return 16;
     case DataType::kBOOL:
       [[fallthrough]];
@@ -79,7 +80,8 @@ constexpr static size_t getDTypeSizeInBits(DataType type) {
     case DataType::kFP4:
       return 4;
     default:
-      TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+      // TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+      assert(false);
   }
   return 0;
 }

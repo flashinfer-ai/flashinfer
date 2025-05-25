@@ -128,30 +128,57 @@ def test_trtllm_fusion_allreduce(world_size: int):
 
 
 if __name__ == "__main__":
-    # temp tests for compile
-    params = comm.AllReduceFusionParams(
-        workspace=torch.zeros(1),  # todo
-        allreduce_in=torch.zeros(1),  # todo
-        nranks=2,
+    # Initialize process group for compilation test
+    distributed_init_method = f"tcp://localhost:{get_open_port()}"
+    dist.init_process_group(
+        backend="nccl",
+        init_method=distributed_init_method,
         rank=0,
-        dtype=comm.DataType.FP16,
-        size=1024,
-        hidden_dim=1024,
+        world_size=1,
     )
-    moe_params = comm.MoeReductionAllReduceFusionParams(
-        workspace=torch.zeros(1),  # todo
-        allreduce_in=torch.zeros(1),  # todo
-        nranks=2,
-        rank=0,
-        dtype=comm.DataType.FP16,
-        size=1024,
-        hidden_dim=1024,
-        residual_in=torch.zeros(1),  # todo
-        rms_gamma=torch.zeros(1),  # todo
-        moe_reduction_device_num_experts=torch.zeros(1),  # todo
-        moe_reduction_scale_input=torch.zeros(1),  # todo
-        moe_reduction_active_experts_token_input=torch.zeros(1),  # todo
-        moe_reduction_token_input=torch.zeros(1),  # todo
+    group = list(range(dist.get_world_size()))
+    
+    # Placeholder tests for JIT compilation
+    device = torch.device("cuda:0")
+    hidden_dim = 1024
+    seq_len = 32
+    num_experts = 8
+
+    # Test allreduce compilation
+    input_tensor = torch.randn(seq_len, hidden_dim, dtype=torch.float16, device=device)
+    residual = torch.randn_like(input_tensor)
+    norm_weight = torch.randn(hidden_dim, dtype=torch.float16, device=device)
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)  # 1MB workspace
+
+    # Test basic allreduce
+    outputs = comm.allreduce(input_tensor)
+    print("Basic allreduce compiled successfully")
+
+    # Test fused residual + RMS norm allreduce
+    outputs = comm.allreduce(
+        input_tensor,
+        residual=residual,
+        norm_weight=norm_weight,
+        workspace=workspace,
+        op=1,  # RESIDUAL_RMS_NORM
     )
-    comm.trtllm_allreduce_fusion_op(params)
-    comm.trtllm_moereduction_allreduce_fusion_op(moe_params)
+    print("Fused residual + RMS norm allreduce compiled successfully")
+
+    # Test MoE allreduce compilation
+    device_num_experts = torch.tensor([num_experts], dtype=torch.int32, device=device)
+    scale_input = torch.randn(num_experts, seq_len, dtype=torch.float32, device=device)
+    active_experts_token_input = torch.randn(num_experts, seq_len, hidden_dim, dtype=torch.float16, device=device)
+    token_input = torch.randn(seq_len, hidden_dim, dtype=torch.float16, device=device)
+
+    outputs = comm.moe_allreduce(
+        residual=residual,
+        norm_weight=norm_weight,
+        device_num_experts=device_num_experts,
+        scale_input=scale_input,
+        active_experts_token_input=active_experts_token_input,
+        token_input=token_input,
+        workspace=workspace,
+    )
+    print("MoE allreduce compiled successfully")
+

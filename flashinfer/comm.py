@@ -15,11 +15,14 @@ limitations under the License.
 """
 
 import ctypes
+import threading
 import functools
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple, Union
+from flashinfer.mapping import Mapping
 
 import torch
 import torch.distributed as dist
@@ -48,74 +51,6 @@ class Function:
     name: str
     restype: Any
     argtypes: List[Any]
-
-
-class DataType(IntEnum):
-    BOOL = 0
-    UINT8 = 1
-    INT8 = 2
-    INT32 = 3
-    INT64 = 4
-    BF16 = 5
-    FP8 = 6
-    FP16 = 7
-    FP32 = 8
-    UNKNOWN = 9
-
-
-class AllReduceFusionPattern(IntEnum):
-    ALL_REDUCE = 0
-    AR_RESIDUAL_RMS_NORM = 1
-    AR_RESIDUAL_RMS_NORM_FP8_QUANT = 2
-    AR_RESIDUAL_RMS_NORM_FP4_QUANT = 3
-    AR_RESIDUAL_RMS_NORM_OUT_FP8_QUANT = 4
-    AR_RESIDUAL_RMS_NORM_OUT_FP4_QUANT = 5
-
-
-class FP4QuantizationSFLayout(IntEnum):
-    SWIZZLED = 0
-    LINEAR = 1
-
-
-@dataclass
-class AllReduceFusionParams:
-    nranks: int
-    rank: int
-    dtype: DataType
-    size: int
-    hidden_dim: int
-    workspace: torch.Tensor  # void**
-    allreduce_in: torch.Tensor  # void*
-    residual_in: Optional[torch.Tensor] = None  # void*
-    allreduce_out: Optional[torch.Tensor] = None  # void*
-    residual_out: Optional[torch.Tensor] = None  # void*
-    norm_out: Optional[torch.Tensor] = None  # void*
-    quant_out: Optional[torch.Tensor] = None  # void*
-    scale_out: Optional[torch.Tensor] = None  # void*
-    rms_gamma: Optional[torch.Tensor] = None  # void*
-    rms_eps: float = 1e-6
-    scale_factor: Optional[torch.Tensor] = None  # float*
-    use_oneshot: bool = True  # non-moe reduction only
-    layout: FP4QuantizationSFLayout = FP4QuantizationSFLayout.SWIZZLED
-    stream: Optional[torch.cuda.Stream] = None
-    pattern: AllReduceFusionPattern = AllReduceFusionPattern.ALL_REDUCE
-
-    def __post_init__(self):
-        if self.stream is None:
-            self.stream = torch.cuda.current_stream()
-
-
-@dataclass
-class MoeReductionAllReduceFusionParams(AllReduceFusionParams):
-    """Parameters for MoE reduction + all-reduce fusion operation.
-
-    This extends AllReduceFusionParams with MoE-specific parameters.
-    """
-
-    moe_reduction_device_num_experts: Optional[torch.Tensor] = None  # int*
-    moe_reduction_scale_input: Optional[torch.Tensor] = None  # float*
-    moe_reduction_active_experts_token_input: Optional[torch.Tensor] = None  # void*
-    moe_reduction_token_input: Optional[torch.Tensor] = None  # void*
 
 
 def find_loaded_library(lib_name) -> Optional[str]:
@@ -276,6 +211,7 @@ def gen_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+            # jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/customAllReduceKernels.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/allReduceFusionKernels.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_comm/moeAllReduceFusionKernels.cu",
         ],
@@ -325,135 +261,87 @@ def get_comm_module():
         return module.meta_size()
 
     @register_custom_op(
-        "flashinfer::all_reduce",
-        mutates_args=["out", "reg_buffer", "reg_buffer_sz_bytes"],
+        "flashinfer::allreduce",
+        mutates_args=["input", "residual", "norm_weight", "scale", "bias", "workspace", "group"],
     )
-    def all_reduce(
-        fa: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        reg_buffer: int,
-        reg_buffer_sz_bytes: int,
-        num_ctas: int,
-    ) -> None:
-        module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
-
-    @register_custom_op(
-        "flashinfer::allreduce_fusion_op",
-        mutates_args=["params"],
-    )
-    def trtllm_allreduce_fusion_op(params: AllReduceFusionParams) -> None:
+    def allreduce(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        strategy: int,
+        op: int,
+        eps: float,
+    ) -> List[torch.Tensor]:
         """Performs an all-reduce operation with optional fusion patterns.
 
         Args:
-            params: AllReduceFusionParams object for the all-reduce operation.
+            input: Input tensor to all-reduce
+            residual: Optional residual tensor for fusion
+            norm_weight: Optional normalization weights
+            scale: Optional scale factors for quantization
+            bias: Optional bias tensor
+            workspace: Optional workspace tensor
+            group: List of ranks in the process group
+            strategy: AllReduceStrategy type (0=NCCL, 1=MIN_LATENCY, etc)
+            op: AllReduceFusionOp type (0=NONE, 1=RESIDUAL_RMS_NORM, etc)
+            eps: Epsilon value for normalization
+
+        Returns:
+            List of output tensors depending on the fusion pattern
         """
-        # Convert Python params to C++ struct format
-        tensors = {
-            "workspace": params.workspace,
-            "allreduce_in": params.allreduce_in,
-            "residual_in": params.residual_in,
-            "allreduce_out": params.allreduce_out,
-            "residual_out": params.residual_out,
-            "norm_out": params.norm_out,
-            "quant_out": params.quant_out,
-            "scale_out": params.scale_out,
-            "rms_gamma": params.rms_gamma,
-            "scale_factor": params.scale_factor,
-        }
-
-        # Filter out None tensors and get their data pointers
-        tensor_ptrs = {
-            k: (v.data_ptr() if v is not None else 0) for k, v in tensors.items()
-        }
-
-        return module.allreduce_fusion_op(
-            params.nranks,
-            params.rank,
-            int(params.dtype),
-            params.size,
-            params.hidden_dim,
-            tensor_ptrs["workspace"],
-            tensor_ptrs["allreduce_in"],
-            tensor_ptrs["residual_in"],
-            tensor_ptrs["allreduce_out"],
-            tensor_ptrs["residual_out"],
-            tensor_ptrs["norm_out"],
-            tensor_ptrs["quant_out"],
-            tensor_ptrs["scale_out"],
-            tensor_ptrs["rms_gamma"],
-            params.rms_eps,
-            tensor_ptrs["scale_factor"],
-            params.use_oneshot,
-            int(params.layout),
-            (
-                params.stream.cuda_stream
-                if params.stream
-                else torch.cuda.current_stream().cuda_stream
-            ),
-            int(params.pattern),
+        return module.allreduce(
+            input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps
         )
 
     @register_custom_op(
-        "flashinfer::moereduction_allreduce_fusion_op",
-        mutates_args=["params"],
+        "flashinfer::moe_allreduce",
+        mutates_args=["residual", "norm_weight", "device_num_experts", "scale_input", 
+                     "active_experts_token_input", "token_input", "workspace"],
     )
-    def trtllm_moereduction_allreduce_fusion_op(
-        params: MoeReductionAllReduceFusionParams,
-    ) -> None:
-        """Performs a MoE reduction + all-reduce operation with optional fusion patterns.
+    def moe_allreduce(
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        device_num_experts: torch.Tensor,
+        scale_input: torch.Tensor,
+        active_experts_token_input: torch.Tensor,
+        token_input: torch.Tensor,
+        workspace: torch.Tensor,
+        rank: int,
+        nranks: int,
+        eps: float,
+    ) -> List[torch.Tensor]:
+        """Performs MoE reduction + all-reduce operation with fusion.
 
         Args:
-            params: MoeReductionAllReduceFusionParams object for the MoE reduction + all-reduce operation.
+            residual: Residual tensor [m, hidden_dim]
+            norm_weight: Normalization weights [hidden_dim]
+            device_num_experts: Number of experts per device [1]
+            scale_input: Scale factors [global_num_experts, m]
+            active_experts_token_input: Active expert tokens [device_num_experts, m, hidden_dim]
+            token_input: Input tokens [m, hidden_dim]
+            workspace: Workspace tensor
+            rank: Current process rank
+            nranks: Total number of ranks
+            eps: Epsilon for normalization
+
+        Returns:
+            List containing [norm_out, residual_out]
         """
-        # Convert Python params to C++ struct format
-        tensors = {
-            "workspace": params.workspace,
-            "allreduce_in": params.allreduce_in,
-            "residual_in": params.residual_in,
-            "residual_out": params.residual_out,
-            "norm_out": params.norm_out,
-            "quant_out": params.quant_out,
-            "scale_out": params.scale_out,
-            "rms_gamma": params.rms_gamma,
-            "scale_factor": params.scale_factor,
-            "moe_reduction_device_num_experts": params.moe_reduction_device_num_experts,
-            "moe_reduction_scale_input": params.moe_reduction_scale_input,
-            "moe_reduction_active_experts_token_input": params.moe_reduction_active_experts_token_input,
-            "moe_reduction_token_input": params.moe_reduction_token_input,
-        }
-
-        # Filter out None tensors and get their data pointers
-        tensor_ptrs = {
-            k: (v.data_ptr() if v is not None else 0) for k, v in tensors.items()
-        }
-
-        return module.moereduction_allreduce_fusion_op(
-            params.nranks,
-            params.rank,
-            int(params.dtype),
-            params.size,
-            params.hidden_dim,
-            tensor_ptrs["workspace"],
-            tensor_ptrs["allreduce_in"],
-            tensor_ptrs["residual_in"],
-            tensor_ptrs["residual_out"],
-            tensor_ptrs["norm_out"],
-            tensor_ptrs["quant_out"],
-            tensor_ptrs["scale_out"],
-            tensor_ptrs["rms_gamma"],
-            params.rms_eps,
-            tensor_ptrs["scale_factor"],
-            int(params.layout),
-            (
-                params.stream.cuda_stream
-                if params.stream
-                else torch.cuda.current_stream().cuda_stream
-            ),
-            tensor_ptrs["moe_reduction_device_num_experts"],
-            tensor_ptrs["moe_reduction_scale_input"],
-            tensor_ptrs["moe_reduction_active_experts_token_input"],
-            tensor_ptrs["moe_reduction_token_input"],
+        return module.moe_allreduce(
+            residual,
+            norm_weight, 
+            device_num_experts,
+            scale_input,
+            active_experts_token_input,
+            token_input,
+            workspace,
+            rank,
+            nranks,
+            eps
         )
 
     return SimpleNamespace(
@@ -463,9 +351,9 @@ def get_comm_module():
         register_buffer=register_buffer,
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
-        all_reduce=all_reduce,
-        trtllm_allreduce_fusion_op=trtllm_allreduce_fusion_op,
-        trtllm_moereduction_allreduce_fusion_op=trtllm_moereduction_allreduce_fusion_op,
+        all_reduce=all_reduce, # vllm
+        allreduce=allreduce, # trtllm
+        moe_allreduce=moe_allreduce, # trtllm
     )
 
 
@@ -502,15 +390,6 @@ def all_reduce(
         fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas
     )
 
-
-def trtllm_allreduce_fusion_op(params: AllReduceFusionParams) -> None:
-    get_comm_module().trtllm_allreduce_fusion_op(params)
-
-
-def trtllm_moereduction_allreduce_fusion_op(
-    params: MoeReductionAllReduceFusionParams,
-) -> None:
-    get_comm_module().trtllm_moereduction_allreduce_fusion_op(params)
 
 
 def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:
@@ -581,3 +460,86 @@ def free_shared_buffer(
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)
+
+
+def allreduce(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    group: Optional[List[int]] = None,
+    strategy: int = 0,  # NCCL by default
+    op: int = 0,  # NONE by default
+    eps: float = 1e-6,
+) -> List[torch.Tensor]:
+    """Performs an all-reduce operation with optional fusion patterns. (from trtllm)
+
+    Args:
+        input: Input tensor to all-reduce
+        residual: Optional residual tensor for fusion
+        norm_weight: Optional normalization weights
+        scale: Optional scale factors for quantization
+        bias: Optional bias tensor
+        workspace: Optional workspace tensor
+        group: List of ranks in the process group (defaults to all ranks)
+        strategy: AllReduceStrategy type (0=NCCL, 1=MIN_LATENCY, etc)
+        op: AllReduceFusionOp type (0=NONE, 1=RESIDUAL_RMS_NORM, etc)
+        eps: Epsilon value for normalization
+
+    Returns:
+        List of output tensors depending on the fusion pattern
+    """
+    if group is None:
+        group = list(range(dist.get_world_size()))
+    return get_comm_module().allreduce(
+        input, residual, norm_weight, scale, bias, workspace, group, strategy, op, eps
+    )
+
+
+def moe_allreduce(
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    device_num_experts: torch.Tensor,
+    scale_input: torch.Tensor,
+    active_experts_token_input: torch.Tensor,
+    token_input: torch.Tensor,
+    workspace: torch.Tensor,
+    rank: Optional[int] = None,
+    nranks: Optional[int] = None,
+    eps: float = 1e-6,
+) -> List[torch.Tensor]:
+    """Performs MoE reduction + all-reduce operation with fusion. (from trtllm)
+
+    Args:
+        residual: Residual tensor [m, hidden_dim]
+        norm_weight: Normalization weights [hidden_dim]
+        device_num_experts: Number of experts per device [1]
+        scale_input: Scale factors [global_num_experts, m]
+        active_experts_token_input: Active expert tokens [device_num_experts, m, hidden_dim]
+        token_input: Input tokens [m, hidden_dim]
+        workspace: Workspace tensor
+        rank: Current process rank (defaults to current rank)
+        nranks: Total number of ranks (defaults to world size)
+        eps: Epsilon for normalization
+
+    Returns:
+        List containing [norm_out, residual_out]
+    """
+    if rank is None:
+        rank = dist.get_rank()
+    if nranks is None:
+        nranks = dist.get_world_size()
+    return get_comm_module().moe_allreduce(
+        residual,
+        norm_weight,
+        device_num_experts,
+        scale_input,
+        active_experts_token_input,
+        token_input,
+        workspace,
+        rank,
+        nranks,
+        eps
+    )
