@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
-from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple, Union, overload
+from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -27,8 +25,6 @@ from .utils import (
     MaskMode,
     _check_shape_dtype_device,
     determine_mla_backend,
-    register_custom_op,
-    register_fake_op,
 )
 
 

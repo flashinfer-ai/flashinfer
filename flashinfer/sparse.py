@@ -352,7 +352,7 @@ class BlockSparseAttentionWrapper:
         if (
             R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
-            and not q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]
+            and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
         ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False

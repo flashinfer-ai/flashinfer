@@ -84,7 +84,7 @@ def get_fmha_module(
             use_logits_soft_cap,
         ).build_and_load()
     else:
-        raise ValueError(f"SM100A is not supported on this device")
+        raise ValueError("SM100A is not supported on this device")
 
 
 def get_single_prefill_module(backend):

@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional, Tuple, Union
 
-import torch
 import triton
 import triton.language as tl
 
