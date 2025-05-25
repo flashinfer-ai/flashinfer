@@ -131,11 +131,13 @@ class AllreduceOp {
 
   ~AllreduceOp() = default;
 
-  std::vector<at::Tensor> run(at::Tensor const& input, at::optional<at::Tensor> const& residual,
-                              at::optional<at::Tensor> const& norm_weight,
-                              at::optional<at::Tensor> const& scale,
-                              at::optional<at::Tensor> const& bias,
-                              at::optional<at::Tensor> workspace) noexcept {
+  std::vector<at::Tensor> run(
+      at::Tensor const& input, at::optional<at::Tensor> const& residual,
+      at::optional<at::Tensor> const& norm_weight, at::optional<at::Tensor> const& scale,
+      at::optional<at::Tensor> const& bias, at::optional<at::Tensor> workspace,
+      at::optional<at::Tensor> maybe_reduce_out, at::optional<at::Tensor> maybe_norm_out,
+      at::optional<at::Tensor> maybe_residual_out, at::optional<at::Tensor> maybe_quant_out,
+      at::optional<at::Tensor> maybe_scale_out) noexcept {
     size_t size = input.numel();
     size_t seq_len = input.size(0);
 
@@ -146,7 +148,9 @@ class AllreduceOp {
     auto const rank = COMM_SESSION.getRank();
 
     // Dispatch to different allreduce implementations
-    return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace, mStrategy);
+    return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace,
+                              maybe_reduce_out, maybe_norm_out, maybe_residual_out, maybe_quant_out,
+                              maybe_scale_out, mStrategy);
   }
 
   int initialize() noexcept {
@@ -161,13 +165,13 @@ class AllreduceOp {
   }
 
  private:
-  std::vector<at::Tensor> runFusionAllReduce(at::Tensor const& input,
-                                             at::optional<at::Tensor> const& residual,
-                                             at::optional<at::Tensor> const& norm_weight,
-                                             at::optional<at::Tensor> const& scale,
-                                             at::optional<at::Tensor> const& bias,
-                                             at::optional<at::Tensor> workspace,
-                                             AllReduceStrategyType strategy) noexcept {
+  std::vector<at::Tensor> runFusionAllReduce(
+      at::Tensor const& input, at::optional<at::Tensor> const& residual,
+      at::optional<at::Tensor> const& norm_weight, at::optional<at::Tensor> const& scale,
+      at::optional<at::Tensor> const& bias, at::optional<at::Tensor> workspace,
+      at::optional<at::Tensor> maybe_reduce_out, at::optional<at::Tensor> maybe_norm_out,
+      at::optional<at::Tensor> maybe_residual_out, at::optional<at::Tensor> maybe_quant_out,
+      at::optional<at::Tensor> maybe_scale_out, AllReduceStrategyType strategy) noexcept {
     // Should handle only Lamport implementation
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
     int size = input.numel();
@@ -217,7 +221,8 @@ class AllreduceOp {
 
     // Handle no fusion allreduce here
     if (mOp == AllReduceFusionOp::NONE) {
-      reduce_out = torch::empty_like(input);
+      //   reduce_out = torch::empty_like(input);
+      reduce_out = maybe_reduce_out.value();
       allreduce_fusion_params.allreduce_out = reduce_out.mutable_data_ptr();
       allreduce_fusion_params.pattern =
           tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kAllReduce;
@@ -225,8 +230,10 @@ class AllreduceOp {
     // Handle allreduce fusion here
     // Prepare required output tensors for each fusion pattern
     else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-      norm_out = torch::empty_like(input);
-      residual_out = torch::empty_like(residual.value());
+      //   norm_out = torch::empty_like(input);
+      //   residual_out = torch::empty_like(residual.value());
+      norm_out = maybe_norm_out.value();
+      residual_out = maybe_residual_out.value();
 
       allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
       allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
@@ -234,9 +241,11 @@ class AllreduceOp {
           tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm;
     } else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8 ||
                mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8) {
-      quant_out = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(),
-                                         std::nullopt);
-      residual_out = torch::empty_like(residual.value());
+      //   quant_out = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(),
+      //                                      std::nullopt);
+      //   residual_out = torch::empty_like(residual.value());
+      quant_out = maybe_quant_out.value();
+      residual_out = maybe_residual_out.value();
 
       allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
       allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
@@ -245,7 +254,8 @@ class AllreduceOp {
 
       // norm out is required
       if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8) {
-        norm_out = torch::empty_like(input);
+        // norm_out = torch::empty_like(input);
+        norm_out = maybe_norm_out.value();
         allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
         allreduce_fusion_params.pattern =
             tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant;
@@ -266,11 +276,15 @@ class AllreduceOp {
       std::vector<int64_t> output_shape(input_shape.begin(), input_shape.end());
       output_shape[r - 1] = k / 2;
 
-      quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-      scale_out =
-          at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sf_vec_size)},
-                                 SF_DTYPE, input.device(), std::nullopt);
-      residual_out = torch::empty_like(residual.value());
+      //   quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(),
+      //   std::nullopt); scale_out =
+      //       at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k /
+      //       sf_vec_size)},
+      //                              SF_DTYPE, input.device(), std::nullopt);
+      //   residual_out = torch::empty_like(residual.value());
+      quant_out = maybe_quant_out.value();
+      scale_out = maybe_scale_out.value();
+      residual_out = maybe_residual_out.value();
 
       allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
       allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
@@ -280,7 +294,8 @@ class AllreduceOp {
 
       // norm out is required
       if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4) {
-        norm_out = torch::empty_like(input);
+        // norm_out = torch::empty_like(input);
+        norm_out = maybe_norm_out.value();
         allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
         allreduce_fusion_params.pattern =
             tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
@@ -338,12 +353,11 @@ class AllreduceOp {
     return {};
   }
 
-  std::vector<at::Tensor> fallbackRunSubsequentOps(at::Tensor const& input,
-                                                   torch::optional<at::Tensor> const& residual,
-                                                   torch::optional<at::Tensor> const& norm_weight,
-                                                   torch::optional<at::Tensor> const& scale,
-                                                   torch::optional<at::Tensor> const& bias,
-                                                   at::Tensor& reduce_output) noexcept {
+  std::vector<at::Tensor> fallbackRunSubsequentOps(
+      at::Tensor const& input, std::optional<at::Tensor> const& residual,
+      std::optional<at::Tensor> const& norm_weight, std::optional<at::Tensor> const& scale,
+      std::optional<at::Tensor> const& bias, at::Tensor& reduce_output,
+      std::optional<at::Tensor> maybe_norm_out) noexcept {
     // If we reach here, it means the extra fallback operations are required.
     // All patterns are broken into ALlReduce + residual_rms_norm + following operations
     // (quantization, etc.)
@@ -351,7 +365,8 @@ class AllreduceOp {
     auto const hidden_size = input.size(-1);
     auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    at::Tensor norm_out = torch::empty_like(input);
+    // at::Tensor norm_out = torch::empty_like(input);
+    at::Tensor norm_out = maybe_norm_out.value();
 
     tensorrt_llm::kernels::AllReduceParams params;
     params.fusion_params.bias_buffer = bias ? bias.value().data_ptr() : nullptr;
@@ -562,13 +577,14 @@ class AllreduceOp {
 
 #endif  // ENABLE_MULTI_DEVICE
 
-std::vector<at::Tensor> allreduce(at::Tensor const& input, at::optional<at::Tensor> const& residual,
-                                  at::optional<at::Tensor> const& norm_weight,
-                                  at::optional<at::Tensor> const& scale,
-                                  at::optional<at::Tensor> const& bias,
-                                  at::optional<at::Tensor> const& workspace,
-                                  at::List<int64_t> const& group_, int64_t const strategy_,
-                                  int64_t const fusion_op_, double const eps_) {
+std::vector<at::Tensor> allreduce(
+    at::Tensor const& input, at::optional<at::Tensor> const& residual,
+    at::optional<at::Tensor> const& norm_weight, at::optional<at::Tensor> const& scale,
+    at::optional<at::Tensor> const& bias, at::optional<at::Tensor> const& workspace,
+    at::optional<at::Tensor> maybe_reduce_out, at::optional<at::Tensor> maybe_norm_out,
+    at::optional<at::Tensor> maybe_residual_out, at::optional<at::Tensor> maybe_quant_out,
+    at::optional<at::Tensor> maybe_scale_out, at::List<int64_t> const& group_,
+    int64_t const strategy_, int64_t const fusion_op_, double const eps_) {
 #if ENABLE_MULTI_DEVICE
   auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
   auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
@@ -580,7 +596,8 @@ std::vector<at::Tensor> allreduce(at::Tensor const& input, at::optional<at::Tens
   }
   AllreduceOp op(group, dtype, strategy, fusion_op, eps);
   op.initialize();
-  return op.run(input, residual, norm_weight, scale, bias, workspace);
+  return op.run(input, residual, norm_weight, scale, bias, workspace, maybe_reduce_out,
+                maybe_norm_out, maybe_residual_out, maybe_quant_out, maybe_scale_out);
 #else
   return {input};
 #endif  // ENABLE_MULTI_DEVICE
@@ -597,6 +614,8 @@ std::vector<at::Tensor> moe_allreduce(at::Tensor const& residual, at::Tensor con
                                       at::Tensor const& scale_input,
                                       at::Tensor const& active_experts_token_input,
                                       at::Tensor const& token_input, at::Tensor workspace,
+                                      std::optional<at::Tensor> maybe_norm_out,
+                                      std::optional<at::Tensor> maybe_residual_out,
                                       int64_t const rank, int64_t const nranks, double const eps) {
   auto allreduce_fusion_params =
       tensorrt_llm::kernels::ar_fusion::moe::MoeReductionAllReduceFusionParams();
@@ -633,8 +652,10 @@ std::vector<at::Tensor> moe_allreduce(at::Tensor const& residual, at::Tensor con
   allreduce_fusion_params.moe_reduction_token_input = token_input.data_ptr();
 
   // output tensors
-  at::Tensor norm_out = torch::empty_like(token_input);
-  at::Tensor residual_out = torch::empty_like(residual);
+  //   at::Tensor norm_out = torch::empty_like(token_input);
+  //   at::Tensor residual_out = torch::empty_like(residual);
+  at::Tensor norm_out = maybe_norm_out.value();
+  at::Tensor residual_out = maybe_residual_out.value();
 
   allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
   allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
