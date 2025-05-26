@@ -16,41 +16,34 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import jit_decode_attention_func_args, jit_prefill_attention_func_args
+from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
 
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    if flashinfer.jit.has_prebuilt_ops:
-        yield
-    else:
-        try:
-            flashinfer.jit.parallel_load_modules(
-                jit_decode_attention_func_args(
-                    [torch.float16],  # q_dtypes
-                    [torch.float16],  # kv_dtypes
-                    [64, 128, 256],  # head_dims
-                    [0, 1],  # pos_encoding_modes
-                    [False],  # use_sliding_windows
-                    [False],  # use_logits_soft_caps
-                )
-                + jit_prefill_attention_func_args(
-                    [torch.float16],  # q_dtypes
-                    [torch.float16],  # kv_dtypes
-                    [64, 128, 256],  # head_dims
-                    [0, 1],  # pos_encoding_modes
-                    [False],  # use_sliding_windows
-                    [False],  # use_logits_soft_caps
-                    [False],  # use_fp16_qk_reductions
-                )
-            )
-        except Exception as e:
-            # abort the test session if warmup fails
-            pytest.exit(str(e))
-        finally:
-            yield
+    flashinfer.jit.build_jit_specs(
+        gen_decode_attention_modules(
+            [torch.float16],  # q_dtypes
+            [torch.float16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [0, 1],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_logits_soft_caps
+        )
+        + gen_prefill_attention_modules(
+            [torch.float16],  # q_dtypes
+            [torch.float16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [0, 1],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_logits_soft_caps
+            [False],  # use_fp16_qk_reductions
+        ),
+        verbose=False,
+    )
+    yield
 
 
 @pytest.mark.parametrize("kv_len", [54, 128, 999, 32789])

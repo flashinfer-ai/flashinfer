@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -5,8 +6,9 @@ import torch
 from ..jit import cudnn_fmha_gen_module
 
 
+@functools.cache
 def get_cudnn_fmha_gen_module():
-    return cudnn_fmha_gen_module()
+    return cudnn_fmha_gen_module().build_and_load()
 
 
 def cudnn_batch_prefill_with_kv_cache(

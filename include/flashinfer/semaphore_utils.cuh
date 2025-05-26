@@ -32,7 +32,7 @@ __global__ void zero_gmem_semaphore(T* semaphore, int size) {
 template <typename T>
 cudaError_t zero_gmem_semaphore_launcher(T* semaphore, int size, bool enable_pdl,
                                          cudaStream_t stream) {
-  cudaLaunchConfig_t config;
+  cudaLaunchConfig_t config = {0};
   config.gridDim = 1;
   config.blockDim = 128;
   config.dynamicSmemBytes = 0;

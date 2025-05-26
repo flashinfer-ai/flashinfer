@@ -19,28 +19,29 @@ from typing import Optional, Union
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
 
 _sampling_module = None
 
 
+def gen_sampling_module() -> JitSpec:
+    return gen_jit_spec(
+        "sampling",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sampling.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "renorm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
+        ],
+    )
+
+
 def get_sampling_module():
     global _sampling_module
     if _sampling_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
-
-            module = _kernels
-        else:
-            module = load_cuda_ops(
-                "sampling",
-                [
-                    FLASHINFER_CSRC_DIR / "sampling.cu",
-                    FLASHINFER_CSRC_DIR / "renorm.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
-                ],
-            )
+        module = gen_sampling_module().build_and_load()
 
         # torch library for sampling_from_logits
         @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())

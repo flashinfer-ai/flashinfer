@@ -17,9 +17,9 @@ limitations under the License.
 import ctypes
 import os
 
-from . import cubin_loader
-
 # Re-export
+from . import cubin_loader
+from . import env as env
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import cudnn_fmha_gen_module as cudnn_fmha_gen_module
@@ -59,28 +59,15 @@ from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import trtllm_fmha_gen_module as trtllm_fmha_gen_module
-from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
-from .env import *
-from .utils import parallel_load_modules as parallel_load_modules
+from .core import JitSpec as JitSpec
+from .core import build_jit_specs as build_jit_specs
+from .core import clear_cache_dir as clear_cache_dir
+from .core import gen_jit_spec as gen_jit_spec
+from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
+from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
 )
 if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
     ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
-
-
-try:
-    from .. import flashinfer_kernels, flashinfer_kernels_sm90  # noqa: F401
-    from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
-
-    has_prebuilt_ops = True
-except ImportError as e:
-    if "undefined symbol" in str(e):
-        raise ImportError("Loading prebuilt ops failed.") from e
-
-    from .core import logger
-
-    logger.info("Prebuilt kernels not found, using JIT backend")
-    prebuilt_ops_uri = {}
-    has_prebuilt_ops = False

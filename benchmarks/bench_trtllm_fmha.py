@@ -33,7 +33,7 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     kv_data = (
         torch.randn(num_blocks, 2, num_kv_heads, page_size, head_dim)
         .to(0)
-        .to(torch.float8_e4m3fn)
+        .to(torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.float16)
     )
 
     ms = triton.testing.do_bench_cudagraph(

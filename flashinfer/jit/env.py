@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# NOTE(lequn): Do not "from .jit.env import xxx".
+# Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
+# This helps AOT script to override envs.
+
 import os
 import pathlib
 import re
@@ -48,10 +52,12 @@ FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
 _package_root = pathlib.Path(__file__).resolve().parents[1]
+FLASHINFER_DATA = _package_root / "data"
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
+FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",

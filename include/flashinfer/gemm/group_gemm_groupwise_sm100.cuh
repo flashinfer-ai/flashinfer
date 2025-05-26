@@ -33,36 +33,40 @@ template <typename ScaleConfig, typename DTypeIn, typename DTypeSF, typename DTy
           typename ProblemShape, typename StrideA, typename StrideB, typename StrideC,
           typename LayoutSFA, typename LayoutSFB>
 __global__ void compute_sm100_cutlass_group_gemm_args(
-    DTypeIn* A, DTypeIn* B, DTypeSF* SFA, DTypeSF* SFB, DTypeOut* C, int* m_indptr, int n, int k,
-    int batch_size, int scale_granularity_m, int scale_granularity_n, int scale_granularity_k,
-    ProblemShape* problem_sizes, const DTypeIn** A_ptr, const DTypeIn** B_ptr,
-    const DTypeSF** SFA_ptr, const DTypeSF** SFB_ptr, const DTypeOut** C_ptr, DTypeOut** D_ptr,
-    StrideA* stride_A, StrideB* stride_B, StrideC* stride_C, LayoutSFA* layout_SFA,
-    LayoutSFB* layout_SFB) {
+    DTypeIn* A, DTypeIn* B, DTypeSF* SFA, DTypeSF* SFB, DTypeOut* C, int* m_indptr, int max_m,
+    int n, int k, int batch_size, int scale_granularity_m, int scale_granularity_n,
+    int scale_granularity_k, ProblemShape* problem_sizes, const DTypeIn** A_ptr,
+    const DTypeIn** B_ptr, const DTypeSF** SFA_ptr, const DTypeSF** SFB_ptr, const DTypeOut** C_ptr,
+    DTypeOut** D_ptr, StrideA* stride_A, StrideB* stride_B, StrideC* stride_C,
+    LayoutSFA* layout_SFA, LayoutSFB* layout_SFB) {
   int i = blockIdx.x;
   int m = m_indptr[i + 1] - m_indptr[i];
   problem_sizes[i] = ProblemShape(m, n, k);
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_C[i] = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
-  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m_indptr[batch_size], n, k, 1));
+  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(max_m, n, k, 1));
   layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-  A_ptr[i] = A + m_indptr[i] * k;
-  B_ptr[i] = B + i * k * n;
-  C_ptr[i] = C + m_indptr[i] * n;
-  D_ptr[i] = C + m_indptr[i] * n;
-  SFA_ptr[i] = SFA + m_indptr[i] / scale_granularity_m;
-  SFB_ptr[i] = SFB + i * k * n / scale_granularity_n / scale_granularity_k;
+  A_ptr[i] = A + int64_t(m_indptr[i]) * int64_t(k);
+  B_ptr[i] = B + int64_t(i) * int64_t(k) * int64_t(n);
+  C_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
+  D_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
+  SFA_ptr[i] = SFA + int64_t(m_indptr[i]) / int64_t(scale_granularity_m);
+  SFB_ptr[i] = SFB + int64_t(i) * int64_t(k) * int64_t(n) / int64_t(scale_granularity_n) /
+                         int64_t(scale_granularity_k);
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
-template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
-          typename DTypeOut>
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, int MmaSM,
+          typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_buffer_size_in_bytes,
                                                  void* float_buffer,
                                                  size_t float_buffer_size_in_bytes, DTypeIn* A,
                                                  DTypeIn* B, float* SFA, float* SFB, DTypeOut* C,
-                                                 int* m_indptr, int n, int k, int batch_size,
-                                                 cudaStream_t stream) {
+                                                 int* m_indptr, int max_m, int n, int k,
+                                                 int batch_size, cudaStream_t stream) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
 
   using ElementA = DTypeIn;                   // Element type for A matrix operand
@@ -90,8 +94,8 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   using ElementAccumulator = float;
   using ElementCompute = float;
 
-  using MmaTileShape_MNK = Shape<_256, _128, _128>;
-  using ClusterShape_MNK = Shape<_2, _1, _1>;
+  using MmaTileShape_MNK = Shape<cute::Int<MmaSM * 128>, _128, _128>;
+  using ClusterShape_MNK = Shape<cute::Int<MmaSM>, _1, _1>;
 
   using ScaleConfig =
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
@@ -100,11 +104,19 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
+  using EpilogueSchedule =
+      std::conditional_t<MmaSM == 1, cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm,
+                         cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTileShape_MNK, ClusterShape_MNK,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
-      LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,
-      cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
+      LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD, EpilogueSchedule>::CollectiveOp;
+
+  using MainloopSchedule =
+      std::conditional_t<MmaSM == 1,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100,
+                         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm100>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementA,
@@ -112,7 +124,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
       AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm100>::CollectiveOp;
+      MainloopSchedule>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
                                                           CollectiveEpilogue, void>;
@@ -158,10 +170,26 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   auto layout_SFB = allocator.aligned_alloc<LayoutSFB>(batch_size * sizeof(LayoutSFB), 16,
                                                        "sm100_groupwise_group_gemm_layout_SFB");
 
-  compute_sm100_cutlass_group_gemm_args<ScaleConfig><<<batch_size, 1, 0, stream>>>(
-      A, B, SFA, SFB, C, m_indptr, n, k, batch_size, ScaleGranularityM, ScaleGranularityN,
-      ScaleGranularityK, problem_sizes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, D_ptr, stride_A,
-      stride_B, stride_C, layout_SFA, layout_SFB);
+  cudaLaunchConfig_t config;
+  config.gridDim = batch_size;
+  config.blockDim = 1;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = true;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  auto prepare_args_kernel =
+      compute_sm100_cutlass_group_gemm_args<ScaleConfig, ElementA, float, ElementC,
+                                            ProblemShape::UnderlyingProblemShape, StrideA, StrideB,
+                                            StrideC, LayoutSFA, LayoutSFB>;
+
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+      &config, prepare_args_kernel, A, B, SFA, SFB, C, m_indptr, max_m, n, k, batch_size,
+      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, problem_sizes, A_ptr, B_ptr, SFA_ptr,
+      SFB_ptr, C_ptr, D_ptr, stride_A, stride_B, stride_C, layout_SFA, layout_SFB));
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
@@ -201,7 +229,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-  CUTLASS_CHECK(gemm.run(stream));
+  CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/true));
   return cudaSuccess;
 }
 
