@@ -1,13 +1,10 @@
 # flashinfer: adapted from sglang + vllm
 # refer to sgl-kernel/tests/test_custom_allreduce.py from sglang
 
-import ctypes
 import logging
 import multiprocessing as mp
-import random
 import socket
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 import torch
