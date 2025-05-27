@@ -51,7 +51,7 @@ def generate_build_meta(aot_build_meta: dict) -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["numpy", "torch", "ninja"]
+install_requires = ["numpy", "torch", "ninja", "requests"]
 generate_build_meta({})
 
 if enable_aot:
@@ -70,7 +70,8 @@ if enable_aot:
     cuda_version = get_cuda_version()
     torch_full_version = Version(torch.__version__)
     torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
-    install_requires = [f"torch == {torch_version}.*"]
+    install_requires = [req for req in install_requires if not req.startswith("torch ")]
+    install_requires.append(f"torch == {torch_version}.*")
 
     aot_build_meta = {}
     aot_build_meta["cuda_major"] = cuda_version.major
