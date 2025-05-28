@@ -66,7 +66,10 @@ def cudnn_batch_prefill_with_kv_cache(
             raise ValueError("lse must have shape (bs, s_q, h_qo)")
 
     if out is None:
-        out = torch.empty(bs, s_q, h_qo, d_vo, device=q.device, dtype=q.dtype)
+        # print(f"out is nan, creating new out tensor")
+        # out = torch.full((bs, s_q, h_qo, d_vo), float('3.0'), device=q.device, dtype=q.dtype)
+        out = torch.randn((bs, h_qo, s_q, d_vo), device=q.device, dtype=q.dtype)
+        out = out.as_strided((bs, h_qo, s_q, d_vo), (h_qo * d_vo, d_vo, h_qo * d_vo, 1))
 
     actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
     actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device)
@@ -91,4 +94,12 @@ def cudnn_batch_prefill_with_kv_cache(
         batch_offsets,
     )
 
+    # import csv
+    # import numpy as np
+    # if return_lse:
+    #     # Save lse tensor to file
+    #     # Convert LSE tensor to numpy array and save to file with descriptive name
+    #     lse_numpy = lse.cpu().numpy()
+    #     with open('cudnn_prefill_lse.csv', 'w', newline='') as f:
+    #         csv.writer(f).writerows([[float(x)] for x in lse_numpy.flatten()])
     return out

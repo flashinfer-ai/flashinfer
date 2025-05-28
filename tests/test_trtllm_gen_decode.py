@@ -96,6 +96,10 @@ def test_trtllm_batch_decode(
         .to(device)
     )
     kv_indices = torch.arange(num_blocks, device=device).int().to(device)
+
+    print(f"kv_indptr: {kv_indptr}")
+    print(f"kv_indices: {kv_indices}")
+
     kv_last_page_len = (
         torch.full((batch_size,), page_size, device=device).int().to(device)
     )

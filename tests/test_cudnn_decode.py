@@ -81,4 +81,8 @@ def test_cudnn_decode(
         num_pages_per_seq,
     )
 
+    # import csv
+    # output_flat = output.cpu().numpy().flatten()
+    # with open('cudnn_decode_output.csv', 'w', newline='') as f:
+    #     csv.writer(f).writerows([[x] for x in output_flat])
     torch.cuda.synchronize()
