@@ -33,6 +33,8 @@ namespace flashinfer {
 
 namespace cudnn_sdpa_kernel_launcher {
 
+#include <flashinfer/cubin_loader.h>
+
 inline __host__ int clz(int x) {
   for (int i = 31; i >= 0; --i) {
     if ((1 << i) & x) {

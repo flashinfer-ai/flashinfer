@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import functools
 import os
 
 # Re-export
@@ -66,6 +67,16 @@ from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .cubin_loader import setup_cubin_loader
+
+
+@functools.cache
+def get_cudnn_fmha_gen_module():
+    print("Getting cudnn fmha gen module")
+    mod = cudnn_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"

@@ -3,12 +3,7 @@ from typing import Optional
 
 import torch
 
-from ..jit import cudnn_fmha_gen_module
-
-
-@functools.cache
-def get_cudnn_fmha_gen_module():
-    return cudnn_fmha_gen_module().build_and_load()
+from ..jit import get_cudnn_fmha_gen_module
 
 
 def cudnn_batch_decode_with_kv_cache(
