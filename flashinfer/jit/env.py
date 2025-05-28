@@ -59,3 +59,4 @@ CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",
 ]
+SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"

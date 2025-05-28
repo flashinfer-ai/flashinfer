@@ -24,6 +24,9 @@ import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
+from .jit import env as jit_env
+from .jit import gen_jit_spec
+
 IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
 
@@ -388,3 +391,39 @@ def _check_shape_dtype_device(
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
+
+
+def get_logging_module():
+    return gen_jit_spec(
+        "logging",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "logging.cu",
+        ],
+        extra_include_paths=[
+            jit_env.SPDLOG_INCLUDE_DIR,
+            jit_env.FLASHINFER_INCLUDE_DIR,
+        ],
+    ).build_and_load()
+
+
+class LogLevel(Enum):
+    TRACE = 0
+    DEBUG = 1
+    INFO = 2
+    WARN = 3
+    ERROR = 4
+    CRITICAL = 5
+
+
+log_level_map = {
+    "trace": LogLevel.TRACE,
+    "debug": LogLevel.DEBUG,
+    "info": LogLevel.INFO,
+    "warn": LogLevel.WARN,
+    "error": LogLevel.ERROR,
+    "critical": LogLevel.CRITICAL,
+}
+
+
+def set_log_level(lvl_str: str) -> None:
+    get_logging_module().set_log_level(log_level_map[lvl_str].value)

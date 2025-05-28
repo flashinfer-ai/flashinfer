@@ -1573,26 +1573,6 @@ cudaError_t customAllReduce(AllReduceParams<T>& params, AllReduceStrategyType st
 }
 
 template <typename T>
-cudaError_t launchResidualRmsNormKernel(AllReduceParams<T>& params, AllReduceFusionOp fusionOp,
-                                        bool launch_with_pdl, cudaStream_t stream) {
-  if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer) {
-    return reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream, fusionOp);
-  } else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer) {
-    return reduce_fusion::rms_norm_kernel_launcher<T, true, true, false>(params, stream, fusionOp);
-  } else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer) {
-    return reduce_fusion::rms_norm_kernel_launcher<T, false, true, true>(params, stream, fusionOp);
-  } else {
-    return reduce_fusion::rms_norm_kernel_launcher<T, false, true, false>(params, stream, fusionOp);
-  }
-}
-
-template <typename T>
-cudaError_t residualRmsNorm(AllReduceParams<T>& params, cudaStream_t stream,
-                            AllReduceFusionOp fusionOp) {
-  return launchResidualRmsNormKernel<T>(params, stream, fusionOp);
-}
-
-template <typename T>
 cudaError_t lamportInitialize(void* buffer, size_t size, cudaStream_t stream) {
   if (size == 0) {
     return cudaSuccess;
