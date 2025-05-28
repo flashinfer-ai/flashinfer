@@ -20,12 +20,30 @@
 
 using namespace flashinfer::trtllm_allreduce;
 
+#define DISPATCH_ALLREDUCE_DTYPE(TENSOR_SCALAR_TYPE, CTYPE_ALIAS, CODE_BLOCK)               \
+  [&]() {                                                                                   \
+    if (TENSOR_SCALAR_TYPE == at::ScalarType::Float) {                                      \
+      using CTYPE_ALIAS = float;                                                            \
+      CODE_BLOCK;                                                                           \
+    } else if (TENSOR_SCALAR_TYPE == at::ScalarType::Half) {                                \
+      using CTYPE_ALIAS = half;                                                             \
+      CODE_BLOCK;                                                                           \
+    } else if (TENSOR_SCALAR_TYPE == at::ScalarType::BFloat16) {                            \
+      using CTYPE_ALIAS = __nv_bfloat16;                                                    \
+      CODE_BLOCK;                                                                           \
+    } else {                                                                                \
+      TORCH_CHECK(false, "Unsupported DType for custom op dispatch: ", TENSOR_SCALAR_TYPE); \
+    }                                                                                       \
+  }()
+
 void trtllm_lamport_initialize(at::Tensor& buffer) {
-  // TODO: add lamport initialization to lamportInitialize
-  auto status =
-      lamportInitialize(buffer.data_ptr(), buffer.numel(), at::cuda::getCurrentCUDAStream());
+  DISPATCH_ALLREDUCE_DTYPE(buffer.scalar_type(), c_type, {
+    cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
+    auto status = lamportInitialize<c_type>(static_cast<void*>(buffer.data_ptr()),
+                                            static_cast<size_t>(buffer.numel()), raw_stream);
   TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
                                          std::string(cudaGetErrorString(status)));
+  });
 }
 
 void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& out, int64_t tp_size,
