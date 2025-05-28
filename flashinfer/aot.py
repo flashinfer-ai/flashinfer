@@ -12,7 +12,7 @@ from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
 from .comm import gen_comm_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
-from .jit import build_jit_specs
+from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
     gen_batch_decode_module,
