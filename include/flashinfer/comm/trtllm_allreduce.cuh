@@ -28,7 +28,49 @@ namespace flashinfer {
 
 namespace trtllm_allreduce {
 
+constexpr size_t WARP_SIZE = 32;
+constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
+constexpr size_t MAX_RANKS_PER_NODE = 16;
+constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 constexpr size_t NUM_POINTERS_PER_RANK = 7;
+
+namespace details {
+
+static constexpr int kBytesPerAccess = 16;
+static constexpr int kWarpSize = 32;
+static constexpr int kMaxCtaSize = 1024;
+static constexpr int kClusterMaxSize = 8;
+static constexpr int kLamportTokenNumThreshold = 16;
+static constexpr int kLamportHiddenSizeThreshold = 256;
+
+}  // namespace details
+
+enum class AllReduceStrategyType : int8_t {
+  NCCL = 0,
+  MIN_LATENCY = 1,
+  UB = 2,
+  AUTO = 3,
+  ONESHOT = 4,
+  TWOSHOT = 5,
+  LOWPRECISION = 6,
+};
+
+enum class AllReduceStrategyConfig : int8_t {
+  USE_MEMCPY = 1 << 0,
+  PUSH_MODE = 1 << 1,
+};
+
+enum class AllReduceFusionOp : int8_t {
+  NONE = 0,
+  RESIDUAL_RMS_NORM = 1,
+  LAST_PROCESS_FOR_UB = 2,
+  RESIDUAL_RMS_PREPOST_NORM = 3,
+  RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
+  RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
+  RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
+  RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
+  MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -49,6 +91,32 @@ struct neg_zero<nv_bfloat16> {
 
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
+
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    if (vec[i] == neg_zero_v<T>) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    vec[i] = (vec[i] == neg_zero_v<T>) ? static_cast<T>(0.f) : vec[i];
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void set_neg_zero(int4* addr) {
+  vec_t<T, 4> val;
+  val.fill(neg_zero_v<T>);
+  val.store_global_volatile(addr);
+}
 
 static inline __device__ void st_flag_release(uint32_t const& flag, uint32_t* flag_addr) {
 #if __CUDA_ARCH__ >= 700
@@ -414,32 +482,6 @@ cudaError_t rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t strea
       }
     }
   }
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) {
-    if (vec[i] == neg_zero_v<T>) {
-      return true;
-    }
-  }
-  return false;
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) {
-    vec[i] = (vec[i] == neg_zero_v<T>) ? static_cast<T>(0.f) : vec[i];
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ void set_neg_zero(int4* addr) {
-  vec_t<T, 4> val;
-  val.fill(neg_zero_v<T>);
-  val.store_global_volatile(addr);
 }
 
 template <typename T, int RanksPerNode, bool PushMode>
@@ -896,18 +938,15 @@ __global__ void __launch_bounds__(1024, 1)
 #endif
 }
 
-static constexpr int kLamportTokenNumThreshold = 16;
-static constexpr int kLamportHiddenSizeThreshold = 256;
-
 template <typename T>
 bool is_lamport_supported(int token_num, int hidden_size) {
   if (!std::is_same_v<T, half> && !std::is_same_v<T, __nv_bfloat16>) {
     return false;
   }
-  if (token_num > kLamportTokenNumThreshold) {
+  if (token_num > details::kLamportTokenNumThreshold) {
     return false;
   }
-  if (hidden_size < kLamportHiddenSizeThreshold) {
+  if (hidden_size < details::kLamportHiddenSizeThreshold) {
     return false;
   }
   return true;
@@ -1391,9 +1430,9 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false,
           bool Bias = false, bool Affine = false>
-cudaError_t AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConfig config,
-                                      AllReduceFusionOp fusionOp, AllReduceParams& params,
-                                      bool launch_with_pdl, cudaStream_t stream) {
+cudaError_t AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceFusionOp fusionOp,
+                                      AllReduceParams& params, bool launch_with_pdl,
+                                      cudaStream_t stream) {
   FLASHINFER_CHECK((fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM ||
                     fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM),
                    "Unsupported AllReduceFusionOp: %d", static_cast<int>(fusionOp));
@@ -1440,29 +1479,28 @@ cudaError_t AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrat
 }
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
-cudaError_t AllReduceNormDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig config,
-                                  AllReduceFusionOp fusionOp, AllReduceParams& params,
-                                  bool launch_with_pdl, cudaStream_t stream) {
+cudaError_t AllReduceNormDispatch(AllReduceStrategyType algo, AllReduceFusionOp fusionOp,
+                                  AllReduceParams& params, bool launch_with_pdl,
+                                  cudaStream_t stream) {
   if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer) {
     return AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, true, true>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+        algo, fusionOp, params, launch_with_pdl, stream);
   } else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer) {
     return AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, true, false>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+        algo, fusionOp, params, launch_with_pdl, stream);
   } else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer) {
     return AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, false, true>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+        algo, fusionOp, params, launch_with_pdl, stream);
   } else {
     return AllReduceNormKernelLaunch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY, false, false>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+        algo, fusionOp, params, launch_with_pdl, stream);
   }
   return cudaSuccess;
 }
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
-cudaError_t AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig config,
-                              AllReduceFusionOp fusionOp, AllReduceParams& params,
-                              bool launch_with_pdl, cudaStream_t stream) {
+cudaError_t AllReduceDispatch(AllReduceStrategyType algo, AllReduceFusionOp fusionOp,
+                              AllReduceParams& params, bool launch_with_pdl, cudaStream_t stream) {
   FLASHINFER_CHECK(fusionOp == AllReduceFusionOp::NONE, "Unsupported AllReduceFusionOp: %d",
                    static_cast<int>(fusionOp));
   FLASHINFER_CHECK(!(USE_MEMCPY && PUSH_MODE), "Memcpy cannot be used with PUSH_MODE.");
@@ -1503,9 +1541,9 @@ cudaError_t AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfi
 }
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCPY = false>
-cudaError_t AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceStrategyConfig config,
-                                    AllReduceFusionOp fusionOp, AllReduceParams& params,
-                                    bool launch_with_pdl, cudaStream_t stream) {
+cudaError_t AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceFusionOp fusionOp,
+                                    AllReduceParams& params, bool launch_with_pdl,
+                                    cudaStream_t stream) {
   if (fusionOp == AllReduceFusionOp::NONE) {
     FLASHINFER_LOG_DEBUG("AllReduceDispatch enabled");
     return AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(
