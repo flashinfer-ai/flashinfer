@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import math
 import os
 from enum import Enum
@@ -462,3 +463,38 @@ log_level_map = {
 
 def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
+
+
+@functools.cache
+def get_trtllm_utils_module():
+    return gen_jit_spec(
+        "trtllm_utils",
+        [
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/delayStream.cu",
+        ],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "cutlass_extensions"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "internal_cutlass_kernels"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "internal_cutlass_kernels",
+        ],
+    ).build_and_load()
+
+
+def delay_kernel(stream_delay_micro_secs):
+    get_trtllm_utils_module().delay_kernel(stream_delay_micro_secs)
