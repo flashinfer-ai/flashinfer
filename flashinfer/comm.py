@@ -26,7 +26,7 @@ from torch.distributed import ProcessGroup
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import register_custom_op
 
 # NOTE(Zihao): we should use cuda-python instead of ctypes cuda runtime bindings.
@@ -207,7 +207,9 @@ def gen_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
         ],
+        extra_cuda_cflags=sm100a_nvcc_flags,
     )
 
 

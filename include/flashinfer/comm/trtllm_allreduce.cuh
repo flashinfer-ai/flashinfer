@@ -15,6 +15,8 @@
  */
 
 #include <cooperative_groups.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <tuple>
 #include <type_traits>
@@ -23,7 +25,6 @@
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
-#include "trtllm_allreduce_params.cuh"
 
 namespace flashinfer {
 
@@ -61,21 +62,127 @@ enum class AllReduceStrategyConfig : int8_t {
   PUSH_MODE = 1 << 1,
 };
 
+//////////////////////
+
+enum class AllReduceFusionOp : int8_t {
+  NONE = 0,
+  RESIDUAL_RMS_NORM = 1,
+  LAST_PROCESS_FOR_UB = 2,
+  RESIDUAL_RMS_PREPOST_NORM = 3,
+  RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
+  RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
+  RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
+  RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
+  MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+};
+
+template <typename T>
+bool is_lamport_supported(int token_num, int hidden_size) {
+  if (!std::is_same_v<T, half> && !std::is_same_v<T, __nv_bfloat16>) {
+    return false;
+  }
+  if (token_num > details::kLamportTokenNumThreshold) {
+    return false;
+  }
+  if (hidden_size < details::kLamportHiddenSizeThreshold) {
+    return false;
+  }
+  return true;
+}
+
+struct AllReduceFusionParams {
+  AllReduceFusionParams()
+      : bias_buffer(nullptr),
+        residual_buffer(nullptr),
+        weight_buffer(nullptr),
+        weight_buffer_pre_residual_norm(nullptr),
+        intermediate_buffer(nullptr) {}
+
+  // gemm bias
+  void const* bias_buffer;
+  // residuial add
+  void const* residual_buffer;
+  // rms norm
+  int hidden_size;                              // equal to normalized_shape
+  void const* weight_buffer;                    // norm elem-wise affine gamma
+  void const* weight_buffer_pre_residual_norm;  // for gemma norm before residual
+  float eps;
+  // new residual
+  void* intermediate_buffer;
+  void* lamport_peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 3];
+};
+
+template <typename T>
+struct AllReduceParams {
+  size_t elts_total;
+  size_t elts_per_rank;
+  size_t elts_per_block;
+  size_t rank_offset;
+  size_t ranks_per_node;
+  size_t local_rank;
+  uint32_t barrier_flag;
+  uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
+  uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
+  void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
+  void* local_output_buffer_ptr;
+  void const* local_input_buffer_ptr;
+
+  AllReduceFusionParams fusion_params;
+
+  static AllReduceParams deserialize(void* buffer, size_t tpSize, size_t tpRank, int token_num,
+                                     int hidden_size, AllReduceFusionOp op) {
+    void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
+    int flag_offset;
+    if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
+        is_lamport_supported<T>(token_num, hidden_size)) {
+      flag_offset = 0;
+    } else {
+      flag_offset = 1;
+    }
+    auto const flag_ptr = &buffer[NUM_POINTERS_PER_RANK * tpSize + flag_offset];
+    // cannot use 0 since 0 represents released state for barrier
+    *flag_ptr += 1;
+    uint32_t flag_value = *flag_ptr;
+    AllReduceParams params;
+    // Even plugins use ping buffers, odd plugins use pong.
+    // That way, we don't need to wait for other GPUs to be done
+    // before copying input tensor to workspace.
+    auto const buffer_offset = (flag_value % 2 == 0) ? 0 : tpSize;
+
+    for (int i = 0; i < tpSize; ++i) {
+      params.peer_comm_buffer_ptrs[i] = buffer_ptrs[buffer_offset + i];
+    }
+    for (int i = 0; i < tpSize; ++i) {
+      params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
+    }
+    for (int i = 0; i < tpSize; ++i) {
+      params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[3 * tpSize + i]);
+    }
+    params.barrier_flag = flag_value;
+    params.ranks_per_node = tpSize;
+    params.local_rank = tpRank;
+
+    return params;
+  }
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
 struct neg_zero {
-  constexpr static T value = -T(0);
+  static constexpr T value = -T(0);
 };
 
 template <>
 struct neg_zero<half> {
-  constexpr static half value = CUDART_NEG_ZERO_HALF;
+  static constexpr unsigned short neg_zero_bits = 0x8000U;
+  static constexpr __half value = __half_raw{neg_zero_bits};
 };
 
 template <>
 struct neg_zero<nv_bfloat16> {
-  constexpr static nv_bfloat16 value = CUDART_NEG_ZERO_BF16;
+  static constexpr unsigned short neg_zero_bits = 0x8000U;
+  static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
 };
 
 template <typename T>
@@ -131,6 +238,7 @@ static inline __device__ uint32_t ld_flag_acquire(uint32_t* flag_addr) {
 template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(vec_t<T, VEC_SIZE> a, vec_t<T, VEC_SIZE> b) {
   vec_t<T, VEC_SIZE> ret;
+#pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
     ret[i] = a[i] + b[i];
   }
@@ -459,8 +567,9 @@ struct Reducer;
 
 template <typename T, int RanksPerNode>
 struct Reducer<T, RanksPerNode, true> {
-  static __device__ __forceinline__ int4 allreduce(AllReduceParams<T>& params, int global_offset) {
-    static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
+  constexpr static uint32_t VEC_SIZE = 16 / sizeof(T);
+  static __device__ __forceinline__ vec_t<T, VEC_SIZE> allreduce(AllReduceParams<T>& params,
+                                                                 int global_offset) {
     int ping = params.barrier_flag % 3;
     int pong = (params.barrier_flag + 2) % 3;
     T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
@@ -907,20 +1016,6 @@ __global__ void __launch_bounds__(1024, 1)
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
-}
-
-template <typename T>
-bool is_lamport_supported(int token_num, int hidden_size) {
-  if (!std::is_same_v<T, half> && !std::is_same_v<T, __nv_bfloat16>) {
-    return false;
-  }
-  if (token_num > details::kLamportTokenNumThreshold) {
-    return false;
-  }
-  if (hidden_size < details::kLamportHiddenSizeThreshold) {
-    return false;
-  }
-  return true;
 }
 
 template <typename T, int RanksPerNode, bool Bias, bool Affine>
@@ -1496,12 +1591,12 @@ cudaError_t AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceFusionO
                                     cudaStream_t stream) {
   if (fusionOp == AllReduceFusionOp::NONE) {
     FLASHINFER_LOG_DEBUG("AllReduceDispatch enabled");
-    return AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+    return AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, fusionOp, params,
+                                                                       launch_with_pdl, stream);
   } else {
     FLASHINFER_LOG_DEBUG("AllReduceNormDispatch enabled");
-    return AllReduceNormDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+    return AllReduceNormDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, fusionOp, params,
+                                                                           launch_with_pdl, stream);
   }
 }
 
@@ -1512,11 +1607,11 @@ cudaError_t AllReduceDispatchPushMode(AllReduceStrategyType algo, AllReduceStrat
   if (static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(config) &
       static_cast<std::underlying_type_t<AllReduceStrategyConfig>>(
           AllReduceStrategyConfig::USE_MEMCPY)) {
-    return AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+    return AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, true>(algo, fusionOp, params,
+                                                                       launch_with_pdl, stream);
   } else {
-    return AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(
-        algo, config, fusionOp, params, launch_with_pdl, stream);
+    return AllReduceDispatchMemcpy<T, RANKS_PER_NODE, PUSH_MODE, false>(algo, fusionOp, params,
+                                                                        launch_with_pdl, stream);
   }
 }
 
@@ -1542,8 +1637,8 @@ cudaError_t AllReduceDispatchType(AllReduceParams<T>& params, AllReduceStrategyT
                                   bool launch_with_pdl, cudaStream_t stream) {
   switch (params.ranks_per_node) {
     case 2:
-      return AllReduceDispatchRanksPerNode<T, 2>(strat, config, fusionOp, params, launch_with_pdl,
-                                                 stream);
+      return AllReduceDispatchRanksPerNode<T, /*RANKS_PER_NODE=*/2>(strat, config, fusionOp, params,
+                                                                    launch_with_pdl, stream);
     case 4:
       return AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, launch_with_pdl,
                                                  stream);
