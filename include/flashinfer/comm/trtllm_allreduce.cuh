@@ -23,6 +23,7 @@
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
+#include "trtllm_allreduce_params.cuh"
 
 namespace flashinfer {
 
@@ -58,18 +59,6 @@ enum class AllReduceStrategyType : int8_t {
 enum class AllReduceStrategyConfig : int8_t {
   USE_MEMCPY = 1 << 0,
   PUSH_MODE = 1 << 1,
-};
-
-enum class AllReduceFusionOp : int8_t {
-  NONE = 0,
-  RESIDUAL_RMS_NORM = 1,
-  LAST_PROCESS_FOR_UB = 2,
-  RESIDUAL_RMS_PREPOST_NORM = 3,
-  RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
-  RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
-  RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
-  RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
-  MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -402,8 +391,8 @@ __global__ void rms_pre_post_norm_kernel(
 }
 
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
-cudaError_t rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream,
-                                     AllReduceFusionOp fusionOp, bool launch_with_pdl) {
+cudaError_t rms_norm_kernel_launcher(AllReduceParams& params, AllReduceFusionOp fusionOp,
+                                     bool launch_with_pdl, cudaStream_t stream) {
   static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
   FLASHINFER_CHECK(params.fusion_params.hidden_size % VEC_SIZE == 0,
                    "hidden_size must be a multiple of ", VEC_SIZE);
@@ -422,66 +411,47 @@ cudaError_t rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t strea
   int smem_size = 0;
   if (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size) {
     smem_size = params.fusion_params.hidden_size * sizeof(T);
-    if (launch_with_pdl) {
-      cudaLaunchConfig_t kernelConfig = {0};
-      kernelConfig.gridDim = cta_num;
-      kernelConfig.blockDim = cta_size;
-      kernelConfig.dynamicSmemBytes = smem_size;
-      kernelConfig.stream = stream;
+    cudaLaunchConfig_t kernelConfig = {0};
+    kernelConfig.gridDim = cta_num;
+    kernelConfig.blockDim = cta_size;
+    kernelConfig.dynamicSmemBytes = smem_size;
+    kernelConfig.stream = stream;
 
-      cudaLaunchAttribute attribute[1];
-      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attribute[0].val.programmaticStreamSerializationAllowed = 1;
-      kernelConfig.attrs = attribute;
-      kernelConfig.numAttrs = 1;
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl;
+    kernelConfig.attrs = attribute;
+    kernelConfig.numAttrs = 1;
 
-      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
-      } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
-      }
-    } else {
-      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-        rms_norm_kernel<T, Bias, Residual, Affine, true>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
-      } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-        rms_pre_post_norm_kernel<T, Bias, Residual, Affine>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
-      }
+    if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
+    } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
     }
   } else {
-    if (launch_with_pdl) {
-      cudaLaunchConfig_t kernelConfig = {0};
-      kernelConfig.gridDim = cta_num;
-      kernelConfig.blockDim = cta_size;
-      kernelConfig.dynamicSmemBytes = smem_size;
-      kernelConfig.stream = stream;
+    cudaLaunchConfig_t kernelConfig = {0};
+    kernelConfig.gridDim = cta_num;
+    kernelConfig.blockDim = cta_size;
+    kernelConfig.dynamicSmemBytes = smem_size;
+    kernelConfig.stream = stream;
 
-      cudaLaunchAttribute attribute[1];
-      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attribute[0].val.programmaticStreamSerializationAllowed = 1;
-      kernelConfig.attrs = attribute;
-      kernelConfig.numAttrs = 1;
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl;
+    kernelConfig.attrs = attribute;
+    kernelConfig.numAttrs = 1;
 
-      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
-      } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
-      }
-    } else {
-      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-        rms_norm_kernel<T, Bias, Residual, Affine, false>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
-      } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-        rms_pre_post_norm_kernel<T, Bias, Residual, Affine>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
-      }
+    if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
+    } else {  // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
     }
   }
+  return cudaSuccess;
 }
 
 template <typename T, int RanksPerNode, bool PushMode>
@@ -984,67 +954,47 @@ cudaError_t one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params,
 
     if (cta_size * VEC_SIZE < params.fusion_params.hidden_size) {
       smem_size = params.fusion_params.hidden_size * sizeof(T);
-      if (launch_with_pdl) {
-        cudaLaunchConfig_t kernelConfig = {0};
-        kernelConfig.gridDim = cta_num;
-        kernelConfig.blockDim = cta_size;
-        kernelConfig.dynamicSmemBytes = smem_size;
-        kernelConfig.stream = stream;
+      cudaLaunchConfig_t kernelConfig = {0};
+      kernelConfig.gridDim = cta_num;
+      kernelConfig.blockDim = cta_size;
+      kernelConfig.dynamicSmemBytes = smem_size;
+      kernelConfig.stream = stream;
 
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        kernelConfig.attrs = attribute;
-        kernelConfig.numAttrs = 1;
-        if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-              &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>,
-              params));
-        } else {  // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-              &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>,
-              params));
-        }
-      } else {
-        if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-          one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
-              <<<cta_num, cta_size, smem_size, stream>>>(params);
-        } else {
-          one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>
-              <<<cta_num, cta_size, smem_size, stream>>>(params);
-        }
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl;
+      kernelConfig.attrs = attribute;
+      kernelConfig.numAttrs = 1;
+      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>,
+            params));
+      } else {  // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>,
+            params));
       }
     } else {
-      if (launch_with_pdl) {
-        cudaLaunchConfig_t kernelConfig = {0};
-        kernelConfig.gridDim = cta_num;
-        kernelConfig.blockDim = cta_size;
-        kernelConfig.dynamicSmemBytes = smem_size;
-        kernelConfig.stream = stream;
+      cudaLaunchConfig_t kernelConfig = {0};
+      kernelConfig.gridDim = cta_num;
+      kernelConfig.blockDim = cta_size;
+      kernelConfig.dynamicSmemBytes = smem_size;
+      kernelConfig.stream = stream;
 
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        kernelConfig.attrs = attribute;
-        kernelConfig.numAttrs = 1;
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl;
+      kernelConfig.attrs = attribute;
+      kernelConfig.numAttrs = 1;
 
-        if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-              &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>,
-              params));
-        } else {  // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-              &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>,
-              params));
-        }
-      } else {
-        if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
-          one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
-              <<<cta_num, cta_size, smem_size, stream>>>(params);
-        } else {
-          one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>
-              <<<cta_num, cta_size, smem_size, stream>>>(params);
-        }
+      if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM) {
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>,
+            params));
+      } else {  // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+            &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>,
+            params));
       }
     }
   }
@@ -1451,26 +1401,22 @@ cudaError_t AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceFusio
     auto output_ptr = params.local_output_buffer_ptr;
     params.local_output_buffer_ptr = params.fusion_params.intermediate_buffer;
 
-    if (launch_with_pdl) {
-      cudaLaunchConfig_t kernelConfig = {0};
-      kernelConfig.gridDim = blocks_per_grid;
-      kernelConfig.blockDim = threads_per_block;
-      kernelConfig.dynamicSmemBytes = 0;
-      kernelConfig.stream = stream;
+    cudaLaunchConfig_t kernelConfig = {0};
+    kernelConfig.gridDim = blocks_per_grid;
+    kernelConfig.blockDim = threads_per_block;
+    kernelConfig.dynamicSmemBytes = 0;
+    kernelConfig.stream = stream;
 
-      cudaLaunchAttribute attribute[1];
-      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attribute[0].val.programmaticStreamSerializationAllowed = 1;
-      kernelConfig.attrs = attribute;
-      kernelConfig.numAttrs = 1;
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl;
+    kernelConfig.attrs = attribute;
+    kernelConfig.numAttrs = 1;
 
-      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-          &kernelConfig,
-          twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>, params));
-    } else {
-      twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>
-          <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
-    }
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &kernelConfig,
+        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>, params));
+
     params.local_output_buffer_ptr = output_ptr;
     return reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream,
                                                                             fusionOp);
@@ -1612,47 +1558,10 @@ cudaError_t AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType
   return cudaSuccess;
 }
 
-AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank,
-                                             nvinfer1::DataType dataType, int token_num,
-                                             int hidden_size, AllReduceFusionOp op) {
-  void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
-  int flag_offset;
-  if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
-      reduce_fusion::is_lamport_supported(dataType, token_num, hidden_size)) {
-    flag_offset = 0;
-  } else {
-    flag_offset = 1;
-  }
-  auto const flag_ptr = &buffer[NUM_POINTERS_PER_RANK * tpSize + flag_offset];
-  // cannot use 0 since 0 represents released state for barrier
-  *flag_ptr += 1;
-  uint32_t flag_value = *flag_ptr;
-  AllReduceParams params;
-  // Even plugins use ping buffers, odd plugins use pong.
-  // That way, we don't need to wait for other GPUs to be done
-  // before copying input tensor to workspace.
-  auto const buffer_offset = (flag_value % 2 == 0) ? 0 : tpSize;
-
-  for (int i = 0; i < tpSize; ++i) {
-    params.peer_comm_buffer_ptrs[i] = buffer_ptrs[buffer_offset + i];
-  }
-  for (int i = 0; i < tpSize; ++i) {
-    params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
-  }
-  for (int i = 0; i < tpSize; ++i) {
-    params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[3 * tpSize + i]);
-  }
-  params.barrier_flag = flag_value;
-  params.ranks_per_node = tpSize;
-  params.local_rank = tpRank;
-
-  return params;
-}
-
 template <typename T>
-cudaError_t customAllReduce(kernels::AllReduceParams& params, AllReduceStrategyType strat,
+cudaError_t customAllReduce(AllReduceParams& params, AllReduceStrategyType strat,
                             AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
-                            cudaStream_t stream) {
+                            bool launch_with_pdl, cudaStream_t stream) {
   FLASHINFER_CHECK(configurationSupported<T>(strat, params.elts_total, params.ranks_per_node),
                    "Custom all-reduce configuration unsupported");
 
@@ -1660,8 +1569,8 @@ cudaError_t customAllReduce(kernels::AllReduceParams& params, AllReduceStrategyT
 }
 
 template <typename T>
-cudaError_t launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream,
-                                        AllReduceFusionOp fusionOp) {
+cudaError_t launchResidualRmsNormKernel(AllReduceParams& params, AllReduceFusionOp fusionOp,
+                                        bool launch_with_pdl, cudaStream_t stream) {
   if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer) {
     return reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream, fusionOp);
   } else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer) {
@@ -1674,7 +1583,7 @@ cudaError_t launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaSt
 }
 
 template <typename T>
-cudaError_t residualRmsNorm(kernels::AllReduceParams& params, cudaStream_t stream,
+cudaError_t residualRmsNorm(AllReduceParams& params, cudaStream_t stream,
                             AllReduceFusionOp fusionOp) {
   return launchResidualRmsNormKernel<T>(params, stream, fusionOp);
 }
