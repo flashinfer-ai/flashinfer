@@ -29,7 +29,10 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
+namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
+}
+using flashinfer::trtllm_cubin_loader::getCubin;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {

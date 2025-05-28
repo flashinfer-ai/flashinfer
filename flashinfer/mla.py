@@ -14,22 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
-from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple, Union, overload
+from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
-from .utils import (
-    MaskMode,
-    _check_shape_dtype_device,
-    determine_mla_backend,
-    register_custom_op,
-    register_fake_op,
-)
+from .utils import MaskMode, _check_shape_dtype_device, determine_mla_backend
 
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):

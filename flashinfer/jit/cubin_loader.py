@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
 import functools
 import hashlib
 import os
@@ -23,7 +24,6 @@ import time
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import filelock
-import requests
 
 from .core import logger
 from .env import FLASHINFER_CACHE_DIR
@@ -51,6 +51,8 @@ def download_file(source, local_path, retries=3, delay=5, timeout=10, lock_timeo
     Returns:
     - bool: True if download or copy is successful, False otherwise.
     """
+
+    import requests
 
     lock_path = f"{local_path}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)
@@ -157,10 +159,32 @@ def get_cubin(name, sha256):
     return load_cubin(cubin_path, sha256)
 
 
-old_flags = sys.getdlopenflags()
-sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL)
-from .. import cubin_utils
-from ..cubin_utils import register_cubin_loader
+def convert_to_ctypes_char_p(data: bytes):
+    return ctypes.c_char_p(data)
 
-sys.setdlopenflags(old_flags)
-register_cubin_loader(get_cubin)
+
+# Keep a reference to the callback for each loaded library to prevent GC
+dll_cubin_handlers = {}
+
+
+def setup_cubin_loader(dll_path: str):
+    if dll_path in dll_cubin_handlers:
+        return
+
+    _LIB = ctypes.CDLL(dll_path)
+
+    # Define the correct callback type
+    CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
+
+    def get_cubin_callback(name, sha256):
+        # Both name and sha256 are bytes (c_char_p)
+        cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
+        _LIB.FlashInferSetCurrentCubin(
+            convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
+        )
+
+    # Create the callback and keep a reference to prevent GC
+    cb = CALLBACK_TYPE(get_cubin_callback)
+    dll_cubin_handlers[dll_path] = cb
+
+    _LIB.FlashInferSetCubinCallback(cb)

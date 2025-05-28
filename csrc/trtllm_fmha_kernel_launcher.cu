@@ -184,6 +184,11 @@ void trtllm_paged_attention(at::Tensor& out, at::Tensor& query, at::Tensor& key_
                             const std::string kv_cache_dtype, double k_scale, double v_scale) {
   DISPATCH_BY_KV_CACHE_ELEM_ENUM(query.dtype(), kv_cache_dtype, CALL_GEN_LAUNCHER);
 }
+
+namespace trtllm_cubin_loader {
+#include <flashinfer/cubin_loader.h>
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_paged_attention", trtllm_paged_attention);
 }

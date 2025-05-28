@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#undef Py_LIMITED_API  // pybind11 blows up otherwise
-
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 
 TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)

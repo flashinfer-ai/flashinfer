@@ -31,6 +31,7 @@ from .jit import (
     gen_single_decode_module,
     get_batch_decode_uri,
     get_single_decode_uri,
+    setup_cubin_loader,
     trtllm_fmha_gen_module,
 )
 from .page import get_seq_lens
@@ -302,7 +303,10 @@ def get_batch_decode_module(*args):
 
 @functools.cache
 def get_trtllm_fmha_gen_module():
-    return trtllm_fmha_gen_module().build_and_load()
+    mod = trtllm_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
 
 
 def single_decode_with_kv_cache_with_jit_module(

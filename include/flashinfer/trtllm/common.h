@@ -147,7 +147,7 @@ inline LogLevel getLogLevelFromEnv() {
   static LogLevel level = LogLevel::LOG_NULL;
 
   std::call_once(init_flag, []() {
-    const char* env = std::getenv("IKL_LOG_LEVEL");
+    const char* env = std::getenv("FLASHINFER_LOG_LEVEL");
     level = parseLogLevel(env);
   });
 
