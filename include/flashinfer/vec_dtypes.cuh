@@ -687,25 +687,25 @@ struct vec_t<__nv_fp8_e4m3, vec_size> {
       ((int4*)ptr)[i] = data[i];
     }
   }
-  FLASHINFER_INLINE void load_global_acquire(float* addr) {
+  FLASHINFER_INLINE void load_global_acquire(__nv_fp8_e4m3* addr) {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 16; ++i) {
       *((int4*)(data + i)) = ld_global_acquire((int4*)(addr + i * 16));
     }
   }
-  FLASHINFER_INLINE void store_global_release(float* addr) const {
+  FLASHINFER_INLINE void store_global_release(__nv_fp8_e4m3* addr) const {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 16; ++i) {
       st_global_release(data[i], (int4*)(addr + i * 16));
     }
   }
-  FLASHINFER_INLINE void load_global_volatile(float* addr) {
+  FLASHINFER_INLINE void load_global_volatile(__nv_fp8_e4m3* addr) {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 16; ++i) {
       data[i] = ld_global_volatile((int4*)(addr + i * 16));
     }
   }
-  FLASHINFER_INLINE void store_global_volatile(float* addr) const {
+  FLASHINFER_INLINE void store_global_volatile(__nv_fp8_e4m3* addr) const {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 16; ++i) {
       st_global_volatile(data[i], (int4*)(addr + i * 16));
@@ -1148,6 +1148,31 @@ struct vec_t<half, vec_size> {
       ((int4*)ptr)[i] = data[i];
     }
   }
+  FLASHINFER_INLINE void load_global_acquire(half* addr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      data[i] = ld_global_acquire((int4*)(addr + i * 8));
+    }
+  }
+  FLASHINFER_INLINE void store_global_release(half* addr) const {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      st_global_release(data[i], (int4*)(addr + i * 8));
+    }
+  }
+  FLASHINFER_INLINE void store_global_volatile(half* addr) const {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      st_global_volatile(data[i], (int4*)(addr + i * 8));
+    }
+  }
+  FLASHINFER_INLINE void load_global_volatile(half* addr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      data[i] = ld_global_volatile((int4*)(addr + i * 8));
+    }
+  }
+
   template <typename T>
   FLASHINFER_INLINE void cast_from(const vec_t<T, vec_size>& src) {
     cast_from_impl(*this, src);

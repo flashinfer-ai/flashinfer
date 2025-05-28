@@ -31,8 +31,9 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, int64_t tp_size, int64_t tp_ra
   const c10::cuda::OptionalCUDAGuard device_guard(buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  auto params = AllReduceParams<half>::deserialize(buffer.data_ptr(), tp_size, tp_rank, token_num,
-                                                   hidden_size, fusion_op);
+  auto params =
+      AllReduceParams<half>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size, tp_rank,
+                                         token_num, hidden_size, fusion_op);
 
   // TODO: add fusion params
 

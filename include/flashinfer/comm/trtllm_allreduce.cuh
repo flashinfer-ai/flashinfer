@@ -129,7 +129,7 @@ struct AllReduceParams {
 
   AllReduceFusionParams fusion_params;
 
-  static AllReduceParams deserialize(void* buffer, size_t tpSize, size_t tpRank, int token_num,
+  static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, int token_num,
                                      int hidden_size, AllReduceFusionOp op) {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     int flag_offset;
@@ -208,8 +208,8 @@ __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 }
 
 template <typename T>
-__device__ __forceinline__ void set_neg_zero(int4* addr) {
-  vec_t<T, 4> val;
+__device__ __forceinline__ void set_neg_zero(T* addr) {
+  vec_t<T, 16 / sizeof(T)> val;
   val.fill(neg_zero_v<T>);
   val.store_global_volatile(addr);
 }
@@ -236,7 +236,8 @@ static inline __device__ uint32_t ld_flag_acquire(uint32_t* flag_addr) {
 }
 
 template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(vec_t<T, VEC_SIZE> a, vec_t<T, VEC_SIZE> b) {
+__device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& a,
+                                                      const vec_t<T, VEC_SIZE>& b) {
   vec_t<T, VEC_SIZE> ret;
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
@@ -389,15 +390,15 @@ __global__ void rms_norm_kernel(AllReduceParams<T> params) {
     if constexpr (Bias) {
       vec_t<T, VEC_SIZE> bias_vec;
       bias_vec.load(bias_buffer + offset);
-      inter_vec = vec_add(inter_vec, bias_vec);
+      inter_vec = vec_add<T, VEC_SIZE>(inter_vec, bias_vec);
     }
     if constexpr (Residual) {
       vec_t<T, VEC_SIZE> residual_vec;
       residual_vec.load(residual_buffer + offset);
-      inter_vec = vec_add(inter_vec, residual_vec);
+      inter_vec = vec_add<T, VEC_SIZE>(inter_vec, residual_vec);
       inter_vec.store(intermediate_buffer + offset);
     }
-    acc = accumulate<T>(acc, inter_vec);
+    acc = accumulate<T, VEC_SIZE>(acc, inter_vec);
     if constexpr (UseSmem) {
       inter_vec.store(&smem[offset]);
     }
@@ -412,7 +413,7 @@ __global__ void rms_norm_kernel(AllReduceParams<T> params) {
     if constexpr (Affine) {
       weight_vec.load(weight_buffer + offset);
     }
-    inter_vec = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+    inter_vec = rms_norm<T, Affine, VEC_SIZE>(denom, inter_vec, weight_vec);
     inter_vec.store(&local_final_output_buffer[offset]);
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
@@ -460,11 +461,11 @@ __global__ void rms_pre_post_norm_kernel(
     }
 
     if constexpr (Bias) {
-      inter_vec = vec_add(inter_vec, bias_vec);
+      inter_vec = vec_add<T, VEC_SIZE>(inter_vec, bias_vec);
     }
 
     // pre-residual norm.
-    acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, inter_vec);
+    acc_pre_residual_norm = accumulate<T, VEC_SIZE>(acc_pre_residual_norm, inter_vec);
     acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
     float denom_pre_residual_norm =
         rsqrtf(acc_pre_residual_norm / params.fusion_params.hidden_size + params.fusion_params.eps);
@@ -472,16 +473,16 @@ __global__ void rms_pre_post_norm_kernel(
     if constexpr (Affine) {
       weight_vec_pre_residual_norm.load(weight_buffer_pre_residual_norm + thread_offset);
     }
-    inter_vec =
-        rms_norm<T, Affine>(denom_pre_residual_norm, inter_vec, weight_vec_pre_residual_norm);
+    inter_vec = rms_norm<T, Affine, VEC_SIZE>(denom_pre_residual_norm, inter_vec,
+                                              weight_vec_pre_residual_norm);
 
     if constexpr (Residual) {
       vec_t<T, VEC_SIZE> residual_vec;
       residual_vec.load(residual_buffer + offset);
-      inter_vec = vec_add(inter_vec, residual_vec);
+      inter_vec = vec_add<T, VEC_SIZE>(inter_vec, residual_vec);
       inter_vec.store(intermediate_buffer + offset);
     }
-    acc = accumulate<T>(acc, inter_vec);
+    acc = accumulate<T, VEC_SIZE>(acc, inter_vec);
   }
   acc = block_reduce_sum(acc);
   float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
@@ -490,7 +491,7 @@ __global__ void rms_pre_post_norm_kernel(
     if constexpr (Affine) {
       weight_vec.load(weight_buffer + offset);
     }
-    inter_vec = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+    inter_vec = rms_norm<T, Affine, VEC_SIZE>(denom, inter_vec, weight_vec);
     inter_vec.store(&local_final_output_buffer[offset]);
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
@@ -601,7 +602,7 @@ struct Reducer<T, RanksPerNode, true> {
 #pragma unroll
     for (int ii = 1; ii < RanksPerNode; ++ii) {
       int rank = (params.local_rank + ii) % RanksPerNode;
-      set_neg_zero<T>(reinterpret_cast<int4*>(local_clean_buffer + rank * params.elts_total));
+      set_neg_zero<T>(local_clean_buffer + rank * params.elts_total);
     }
     vec_t<T, VEC_SIZE> vals[RanksPerNode - 1];
     bool done = false;
@@ -610,18 +611,17 @@ struct Reducer<T, RanksPerNode, true> {
 #pragma unroll
       for (int ii = 1; ii < RanksPerNode; ++ii) {
         int rank = (params.local_rank + ii) % RanksPerNode;
-        vals[ii - 1].load_global_volatile(
-            reinterpret_cast<int4*>(local_shared_buffer + rank * params.elts_total));
+        vals[ii - 1].load_global_volatile(local_shared_buffer + rank * params.elts_total);
       }
 #pragma unroll
       for (int ii = 0; ii < RanksPerNode - 1; ii++) {
-        done &= !has_neg_zero(vals[ii]);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[ii]);
       }
     }
 
 #pragma unroll
     for (int ii = 1; ii < RanksPerNode; ++ii) {
-      sum_vec = vec_add(sum_vec, vals[ii - 1]);
+      sum_vec = vec_add<T, VEC_SIZE>(sum_vec, vals[ii - 1]);
     }
     return sum_vec;
   }
@@ -661,10 +661,10 @@ struct Reducer<T, RanksPerNode, false> {
     for (int ii = 1; ii < RanksPerNode; ++ii) {
       do {
         val.load_global_volatile(reinterpret_cast<int4*>(buffers[ii]));
-      } while (has_neg_zero(val));
-      sum_vec = vec_add(sum_vec, val);
+      } while (has_neg_zero<T, VEC_SIZE>(val));
+      sum_vec = vec_add<T, VEC_SIZE>(sum_vec, val);
     }
-    set_neg_zero<T>(reinterpret_cast<int4*>(local_clean_buffer));
+    set_neg_zero<T>(local_clean_buffer);
     return sum_vec;
   }
 };
@@ -720,11 +720,11 @@ __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams<T>
   sum_vec = Reducer<T, RanksPerNode, PushMode>::allreduce(params, global_offset);
 
   if constexpr (Bias) {
-    sum_vec = vec_add(sum_vec, bias_vec);
+    sum_vec = vec_add<T, VEC_SIZE>(sum_vec, bias_vec);
   }
-  sum_vec = vec_add(sum_vec, residual_vec);
+  sum_vec = vec_add<T, VEC_SIZE>(sum_vec, residual_vec);
   sum_vec.store(intermediate_buffer);
-  acc = accumulate<T>(acc, sum_vec);
+  acc = accumulate<T, VEC_SIZE>(acc, sum_vec);
   acc = block_reduce_sum(acc);
   if (ClusterSize > 1) {
     if (threadIdx.x == 0) {
@@ -745,7 +745,7 @@ __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams<T>
   }
 
   float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
-  sum_vec = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+  sum_vec = rms_norm<T, Affine, VEC_SIZE>(denom, sum_vec, weight_vec);
   sum_vec.store(local_final_output_buffer);
 
   cudaTriggerProgrammaticLaunchCompletion();
@@ -885,14 +885,14 @@ __global__ void __launch_bounds__(1024, 1)
       }
 #pragma unroll
       for (int ii = 0; ii < RanksPerNode; ++ii) {
-        sum_vec = vec_add(sum_vec, vals[ii]);
+        sum_vec = vec_add<T, VEC_SIZE>(sum_vec, vals[ii]);
       }
       if constexpr (Bias) {
-        sum_vec = vec_add(sum_vec, bias_vec);
+        sum_vec = vec_add<T, VEC_SIZE>(sum_vec, bias_vec);
       }
-      sum_vec = vec_add(sum_vec, residual_vec);
+      sum_vec = vec_add<T, VEC_SIZE>(sum_vec, residual_vec);
       sum_vec.store(&intermediate_buffer[norm_offset + offset]);
-      acc = accumulate<T>(acc, sum_vec);
+      acc = accumulate<T, VEC_SIZE>(acc, sum_vec);
       if constexpr (UseSmem) {
         sum_vec.store(&smem[offset]);
       }
@@ -907,7 +907,7 @@ __global__ void __launch_bounds__(1024, 1)
       if constexpr (Affine) {
         weight_vec.load(weight_buffer + offset);
       }
-      sum_vec = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+      sum_vec = rms_norm<T, Affine, VEC_SIZE>(denom, sum_vec, weight_vec);
       sum_vec.store(&local_final_output_buffer[norm_offset + offset]);
     }
   }
@@ -982,15 +982,15 @@ __global__ void __launch_bounds__(1024, 1)
       }
 #pragma unroll
       for (int ii = 0; ii < RanksPerNode; ++ii) {
-        sum_vec = vec_add(sum_vec, vals[ii]);
+        sum_vec = vec_add<T, VEC_SIZE>(sum_vec, vals[ii]);
       }
 
       if constexpr (Bias) {
-        sum_vec = vec_add(sum_vec, bias_vec);
+        sum_vec = vec_add<T, VEC_SIZE>(sum_vec, bias_vec);
       }
 
       // norm1 is pre-residual norm.
-      acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, sum_vec);
+      acc_pre_residual_norm = accumulate<T, VEC_SIZE>(acc_pre_residual_norm, sum_vec);
 
       acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
 
@@ -999,18 +999,19 @@ __global__ void __launch_bounds__(1024, 1)
       if constexpr (Affine) {
         weight_vec_pre_residual_norm.load(weight_buffer_pre_residual_norm + thread_offset);
       }
-      sum_vec = rms_norm<T, Affine>(denom_pre_residual_norm, sum_vec, weight_vec_pre_residual_norm);
+      sum_vec = rms_norm<T, Affine, VEC_SIZE>(denom_pre_residual_norm, sum_vec,
+                                              weight_vec_pre_residual_norm);
 
-      sum_vec = vec_add(sum_vec, residual_vec);
+      sum_vec = vec_add<T, VEC_SIZE>(sum_vec, residual_vec);
       sum_vec.store(&intermediate_buffer[norm_offset + offset]);
-      acc = accumulate<T>(acc, sum_vec);
+      acc = accumulate<T, VEC_SIZE>(acc, sum_vec);
     }
     acc = block_reduce_sum(acc);
     float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     if constexpr (Affine) {
       weight_vec.load(weight_buffer + thread_offset);
     }
-    sum_vec = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+    sum_vec = rms_norm<T, Affine, VEC_SIZE>(denom, sum_vec, weight_vec);
     sum_vec.store(&local_final_output_buffer[norm_offset + thread_offset]);
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
@@ -1102,7 +1103,7 @@ __global__ void lamport_initialize_kernel(T* buffer, size_t size) {
   static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
   for (size_t offset = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE; offset < size;
        offset += gridDim.x * blockDim.x * VEC_SIZE) {
-    set_neg_zero<T>(reinterpret_cast<int4*>(&buffer[offset]));
+    set_neg_zero<T>(&buffer[offset]);
   }
 }
 
@@ -1204,9 +1205,9 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams<T> params) {
 #pragma unroll
     for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
       if constexpr (PUSH_MODE) {
-        vals[ii].load(buffers[params.local_rank][ii * params.elts_total + iter_offset]);
+        vals[ii].load(&buffers[params.local_rank][ii * params.elts_total + iter_offset]);
       } else {
-        vals[ii].load(buffers[ii][iter_offset]);
+        vals[ii].load(&buffers[ii][iter_offset]);
       }
     }
 
@@ -1217,7 +1218,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams<T> params) {
     for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
       // Always reduce from rank 0 to ensure stable reduce order.
       int ii = (rank + RANKS_PER_NODE - params.local_rank) % RANKS_PER_NODE;
-      sums = vec_add(sums, vals[ii]);
+      sums = vec_add<T, VEC_SIZE>(sums, vals[ii]);
     }
     // Store to the destination buffer.
     sums.store(&local_output_buffer[iter_offset]);
@@ -1337,9 +1338,9 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
 #pragma unroll
     for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
       if constexpr (PUSH_MODE) {
-        vals[ii].load(local_shared_buffer[ii * params.elts_per_rank + local_offset]);
+        vals[ii].load(&local_shared_buffer[ii * params.elts_per_rank + local_offset]);
       } else {
-        vals[ii].load(buffers[ii][responsible_block_offset]);
+        vals[ii].load(&buffers[ii][responsible_block_offset]);
       }
     }
 
@@ -1350,7 +1351,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
       // Always reduce from rank 0 to ensure stable reduce order.
       int ii = (rank + RANKS_PER_NODE - params.local_rank) % RANKS_PER_NODE;
-      sums = vec_add(sums, vals[ii]);
+      sums = vec_add<T, VEC_SIZE>(sums, vals[ii]);
     }
 
     // Store to the local buffer.
@@ -1386,17 +1387,17 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
       if constexpr (PUSH_MODE) {
         *reinterpret_cast<int4*>(&local_output_buffer[offset_rank]) =
             *reinterpret_cast<int4*>(&buffers[ii][local_offset]);
-        sums.load(buffers[ii][local_offset]);
+        sums.load(&buffers[ii][local_offset]);
       } else {
         *reinterpret_cast<int4*>(&local_output_buffer[offset_rank]) =
             *reinterpret_cast<int4*>(&buffers[ii][offset_rank]);
-        sums.load(buffers[ii][offset_rank]);
+        sums.load(&buffers[ii][offset_rank]);
       }
       if constexpr (Bias) {
-        sums = vec_add(sums, bias_vec);
+        sums = vec_add<T, VEC_SIZE>(sums, bias_vec);
       }
       if constexpr (Residual) {
-        sums = vec_add(sums, residual_vec);
+        sums = vec_add<T, VEC_SIZE>(sums, residual_vec);
       }
       sums.store(&local_output_buffer[offset_rank]);
     }
@@ -1516,8 +1517,8 @@ cudaError_t AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceFusio
         twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>, params));
 
     params.local_output_buffer_ptr = output_ptr;
-    return reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream,
-                                                                            fusionOp);
+    return reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(
+        params, fusionOp, launch_with_pdl, stream);
   }
   return cudaSuccess;
 }
