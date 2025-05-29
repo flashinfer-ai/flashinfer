@@ -23,22 +23,23 @@ def single_softmax_rule(ops: List[Op]) -> None:
         raise CompileError("Multiple Softmax operators found. Only one Softmax is allowed per pipeline.")
 
 
-def topp_after_softmax_rule(ops: List[Op]) -> None:
-    """
-    R2: TopP-after-Softmax rule.
+# Disabled since we allow PROBS inputs to TopP, the input type is already guarded by the compiler
+# def topp_after_softmax_rule(ops: List[Op]) -> None:
+#     """
+#     R2: TopP-after-Softmax rule.
     
-    Every TopP must be preceded (anywhere earlier) by a Softmax.
-    """
-    seen_softmax = False
+#     Every TopP must be preceded (anywhere earlier) by a Softmax.
+#     """
+#     seen_softmax = False
     
-    for op in ops:
-        if isinstance(op, Softmax):
-            seen_softmax = True
-        elif isinstance(op, TopP) and not seen_softmax:
-            raise CompileError(
-                "TopP operator requires a preceding Softmax operator. "
-                "TopP can only operate on probabilities, not logits."
-            )
+#     for op in ops:
+#         if isinstance(op, Softmax):
+#             seen_softmax = True
+#         elif isinstance(op, TopP) and not seen_softmax:
+#             raise CompileError(
+#                 "TopP operator requires a preceding Softmax operator. "
+#                 "TopP can only operate on probabilities, not logits."
+#             )
 
 
 def indices_terminal_rule(ops: List[Op]) -> None:
@@ -60,7 +61,7 @@ def indices_terminal_rule(ops: List[Op]) -> None:
 def get_default_validity_checks() -> List[ValidityCheck]:
     return [
         single_softmax_rule,
-        topp_after_softmax_rule,
+        # topp_after_softmax_rule,
         indices_terminal_rule,
     ]
 

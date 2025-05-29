@@ -1,5 +1,5 @@
+from __future__ import annotations # python 3.7+
 from enum import Enum, auto
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Tuple, Dict, Optional
 import torch

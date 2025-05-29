@@ -23,6 +23,8 @@ class Compiler:
         if not ops:
             raise CompileError("Cannot compile empty operator list")
         
+        print("Original ops: ", ops)
+
         compiled_ops = list(ops)
         
         self._type_check(compiled_ops)
@@ -30,27 +32,44 @@ class Compiler:
         self._run_validity_checks(compiled_ops)
          
         compiled_ops = self._fuse_all(compiled_ops)
+
+        print("Compiled ops: ", compiled_ops)
         
         return compiled_ops
         
     def _type_check(self, ops: List[Op]) -> None:
-        current_sort = Sort.LOGITS
+        first_op = ops[0]
+        
+        initial_candidates = [Sort.LOGITS, Sort.PROBS]
+        current_sort = None
+        
+        for candidate_sort in initial_candidates:
+            if candidate_sort in first_op.IN:
+                current_sort = candidate_sort
+                break
+        
+        if current_sort is None:
+            raise CompileError(
+                f"First operator ({first_op.__class__.__name__}) cannot accept standard pipeline inputs. "
+                f"Expected LOGITS or PROBS, but operator accepts: {first_op.IN}"
+            )
         
         for i, op in enumerate(ops):
             compatible_found = False
             
-            for j, input_sort in enumerate(op.IN):
+            for input_sort, output_sort in zip(op.IN, op.OUT):
                 if current_sort == input_sort:
-                    current_sort = op.OUT[j]
+                    current_sort = output_sort
                     compatible_found = True
                     break
             
             if not compatible_found:
                 raise CompileError(
                     f"Type mismatch at operator {i} ({op.__class__.__name__}). "
-                    f"Expected input sort {current_sort}, but operator accepts {op.IN}"
+                    f"Expected input type: {current_sort}, but operator accepts: {op.IN}. "
+                    f"Previous operator output: {current_sort}"
                 )
-            
+        
     
     def _run_validity_checks(self, ops: List[Op]) -> None:
         for check in self.validity_checks:
