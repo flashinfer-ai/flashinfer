@@ -46,6 +46,9 @@ class TopK(ParameterizedOp):
     IN = [Sort.PROBS]
     OUT = [Sort.PROBS]
 
+    def __init__(self, **default_params: Any):
+        super().__init__(**default_params)
+
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
 

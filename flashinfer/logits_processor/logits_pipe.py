@@ -72,9 +72,6 @@ class LogitsPipe:
                     f"Error executing operator {i} ({op.__class__.__name__}): {e}"
                 ) from e
 
-        if runtime_kwargs:
-            unused_keys = list(runtime_kwargs.keys())
-            print(f"WARN: Unused kwargs: {unused_keys}")
 
         return tagged_tensor.data
 

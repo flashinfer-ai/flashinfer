@@ -960,16 +960,6 @@ def top_k_top_p_sampling_from_logits(
             maybe_top_p_arr=maybe_top_p_arr,
             top_p_val=top_p_val,
         )
-        # masked_logits = top_k_mask_logits(logits, top_k)
-        # probs = torch.softmax(masked_logits, dim=-1)
-        # return top_p_sampling_from_probs(
-        #     probs,
-        #     top_p,
-        #     indices,
-        #     deterministic,
-        #     check_nan=check_nan,
-        #     generator=generator,
-        # )
     elif filter_apply_order == "joint":
         # if check_nan:
         #     if torch.any(torch.isnan(probs)):
@@ -1114,15 +1104,6 @@ def top_k_top_p_sampling_from_probs(
             top_p_val=top_p_val,
             generator=generator,
         )
-        # renorm_probs = top_k_renorm_probs(probs, top_k)
-        # return top_p_sampling_from_probs(
-        #     renorm_probs,
-        #     top_p,
-        #     indices,
-        #     deterministic,
-        #     check_nan=check_nan,
-        #     generator=generator,
-        # )
     elif filter_apply_order == "joint":
         if check_nan:
             if torch.any(torch.isnan(probs)):

@@ -70,7 +70,8 @@ def joint_topk_topp_sampling_guard(window: List[Op]) -> bool:
     Only fuse when joint_topk_topp is True
     """
     topk_op = window[0]
-    return getattr(topk_op, "joint_topk_topp", False)
+    joint_topk_topp = getattr(topk_op, "default_params", {}).get("joint_topk_topp", False)
+    return joint_topk_topp
 
 
 def softmax_topk_masklogits_guard(window: List[Op]) -> bool:
