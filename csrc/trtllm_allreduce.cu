@@ -77,7 +77,7 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
                               std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
                               std::optional<at::Tensor> weight,
                               std::optional<at::Tensor> weight_pre_residual_norm,
-                              std::optional<float> eps,
+                              std::optional<double> eps,
                               std::optional<at::Tensor> intermediate_buffer,
                               std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
@@ -94,7 +94,7 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
         AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
                                              tp_rank, token_num, hidden_size, fusion_op);
 
-    params.elts_total = message_size; // review: not passing elts_total as params
+    params.elts_total = message_size;  // review: not passing elts_total as params
     params.local_input_buffer_ptr = in.data_ptr();
     params.local_output_buffer_ptr = out.data_ptr();
 
@@ -124,4 +124,9 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
     TORCH_CHECK(status == cudaSuccess, "customAllReduce failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
+}
+
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("trtllm_lamport_initialize", &trtllm_lamport_initialize);
+  m.def("trtllm_custom_all_reduce", &trtllm_custom_all_reduce);
 }

@@ -268,6 +268,54 @@ def get_comm_module():
     ) -> None:
         module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
+    @register_custom_op(
+        "flashinfer::trtllm_lamport_initialize", mutates_args=["buffer"]
+    )
+    def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
+        module.trtllm_lamport_initialize(buffer)
+
+    @register_custom_op(
+        "flashinfer::trtllm_custom_all_reduce", mutates_args=["buffer", "inp", "out"]
+    )
+    def trtllm_custom_all_reduce(
+        buffer: torch.Tensor,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        tp_size: int,
+        tp_rank: int,
+        token_num: int,
+        fusion_op_code: int,
+        strategy_code: int,
+        config_code: int,
+        launch_with_pdl: bool,
+        bias: Optional[torch.Tensor],
+        residual: Optional[torch.Tensor],
+        weight: Optional[torch.Tensor],
+        weight_pre_residual_norm: Optional[torch.Tensor],
+        eps: Optional[float],
+        intermediate_buffer: Optional[torch.Tensor],
+        lamport_peer_comm_buffer_ptrs: Optional[torch.Tensor],
+    ) -> None:
+        module.trtllm_custom_all_reduce(
+            buffer,
+            inp,
+            out,
+            tp_size,
+            tp_rank,
+            token_num,
+            fusion_op_code,
+            strategy_code,
+            config_code,
+            launch_with_pdl,
+            bias,
+            residual,
+            weight,
+            weight_pre_residual_norm,
+            eps,
+            intermediate_buffer,
+            lamport_peer_comm_buffer_ptrs,
+        )
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -276,6 +324,8 @@ def get_comm_module():
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
         all_reduce=all_reduce,
+        trtllm_lamport_initialize=trtllm_lamport_initialize,
+        trtllm_custom_all_reduce=trtllm_custom_all_reduce,
     )
 
 
@@ -385,6 +435,7 @@ def free_shared_buffer(
 
 def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
     get_comm_module().trtllm_lamport_initialize(buffer)
+
 
 def trtllm_custom_all_reduce(
     buffer: torch.Tensor,
