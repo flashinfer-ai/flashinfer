@@ -392,6 +392,39 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   void* actual_seq_lens_kv_gpu_pointer = actual_seq_lens_kv_gpu.data_ptr<int32_t>();
   void* block_tables_pointer = block_tables.data_ptr<int32_t>();
 
+  // auto print_cudaTmaDescTiled = [](tma::cudaTmaDescTiled* desc) {
+  //   std::cout << "Addr " << desc->tensor_common0;
+  //   std::cout << " common1 " << desc->tensor_common1;
+  //   std::cout << " stride " << desc->tensor_stride_lower[0];
+  //   std::cout << " stride " << desc->tensor_stride_lower[1];
+  //   std::cout << " stride " << desc->tensor_stride_lower[2];
+  //   std::cout << " stride " << desc->tensor_stride_lower[3];
+  //   std::cout << " stride " << desc->tensor_stride_upper;
+  //   std::cout << " size " << desc->tensor_size[0];
+  //   std::cout << " size " << desc->tensor_size[1];
+  //   std::cout << " size " << desc->tensor_size[2];
+  //   std::cout << " size " << desc->tensor_size[3];
+  //   std::cout << " size " << desc->tensor_size[4];
+  //   std::cout << " stride " << desc->traversal_stride_box_0;
+  //   std::cout << " box_size_end " << desc->box_size_end;
+  //   std::cout << std::endl;
+  // };
+
+  // std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
+  // for (auto i = 0; i < b; i++) {
+  //   std::cout << std::hex;
+  //   std::cout << "q: ";
+  //   tma::cudaTmaDescTiled* q_desc =
+  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
+  //   print_cudaTmaDescTiled(q_desc);
+  //   std::cout << std::endl << "o: ";
+  //   tma::cudaTmaDescTiled* o_desc =
+  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
+  //   print_cudaTmaDescTiled(o_desc);
+  //   std::cout << std::endl;
+  // }
+  // std::cout << std::dec << std::endl;
+
   void* args[14];
   args[0] = (void*)&attn_desc;
   args[1] = (void*)&packed_tma_desc_q_dev;
@@ -414,6 +447,23 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
     cuGetErrorString(err_launch, &errstr);
     throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
   }
+
+  // // Copy output data to host array
+  // size_t output_size = b * h_qo * s_q * d * sizeof(uint16_t);
+  // uint16_t* host_output = new uint16_t[output_size / sizeof(uint16_t)];
+  // cudaMemcpyAsync(host_output, out.data_ptr(), output_size, cudaMemcpyDeviceToHost, stream);
+
+  // cudaStreamSynchronize(stream);
+  // // Print each element
+  // std::cout << "Output tensor elements:" << std::endl;
+  // for (size_t i = 0; i < output_size / sizeof(uint16_t); i++) {
+  //   __nv_bfloat16 f = *(reinterpret_cast<__nv_bfloat16*>(&(host_output[i])));
+  //   std::cout << i << " " << float(f) << " " << std::dec << std::endl;
+  // }
+  // std::cout << std::endl;
+
+  // Clean up
+  // delete[] host_output;
 }
 
 static int32_t compute_split_factor(int32_t b, int32_t h_kv, int32_t h_qo, int32_t s_kv,
@@ -471,8 +521,6 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
             at::Tensor actual_seq_lens_kv, at::Tensor actual_seq_lens_q_gpu,
             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, int64_t num_pages_per_seq,
             at::Tensor out, std::optional<at::Tensor> batch_offset_array) {
-  std::cout << "decode called" << std::endl;
-
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr size_t REDUCTION_MEM_SIZE = 128 * 1024;
   constexpr int64_t TILE_N_1 = 128;

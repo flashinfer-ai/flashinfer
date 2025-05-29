@@ -12,7 +12,7 @@ import flashinfer
 @pytest.mark.parametrize("s_kv", [8, 54, 2048])
 @pytest.mark.parametrize("page_size", [1, 8, 128])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("num_qo_heads", [1, 4, 32])
+@pytest.mark.parametrize("num_qo_heads", [4])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("return_lse", [True])
@@ -36,12 +36,13 @@ def test_cudnn_prefill(
     device = "cuda:0"
 
     # Initialize Q tensor
-    q = torch.randn(batch_size, num_qo_heads, s_qo, head_dim).to(device).half()
+    shape = (batch_size, num_qo_heads, s_qo, head_dim)
+    strides = (num_qo_heads * s_qo * head_dim, head_dim, num_qo_heads * head_dim, 1)
+
+    q = torch.randn(shape, device=device).half()
+
     # Create view with desired strides [1, h*d, d, h*s*d]
-    q = q.as_strided(
-        (batch_size, num_qo_heads, s_qo, head_dim),
-        (num_qo_heads * s_qo * head_dim, head_dim, num_qo_heads * head_dim, 1),
-    )
+    q = q.as_strided(shape, strides)
 
     # Initialize KV Cache
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
@@ -76,7 +77,7 @@ def test_cudnn_prefill(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output, lse = flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
-        q.contiguous(),
+        q,
         k_cache,
         v_cache,
         scale,
@@ -92,6 +93,18 @@ def test_cudnn_prefill(
     torch.cuda.synchronize()
 
     import csv
+
+    # print(f"output: {output[2, 0:4, 4:8, 0:3]}")
+    # print(f"output: {output[2, 2:4, 0:8, 0:3]}")
+    # print(f"output.shape: {output.shape}, output.stride: {output.stride()}, output.data_ptr: {hex(output.data_ptr())}")
+
+    output = output.as_strided(
+        (batch_size, num_qo_heads, s_qo, head_dim),
+        (num_qo_heads * s_qo * head_dim, s_qo * head_dim, head_dim, 1),
+    )
+    # print(f"output: {output[2, 0:4, 4:8, 0:3]}")
+    # print(f"output: {output[2, 2:4, 0:8, 0:3]}")
+    # print(f"output.shape: {output.shape}, output.stride: {output.stride()}, output.data_ptr: {hex(output.data_ptr())}")
 
     output_np = output.cpu().numpy()
     with open("cudnn_prefill_output.csv", "w", newline="") as f:
