@@ -295,10 +295,10 @@ def get_comm_module():
         module.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
     @register_custom_op(
-        "flashinfer::trtllm_lamport_initialize", mutates_args=["buffer"]
+        "flashinfer::trtllm_lamport_initialize_all", mutates_args=["buffer_0", "buffer_1", "buffer_2"]
     )
-    def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
-        module.trtllm_lamport_initialize(buffer)
+    def trtllm_lamport_initialize_all(buffer_0: torch.Tensor, buffer_1: torch.Tensor, buffer_2: torch.Tensor) -> None:
+        module.trtllm_lamport_initialize_all(buffer_0, buffer_1, buffer_2)
 
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce", mutates_args=["buffer", "inp", "out"]
@@ -350,7 +350,7 @@ def get_comm_module():
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
         all_reduce=all_reduce,
-        trtllm_lamport_initialize=trtllm_lamport_initialize,
+        trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
     )
 
@@ -459,8 +459,8 @@ def free_shared_buffer(
     dist.barrier(group=group)
 
 
-def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
-    get_comm_module().trtllm_lamport_initialize(buffer)
+def trtllm_lamport_initialize_all(buffer_0: torch.Tensor, buffer_1: torch.Tensor, buffer_2: torch.Tensor) -> None:
+    get_comm_module().trtllm_lamport_initialize_all(buffer_0, buffer_1, buffer_2)
 
 
 def trtllm_custom_all_reduce(

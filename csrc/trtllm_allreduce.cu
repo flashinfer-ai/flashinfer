@@ -60,12 +60,14 @@ using namespace flashinfer::trtllm_allreduce;
     }                                                                                             \
   }()
 
-void trtllm_lamport_initialize(at::Tensor& buffer) {
-  DISPATCH_ALLREDUCE_DTYPE(buffer.scalar_type(), c_type, {
+void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1, at::Tensor& buffer_2) {
+  DISPATCH_ALLREDUCE_DTYPE(buffer_0.scalar_type(), c_type, {
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
-    auto status = lamportInitialize<c_type>(static_cast<void*>(buffer.data_ptr()),
-                                            static_cast<size_t>(buffer.numel()), raw_stream);
-    TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
+    auto status = lamportInitializeAll<c_type>(static_cast<void*>(buffer_0.data_ptr()),
+                                            static_cast<void*>(buffer_1.data_ptr()),
+                                            static_cast<void*>(buffer_2.data_ptr()),
+                                            static_cast<size_t>(buffer_0.numel()), raw_stream);
+    TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
 }
@@ -127,6 +129,6 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
 }
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("trtllm_lamport_initialize", &trtllm_lamport_initialize);
+  m.def("trtllm_lamport_initialize_all", &trtllm_lamport_initialize_all);
   m.def("trtllm_custom_all_reduce", &trtllm_custom_all_reduce);
 }
