@@ -497,10 +497,12 @@ def sampling_from_logits(
 
     # Lazy import to avoid circular dependency
     # TODO(shanli): fix this type of import
-    from flashinfer.logits_processor import LogitsPipe, Sampling, Softmax
+    from flashinfer.logits_processor import LogitsPipe, SampleLogits
 
-    pipe = LogitsPipe([Softmax(), Sampling(deterministic=deterministic)])
-    return pipe(logits, indices=indices, generator=generator)
+    pipe = LogitsPipe([SampleLogits(deterministic=deterministic)])
+    return pipe(
+        logits, indices=indices, deterministic=deterministic, generator=generator
+    ).data
 
 
 def sampling_from_probs(
@@ -563,10 +565,12 @@ def sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    from flashinfer.logits_processor import LogitsPipe, Sampling
+    from flashinfer.logits_processor import LogitsPipe, SampleProbs
 
-    pipe = LogitsPipe([Sampling(deterministic=deterministic)])
-    return pipe(probs, indices=indices, generator=generator)
+    pipe = LogitsPipe([SampleProbs(deterministic=deterministic)])
+    return pipe(
+        probs, indices=indices, deterministic=deterministic, generator=generator
+    ).data
 
 
 def top_p_sampling_from_probs(
@@ -647,17 +651,18 @@ def top_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    from flashinfer.logits_processor import LogitsPipe, Sampling, TopP
+    from flashinfer.logits_processor import LogitsPipe, SampleProbs, TopP
 
-    pipe = LogitsPipe([TopP(), Sampling(deterministic=deterministic)])
+    pipe = LogitsPipe([TopP(), SampleProbs(deterministic=deterministic)])
     maybe_top_p_arr, top_p_val = _to_tensor_scalar_tuple(top_p)
     return pipe(
         probs,
         indices=indices,
         maybe_top_p_arr=maybe_top_p_arr,
         top_p_val=top_p_val,
+        deterministic=deterministic,
         generator=generator,
-    )
+    ).data
 
 
 def top_k_sampling_from_probs(
@@ -738,17 +743,18 @@ def top_k_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    from flashinfer.logits_processor import LogitsPipe, Sampling, TopK
+    from flashinfer.logits_processor import LogitsPipe, SampleProbs, TopKProbs
 
-    pipe = LogitsPipe([TopK(), Sampling(deterministic=deterministic)])
+    pipe = LogitsPipe([TopKProbs(), SampleProbs(deterministic=deterministic)])
     maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
     return pipe(
         probs,
         indices=indices,
         maybe_top_k_arr=maybe_top_k_arr,
         top_k_val=top_k_val,
+        deterministic=deterministic,
         generator=generator,
-    )
+    ).data
 
 
 def min_p_sampling_from_probs(
@@ -825,17 +831,18 @@ def min_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    from flashinfer.logits_processor import LogitsPipe, MinP, Sampling
+    from flashinfer.logits_processor import LogitsPipe, MinP, SampleProbs
 
-    pipe = LogitsPipe([MinP(), Sampling(deterministic=deterministic)])
+    pipe = LogitsPipe([MinP(), SampleProbs(deterministic=deterministic)])
     maybe_min_p_arr, min_p_val = _to_tensor_scalar_tuple(min_p)
     return pipe(
         probs,
         indices=indices,
         maybe_min_p_arr=maybe_min_p_arr,
         min_p_val=min_p_val,
+        deterministic=deterministic,
         generator=generator,
-    )
+    ).data
 
 
 def top_k_top_p_sampling_from_logits(
@@ -934,16 +941,15 @@ def top_k_top_p_sampling_from_logits(
 
         from flashinfer.logits_processor import (
             LogitsPipe,
-            MaskLogits,
-            Sampling,
+            SampleProbs,
             Softmax,
-            TopK,
+            TopKLogits,
             TopP,
         )
 
-        topk_mask_pipe = LogitsPipe([Softmax(), TopK(), MaskLogits()])
+        topk_mask_pipe = LogitsPipe([TopKLogits()])
         topp_pipe = LogitsPipe(
-            [Softmax(), TopP(), Sampling(deterministic=deterministic)]
+            [Softmax(), TopP(), SampleProbs(deterministic=deterministic)]
         )
 
         maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
@@ -952,14 +958,16 @@ def top_k_top_p_sampling_from_logits(
         return topp_pipe(
             topk_mask_pipe(
                 logits,
-                indices=indices,
                 maybe_top_k_arr=maybe_top_k_arr,
                 top_k_val=top_k_val,
-                generator=generator,
-            ),
+            ).data,
             maybe_top_p_arr=maybe_top_p_arr,
             top_p_val=top_p_val,
-        )
+            indices=indices,
+            deterministic=deterministic,
+            check_nan=check_nan,
+            generator=generator,
+        ).data
     elif filter_apply_order == "joint":
         # if check_nan:
         #     if torch.any(torch.isnan(probs)):
@@ -967,18 +975,18 @@ def top_k_top_p_sampling_from_logits(
 
         from flashinfer.logits_processor import (
             LogitsPipe,
-            Sampling,
+            SampleProbs,
             Softmax,
-            TopK,
+            TopKProbs,
             TopP,
         )
 
         pipe = LogitsPipe(
             [
                 Softmax(),
-                TopK(joint_topk_topp=True),
+                TopKProbs(joint_topk_topp=True),
                 TopP(),
-                Sampling(deterministic=deterministic),
+                SampleProbs(deterministic=deterministic),
             ]
         )
 
@@ -992,8 +1000,9 @@ def top_k_top_p_sampling_from_logits(
             top_k_val=top_k_val,
             maybe_top_p_arr=maybe_top_p_arr,
             top_p_val=top_p_val,
+            deterministic=deterministic,
             generator=generator,
-        )
+        ).data
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
@@ -1086,10 +1095,14 @@ def top_k_top_p_sampling_from_probs(
     top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
-        from flashinfer.logits_processor import LogitsPipe, Sampling, TopK, TopP
+        from flashinfer.logits_processor import LogitsPipe, SampleProbs, TopKProbs, TopP
 
         pipe = LogitsPipe(
-            [TopK(joint_topk_topp=False), TopP(), Sampling(deterministic=deterministic)]
+            [
+                TopKProbs(joint_topk_topp=False),
+                TopP(),
+                SampleProbs(deterministic=deterministic),
+            ]
         )
 
         maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
@@ -1102,17 +1115,22 @@ def top_k_top_p_sampling_from_probs(
             top_k_val=top_k_val,
             maybe_top_p_arr=maybe_top_p_arr,
             top_p_val=top_p_val,
+            deterministic=deterministic,
             generator=generator,
-        )
+        ).data
     elif filter_apply_order == "joint":
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
 
-        from flashinfer.logits_processor import LogitsPipe, Sampling, TopK, TopP
+        from flashinfer.logits_processor import LogitsPipe, SampleProbs, TopKProbs, TopP
 
         pipe = LogitsPipe(
-            [TopK(joint_topk_topp=True), TopP(), Sampling(deterministic=deterministic)]
+            [
+                TopKProbs(joint_topk_topp=True),
+                TopP(),
+                SampleProbs(deterministic=deterministic),
+            ]
         )
 
         maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
@@ -1125,8 +1143,9 @@ def top_k_top_p_sampling_from_probs(
             top_k_val=top_k_val,
             maybe_top_p_arr=maybe_top_p_arr,
             top_p_val=top_p_val,
+            deterministic=deterministic,
             generator=generator,
-        )
+        ).data
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
@@ -1193,7 +1212,7 @@ def top_p_renorm_probs(
     from flashinfer.logits_processor import LogitsPipe, TopP
 
     pipe = LogitsPipe([TopP()])
-    return pipe(probs, maybe_top_p_arr=maybe_top_p_arr, top_p_val=top_p_val)
+    return pipe(probs, maybe_top_p_arr=maybe_top_p_arr, top_p_val=top_p_val).data
 
 
 top_p_renorm_prob = top_p_renorm_probs
@@ -1256,10 +1275,10 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     """
     maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
-    from flashinfer.logits_processor import LogitsPipe, TopK
+    from flashinfer.logits_processor import LogitsPipe, TopKProbs
 
-    pipe = LogitsPipe([TopK()])
-    return pipe(probs, maybe_top_k_arr=maybe_top_k_arr, top_k_val=top_k_val)
+    pipe = LogitsPipe([TopKProbs()])
+    return pipe(probs, maybe_top_k_arr=maybe_top_k_arr, top_k_val=top_k_val).data
 
 
 top_k_renorm_prob = top_k_renorm_probs
@@ -1317,10 +1336,10 @@ def top_k_mask_logits(
     top_k_renorm_probs
     """
     maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
-    from flashinfer.logits_processor import LogitsPipe, MaskLogits, Softmax, TopK
+    from flashinfer.logits_processor import LogitsPipe, TopKLogits
 
-    pipe = LogitsPipe([Softmax(), TopK(), MaskLogits()])
-    return pipe(logits, maybe_top_k_arr=maybe_top_k_arr, top_k_val=top_k_val)
+    pipe = LogitsPipe([TopKLogits()])
+    return pipe(logits, maybe_top_k_arr=maybe_top_k_arr, top_k_val=top_k_val).data
 
 
 def chain_speculative_sampling(

@@ -46,7 +46,7 @@ class LogitsPipe:
 
     def __repr__(self) -> str:
         op_names = [op.__class__.__name__ for op in self.ops]
-        return f"LogitsPipe([{' → '.join(op_names)}])"
+        return f"LogitsPipe([{' -> '.join(op_names)}])"
 
     def __call__(
         self, x: Union[torch.Tensor, TaggedTensor], **kwargs: Any

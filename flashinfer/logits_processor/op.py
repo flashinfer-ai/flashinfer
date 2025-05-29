@@ -34,7 +34,7 @@ class Op(ABC):
         )
 
     def __repr__(self) -> str:
-        signatures = [f"{inp} → {out}" for inp, out in zip(self.IN, self.OUT)]
+        signatures = [f"{inp} -> {out}" for inp, out in zip(self.IN, self.OUT)]
         return f"{self.__class__.__name__}({', '.join(signatures)})"
 
 

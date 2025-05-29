@@ -9,7 +9,7 @@ from .types import Sort, TaggedTensor
 
 
 class Temperature(ParameterizedOp):
-    """Temperature scaling: Logits → Logits"""
+    """Temperature scaling: Logits -> Logits"""
 
     IN = [Sort.LOGITS]
     OUT = [Sort.LOGITS]
@@ -27,7 +27,7 @@ class Temperature(ParameterizedOp):
 
 
 class Softmax(Op):
-    """Softmax: Logits → Probabilities"""
+    """Softmax: Logits -> Probabilities"""
 
     IN = [Sort.LOGITS]
     OUT = [Sort.PROBS]
@@ -40,14 +40,11 @@ class Softmax(Op):
         return TaggedTensor(probs, output_sort)
 
 
-class TopK(ParameterizedOp):
-    """TopK: Probabilities → Probabilities"""
+class TopKProbs(ParameterizedOp):
+    """TopK Renorm Probs: Probabilities -> Probabilities"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.PROBS]
-
-    def __init__(self, **default_params: Any):
-        super().__init__(**default_params)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -68,8 +65,32 @@ class TopK(ParameterizedOp):
         return TaggedTensor(renorm_probs, output_sort)
 
 
+class TopKLogits(ParameterizedOp):
+    """TopK Mask Logits: Logits -> Logits"""
+
+    IN = [Sort.LOGITS]
+    OUT = [Sort.LOGITS]
+
+    def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
+        output_sort = self._validate_input_sort(tensor)
+
+        maybe_top_k_arr = self._get_param("maybe_top_k_arr", kwargs)
+        top_k_val = self._get_param("top_k_val", kwargs)
+        if (
+            not isinstance(top_k_val, int) or top_k_val <= 0
+        ) and maybe_top_k_arr is None:
+            raise ValueError(
+                "top_k must be a positive integer or maybe_top_k_arr must be provided"
+            )
+
+        masked_logits = get_sampling_module().top_k_mask_logits(
+            tensor.data, maybe_top_k_arr, top_k_val
+        )
+        return TaggedTensor(masked_logits, output_sort)
+
+
 class TopP(ParameterizedOp):
-    """TopP: Probabilities → Probabilities"""
+    """TopP: Probabilities -> Probabilities"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.PROBS]
@@ -92,7 +113,7 @@ class TopP(ParameterizedOp):
 
 
 class MinP(ParameterizedOp):
-    """MinP: Probabilities → Probabilities"""
+    """MinP: Probabilities -> Probabilities"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.PROBS]
@@ -111,27 +132,11 @@ class MinP(ParameterizedOp):
         return TaggedTensor(probs, output_sort)
 
 
-class MaskLogits(ParameterizedOp):
-    """MaskLogits: Logits | Probabilities → Logits"""
-
-    IN = [Sort.LOGITS, Sort.PROBS]
-    OUT = [Sort.LOGITS, Sort.LOGITS]
-
-    def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
-        output_sort = self._validate_input_sort(tensor)
-
-        # TODO(shanli): implement Mask Op. This class is kept temporarily for fusing SoftmaxTopKMaskLogits
-        pass
-
-
-class Sampling(ParameterizedOp):
-    """Sampling: Probabilities → Indices"""
+class SampleProbs(ParameterizedOp):
+    """Sampling: Probabilities -> Indices"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.INDICES]
-
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -150,23 +155,19 @@ class Sampling(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedSoftmaxSampling(ParameterizedOp):
-    """Fused Softmax → Sampling: Logits → Indices
-    Note that this operator is actually softmax-free,
-    """
+class SampleLogits(ParameterizedOp):
+    """Sampling: Logits -> Indices"""
 
     IN = [Sort.LOGITS]
     OUT = [Sort.INDICES]
 
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
-
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
 
-        deterministic = self._get_param(
-            "deterministic", kwargs, required=False
-        ) or self.default_params.get("deterministic", True)
+        deterministic = self._get_param("deterministic", kwargs, required=False)
+        if deterministic is None:
+            deterministic = self.default_params.get("deterministic", True)
+
         indices = self._get_param("indices", kwargs, required=False)
         generator = self._get_param("generator", kwargs, required=False)
 
@@ -178,7 +179,7 @@ class FusedSoftmaxSampling(ParameterizedOp):
 
 
 class FusedTopKSampling(ParameterizedOp):
-    """Fused TopK → Sampling: Probabilities → Indices"""
+    """Fused TopK -> Sampling: Probabilities -> Indices"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.INDICES]
@@ -206,7 +207,7 @@ class FusedTopKSampling(ParameterizedOp):
 
 
 class FusedTopPSampling(ParameterizedOp):
-    """Fused TopP → Sampling: Probabilities → Indices"""
+    """Fused TopP -> Sampling: Probabilities -> Indices"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.INDICES]
@@ -234,7 +235,7 @@ class FusedTopPSampling(ParameterizedOp):
 
 
 class FusedMinPSampling(ParameterizedOp):
-    """Fused MinP → Sampling: Probabilities → Indices"""
+    """Fused MinP -> Sampling: Probabilities -> Indices"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.INDICES]
@@ -261,8 +262,8 @@ class FusedMinPSampling(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedJointTopKTopPSampling(ParameterizedOp):
-    """Fused Joint TopK → TopP → Sampling: Probabilities → Indices"""
+class FusedJointTopKTopPSampleProbs(ParameterizedOp):
+    """Fused Joint TopKProbs -> TopP -> SampleProbs: Probabilities -> Indices"""
 
     IN = [Sort.PROBS]
     OUT = [Sort.INDICES]
@@ -296,25 +297,3 @@ class FusedJointTopKTopPSampling(ParameterizedOp):
         )
 
         return TaggedTensor(samples, output_sort)
-
-
-class FusedSoftmaxTopKMaskLogits(ParameterizedOp):
-    """Fused TopK → MaskLogits: Logits → Logits"""
-
-    IN = [Sort.LOGITS]
-    OUT = [Sort.LOGITS]
-
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
-        output_sort = self._validate_input_sort(tensor)
-
-        maybe_top_k_arr = self._get_param("maybe_top_k_arr", kwargs)
-        top_k_val = self._get_param("top_k_val", kwargs)
-
-        mask_logits = get_sampling_module().top_k_mask_logits(
-            tensor.data, maybe_top_k_arr, top_k_val
-        )
-
-        return TaggedTensor(mask_logits, output_sort)

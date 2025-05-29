@@ -1,9 +1,12 @@
+import logging
 from typing import List, Optional
 
 from .fusion_rules import FusionRule, get_default_fusion_rules
 from .op import Op
 from .types import Sort
 from .validators import CompileError, ValidityCheck, get_default_validity_checks
+
+logger = logging.getLogger(__name__)
 
 
 class Compiler:
@@ -23,7 +26,7 @@ class Compiler:
         if not ops:
             raise CompileError("Cannot compile empty operator list")
 
-        print("Original ops: ", ops)
+        logger.info("Original ops: %s", ops)
 
         compiled_ops = list(ops)
 
@@ -33,7 +36,7 @@ class Compiler:
 
         compiled_ops = self._fuse_all(compiled_ops)
 
-        print("Compiled ops: ", compiled_ops)
+        logger.info("Compiled ops: %s", compiled_ops)
 
         return compiled_ops
 
