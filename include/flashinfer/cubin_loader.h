@@ -35,7 +35,6 @@ void (*callbackGetCubin)(const char* path, const char* sha256) = nullptr;
 
 // Set the python callback, called by the python code using ctypes.
 extern "C" void FlashInferSetCubinCallback(void (*callback)(const char* path, const char* sha256)) {
-  std::cerr << "FlashInferSetCubinCallback " << callback << std::endl;
   callbackGetCubin = callback;
 }
 
@@ -54,7 +53,6 @@ std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
-  std::cout << "getCubin: " << name << " " << sha256 << " " << callbackGetCubin << std::endl;
   callbackGetCubin(name.c_str(), sha256.c_str());
   return current_cubin;
 }

@@ -71,7 +71,6 @@ from .cubin_loader import setup_cubin_loader
 
 @functools.cache
 def get_cudnn_fmha_gen_module():
-    print("Getting cudnn fmha gen module")
     mod = cudnn_fmha_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
