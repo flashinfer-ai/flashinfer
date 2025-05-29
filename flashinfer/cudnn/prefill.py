@@ -56,6 +56,9 @@ def cudnn_batch_prefill_with_kv_cache(
     s_q = q.shape[2]
     d_vo = v_cache.shape[3]
 
+    assert causal, "Currently only supports causal attention"
+    assert use_cuda_graph == False, "Currently only supports use_cuda_graph == False"
+
     if return_lse:
         if lse is None:
             lse = torch.empty(bs, s_q, h_qo, device=q.device, dtype=torch.float32)
@@ -70,8 +73,6 @@ def cudnn_batch_prefill_with_kv_cache(
 
     actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
     actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device)
-
-    use_cuda_graph = False
 
     run_func = get_cudnn_fmha_gen_module().prefill
     run_func(
