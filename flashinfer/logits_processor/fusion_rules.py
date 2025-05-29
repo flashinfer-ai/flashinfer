@@ -1,23 +1,36 @@
-from typing import List, Callable, Tuple, NamedTuple
+from typing import Callable, List, NamedTuple, Tuple
 
 from .op import Op
 from .operators import (
-    FusedJointTopKTopPSampling, FusedMinPSampling, FusedSoftmaxSampling, FusedSoftmaxTopKMaskLogits, FusedTopKSampling, FusedTopPSampling, MaskLogits, MinP, Softmax, TopK, TopP, Sampling
+    FusedJointTopKTopPSampling,
+    FusedMinPSampling,
+    FusedSoftmaxSampling,
+    FusedSoftmaxTopKMaskLogits,
+    FusedTopKSampling,
+    FusedTopPSampling,
+    MaskLogits,
+    MinP,
+    Sampling,
+    Softmax,
+    TopK,
+    TopP,
 )
 
 
 class FusionRule(NamedTuple):
-    """    
+    """
     Attributes:
         pattern: Tuple of operator types to match (e.g., (TopK, Sampling))
         guard: Function that takes the matched operators and returns True if fusion should apply
         build: Function that takes the matched operators and returns a fused operator
         prio: Priority for rule application (higher = tried earlier)
     """
+
     pattern: Tuple[type, ...]
     guard: Callable[[List[Op]], bool]
     build: Callable[[List[Op]], Op]
     prio: int = 0
+
 
 def softmax_sampling_guard(window: List[Op]) -> bool:
     """
@@ -25,6 +38,7 @@ def softmax_sampling_guard(window: List[Op]) -> bool:
     Allow any input for fusion since softmax only accepted LOGITS.
     """
     return True
+
 
 def topk_sampling_guard(window: List[Op]) -> bool:
     """
@@ -41,6 +55,7 @@ def topp_sampling_guard(window: List[Op]) -> bool:
     """
     return True
 
+
 def minp_sampling_guard(window: List[Op]) -> bool:
     """
     Probabilities → Indices
@@ -48,13 +63,15 @@ def minp_sampling_guard(window: List[Op]) -> bool:
     """
     return True
 
+
 def joint_topk_topp_sampling_guard(window: List[Op]) -> bool:
     """
     Logits → Indices
     Only fuse when joint_topk_topp is True
     """
     topk_op = window[0]
-    return getattr(topk_op, 'joint_topk_topp', False)
+    return getattr(topk_op, "joint_topk_topp", False)
+
 
 def softmax_topk_masklogits_guard(window: List[Op]) -> bool:
     """
@@ -63,31 +80,46 @@ def softmax_topk_masklogits_guard(window: List[Op]) -> bool:
     """
     return True
 
+
 def build_softmax_sampling(window: List[Op]) -> Op:
     sampling_op = window[1]
-    deterministic = getattr(sampling_op, 'default_params', {}).get('deterministic', True)
+    deterministic = getattr(sampling_op, "default_params", {}).get(
+        "deterministic", True
+    )
     return FusedSoftmaxSampling(deterministic=deterministic)
+
 
 def build_topk_sampling(window: List[Op]) -> Op:
     sampling_op = window[1]
-    deterministic = getattr(sampling_op, 'default_params', {}).get('deterministic', True)
+    deterministic = getattr(sampling_op, "default_params", {}).get(
+        "deterministic", True
+    )
     return FusedTopKSampling(deterministic=deterministic)
+
 
 def build_topp_sampling(window: List[Op]) -> Op:
     sampling_op = window[1]
-    deterministic = getattr(sampling_op, 'default_params', {}).get('deterministic', True)
+    deterministic = getattr(sampling_op, "default_params", {}).get(
+        "deterministic", True
+    )
     return FusedTopPSampling(deterministic=deterministic)
+
 
 def build_minp_sampling(window: List[Op]) -> Op:
     sampling_op = window[1]
-    deterministic = getattr(sampling_op, 'default_params', {}).get('deterministic', True)
+    deterministic = getattr(sampling_op, "default_params", {}).get(
+        "deterministic", True
+    )
     return FusedMinPSampling(deterministic=deterministic)
+
 
 def build_softmax_topk_masklogits(window: List[Op]) -> Op:
     return FusedSoftmaxTopKMaskLogits()
 
+
 def build_joint_topk_topp_sampling(window: List[Op]) -> Op:
     return FusedJointTopKTopPSampling()
+
 
 def get_default_fusion_rules() -> List[FusionRule]:
     return [
