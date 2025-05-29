@@ -37,6 +37,32 @@ from .utils import register_custom_op
 cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
 
+# for trtllm_custom_all_reduce
+class AllReduceStrategyType:
+    NCCL = 0
+    MIN_LATENCY = 1
+    UB = 2
+    AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
+    LOWPRECISION = 6
+
+# for trtllm_custom_all_reduce
+class AllReduceStrategyConfig:
+    USE_MEMCPY = 1 << 0
+    PUSH_MODE = 1 << 1
+
+# for trtllm_custom_all_reduce
+class AllReduceFusionOp:
+    NONE = 0
+    RESIDUAL_RMS_NORM = 1
+    LAST_PROCESS_FOR_UB = 2
+    RESIDUAL_RMS_PREPOST_NORM = 3
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
@@ -284,9 +310,9 @@ def get_comm_module():
         tp_size: int,
         tp_rank: int,
         token_num: int,
-        fusion_op_code: int,
-        strategy_code: int,
-        config_code: int,
+        fusion_op_code: AllReduceFusionOp,
+        strategy_code: AllReduceStrategyType,
+        config_code: AllReduceStrategyConfig,
         launch_with_pdl: bool,
         bias: Optional[torch.Tensor],
         residual: Optional[torch.Tensor],
@@ -444,9 +470,9 @@ def trtllm_custom_all_reduce(
     tp_size: int,
     tp_rank: int,
     token_num: int,
-    fusion_op_code: int,
-    strategy_code: int,
-    config_code: int,
+    fusion_op_code: AllReduceFusionOp,
+    strategy_code: AllReduceStrategyType,
+    config_code: AllReduceStrategyConfig,
     launch_with_pdl: bool,
     bias: Optional[torch.Tensor],
     residual: Optional[torch.Tensor],
