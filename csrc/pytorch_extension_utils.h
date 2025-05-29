@@ -148,22 +148,6 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     }                                                                                    \
   }()
 
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_ALLREDUCE(in_tensor, out_tensor, c_type, ...)             \
-  [&]() -> bool {                                                                                 \
-    TORCH_CHECK(in_tensor.scalar_type() == out_tensor.scalar_type(),                              \
-                "Input and output tensors must have the same dtype for AllReduce");               \
-    switch (in_tensor.scalar_type()) {                                                            \
-      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                                     \
-      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                                    \
-      default:                                                                                    \
-        std::ostringstream oss;                                                                   \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << in_tensor.scalar_type() \
-            << " for AllReduce";                                                                  \
-        TORCH_CHECK(false, oss.str());                                                            \
-        return false;                                                                             \
-    }                                                                                             \
-  }()
-
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
   [&]() -> bool {                                                                       \
     switch (cond) {                                                                     \

@@ -381,3 +381,50 @@ def free_shared_buffer(
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)
+
+
+def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
+    get_comm_module().trtllm_lamport_initialize(buffer)
+
+def trtllm_custom_all_reduce(
+    buffer: torch.Tensor,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+    token_num: int,
+    fusion_op_code: int,
+    strategy_code: int,
+    config_code: int,
+    elts_total: int,
+    launch_with_pdl: bool,
+    bias: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+    hidden_size: Optional[int],
+    weight: Optional[torch.Tensor],
+    weight_pre_residual_norm: Optional[torch.Tensor],
+    eps: Optional[float],
+    intermediate_buffer: Optional[torch.Tensor],
+    lamport_peer_comm_buffer_ptrs: Optional[torch.Tensor],
+) -> None:
+    get_comm_module().trtllm_custom_all_reduce(
+        buffer,
+        inp,
+        out,
+        tp_size,
+        tp_rank,
+        token_num,
+        fusion_op_code,
+        strategy_code,
+        config_code,
+        elts_total,
+        launch_with_pdl,
+        bias,
+        residual,
+        hidden_size,
+        weight,
+        weight_pre_residual_norm,
+        eps,
+        intermediate_buffer,
+        lamport_peer_comm_buffer_ptrs,
+    )

@@ -36,20 +36,48 @@ using namespace flashinfer::trtllm_allreduce;
     }                                                                                       \
   }()
 
+#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(ctype, in, ...)                                     \
+  [&] {                                                                                           \
+    const auto& scalar_type = (in).scalar_type();                                                 \
+    switch (scalar_type) {                                                                        \
+      case at::ScalarType::Float: {                                                               \
+        using ctype = float;                                                                      \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
+      /* Requires nv_half to be defined somewhere */                                              \
+      case at::ScalarType::Half: {                                                                \
+        using ctype = half;                                                                       \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
+      /* Requires nv_bfloat16 to be defined somewhere */                                          \
+      case at::ScalarType::BFloat16: {                                                            \
+        using ctype = __nv_bfloat16;                                                              \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
+      default:                                                                                    \
+        TORCH_CHECK(false,                                                                        \
+                    "Unsupported dtype in DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE: ", scalar_type); \
+    }                                                                                             \
+  }()
+
 void trtllm_lamport_initialize(at::Tensor& buffer) {
   DISPATCH_ALLREDUCE_DTYPE(buffer.scalar_type(), c_type, {
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
     auto status = lamportInitialize<c_type>(static_cast<void*>(buffer.data_ptr()),
                                             static_cast<size_t>(buffer.numel()), raw_stream);
-  TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
-                                         std::string(cudaGetErrorString(status)));
+    TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
+                                           std::string(cudaGetErrorString(status)));
   });
 }
 
+// TODO(yingyi): update params list since 
+// message_size = max_token_num * hidden_dim;
+// in/out/residual_in/residual_out/norm_out.. sized of message_size
+// refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
 void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& out, int64_t tp_size,
-                              int64_t tp_rank, int64_t token_num, int64_t hidden_size,
-                              int64_t fusion_op_code, int64_t strategy_code, int64_t config_code,
-                              int64_t elts_total, std::optional<at::Tensor> bias,
+                              int64_t tp_rank, int64_t token_num, int64_t fusion_op_code,
+                              int64_t strategy_code, int64_t config_code, int64_t elts_total,
+                              bool launch_with_pdl, std::optional<at::Tensor> bias,
                               std::optional<at::Tensor> residual,
                               std::optional<int64_t> hidden_size, std::optional<at::Tensor> weight,
                               std::optional<at::Tensor> weight_pre_residual_norm,
@@ -60,11 +88,15 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
   const c10::cuda::OptionalCUDAGuard device_guard(buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  // TODO(zihao): review dispatch
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_ALLREDUCE(in, out, scalar_t, [&] {
+  // TODO(zihao): review dispatch type: support fp16, bf16, fp32
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(c_type, in, [&] {
+    int64_t hidden_size_val = hidden_size.has_value() ? hidden_size.value() : 0;
+
+    // TODO(yingyi): might move all initialization into deserialization?
+    // TODO(yingyi): remove type template here (used to check if lamport is supported)
     auto params =
-        AllReduceParams<scalar_t>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
-                                               tp_rank, token_num, hidden_size, fusion_op);
+        AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
+                                             tp_rank, token_num, hidden_size_val, fusion_op);
 
     // TODO(yingyi): complete params init
     params.elts_total = elts_total;
@@ -82,16 +114,17 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
     params.fusion_params.eps = eps.has_value() ? eps.value() : 1e-5f;
     params.fusion_params.intermediate_buffer =
         intermediate_buffer.has_value() ? intermediate_buffer.value().data_ptr() : nullptr;
-    params.fusion_params.lamport_peer_comm_buffer_ptrs =
-        lamport_peer_comm_buffer_ptrs.has_value() ? lamport_peer_comm_buffer_ptrs.value().data_ptr()
-                                                  : nullptr;
+    if (lamport_peer_comm_buffer_ptrs.has_value()) {
+      auto* src = static_cast<void**>(lamport_peer_comm_buffer_ptrs.value().data_ptr());
+      for (int i = 0; i < MAX_RANKS_PER_NODE * 3; ++i) {
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = src[i];
+      }
+    }
 
     auto strategy = static_cast<AllReduceStrategyType>(strategy_code);
     auto config = static_cast<AllReduceStrategyConfig>(config_code);
 
-    // TODO(yingyi): default launch_with_pdl to true?
-    auto status =
-        customAllReduce(params, strategy, config, fusion_op, /*launch_with_pdl=*/true, stream);
+    auto status = customAllReduce(params, strategy, config, fusion_op, launch_with_pdl, stream);
     TORCH_CHECK(status == cudaSuccess, "customAllReduce failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
