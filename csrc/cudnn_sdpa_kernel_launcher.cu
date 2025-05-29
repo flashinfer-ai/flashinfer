@@ -15,6 +15,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_fp16.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
 #include <nvrtc.h>
@@ -70,7 +71,7 @@ enum KernelType { PREFILL, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
-                                "11f99ba4e0143c586e09cb51528d8d941bd82baa0420a3d1c0fbe4ccfb2dfbb6");
+                                "3ee5836768efc722f2eea431f054da23f5878873fd1bc6cbabb331063b5b5fe0");
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
                                "47cd6058cd981abebe86d32600aaab793fd04b4e35d6d9964a5fbcf4b5c18431");
@@ -168,8 +169,8 @@ void setup_prefill(CUfunction* hfunc) {
   // Use cu++filt to get the kernel name
   std::string kernel_name =
       "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
-      "128x128x128ILb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES3_fPfNS0_7stridesES3_S5_"
-      "PKjS9_S9_jjNS0_11FastDivisorE";
+      "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES3_fPfNS0_"
+      "7stridesES3_S5_PKjS9_S9_jjNS0_11FastDivisorE";
 
   std::string cubin = get_cudnn_cubin(PREFILL);
   if (cubin.empty()) {
@@ -385,20 +386,18 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
     std::cout << std::endl;
   };
 
-  // std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
-  // for (auto i = 0; i < b; i++) {
-  //   std::cout << std::hex;
-  //   std::cout << "q: ";
-  //   tma::cudaTmaDescTiled* q_desc =
-  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
-  //   print_cudaTmaDescTiled(q_desc);
-  //   std::cout << std::endl << "o: ";
-  //   tma::cudaTmaDescTiled* o_desc =
-  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
-  //   print_cudaTmaDescTiled(o_desc);
-  //   std::cout << std::endl;
-  // }
-  // std::cout << std::dec << std::endl;
+  std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
+  for (auto i = 0; i < b; i++) {
+    std::cout << std::hex;
+    std::cout << "q: ";
+    tma::cudaTmaDescTiled* q_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
+    print_cudaTmaDescTiled(q_desc);
+    std::cout << std::endl << "o: ";
+    tma::cudaTmaDescTiled* o_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
+    print_cudaTmaDescTiled(o_desc);
+    std::cout << std::endl;
+  }
+  std::cout << std::dec << std::endl;
 
   cudaMemcpyAsync(workspace_start, packed_tma_desc.get(), sizeof(tma::cudaTmaDesc) * 2 * b,
                   cudaMemcpyHostToDevice, stream);
@@ -446,6 +445,22 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
     cuGetErrorString(err_launch, &errstr);
     throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
   }
+  // // Copy output data to host array
+  // size_t output_size = b * h_qo * s_q * d * sizeof(uint16_t);
+  // uint16_t* host_output = new uint16_t[output_size / sizeof(uint16_t)];
+  // cudaMemcpyAsync(host_output, out.data_ptr(), output_size, cudaMemcpyDeviceToHost, stream);
+
+  // cudaStreamSynchronize(stream);
+  // // Print each element
+  // std::cout << "Output tensor elements:" << std::endl;
+  // for (size_t i = 0; i < output_size / sizeof(uint16_t); i++) {
+  //   __half f = host_output[i];
+  //   std::cout << i << " " << __half2float(f) << " " << std::dec << std::endl;
+  // }
+  // std::cout << std::endl;
+
+  // // Clean up
+  // delete[] host_output;
 }
 
 static int32_t compute_split_factor(int32_t b, int32_t h_kv, int32_t h_qo, int32_t s_kv,
