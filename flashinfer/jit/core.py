@@ -77,8 +77,13 @@ class JitSpec:
         return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
 
     @property
-    def library_path(self) -> Path:
+    def jit_library_path(self) -> Path:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+
+    def get_library_path(self) -> Path:
+        if self.aot_path.exists():
+            return self.aot_path
+        return self.jit_library_path
 
     @property
     def aot_path(self) -> Path:
@@ -106,7 +111,7 @@ class JitSpec:
         if self.aot_path.exists():
             so_path = self.aot_path
         else:
-            so_path = self.library_path
+            so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose)
         torch.ops.load_library(so_path)
