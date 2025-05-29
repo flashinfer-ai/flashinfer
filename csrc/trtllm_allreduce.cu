@@ -70,16 +70,12 @@ void trtllm_lamport_initialize(at::Tensor& buffer) {
   });
 }
 
-// TODO(yingyi): update params list since 
-// message_size = max_token_num * hidden_dim;
-// in/out/residual_in/residual_out/norm_out.. sized of message_size
 // refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
 void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& out, int64_t tp_size,
                               int64_t tp_rank, int64_t token_num, int64_t fusion_op_code,
-                              int64_t strategy_code, int64_t config_code, int64_t elts_total,
-                              bool launch_with_pdl, std::optional<at::Tensor> bias,
-                              std::optional<at::Tensor> residual,
-                              std::optional<int64_t> hidden_size, std::optional<at::Tensor> weight,
+                              int64_t strategy_code, int64_t config_code, bool launch_with_pdl,
+                              std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
+                              std::optional<at::Tensor> weight,
                               std::optional<at::Tensor> weight_pre_residual_norm,
                               std::optional<float> eps,
                               std::optional<at::Tensor> intermediate_buffer,
@@ -90,23 +86,23 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
 
   // TODO(zihao): review dispatch type: support fp16, bf16, fp32
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(c_type, in, [&] {
-    int64_t hidden_size_val = hidden_size.has_value() ? hidden_size.value() : 0;
-
     // TODO(yingyi): might move all initialization into deserialization?
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
+    int64_t message_size = in.numel();
+    int64_t hidden_size = in.numel() / token_num;
     auto params =
         AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
-                                             tp_rank, token_num, hidden_size_val, fusion_op);
+                                             tp_rank, token_num, hidden_size, fusion_op);
 
-    // TODO(yingyi): complete params init
-    params.elts_total = elts_total;
+    params.elts_total = message_size; // review: not passing elts_total as params
     params.local_input_buffer_ptr = in.data_ptr();
     params.local_output_buffer_ptr = out.data_ptr();
 
-    // TODO(yingyi): add fusion params
+    // add fusion params
     params.fusion_params.bias_buffer = bias.has_value() ? bias.value().data_ptr() : nullptr;
     params.fusion_params.residual_buffer =
         residual.has_value() ? residual.value().data_ptr() : nullptr;
+    params.fusion_params.hidden_size = hidden_size;
     params.fusion_params.weight_buffer = weight.has_value() ? weight.value().data_ptr() : nullptr;
     params.fusion_params.weight_buffer_pre_residual_norm =
         weight_pre_residual_norm.has_value() ? weight_pre_residual_norm.value().data_ptr()
