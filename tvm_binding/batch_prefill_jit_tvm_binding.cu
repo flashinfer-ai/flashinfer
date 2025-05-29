@@ -44,6 +44,8 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
                                      int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
                                      TVMStreamHandle cuda_stream);
 
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_kv_cache_plan, BatchPrefillWithKVCachePlan);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_ragged_kv_cache_run, BatchPrefillWithRaggedKVCacheRun);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_paged_kv_cache_run, BatchPrefillWithPagedKVCacheRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_kv_cache_plan, BatchPrefillWithKVCachePlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_ragged_kv_cache_run,
+                              BatchPrefillWithRaggedKVCacheRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_paged_kv_cache_run,
+                              BatchPrefillWithPagedKVCacheRun);
