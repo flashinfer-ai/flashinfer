@@ -72,7 +72,6 @@ class LogitsPipe:
                     f"Error executing operator {i} ({op.__class__.__name__}): {e}"
                 ) from e
 
-
         return tagged_tensor.data
 
     def _determine_initial_sort(self) -> Sort:
