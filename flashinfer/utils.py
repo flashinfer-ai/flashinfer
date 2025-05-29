@@ -397,7 +397,7 @@ def get_logging_module():
     return gen_jit_spec(
         "logging",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "logging.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
         ],
         extra_include_paths=[
             jit_env.SPDLOG_INCLUDE_DIR,
