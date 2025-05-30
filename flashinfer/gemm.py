@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -702,7 +702,7 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_k: bool = False,
+    scale_major_mode: Literal["MN", "K"] = "MN",
     mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
@@ -723,18 +723,20 @@ def gemm_fp8_nt_groupwise(
         Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_k is ``True``
-        otherwise ``(k // block_size, m)``.
+        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
+        or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``True``
-        otherwise ``(k // block_size, n // block_size)``.
+        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
+        or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
 
-    scale_major_k: bool
-        Whether scale tensors are k-major layout.
+    scale_major_mode: Literal["MN", "K"]
+        The layout mode of scale tensor, `MN` for MN-major scale with shape of
+        ``(k // block_size, *)`` and `K` for K-major scale with shape of
+        ``(*, k // block_size)``
 
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
@@ -794,7 +796,7 @@ def gemm_fp8_nt_groupwise(
         b_scale,
         out,
         *scale_granularity_mnk,
-        scale_major_k,
+        scale_major_mode,
         mma_sm,
     )
 
@@ -806,7 +808,7 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_k: bool = False,
+    scale_major_mode: str = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -822,7 +824,7 @@ def gemm_fp8_nt_blockscaled(
         a_scale,
         b_scale,
         scale_granularity_mnk=(128, 128, 128),
-        scale_major_k=scale_major_k,
+        scale_major_mode=scale_major_mode,
         mma_sm=mma_sm,
         out=out,
         out_dtype=out_dtype,
@@ -836,7 +838,7 @@ def group_gemm_fp8_nt_groupwise(
     b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
-    scale_major_k: bool = False,
+    scale_major_mode: Literal["MN", "K"] = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
@@ -854,12 +856,12 @@ def group_gemm_fp8_nt_groupwise(
         Column-major input tensor shape ``(batch_size, n, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape ``(cum_m, k // block_size)`` if scale_major_k is ``True``
-        otherwise ``(k // block_size, cum_m)``.
+        Column-major scale tensor for a, shape ``(cum_m, k // block_size)`` if scale_major_mode is ``K``
+        or shape ``(k // block_size, cum_m)`` if scale_major_mode is ``MN``
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_k is ``True``
-        otherwise ``(batch_size, k // block_size, n // block_size)``.
+        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_mode is ``K``
+        shape ``(batch_size, k // block_size, n // block_size)`` if scale_major_mode is ``MN``
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``.
@@ -868,8 +870,10 @@ def group_gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
 
-    scale_major_k: bool
-        Whether scale tensors are k-major layout.
+    scale_major_mode: Literal["MN", "K"]
+        The layout mode of scale tensor, `MN` for MN-major scale with shape of
+        ``(k // block_size, *)`` and `K` for K-major scale with shape of
+        ``(*, k // block_size)``
 
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
@@ -920,7 +924,7 @@ def group_gemm_fp8_nt_groupwise(
         n,
         k,
         *scale_granularity_mnk,
-        scale_major_k,
+        scale_major_mode,
         mma_sm,
     )
     return out

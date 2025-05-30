@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <string>
+
 #include "pytorch_extension_utils.h"
 
 void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
@@ -20,7 +22,7 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                                           at::Tensor B, at::Tensor SFA, at::Tensor SFB,
                                           at::Tensor C, at::Tensor m_indptr, int64_t n, int64_t k,
                                           int64_t scale_granularity_m, int64_t scale_granularity_n,
-                                          int64_t scale_granularity_k, bool scale_major_k,
+                                          int64_t scale_granularity_k, std::string scale_major_mode,
                                           int64_t mma_sm);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

@@ -29,7 +29,7 @@ from flashinfer.gemm import (
 
 
 def gemm_fp8_nt_blockscaled_ref(
-    A, B, As, Bs, block_size, scale_major_k=False, output_dtype=torch.float16
+    A, B, As, Bs, block_size, scale_major_mode, output_dtype=torch.float16
 ):
     r"""
     A: (m, k)
@@ -42,7 +42,7 @@ def gemm_fp8_nt_blockscaled_ref(
     A_f32_reshape = rearrange(
         A_f32, "(m b) (k c) -> m k b c", b=block_size, c=block_size
     )
-    if scale_major_k:
+    if scale_major_mode == "K":
         A_f32_scale_reshape = A_f32_reshape * rearrange(As, "m k -> m k 1 1")
     else:
         A_f32_scale_reshape = A_f32_reshape * rearrange(As, "k m -> m k 1 1")
@@ -50,7 +50,7 @@ def gemm_fp8_nt_blockscaled_ref(
     B_f32_reshape = rearrange(
         B_f32, "(n b) (k c) -> n k b c", b=block_size, c=block_size
     )
-    if scale_major_k:
+    if scale_major_mode == "K":
         B_f32_scale_reshape = B_f32_reshape * rearrange(Bs, "n k -> n k 1 1")
     else:
         B_f32_scale_reshape = B_f32_reshape * rearrange(Bs, "k n -> n k 1 1")
@@ -60,7 +60,7 @@ def gemm_fp8_nt_blockscaled_ref(
 
 
 def gemm_fp8_nt_groupwise_ref(
-    A, B, As, Bs, block_size, scale_major_k=False, output_dtype=torch.float16
+    A, B, As, Bs, block_size, scale_major_mode, output_dtype=torch.float16
 ):
     r"""
     A: (m, k)
@@ -71,7 +71,7 @@ def gemm_fp8_nt_groupwise_ref(
     A_f32 = A.to(torch.float32)
     B_f32 = B.to(torch.float32)
     A_f32_reshape = rearrange(A_f32, "m (k b) -> m k b", b=block_size)
-    if scale_major_k:
+    if scale_major_mode == "K":
         A_f32_scale_reshape = A_f32_reshape * rearrange(As, "m k -> m k 1")
     else:
         A_f32_scale_reshape = A_f32_reshape * rearrange(As, "k m -> m k 1")
@@ -79,7 +79,7 @@ def gemm_fp8_nt_groupwise_ref(
     B_f32_reshape = rearrange(
         B_f32, "(n b) (k c) -> n k b c", b=block_size, c=block_size
     )
-    if scale_major_k:
+    if scale_major_mode == "K":
         B_f32_scale_reshape = B_f32_reshape * rearrange(Bs, "n k -> n k 1 1")
     else:
         B_f32_scale_reshape = B_f32_reshape * rearrange(Bs, "k n -> n k 1 1")
@@ -90,13 +90,13 @@ def gemm_fp8_nt_groupwise_ref(
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("scale_major_k", [True, False])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_blockscale_gemm(
     m,
     n,
     k,
-    scale_major_k,
+    scale_major_mode,
     out_dtype,
 ):
     torch.random.manual_seed(0)
@@ -111,7 +111,7 @@ def test_fp8_blockscale_gemm(
     b_fp32 = (torch.randn((n, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-    if scale_major_k:
+    if scale_major_mode == "K":
         a_scale_shape = (m // tile_size, k // tile_size)
         b_scale_shape = (n // tile_size, k // tile_size)
     else:
@@ -126,7 +126,7 @@ def test_fp8_blockscale_gemm(
     )
 
     c = gemm_fp8_nt_blockscaled(
-        a_fp8, b_fp8, a_scale, b_scale, scale_major_k, out_dtype=out_dtype
+        a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
     )
     ref_c = gemm_fp8_nt_blockscaled_ref(
         a_fp8,
@@ -134,7 +134,7 @@ def test_fp8_blockscale_gemm(
         a_scale,
         b_scale,
         tile_size,
-        scale_major_k,
+        scale_major_mode,
         out_dtype,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
@@ -143,13 +143,13 @@ def test_fp8_blockscale_gemm(
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("scale_major_k", [True, False])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_groupwise_gemm(
     m,
     n,
     k,
-    scale_major_k,
+    scale_major_mode,
     out_dtype,
 ):
     torch.random.manual_seed(0)
@@ -164,7 +164,7 @@ def test_fp8_groupwise_gemm(
     b_fp32 = (torch.randn((n, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-    if scale_major_k:
+    if scale_major_mode == "K":
         a_scale_shape = (m, k // tile_size)
         b_scale_shape = (n // tile_size, k // tile_size)
     else:
@@ -179,7 +179,7 @@ def test_fp8_groupwise_gemm(
     )
 
     c = gemm_fp8_nt_groupwise(
-        a_fp8, b_fp8, a_scale, b_scale, scale_major_k, out_dtype=out_dtype
+        a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
     )
     ref_c = gemm_fp8_nt_groupwise_ref(
         a_fp8,
@@ -187,7 +187,7 @@ def test_fp8_groupwise_gemm(
         a_scale,
         b_scale,
         tile_size,
-        scale_major_k,
+        scale_major_mode,
         out_dtype,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
@@ -197,14 +197,14 @@ def test_fp8_groupwise_gemm(
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("scale_major_k", [True, False])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_groupwise_group_gemm(
     m,
     n,
     k,
     group_size,
-    scale_major_k,
+    scale_major_mode,
     out_dtype,
 ):
     torch.random.manual_seed(0)
@@ -227,7 +227,7 @@ def test_fp8_groupwise_group_gemm(
     )
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-    if scale_major_k:
+    if scale_major_mode == "K":
         a_scale_shape = (group_size * m, k // tile_size)
         b_scale_shape = (group_size, n // tile_size, k // tile_size)
     else:
@@ -249,13 +249,13 @@ def test_fp8_groupwise_group_gemm(
         a_scale,
         b_scale,
         m_indptr,
-        scale_major_k=scale_major_k,
+        scale_major_mode=scale_major_mode,
         out_dtype=out_dtype,
     )
     for i in range(group_size):
         a_scale_i = (
             a_scale[m * i : m * (i + 1)]
-            if scale_major_k
+            if scale_major_mode == "K"
             else a_scale[::, m * i : m * (i + 1)]
         )
         ref_c = gemm_fp8_nt_groupwise_ref(
@@ -264,7 +264,7 @@ def test_fp8_groupwise_group_gemm(
             a_scale_i,
             b_scale[i],
             tile_size,
-            scale_major_k,
+            scale_major_mode,
             out_dtype,
         )
         torch.testing.assert_close(
@@ -273,6 +273,6 @@ def test_fp8_groupwise_group_gemm(
 
 
 if __name__ == "__main__":
-    test_fp8_blockscale_gemm(8192, 8192, 8192, False, torch.bfloat16)
-    test_fp8_groupwise_gemm(8192, 8192, 8192, True, torch.bfloat16)
-    test_fp8_groupwise_group_gemm(4, 128, 256, 2, True, torch.bfloat16)
+    test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
+    test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
+    test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
