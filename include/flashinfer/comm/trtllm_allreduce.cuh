@@ -1678,18 +1678,19 @@ cudaError_t lamportInitialize(void* buffer, size_t size, cudaStream_t stream) {
 
 // lamport: 3 buffers for synchronization
 template <typename T>
-cudaError_t lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size, cudaStream_t stream) {
+cudaError_t lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size,
+                                 cudaStream_t stream) {
   auto status = lamportInitialize<T>(buffer_0, size / sizeof(T), stream);
   FLASHINFER_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+                                              std::string(cudaGetErrorString(status)));
 
   status = lamportInitialize<T>(buffer_1, size / sizeof(T), stream);
   FLASHINFER_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+                                              std::string(cudaGetErrorString(status)));
 
   status = lamportInitialize<T>(buffer_2, size / sizeof(T), stream);
   FLASHINFER_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+                                              std::string(cudaGetErrorString(status)));
 
   return cudaSuccess;
   // todo(zihao): we can skip sycn with stream as below?

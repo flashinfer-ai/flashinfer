@@ -13,10 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "flashinfer/logging.h"
+
 #include <torch/library.h>
 
 #include "Python.h"
-#include "flashinfer/logging.h"
 
 void set_log_level(int64_t log_level_code) {
   auto log_level = static_cast<spdlog::level::level_enum>(log_level_code);

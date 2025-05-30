@@ -70,35 +70,36 @@ void trtllm_lamport_initialize(at::Tensor& buffer) {
   });
 }
 
-void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1, at::Tensor& buffer_2) {
+void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1,
+                                   at::Tensor& buffer_2) {
   DISPATCH_ALLREDUCE_DTYPE(buffer_0.scalar_type(), c_type, {
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
-    auto status = lamportInitializeAll<c_type>(static_cast<void*>(buffer_0.data_ptr()),
-                                            static_cast<void*>(buffer_1.data_ptr()),
-                                            static_cast<void*>(buffer_2.data_ptr()),
-                                            static_cast<size_t>(buffer_0.numel()), raw_stream);
+    auto status = lamportInitializeAll<c_type>(
+        static_cast<void*>(buffer_0.data_ptr()), static_cast<void*>(buffer_1.data_ptr()),
+        static_cast<void*>(buffer_2.data_ptr()), static_cast<size_t>(buffer_0.numel()), raw_stream);
     TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
 }
 
 // refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
-void trtllm_custom_all_reduce(AllReduceParams& params, at::Tensor& in, at::Tensor& out, int64_t tp_size,
-                              int64_t tp_rank, int64_t token_num, int64_t fusion_op_code,
-                              int64_t strategy_code, int64_t config_code, bool launch_with_pdl,
-                              std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
-                              std::optional<at::Tensor> weight,
+void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, int64_t tp_rank,
+                              int64_t token_num, int64_t fusion_op_code, int64_t strategy_code,
+                              int64_t config_code, bool launch_with_pdl, int64_t* flag_buffer_ptr,
+                              int64_t* peer_comm_buffer_ptrs, int64_t* peer_barrier_ptrs_in,
+                              int64_t* peer_barrier_ptrs_out, std::optional<at::Tensor> bias,
+                              std::optional<at::Tensor> residual, std::optional<at::Tensor> weight,
                               std::optional<at::Tensor> weight_pre_residual_norm,
                               std::optional<double> eps,
                               std::optional<at::Tensor> intermediate_buffer,
-                              std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs) {
+                              std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs,
+                              int64_t* lamport_peer_comm_buffer_ptrs) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
   const c10::cuda::OptionalCUDAGuard device_guard(buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
   // TODO(zihao): review dispatch type: support fp16, bf16, fp32
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(c_type, in, [&] {
-    // TODO(yingyi): might move all initialization into deserialization?
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
     int64_t hidden_size = in.numel() / token_num;
@@ -106,9 +107,24 @@ void trtllm_custom_all_reduce(AllReduceParams& params, at::Tensor& in, at::Tenso
     //     AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
     //                                          tp_rank, token_num, hidden_size, fusion_op);
 
-    params.elts_total = message_size;  // review: not passing elts_total as params
+    params.elts_total = message_size;
+    params.local_rank = tp_rank;
+    params.ranks_per_node = tp_size;
     params.local_input_buffer_ptr = in.data_ptr();
     params.local_output_buffer_ptr = out.data_ptr();
+
+    // NOTE(yingyi): review the barrier flag
+    if (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
+        is_lamport_supported<c_type>(token_num, hidden_size)) {
+      flag_offset = 0;
+    } else {
+      flag_offset = 1;
+    }
+
+    auto const flag_ptr = &flag_buffer_ptr[NUM_POINTERS_PER_RANK * tp_size + flag_offset];
+    *flag_ptr += 1;
+    uint32_t flag_value = *flag_ptr;
+    params.barrier_flag = flag_value;
 
     // add fusion params
     params.fusion_params.bias_buffer = bias.has_value() ? bias.value().data_ptr() : nullptr;
@@ -122,10 +138,21 @@ void trtllm_custom_all_reduce(AllReduceParams& params, at::Tensor& in, at::Tenso
     params.fusion_params.eps = eps.has_value() ? eps.value() : 1e-5f;
     params.fusion_params.intermediate_buffer =
         intermediate_buffer.has_value() ? intermediate_buffer.value().data_ptr() : nullptr;
+
+    // add ipc buffer pointers
+    for (int i = 0; i < tp_size; ++i) {
+      params.peer_comm_buffer_ptrs[i] = peer_comm_buffer_ptrs[i];
+      params.peer_barrier_ptrs_in[i] = peer_barrier_ptrs_in[i];
+      params.peer_barrier_ptrs_out[i] = peer_barrier_ptrs_out[i];
+    }
+
     if (lamport_peer_comm_buffer_ptrs.has_value()) {
-      auto* src = static_cast<void**>(lamport_peer_comm_buffer_ptrs.value().data_ptr());
-      for (int i = 0; i < MAX_RANKS_PER_NODE * 3; ++i) {
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = src[i];
+      for (int i = 0; i < tp_size; ++i) {
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = lamport_peer_comm_buffer_ptrs[i];
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] =
+            lamport_peer_comm_buffer_ptrs[i + tp_size];
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size * 2] =
+            lamport_peer_comm_buffer_ptrs[i + tp_size * 2];
       }
     }
 

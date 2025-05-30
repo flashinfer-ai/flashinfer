@@ -8,7 +8,6 @@ import torch.distributed as dist
 
 import flashinfer.comm as comm
 
-
 # todo: temp for test
 maxBatchSize = 1
 maxBeamWidth = 3
@@ -44,8 +43,10 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # create ipc memory
         # todo(29 May): create ipc memory buffer instead of lists of ipc memory???
         # todo(yingyi): lamport should be init only when can_access_peer is true
-        # init per world_size? 
-        ipc_handles = comm.trtllm_create_ipc_buffer_for_all_reduce(rank, world_size, maxSeqLen, hiddenSize, group=group)
+        # init per world_size?
+        ipc_handles = comm.trtllm_create_ipc_buffer_for_all_reduce(
+            rank, world_size, maxSeqLen, hiddenSize, group=group
+        )
 
         test_loop = 3
 
@@ -61,15 +62,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
                                 inp1_ref = inp1.clone()
                                 out1 = torch.empty_like(inp1)
-
-                                all_reduce_params = comm.trtllm_create_all_reduce_params(
-                                    message_size,
-                                    world_size,
-                                    rank,
-                                    inp1.data_ptr(),
-                                    out1.data_ptr(),
-                                    ipc_handles,
-                                )
 
                                 comm.trtllm_custom_all_reduce(
                                     all_reduce_params,
