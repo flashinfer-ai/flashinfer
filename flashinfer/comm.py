@@ -465,6 +465,131 @@ def free_shared_buffer(
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)
 
+# NOTE(Yingyi): The customAllReduce and allReduceFusion require different buffer size
+# since allreduceFusion kernels are an improved implementation
+# todo(review): align the ipc buffer size to tllm implementation
+OneShotMaxToken = 128
+MAX_ALL_REDUCE_BLOCKS = 24
+LamportTokenNumThreshold = 16
+def trtllm_create_ipc_buffer_for_all_reduce(
+    rank: int, tp_size: int, max_token_num: int, hidden_dim, group: Optional[ProcessGroup] = None
+) -> List[int]:
+    # NOTE(Yingyi): refer to tllm 
+    # - cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
+
+    buffer_size = tp_size * max_token_num * hidden_dim * 4 # size of float
+    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4 # size of uint32_t
+    flag_size = FLAG_SIZE * tp_size * 2
+    lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2 # size of half
+
+    ipc_handles = list()
+    # we should init 7 buffers for custom_all_reduce:
+    # [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
+
+    for size in [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]:
+        ipc_handles.append(create_shared_buffer(size, group))
+
+    # todo(yingyi): init flag to be 0
+    # todo(yingyi): init lamport buffer to be negative zero
+
+    return ipc_handles
+
+# todo(review): align the ipc buffer size to tllm implementation
+BarrierFlagCount = 256
+def trtllm_create_ipc_buffer_for_all_reduce_fusion(
+    rank: int, tp_size: int, max_token_num: int, hidden_dim, group: Optional[ProcessGroup] = None
+) -> List[int]:
+    # NOTE(Yingyi): refer to tllm 
+    # - cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
+
+    buffer_size = tp_size * max_token_num * hidden_dim * 2 # size of half
+    flag_size = tp_size * BarrierFlagCount * 4 # size of int
+    lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2 # size of half
+    lamport_buffer_size = lamport_comm_size * 3
+
+    # we should init 3 buffers for all reduce fusion:
+    # [buffer_size, flag_size, lamport_buffer_size]
+
+    ipc_handles = list()
+    for size in [buffer_size, flag_size, lamport_buffer_size]:
+        ipc_handles.append(create_shared_buffer(size, group))
+
+    return ipc_handles
+
+@dataclass
+class AllReduceFusionParams:
+    bias_buffer: int
+    residual_buffer: int
+    hidden_size: int
+    weight_buffer: int
+    weight_buffer_pre_residual_norm: int
+    eps: float
+    intermediate_buffer: int
+    lamport_peer_comm_buffer_ptrs: List[int]
+
+@dataclass
+class AllReduceParams:
+    elts_total: int
+    elts_per_rank: int
+    elts_per_block: int
+    rank_offset: int
+    ranks_per_node: int
+    local_rank: int
+    barrier_flag: int
+    peer_barrier_ptrs_in: List[int]
+    peer_barrier_ptrs_out: List[int]
+    peer_comm_buffer_ptrs: List[int]
+    local_output_buffer_ptr: int
+    local_input_buffer_ptr: int
+    fusion_params: AllReduceFusionParams
+
+def trtllm_create_all_reduce_params(
+    message_size: int,
+    world_size: int,
+    local_rank: int,
+    local_input_buffer_ptr: int,
+    local_output_buffer_ptr: int,
+    ipc_handles: List[List[int]],
+    fusion_bias_buffer_ptr: int = None,
+    fusion_residual_buffer_ptr: int = None,
+    fusion_weight_buffer_ptr: int = None,
+    fusion_weight_pre_residual_norm_buffer_ptr: int = None,
+    fusion_eps: float = None,
+    fusion_intermediate_buffer_ptr: int = None,
+    fusion_lamport_peer_comm_buffer_ptrs: List[int] = None,
+) -> AllReduceParams:
+    all_reduce_params = AllReduceParams()
+    all_reduce_params.elts_total = message_size
+    all_reduce_params.ranks_per_node = world_size
+    all_reduce_params.local_rank = local_rank
+    all_reduce_params.local_output_buffer_ptr = local_output_buffer_ptr # in.data_ptr()
+    all_reduce_params.local_input_buffer_ptr = local_input_buffer_ptr # out.data_ptr()
+
+    # fusion params
+    all_reduce_params.fusion_params.bias_buffer = fusion_bias_buffer_ptr # bias.data_ptr()
+    all_reduce_params.fusion_params.residual_buffer = fusion_residual_buffer_ptr # residual.data_ptr()
+    all_reduce_params.fusion_params.weight_buffer = fusion_weight_buffer_ptr # weight.data_ptr()
+    all_reduce_params.fusion_params.weight_buffer_pre_residual_norm = fusion_weight_pre_residual_norm_buffer_ptr # weight_pre_residual_norm.data_ptr()
+    all_reduce_params.fusion_params.eps = fusion_eps # eps
+    all_reduce_params.fusion_params.intermediate_buffer = fusion_intermediate_buffer_ptr # intermediate_buffer.data_ptr()
+
+    # ipc buffer pointers
+    for i in range(world_size):
+        all_reduce_params.peer_comm_buffer_ptrs.append(ipc_handles[0][i])
+        all_reduce_params.peer_barrier_ptrs_in.append(ipc_handles[2][i])
+        all_reduce_params.peer_barrier_ptrs_out.append(ipc_handles[3][i])
+
+        # world size was MAX_RANKS_PER_NODE = 16
+        all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs = [0] * (world_size * 3)
+        all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = ipc_handles[4][i] # peer_comm_buffer_ptrs[i]
+        all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i + world_size] = ipc_handles[5][i] # peer_comm_buffer_ptrs[i + world_size]
+        all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i + world_size * 2] = ipc_handles[6][i] # peer_comm_buffer_ptrs[i + world_size * 2]
+
+    return all_reduce_params
+
+def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
+    get_comm_module().trtllm_lamport_initialize(buffer)
+
 
 def trtllm_lamport_initialize_all(buffer_0: torch.Tensor, buffer_1: torch.Tensor, buffer_2: torch.Tensor) -> None:
     get_comm_module().trtllm_lamport_initialize_all(buffer_0, buffer_1, buffer_2)

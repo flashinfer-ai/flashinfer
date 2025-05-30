@@ -83,7 +83,7 @@ void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1, a
 }
 
 // refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
-void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& out, int64_t tp_size,
+void trtllm_custom_all_reduce(AllReduceParams& params, at::Tensor& in, at::Tensor& out, int64_t tp_size,
                               int64_t tp_rank, int64_t token_num, int64_t fusion_op_code,
                               int64_t strategy_code, int64_t config_code, bool launch_with_pdl,
                               std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
@@ -102,9 +102,9 @@ void trtllm_custom_all_reduce(at::Tensor& buffer, at::Tensor& in, at::Tensor& ou
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
     int64_t hidden_size = in.numel() / token_num;
-    auto params =
-        AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
-                                             tp_rank, token_num, hidden_size, fusion_op);
+    // auto params =
+    //     AllReduceParams<c_type>::deserialize(static_cast<int64_t*>(buffer.data_ptr()), tp_size,
+    //                                          tp_rank, token_num, hidden_size, fusion_op);
 
     params.elts_total = message_size;  // review: not passing elts_total as params
     params.local_input_buffer_ptr = in.data_ptr();

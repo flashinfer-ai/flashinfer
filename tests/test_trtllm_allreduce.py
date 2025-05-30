@@ -12,8 +12,8 @@ import flashinfer.comm as comm
 # todo: temp for test
 maxBatchSize = 1
 maxBeamWidth = 3
-maxSeqLen = 4096
-hiddenSize = 512
+maxSeqLen = 65536
+hiddenSize = 64
 
 
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
@@ -30,11 +30,10 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
     try:
         device = torch.device(f"cuda:{rank}")
-        message_sizes = [
+        token_nums = [
             512,
             2560,
             4096,
-            5120,
         ]
         strategy_codes = [0, 1, 2, 3, 4, 5, 6]
         config_codes = [0, 1]
@@ -42,39 +41,38 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # dtypes = [torch.float32, torch.float16, torch.bfloat16]
         launch_with_pdl = [True, False]
 
-        # todo(yingyi): calculate actual buffer size
-        param_buffer_size = 8192 * 1024
-        lamport_buffer_size = 8192
-        # review (reference 1): AllReduceBuffers::AllReduceBuffers in cpp/tensorrt_llm/runtime/ipcUtils.cpp, trtllm
-        # buffer_size = 1 * maxBatchSize * maxBeamWidth * maxSeqLen * hiddenSize * dtype.itemsize()
-        # review (reference 2): AllReduceParams::deserialize in csrc/trtllm_allreduce.cu here
-
         # create ipc memory
         # todo(29 May): create ipc memory buffer instead of lists of ipc memory???
-        param_buffer_ptrs = comm.create_shared_buffer(param_buffer_size, group=group)
-        lamport_buffer_ptrs_0 = comm.create_shared_buffer(lamport_buffer_size, group=group)
-        lamport_buffer_ptrs_1 = comm.create_shared_buffer(lamport_buffer_size, group=group)
-        lamport_buffer_ptrs_2 = comm.create_shared_buffer(lamport_buffer_size, group=group)
+        # todo(yingyi): lamport should be init only when can_access_peer is true
+        # init per world_size? 
+        ipc_handles = comm.trtllm_create_ipc_buffer_for_all_reduce(rank, world_size, maxSeqLen, hiddenSize, group=group)
 
         test_loop = 3
 
-        # init per world_size
-        comm.trtllm_lamport_initialize_all(lamport_buffer_ptrs_0, lamport_buffer_ptrs_1, lamport_buffer_ptrs_2)
-
-        for message_size in message_sizes:
+        for token_num in token_nums:
             for strategy_code in strategy_codes:
                 for config_code in config_codes:
                     for fusion_op_code in fusion_op_codes:
                         for launch_with_pdl in launch_with_pdl:
                             for _ in range(test_loop):
-                                inp1 = torch.randint(
-                                    1, 16, (message_size,), dtype=dtype, device=device
+                                message_size = token_num * hiddenSize
+                                inp1 = torch.rand(
+                                    message_size, dtype=dtype, device=device
                                 )
                                 inp1_ref = inp1.clone()
                                 out1 = torch.empty_like(inp1)
 
+                                all_reduce_params = comm.trtllm_create_all_reduce_params(
+                                    message_size,
+                                    world_size,
+                                    rank,
+                                    inp1.data_ptr(),
+                                    out1.data_ptr(),
+                                    ipc_handles,
+                                )
+
                                 comm.trtllm_custom_all_reduce(
-                                    param_buffer_ptrs,
+                                    all_reduce_params,
                                     inp1,
                                     out1,
                                     world_size,
@@ -102,14 +100,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # if custom_ptr is not None:
         #     comm.dispose(custom_ptr)
 
-        if param_buffer_ptrs:
-            comm.free_shared_buffer(param_buffer_ptrs, group)
-        if lamport_buffer_ptrs_0:
-            comm.free_shared_buffer(lamport_buffer_ptrs_0, group)
-        if lamport_buffer_ptrs_1:
-            comm.free_shared_buffer(lamport_buffer_ptrs_1, group)
-        if lamport_buffer_ptrs_2:
-            comm.free_shared_buffer(lamport_buffer_ptrs_2, group)
+        # todo(yingyi): free ipc handles
+        for ipc_handle in ipc_handles:
+            comm.free_shared_buffer(ipc_handle, group)
 
         dist.destroy_process_group(group=group)
 
