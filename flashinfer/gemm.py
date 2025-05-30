@@ -702,6 +702,8 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    scale_major_k: bool = False,
+    mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -721,13 +723,22 @@ def gemm_fp8_nt_groupwise(
         Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape (ceil_div(k, k_granularity), ceil_div(m, m_granularity)).
+        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_k is ``True``
+        otherwise ``(k // block_size, m)``.
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape (ceil_div(k, k_granularity), ceil_div(n, n_granularity)).
+        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``True``
+        otherwise ``(k // block_size, n // block_size)``.
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    scale_major_k: bool
+        Whether scale tensors are k-major layout.
+
+    mma_sm: int
+        How many SMs to use for the MMA operation, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
 
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
@@ -743,23 +754,13 @@ def gemm_fp8_nt_groupwise(
 
     Notes
     -----
-    If ``m`` is not a multiple of 4, we will pad ``m`` to the next multiple of 4 to accommodate the kernel's requirement.
+    The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
     )
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
-    m = a.shape[0]
-    m_padded = ((m + 3) // 4) * 4
-    need_padding = m_padded != m
-    if need_padding:
-        a_padded = F.pad(a, (0, 0, 0, m_padded - m))
-        # a_scale is (k // 128, m)
-        a_scale_padded = F.pad(a_scale, (0, m_padded - m))
-    else:
-        a_padded = a
-        a_scale_padded = a_scale
 
     if a.shape[1] != b.shape[1]:
         raise ValueError(
@@ -777,33 +778,25 @@ def gemm_fp8_nt_groupwise(
     # (True, False) -> use out tensor as out_padded
     # (True, True) -> create out_padded tensor explicitly
 
-    if need_padding or out is None:
-        out_padded = torch.empty(
-            m_padded,
+    if out is None:
+        out = torch.empty(
+            a.shape[0],
             b.shape[0],
             device=a.device,
             dtype=out_dtype,
         )
-    else:
-        out_padded = out
 
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
         workspace_buffer,
-        a_padded,
+        a,
         b,
-        a_scale_padded,
+        a_scale,
         b_scale,
-        out_padded,
+        out,
         *scale_granularity_mnk,
+        scale_major_k,
+        mma_sm,
     )
-
-    # NOTE(Zihao): if out is specified and need_padding is True, we need to copy
-    # the result back to out
-
-    if out is not None and need_padding:
-        out.copy_(out_padded[:m])
-    else:
-        out = out_padded[:m]
 
     return out
 
@@ -813,6 +806,8 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    scale_major_k: bool = False,
+    mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -827,6 +822,8 @@ def gemm_fp8_nt_blockscaled(
         a_scale,
         b_scale,
         scale_granularity_mnk=(128, 128, 128),
+        scale_major_k=scale_major_k,
+        mma_sm=mma_sm,
         out=out,
         out_dtype=out_dtype,
     )
@@ -839,6 +836,7 @@ def group_gemm_fp8_nt_groupwise(
     b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_k: bool = False,
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
@@ -856,10 +854,12 @@ def group_gemm_fp8_nt_groupwise(
         Column-major input tensor shape ``(batch_size, n, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape ``(k // block_size, cum_m)``.
+        Column-major scale tensor for a, shape ``(cum_m, k // block_size)`` if scale_major_k is ``True``
+        otherwise ``(k // block_size, cum_m)``.
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(batch_size, k // block_size, n // block_size)``.
+        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_k is ``True``
+        otherwise ``(batch_size, k // block_size, n // block_size)``.
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``.
@@ -867,6 +867,9 @@ def group_gemm_fp8_nt_groupwise(
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    scale_major_k: bool
+        Whether scale tensors are k-major layout.
 
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
@@ -882,6 +885,11 @@ def group_gemm_fp8_nt_groupwise(
     -------
     out: torch.Tensor
         The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
+    to accommodate the kernel's requirement.
     """
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
@@ -912,6 +920,7 @@ def group_gemm_fp8_nt_groupwise(
         n,
         k,
         *scale_granularity_mnk,
+        scale_major_k,
         mma_sm,
     )
     return out
