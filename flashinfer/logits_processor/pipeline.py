@@ -3,11 +3,11 @@ from typing import Any, List, Optional, Union
 
 import torch
 
-from .compiler import Compiler, compile_pipeline
+from .compiler import compile_pipeline
 from .fusion_rules import FusionRule
-from .legalization import LegalizationError, infer_initial_sort, legalize_processors
+from .legalization import LegalizationError, infer_initial_type, legalize_processors
 from .processors import LogitsProcessor
-from .types import Sort, TaggedTensor
+from .types import TaggedTensor, TensorType
 from .validators import CompileError, ValidityCheck
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ class LogitsPipe:
         self,
         processors: List[LogitsProcessor],
         compile: bool = True,
-        input_sort: Optional[Sort] = None,
+        input_type: Optional[TensorType] = None,
         custom_fusion_rules: Optional[List[FusionRule]] = None,
         custom_validity_checks: Optional[List[ValidityCheck]] = None,
     ):
@@ -28,27 +28,35 @@ class LogitsPipe:
         self.processors = list(processors)
 
         try:
-            # Step 1: Infer initial sort type
-            self._initial_sort = input_sort or infer_initial_sort(self.processors)
+            # Step 1: Infer initial input tensor type
+            self._initial_type = input_type or infer_initial_type(self.processors)
 
             # Step 2: Legalization - convert high-level processors to low-level ops
-            self.ops = legalize_processors(self.processors, self._initial_sort)
+            self.ops = legalize_processors(self.processors, self._initial_type)
 
             # Step 3: Compilation - type check, validate, and fuse ops
             if compile:
                 self.compile(custom_fusion_rules, custom_validity_checks)
+            else:
+                self.compiled_ops = None
 
         except (LegalizationError, CompileError) as e:
             raise ValueError(f"Pipeline creation failed: {e}") from e
 
     def __repr__(self) -> str:
         processor_names = [proc.__class__.__name__ for proc in self.processors]
-        return f"LogitsPipeline([{' -> '.join(processor_names)}])"
+        op_names = [op.__class__.__name__ for op in self.ops]
+        compiled_op_names = (
+            [op.__class__.__name__ for op in self.compiled_ops]
+            if self.compiled_ops
+            else []
+        )
+        return f"LogitsPipe([{' -> '.join(processor_names)}], ops=[{' -> '.join(op_names)}], compiled_ops=[{' -> '.join(compiled_op_names)}])"
 
     def __call__(
         self, x: Union[torch.Tensor, TaggedTensor], **kwargs: Any
     ) -> torch.Tensor:
-        if not self.compiled_ops:
+        if self.compiled_ops is None:
             logger.warning("Pipeline is not compiled, running discrete ops.")
             ops = self.ops
         else:
@@ -57,7 +65,7 @@ class LogitsPipe:
         if isinstance(x, TaggedTensor):
             tagged_tensor = x
         else:
-            if self._initial_sort == Sort.PROBS:
+            if self._initial_type == TensorType.PROBS:
                 tagged_tensor = TaggedTensor.probs(x)
             else:
                 tagged_tensor = TaggedTensor.logits(x)
@@ -75,8 +83,8 @@ class LogitsPipe:
         return tagged_tensor.data
 
     @property
-    def initial_sort(self) -> Sort:
-        return self._initial_sort
+    def initial_type(self) -> TensorType:
+        return self._initial_type
 
     def compile(
         self,

@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from .fusion_rules import FusionRule, get_default_fusion_rules
 from .op import Op
-from .types import Sort
+from .types import TensorType
 from .validators import CompileError, ValidityCheck, get_default_validity_checks
 
 logger = logging.getLogger(__name__)
@@ -43,23 +43,23 @@ class Compiler:
     def _type_check(self, ops: List[Op]) -> None:
         first_op = ops[0]
 
-        current_sort = first_op.IN
+        current_type = first_op.IN
 
-        if current_sort not in [Sort.LOGITS, Sort.PROBS]:
+        if current_type not in [TensorType.LOGITS, TensorType.PROBS]:
             raise CompileError(
                 f"First operator ({first_op.__class__.__name__}) cannot accept standard pipeline inputs. "
                 f"Expected LOGITS or PROBS, but operator accepts: {first_op.IN}"
             )
 
         for i, op in enumerate(ops):
-            if current_sort != op.IN:
+            if current_type != op.IN:
                 raise CompileError(
                     f"Type mismatch at operator {i} ({op.__class__.__name__}). "
-                    f"Expected input type: {current_sort}, but operator accepts: {op.IN}. "
-                    f"Previous operator output: {current_sort}"
+                    f"Expected input type: {current_type}, but operator accepts: {op.IN}. "
+                    f"Previous operator output: {current_type}"
                 )
 
-            current_sort = op.OUT
+            current_type = op.OUT
 
     def _run_validity_checks(self, ops: List[Op]) -> None:
         for check in self.validity_checks:

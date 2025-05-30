@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 
-class Sort(Enum):
+class TensorType(Enum):
     """
-    Sort represents the semantic type of tensors in the pipeline.
+    TensorType represents the semantic type of tensors in the pipeline.
 
     - LOGITS: Raw or masked scores (real-valued vectors)
     - PROBS: Non-negative scores (user decides whether normalized)
@@ -24,25 +24,25 @@ class Sort(Enum):
         return self.name
 
     def __repr__(self) -> str:
-        return f"Sort.{self.name}"
+        return f"TensorType.{self.name}"
 
 
 @dataclass(slots=True, frozen=True)
 class TaggedTensor:
     data: torch.Tensor
-    sort: Sort
+    type: TensorType
 
     @staticmethod
     def logits(t: torch.Tensor) -> TaggedTensor:
-        return TaggedTensor(t, Sort.LOGITS)
+        return TaggedTensor(t, TensorType.LOGITS)
 
     @staticmethod
     def probs(t: torch.Tensor) -> TaggedTensor:
-        return TaggedTensor(t, Sort.PROBS)
+        return TaggedTensor(t, TensorType.PROBS)
 
     @staticmethod
     def indices(t: torch.Tensor) -> TaggedTensor:
-        return TaggedTensor(t, Sort.INDICES)
+        return TaggedTensor(t, TensorType.INDICES)
 
     def __torch_function__(
         self,
@@ -77,4 +77,4 @@ class TaggedTensor:
         return self.data.size(dim)
 
     def __repr__(self) -> str:
-        return f"TaggedTensor(sort={self.sort}, shape={self.shape}, dtype={self.dtype}, device={self.device})"
+        return f"TaggedTensor(type={self.type}, shape={self.shape}, dtype={self.dtype}, device={self.device})"

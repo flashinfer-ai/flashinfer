@@ -14,5 +14,5 @@ from .processors import Softmax as Softmax
 from .processors import Temperature as Temperature
 from .processors import TopK as TopK
 from .processors import TopP as TopP
-from .types import Sort as Sort
 from .types import TaggedTensor as TaggedTensor
+from .types import TensorType as TensorType

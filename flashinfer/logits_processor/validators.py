@@ -1,8 +1,8 @@
 from typing import Callable, List
 
 from .op import Op
-from .operators import SoftmaxOp, TopPOp
-from .types import Sort
+from .operators import SoftmaxOp
+from .types import TensorType
 
 
 class CompileError(Exception):
@@ -51,7 +51,7 @@ def indices_terminal_rule(ops: List[Op]) -> None:
     If an operator outputs Indices, no operator may follow it.
     """
     for i, op in enumerate(ops[:-1]):  # Check all but the last operator
-        if Sort.INDICES == op.OUT:
+        if TensorType.INDICES == op.OUT:
             next_op = ops[i + 1]
             raise CompileError(
                 f"No operator may follow one that outputs Indices. "
