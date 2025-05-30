@@ -1,22 +1,17 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from .types import Sort, TaggedTensor
 
 
 class Op(ABC):
-    IN: List[Sort] = []
-    OUT: List[Sort] = []
+    IN: Sort = None
+    OUT: Sort = None
 
     def __init__(self):
-        if not self.IN or not self.OUT:
+        if self.IN is None or self.OUT is None:
             raise ValueError(
-                f"Operator {self.__class__.__name__} must define IN and OUT type signatures"
-            )
-
-        if len(self.IN) != len(self.OUT):
-            raise ValueError(
-                f"Operator {self.__class__.__name__} must have matching IN/OUT signature lengths"
+                f"Operator {self.__class__.__name__} must define IN and OUT sort types"
             )
 
     @abstractmethod
@@ -24,18 +19,15 @@ class Op(ABC):
         raise NotImplementedError
 
     def _validate_input_sort(self, tensor: TaggedTensor) -> Sort:
-        for i, input_sort in enumerate(self.IN):
-            if tensor.sort == input_sort:
-                return self.OUT[i]
-
-        raise ValueError(
-            f"Operator {self.__class__.__name__} cannot accept input sort {tensor.sort}. "
-            f"Expected one of: {self.IN}"
-        )
+        if tensor.sort != self.IN:
+            raise ValueError(
+                f"Operator {self.__class__.__name__} cannot accept input sort {tensor.sort}. "
+                f"Expected: {self.IN}"
+            )
+        return self.OUT
 
     def __repr__(self) -> str:
-        signatures = [f"{inp} -> {out}" for inp, out in zip(self.IN, self.OUT)]
-        return f"{self.__class__.__name__}({', '.join(signatures)})"
+        return f"{self.__class__.__name__}({self.IN} -> {self.OUT})"
 
 
 class ParameterizedOp(Op):

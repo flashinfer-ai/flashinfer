@@ -1,7 +1,7 @@
 from typing import Callable, List
 
 from .op import Op
-from .operators import Softmax, TopP
+from .operators import SoftmaxOp, TopPOp
 from .types import Sort
 
 
@@ -18,7 +18,7 @@ def single_softmax_rule(ops: List[Op]) -> None:
 
     Softmax appears ≤ 1 time in the pipeline.
     """
-    softmax_count = sum(1 for op in ops if isinstance(op, Softmax))
+    softmax_count = sum(1 for op in ops if isinstance(op, SoftmaxOp))
     if softmax_count > 1:
         raise CompileError(
             "Multiple Softmax operators found. Only one Softmax is allowed per pipeline."
@@ -35,9 +35,9 @@ def single_softmax_rule(ops: List[Op]) -> None:
 #     seen_softmax = False
 
 #     for op in ops:
-#         if isinstance(op, Softmax):
+#         if isinstance(op, SoftmaxOp):
 #             seen_softmax = True
-#         elif isinstance(op, TopP) and not seen_softmax:
+#         elif isinstance(op, TopPOp) and not seen_softmax:
 #             raise CompileError(
 #                 "TopP operator requires a preceding Softmax operator. "
 #                 "TopP can only operate on probabilities, not logits."
@@ -51,7 +51,7 @@ def indices_terminal_rule(ops: List[Op]) -> None:
     If an operator outputs Indices, no operator may follow it.
     """
     for i, op in enumerate(ops[:-1]):  # Check all but the last operator
-        if Sort.INDICES in op.OUT:
+        if Sort.INDICES == op.OUT:
             next_op = ops[i + 1]
             raise CompileError(
                 f"No operator may follow one that outputs Indices. "

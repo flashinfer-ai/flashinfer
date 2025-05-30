@@ -2,14 +2,14 @@ from typing import Callable, List, NamedTuple, Tuple
 
 from .op import Op
 from .operators import (
-    FusedJointTopKTopPSampleProbs,
-    FusedMinPSampling,
-    FusedTopKSampling,
-    FusedTopPSampling,
-    MinP,
-    SampleProbs,
-    TopKProbs,
-    TopP,
+    FusedJointTopKTopPSampleProbsOp,
+    FusedMinPSampleProbsOp,
+    FusedTopKSampleProbsOp,
+    FusedTopPSampleProbsOp,
+    MinPOp,
+    ProbsTopKOp,
+    SampleProbsOp,
+    TopPOp,
 )
 
 
@@ -45,7 +45,7 @@ def build_topk_sampling(window: List[Op]) -> Op:
     deterministic = getattr(sampling_op, "default_params", {}).get(
         "deterministic", True
     )
-    return FusedTopKSampling(deterministic=deterministic)
+    return FusedTopKSampleProbsOp(deterministic=deterministic)
 
 
 def build_topp_sampling(window: List[Op]) -> Op:
@@ -53,7 +53,7 @@ def build_topp_sampling(window: List[Op]) -> Op:
     deterministic = getattr(sampling_op, "default_params", {}).get(
         "deterministic", True
     )
-    return FusedTopPSampling(deterministic=deterministic)
+    return FusedTopPSampleProbsOp(deterministic=deterministic)
 
 
 def build_minp_sampling(window: List[Op]) -> Op:
@@ -61,31 +61,31 @@ def build_minp_sampling(window: List[Op]) -> Op:
     deterministic = getattr(sampling_op, "default_params", {}).get(
         "deterministic", True
     )
-    return FusedMinPSampling(deterministic=deterministic)
+    return FusedMinPSampleProbsOp(deterministic=deterministic)
 
 
 def get_default_fusion_rules() -> List[FusionRule]:
     return [
         FusionRule(
-            pattern=(TopKProbs, TopP, SampleProbs),
+            pattern=(ProbsTopKOp, TopPOp, SampleProbsOp),
             guard=joint_topk_topp_sampleprobs_guard,
-            build=lambda window: FusedJointTopKTopPSampleProbs(),
+            build=lambda window: FusedJointTopKTopPSampleProbsOp(),
             prio=100,
         ),
         FusionRule(
-            pattern=(TopKProbs, SampleProbs),
+            pattern=(ProbsTopKOp, SampleProbsOp),
             guard=lambda window: True,
             build=build_topk_sampling,
             prio=10,
         ),
         FusionRule(
-            pattern=(TopP, SampleProbs),
+            pattern=(TopPOp, SampleProbsOp),
             guard=lambda window: True,
             build=build_topp_sampling,
             prio=10,
         ),
         FusionRule(
-            pattern=(MinP, SampleProbs),
+            pattern=(MinPOp, SampleProbsOp),
             guard=lambda window: True,
             build=build_minp_sampling,
             prio=10,

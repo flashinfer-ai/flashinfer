@@ -8,11 +8,11 @@ from .op import Op, ParameterizedOp
 from .types import Sort, TaggedTensor
 
 
-class Temperature(ParameterizedOp):
+class TemperatureOp(ParameterizedOp):
     """Temperature scaling: Logits -> Logits"""
 
-    IN = [Sort.LOGITS]
-    OUT = [Sort.LOGITS]
+    IN = Sort.LOGITS
+    OUT = Sort.LOGITS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -26,11 +26,11 @@ class Temperature(ParameterizedOp):
         return TaggedTensor(scaled_logits, output_sort)
 
 
-class Softmax(Op):
+class SoftmaxOp(Op):
     """Softmax: Logits -> Probabilities"""
 
-    IN = [Sort.LOGITS]
-    OUT = [Sort.PROBS]
+    IN = Sort.LOGITS
+    OUT = Sort.PROBS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -40,11 +40,11 @@ class Softmax(Op):
         return TaggedTensor(probs, output_sort)
 
 
-class TopKProbs(ParameterizedOp):
+class ProbsTopKOp(ParameterizedOp):
     """TopK Renorm Probs: Probabilities -> Probabilities"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.PROBS]
+    IN = Sort.PROBS
+    OUT = Sort.PROBS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -65,11 +65,11 @@ class TopKProbs(ParameterizedOp):
         return TaggedTensor(renorm_probs, output_sort)
 
 
-class TopKLogits(ParameterizedOp):
+class LogitsTopKOp(ParameterizedOp):
     """TopK Mask Logits: Logits -> Logits"""
 
-    IN = [Sort.LOGITS]
-    OUT = [Sort.LOGITS]
+    IN = Sort.LOGITS
+    OUT = Sort.LOGITS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -89,11 +89,11 @@ class TopKLogits(ParameterizedOp):
         return TaggedTensor(masked_logits, output_sort)
 
 
-class TopP(ParameterizedOp):
+class TopPOp(ParameterizedOp):
     """TopP: Probabilities -> Probabilities"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.PROBS]
+    IN = Sort.PROBS
+    OUT = Sort.PROBS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -112,11 +112,11 @@ class TopP(ParameterizedOp):
         return TaggedTensor(renorm_probs, output_sort)
 
 
-class MinP(ParameterizedOp):
+class MinPOp(ParameterizedOp):
     """MinP: Probabilities -> Probabilities"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.PROBS]
+    IN = Sort.PROBS
+    OUT = Sort.PROBS
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -132,11 +132,11 @@ class MinP(ParameterizedOp):
         return TaggedTensor(probs, output_sort)
 
 
-class SampleProbs(ParameterizedOp):
+class SampleProbsOp(ParameterizedOp):
     """Sampling: Probabilities -> Indices"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.INDICES]
+    IN = Sort.PROBS
+    OUT = Sort.INDICES
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -155,11 +155,11 @@ class SampleProbs(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class SampleLogits(ParameterizedOp):
+class SampleLogitsOp(ParameterizedOp):
     """Sampling: Logits -> Indices"""
 
-    IN = [Sort.LOGITS]
-    OUT = [Sort.INDICES]
+    IN = Sort.LOGITS
+    OUT = Sort.INDICES
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -178,14 +178,15 @@ class SampleLogits(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedTopKSampling(ParameterizedOp):
+# Fused operators
+class FusedTopKSampleProbsOp(ParameterizedOp):
     """Fused TopK -> Sampling: Probabilities -> Indices"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.INDICES]
+    IN = Sort.PROBS
+    OUT = Sort.INDICES
 
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
+    def __init__(self, deterministic: bool = True, **default_params: Any):
+        super().__init__(deterministic=deterministic, **default_params)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -195,6 +196,13 @@ class FusedTopKSampling(ParameterizedOp):
         ) or self.default_params.get("deterministic", True)
         maybe_top_k_arr = self._get_param("maybe_top_k_arr", kwargs)
         top_k_val = self._get_param("top_k_val", kwargs)
+
+        if (
+            not isinstance(top_k_val, int) or top_k_val <= 0
+        ) and maybe_top_k_arr is None:
+            raise ValueError(
+                "top_k must be a positive integer or maybe_top_k_arr must be provided"
+            )
 
         indices = self._get_param("indices", kwargs, required=False)
         generator = self._get_param("generator", kwargs, required=False)
@@ -206,14 +214,14 @@ class FusedTopKSampling(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedTopPSampling(ParameterizedOp):
+class FusedTopPSampleProbsOp(ParameterizedOp):
     """Fused TopP -> Sampling: Probabilities -> Indices"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.INDICES]
+    IN = Sort.PROBS
+    OUT = Sort.INDICES
 
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
+    def __init__(self, deterministic: bool = True, **default_params: Any):
+        super().__init__(deterministic=deterministic, **default_params)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -223,6 +231,11 @@ class FusedTopPSampling(ParameterizedOp):
         ) or self.default_params.get("deterministic", True)
         maybe_top_p_arr = self._get_param("maybe_top_p_arr", kwargs)
         top_p_val = self._get_param("top_p_val", kwargs)
+
+        if not (0 < top_p_val <= 1) and maybe_top_p_arr is None:
+            raise ValueError(
+                "top_p must be in (0, 1] or maybe_top_p_arr must be provided"
+            )
 
         indices = self._get_param("indices", kwargs, required=False)
         generator = self._get_param("generator", kwargs, required=False)
@@ -234,14 +247,14 @@ class FusedTopPSampling(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedMinPSampling(ParameterizedOp):
+class FusedMinPSampleProbsOp(ParameterizedOp):
     """Fused MinP -> Sampling: Probabilities -> Indices"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.INDICES]
+    IN = Sort.PROBS
+    OUT = Sort.INDICES
 
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
+    def __init__(self, deterministic: bool = True, **default_params: Any):
+        super().__init__(deterministic=deterministic, **default_params)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -251,6 +264,11 @@ class FusedMinPSampling(ParameterizedOp):
         ) or self.default_params.get("deterministic", True)
         maybe_min_p_arr = self._get_param("maybe_min_p_arr", kwargs)
         min_p_val = self._get_param("min_p_val", kwargs)
+
+        if not (0 < min_p_val <= 1) and maybe_min_p_arr is None:
+            raise ValueError(
+                "min_p must be in (0, 1] or maybe_min_p_arr must be provided"
+            )
 
         indices = self._get_param("indices", kwargs, required=False)
         generator = self._get_param("generator", kwargs, required=False)
@@ -262,14 +280,14 @@ class FusedMinPSampling(ParameterizedOp):
         return TaggedTensor(samples, output_sort)
 
 
-class FusedJointTopKTopPSampleProbs(ParameterizedOp):
+class FusedJointTopKTopPSampleProbsOp(ParameterizedOp):
     """Fused Joint TopKProbs -> TopP -> SampleProbs: Probabilities -> Indices"""
 
-    IN = [Sort.PROBS]
-    OUT = [Sort.INDICES]
+    IN = Sort.PROBS
+    OUT = Sort.INDICES
 
-    def __init__(self, deterministic: bool = True):
-        super().__init__(deterministic=deterministic)
+    def __init__(self, deterministic: bool = True, **default_params: Any):
+        super().__init__(deterministic=deterministic, **default_params)
 
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_sort = self._validate_input_sort(tensor)
@@ -281,6 +299,18 @@ class FusedJointTopKTopPSampleProbs(ParameterizedOp):
         top_k_val = self._get_param("top_k_val", kwargs)
         maybe_top_p_arr = self._get_param("maybe_top_p_arr", kwargs)
         top_p_val = self._get_param("top_p_val", kwargs)
+
+        if (
+            not isinstance(top_k_val, int) or top_k_val <= 0
+        ) and maybe_top_k_arr is None:
+            raise ValueError(
+                "top_k must be a positive integer or maybe_top_k_arr must be provided"
+            )
+
+        if not (0 < top_p_val <= 1) and maybe_top_p_arr is None:
+            raise ValueError(
+                "top_p must be in (0, 1] or maybe_top_p_arr must be provided"
+            )
 
         indices = self._get_param("indices", kwargs, required=False)
         generator = self._get_param("generator", kwargs, required=False)
