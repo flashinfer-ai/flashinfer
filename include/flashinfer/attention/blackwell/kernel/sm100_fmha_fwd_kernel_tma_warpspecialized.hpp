@@ -130,6 +130,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     ProblemShape problem_shape;
     typename CollectiveMainloop::Arguments mainloop;
     typename CollectiveEpilogue::Arguments epilogue;
+    typename TileScheduler::Arguments tile_scheduler;
     cutlass::KernelHardwareInfo hw_info;
   };
 
@@ -167,8 +168,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         args.problem_shape,
         CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info, ClusterShape{},
-                                               TileShape{})};
+        TileScheduler::to_underlying_arguments(args.tile_scheduler, args.hw_info)};
   }
 
   CUTLASS_DEVICE auto apply_batch(const Params& params, ProblemShape const& problem_shape,
@@ -177,6 +177,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
     TileScheduler tile_scheduler{params.tile_scheduler};
 
     int warp_idx = cutlass::canonical_warp_idx_sync();

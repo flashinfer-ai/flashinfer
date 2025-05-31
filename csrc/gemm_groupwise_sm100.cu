@@ -68,6 +68,8 @@ void CutlassGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tens
               static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
               static_cast<cutlass_t_out*>(C.data_ptr()), A.size(0), B.size(0), A.size(1), 1,
               stream);
+          TORCH_CHECK(status == cudaSuccess, "Failed to run cutlass gemm groupwise scaled sm100",
+                      cudaGetErrorString(status));
           return true;
         });
   });
