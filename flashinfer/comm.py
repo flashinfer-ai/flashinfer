@@ -314,10 +314,9 @@ def get_comm_module():
         module.trtllm_lamport_initialize_all(buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype)
 
     @register_custom_op(
-        "flashinfer::trtllm_custom_all_reduce", mutates_args=["buffer", "inp", "out"]
+        "flashinfer::trtllm_custom_all_reduce", mutates_args=["inp", "out", "tp_size", "tp_rank", "token_num", "fusion_op_code", "strategy_code", "config_code", "launch_with_pdl", "flag_value", "peer_comm_buffer_ptrs", "peer_barrier_ptrs_in", "peer_barrier_ptrs_out", "bias", "residual", "weight", "weight_pre_residual_norm", "eps", "intermediate_buffer", "lamport_peer_comm_buffer_ptrs_0", "lamport_peer_comm_buffer_ptrs_1", "lamport_peer_comm_buffer_ptrs_2"]
     )
     def trtllm_custom_all_reduce(
-        buffer: torch.Tensor,
         inp: torch.Tensor,
         out: torch.Tensor,
         tp_size: int,
@@ -342,7 +341,6 @@ def get_comm_module():
         lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
     ) -> None:
         module.trtllm_custom_all_reduce(
-            buffer,
             inp,
             out,
             tp_size,
@@ -544,7 +542,7 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     ]:
         ipc_handles.append(create_shared_buffer(size, group))
 
-    # todo(yingyi): init flag to be 0 - move to c++ side
+    print(f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}")
     # todo(yingyi): init lamport buffer to be negative zero - move to outer init flow
     # note(yingyi): maintain local buffer - unused in tllm, skip
 
@@ -578,6 +576,7 @@ def trtllm_create_ipc_buffer_for_all_reduce_fusion(
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         ipc_handles.append(create_shared_buffer(size, group))
 
+    print(f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}")
     return ipc_handles
 
 

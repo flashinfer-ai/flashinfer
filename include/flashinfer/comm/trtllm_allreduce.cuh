@@ -1114,6 +1114,8 @@ cudaError_t lamport_initialize_kernel_launcher(void* buffer, size_t size, cudaSt
   int grid_size = (size + 1024 * VEC_SIZE - 1) / (1024 * VEC_SIZE);
   lamport_initialize_kernel<T>
       <<<grid_size, block_size, 0, stream>>>(reinterpret_cast<T*>(buffer), size);
+  auto status = cudaGetLastError();
+  return status;
 }
 };  // namespace reduce_fusion
 
@@ -1673,6 +1675,7 @@ cudaError_t lamportInitialize(void* buffer, size_t size, cudaStream_t stream) {
   if (size == 0) {
     return cudaSuccess;
   }
+  FLASHINFER_LOG_INFO("lamportInitialize start: buffer: {}, size: {}", buffer, size);
   return reduce_fusion::lamport_initialize_kernel_launcher<T>(buffer, size, stream);
 }
 
