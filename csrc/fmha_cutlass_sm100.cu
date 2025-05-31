@@ -70,7 +70,9 @@ using namespace flashinfer;
 
 void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
                          at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
-                         at::Tensor kv_segment_offsets, at::Tensor o,
+                         at::Tensor kv_segment_offsets, at::Tensor work_indptr,
+                         at::Tensor qo_tile_indices, at::Tensor qo_head_indices,
+                         at::Tensor batch_indices, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
                          int64_t head_dim_qk, int64_t head_dim_vo, int64_t batch_size,
@@ -92,9 +94,17 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
     using CutlassMaskMode =
         typename std::conditional<MASK_MODE == MaskMode::kCausal, CausalMask, ResidualMask>::type;
     run_fmha_fwd<cutlass_type_in, cutlass_type_out, TileShapeQK, TileShapePV, CutlassMaskMode>(
-        workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o,
-        maybe_lse, mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
-        batch_size, total_qo_len, total_kv_len, max_qo_len, max_kv_len);
+        workspace_buffer, static_cast<cutlass_type_in*>(q.data_ptr()),
+        static_cast<cutlass_type_in*>(k.data_ptr()), static_cast<cutlass_type_in*>(v.data_ptr()),
+        static_cast<int*>(qo_lens.data_ptr()), static_cast<int*>(kv_lens.data_ptr()),
+        static_cast<int*>(qo_segment_offsets.data_ptr()),
+        static_cast<int*>(kv_segment_offsets.data_ptr()), static_cast<int*>(work_indptr.data_ptr()),
+        static_cast<int*>(qo_tile_indices.data_ptr()),
+        static_cast<int*>(qo_head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
+        static_cast<cutlass_type_out*>(o.data_ptr()),
+        maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
+        mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size,
+        total_qo_len, total_kv_len, max_qo_len, max_kv_len);
 
     return true;
   });
