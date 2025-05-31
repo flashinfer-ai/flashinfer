@@ -33,7 +33,7 @@ class FusionRule(NamedTuple):
     """
     Attributes:
         pattern: Tuple of operator types to match (e.g., (TopK, Sampling))
-        guard: Function that takes the matched operators and returns True if fusion should apply
+        guard: Function that takes the matched operators and returns True if fusion should apply. It accepts a window of operators parameter which is a subset of the operators in the pipeline and is an exact match of the pattern.
         build: Function that takes the matched operators and returns a fused operator
         prio: Priority for rule application (higher = tried earlier)
     """
@@ -46,7 +46,6 @@ class FusionRule(NamedTuple):
 
 def joint_topk_topp_sampleprobs_guard(window: List[Op]) -> bool:
     """
-    Logits -> Indices
     Only fuse when joint_topk_topp is True
     """
     topk_op = window[0]

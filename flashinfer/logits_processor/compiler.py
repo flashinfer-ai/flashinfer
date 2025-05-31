@@ -14,15 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import logging
 from typing import List, Optional
 
 from .fusion_rules import FusionRule, get_default_fusion_rules
 from .op import Op
 from .types import TensorType
 from .validators import CompileError, ValidityCheck, get_default_validity_checks
-
-logger = logging.getLogger(__name__)
 
 
 class Compiler:
@@ -42,8 +39,6 @@ class Compiler:
         if not ops:
             raise CompileError("Cannot compile empty operator list")
 
-        logger.info("Original ops: %s", ops)
-
         compiled_ops = list(ops)
 
         self._type_check(compiled_ops)
@@ -51,8 +46,6 @@ class Compiler:
         self._run_validity_checks(compiled_ops)
 
         compiled_ops = self._fuse_all(compiled_ops)
-
-        logger.info("Compiled ops: %s", compiled_ops)
 
         return compiled_ops
 
@@ -127,6 +120,23 @@ def compile_pipeline(
     custom_fusion_rules: Optional[List[FusionRule]] = None,
     custom_validity_checks: Optional[List[ValidityCheck]] = None,
 ) -> List[Op]:
+    """
+    Compile a pipeline of operators into a list of compiled operators.
+
+    Parameters
+    ----------
+    ops : List[Op]
+        List of operators to compile
+    custom_fusion_rules : Optional[List[FusionRule]]
+        List of custom fusion rules to use
+    custom_validity_checks : Optional[List[ValidityCheck]]
+        List of custom validity checks to use
+
+    Returns
+    -------
+    List[Op]
+        List of compiled operators
+    """
     compiler = Compiler()
 
     if custom_fusion_rules:

@@ -26,15 +26,20 @@ import torch
 class TensorType(Enum):
     """
     TensorType represents the semantic type of tensors in the pipeline.
-
-    - LOGITS: Raw or masked scores (real-valued vectors)
-    - PROBS: Non-negative scores (user decides whether normalized)
-    - INDICES: Integer token IDs (terminal type)
     """
 
     LOGITS = auto()
+    """
+    Raw or masked float scores, real-valued vectors
+    """
     PROBS = auto()
+    """
+    Non-negative float probabilities, maybe normalized
+    """
     INDICES = auto()
+    """
+    Integer token IDs, terminal type
+    """
 
     def __str__(self) -> str:
         return self.name
@@ -45,19 +50,45 @@ class TensorType(Enum):
 
 @dataclass(slots=True, frozen=True)
 class TaggedTensor:
+    """
+    Tensor wrapper that maintains semantic type information through pipeline execution.
+
+    It ensures type safety as tensors flow through the logits processing pipeline and zero friction for downstream PyTorch code
+
+    Notes
+    -----
+    - TaggedTensor is primarily for internal use by :class:`LogitsPipe`
+    - Users typically work with plain tensors; tagging happens automatically
+    """
+
     data: torch.Tensor
+    """
+    The underlying tensor.
+    """
     type: TensorType
+    """
+    The semantic type of the tensor.
+    """
 
     @staticmethod
     def logits(t: torch.Tensor) -> TaggedTensor:
+        """
+        Create a TaggedTensor with type :attr:`TensorType.LOGITS`.
+        """
         return TaggedTensor(t, TensorType.LOGITS)
 
     @staticmethod
     def probs(t: torch.Tensor) -> TaggedTensor:
+        """
+        Create a TaggedTensor with type :attr:`TensorType.PROBS`.
+        """
         return TaggedTensor(t, TensorType.PROBS)
 
     @staticmethod
     def indices(t: torch.Tensor) -> TaggedTensor:
+        """
+        Create a TaggedTensor with type :attr:`TensorType.INDICES`.
+        """
         return TaggedTensor(t, TensorType.INDICES)
 
     def __torch_function__(
@@ -79,17 +110,29 @@ class TaggedTensor:
 
     @property
     def shape(self) -> torch.Size:
+        """
+        Get the shape of the underlying tensor.
+        """
         return self.data.shape
 
     @property
     def device(self) -> torch.device:
+        """
+        Get the device of the underlying tensor.
+        """
         return self.data.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """
+        Get the data type of the underlying tensor.
+        """
         return self.data.dtype
 
     def size(self, dim: Optional[int] = None) -> torch.Size | int:
+        """
+        Get the size of the underlying tensor.
+        """
         return self.data.size(dim)
 
     def __repr__(self) -> str:

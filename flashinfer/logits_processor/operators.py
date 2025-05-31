@@ -34,7 +34,16 @@ def _to_tensor_scalar_tuple(
 
 
 class TemperatureOp(ParameterizedOp):
-    """Temperature scaling: Logits -> Logits"""
+    """
+    Temperature scaling operator.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.LOGITS`
+
+    Parameters
+    ----------
+    temperature : float
+        Temperature value for scaling. Must be positive.
+    """
 
     IN = TensorType.LOGITS
     OUT = TensorType.LOGITS
@@ -52,7 +61,13 @@ class TemperatureOp(ParameterizedOp):
 
 
 class SoftmaxOp(Op):
-    """Softmax: Logits -> Probs"""
+    """
+    Softmax operator.
+
+    Converts logits to probabilities using softmax function.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.PROBS`
+    """
 
     IN = TensorType.LOGITS
     OUT = TensorType.PROBS
@@ -66,7 +81,22 @@ class SoftmaxOp(Op):
 
 
 class ProbsTopKOp(ParameterizedOp):
-    """TopK Renorm Probs: Probs -> Probs"""
+    """
+    Top-k filtering operator for probabilities.
+
+    Keeps top-k probabilities, zeros out others, and renormalizes.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    top_k : int or torch.Tensor
+        Number of top tokens to keep.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.top_k_renorm_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.PROBS
@@ -90,7 +120,22 @@ class ProbsTopKOp(ParameterizedOp):
 
 
 class LogitsTopKOp(ParameterizedOp):
-    """TopK Mask Logits: Logits -> Logits"""
+    """
+    Top-k filtering operator for logits.
+
+    Masks rejected logits to -inf.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.LOGITS`
+
+    Parameters
+    ----------
+    top_k : int or torch.Tensor
+        Number of top tokens to keep.
+
+    See Also
+    --------
+    :class:`~flashinfer.sampling.top_k_mask_logits`
+    """
 
     IN = TensorType.LOGITS
     OUT = TensorType.LOGITS
@@ -113,7 +158,22 @@ class LogitsTopKOp(ParameterizedOp):
 
 
 class TopPOp(ParameterizedOp):
-    """TopP: Probs -> Probs"""
+    """
+    Top-p (nucleus) filtering operator.
+
+    Keeps tokens with cumulative probability up to threshold p, zeros out others, and renormalizes.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    top_p : float or torch.Tensor
+        Cumulative probability threshold in (0, 1].
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.top_p_renorm_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.PROBS
@@ -135,7 +195,22 @@ class TopPOp(ParameterizedOp):
 
 
 class MinPOp(ParameterizedOp):
-    """MinP: Probs -> Probs"""
+    """
+    Min-p filtering operator.
+
+    Keeps tokens with probability at least p times the maximum probability, zeros out others, and renormalizes.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    min_p : float or torch.Tensor
+        Minimum probability threshold as ratio of max probability.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.min_p_renorm_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.PROBS
@@ -166,7 +241,26 @@ class MinPOp(ParameterizedOp):
 
 
 class ProbsSampleOp(ParameterizedOp):
-    """Sample: Probs -> Indices"""
+    """
+    Sampling operator for probabilities.
+
+    Samples token indices from probability distribution using inverse transform sampling.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.INDICES`
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.sampling_from_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.INDICES
@@ -187,7 +281,26 @@ class ProbsSampleOp(ParameterizedOp):
 
 
 class LogitsSampleOp(ParameterizedOp):
-    """Sample: Logits -> Indices"""
+    """
+    Sampling operator for logits.
+
+    Samples token indices from logits using Gumbel-max trick.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.INDICES`
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.sampling_from_logits`
+    """
 
     IN = TensorType.LOGITS
     OUT = TensorType.INDICES
@@ -209,7 +322,28 @@ class LogitsSampleOp(ParameterizedOp):
 
 # Fused operators
 class FusedProbsTopKSampleOp(ParameterizedOp):
-    """Fused TopK -> Sample: Probs -> Indices"""
+    """
+    Fused top-k filtering and sampling operator for probabilities.
+
+    Use rejection sampling to directly sample from the top-k probabilities.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.INDICES`
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    top_k : int or torch.Tensor
+        Number of top tokens to keep.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.top_k_sampling_from_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.INDICES
@@ -241,7 +375,28 @@ class FusedProbsTopKSampleOp(ParameterizedOp):
 
 
 class FusedProbsTopPSampleOp(ParameterizedOp):
-    """Fused TopP -> Sample: Probs -> Indices"""
+    """
+    Fused top-p filtering and sampling operator for probabilities.
+
+    Use rejection sampling to directly sample from the top-p probabilities.
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.INDICES`
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    top_p : float or torch.Tensor
+        Cumulative probability threshold.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.top_p_sampling_from_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.INDICES
@@ -271,7 +426,28 @@ class FusedProbsTopPSampleOp(ParameterizedOp):
 
 
 class FusedProbsMinPSampleOp(ParameterizedOp):
-    """Fused MinP -> Sample: Probs -> Indices"""
+    """
+    Fused min-p filtering and sampling operator for probabilities.
+
+    Use rejection sampling to directly sample from the min-p probabilities.
+
+    PROBS → INDICES
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    min_p : float or torch.Tensor
+        Minimum probability threshold.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.min_p_sampling_from_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.INDICES
@@ -301,7 +477,30 @@ class FusedProbsMinPSampleOp(ParameterizedOp):
 
 
 class FusedProbsTopKTopPSampleOp(ParameterizedOp):
-    """Fused TopK -> TopP -> Sample: Probs -> Indices"""
+    """
+    Fused top-k, top-p filtering and sampling operator for probabilities.
+
+    Use rejection sampling to directly sample from the probabilities, top-k and top-p filtering are applied jointly (rather than applying first -> renormalize -> second).
+
+    :attr:`TensorType.PROBS` -> :attr:`TensorType.INDICES`
+
+    Parameters
+    ----------
+    deterministic : bool, optional
+        Whether to use deterministic kernel implementation.
+    top_k : int or torch.Tensor
+        Number of top tokens to keep.
+    top_p : float or torch.Tensor
+        Cumulative probability threshold.
+    indices : torch.Tensor, optional
+        Indices for batched sampling.
+    generator : torch.Generator, optional
+        Random number generator.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.top_k_top_p_sampling_from_probs`
+    """
 
     IN = TensorType.PROBS
     OUT = TensorType.INDICES

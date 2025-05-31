@@ -30,6 +30,63 @@ logger = logging.getLogger(__name__)
 
 
 class LogitsPipe:
+    """
+    Provides a declarative way to build processing pipelines for LLM outputs.
+
+    Parameters
+    ----------
+    processors : List[:class:`LogitsProcessor`]
+        List of processors to apply in sequence.
+    compile : bool, optional
+        Whether to compile the pipeline with fusion optimizations. Default is True. LogitsPipe.compile() can be called to perform compilation after pipeline instantiation.
+    input_type : Optional[TensorType], optional
+        Expected input tensor type. It can be TensorType.LOGITS or TensorType.PROBS. It's required if the first processor can take both types. In other cases, it will be automatically inferred from the first processor.
+        Default is None.
+    custom_fusion_rules : Optional[List[FusionRule]], optional
+        Additional fusion rules to apply during compilation. Default is None.
+    custom_validity_checks : Optional[List[ValidityCheck]], optional
+        Additional validity checks to apply during compilation. Default is None.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.logits_processor import LogitsPipe, Temperature, Softmax, TopK, Sample
+    >>> torch.manual_seed(42)
+    >>>
+    >>> # Basic pipeline with temperature, top-k, and sampling
+    >>> pipe = LogitsPipe([
+    ...     Temperature(),
+    ...     Softmax(),
+    ...     TopK(),
+    ...     Sample(deterministic=True)
+    ... ])
+    >>>
+    >>> # Execute the pipeline
+    >>> logits = torch.randn(4, 32000, device="cuda")  # [batch_size, vocab_size]
+    >>> token_ids = pipe(logits, temperature=0.9, top_k=40)
+    >>> token_ids
+    tensor([15806,  8154, 13923, 20311], device='cuda:0')
+    >>>
+    >>> # Pipeline starting from probabilities
+    >>> from flashinfer.logits_processor import TensorType, TopK
+    >>>
+    >>> prob_pipe = LogitsPipe(
+    ...     [TopK(), Sample()],
+    ...     input_type=TensorType.PROBS
+    ... )
+    >>> probs = torch.softmax(logits, dim=-1)
+    >>> token_ids = prob_pipe(probs, top_k=40)
+    >>> token_ids
+    tensor([  346, 14846,  1517,  9006], device='cuda:0')
+
+    Notes
+    -----
+    - The pipeline automatically validates type compatibility between operations.
+    - Operations are fused when possible
+    - Runtime parameters (like temperature, top_k) are passed with pipe.call().
+    - The output is always a plain torch.Tensor, not a :class:`~flashinfer.logits_processor.TaggedTensor`.
+    """
+
     def __init__(
         self,
         processors: List[LogitsProcessor],
@@ -38,6 +95,9 @@ class LogitsPipe:
         custom_fusion_rules: Optional[List[FusionRule]] = None,
         custom_validity_checks: Optional[List[ValidityCheck]] = None,
     ):
+        """
+        Constructor for a :class:`LogitsPipe`.
+        """
         if not processors:
             raise ValueError("Pipeline cannot be empty")
 
@@ -100,6 +160,9 @@ class LogitsPipe:
 
     @property
     def initial_type(self) -> TensorType:
+        """
+        The initial input tensor type of the pipeline. It can be :attr:`TensorType.LOGITS` or :attr:`TensorType.PROBS`.
+        """
         return self._initial_type
 
     def compile(
@@ -107,6 +170,16 @@ class LogitsPipe:
         custom_fusion_rules: Optional[List[FusionRule]] = None,
         custom_validity_checks: Optional[List[ValidityCheck]] = None,
     ) -> None:
+        """
+        Compile the pipeline.
+
+        Parameters
+        ----------
+        custom_fusion_rules : Optional[List[FusionRule]], optional
+            Additional fusion rules to apply during compilation. Default is None.
+        custom_validity_checks : Optional[List[ValidityCheck]], optional
+            Additional validity checks to apply during compilation. Default is None.
+        """
         try:
             self.compiled_ops = compile_pipeline(
                 self.ops, custom_fusion_rules, custom_validity_checks
