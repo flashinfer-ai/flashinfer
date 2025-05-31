@@ -77,7 +77,7 @@ struct HostPrecomputedTileScheduler {
 
   static Params to_underlying_arguments(Arguments const& args, KernelHardwareInfo hw_info) {
     return {args.work_indptr, args.qo_tile_indices, args.qo_head_indices, args.batch_indices,
-            hw_info.num_sm};
+            hw_info.sm_count};
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -94,7 +94,7 @@ struct HostPrecomputedTileScheduler {
   }
 
   CUTLASS_DEVICE
-  NaiveTileScheduler& operator++() {
+  HostPrecomputedTileScheduler& operator++() {
     work_ptr++;
     if (work_ptr < work_ptr_end) {
       qo_tile_idx = params.qo_tile_indices[work_ptr];

@@ -1403,6 +1403,7 @@ def gen_fmha_cutlass_sm100a_module(
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
     return gen_jit_spec(
         uri,

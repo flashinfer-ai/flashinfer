@@ -20,8 +20,11 @@
 void blackwell_fmha_plan(at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor work_indptr,
                          at::Tensor qo_tile_indices, at::Tensor head_indices,
                          at::Tensor batch_indices, int64_t qo_tile_size, int64_t batch_size,
-                         int64_t num_heads, int64_t num_buckets, cudaStream_t stream) {
-  auto status = plan_kernel_wrapper(
+                         int64_t num_heads, int64_t num_buckets) {
+  const c10::cuda::OptionalCUDAGuard device_guard(qo_lens.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+  auto status = flashinfer::plan_kernel_wrapper(
       static_cast<int*>(qo_lens.data_ptr()), static_cast<int*>(kv_lens.data_ptr()),
       static_cast<int*>(work_indptr.data_ptr()), static_cast<int*>(qo_tile_indices.data_ptr()),
       static_cast<int*>(head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),

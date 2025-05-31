@@ -29,7 +29,7 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
 void blackwell_fmha_plan(at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor work_indptr,
                          at::Tensor qo_tile_indices, at::Tensor head_indices,
                          at::Tensor batch_indices, int64_t qo_tile_size, int64_t batch_size,
-                         int64_t num_heads, int64_t num_buckets, cudaStream_t stream);
+                         int64_t num_heads, int64_t num_buckets);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("run", FMHACutlassSM100Run);
