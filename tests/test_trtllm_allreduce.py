@@ -41,8 +41,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         launch_with_pdl = [True, False]
 
         # create ipc memory
-        # todo(29 May): create ipc memory buffer instead of lists of ipc memory???
-        # todo(yingyi): lamport should be init only when can_access_peer is true
+        # todo(yingyi): lamport should be init only when can_access_peer is true, is it true default?
         # init per world_size?
         ipc_handles = comm.trtllm_create_ipc_buffer_for_all_reduce(
             rank, world_size, maxSeqLen, hiddenSize, group=group
@@ -50,6 +49,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
         test_loop = 3
 
+        flag_value = 0
         for token_num in token_nums:
             for strategy_code in strategy_codes:
                 for config_code in config_codes:
@@ -63,8 +63,17 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 inp1_ref = inp1.clone()
                                 out1 = torch.empty_like(inp1)
 
+                                # lamport init to negative zero
+                                comm.trtllm_lamport_initialize_all(
+                                    ipc_handles[4][rank],
+                                    ipc_handles[5][rank],
+                                    ipc_handles[6][rank],
+                                    message_size,
+                                    dtype,
+                                )
+                                flag_value += 1
+
                                 comm.trtllm_custom_all_reduce(
-                                    all_reduce_params,
                                     inp1,
                                     out1,
                                     world_size,
@@ -74,13 +83,18 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     strategy_code,
                                     config_code,
                                     launch_with_pdl,
+                                    flag_value,
+                                    torch.tensor(ipc_handles[0]),
+                                    torch.tensor(ipc_handles[2]),
+                                    torch.tensor(ipc_handles[3]),
                                     None,
                                     None,
                                     None,
                                     None,
                                     None,
-                                    None,
-                                    None,
+                                    torch.tensor(ipc_handles[4]),
+                                    torch.tensor(ipc_handles[5]),
+                                    torch.tensor(ipc_handles[6]),
                                 )
                                 dist.all_reduce(inp1_ref, group=group)
 
@@ -154,33 +168,35 @@ if __name__ == "__main__":
     mod = comm.get_comm_module()
 
     # add py interface binding tests
-    # comm.trtllm_lamport_initialize_all(
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    # )
-    # comm.trtllm_custom_all_reduce(
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     2,
-    #     0,
-    #     1024,
-    #     0,
-    #     0,
-    #     0,
-    #     True,
-    #     0,
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    # )
+    comm.trtllm_lamport_initialize_all(
+        torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
+        torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
+        torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
+        1024,
+        torch.float32,
+    )
+    comm.trtllm_custom_all_reduce(
+        torch.empty(1024, dtype=torch.float32, device="cuda"),
+        torch.empty(1024, dtype=torch.float32, device="cuda"),
+        2,
+        0,
+        1024,
+        0,
+        0,
+        0,
+        True,
+        0,
+        torch.empty(1024, dtype=torch.float32, device="cuda"),
+        torch.empty(1024, dtype=torch.float32, device="cuda"),
+        torch.empty(1024, dtype=torch.float32, device="cuda"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
     # todo: add real tests above

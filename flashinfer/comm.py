@@ -301,17 +301,17 @@ def get_comm_module():
     @register_custom_op(
         "flashinfer::trtllm_lamport_initialize", mutates_args=["buffer"]
     )
-    def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
-        module.trtllm_lamport_initialize(buffer)
+    def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
+        module.trtllm_lamport_initialize(buffer_ptr, size, dtype)
 
     @register_custom_op(
         "flashinfer::trtllm_lamport_initialize_all",
-        mutates_args=["buffer_0", "buffer_1", "buffer_2"],
+        mutates_args=["buffer_0_ptr", "buffer_1_ptr", "buffer_2_ptr", "size", "dtype"],
     )
     def trtllm_lamport_initialize_all(
-        buffer_0: torch.Tensor, buffer_1: torch.Tensor, buffer_2: torch.Tensor
+        buffer_0_ptr: int, buffer_1_ptr: int, buffer_2_ptr: int, size: int, dtype: torch.dtype
     ) -> None:
-        module.trtllm_lamport_initialize_all(buffer_0, buffer_1, buffer_2)
+        module.trtllm_lamport_initialize_all(buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype)
 
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce", mutates_args=["buffer", "inp", "out"]
@@ -327,7 +327,7 @@ def get_comm_module():
         strategy_code: AllReduceStrategyType,
         config_code: AllReduceStrategyConfig,
         launch_with_pdl: bool,
-        flag_buffer_ptr: int,
+        flag_value: int,
         peer_comm_buffer_ptrs: torch.Tensor,
         peer_barrier_ptrs_in: torch.Tensor,
         peer_barrier_ptrs_out: torch.Tensor,
@@ -337,7 +337,9 @@ def get_comm_module():
         weight_pre_residual_norm: Optional[torch.Tensor],
         eps: Optional[float],
         intermediate_buffer: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs: Optional[torch.Tensor],
+        lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
+        lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
+        lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
     ) -> None:
         module.trtllm_custom_all_reduce(
             buffer,
@@ -350,7 +352,7 @@ def get_comm_module():
             strategy_code,
             config_code,
             launch_with_pdl,
-            flag_buffer_ptr,
+            flag_value,
             peer_comm_buffer_ptrs,
             peer_barrier_ptrs_in,
             peer_barrier_ptrs_out,
@@ -360,7 +362,9 @@ def get_comm_module():
             weight_pre_residual_norm,
             eps,
             intermediate_buffer,
-            lamport_peer_comm_buffer_ptrs,
+            lamport_peer_comm_buffer_ptrs_0,
+            lamport_peer_comm_buffer_ptrs_1,
+            lamport_peer_comm_buffer_ptrs_2,
         )
 
     return SimpleNamespace(
@@ -496,6 +500,27 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     hidden_dim,
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
+    '''
+    Note:
+    We would init 7 IPC buffers for trtllm_custom_all_reduce.
+    They are sized as follows:
+    [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
+    where:
+    - buffer_size: tp_size * max_token_num * hidden_dim * 4  # size of float
+    - flag_size: (MAX_ALL_REDUCE_BLOCKS + 1) * 4  # size of uint32_t
+    - lamport_buffer_size: tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2  # size of half
+
+    They are for:
+    ipcHandles[0] - peer_comm_buffer_ptrs
+    ipcHandles[2] - peer_barrier_ptrs_in
+    ipcHandles[3] - peer_barrier_ptrs_out
+    ipcHandles[4] - lamport_peer_comm_buffer_ptrs[0:tp_size]
+    ipcHandles[5] - lamport_peer_comm_buffer_ptrs[tp_size:tp_size * 2]
+    ipcHandles[6] - lamport_peer_comm_buffer_ptrs[tp_size * 2:tp_size * 3]
+
+    We use tp_size and world_size here interchangeably (customAllReduce).
+    '''
+
     # NOTE(Yingyi): refer to tllm
     # - cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
 
@@ -507,8 +532,6 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     )  # size of half
 
     ipc_handles = list()
-    # we should init 7 buffers for custom_all_reduce:
-    # [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
 
     for size in [
         buffer_size,
@@ -521,12 +544,11 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     ]:
         ipc_handles.append(create_shared_buffer(size, group))
 
-    # todo(yingyi): init flag to be 0
-    # todo(yingyi): init lamport buffer to be negative zero
-    # todo(yingyi): maintain local buffer
+    # todo(yingyi): init flag to be 0 - move to c++ side
+    # todo(yingyi): init lamport buffer to be negative zero - move to outer init flow
+    # note(yingyi): maintain local buffer - unused in tllm, skip
 
     return ipc_handles
-
 
 # todo(review): align the ipc buffer size to tllm implementation
 BarrierFlagCount = 256
@@ -631,14 +653,14 @@ def trtllm_create_ipc_buffer_for_all_reduce_fusion(
 # return all_reduce_params
 
 
-def trtllm_lamport_initialize(buffer: torch.Tensor) -> None:
-    get_comm_module().trtllm_lamport_initialize(buffer)
+def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
+    get_comm_module().trtllm_lamport_initialize(buffer_ptr, size, dtype)
 
 
 def trtllm_lamport_initialize_all(
-    buffer_0: torch.Tensor, buffer_1: torch.Tensor, buffer_2: torch.Tensor
+    buffer_0_ptr: int, buffer_1_ptr: int, buffer_2_ptr: int, size: int, dtype: torch.dtype
 ) -> None:
-    get_comm_module().trtllm_lamport_initialize_all(buffer_0, buffer_1, buffer_2)
+    get_comm_module().trtllm_lamport_initialize_all(buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype)
 
 
 def trtllm_custom_all_reduce(
@@ -651,7 +673,7 @@ def trtllm_custom_all_reduce(
     strategy_code: AllReduceStrategyType,
     config_code: AllReduceStrategyConfig,
     launch_with_pdl: bool,
-    flag_buffer_ptr: int,
+    flag_value: int,
     peer_comm_buffer_ptrs: torch.Tensor,
     peer_barrier_ptrs_in: torch.Tensor,
     peer_barrier_ptrs_out: torch.Tensor,
@@ -661,7 +683,9 @@ def trtllm_custom_all_reduce(
     weight_pre_residual_norm: Optional[torch.Tensor],
     eps: Optional[float],
     intermediate_buffer: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs: Optional[torch.Tensor],
+    lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
+    lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
+    lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
 ) -> None:
     get_comm_module().trtllm_custom_all_reduce(
         inp,
@@ -673,7 +697,7 @@ def trtllm_custom_all_reduce(
         strategy_code,
         config_code,
         launch_with_pdl,
-        flag_buffer_ptr,
+        flag_value,
         peer_comm_buffer_ptrs,
         peer_barrier_ptrs_in,
         peer_barrier_ptrs_out,
@@ -683,5 +707,7 @@ def trtllm_custom_all_reduce(
         weight_pre_residual_norm,
         eps,
         intermediate_buffer,
-        lamport_peer_comm_buffer_ptrs,
+        lamport_peer_comm_buffer_ptrs_0,
+        lamport_peer_comm_buffer_ptrs_1,
+        lamport_peer_comm_buffer_ptrs_2,
     )

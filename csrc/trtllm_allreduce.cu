@@ -60,23 +60,22 @@ using namespace flashinfer::trtllm_allreduce;
     }                                                                                             \
   }()
 
-void trtllm_lamport_initialize(at::Tensor& buffer) {
-  DISPATCH_ALLREDUCE_DTYPE(buffer.scalar_type(), c_type, {
+void trtllm_lamport_initialize(int64_t buffer_ptr, int64_t size, at::ScalarType dtype) {
+  DISPATCH_ALLREDUCE_DTYPE(dtype, c_type, {
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
-    auto status = lamportInitialize<c_type>(static_cast<void*>(buffer.data_ptr()),
-                                            static_cast<size_t>(buffer.numel()), raw_stream);
+    auto status = lamportInitialize<c_type>(reinterpret_cast<void*>(buffer_ptr),
+                                            static_cast<size_t>(size), raw_stream);
     TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
 }
 
-void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1,
-                                   at::Tensor& buffer_2) {
-  DISPATCH_ALLREDUCE_DTYPE(buffer_0.scalar_type(), c_type, {
+void trtllm_lamport_initialize_all(int64_t buffer_0_ptr, int64_t buffer_1_ptr, int64_t buffer_2_ptr, int64_t size, at::ScalarType dtype) {
+  DISPATCH_ALLREDUCE_DTYPE(dtype, c_type, {
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
     auto status = lamportInitializeAll<c_type>(
-        static_cast<void*>(buffer_0.data_ptr()), static_cast<void*>(buffer_1.data_ptr()),
-        static_cast<void*>(buffer_2.data_ptr()), static_cast<size_t>(buffer_0.numel()), raw_stream);
+        reinterpret_cast<void*>(buffer_0_ptr), reinterpret_cast<void*>(buffer_1_ptr),
+        reinterpret_cast<void*>(buffer_2_ptr), static_cast<size_t>(size), raw_stream);
     TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code " +
                                            std::string(cudaGetErrorString(status)));
   });
@@ -86,14 +85,16 @@ void trtllm_lamport_initialize_all(at::Tensor& buffer_0, at::Tensor& buffer_1,
 void trtllm_custom_all_reduce(
     at::Tensor& in, at::Tensor& out, int64_t tp_size, int64_t tp_rank, int64_t token_num,
     int64_t fusion_op_code, int64_t strategy_code, int64_t config_code, bool launch_with_pdl,
-    int64_t flag_buffer_ptr,
+    int64_t flag_value,
     at::Tensor peer_comm_buffer_ptrs,  // std::vector<void*>
     at::Tensor peer_barrier_ptrs_in,   // std::vector<void*>
     at::Tensor peer_barrier_ptrs_out,  // std::vector<void*>
     std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
     std::optional<at::Tensor> weight, std::optional<at::Tensor> weight_pre_residual_norm,
     std::optional<double> eps, std::optional<at::Tensor> intermediate_buffer,
-    std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs  // std::vector<void*>
+    std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_0,
+    std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_1,
+    std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_2
 ) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
   const c10::cuda::OptionalCUDAGuard device_guard(in.device());
@@ -113,17 +114,17 @@ void trtllm_custom_all_reduce(
     params.local_output_buffer_ptr = out.data_ptr();
 
     // NOTE(yingyi): review the barrier flag
-    int flag_offset;
-    if (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
-        is_lamport_supported<c_type>(token_num, hidden_size)) {
-      flag_offset = 0;
-    } else {
-      flag_offset = 1;
-    }
+    // int flag_offset;
+    // if (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
+    //     is_lamport_supported<c_type>(token_num, hidden_size)) {
+    //   flag_offset = 0;
+    // } else {
+    //   flag_offset = 1;
+    // }
 
-    auto const flag_ptr = reinterpret_cast<int64_t*>(flag_buffer_ptr) + NUM_POINTERS_PER_RANK * tp_size + flag_offset;
-    *flag_ptr += 1;
-    uint32_t flag_value = *flag_ptr;
+    // auto const flag_ptr = reinterpret_cast<int64_t*>(flag_buffer_ptr) + NUM_POINTERS_PER_RANK * tp_size + flag_offset;
+    // *flag_ptr += 1;
+    // uint32_t flag_value = *flag_ptr;
     params.barrier_flag = flag_value;
 
     // add fusion params
@@ -146,11 +147,13 @@ void trtllm_custom_all_reduce(
       params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(peer_barrier_ptrs_out.data_ptr<int64_t>()[i]);
     }
 
-    if (lamport_peer_comm_buffer_ptrs.has_value()) {
+    if (lamport_peer_comm_buffer_ptrs_0.has_value()) {
+      TORCH_CHECK(lamport_peer_comm_buffer_ptrs_1.has_value(), "lamport_peer_comm_buffer_ptrs_1 is required if lamport_peer_comm_buffer_ptrs_0 is provided");
+      TORCH_CHECK(lamport_peer_comm_buffer_ptrs_2.has_value(), "lamport_peer_comm_buffer_ptrs_2 is required if lamport_peer_comm_buffer_ptrs_0 is provided");
       for (int i = 0; i < tp_size; ++i) {
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs.value().data_ptr<int64_t>()[i]);
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs.value().data_ptr<int64_t>()[i + tp_size]);
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size * 2] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs.value().data_ptr<int64_t>()[i + tp_size * 2]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_0.value().data_ptr<int64_t>()[i]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_1.value().data_ptr<int64_t>()[i]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size * 2] = reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_2.value().data_ptr<int64_t>()[i]);
       }
     }
 
