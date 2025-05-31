@@ -59,15 +59,33 @@ def infer_initial_type(processors: List[LogitsProcessor]) -> TensorType:
         return TensorType.LOGITS
 
     first_processor = processors[0]
+    valid_types = _get_supported_types(first_processor)
 
-    for candidate_type in [TensorType.LOGITS, TensorType.PROBS]:
+    if len(valid_types) > 1:
+        raise LegalizationError(
+            f"Cannot infer input type: {first_processor.__class__.__name__} can accept both LOGITS and PROBS. "
+            f"Please specify input_type explicitly when creating the LogitsPipe."
+        )
+
+    if len(valid_types) == 1:
+        return valid_types[0]
+
+    raise LegalizationError(
+        f"Processor {first_processor.__class__.__name__} cannot accept standard pipeline inputs "
+        f"(LOGITS or PROBS)"
+    )
+
+
+def _get_supported_types(processor: LogitsProcessor) -> bool:
+    valid_types = []
+    for tensor_type in [TensorType.LOGITS, TensorType.PROBS]:
         try:
-            first_processor.legalize(candidate_type)
-            return candidate_type
+            processor.legalize(tensor_type)
+            valid_types.append(tensor_type)
         except (ValueError, LegalizationError):
             continue
 
-    return TensorType.LOGITS
+    return valid_types
 
 
 def validate_processor_chain(processors: List[LogitsProcessor]) -> None:

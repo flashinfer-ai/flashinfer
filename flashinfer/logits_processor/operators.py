@@ -108,9 +108,7 @@ class TopPOp(ParameterizedOp):
         top_p = self._get_param("top_p", kwargs, required=True)
         maybe_top_p_arr, top_p_val = _to_tensor_scalar_tuple(top_p)
 
-        if maybe_top_p_arr is None and not (
-            0 < top_p_val <= 1 and isinstance(top_p_val, float)
-        ):
+        if maybe_top_p_arr is None and not (0 < top_p_val <= 1):
             raise ValueError("top_p must be float in (0, 1] or a tensor array")
 
         renorm_probs = get_sampling_module().top_p_renorm_probs(
@@ -132,9 +130,7 @@ class MinPOp(ParameterizedOp):
         min_p = self._get_param("min_p", kwargs, required=True)
         maybe_min_p_arr, min_p_val = _to_tensor_scalar_tuple(min_p)
 
-        if maybe_min_p_arr is None and not (
-            0 < min_p_val <= 1 and isinstance(min_p_val, float)
-        ):
+        if maybe_min_p_arr is None and not (0 < min_p_val <= 1):
             raise ValueError("min_p must be float in (0, 1] or a tensor array")
 
         if maybe_min_p_arr is not None:
@@ -245,9 +241,7 @@ class FusedProbsTopPSampleOp(ParameterizedOp):
         top_p = self._get_param("top_p", kwargs, required=True)
         maybe_top_p_arr, top_p_val = _to_tensor_scalar_tuple(top_p)
 
-        if maybe_top_p_arr is None and not (
-            0 < top_p_val <= 1 and isinstance(top_p_val, float)
-        ):
+        if maybe_top_p_arr is None and not (0 < top_p_val <= 1):
             raise ValueError("top_p must be float in (0, 1] or a tensor array")
 
         indices = self._get_param("indices", kwargs, required=False)
@@ -277,9 +271,7 @@ class FusedProbsMinPSampleOp(ParameterizedOp):
         min_p = self._get_param("min_p", kwargs, required=True)
         maybe_min_p_arr, min_p_val = _to_tensor_scalar_tuple(min_p)
 
-        if maybe_min_p_arr is None and not (
-            0 < min_p_val <= 1 and isinstance(min_p_val, float)
-        ):
+        if maybe_min_p_arr is None and not (0 < min_p_val <= 1):
             raise ValueError("min_p must be float in (0, 1] or a tensor array")
 
         indices = self._get_param("indices", kwargs, required=False)
@@ -317,9 +309,7 @@ class FusedProbsTopKTopPSampleOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        if maybe_top_p_arr is None and not (
-            0 < top_p_val <= 1 and isinstance(top_p_val, float)
-        ):
+        if maybe_top_p_arr is None and not (0 < top_p_val <= 1):
             raise ValueError("top_p must be float in (0, 1] or a tensor array")
 
         indices = self._get_param("indices", kwargs, required=False)
