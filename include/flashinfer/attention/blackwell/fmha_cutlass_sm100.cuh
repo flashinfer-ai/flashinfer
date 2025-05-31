@@ -38,10 +38,9 @@ using namespace cutlass::fmha::collective;
 using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::device;
 
-template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
-          class ActiveMask>
+template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
+          class TileShapePV, class ActiveMask>
 struct FwdRunner {
-  using IdType = int32_t;
   using Element = DTypeIn;
   using ElementAccumulatorQK = float;
   using ElementAccumulatorPV = float;
@@ -166,8 +165,8 @@ struct FwdRunner {
   }
 };
 
-template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
-          class ActiveMask>
+template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
+          class TileShapePV, class ActiveMask>
 cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
                          IdType* qo_lens, IdType* kv_lens, IdType* qo_segment_offsets,
                          IdType* kv_segment_offsets, IdType* work_indptr, IdType* qo_tile_indices,
@@ -176,7 +175,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo,
                          int batch_size, int total_qo_len, int total_kv_len, int max_qo_len,
                          int max_kv_len) {
-  return FwdRunner<DTypeIn, DTypeOut, TileShapeQK, TileShapePV, ActiveMask>::run(
+  return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
       workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets,
       work_indptr, qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code,
       sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size, total_qo_len,

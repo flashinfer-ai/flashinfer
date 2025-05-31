@@ -93,8 +93,9 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
     using TileShapePV = Shape<TILE_Q, D_VO, TILE_KV>;
     using CutlassMaskMode =
         typename std::conditional<MASK_MODE == MaskMode::kCausal, CausalMask, ResidualMask>::type;
-    run_fmha_fwd<cutlass_type_in, cutlass_type_out, TileShapeQK, TileShapePV, CutlassMaskMode>(
-        workspace_buffer, static_cast<cutlass_type_in*>(q.data_ptr()),
+    auto status = run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t, TileShapeQK, TileShapePV,
+                               CutlassMaskMode>(
+        workspace_buffer.data_ptr(), static_cast<cutlass_type_in*>(q.data_ptr()),
         static_cast<cutlass_type_in*>(k.data_ptr()), static_cast<cutlass_type_in*>(v.data_ptr()),
         static_cast<int*>(qo_lens.data_ptr()), static_cast<int*>(kv_lens.data_ptr()),
         static_cast<int*>(qo_segment_offsets.data_ptr()),
@@ -105,6 +106,8 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
         maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
         mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size,
         total_qo_len, total_kv_len, max_qo_len, max_kv_len);
+    TORCH_CHECK(status == cudaSuccess, "Cutlass FMHA forward pass failed",
+                cudaGetErrorString(status));
 
     return true;
   });

@@ -17,6 +17,8 @@
 
 #include "../../utils.cuh"
 
+namespace flashinfer {
+
 __device__ __forceinline__ float cost_function(int qo_len, int kv_len) {
   return 0.6 * float(qo_len) + kv_len;
 }
@@ -29,10 +31,12 @@ union CostIndex {
   long long packed;
 };
 
-__device__ __forceinline__ CostIndex min_cost_index(CostIndex cost_index, int num_buckets) {
+__device__ __forceinline__ CostIndex get_min_cost_index(CostIndex* warp_min_cost,
+                                                        CostIndex cost_index, int num_buckets) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    CostIndex other = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
+    CostIndex other;
+    other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
     if (other.cost < cost_index.cost ||
         (other.cost == cost_index.cost && other.bucket_idx < cost_index.bucket_idx)) {
       cost_index = other;
@@ -48,7 +52,8 @@ __device__ __forceinline__ CostIndex min_cost_index(CostIndex cost_index, int nu
                      : CostIndex{threadIdx.x * 32, cuda::std::numeric_limits<float>::infinity()};
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-      CostIndex other = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
+      CostIndex other;
+      other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
       if (other.cost < cost_index.cost ||
           (other.cost == cost_index.cost && other.bucket_idx < cost_index.bucket_idx)) {
         cost_index = other;
@@ -80,7 +85,8 @@ __global__ void plan_kernel(int* qo_lens, int* kv_lens, int* work_indptr, int* q
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       for (int qo_tile_idx = 0; qo_tile_idx < ceil_div(qo_lens[batch_idx], qo_tile_size);
            ++qo_tile_idx) {
-        auto min_cost_index = min_cost_index(thread_local_cost_index, num_buckets);
+        auto min_cost_index =
+            get_min_cost_index(warp_min_cost, thread_local_cost_index, num_buckets);
         int bucket_idx = min_cost_index.bucket_idx;
         float cost = min_cost_index.cost;
         if (bucket_idx == threadIdx.x) {
@@ -110,7 +116,8 @@ __global__ void plan_kernel(int* qo_lens, int* kv_lens, int* work_indptr, int* q
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       for (int qo_tile_idx = 0; qo_tile_idx < ceil_div(qo_lens[batch_idx], qo_tile_size);
            ++qo_tile_idx) {
-        auto min_cost_index = min_cost_index(thread_local_cost_index, num_buckets);
+        auto min_cost_index =
+            get_min_cost_index(warp_min_cost, thread_local_cost_index, num_buckets);
         int bucket_idx = min_cost_index.bucket_idx;
         float cost = min_cost_index.cost;
         if (bucket_idx == threadIdx.x) {
@@ -142,8 +149,10 @@ cudaError_t plan_kernel_wrapper(int* qo_lens, int* kv_lens, int* work_indptr, in
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, schedule_kernel, qo_lens, kv_lens, work_indptr,
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, plan_kernel, qo_lens, kv_lens, work_indptr,
                                           qo_tile_indices, head_indices, batch_indices,
                                           qo_tile_size, batch_size, num_heads, num_buckets));
   return cudaSuccess;
 }
+
+}  // namespace flashinfer
