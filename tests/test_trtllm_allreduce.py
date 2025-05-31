@@ -162,7 +162,6 @@ if __name__ == "__main__":
     # comm.trtllm_custom_all_reduce(
     #     torch.empty(1024, dtype=torch.float32, device="cuda"),
     #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
     #     2,
     #     0,
     #     1024,
@@ -170,6 +169,10 @@ if __name__ == "__main__":
     #     0,
     #     0,
     #     True,
+    #     0,
+    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
+    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
+    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
     #     None,
     #     None,
     #     None,
