@@ -38,8 +38,8 @@ cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
 
 
-# for trtllm_custom_all_reduce
 class AllReduceStrategyType:
+    # NOTE: for trtllm_custom_all_reduce
     NCCL = 0
     MIN_LATENCY = 1
     UB = 2
@@ -49,14 +49,14 @@ class AllReduceStrategyType:
     LOWPRECISION = 6
 
 
-# for trtllm_custom_all_reduce
 class AllReduceStrategyConfig:
+    # NOTE: for trtllm_custom_all_reduce
     USE_MEMCPY = 1 << 0
     PUSH_MODE = 1 << 1
 
 
-# for trtllm_custom_all_reduce
 class AllReduceFusionOp:
+    # NOTE: for trtllm_custom_all_reduce
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
@@ -523,7 +523,7 @@ MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
 
-def trtllm_create_ipc_buffer_for_all_reduce(
+def trtllm_create_ipc_workspace_for_all_reduce(
     rank: int,
     tp_size: int,
     max_token_num: int,
@@ -532,13 +532,19 @@ def trtllm_create_ipc_buffer_for_all_reduce(
 ) -> List[int]:
     """
     Note:
+    This function is used to create a workspace for all reduce.
+    The workspace is a list of IPC handles.
+    The workspace should be initialized before calling trtllm_custom_all_reduce.
+    The workspace should be destroyed after calling trtllm_custom_all_reduce.
+    The workspace can be reused for multiple all reduce calls under the same configuration.
+
     We would init 7 IPC buffers for trtllm_custom_all_reduce.
     They are sized as follows:
     [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
     where:
-    - buffer_size: tp_size * max_token_num * hidden_dim * 4  # size of float
-    - flag_size: (MAX_ALL_REDUCE_BLOCKS + 1) * 4  # size of uint32_t
-    - lamport_buffer_size: tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2  # size of half
+    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(float) * (maxBeamWidth)
+    - flag_size: (MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t) * tp_size * 2
+    - lamport_buffer_size: tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * sizeof(half)
 
     They are for:
     ipcHandles[0] - peer_comm_buffer_ptrs
@@ -549,17 +555,14 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     ipcHandles[6] - lamport_peer_comm_buffer_ptrs[tp_size * 2:tp_size * 3]
 
     We use tp_size and world_size here interchangeably (customAllReduce).
+
+    Reference: trtllm, cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
     """
 
-    # NOTE(Yingyi): refer to tllm
-    # - cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
-
-    buffer_size = tp_size * max_token_num * hidden_dim * 4  # size of float
-    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4  # size of uint32_t
+    buffer_size = tp_size * max_token_num * hidden_dim * 4
+    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4
     flag_size = FLAG_SIZE * tp_size * 2
-    lamport_buffer_size = (
-        tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
-    )  # size of half
+    lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
 
     ipc_handles = list()
 
@@ -577,31 +580,56 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     print(
         f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
     )
-    # todo(yingyi): init lamport buffer to be negative zero - move to outer init flow
-    # note(yingyi): maintain local buffer - unused in tllm, skip
 
     return ipc_handles
+
+
+def trtllm_destroy_ipc_workspace_for_all_reduce(
+    workspace: List[int], group: Optional[ProcessGroup] = None
+) -> None:
+    """
+    Note:
+    This function is used to destroy a workspace for all reduce.
+    The workspace is a list of IPC handles.
+    The workspace should be destroyed after calling trtllm_custom_all_reduce.
+    The workspace can be reused for multiple all reduce calls under the same configuration.
+    """
+
+    for ipc_handle in workspace:
+        free_shared_buffer(ipc_handle, group)
 
 
 # todo(review): align the ipc buffer size to tllm implementation
 BarrierFlagCount = 256
 
 
-def trtllm_create_ipc_buffer_for_all_reduce_fusion(
+def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     rank: int,
     tp_size: int,
     max_token_num: int,
     hidden_dim,
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
-    # NOTE(Yingyi): refer to tllm
-    # - cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
+    """
+    Note:
+    We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion.
+    They are sized as follows:
+    [buffer_size, flag_size, lamport_buffer_size * 3]
+    where:
+    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
+    - flag_size: tp_size * BarrierFlagCount * sizeof(int)
+    - lamport_buffer_size: tp_size * max(max_token_num, OneShotMaxToken) * tp_size * hidden_dim * sizeof(half)
 
-    buffer_size = tp_size * max_token_num * hidden_dim * 2  # size of half
-    flag_size = tp_size * BarrierFlagCount * 4  # size of int
-    lamport_comm_size = (
-        tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
-    )  # size of half
+    The workspace is passed as workspace field in AllReduceFusionParams.
+
+    We use tp_size and world_size here interchangeably (allReduceFusion).
+
+    Reference: trtllm, cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
+    """
+
+    buffer_size = tp_size * max_token_num * hidden_dim * 2
+    flag_size = tp_size * BarrierFlagCount * 4
+    lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -617,76 +645,19 @@ def trtllm_create_ipc_buffer_for_all_reduce_fusion(
     return ipc_handles
 
 
-# @dataclass
-# class AllReduceFusionParams:
-#     bias_buffer: int
-#     residual_buffer: int
-#     hidden_size: int
-#     weight_buffer: int
-#     weight_buffer_pre_residual_norm: int
-#     eps: float
-#     intermediate_buffer: int
-#     lamport_peer_comm_buffer_ptrs: List[int]
+def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+    workspace: List[int], group: Optional[ProcessGroup] = None
+) -> None:
+    """
+    Note:
+    This function is used to destroy a workspace for all reduce fusion.
+    The workspace is a list of IPC handles.
+    The workspace should be destroyed after calling trtllm_custom_all_reduce_fusion.
+    The workspace can be reused for multiple all reduce fusion calls under the same configuration.
+    """
 
-# @dataclass
-# class AllReduceParams:
-#     elts_total: int
-#     elts_per_rank: int
-#     elts_per_block: int
-#     rank_offset: int
-#     ranks_per_node: int
-#     local_rank: int
-#     barrier_flag: int
-#     peer_barrier_ptrs_in: List[int]
-#     peer_barrier_ptrs_out: List[int]
-#     peer_comm_buffer_ptrs: List[int]
-#     local_output_buffer_ptr: int
-#     local_input_buffer_ptr: int
-#     fusion_params: AllReduceFusionParams
-
-# def trtllm_create_all_reduce_params(
-#     message_size: int,
-#     world_size: int,
-#     local_rank: int,
-#     local_input_buffer_ptr: int,
-#     local_output_buffer_ptr: int,
-#     ipc_handles: List[List[int]],
-#     fusion_bias_buffer_ptr: int = None,
-#     fusion_residual_buffer_ptr: int = None,
-#     fusion_weight_buffer_ptr: int = None,
-#     fusion_weight_pre_residual_norm_buffer_ptr: int = None,
-#     fusion_eps: float = None,
-#     fusion_intermediate_buffer_ptr: int = None,
-#     fusion_lamport_peer_comm_buffer_ptrs: List[int] = None,
-# ) -> AllReduceParams:
-#     all_reduce_params = AllReduceParams()
-# all_reduce_params.elts_total = message_size
-# all_reduce_params.ranks_per_node = world_size
-# all_reduce_params.local_rank = local_rank
-# all_reduce_params.local_output_buffer_ptr = local_output_buffer_ptr # in.data_ptr()
-# all_reduce_params.local_input_buffer_ptr = local_input_buffer_ptr # out.data_ptr()
-
-# fusion params
-# all_reduce_params.fusion_params.bias_buffer = fusion_bias_buffer_ptr # bias.data_ptr()
-# all_reduce_params.fusion_params.residual_buffer = fusion_residual_buffer_ptr # residual.data_ptr()
-# all_reduce_params.fusion_params.weight_buffer = fusion_weight_buffer_ptr # weight.data_ptr()
-# all_reduce_params.fusion_params.weight_buffer_pre_residual_norm = fusion_weight_pre_residual_norm_buffer_ptr # weight_pre_residual_norm.data_ptr()
-# all_reduce_params.fusion_params.eps = fusion_eps # eps
-# all_reduce_params.fusion_params.intermediate_buffer = fusion_intermediate_buffer_ptr # intermediate_buffer.data_ptr()
-
-# ipc buffer pointers
-# for i in range(world_size):
-#     all_reduce_params.peer_comm_buffer_ptrs.append(ipc_handles[0][i])
-#     all_reduce_params.peer_barrier_ptrs_in.append(ipc_handles[2][i])
-#     all_reduce_params.peer_barrier_ptrs_out.append(ipc_handles[3][i])
-
-#     # world size was MAX_RANKS_PER_NODE = 16
-#     all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs = [0] * (world_size * 3)
-#     all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = ipc_handles[4][i] # peer_comm_buffer_ptrs[i]
-#     all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i + world_size] = ipc_handles[5][i] # peer_comm_buffer_ptrs[i + world_size]
-#     all_reduce_params.fusion_params.lamport_peer_comm_buffer_ptrs[i + world_size * 2] = ipc_handles[6][i] # peer_comm_buffer_ptrs[i + world_size * 2]
-
-# return all_reduce_params
+    for ipc_handle in workspace:
+        free_shared_buffer(ipc_handle, group)
 
 
 def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:

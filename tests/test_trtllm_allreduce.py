@@ -39,7 +39,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.AllReduceStrategyType.TWOSHOT,
         ]
         config_codes = [
-            # 0,
+            0,
             comm.AllReduceStrategyConfig.USE_MEMCPY,
             comm.AllReduceStrategyConfig.PUSH_MODE,
         ]
@@ -47,6 +47,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             0,
             comm.AllReduceFusionOp.NONE,
             comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            # todo(yingyi): bugfix - nccl timeout on some settings: the flag value should be incremented by 1 for each AR
             comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
             # below are not enabled in trtllm test, skip for now
             # comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
@@ -61,7 +62,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # create ipc memory
         # todo(yingyi): lamport should be init only when can_access_peer is true, is it true default?
         # init per world_size?
-        ipc_handles = comm.trtllm_create_ipc_buffer_for_all_reduce(
+        workspace = comm.trtllm_create_ipc_workspace_for_all_reduce(
             rank, world_size, maxSeqLen, hiddenSize, group=group
         )
 
@@ -86,27 +87,37 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # lamport init to negative zero
                                 comm.trtllm_lamport_initialize_all(
-                                    ipc_handles[4][rank],
-                                    ipc_handles[5][rank],
-                                    ipc_handles[6][rank],
+                                    workspace[4][rank],
+                                    workspace[5][rank],
+                                    workspace[6][rank],
                                     message_size,
                                     dtype,
                                 )
                                 flag_value += 1
 
                                 # init params for each fusion op
-                                bias = torch.rand(
-                                    hiddenSize, dtype=dtype, device=device
+                                bias = (
+                                    torch.rand(hiddenSize, dtype=dtype, device=device)
+                                    * 2
+                                    - 1
                                 )
-                                residual = torch.rand(
-                                    message_size, dtype=dtype, device=device
+                                residual = (
+                                    torch.rand(message_size, dtype=dtype, device=device)
+                                    * 2
+                                    - 1
                                 )
-                                weight = torch.rand(
-                                    hiddenSize, dtype=dtype, device=device
+                                weight = (
+                                    torch.rand(hiddenSize, dtype=dtype, device=device)
+                                    * 2
+                                    - 1
                                 )
-                                weight_pre_residual_norm = None
-                                eps = None
-                                intermediate_buffer = torch.rand(
+                                weight_pre_residual_norm = (
+                                    torch.rand(hiddenSize, dtype=dtype, device=device)
+                                    * 2
+                                    - 1
+                                )
+                                eps = 1e-6
+                                intermediate_buffer = torch.zeros(
                                     message_size, dtype=dtype, device=device
                                 )
 
@@ -122,13 +133,13 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     launch_with_pdl=launch_with_pdl,
                                     flag_value=flag_value,
                                     peer_comm_buffer_ptrs=torch.tensor(
-                                        ipc_handles[0], dtype=torch.int64
+                                        workspace[0], dtype=torch.int64
                                     ),
                                     peer_barrier_ptrs_in=torch.tensor(
-                                        ipc_handles[2], dtype=torch.int64
+                                        workspace[2], dtype=torch.int64
                                     ),
                                     peer_barrier_ptrs_out=torch.tensor(
-                                        ipc_handles[3], dtype=torch.int64
+                                        workspace[3], dtype=torch.int64
                                     ),
                                     bias=bias,
                                     residual=residual,
@@ -137,16 +148,22 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     eps=eps,
                                     intermediate_buffer=intermediate_buffer,
                                     lamport_peer_comm_buffer_ptrs_0=torch.tensor(
-                                        ipc_handles[4], dtype=torch.int64
+                                        workspace[4], dtype=torch.int64
                                     ),
                                     lamport_peer_comm_buffer_ptrs_1=torch.tensor(
-                                        ipc_handles[5], dtype=torch.int64
+                                        workspace[5], dtype=torch.int64
                                     ),
                                     lamport_peer_comm_buffer_ptrs_2=torch.tensor(
-                                        ipc_handles[6], dtype=torch.int64
+                                        workspace[6], dtype=torch.int64
                                     ),
                                 )
+                                print(
+                                    f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} test AR done"
+                                )
                                 dist.all_reduce(inp1_ref, group=group)
+                                print(
+                                    f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} ref AR done"
+                                )
 
                                 if fusion_op_code == comm.AllReduceFusionOp.NONE:
                                     torch.testing.assert_close(
@@ -156,42 +173,60 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     fusion_op_code
                                     == comm.AllReduceFusionOp.RESIDUAL_RMS_NORM
                                 ):
-                                    # # Step 1: Copy intermediate_buffer to ref
-                                    # inter_buffer = intermediate_buffer.clone()
+                                    # cache intermediate_buffer to inter_buffer
+                                    inter_buffer = intermediate_buffer.clone()
 
-                                    # # Step 2: Add residual and bias
-                                    # has_bias = bias is not None
-                                    # has_affine = weight is not None
-                                    # eps_value = 1e-5 if eps is None else eps
+                                    # residual and bias
+                                    ref = inp1_ref.clone()
+                                    ref_float = ref.to(torch.float32)
+                                    residual_float = residual.to(torch.float32)
+                                    bias_float = bias.to(torch.float32)
 
-                                    # # Convert to float32 for precision
-                                    # ref = ref.to(torch.float32)
-                                    # residual_f = residual.to(torch.float32)
-                                    # if has_bias:
-                                    #     bias_f = bias.to(torch.float32)
+                                    for i in range(ref.numel()):
+                                        ref_float[i] += (
+                                            residual_float[i]
+                                            + bias_float[i % hiddenSize]
+                                        )
+                                    ref_half = ref_float.to(dtype)
 
-                                    # for i in range(ref.numel()):
-                                    #     ref[i] += residual_f[i]
-                                    #     if has_bias:
-                                    #         ref[i] += bias_f[i % hiddenSize]
+                                    torch.testing.assert_close(
+                                        inter_buffer, ref_half, atol=1e-3, rtol=3e-2
+                                    )
 
-                                    # # Step 3: RMSNorm over hidden size
-                                    # ref = ref.view(token_num, hiddenSize)
-                                    # normed = torch.empty_like(ref)
+                                    # RMSNorm over hidden size
+                                    ref_float = ref_float.view(token_num, hiddenSize)
+                                    normed_float = torch.empty_like(ref_float)
+
+                                    mean_sq = torch.mean(
+                                        ref_float * ref_float, dim=-1, keepdim=True
+                                    )
+                                    denom = torch.sqrt(mean_sq + eps)
+                                    normed_float = ref_float / denom
+                                    normed_float = normed_float * weight.to(
+                                        torch.float32
+                                    )
+                                    normed_half = normed_float.to(dtype)
+                                    torch.testing.assert_close(
+                                        out1, normed_half.view(-1), atol=1e-3, rtol=3e-2
+                                    )
 
                                     # for i in range(token_num):
-                                    #     vec = ref[i]
+                                    #     vec = ref_float[i]
                                     #     mean_sq = torch.mean(vec * vec)
-                                    #     denom = torch.sqrt(mean_sq + eps_value)
-                                    #     if has_affine:
-                                    #         normed[i] = (vec / denom) * weight.to(torch.float32)
-                                    #     else:
-                                    #         normed[i] = vec / denom
+                                    #     denom = torch.sqrt(mean_sq + eps)
+                                    #     normed_float[i] = (vec / denom) * weight.to(
+                                    #         torch.float32
+                                    #     )
+                                    # normed_half = normed_float.to(dtype)
 
-                                    # # Step 4: Validate output
-                                    # torch.testing.assert_close(out1.to(torch.float32), normed.view(-1), atol=1e-2, rtol=1e-2)
-                                    pass
-                                elif fusion_op_code == comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
+                                    # torch.testing.assert_close(
+                                    #     out1, normed_half.view(-1), atol=1e-2, rtol=3e-2
+                                    # )
+                                elif (
+                                    fusion_op_code
+                                    == comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM
+                                ):
+                                    # todo(yingyi): add test results here
                                     pass
                             print(
                                 f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} passed"
@@ -204,8 +239,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         #     comm.dispose(custom_ptr)
 
         # todo(yingyi): free ipc handles
-        for ipc_handle in ipc_handles:
-            comm.free_shared_buffer(ipc_handle, group)
+        comm.trtllm_destroy_ipc_workspace_for_all_reduce(workspace, group=group)
 
         dist.destroy_process_group(group=group)
 
@@ -264,38 +298,9 @@ if __name__ == "__main__":
     # compile tests
     mod = comm.get_comm_module()
 
-    # add py interface binding tests
-    # comm.trtllm_lamport_initialize_all(
-    #     torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda").data_ptr(),
-    #     1024,
-    #     torch.float32,
-    # )
-    # comm.trtllm_custom_all_reduce(
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     2,
-    #     0,
-    #     1024,
-    #     0,
-    #     0,
-    #     0,
-    #     True,
-    #     0,
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     torch.empty(1024, dtype=torch.float32, device="cuda"),
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    #     None,
-    # )
-
-    # todo: add real tests
+    # todo: pass real tests
     set_log_level("info")
     test_trtllm_custom_allreduce(2, torch.float16)
+    test_trtllm_custom_allreduce(2, torch.bfloat16)
+    test_trtllm_custom_allreduce(4, torch.float16)
+    test_trtllm_custom_allreduce(4, torch.bfloat16)
