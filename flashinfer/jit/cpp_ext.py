@@ -47,6 +47,7 @@ def generate_ninja_build_for_op(
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
+    system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
