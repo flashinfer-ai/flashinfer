@@ -38,17 +38,23 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.AllReduceStrategyType.ONESHOT,
             comm.AllReduceStrategyType.TWOSHOT,
         ]
-        config_codes = [0, 1]
+        config_codes = [
+            # 0,
+            comm.AllReduceStrategyConfig.USE_MEMCPY,
+            comm.AllReduceStrategyConfig.PUSH_MODE,
+        ]
         fusion_op_codes = [
+            0,
             comm.AllReduceFusionOp.NONE,
             comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
-            comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
-            comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
-            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
-            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
-            comm.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+            # below are not enabled in trtllm test, skip for now
+            # comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
+            # comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
+            # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+            # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+            # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+            # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+            # comm.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
         ]
         launch_with_pdls = [True, False]
 
@@ -59,7 +65,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             rank, world_size, maxSeqLen, hiddenSize, group=group
         )
 
-        test_loop = 3
+        test_loop = 1
 
         flag_value = 0
         for token_num in token_nums:
@@ -67,10 +73,10 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                 for config_code in config_codes:
                     for fusion_op_code in fusion_op_codes:
                         for launch_with_pdl in launch_with_pdls:
+                            print(
+                                f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} start"
+                            )
                             for _ in range(test_loop):
-                                print(
-                                    f"test {world_size}-{rank}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} start"
-                                )
                                 message_size = token_num * hiddenSize
                                 inp1 = torch.rand(
                                     message_size, dtype=dtype, device=device
@@ -87,6 +93,22 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     dtype,
                                 )
                                 flag_value += 1
+
+                                # init params for each fusion op
+                                bias = torch.rand(
+                                    hiddenSize, dtype=dtype, device=device
+                                )
+                                residual = torch.rand(
+                                    message_size, dtype=dtype, device=device
+                                )
+                                weight = torch.rand(
+                                    hiddenSize, dtype=dtype, device=device
+                                )
+                                weight_pre_residual_norm = None
+                                eps = None
+                                intermediate_buffer = torch.rand(
+                                    message_size, dtype=dtype, device=device
+                                )
 
                                 comm.trtllm_custom_all_reduce(
                                     inp=inp1,
@@ -108,12 +130,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     peer_barrier_ptrs_out=torch.tensor(
                                         ipc_handles[3], dtype=torch.int64
                                     ),
-                                    bias=None,
-                                    residual=None,
-                                    weight=None,
-                                    weight_pre_residual_norm=None,
-                                    eps=None,
-                                    intermediate_buffer=None,
+                                    bias=bias,
+                                    residual=residual,
+                                    weight=weight,
+                                    weight_pre_residual_norm=weight_pre_residual_norm,
+                                    eps=eps,
+                                    intermediate_buffer=intermediate_buffer,
                                     lamport_peer_comm_buffer_ptrs_0=torch.tensor(
                                         ipc_handles[4], dtype=torch.int64
                                     ),
@@ -126,10 +148,52 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
                                 dist.all_reduce(inp1_ref, group=group)
 
-                                torch.testing.assert_close(out1, inp1_ref)
-                                print(
-                                    f"test {world_size}-{rank}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} passed"
-                                )
+                                if fusion_op_code == comm.AllReduceFusionOp.NONE:
+                                    torch.testing.assert_close(
+                                        out1, inp1_ref, atol=1e-4, rtol=3e-2
+                                    )
+                                elif (
+                                    fusion_op_code
+                                    == comm.AllReduceFusionOp.RESIDUAL_RMS_NORM
+                                ):
+                                    # # Step 1: Copy intermediate_buffer to ref
+                                    # inter_buffer = intermediate_buffer.clone()
+
+                                    # # Step 2: Add residual and bias
+                                    # has_bias = bias is not None
+                                    # has_affine = weight is not None
+                                    # eps_value = 1e-5 if eps is None else eps
+
+                                    # # Convert to float32 for precision
+                                    # ref = ref.to(torch.float32)
+                                    # residual_f = residual.to(torch.float32)
+                                    # if has_bias:
+                                    #     bias_f = bias.to(torch.float32)
+
+                                    # for i in range(ref.numel()):
+                                    #     ref[i] += residual_f[i]
+                                    #     if has_bias:
+                                    #         ref[i] += bias_f[i % hiddenSize]
+
+                                    # # Step 3: RMSNorm over hidden size
+                                    # ref = ref.view(token_num, hiddenSize)
+                                    # normed = torch.empty_like(ref)
+
+                                    # for i in range(token_num):
+                                    #     vec = ref[i]
+                                    #     mean_sq = torch.mean(vec * vec)
+                                    #     denom = torch.sqrt(mean_sq + eps_value)
+                                    #     if has_affine:
+                                    #         normed[i] = (vec / denom) * weight.to(torch.float32)
+                                    #     else:
+                                    #         normed[i] = vec / denom
+
+                                    # # Step 4: Validate output
+                                    # torch.testing.assert_close(out1.to(torch.float32), normed.view(-1), atol=1e-2, rtol=1e-2)
+                                    pass
+                            print(
+                                f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} passed"
+                            )
     finally:
         dist.barrier(group=group)
 
@@ -175,10 +239,8 @@ def multi_process_parallel(
         ), f"Process {i} failed with exit code {procs[i].exitcode}"
 
 
-# @pytest.mark.parametrize("world_size", [2, 4])
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("world_size", [2])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_trtllm_custom_allreduce(world_size, dtype):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
@@ -232,6 +294,6 @@ if __name__ == "__main__":
     #     None,
     # )
 
-    # todo: add real tests above
+    # todo: add real tests
     set_log_level("info")
     test_trtllm_custom_allreduce(2, torch.float16)

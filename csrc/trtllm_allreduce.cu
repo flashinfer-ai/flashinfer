@@ -106,7 +106,6 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
     int64_t hidden_size = in.numel() / token_num;
-    FLASHINFER_LOG_INFO("params.hidden_size: {}", hidden_size);
 
     AllReduceParams<c_type> params;
     params.elts_total = message_size;
