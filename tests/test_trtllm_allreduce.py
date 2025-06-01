@@ -47,9 +47,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             0,
             comm.AllReduceFusionOp.NONE,
             comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
             # below are not enabled in trtllm test, skip for now
             # comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
-            # comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
@@ -190,6 +190,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                     # # Step 4: Validate output
                                     # torch.testing.assert_close(out1.to(torch.float32), normed.view(-1), atol=1e-2, rtol=1e-2)
+                                    pass
+                                elif fusion_op_code == comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
                                     pass
                             print(
                                 f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} passed"
