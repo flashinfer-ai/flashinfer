@@ -73,6 +73,10 @@ struct HostPrecomputedTileScheduler {
     } else {
       is_valid_tile = false;
     }
+    if (threadIdx.x % 32 == 0) {
+      printf("blockIdx.x: %d, work_ptr: %d, work_ptr_end: %d, is_valid_tile: %d\n", blockIdx.x,
+             work_ptr, work_ptr_end, is_valid_tile);
+    }
   }
 
   static Params to_underlying_arguments(Arguments const& args, KernelHardwareInfo hw_info) {
@@ -100,6 +104,7 @@ struct HostPrecomputedTileScheduler {
       qo_tile_idx = params.qo_tile_indices[work_ptr];
       batch_idx = params.batch_indices[work_ptr];
       qo_head_idx = params.qo_head_indices[work_ptr];
+      is_valid_tile = true;
     } else {
       is_valid_tile = false;
     }

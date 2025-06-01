@@ -31,16 +31,17 @@ union CostIndex {
   long long packed;
 };
 
+__device__ __forceinline__ CostIndex min(CostIndex a, CostIndex b) {
+  return a.cost < b.cost || (a.cost == b.cost && a.bucket_idx < b.bucket_idx) ? a : b;
+}
+
 __device__ __forceinline__ CostIndex get_min_cost_index(CostIndex* warp_min_cost,
                                                         CostIndex cost_index, int num_buckets) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     CostIndex other;
     other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
-    if (other.cost < cost_index.cost ||
-        (other.cost == cost_index.cost && other.bucket_idx < cost_index.bucket_idx)) {
-      cost_index = other;
-    }
+    cost_index = min(cost_index, other);
   }
   if (threadIdx.x % 32 == 0) {
     warp_min_cost[threadIdx.x / 32] = cost_index;
@@ -54,10 +55,7 @@ __device__ __forceinline__ CostIndex get_min_cost_index(CostIndex* warp_min_cost
     for (int offset = 16; offset > 0; offset >>= 1) {
       CostIndex other;
       other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
-      if (other.cost < cost_index.cost ||
-          (other.cost == cost_index.cost && other.bucket_idx < cost_index.bucket_idx)) {
-        cost_index = other;
-      }
+      cost_index = min(cost_index, other);
     }
     if (threadIdx.x == 0) {
       warp_min_cost[0] = cost_index;
@@ -98,7 +96,7 @@ __global__ void plan_kernel(int* qo_lens, int* kv_lens, int* work_indptr, int* q
   }
   // compute exclusive prefix sum of
   int thread_local_work_indptr = 0;
-  BlockScan(temp_storage).InclusiveSum(thread_local_work_counter, thread_local_work_indptr);
+  BlockScan(temp_storage).ExclusiveSum(thread_local_work_counter, thread_local_work_indptr);
   __syncthreads();
   if (threadIdx.x < num_buckets) {
     work_indptr[threadIdx.x] = thread_local_work_indptr;
@@ -111,6 +109,8 @@ __global__ void plan_kernel(int* qo_lens, int* kv_lens, int* work_indptr, int* q
   thread_local_work_counter = 0;
   if (threadIdx.x >= num_buckets) {
     thread_local_cost_index.cost = cuda::std::numeric_limits<float>::infinity();
+  } else {
+    thread_local_cost_index.cost = 0.f;
   }
   for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
@@ -125,6 +125,7 @@ __global__ void plan_kernel(int* qo_lens, int* kv_lens, int* work_indptr, int* q
           qo_tile_indices[thread_local_work_indptr + thread_local_work_counter] = qo_tile_idx;
           head_indices[thread_local_work_indptr + thread_local_work_counter] = head_idx;
           batch_indices[thread_local_work_indptr + thread_local_work_counter] = batch_idx;
+          thread_local_cost_index.cost += cost_function(qo_lens[batch_idx], kv_lens[batch_idx]);
           thread_local_work_counter++;
         }
       }

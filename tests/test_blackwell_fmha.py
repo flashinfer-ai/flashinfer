@@ -124,6 +124,7 @@ def test_blackwell_cutlass_fmha(
     o_ref, lse_ref = attention_ref(
         batch_size, q, k_repeated, v_repeated, causal, sm_scale
     )
+    print(o, o_ref)
 
     lse_ref = lse_ref.flatten(0, 1)
     if dtype == torch.half:
@@ -137,14 +138,14 @@ def test_blackwell_cutlass_fmha(
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         1,
-        32,
-        32,
-        4,
-        4,
+        512,
+        512,
+        1,
+        1,
         192,
         128,
         1,
-        True,
+        False,
         torch.bfloat16,
         # 3,
         # 999,

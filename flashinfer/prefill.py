@@ -2599,6 +2599,7 @@ def fmha_varlen(
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
     )
+
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     nnz_kv, num_kv_heads, head_dim_vo = v.shape
 
@@ -2613,6 +2614,27 @@ def fmha_varlen(
     max_kv_len = kv_lens.max()
     qo_total_len = nnz_qo
 
+    num_ctas = torch.cuda.get_device_properties(q.device).multi_processor_count
+    work_indptr = torch.empty(num_ctas + 1, device=q.device, dtype=torch.int32)
+    qo_tile_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
+    head_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
+    batch_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
+    module.plan(
+        qo_lens,
+        kv_lens,
+        work_indptr,
+        qo_tile_indices,
+        head_indices,
+        batch_indices,
+        256,  # qo_tile_size
+        batch_size,
+        num_qo_heads,
+        num_ctas,
+    )
+    print(work_indptr)
+    print(qo_tile_indices[: work_indptr[-1]].tolist())
+    print(head_indices[: work_indptr[-1]].tolist())
+    print(batch_indices[: work_indptr[-1]].tolist())
     if out is None:
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
@@ -2636,6 +2658,10 @@ def fmha_varlen(
         kv_lens,
         qo_segment_offsets,
         kv_segment_offsets,
+        work_indptr,
+        qo_tile_indices,
+        head_indices,
+        batch_indices,
         out,
         lse,
         mask_mode_code,

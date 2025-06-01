@@ -480,6 +480,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           }
         }
         auto blk_coord = tile_scheduler.get_block_coord();
+        if (threadIdx.x % 32 == 0) {
+          printf("work_idx: %d, coord: %d, %d, %d\n", work_idx, get<0>(blk_coord),
+                 get<2, 0>(blk_coord), get<2, 1>(blk_coord));
+        }
 
         auto logical_problem_shape =
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));

@@ -77,10 +77,9 @@ struct FwdRunner {
                          IdType* qo_lens, IdType* kv_lens, IdType* qo_segment_offsets,
                          IdType* kv_segment_offsets, IdType* work_indptr, IdType* qo_tile_indices,
                          IdType* qo_head_indices, IdType* batch_indices, DTypeOut* o,
-                         std::optional<float*> maybe_lse, int mask_mode_code, double sm_scale,
-                         int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo,
-                         int batch_size, int total_qo_len, int total_kv_len, int max_qo_len,
-                         int max_kv_len) {
+                         float* maybe_lse, int mask_mode_code, double sm_scale, int num_qo_heads,
+                         int num_kv_heads, int head_dim_qk, int head_dim_vo, int batch_size,
+                         int total_qo_len, int total_kv_len, int max_qo_len, int max_kv_len) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -124,7 +123,7 @@ struct FwdRunner {
     typename Operation::Arguments arguments{
         problem_shape,
         {q, layout_Q, k, layout_K, v, layout_V, sm_scale},
-        {o, layout_O, maybe_lse.value(), layout_LSE},
+        {o, layout_O, maybe_lse, layout_LSE},
         {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
 
@@ -156,12 +155,7 @@ struct FwdRunner {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
     }
-
-    cudaError_t result = cudaDeviceSynchronize();
-    if (result != cudaSuccess) {
-      std::cerr << "Error running the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(result) << std::endl;
-    }
+    return cudaSuccess;
   }
 };
 
@@ -171,10 +165,9 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          IdType* qo_lens, IdType* kv_lens, IdType* qo_segment_offsets,
                          IdType* kv_segment_offsets, IdType* work_indptr, IdType* qo_tile_indices,
                          IdType* qo_head_indices, IdType* batch_indices, DTypeOut* o,
-                         std::optional<float*> maybe_lse, int mask_mode_code, double sm_scale,
-                         int num_qo_heads, int num_kv_heads, int head_dim_qk, int head_dim_vo,
-                         int batch_size, int total_qo_len, int total_kv_len, int max_qo_len,
-                         int max_kv_len) {
+                         float* maybe_lse, int mask_mode_code, double sm_scale, int num_qo_heads,
+                         int num_kv_heads, int head_dim_qk, int head_dim_vo, int batch_size,
+                         int total_qo_len, int total_kv_len, int max_qo_len, int max_kv_len) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
       workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets,
       work_indptr, qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code,
