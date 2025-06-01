@@ -31,13 +31,25 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     try:
         device = torch.device(f"cuda:{rank}")
         token_nums = [
-            512,
-            2560,
             4096,
+            8192,
         ]
-        strategy_codes = [0, 1, 2, 3, 4, 5, 6]
+        strategy_codes = [
+            comm.AllReduceStrategyType.ONESHOT,
+            comm.AllReduceStrategyType.TWOSHOT,
+        ]
         config_codes = [0, 1]
-        fusion_op_codes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        fusion_op_codes = [
+            comm.AllReduceFusionOp.NONE,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+            comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+            comm.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+        ]
         launch_with_pdls = [True, False]
 
         # create ipc memory
@@ -56,6 +68,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                     for fusion_op_code in fusion_op_codes:
                         for launch_with_pdl in launch_with_pdls:
                             for _ in range(test_loop):
+                                print(
+                                    f"test {world_size}-{rank}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} start"
+                                )
                                 message_size = token_num * hiddenSize
                                 inp1 = torch.rand(
                                     message_size, dtype=dtype, device=device
@@ -74,32 +89,47 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 flag_value += 1
 
                                 comm.trtllm_custom_all_reduce(
-                                    inp1,
-                                    out1,
-                                    world_size,
-                                    rank,
-                                    message_size,
-                                    fusion_op_code,
-                                    strategy_code,
-                                    config_code,
-                                    launch_with_pdl,
-                                    flag_value,
-                                    torch.tensor(ipc_handles[0], dtype=torch.int64),
-                                    torch.tensor(ipc_handles[2], dtype=torch.int64),
-                                    torch.tensor(ipc_handles[3], dtype=torch.int64),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    torch.tensor(ipc_handles[4], dtype=torch.int64),
-                                    torch.tensor(ipc_handles[5], dtype=torch.int64),
-                                    torch.tensor(ipc_handles[6], dtype=torch.int64),
+                                    inp=inp1,
+                                    out=out1,
+                                    tp_size=world_size,
+                                    tp_rank=rank,
+                                    token_num=token_num,
+                                    fusion_op_code=fusion_op_code,
+                                    strategy_code=strategy_code,
+                                    config_code=config_code,
+                                    launch_with_pdl=launch_with_pdl,
+                                    flag_value=flag_value,
+                                    peer_comm_buffer_ptrs=torch.tensor(
+                                        ipc_handles[0], dtype=torch.int64
+                                    ),
+                                    peer_barrier_ptrs_in=torch.tensor(
+                                        ipc_handles[2], dtype=torch.int64
+                                    ),
+                                    peer_barrier_ptrs_out=torch.tensor(
+                                        ipc_handles[3], dtype=torch.int64
+                                    ),
+                                    bias=None,
+                                    residual=None,
+                                    weight=None,
+                                    weight_pre_residual_norm=None,
+                                    eps=None,
+                                    intermediate_buffer=None,
+                                    lamport_peer_comm_buffer_ptrs_0=torch.tensor(
+                                        ipc_handles[4], dtype=torch.int64
+                                    ),
+                                    lamport_peer_comm_buffer_ptrs_1=torch.tensor(
+                                        ipc_handles[5], dtype=torch.int64
+                                    ),
+                                    lamport_peer_comm_buffer_ptrs_2=torch.tensor(
+                                        ipc_handles[6], dtype=torch.int64
+                                    ),
                                 )
                                 dist.all_reduce(inp1_ref, group=group)
 
-                                # torch.testing.assert_close(out1, inp1_ref)
+                                torch.testing.assert_close(out1, inp1_ref)
+                                print(
+                                    f"test {world_size}-{rank}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} passed"
+                                )
     finally:
         dist.barrier(group=group)
 
@@ -146,7 +176,7 @@ def multi_process_parallel(
 
 
 # @pytest.mark.parametrize("world_size", [2, 4])
-# @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("world_size", [2])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_trtllm_custom_allreduce(world_size, dtype):

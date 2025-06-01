@@ -301,7 +301,9 @@ def get_comm_module():
     @register_custom_op(
         "flashinfer::trtllm_lamport_initialize", mutates_args=["buffer"]
     )
-    def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
+    def trtllm_lamport_initialize(
+        buffer_ptr: int, size: int, dtype: torch.dtype
+    ) -> None:
         module.trtllm_lamport_initialize(buffer_ptr, size, dtype)
 
     @register_custom_op(
@@ -309,12 +311,42 @@ def get_comm_module():
         mutates_args=["buffer_0_ptr", "buffer_1_ptr", "buffer_2_ptr", "size", "dtype"],
     )
     def trtllm_lamport_initialize_all(
-        buffer_0_ptr: int, buffer_1_ptr: int, buffer_2_ptr: int, size: int, dtype: torch.dtype
+        buffer_0_ptr: int,
+        buffer_1_ptr: int,
+        buffer_2_ptr: int,
+        size: int,
+        dtype: torch.dtype,
     ) -> None:
-        module.trtllm_lamport_initialize_all(buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype)
+        module.trtllm_lamport_initialize_all(
+            buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
+        )
 
     @register_custom_op(
-        "flashinfer::trtllm_custom_all_reduce", mutates_args=["inp", "out", "tp_size", "tp_rank", "token_num", "fusion_op_code", "strategy_code", "config_code", "launch_with_pdl", "flag_value", "peer_comm_buffer_ptrs", "peer_barrier_ptrs_in", "peer_barrier_ptrs_out", "bias", "residual", "weight", "weight_pre_residual_norm", "eps", "intermediate_buffer", "lamport_peer_comm_buffer_ptrs_0", "lamport_peer_comm_buffer_ptrs_1", "lamport_peer_comm_buffer_ptrs_2"]
+        "flashinfer::trtllm_custom_all_reduce",
+        mutates_args=[
+            "inp",
+            "out",
+            "tp_size",
+            "tp_rank",
+            "token_num",
+            "fusion_op_code",
+            "strategy_code",
+            "config_code",
+            "launch_with_pdl",
+            "flag_value",
+            "peer_comm_buffer_ptrs",
+            "peer_barrier_ptrs_in",
+            "peer_barrier_ptrs_out",
+            "bias",
+            "residual",
+            "weight",
+            "weight_pre_residual_norm",
+            "eps",
+            "intermediate_buffer",
+            "lamport_peer_comm_buffer_ptrs_0",
+            "lamport_peer_comm_buffer_ptrs_1",
+            "lamport_peer_comm_buffer_ptrs_2",
+        ],
     )
     def trtllm_custom_all_reduce(
         inp: torch.Tensor,
@@ -498,7 +530,7 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     hidden_dim,
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
-    '''
+    """
     Note:
     We would init 7 IPC buffers for trtllm_custom_all_reduce.
     They are sized as follows:
@@ -517,7 +549,7 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     ipcHandles[6] - lamport_peer_comm_buffer_ptrs[tp_size * 2:tp_size * 3]
 
     We use tp_size and world_size here interchangeably (customAllReduce).
-    '''
+    """
 
     # NOTE(Yingyi): refer to tllm
     # - cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
@@ -542,11 +574,14 @@ def trtllm_create_ipc_buffer_for_all_reduce(
     ]:
         ipc_handles.append(create_shared_buffer(size, group))
 
-    print(f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}")
+    print(
+        f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    )
     # todo(yingyi): init lamport buffer to be negative zero - move to outer init flow
     # note(yingyi): maintain local buffer - unused in tllm, skip
 
     return ipc_handles
+
 
 # todo(review): align the ipc buffer size to tllm implementation
 BarrierFlagCount = 256
@@ -576,7 +611,9 @@ def trtllm_create_ipc_buffer_for_all_reduce_fusion(
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         ipc_handles.append(create_shared_buffer(size, group))
 
-    print(f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}")
+    print(
+        f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    )
     return ipc_handles
 
 
@@ -657,9 +694,15 @@ def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) ->
 
 
 def trtllm_lamport_initialize_all(
-    buffer_0_ptr: int, buffer_1_ptr: int, buffer_2_ptr: int, size: int, dtype: torch.dtype
+    buffer_0_ptr: int,
+    buffer_1_ptr: int,
+    buffer_2_ptr: int,
+    size: int,
+    dtype: torch.dtype,
 ) -> None:
-    get_comm_module().trtllm_lamport_initialize_all(buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype)
+    get_comm_module().trtllm_lamport_initialize_all(
+        buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
+    )
 
 
 def trtllm_custom_all_reduce(
