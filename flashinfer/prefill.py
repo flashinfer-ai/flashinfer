@@ -2339,10 +2339,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cutlass":
-            # self._cached_module.plan(
-            # TODO
-            # )
-            pass
+            self._plan_info = fmha_varlen_plan(
+                self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
+            )
         else:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -2495,6 +2494,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             _check_shape_dtype_device(
                 out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
             )
+        if self._backend == "cutlass":
+            out, lse = fmha_varlen(
+                q=q,
+                k=k,
+                v=v,
+                qo_segment_offsets=self._qo_indptr_buf,
+                kv_segment_offsets=self._kv_indptr_buf,
+                plan_info=self._plan_info,
+                causal=self._causal,
+                sm_scale=sm_scale,
+                max_qo_len=max(self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]),
+                out=out,
+                lse=lse,
+            )
+            return (out, lse) if return_lse else out
 
         if is_float8(q):
             logging.warning(

@@ -98,55 +98,24 @@ def test_blackwell_cutlass_fmha(
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
     )
 
-    # wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-    #     torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
-    #     kv_layout="NHD",
-    #     backend="cutlass",
-    # )
-    # wrapper.plan(
-    #     qo_indptr,
-    #     kv_indptr,
-    #     num_qo_heads,
-    #     num_kv_heads,
-    #     head_dim_qk,
-    #     head_dim_vo=head_dim_vo,
-    #     causal=causal,
-    #     sm_scale=sm_scale,
-    #     q_data_type=dtype,
-    #     kv_data_type=dtype,
-    # )
-    # o, lse = wrapper.run(q, k, v, return_lse=True)
-
-    module = flashinfer.prefill.get_fmha_module(
-        q.dtype,
-        k.dtype,
-        v.dtype,
-        torch.int32,
-        q.shape[2],
-        v.shape[2],
-        0,
-        False,
-        False,
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
     )
-    plan_info = flashinfer.prefill.fmha_varlen_plan(
-        module,
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
-        q.shape[1],
-        causal,
-    )
-
-    o, lse = flashinfer.prefill.fmha_varlen(
-        q,
-        k,
-        v,
-        qo_indptr,
-        kv_indptr,
-        plan_info=plan_info,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
         causal=causal,
         sm_scale=sm_scale,
-        max_qo_len=qo_len,
+        q_data_type=dtype,
+        kv_data_type=dtype,
     )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
     k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
@@ -194,55 +163,24 @@ def test_blackwell_cutlass_varlen(
     qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
     kv_indptr = qo_indptr
 
-    # wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-    #     torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
-    #     kv_layout="NHD",
-    #     backend="cutlass",
-    # )
-    # wrapper.plan(
-    #     qo_indptr,
-    #     kv_indptr,
-    #     num_qo_heads,
-    #     num_kv_heads,
-    #     head_dim_qk,
-    #     head_dim_vo=head_dim_vo,
-    #     causal=causal,
-    #     sm_scale=sm_scale,
-    #     q_data_type=dtype,
-    #     kv_data_type=dtype,
-    # )
-    # o, lse = wrapper.run(q, k, v, return_lse=True)
-    # print(o)
-    module = flashinfer.prefill.get_fmha_module(
-        q.dtype,
-        k.dtype,
-        v.dtype,
-        torch.int32,
-        q.shape[2],
-        v.shape[2],
-        0,
-        False,
-        False,
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
     )
-    plan_info = flashinfer.prefill.fmha_varlen_plan(
-        module,
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
-        q.shape[1],
-        causal,
-    )
-
-    o, lse = flashinfer.prefill.fmha_varlen(
-        q,
-        k,
-        v,
-        qo_indptr,
-        kv_indptr,
-        plan_info=plan_info,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
         causal=causal,
         sm_scale=sm_scale,
-        max_qo_len=max(indptr),
+        q_data_type=dtype,
+        kv_data_type=dtype,
     )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
     k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
