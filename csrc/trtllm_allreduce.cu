@@ -20,38 +20,38 @@
 
 using namespace flashinfer::trtllm_allreduce;
 
-#define DISPATCH_ALLREDUCE_DTYPE(TENSOR_SCALAR_TYPE, CTYPE_ALIAS, CODE_BLOCK)               \
+#define DISPATCH_ALLREDUCE_DTYPE(scalar_type, C_TYPE, ...)                                  \
   [&]() {                                                                                   \
-    if (TENSOR_SCALAR_TYPE == at::ScalarType::Float) {                                      \
-      using CTYPE_ALIAS = float;                                                            \
-      CODE_BLOCK;                                                                           \
-    } else if (TENSOR_SCALAR_TYPE == at::ScalarType::Half) {                                \
-      using CTYPE_ALIAS = half;                                                             \
-      CODE_BLOCK;                                                                           \
-    } else if (TENSOR_SCALAR_TYPE == at::ScalarType::BFloat16) {                            \
-      using CTYPE_ALIAS = __nv_bfloat16;                                                    \
-      CODE_BLOCK;                                                                           \
+    if (scalar_type == at::ScalarType::Float) {                                             \
+      using C_TYPE = float;                                                                 \
+      __VA_ARGS__                                                                           \
+    } else if (scalar_type == at::ScalarType::Half) {                                       \
+      using C_TYPE = half;                                                                  \
+      __VA_ARGS__                                                                           \
+    } else if (scalar_type == at::ScalarType::BFloat16) {                                   \
+      using C_TYPE = __nv_bfloat16;                                                         \
+      __VA_ARGS__                                                                           \
     } else {                                                                                \
       TORCH_CHECK(false, "Unsupported DType for custom op dispatch: ", TENSOR_SCALAR_TYPE); \
     }                                                                                       \
   }()
 
-#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(ctype, in, ...)                                     \
+#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in, c_type, ...)                                    \
   [&] {                                                                                           \
     const auto& scalar_type = (in).scalar_type();                                                 \
     switch (scalar_type) {                                                                        \
       case at::ScalarType::Float: {                                                               \
-        using ctype = float;                                                                      \
+        using c_type = float;                                                                     \
         return __VA_ARGS__();                                                                     \
       }                                                                                           \
       /* Requires nv_half to be defined somewhere */                                              \
       case at::ScalarType::Half: {                                                                \
-        using ctype = half;                                                                       \
+        using c_type = half;                                                                      \
         return __VA_ARGS__();                                                                     \
       }                                                                                           \
       /* Requires nv_bfloat16 to be defined somewhere */                                          \
       case at::ScalarType::BFloat16: {                                                            \
-        using ctype = __nv_bfloat16;                                                              \
+        using c_type = __nv_bfloat16;                                                             \
         return __VA_ARGS__();                                                                     \
       }                                                                                           \
       default:                                                                                    \
@@ -65,8 +65,8 @@ void trtllm_lamport_initialize(int64_t buffer_ptr, int64_t size, at::ScalarType 
     cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
     auto status = lamportInitialize<c_type>(reinterpret_cast<void*>(buffer_ptr),
                                             static_cast<size_t>(size), raw_stream);
-    TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+    TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code ",
+                cudaGetErrorString(status));
   });
 }
 
@@ -77,8 +77,8 @@ void trtllm_lamport_initialize_all(int64_t buffer_0_ptr, int64_t buffer_1_ptr, i
     auto status = lamportInitializeAll<c_type>(
         reinterpret_cast<void*>(buffer_0_ptr), reinterpret_cast<void*>(buffer_1_ptr),
         reinterpret_cast<void*>(buffer_2_ptr), static_cast<size_t>(size), raw_stream);
-    TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+    TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code ",
+                cudaGetErrorString(status));
   });
 }
 
@@ -102,7 +102,7 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
   auto stream = at::cuda::getCurrentCUDAStream();
 
   // TODO(zihao): review dispatch type - support fp16, bf16 only
-  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(c_type, in, [&] {
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in, c_type, [&] {
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
     int64_t hidden_size = in.numel() / token_num;
@@ -171,8 +171,8 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
     auto config = static_cast<AllReduceStrategyConfig>(config_code);
 
     auto status = customAllReduce(params, strategy, config, fusion_op, launch_with_pdl, stream);
-    TORCH_CHECK(status == cudaSuccess, "customAllReduce failed with error code " +
-                                           std::string(cudaGetErrorString(status)));
+    TORCH_CHECK(status == cudaSuccess, "customAllReduce failed with error code ",
+                cudaGetErrorString(status));
   });
 }
 
