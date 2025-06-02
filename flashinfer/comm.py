@@ -516,7 +516,6 @@ def free_shared_buffer(
 
 # NOTE(Yingyi): The customAllReduce and allReduceFusion require different buffer size
 # since allreduceFusion kernels are an improved implementation
-# todo(review): align the ipc buffer size to tllm implementation
 OneShotMaxToken = 128
 MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
@@ -598,7 +597,6 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
         free_shared_buffer(ipc_handle, group)
 
 
-# todo(review): align the ipc buffer size to tllm implementation
 BarrierFlagCount = 256
 
 
