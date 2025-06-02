@@ -63,8 +63,8 @@ __device__ __forceinline__ CostIndex get_min_cost_index(CostIndex* warp_min_cost
 
 __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, int* qo_lens,
                             int* kv_lens, int* work_indptr, int* qo_tile_indices, int* head_indices,
-                            int* batch_indices, int* max_qo_len_buf, int qo_tile_size,
-                            int batch_size, int num_heads, int num_buckets, bool causal) {
+                            int* batch_indices, int qo_tile_size, int batch_size, int num_heads,
+                            int num_buckets, bool causal) {
   __shared__ CostIndex warp_min_cost[32];
   constexpr int MAX_BUCKET_SIZE = 256;
   using BlockScan = cub::BlockScan<int, MAX_BUCKET_SIZE>;
@@ -75,13 +75,11 @@ __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, in
   if (threadIdx.x >= num_buckets) {
     thread_local_cost_index.cost = cuda::std::numeric_limits<float>::infinity();
   }
-  int max_qo_len = 0;
 
   for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       int qo_len = qo_lens ? qo_lens[batch_idx]
                            : qo_segment_offsets[batch_idx + 1] - qo_segment_offsets[batch_idx];
-      max_qo_len = max(max_qo_len, qo_len);
       int kv_len = kv_lens ? kv_lens[batch_idx]
                            : kv_segment_offsets[batch_idx + 1] - kv_segment_offsets[batch_idx];
       int num_qo_tiles = ceil_div(qo_len, qo_tile_size);
@@ -98,9 +96,7 @@ __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, in
       }
     }
   }
-  if (threadIdx.x == 0) {
-    max_qo_len_buf[0] = max_qo_len;
-  }
+  __syncthreads();
   // compute exclusive prefix sum of
   int thread_local_work_indptr = 0;
   BlockScan(temp_storage).ExclusiveSum(thread_local_work_counter, thread_local_work_indptr);
@@ -142,16 +138,16 @@ __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, in
       }
     }
   }
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
+  // #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  //   asm volatile("griddepcontrol.launch_dependents;");
+  // #endif
 }
 
 cudaError_t plan_kernel_wrapper(int* qo_segment_offsets, int* kv_segment_offsets, int* qo_lens,
                                 int* kv_lens, int* work_indptr, int* qo_tile_indices,
-                                int* head_indices, int* batch_indices, int* max_qo_len_buf,
-                                int qo_tile_size, int batch_size, int num_heads, int num_buckets,
-                                bool causal, bool enable_pdl, cudaStream_t stream) {
+                                int* head_indices, int* batch_indices, int qo_tile_size,
+                                int batch_size, int num_heads, int num_buckets, bool causal,
+                                bool enable_pdl, cudaStream_t stream) {
   cudaLaunchConfig_t config;
   config.gridDim = 1;
   config.blockDim = 256;
@@ -165,7 +161,7 @@ cudaError_t plan_kernel_wrapper(int* qo_segment_offsets, int* kv_segment_offsets
   FLASHINFER_CUDA_CALL(
       cudaLaunchKernelEx(&config, plan_kernel, qo_segment_offsets, kv_segment_offsets, qo_lens,
                          kv_lens, work_indptr, qo_tile_indices, head_indices, batch_indices,
-                         max_qo_len_buf, qo_tile_size, batch_size, num_heads, num_buckets, causal));
+                         qo_tile_size, batch_size, num_heads, num_buckets, causal));
   return cudaSuccess;
 }
 

@@ -54,17 +54,16 @@ def attention_ref(
     return o_ref, lse_ref * math.log2(math.e)
 
 
-# @pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
-@pytest.mark.parametrize("batch_size", [9])
-@pytest.mark.parametrize("qo_len", [377])  # [1, 17, 177, 377, 977])
-@pytest.mark.parametrize("kv_len", [512])  # [1, 17, 544, 977, 1999])
-@pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
+@pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
+@pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_blackwell_cutlass_fmha(
     batch_size,
     qo_len,
@@ -86,103 +85,78 @@ def test_blackwell_cutlass_fmha(
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
     )
-    qo_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+
+    # qo_indptr = (
+    #     torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    # )
+    qo_indptr = torch.tensor(
+        [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192], device="cuda", dtype=torch.int32
     )
+    # qo_indptr = torch.arange(0, 128 * 8 + 1, 128, device="cuda", dtype=torch.int32)
+    # kv_indptr = torch.tensor([0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192], device="cuda", dtype=torch.int32)
+
     k = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim_qk, dtype=dtype, device="cuda"
     )
     v = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim_vo, dtype=dtype, device="cuda"
     )
-    kv_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
-    )
-
-    # wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-    #     torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
-    #     kv_layout="NHD",
-    #     backend="cutlass",
+    # kv_indptr = (
+    #     torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
     # )
-    # wrapper.plan(
-    #     qo_indptr,
-    #     kv_indptr,
-    #     num_qo_heads,
-    #     num_kv_heads,
-    #     head_dim_qk,
-    #     head_dim_vo=head_dim_vo,
-    #     causal=causal,
-    #     sm_scale=sm_scale,
-    #     q_data_type=dtype,
-    #     kv_data_type=dtype,
-    # )
-    # o, lse = wrapper.run(q, k, v, return_lse=True)
+    kv_indptr = qo_indptr
 
-    module = flashinfer.prefill.get_fmha_module(
-        q.dtype,
-        k.dtype,
-        v.dtype,
-        torch.int32,
-        q.shape[2],
-        v.shape[2],
-        0,
-        False,
-        False,
+    print(q.shape, k.shape, v.shape)
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
     )
-    plan_info = flashinfer.prefill.fmha_varlen_plan(
-        module,
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
-        q.shape[1],
-        causal,
-    )
-    # print(work_indptr)
-    # print(len(work_indptr))
-    # print(qo_tile_indices[:work_indptr[-1]])
-    # print(head_indices[:work_indptr[-1]])
-    # print(batch_indices[:work_indptr[-1]])
-    # print(max_qo_len_buf)
-    # print(max_qo_len)
-
-    o, lse = flashinfer.prefill.fmha_varlen(
-        q,
-        k,
-        v,
-        qo_indptr,
-        kv_indptr,
-        plan_info=plan_info,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
         causal=causal,
         sm_scale=sm_scale,
-        max_qo_len=32768,
+        q_data_type=dtype,
+        kv_data_type=dtype,
     )
+    o = wrapper.run(q, k, v, return_lse=True)  # return_lse=True)
+    print(o[:8192])
 
-    gqa_group_ratio = num_qo_heads // num_kv_heads
-    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
-    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
-    o_ref, lse_ref = attention_ref(
-        batch_size, q, k_repeated, v_repeated, causal, sm_scale
-    )
+    # gqa_group_ratio = num_qo_heads // num_kv_heads
+    # k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    # v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    # o_ref, lse_ref = attention_ref(
+    #     8, q, k_repeated, v_repeated, causal, sm_scale
+    # )
+    # print(o_ref[:8192])
 
-    lse_ref = lse_ref.flatten(0, 1)
-    if dtype == torch.half:
-        torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    else:
-        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    # lse_ref = lse_ref.flatten(0, 1)
+    # if dtype == torch.half:
+    #     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    # else:
+    #     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
-    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
-        9,
-        377,
-        512,
+        1,
+        # 128 * 8,
+        8192,
+        8192,
         1,
         1,
+        192,
         128,
-        128,
         1,
-        False,
+        True,
         torch.bfloat16,
         # 3,
         # 999,

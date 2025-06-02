@@ -72,7 +72,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     ElementAcc* ptr_LSE;
     LayoutLSE layout_LSE;
-    int* max_qo_len_buf;
+    int max_qo_len;
   };
 
   using TMA_O = decltype(make_tma_copy(
@@ -84,7 +84,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     LayoutO layout_O;
     ElementAcc* ptr_LSE;
     LayoutLSE layout_LSE;
-    int* max_qo_len_buf;
+    int max_qo_len;
   };
 
   template <class ProblemShape>
@@ -97,7 +97,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     auto tma_store_o =
         make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, layout_O), SmemLayoutO{}(_, _, _0{}));
 
-    return {tma_store_o, layout_O, args.ptr_LSE, args.layout_LSE, args.max_qo_len_buf};
+    return {tma_store_o, layout_O, args.ptr_LSE, args.layout_LSE, args.max_qo_len};
   }
 
   CUTLASS_DEVICE
@@ -126,8 +126,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     int o0_index = 2 * get<0>(blk_coord);
     int o1_index = 2 * get<0>(blk_coord) + 1;
 
-    int max_length_q = params.max_qo_len_buf[0];
-    int offs_0 = max_length_q - qo_len;
+    int offs_0 = params.max_qo_len - qo_len;
     int offs_2_1 = qo_segment_offset + qo_len;
     BlkCoord blk_coord_updated = blk_coord;
     get<2, 1>(blk_coord_updated) = 0;

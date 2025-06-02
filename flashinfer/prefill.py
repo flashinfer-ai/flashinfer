@@ -2602,7 +2602,6 @@ def fmha_varlen_plan(
     batch_indices = torch.empty(
         131072, device=qo_segment_offsets.device, dtype=torch.int32
     )
-    max_qo_len_buf = torch.empty(1, device=qo_segment_offsets.device, dtype=torch.int32)
     module.plan(
         qo_segment_offsets,
         kv_segment_offsets,
@@ -2610,20 +2609,16 @@ def fmha_varlen_plan(
         qo_tile_indices,
         head_indices,
         batch_indices,
-        max_qo_len_buf,
         256,  # qo_tile_size
         num_qo_heads,
         num_ctas,
         causal,
     )
-    max_qo_len = max_qo_len_buf[0].item()
     return (
         work_indptr,
         qo_tile_indices,
         head_indices,
         batch_indices,
-        max_qo_len_buf,
-        max_qo_len,
     )
 
 
@@ -2634,6 +2629,7 @@ def fmha_varlen(
     qo_segment_offsets: torch.Tensor,
     kv_segment_offsets: torch.Tensor,
     plan_info: Optional[List[torch.Tensor]] = None,
+    max_qo_len: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -2662,19 +2658,20 @@ def fmha_varlen(
         sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
     qo_total_len = nnz_qo
+    if max_qo_len is None:
+        max_qo_len = torch.max(qo_segment_offsets[1:] - qo_segment_offsets[:-1]).item()
 
     if plan_info is None:
         plan_info = fmha_varlen_plan(
             module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
         )
+        torch.cuda.synchronize()
 
     (
         work_indptr,
         qo_tile_indices,
         head_indices,
         batch_indices,
-        max_qo_len_buf,
-        max_qo_len,
     ) = plan_info
 
     if out is None:
@@ -2704,7 +2701,6 @@ def fmha_varlen(
         batch_indices,
         out,
         lse,
-        max_qo_len_buf,
         mask_mode_code,
         sm_scale,
         num_qo_heads,
