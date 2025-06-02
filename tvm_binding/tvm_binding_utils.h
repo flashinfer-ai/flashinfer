@@ -16,15 +16,18 @@
 #pragma once
 
 #include <dlpack/dlpack.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/shape.h>
+#include <tvm/ffi/function.h>
 #include <tvm/runtime/data_type.h>
-#include <tvm/runtime/packed_func.h>
+#include <tvm/runtime/int_tuple.h>
+#include <tvm/runtime/ndarray.h>
 
 using IdType = int32_t;
-using tvm::runtime::Array;
+using tvm::ffi::Array;
 using tvm::runtime::DataType;
 using tvm::runtime::IntTuple;
 using tvm::runtime::NDArray;
-using tvm::runtime::ShapeTuple;
 
 #define DISPATCH_BOOL(expr, const_expr, ...) \
   [&]() -> bool {                            \

@@ -7,13 +7,11 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.utils import set_log_level
 
-# todo: temp for test
 maxBatchSize = 1
 maxBeamWidth = 3
-maxSeqLen = 65536 # max sequence length for all reduce
-hiddenSize = 64 # max hidden size for all reduce
+maxSeqLen = 65536  # max sequence length for all reduce
+hiddenSize = 64  # max hidden size for all reduce
 
 
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
@@ -21,7 +19,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     torch.cuda.set_device(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
     dist.init_process_group(
-        backend="nccl",  # todo: do we need to support other backends?
+        backend="nccl",
         init_method=distributed_init_method,
         rank=rank,
         world_size=world_size,
@@ -46,11 +44,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         fusion_op_codes = [
             comm.AllReduceFusionOp.NONE,
             comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
-
             # NOTE(yingyi): bug - nccl timeout on pre-post norm
             # comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
-
-            # below are not enabled for custom all-reduce in trtllm test, skip
+            # Below are not enabled for custom all-reduce in trtllm test, skip
             # comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -61,8 +57,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         launch_with_pdls = [True, False]
 
         # create ipc memory
-        # todo(yingyi): lamport should be init only when can_access_peer is true, is it true default?
-        # init per world_size?
         workspace = comm.trtllm_create_ipc_workspace_for_all_reduce(
             rank, world_size, maxSeqLen, hiddenSize, group=group
         )
@@ -86,6 +80,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             print(
                                 f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl} start"
                             )
+                            torch.cuda.synchronize()
                             for _ in range(test_loop):
                                 message_size = token_num * hiddenSize
                                 inp1 = torch.randn(
@@ -104,17 +99,17 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
 
                                 # init params for each fusion op
-                                bias = (
-                                    torch.randn(hiddenSize, dtype=dtype, device=device)
+                                bias = torch.randn(
+                                    hiddenSize, dtype=dtype, device=device
                                 )
-                                residual = (
-                                    torch.randn(message_size, dtype=dtype, device=device)
+                                residual = torch.randn(
+                                    message_size, dtype=dtype, device=device
                                 )
-                                weight = (
-                                    torch.randn(hiddenSize, dtype=dtype, device=device)
+                                weight = torch.randn(
+                                    hiddenSize, dtype=dtype, device=device
                                 )
-                                weight_pre_residual_norm = (
-                                    torch.randn(hiddenSize, dtype=dtype, device=device)
+                                weight_pre_residual_norm = torch.randn(
+                                    hiddenSize, dtype=dtype, device=device
                                 )
                                 eps = 1e-6
                                 intermediate_buffer = torch.zeros(
@@ -157,13 +152,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         workspace[6], dtype=torch.int64
                                     ),
                                 )
-                                # print(
-                                #     f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} test AR done"
-                                # )
                                 dist.all_reduce(inp1_ref, group=group)
-                                # print(
-                                #     f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{flag_value} ref AR done"
-                                # )
 
                                 if fusion_op_code == comm.AllReduceFusionOp.NONE:
                                     torch.testing.assert_close(
@@ -216,18 +205,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 ):
                                     # NOTE(yingyi): bugfix todo, the test invokes nccl timeout for now
                                     pass
-
-                                    # ref_float = inp1_ref.clone()
-                                    # ref_float = ref_float.to(torch.float32)
-                                    # residual_float = residual.to(torch.float32)
-                                    # bias_float = bias.to(torch.float32)
-
-                                    # for i in range(ref.numel()):
-                                    #     ref_float[i] += (
-                                    #         residual_float[i]
-                                    #         + bias_float[i % hiddenSize]
-                                    #     )
-                                    # ref_half = ref_float.to(dtype)
 
                                 flag_value += 1
                             print(
@@ -295,8 +272,8 @@ if __name__ == "__main__":
     # compile tests
     mod = comm.get_comm_module()
 
-    # pass real tests
-    # test_trtllm_custom_allreduce(2, torch.float16)
+    # real tests
+    test_trtllm_custom_allreduce(2, torch.float16)
     test_trtllm_custom_allreduce(2, torch.bfloat16)
-    # test_trtllm_custom_allreduce(4, torch.float16)
+    test_trtllm_custom_allreduce(4, torch.float16)
     test_trtllm_custom_allreduce(4, torch.bfloat16)
