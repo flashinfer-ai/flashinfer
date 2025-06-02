@@ -2332,29 +2332,35 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
-                self._cached_module = get_cutlass_mha_module()(*get_module_args)
+                self._cached_module = get_fmha_module(*get_module_args)
             else:
                 self._cached_module = get_batch_prefill_module(self._backend)(
                     *get_module_args
                 )
 
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            kv_indptr_host,
-            kv_len_arr,
-            self._max_total_num_rows or total_num_rows,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            1,  # page_size
-            self.is_cuda_graph_enabled,
-            head_dim_qk,
-            head_dim_vo,
-            causal,
-        )
+        if self._backend == "cutlass":
+            # self._cached_module.plan(
+            # TODO
+            # )
+            pass
+        else:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                kv_indptr_host,
+                kv_len_arr,
+                self._max_total_num_rows or total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                1,  # page_size
+                self.is_cuda_graph_enabled,
+                head_dim_qk,
+                head_dim_vo,
+                causal,
+            )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -2574,12 +2580,60 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pass
 
 
+def fmha_varlen_plan(
+    module,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    num_qo_heads: int,
+    causal: bool,
+):
+    num_ctas = torch.cuda.get_device_properties(
+        qo_segment_offsets.device
+    ).multi_processor_count
+    work_indptr = torch.empty(
+        num_ctas + 1, device=qo_segment_offsets.device, dtype=torch.int32
+    )
+    qo_tile_indices = torch.empty(
+        131072, device=qo_segment_offsets.device, dtype=torch.int32
+    )
+    head_indices = torch.empty(
+        131072, device=qo_segment_offsets.device, dtype=torch.int32
+    )
+    batch_indices = torch.empty(
+        131072, device=qo_segment_offsets.device, dtype=torch.int32
+    )
+    max_qo_len_buf = torch.empty(1, device=qo_segment_offsets.device, dtype=torch.int32)
+    module.plan(
+        qo_segment_offsets,
+        kv_segment_offsets,
+        work_indptr,
+        qo_tile_indices,
+        head_indices,
+        batch_indices,
+        max_qo_len_buf,
+        256,  # qo_tile_size
+        num_qo_heads,
+        num_ctas,
+        causal,
+    )
+    max_qo_len = max_qo_len_buf[0].item()
+    return (
+        work_indptr,
+        qo_tile_indices,
+        head_indices,
+        batch_indices,
+        max_qo_len_buf,
+        max_qo_len,
+    )
+
+
 def fmha_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     qo_segment_offsets: torch.Tensor,
     kv_segment_offsets: torch.Tensor,
+    plan_info: Optional[List[torch.Tensor]] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -2607,34 +2661,22 @@ def fmha_varlen(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
-    qo_lens = qo_segment_offsets[1:] - qo_segment_offsets[:-1]
-    kv_lens = kv_segment_offsets[1:] - kv_segment_offsets[:-1]
-    batch_size = qo_lens.shape[0]
-    max_qo_len = qo_lens.max()
-    max_kv_len = kv_lens.max()
     qo_total_len = nnz_qo
 
-    num_ctas = torch.cuda.get_device_properties(q.device).multi_processor_count
-    work_indptr = torch.empty(num_ctas + 1, device=q.device, dtype=torch.int32)
-    qo_tile_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
-    head_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
-    batch_indices = torch.empty(32768, device=q.device, dtype=torch.int32)
-    module.plan(
-        qo_lens,
-        kv_lens,
+    if plan_info is None:
+        plan_info = fmha_varlen_plan(
+            module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
+        )
+
+    (
         work_indptr,
         qo_tile_indices,
         head_indices,
         batch_indices,
-        256,  # qo_tile_size
-        batch_size,
-        num_qo_heads,
-        num_ctas,
-    )
-    print(work_indptr)
-    print(qo_tile_indices[: work_indptr[-1]].tolist())
-    print(head_indices[: work_indptr[-1]].tolist())
-    print(batch_indices[: work_indptr[-1]].tolist())
+        max_qo_len_buf,
+        max_qo_len,
+    ) = plan_info
+
     if out is None:
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
@@ -2654,8 +2696,6 @@ def fmha_varlen(
         q,
         k,
         v,
-        qo_lens,
-        kv_lens,
         qo_segment_offsets,
         kv_segment_offsets,
         work_indptr,
@@ -2664,198 +2704,14 @@ def fmha_varlen(
         batch_indices,
         out,
         lse,
+        max_qo_len_buf,
         mask_mode_code,
         sm_scale,
         num_qo_heads,
         num_kv_heads,
         head_dim_qk,
         head_dim_vo,
-        batch_size,
-        nnz_qo,
-        nnz_kv,
         max_qo_len,
-        max_kv_len,
     )
 
     return out, lse
-
-
-@functools.cache
-def get_cutlass_mha_module():
-    def backend_module(*args):
-        modules_dict = _batch_prefill_modules
-
-        if args not in modules_dict:
-            uri = get_batch_prefill_uri("cutlass", *args)
-            module = get_fmha_module(*args)
-
-            @register_custom_op(
-                f"flashinfer::{uri}_ragged_run",
-                mutates_args=(
-                    "float_workspace_buffer",
-                    "int_workspace_buffer",
-                    "o",
-                    "maybe_lse",
-                ),
-            )
-            def ragged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                kv_indptr: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                return fmha_varlen(
-                    q,
-                    k,
-                    v,
-                    qo_indptr,
-                    kv_indptr,
-                    o,
-                    maybe_lse,
-                    mask_mode == MaskMode.CAUSAL.value,
-                    sm_scale,
-                )
-
-            @register_custom_op(
-                f"flashinfer::{uri}_paged_run",
-                mutates_args=(
-                    "float_workspace_buffer",
-                    "int_workspace_buffer",
-                    "paged_k_cache",
-                    "paged_v_cache",
-                    "o",
-                    "maybe_lse",
-                ),
-            )
-            def paged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                paged_k_cache: torch.Tensor,
-                paged_v_cache: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                paged_kv_indptr: torch.Tensor,
-                paged_kv_indices: torch.Tensor,
-                paged_kv_last_page_len: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                scale_q: Optional[torch.Tensor],
-                scale_k: Optional[torch.Tensor],
-                scale_v: Optional[torch.Tensor],
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                pass
-
-            @register_fake_op(f"flashinfer::{uri}_ragged_run")
-            def _fake_ragged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                kv_indptr: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                pass
-
-            @register_fake_op(f"flashinfer::{uri}_paged_run")
-            def _fake_paged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                paged_k_cache: torch.Tensor,
-                paged_v_cache: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                paged_kv_indptr: torch.Tensor,
-                paged_kv_indices: torch.Tensor,
-                paged_kv_last_page_len: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                scale_q: Optional[torch.Tensor],
-                scale_k: Optional[torch.Tensor],
-                scale_v: Optional[torch.Tensor],
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                pass
-
-            def plan(*args):
-                return None
-
-            # Register the module.
-            #
-            # Note that plan is not part of model logic. It should not be included in
-            # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-            modules_dict[args] = SimpleNamespace(
-                plan=plan,
-                ragged_run=ragged_run,
-                paged_run=paged_run,
-            )
-
-        return modules_dict[args]
-
-    return backend_module
