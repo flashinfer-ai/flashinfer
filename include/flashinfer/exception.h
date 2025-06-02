@@ -21,10 +21,22 @@
 
 #define FLASHINFER_ERROR(message) throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, message)
 
+template <typename T>
+void write_to_stream(std::ostringstream& oss, T&& val) {
+  oss << std::forward<T>(val);
+}
+
+template <typename T, typename... Args>
+void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
+  oss << std::forward<T>(val) << " ";
+  write_to_stream(oss, std::forward<Args>(args)...);
+}
+
 #define FLASHINFER_CHECK(condition, ...) \
   if (!(condition)) {                    \
     std::ostringstream oss;              \
-    oss << __VA_ARGS__;                  \
+    write_to_stream(oss, __VA_ARGS__);   \
+    std::cerr << oss.str() << std::endl; \
     FLASHINFER_ERROR(oss.str());         \
   }
 
