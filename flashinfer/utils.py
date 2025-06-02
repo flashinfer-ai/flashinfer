@@ -313,6 +313,47 @@ def is_fa3_backend_supported(
     return True
 
 
+def is_cutlass_backend_supported(
+    pos_encoding_mode: int,
+    use_fp16_qk_reductions: bool,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """
+    Check if the cutlass backend is supported based on the given parameters.
+
+    Parameters
+    ----------
+    pos_encoding_mode : int
+        The positional encoding mode.
+    use_fp16_qk_reductions : bool
+        Whether FP16 QK reductions are allowed.
+    use_custom_mask : bool
+        Whether a custom mask is used.
+    dtype_q : torch.dtype
+        The data type of the query tensor.
+    dtype_kv : torch.dtype
+        The data type of the key-value tensor.
+
+    Returns
+    -------
+    bool
+        True if the cutlass backend is supported, False otherwise.
+    """
+    if use_custom_mask:
+        return True
+    if pos_encoding_mode != PosEncodingMode.NONE.value:
+        return True
+    if use_fp16_qk_reductions:
+        return True
+    if dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return True
+    if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return True
+    return True
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -354,6 +395,14 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
+    elif is_sm100a_supported(device) and is_cutlass_backend_supported(
+        pos_encoding_mode,
+        use_fp16_qk_reductions,
+        use_custom_mask,
+        dtype_q,
+        dtype_kv,
+    ):
+        return "cutlass"
     else:
         return "fa2"
 
