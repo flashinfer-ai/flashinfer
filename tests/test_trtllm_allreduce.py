@@ -266,14 +266,3 @@ def test_trtllm_custom_allreduce(world_size, dtype):
         target_args=(),
     )
     print(f"custom allreduce tp = {world_size}: OK")
-
-
-if __name__ == "__main__":
-    # compile tests
-    mod = comm.get_comm_module()
-
-    # real tests
-    test_trtllm_custom_allreduce(2, torch.float16)
-    test_trtllm_custom_allreduce(2, torch.bfloat16)
-    test_trtllm_custom_allreduce(4, torch.float16)
-    test_trtllm_custom_allreduce(4, torch.bfloat16)
