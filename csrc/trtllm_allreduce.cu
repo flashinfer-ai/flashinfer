@@ -20,20 +20,20 @@
 
 using namespace flashinfer::trtllm_allreduce;
 
-#define DISPATCH_ALLREDUCE_DTYPE(scalar_type, C_TYPE, ...)                                  \
-  [&]() {                                                                                   \
-    if (scalar_type == at::ScalarType::Float) {                                             \
-      using C_TYPE = float;                                                                 \
-      __VA_ARGS__                                                                           \
-    } else if (scalar_type == at::ScalarType::Half) {                                       \
-      using C_TYPE = half;                                                                  \
-      __VA_ARGS__                                                                           \
-    } else if (scalar_type == at::ScalarType::BFloat16) {                                   \
-      using C_TYPE = __nv_bfloat16;                                                         \
-      __VA_ARGS__                                                                           \
-    } else {                                                                                \
-      TORCH_CHECK(false, "Unsupported DType for custom op dispatch: ", TENSOR_SCALAR_TYPE); \
-    }                                                                                       \
+#define DISPATCH_ALLREDUCE_DTYPE(scalar_type, C_TYPE, ...)                           \
+  [&]() {                                                                            \
+    if (scalar_type == at::ScalarType::Float) {                                      \
+      using C_TYPE = float;                                                          \
+      __VA_ARGS__                                                                    \
+    } else if (scalar_type == at::ScalarType::Half) {                                \
+      using C_TYPE = half;                                                           \
+      __VA_ARGS__                                                                    \
+    } else if (scalar_type == at::ScalarType::BFloat16) {                            \
+      using C_TYPE = __nv_bfloat16;                                                  \
+      __VA_ARGS__                                                                    \
+    } else {                                                                         \
+      TORCH_CHECK(false, "Unsupported DType for custom op dispatch: ", scalar_type); \
+    }                                                                                \
   }()
 
 #define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in, c_type, ...)                                    \
