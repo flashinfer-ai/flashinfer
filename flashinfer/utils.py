@@ -304,12 +304,6 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
-    # NOTE: currently fp8 is not supported in our FA3 backend
-    # will add support soon
-    if dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        return False
-    if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        return False
     return True
 
 
@@ -342,15 +336,15 @@ def is_cutlass_backend_supported(
         True if the cutlass backend is supported, False otherwise.
     """
     if use_custom_mask:
-        return True
+        return False
     if pos_encoding_mode != PosEncodingMode.NONE.value:
-        return True
+        return False
     if use_fp16_qk_reductions:
-        return True
+        return False
     if dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        return True
+        return False
     if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        return True
+        return False
     return True
 
 
@@ -395,14 +389,6 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
-    elif is_sm100a_supported(device) and is_cutlass_backend_supported(
-        pos_encoding_mode,
-        use_fp16_qk_reductions,
-        use_custom_mask,
-        dtype_q,
-        dtype_kv,
-    ):
-        return "cutlass"
     else:
         return "fa2"
 

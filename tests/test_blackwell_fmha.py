@@ -157,7 +157,6 @@ def test_blackwell_cutlass_varlen(
         pytest.skip("SM100A is not supported on this device")
     torch.manual_seed(42)
     q = torch.randn(indptr[-1], num_qo_heads, head_dim_qk, dtype=dtype, device="cuda")
-
     k = torch.randn(indptr[-1], num_kv_heads, head_dim_qk, dtype=dtype, device="cuda")
     v = torch.randn(indptr[-1], num_kv_heads, head_dim_vo, dtype=dtype, device="cuda")
     qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)

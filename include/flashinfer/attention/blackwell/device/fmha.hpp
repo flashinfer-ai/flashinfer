@@ -183,7 +183,7 @@ class FMHA {
 
   /// Primary run() entry point API that is static allowing users to create and manage their own
   /// params. Supplied params struct must be construct by calling Kernel::to_underling_arguments()
-  static Status run(Params& params, cudaStream_t stream = nullptr, bool launch_with_pdl = false) {
+  static Status run(Params& params, cudaStream_t stream = nullptr, bool launch_with_pdl = true) {
     CUTLASS_TRACE_HOST("FMHA::run()");
     dim3 const block = Kernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);

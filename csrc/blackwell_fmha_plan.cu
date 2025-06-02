@@ -32,6 +32,6 @@ void blackwell_fmha_plan(at::Tensor qo_segment_offsets, at::Tensor kv_segment_of
       /*kv_lens=*/nullptr, static_cast<int*>(work_indptr.data_ptr()),
       static_cast<int*>(qo_tile_indices.data_ptr()), static_cast<int*>(head_indices.data_ptr()),
       static_cast<int*>(batch_indices.data_ptr()), qo_tile_size, batch_size, num_heads, num_buckets,
-      causal, /*enable_pdl=*/false, stream);
+      causal, /*enable_pdl=*/true, stream);
   TORCH_CHECK(status == cudaSuccess, "Failed to plan blackwell fmha", cudaGetErrorString(status));
 }

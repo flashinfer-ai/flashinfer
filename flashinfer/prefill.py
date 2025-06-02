@@ -2342,7 +2342,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
-            self._max_qo_indptr = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
+            self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         else:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -2497,15 +2497,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
         if self._backend == "cutlass":
             out, lse = fmha_varlen(
-                q=q,
-                k=k,
-                v=v,
-                qo_segment_offsets=self._qo_indptr_buf,
-                kv_segment_offsets=self._kv_indptr_buf,
+                q,
+                k,
+                v,
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
                 plan_info=self._plan_info,
                 causal=self._causal,
                 sm_scale=sm_scale,
-                max_qo_len=self._max_qo_indptr,
+                max_qo_len=self._max_qo_len,
                 out=out,
                 lse=lse,
             )
@@ -2637,6 +2637,7 @@ def fmha_varlen_plan(
     )
 
 
+@overload
 def fmha_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2649,7 +2650,41 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def fmha_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    plan_info: Optional[List[torch.Tensor]] = None,
+    max_qo_len: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    sm_scale: Optional[float] = None,
+    return_lse: Literal[True] = True,
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def fmha_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    plan_info: Optional[List[torch.Tensor]] = None,
+    max_qo_len: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
     )
@@ -2697,7 +2732,7 @@ def fmha_varlen(
             dtype=q.dtype,
         )[max(max_qo_len, 128) :]
 
-    if lse is None:
+    if lse is None and return_lse:
         lse = torch.empty(
             qo_total_len, num_qo_heads, device=q.device, dtype=torch.float32
         )
