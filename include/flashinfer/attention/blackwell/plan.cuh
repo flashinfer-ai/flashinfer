@@ -19,7 +19,7 @@
 
 namespace flashinfer {
 
-union CostIndex {
+union alignas(8) CostIndex {
   struct {
     int bucket_idx;
     float cost;
@@ -148,20 +148,27 @@ cudaError_t plan_kernel_wrapper(int* qo_segment_offsets, int* kv_segment_offsets
                                 int* head_indices, int* batch_indices, int qo_tile_size,
                                 int batch_size, int num_heads, int num_buckets, bool causal,
                                 bool enable_pdl, cudaStream_t stream) {
-  cudaLaunchConfig_t config;
-  config.gridDim = 1;
-  config.blockDim = 256;
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
-  FLASHINFER_CUDA_CALL(
-      cudaLaunchKernelEx(&config, plan_kernel, qo_segment_offsets, kv_segment_offsets, qo_lens,
-                         kv_lens, work_indptr, qo_tile_indices, head_indices, batch_indices,
-                         qo_tile_size, batch_size, num_heads, num_buckets, causal));
+  if (enable_pdl) {
+    cudaLaunchConfig_t config;
+    config.gridDim = 1;
+    config.blockDim = 256;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = true;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    FLASHINFER_CUDA_CALL(
+        cudaLaunchKernelEx(&config, plan_kernel, qo_segment_offsets, kv_segment_offsets, qo_lens,
+                           kv_lens, work_indptr, qo_tile_indices, head_indices, batch_indices,
+                           qo_tile_size, batch_size, num_heads, num_buckets, causal));
+  } else {
+    plan_kernel<<<1, 256, 0, stream>>>(qo_segment_offsets, kv_segment_offsets, qo_lens, kv_lens,
+                                       work_indptr, qo_tile_indices, head_indices, batch_indices,
+                                       qo_tile_size, batch_size, num_heads, num_buckets, causal);
+    FLASHINFER_CUDA_CALL(cudaGetLastError());
+  }
   return cudaSuccess;
 }
 

@@ -53,12 +53,13 @@ struct HostPrecomputedTileScheduler {
     int num_sm;
   };
 
+  Params params;
   int work_ptr;
   int work_ptr_end;
   int qo_tile_idx;
   int batch_idx;
   int qo_head_idx;
-  Params params;
+  bool is_valid_;
 
   CUTLASS_DEVICE
   HostPrecomputedTileScheduler(Params const& params) {
@@ -69,7 +70,12 @@ struct HostPrecomputedTileScheduler {
       qo_tile_idx = params.qo_tile_indices[work_ptr];
       batch_idx = params.batch_indices[work_ptr];
       qo_head_idx = params.qo_head_indices[work_ptr];
+    } else {
+      qo_tile_idx = 0;
+      batch_idx = 0;
+      qo_head_idx = 0;
     }
+    is_valid_ = true;
   }
 
   static Params to_underlying_arguments(Arguments const& args, KernelHardwareInfo hw_info) {
@@ -83,7 +89,7 @@ struct HostPrecomputedTileScheduler {
   }
 
   CUTLASS_DEVICE
-  bool is_valid() const { return work_ptr < work_ptr_end; }
+  bool is_valid() const { return is_valid_; }
 
   CUTLASS_DEVICE
   auto get_block_coord() {
@@ -93,7 +99,8 @@ struct HostPrecomputedTileScheduler {
   CUTLASS_DEVICE
   HostPrecomputedTileScheduler& operator++() {
     work_ptr++;
-    if (is_valid()) {
+    is_valid_ = work_ptr < work_ptr_end;
+    if (is_valid_) {
       qo_tile_idx = params.qo_tile_indices[work_ptr];
       batch_idx = params.batch_indices[work_ptr];
       qo_head_idx = params.qo_head_indices[work_ptr];

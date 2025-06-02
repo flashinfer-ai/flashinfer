@@ -54,12 +54,11 @@ def attention_ref(
     return o_ref, lse_ref * math.log2(math.e)
 
 
-# @pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
-@pytest.mark.parametrize("batch_size", [9])
-@pytest.mark.parametrize("qo_len", [377])  # [1, 17, 177, 377, 977])
-@pytest.mark.parametrize("kv_len", [512])  # [1, 17, 544, 977, 1999])
-@pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
+@pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
+@pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
@@ -136,13 +135,7 @@ def test_blackwell_cutlass_fmha(
         q.shape[1],
         causal,
     )
-    # print(work_indptr)
-    # print(len(work_indptr))
-    # print(qo_tile_indices[:work_indptr[-1]])
-    # print(head_indices[:work_indptr[-1]])
-    # print(batch_indices[:work_indptr[-1]])
-    # print(max_qo_len_buf)
-    # print(max_qo_len)
+    work_indptr, qo_tile_indices, head_indices, batch_indices = plan_info
 
     o, lse = flashinfer.prefill.fmha_varlen(
         q,
@@ -153,7 +146,7 @@ def test_blackwell_cutlass_fmha(
         plan_info=plan_info,
         causal=causal,
         sm_scale=sm_scale,
-        max_qo_len=32768,
+        max_qo_len=qo_len,
     )
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
@@ -176,10 +169,10 @@ if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
         9,
         377,
-        512,
+        977,
         1,
         1,
-        128,
+        192,
         128,
         1,
         False,
