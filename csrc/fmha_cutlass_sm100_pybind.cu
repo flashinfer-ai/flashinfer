@@ -16,20 +16,19 @@
 #include "pytorch_extension_utils.h"
 
 void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                         at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
-                         at::Tensor kv_segment_offsets, at::Tensor work_indptr,
-                         at::Tensor qo_tile_indices, at::Tensor qo_head_indices,
-                         at::Tensor batch_indices, at::Tensor o,
-                         std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t batch_size,
-                         int64_t total_qo_len, int64_t total_kv_len, int64_t max_qo_len,
-                         int64_t max_kv_len);
+                         at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
+                         at::Tensor work_indptr, at::Tensor qo_tile_indices,
+                         at::Tensor qo_head_indices, at::Tensor batch_indices, at::Tensor o,
+                         std::optional<at::Tensor> maybe_lse, at::Tensor max_qo_len_buf,
+                         int64_t mask_mode_code, double sm_scale, int64_t num_qo_heads,
+                         int64_t num_kv_heads, int64_t head_dim_qk, int64_t head_dim_vo,
+                         int64_t max_qo_len);
 
-void blackwell_fmha_plan(at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor work_indptr,
-                         at::Tensor qo_tile_indices, at::Tensor head_indices,
-                         at::Tensor batch_indices, int64_t qo_tile_size, int64_t batch_size,
-                         int64_t num_heads, int64_t num_buckets);
+void blackwell_fmha_plan(at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
+                         at::Tensor work_indptr, at::Tensor qo_tile_indices,
+                         at::Tensor head_indices, at::Tensor batch_indices,
+                         at::Tensor max_qo_len_buf, int64_t qo_tile_size, int64_t num_heads,
+                         int64_t num_buckets, bool causal);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("run", FMHACutlassSM100Run);

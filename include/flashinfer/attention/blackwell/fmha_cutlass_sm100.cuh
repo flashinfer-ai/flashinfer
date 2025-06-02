@@ -74,12 +74,12 @@ struct FwdRunner {
   using LayoutLSE = typename Epilogue::LayoutLSE;
 
   static cudaError_t run(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                         IdType* qo_lens, IdType* kv_lens, IdType* qo_segment_offsets,
-                         IdType* kv_segment_offsets, IdType* work_indptr, IdType* qo_tile_indices,
-                         IdType* qo_head_indices, IdType* batch_indices, DTypeOut* o,
-                         float* maybe_lse, int mask_mode_code, double sm_scale, int num_qo_heads,
-                         int num_kv_heads, int head_dim_qk, int head_dim_vo, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len, int max_kv_len) {
+                         IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+                         IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
+                         IdType* batch_indices, DTypeOut* o, float* maybe_lse, int* max_qo_len_buf,
+                         int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
+                         int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
+                         int total_kv_len, int max_qo_len) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -93,10 +93,9 @@ struct FwdRunner {
 
     int h_r = num_qo_heads / num_kv_heads;
     assert(num_qo_heads % num_kv_heads == 0);
-    ProblemShapeVarlen problem_shape =
-        cute::make_tuple(VariableLength{max_qo_len, qo_segment_offsets, qo_lens},
-                         VariableLength{max_kv_len, kv_segment_offsets, kv_lens}, head_dim_qk,
-                         cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
+    ProblemShapeVarlen problem_shape = cute::make_tuple(
+        VariableLength{qo_segment_offsets}, VariableLength{kv_segment_offsets}, head_dim_qk,
+        cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
 
     stride_Q =
         make_stride(num_qo_heads * head_dim_qk, _1{}, make_stride(head_dim_qk, h_r * head_dim_qk));
@@ -123,7 +122,7 @@ struct FwdRunner {
     typename Operation::Arguments arguments{
         problem_shape,
         {q, layout_Q, k, layout_K, v, layout_V, sm_scale},
-        {o, layout_O, maybe_lse, layout_LSE},
+        {o - max_qo_len * get<0>(stride_O), layout_O, maybe_lse, layout_LSE, max_qo_len_buf},
         {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
 
@@ -162,17 +161,17 @@ struct FwdRunner {
 template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
           class TileShapePV, class ActiveMask>
 cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                         IdType* qo_lens, IdType* kv_lens, IdType* qo_segment_offsets,
-                         IdType* kv_segment_offsets, IdType* work_indptr, IdType* qo_tile_indices,
-                         IdType* qo_head_indices, IdType* batch_indices, DTypeOut* o,
-                         float* maybe_lse, int mask_mode_code, double sm_scale, int num_qo_heads,
-                         int num_kv_heads, int head_dim_qk, int head_dim_vo, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len, int max_kv_len) {
+                         IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+                         IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
+                         IdType* batch_indices, DTypeOut* o, float* maybe_lse, int* max_qo_len_buf,
+                         int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
+                         int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
+                         int total_kv_len, int max_qo_len) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
-      workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets,
-      work_indptr, qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code,
+      workspace_buffer, q, k, v, qo_segment_offsets, kv_segment_offsets, work_indptr,
+      qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, max_qo_len_buf, mask_mode_code,
       sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, batch_size, total_qo_len,
-      total_kv_len, max_qo_len, max_kv_len);
+      total_kv_len, max_qo_len);
 }
 
 };  // namespace flashinfer

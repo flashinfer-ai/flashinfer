@@ -17,18 +17,23 @@
 #include "flashinfer/attention/blackwell/plan.cuh"
 #include "pytorch_extension_utils.h"
 
-void blackwell_fmha_plan(at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor work_indptr,
-                         at::Tensor qo_tile_indices, at::Tensor head_indices,
-                         at::Tensor batch_indices, int64_t qo_tile_size, int64_t batch_size,
-                         int64_t num_heads, int64_t num_buckets) {
-  const c10::cuda::OptionalCUDAGuard device_guard(qo_lens.device());
+void blackwell_fmha_plan(at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
+                         at::Tensor work_indptr, at::Tensor qo_tile_indices,
+                         at::Tensor head_indices, at::Tensor batch_indices,
+                         at::Tensor max_qo_len_buf, int64_t qo_tile_size, int64_t num_heads,
+                         int64_t num_buckets, bool causal) {
+  const c10::cuda::OptionalCUDAGuard device_guard(qo_segment_offsets.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  int batch_size = qo_segment_offsets.size(0) - 1;
 
   auto status = flashinfer::plan_kernel_wrapper(
-      static_cast<int*>(qo_lens.data_ptr()), static_cast<int*>(kv_lens.data_ptr()),
-      static_cast<int*>(work_indptr.data_ptr()), static_cast<int*>(qo_tile_indices.data_ptr()),
-      static_cast<int*>(head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
-      qo_tile_size, batch_size, num_heads, num_buckets,
+      static_cast<int*>(qo_segment_offsets.data_ptr()),
+      static_cast<int*>(kv_segment_offsets.data_ptr()),
+      /*qo_lens=*/nullptr,
+      /*kv_lens=*/nullptr, static_cast<int*>(work_indptr.data_ptr()),
+      static_cast<int*>(qo_tile_indices.data_ptr()), static_cast<int*>(head_indices.data_ptr()),
+      static_cast<int*>(batch_indices.data_ptr()), static_cast<int*>(max_qo_len_buf.data_ptr()),
+      qo_tile_size, batch_size, num_heads, num_buckets, causal,
       /*enable_pdl=*/true, stream);
   TORCH_CHECK(status == cudaSuccess, "Failed to plan blackwell fmha", cudaGetErrorString(status));
 }
