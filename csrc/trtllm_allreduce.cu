@@ -86,11 +86,9 @@ void trtllm_lamport_initialize_all(int64_t buffer_0_ptr, int64_t buffer_1_ptr, i
 void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, int64_t tp_rank,
                               int64_t token_num, int64_t fusion_op_code, int64_t strategy_code,
                               int64_t config_code, bool launch_with_pdl, int64_t flag_value,
-                              at::Tensor peer_comm_buffer_ptrs,  // std::vector<void*>
-                              at::Tensor peer_barrier_ptrs_in,   // std::vector<void*>
-                              at::Tensor peer_barrier_ptrs_out,  // std::vector<void*>
-                              std::optional<at::Tensor> bias, std::optional<at::Tensor> residual,
-                              std::optional<at::Tensor> weight,
+                              at::Tensor peer_comm_buffer_ptrs, at::Tensor peer_barrier_ptrs_in,
+                              at::Tensor peer_barrier_ptrs_out, std::optional<at::Tensor> bias,
+                              std::optional<at::Tensor> residual, std::optional<at::Tensor> weight,
                               std::optional<at::Tensor> weight_pre_residual_norm,
                               std::optional<double> eps,
                               std::optional<at::Tensor> intermediate_buffer,
@@ -101,7 +99,6 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
   const c10::cuda::OptionalCUDAGuard device_guard(in.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  // TODO(zihao): review dispatch type - support fp16, bf16 only
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(c_type, in, [&] {
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
@@ -113,18 +110,6 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
     params.ranks_per_node = tp_size;
     params.local_input_buffer_ptr = in.data_ptr();
     params.local_output_buffer_ptr = out.data_ptr();
-
-    // NOTE(yingyi): review the barrier flag
-    // int flag_offset;
-    // if (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM &&
-    //     is_lamport_supported<c_type>(token_num, hidden_size)) {
-    //   flag_offset = 0;
-    // } else {
-    //   flag_offset = 1;
-    // }
-
-    // auto const flag_ptr = reinterpret_cast<int64_t*>(flag_buffer_ptr) + NUM_POINTERS_PER_RANK *
-    // tp_size + flag_offset; *flag_ptr += 1; uint32_t flag_value = *flag_ptr;
     params.barrier_flag = flag_value;
 
     // add fusion params
