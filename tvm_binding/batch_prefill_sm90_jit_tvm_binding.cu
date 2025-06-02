@@ -38,8 +38,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     int64_t pos_encoding_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
     TVMStreamHandle cuda_stream);
 
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_kv_cache_plan, BatchPrefillWithKVCacheSM90Plan);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_ragged_kv_cache_run,
-                          BatchPrefillWithRaggedKVCacheSM90Run);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_paged_kv_cache_run,
-                          BatchPrefillWithPagedKVCacheSM90Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_kv_cache_plan, BatchPrefillWithKVCacheSM90Plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_ragged_kv_cache_run,
+                              BatchPrefillWithRaggedKVCacheSM90Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_paged_kv_cache_run,
+                              BatchPrefillWithPagedKVCacheSM90Run);

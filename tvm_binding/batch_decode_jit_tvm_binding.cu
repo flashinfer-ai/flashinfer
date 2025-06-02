@@ -30,5 +30,6 @@ void BatchDecodeWithPagedKVCacheRun(
     DLTensor* o, DLTensor* lse, int64_t pos_encoding_mode_code, int64_t kv_layout_code,
     int64_t window_left ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream);
 
-TVM_DLL_EXPORT_TYPED_FUNC(batch_decode_with_paged_kv_cache_plan, BatchDecodeWithPagedKVCachePlan);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_decode_with_paged_kv_cache_run, BatchDecodeWithPagedKVCacheRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_decode_with_paged_kv_cache_plan,
+                              BatchDecodeWithPagedKVCachePlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_decode_with_paged_kv_cache_run, BatchDecodeWithPagedKVCacheRun);

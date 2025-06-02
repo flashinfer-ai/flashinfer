@@ -28,5 +28,5 @@ void BatchMLAPagedAttentionRun(DLTensor* float_workspace_buffer, DLTensor* int_w
                                int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
                                double sm_scale, TVMStreamHandle cuda_stream);
 
-TVM_DLL_EXPORT_TYPED_FUNC(batch_mla_paged_attention_plan, BatchMLAPagedAttentionPlan);
-TVM_DLL_EXPORT_TYPED_FUNC(batch_mla_paged_attention_run, BatchMLAPagedAttentionRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_mla_paged_attention_plan, BatchMLAPagedAttentionPlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_mla_paged_attention_run, BatchMLAPagedAttentionRun);
