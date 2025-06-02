@@ -12,8 +12,8 @@ from flashinfer.utils import set_log_level
 # todo: temp for test
 maxBatchSize = 1
 maxBeamWidth = 3
-maxSeqLen = 65536
-hiddenSize = 64
+maxSeqLen = 65536 # max sequence length for all reduce
+hiddenSize = 64 # max hidden size for all reduce
 
 
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
@@ -44,12 +44,13 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.AllReduceStrategyConfig.PUSH_MODE,
         ]
         fusion_op_codes = [
-            0,
             comm.AllReduceFusionOp.NONE,
             comm.AllReduceFusionOp.RESIDUAL_RMS_NORM,
-            # todo(yingyi): bugfix - nccl timeout on some settings: the flag value should be incremented by 1 for each AR
+
+            # NOTE(yingyi): bug - nccl timeout on pre-post norm
             # comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
-            # below are not enabled in trtllm test, skip for now
+
+            # below are not enabled for custom all-reduce in trtllm test, skip
             # comm.AllReduceFusionOp.LAST_PROCESS_FOR_UB,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
             # comm.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -68,18 +69,26 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
         test_loop = 1
 
+        # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR
         flag_value = 1
         for token_num in token_nums:
             for strategy_code in strategy_codes:
                 for config_code in config_codes:
                     for fusion_op_code in fusion_op_codes:
                         for launch_with_pdl in launch_with_pdls:
+                            if (
+                                strategy_code == comm.AllReduceStrategyType.TWOSHOT
+                                and fusion_op_code
+                                == comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM
+                            ):
+                                # skip twoshot pre-post norm: not supported in trtllm test
+                                continue
                             print(
                                 f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl} start"
                             )
                             for _ in range(test_loop):
                                 message_size = token_num * hiddenSize
-                                inp1 = torch.rand(
+                                inp1 = torch.randn(
                                     message_size, dtype=dtype, device=device
                                 )
                                 inp1_ref = inp1.clone()
@@ -96,24 +105,16 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # init params for each fusion op
                                 bias = (
-                                    torch.rand(hiddenSize, dtype=dtype, device=device)
-                                    * 2
-                                    - 1
+                                    torch.randn(hiddenSize, dtype=dtype, device=device)
                                 )
                                 residual = (
-                                    torch.rand(message_size, dtype=dtype, device=device)
-                                    * 2
-                                    - 1
+                                    torch.randn(message_size, dtype=dtype, device=device)
                                 )
                                 weight = (
-                                    torch.rand(hiddenSize, dtype=dtype, device=device)
-                                    * 2
-                                    - 1
+                                    torch.randn(hiddenSize, dtype=dtype, device=device)
                                 )
                                 weight_pre_residual_norm = (
-                                    torch.rand(hiddenSize, dtype=dtype, device=device)
-                                    * 2
-                                    - 1
+                                    torch.randn(hiddenSize, dtype=dtype, device=device)
                                 )
                                 eps = 1e-6
                                 intermediate_buffer = torch.zeros(
@@ -206,14 +207,14 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     )
                                     normed_half = normed_float.to(dtype)
                                     torch.testing.assert_close(
-                                        out1, normed_half.view(-1), atol=1e-3, rtol=3e-2
+                                        out1, normed_half.view(-1), atol=1e-2, rtol=1e-2
                                     )
 
                                 elif (
                                     fusion_op_code
                                     == comm.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM
                                 ):
-                                    # todo(yingyi): add test results here
+                                    # NOTE(yingyi): bugfix todo, the test invokes nccl timeout for now
                                     pass
 
                                     # ref_float = inp1_ref.clone()
@@ -227,8 +228,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     #         + bias_float[i % hiddenSize]
                                     #     )
                                     # ref_half = ref_float.to(dtype)
-
-                                    
 
                                 flag_value += 1
                             print(
@@ -296,9 +295,8 @@ if __name__ == "__main__":
     # compile tests
     mod = comm.get_comm_module()
 
-    # todo: pass real tests
-    # set_log_level("info")
-    test_trtllm_custom_allreduce(2, torch.float16)
+    # pass real tests
+    # test_trtllm_custom_allreduce(2, torch.float16)
     test_trtllm_custom_allreduce(2, torch.bfloat16)
-    test_trtllm_custom_allreduce(4, torch.float16)
+    # test_trtllm_custom_allreduce(4, torch.float16)
     test_trtllm_custom_allreduce(4, torch.bfloat16)

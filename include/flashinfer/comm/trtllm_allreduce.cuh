@@ -241,7 +241,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& 
   vec_t<T, VEC_SIZE> ret;
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    ret[i] = a[i] + b[i];
+    ret[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
   }
   return ret;
 }
