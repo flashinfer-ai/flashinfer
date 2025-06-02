@@ -2342,6 +2342,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
+            self._max_qo_indptr = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         else:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -2504,7 +2505,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 plan_info=self._plan_info,
                 causal=self._causal,
                 sm_scale=sm_scale,
-                max_qo_len=max(self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]),
+                max_qo_len=self._max_qo_indptr,
                 out=out,
                 lse=lse,
             )
