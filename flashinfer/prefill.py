@@ -2665,7 +2665,6 @@ def fmha_varlen(
         plan_info = fmha_varlen_plan(
             module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
         )
-        torch.cuda.synchronize()
 
     (
         work_indptr,
