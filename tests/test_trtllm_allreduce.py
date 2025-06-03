@@ -249,8 +249,8 @@ def multi_process_parallel(
         ), f"Process {i} failed with exit code {procs[i].exitcode}"
 
 
-@pytest.mark.parametrize("world_size", [4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_trtllm_custom_allreduce(world_size, dtype):
     torch.manual_seed(RANDOM_SEED)
     available_gpus = torch.cuda.device_count()
