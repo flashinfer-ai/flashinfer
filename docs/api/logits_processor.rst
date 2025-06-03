@@ -14,8 +14,8 @@ Use :class:`LogitsPipe` to create processing pipelines:
 
 .. code-block:: python
 
-    import flashinfer
-    from flashinfer.logits_processor import LogitsPipe, Temperature, Softmax, TopK, Sample
+    import torch
+    from flashinfer.logits_processor import LogitsPipe, Temperature, Softmax, TopP, Sample
 
     # Create a pipeline
     pipe = LogitsPipe([
@@ -26,6 +26,8 @@ Use :class:`LogitsPipe` to create processing pipelines:
     ])
 
     # Apply the pipeline
+    batch_size = 4
+    vocab_size = 5
     logits = torch.randn(batch_size, vocab_size, device="cuda")
     output_ids = pipe(logits, temperature=0.7, top_p=0.9)
 
