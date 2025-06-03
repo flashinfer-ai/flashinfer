@@ -117,6 +117,78 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
 #endif
   return nullptr;
 }
+
+// Quantizes the provided PackedVec into the uint32_t output
+template <class Type, uint32_t VEC_SIZE, bool UE8M0_SF = false>
+__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFScaleVal,
+                                         uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Get absolute maximum values among the local 8 values.
+  auto localMax = cuda_abs(vec.elts[0]);
+
+// Local maximum value.
+#pragma unroll
+  for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
+
+  // Get the absolute maximum among all 16 values (two threads).
+  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  // Get the final absolute maximum values.
+  float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+  // Get the SF (max value of the vector / max value of e2m1).
+  // maximum value of e2m1 = 6.0.
+  // TODO: use half as compute data type.
+  float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+  // 8 bits representation of the SF.
+  uint8_t fp8SFVal;
+  // Write the SF to global memory (STG.8).
+  if constexpr (UE8M0_SF) {
+    __nv_fp8_e8m0 tmp;
+    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    SFValue = static_cast<float>(tmp);
+    fp8SFVal = tmp.__x;
+  } else {
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+  }
+  // Get the output scale.
+  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+  float outputScale =
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                   : 0.0f;
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<Type, half>) {
+      fp2Vals[i] = __half22float2(vec.elts[i]);
+    } else {
+      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+    }
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+
+  // Convert to e2m1 values.
+  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
 }  // namespace utils
 
 // struct __device_builtin__ __builtin_align__(16) float4
@@ -271,13 +343,14 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     norm_val.store(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.norm_out) + access_id);
   }
   if constexpr (QuantOut) {
-    vec_t<T, VEC_SIZE> pack_val;
-    pack_val.cast_load(norm_val);
+    // todo: review and fix it
+    // vec_t<T, VEC_SIZE> pack_val;
+    // pack_val.cast_load(norm_val);
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
         params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-        cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
+        utils::cvt_warp_fp16_to_fp4(norm_val, *params.scale_factor, sf_out);
   }
 }
 
