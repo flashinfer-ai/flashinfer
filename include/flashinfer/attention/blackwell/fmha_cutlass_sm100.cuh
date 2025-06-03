@@ -38,8 +38,8 @@ using namespace cutlass::fmha::collective;
 using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::device;
 
-template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
-          class ActiveMask>
+template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
+          class TileShapePV, class ActiveMask>
 struct FwdRunner {
   using Element = DTypeIn;
   using ElementAccumulatorQK = float;
@@ -66,21 +66,21 @@ struct FwdRunner {
   using Operation =
       cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
           ProblemShapeVarlen, Mainloop, Epilogue,
-          typename std::conditional<std::is_same<ActiveMask, CausalMask>::value,
-                                    cutlass::fmha::kernel::NaiveTileScheduler,
-                                    cutlass::fmha::kernel::PersistentTileScheduler>::type>>;
+          cutlass::fmha::kernel::HostPrecomputedTileScheduler>>;
   using LayoutQ = typename Mainloop::LayoutQ;
   using LayoutK = typename Mainloop::LayoutK;
   using LayoutV = typename Mainloop::LayoutV;
   using LayoutO = typename Epilogue::LayoutO;
   using LayoutLSE = typename Epilogue::LayoutLSE;
 
-  static void run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                  at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
-                  at::Tensor kv_segment_offsets, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                  int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
-                  int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
-                  int total_kv_len, int max_qo_len, int max_kv_len) {
+  static cudaError_t run(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
+                         IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+                         IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
+                         IdType* batch_indices, DTypeOut* o, float* maybe_lse, int mask_mode_code,
+                         double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                         int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
+                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
+                         int total_qo_len, int total_kv_len, int max_qo_len) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -95,19 +95,15 @@ struct FwdRunner {
     int h_r = num_qo_heads / num_kv_heads;
     assert(num_qo_heads % num_kv_heads == 0);
     ProblemShapeVarlen problem_shape = cute::make_tuple(
-        VariableLength{max_qo_len, static_cast<int*>(qo_segment_offsets.data_ptr()),
-                       static_cast<int*>(qo_lens.data_ptr())},
-        VariableLength{max_kv_len, static_cast<int*>(kv_segment_offsets.data_ptr()),
-                       static_cast<int*>(kv_lens.data_ptr())},
-        head_dim_qk, cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
+        VariableLength{qo_segment_offsets}, VariableLength{kv_segment_offsets}, head_dim_qk,
+        cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));
 
-    stride_Q =
-        make_stride(num_qo_heads * head_dim_qk, _1{}, make_stride(head_dim_qk, h_r * head_dim_qk));
+    stride_Q = make_stride(q_stride_n, _1{}, make_stride(q_stride_h, h_r * q_stride_h));
     stride_O = make_stride(
         num_qo_heads * head_dim_vo, _1{},
         make_stride(make_stride(head_dim_vo, h_r * head_dim_vo), num_qo_heads * head_dim_vo));
-    stride_K = make_stride(num_kv_heads * head_dim_qk, _1{}, make_stride(_0{}, head_dim_qk));
-    stride_V = make_stride(_1{}, num_kv_heads * head_dim_vo, make_stride(_0{}, head_dim_vo));
+    stride_K = make_stride(k_stride_n, _1{}, make_stride(_0{}, k_stride_h));
+    stride_V = make_stride(_1{}, v_stride_n, make_stride(_0{}, v_stride_h));
     stride_LSE = make_stride(num_qo_heads, make_stride(_1{}, h_r));
 
     auto shape_Q = make_shape(total_qo_len, head_dim_qk, make_shape(h_r, num_kv_heads));
@@ -125,10 +121,9 @@ struct FwdRunner {
 
     typename Operation::Arguments arguments{
         problem_shape,
-        {static_cast<Element*>(q.data_ptr()), layout_Q, static_cast<Element*>(k.data_ptr()),
-         layout_K, static_cast<Element*>(v.data_ptr()), layout_V, float(sm_scale)},
-        {static_cast<ElementOut*>(o.data_ptr()) - max_qo_len * get<0>(stride_O), layout_O,
-         static_cast<ElementAccumulatorPV*>(maybe_lse.value().data_ptr()), layout_LSE},
+        {q, layout_Q, k, layout_K, v, layout_V, sm_scale},
+        {o - max_qo_len * get<0>(stride_O), layout_O, maybe_lse, layout_LSE, max_qo_len},
+        {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
 
     Operation op;
@@ -136,7 +131,7 @@ struct FwdRunner {
     // NOTE(Zihao): workspace size is not used at this moment
     size_t workspace_size = 0;
     workspace_size = Operation::get_workspace_size(arguments);
-    AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_size);
+    AlignedAllocator allocator(workspace_buffer, workspace_size);
     uint8_t* workspace_ptr =
         allocator.aligned_alloc<uint8_t>(workspace_size, 16, "fmha_cutlass_sm100_workspace");
 
@@ -159,27 +154,25 @@ struct FwdRunner {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
     }
-
-    cudaError_t result = cudaDeviceSynchronize();
-    if (result != cudaSuccess) {
-      std::cerr << "Error running the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(result) << std::endl;
-    }
+    return cudaSuccess;
   }
 };
 
-template <typename DTypeIn, typename DTypeOut, class TileShapeQK, class TileShapePV,
-          class ActiveMask>
-void run_fmha_fwd(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                  at::Tensor qo_lens, at::Tensor kv_lens, at::Tensor qo_segment_offsets,
-                  at::Tensor kv_segment_offsets, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                  int mask_mode_code, double sm_scale, int num_qo_heads, int num_kv_heads,
-                  int head_dim_qk, int head_dim_vo, int batch_size, int total_qo_len,
-                  int total_kv_len, int max_qo_len, int max_kv_len) {
-  FwdRunner<DTypeIn, DTypeOut, TileShapeQK, TileShapePV, ActiveMask>::run(
-      workspace_buffer, q, k, v, qo_lens, kv_lens, qo_segment_offsets, kv_segment_offsets, o,
-      maybe_lse, mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
-      batch_size, total_qo_len, total_kv_len, max_qo_len, max_kv_len);
+template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
+          class TileShapePV, class ActiveMask>
+cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
+                         IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+                         IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
+                         IdType* batch_indices, DTypeOut* o, float* maybe_lse, int mask_mode_code,
+                         double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                         int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
+                         int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
+                         int total_qo_len, int total_kv_len, int max_qo_len) {
+  return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
+      workspace_buffer, q, k, v, qo_segment_offsets, kv_segment_offsets, work_indptr,
+      qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code, sm_scale,
+      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n,
+      k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len);
 }
 
 };  // namespace flashinfer

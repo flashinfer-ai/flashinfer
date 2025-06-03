@@ -37,168 +37,76 @@
 
 namespace cutlass::fmha::kernel {
 
-////////////////////////////////////////////////////////////////////////////////
-
-struct IndividualTileScheduler {
-  struct Params {
-    dim3 grid;
+struct HostPrecomputedTileScheduler {
+  struct Arguments {
+    int* work_indptr;
+    int* qo_tile_indices;
+    int* qo_head_indices;
+    int* batch_indices;
   };
 
-  bool valid_ = true;
-
-  CUTLASS_DEVICE
-  IndividualTileScheduler(Params const&) {}
-
-  template <class ProblemSize, class ClusterShape, class TileShape>
-  static Params to_underlying_arguments(ProblemSize const& problem_size, KernelHardwareInfo hw_info,
-                                        ClusterShape const& cluster_shape,
-                                        TileShape const& tile_shape) {
-    using namespace cute;
-    dim3 grid(
-        round_up(ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<0>(cluster_shape)),
-        size<3, 0>(problem_size), size<3, 1>(problem_size));
-    return Params{grid};
-  }
-
-  static dim3 get_grid_shape(Params const& params) { return params.grid; }
-
-  CUTLASS_DEVICE
-  bool is_valid() { return valid_; }
-
-  CUTLASS_DEVICE
-  auto get_block_coord() {
-    using namespace cute;
-    return make_coord(blockIdx.x, _0{}, make_coord(blockIdx.y, blockIdx.z));
-  }
-
-  CUTLASS_DEVICE
-  IndividualTileScheduler& operator++() {
-    valid_ = false;
-    return *this;
-  }
-};
-
-////////////////////////////////////////////////////////////////////////////////
-
-struct NaiveTileScheduler {
   struct Params {
-    int num_qo_tiles;
-    int batch_size;
-    int num_qo_heads;
+    int* work_indptr;
+    int* qo_tile_indices;
+    int* qo_head_indices;
+    int* batch_indices;
+    int num_sm;
   };
 
+  Params params;
+  int work_ptr;
+  int work_ptr_end;
   int qo_tile_idx;
   int batch_idx;
   int qo_head_idx;
-  bool is_valid_tile;
+  bool is_valid_;
 
   CUTLASS_DEVICE
-  NaiveTileScheduler(Params const& params)
-      : qo_tile_idx(blockIdx.x),
-        batch_idx(blockIdx.y),
-        qo_head_idx(blockIdx.z),
-        is_valid_tile(true) {}
-
-  template <class ProblemSize, class ClusterShape, class TileShape>
-  static Params to_underlying_arguments(ProblemSize const& problem_size, KernelHardwareInfo hw_info,
-                                        ClusterShape const& cluster_shape,
-                                        TileShape const& tile_shape) {
-    return Params{ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<3, 0>(problem_size),
-                  size<3, 1>(problem_size)};
-  }
-
-  static dim3 get_grid_shape(Params const& params) {
-    dim3 grid(params.num_qo_tiles, params.batch_size, params.num_qo_heads);
-    return grid;
-  }
-
-  CUTLASS_DEVICE
-  bool is_valid() { return is_valid_tile; }
-
-  CUTLASS_DEVICE
-  auto get_block_coord() {
-    return make_coord(qo_tile_idx, _0{}, make_coord(batch_idx, qo_head_idx));
-  }
-
-  CUTLASS_DEVICE
-  NaiveTileScheduler& operator++() {
-    is_valid_tile = false;
-    return *this;
-  }
-};
-
-struct PersistentTileScheduler {
-  struct Params {
-    int num_blocks;
-    FastDivmod divmod_m_block;
-    FastDivmod divmod_b;
-    FastDivmod divmod_h;
-
-    KernelHardwareInfo hw_info;
-  };
-
-  int block_idx = 0;
-  Params params;
-
-  CUTLASS_DEVICE
-  PersistentTileScheduler(Params const& params) : block_idx(blockIdx.x), params(params) {}
-
-  template <class ProblemSize, class ClusterShape, class TileShape>
-  static Params to_underlying_arguments(ProblemSize const& problem_size, KernelHardwareInfo hw_info,
-                                        ClusterShape const& cluster_shape,
-                                        TileShape const& tile_shape) {
-    using namespace cute;
-    // Get SM count if needed, otherwise use user supplied SM count
-    int sm_count = hw_info.sm_count;
-    if (sm_count <= 0) {
-      CUTLASS_TRACE_HOST(
-          "  WARNING: Arguments do not include a valid SM count.\n"
-          "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM "
-          "count.");
-      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  HostPrecomputedTileScheduler(Params const& params) {
+    this->params = params;
+    work_ptr = params.work_indptr[blockIdx.x];
+    work_ptr_end = params.work_indptr[blockIdx.x + 1];
+    if (work_ptr < work_ptr_end) {
+      qo_tile_idx = params.qo_tile_indices[work_ptr];
+      batch_idx = params.batch_indices[work_ptr];
+      qo_head_idx = params.qo_head_indices[work_ptr];
+    } else {
+      qo_tile_idx = 0;
+      batch_idx = 0;
+      qo_head_idx = 0;
     }
+    is_valid_ = true;
+  }
 
-    CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to "
-                       << sm_count);
-    hw_info.sm_count = sm_count;
-
-    int num_m_blocks = cutlass::round_up(ceil_div(size<0>(problem_size), size<0>(tile_shape)),
-                                         size<0>(cluster_shape));
-    int num_blocks = num_m_blocks * size<3, 0>(problem_size) * size<3, 1>(problem_size);
-
-    return Params{num_blocks,
-                  {num_m_blocks},
-                  {size<3, 0>(problem_size)},
-                  {size<3, 1>(problem_size)},
-                  hw_info};
+  static Params to_underlying_arguments(Arguments const& args, KernelHardwareInfo hw_info) {
+    return {args.work_indptr, args.qo_tile_indices, args.qo_head_indices, args.batch_indices,
+            hw_info.sm_count};
   }
 
   static dim3 get_grid_shape(Params const& params) {
-    dim3 grid(std::min(params.num_blocks, params.hw_info.sm_count), 1, 1);
+    dim3 grid(params.num_sm);
     return grid;
   }
 
   CUTLASS_DEVICE
-  bool is_valid() { return block_idx < params.num_blocks; }
+  bool is_valid() const { return is_valid_; }
 
   CUTLASS_DEVICE
   auto get_block_coord() {
-    using namespace cute;
-    int block_decode = block_idx;
-    int m_block, bidb, bidh;
-    params.divmod_m_block(block_decode, m_block, block_decode);
-    params.divmod_b(block_decode, bidb, block_decode);
-    params.divmod_h(block_decode, bidh, block_decode);
-    return make_coord(m_block, _0{}, make_coord(bidb, bidh));
+    return make_coord(qo_tile_idx, _0{}, make_coord(qo_head_idx, batch_idx));
   }
 
   CUTLASS_DEVICE
-  PersistentTileScheduler& operator++() {
-    block_idx += gridDim.x;
+  HostPrecomputedTileScheduler& operator++() {
+    work_ptr++;
+    is_valid_ = work_ptr < work_ptr_end;
+    if (is_valid_) {
+      qo_tile_idx = params.qo_tile_indices[work_ptr];
+      batch_idx = params.batch_indices[work_ptr];
+      qo_head_idx = params.qo_head_indices[work_ptr];
+    }
     return *this;
   }
 };
-
-////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace cutlass::fmha::kernel

@@ -72,6 +72,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     ElementAcc* ptr_LSE;
     LayoutLSE layout_LSE;
+    int max_qo_len;
   };
 
   using TMA_O = decltype(make_tma_copy(
@@ -83,6 +84,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     LayoutO layout_O;
     ElementAcc* ptr_LSE;
     LayoutLSE layout_LSE;
+    int max_qo_len;
   };
 
   template <class ProblemShape>
@@ -95,7 +97,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     auto tma_store_o =
         make_tma_copy(SM90_TMA_STORE{}, make_tensor(ptr_O, layout_O), SmemLayoutO{}(_, _, _0{}));
 
-    return {tma_store_o, layout_O, args.ptr_LSE, args.layout_LSE};
+    return {tma_store_o, layout_O, args.ptr_LSE, args.layout_LSE, args.max_qo_len};
   }
 
   CUTLASS_DEVICE
@@ -124,8 +126,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     int o0_index = 2 * get<0>(blk_coord);
     int o1_index = 2 * get<0>(blk_coord) + 1;
 
-    int max_length_q = get<0>(params_problem_shape).max_length;
-    int offs_0 = max_length_q - qo_len;
+    int offs_0 = params.max_qo_len - qo_len;
     int offs_2_1 = qo_segment_offset + qo_len;
     BlkCoord blk_coord_updated = blk_coord;
     get<2, 1>(blk_coord_updated) = 0;
@@ -137,9 +138,6 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     Tensor gO_qdl = local_tile(mO_qdl, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
     Tensor gO = gO_qdl(_, _, _, _0{}, get<2>(blk_coord_updated));
 
-    // auto gO = get_local_tile_tensor(mO, select<0, 1>(TileShape{}), qo_head_idx,
-    // qo_segment_offset,
-    //                                 qo_len);
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     auto block_tma = params.tma_store_o.get_slice(0);
     Tensor tOsO = block_tma.partition_S(sO);
