@@ -140,7 +140,7 @@ struct Sm100FmhaMlaReductionKernel {
       ElementAcc sum_lse = 0;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < kNLsePerThread; ++i) {
-        sum_lse = sum_lse + expf(local_lse[i] - params.scale * lse_max);
+        sum_lse = sum_lse + expf(local_lse[i] - lse_max);
       }
 
       CUTLASS_PRAGMA_UNROLL
@@ -152,7 +152,7 @@ struct Sm100FmhaMlaReductionKernel {
 
       ElementAcc global_lse = (sum_lse == 0.f || sum_lse != sum_lse)
                                   ? std::numeric_limits<ElementAcc>::infinity()
-                                  : logf(sum_lse) + params.scale * lse_max;
+                                  : logf(sum_lse) + lse_max;
       if (threadIdx.x == 0 and params.ptr_lse != nullptr) {
         gLSE(0) = global_lse;
       }
