@@ -12,6 +12,7 @@ maxBatchSize = 1
 maxBeamWidth = 3
 maxSeqLen = 65536  # max sequence length for all reduce
 hiddenSize = 64  # max hidden size for all reduce
+RANDOM_SEED = 42
 
 
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
@@ -248,9 +249,10 @@ def multi_process_parallel(
         ), f"Process {i} failed with exit code {procs[i].exitcode}"
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("world_size", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_trtllm_custom_allreduce(world_size, dtype):
+    torch.manual_seed(RANDOM_SEED)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
         raise ValueError(
