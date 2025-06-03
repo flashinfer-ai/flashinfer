@@ -7,9 +7,9 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [4, 8])
+@pytest.mark.parametrize("batch_size", [4, 8, 64])
 @pytest.mark.parametrize("s_qo", [1])
-@pytest.mark.parametrize("s_kv", [64, 128, 2048])
+@pytest.mark.parametrize("s_kv", [8, 64, 2048])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32, 64])
@@ -24,15 +24,22 @@ def test_cudnn_decode(
     device = "cuda:0"
 
     # Initialize Q tensor
-    q = torch.randn(batch_size, num_qo_heads, s_qo, head_dim).to(device).half()
+    shape = (batch_size, num_qo_heads, s_qo, head_dim)
+    strides = (num_qo_heads * s_qo * head_dim, head_dim, num_qo_heads * head_dim, 1)
+
+    q_unstrided = torch.randn(shape, device=device).half()
+
+    # Create view with desired strides [1, h*d, d, h*s*d]
+    q = q_unstrided.as_strided(shape, strides)
 
     # Initialize KV Cache
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
 
-    kv_cache_shape = (total_num_pages, num_kv_heads, page_size, head_dim)
-    k_cache = torch.randn(size=kv_cache_shape).half().to(device)
-    v_cache = torch.randn(size=kv_cache_shape).half().to(device)
+    kv_cache_shape = (total_num_pages, 2, num_kv_heads, page_size, head_dim)
+    kv_cache = torch.randn(size=kv_cache_shape).half().to(device)
+    k_cache = kv_cache[:, 0, :, :, :]
+    v_cache = kv_cache[:, 1, :, :, :]
 
     # Now initialize the page tables
     block_tables = torch.tensor(
@@ -49,7 +56,7 @@ def test_cudnn_decode(
 
     # Actual sequence lengths (should be randomized across batches. )
     actual_seq_lens_kv = torch.randint(
-        1, s_kv, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
     actual_seq_lens_q = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
@@ -70,7 +77,7 @@ def test_cudnn_decode(
     )
 
     output = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
-        q.contiguous(),
+        q,
         k_cache,
         v_cache,
         scale,
@@ -81,8 +88,14 @@ def test_cudnn_decode(
         num_pages_per_seq,
     )
 
-    # import csv
-    # output_flat = output.cpu().numpy().flatten()
-    # with open('cudnn_decode_output.csv', 'w', newline='') as f:
-    #     csv.writer(f).writerows([[x] for x in output_flat])
+    output = output.as_strided(
+        (batch_size, num_qo_heads, s_qo, head_dim),
+        (num_qo_heads * s_qo * head_dim, s_qo * head_dim, head_dim, 1),
+    )
+
+    import csv
+
+    output_flat = output.cpu().numpy().flatten()
+    with open("cudnn_decode_output.csv", "w", newline="") as f:
+        csv.writer(f).writerows([[x] for x in output_flat])
     torch.cuda.synchronize()

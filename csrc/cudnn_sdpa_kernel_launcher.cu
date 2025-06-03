@@ -71,7 +71,7 @@ enum KernelType { PREFILL, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
-                                "3ee5836768efc722f2eea431f054da23f5878873fd1bc6cbabb331063b5b5fe0");
+                                "2441193e945280c4fc5879dc9114cc8481e6d36c9bf829240fa3ce95c2cc8769");
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
                                "47cd6058cd981abebe86d32600aaab793fd04b4e35d6d9964a5fbcf4b5c18431");
@@ -84,8 +84,7 @@ auto get_cudnn_cubin(KernelType kernel_type) -> std::string {
 }
 
 static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_data, int64_t d,
-                                           int64_t h_qo, c10::IntArrayRef qo_strides,
-                                           uint32_t* tensor_traversal_stride_qkv,
+                                           int64_t h_qo, uint32_t* tensor_traversal_stride_qkv,
                                            uint32_t* tensor_box_size_q,
                                            tma::cudaTmaDesc* packed_tma_desc_q,
                                            tma::cudaTmaDesc* packed_tma_desc_o, at::Tensor q,
@@ -96,9 +95,11 @@ static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_dat
     const uint32_t actual_s_q = static_cast<uint32_t>(actual_seq_lens_q_data[i]);
 
     batch_offset_qo = batch_offset_array ? batch_offset_array[i] : batch_offset_qo;
+    std::cout << "actual_s_q: " << actual_s_q << " batch_offset_qo: " << batch_offset_qo
+              << std::endl;
     std::array<uint32_t, DIMS_QKV> packed_tensor_size_qo = {d, actual_s_q, h_qo, 1};
-    std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_qo = {
-        qo_strides[2] * BYTES_PER_ELEMENT, qo_strides[1] * BYTES_PER_ELEMENT, 0};
+    std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_qo = {h_qo * d * BYTES_PER_ELEMENT,
+                                                                  d * BYTES_PER_ELEMENT, 0};
 
     uint16_t* q_ptr = reinterpret_cast<uint16_t*>(q.data_ptr() + batch_offset_qo);
     uint16_t* out_ptr = reinterpret_cast<uint16_t*>(out.data_ptr() + batch_offset_qo);
@@ -115,6 +116,7 @@ static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_dat
 
     batch_offset_qo += static_cast<int64_t>(actual_s_q) * d * h_qo *
                        BYTES_PER_ELEMENT;  // Becomes a no-op if batch_offset_array is provided
+    std::cout << "batch_offset_qo: " << batch_offset_qo << std::endl;
   }
 }
 
@@ -235,8 +237,8 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
   }
 };
 
-void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
-             at::Tensor workspace_buffer, at::Tensor actual_seq_lens_q,
+void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tensor v_cache,
+             double scale, at::Tensor workspace_buffer, at::Tensor actual_seq_lens_q,
              at::Tensor actual_seq_lens_kv, at::Tensor actual_seq_lens_q_gpu,
              at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, int64_t num_pages_per_seq,
              bool causal, bool return_lse, at::Tensor out, at::Tensor lse,
@@ -274,16 +276,14 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   // Step 2: Extract attention descriptor
 
-  TORCH_CHECK(q.dim() >= 4, "Input tensor q must have at least 4 dimensions");
+  // TORCH_CHECK(q.dim() >= 4, "Input tensor q must have at least 4 dimensions");
   TORCH_CHECK(k_cache.dim() >= 3, "Input tensor k_cache must have at least 3 dimensions");
 
-  int64_t b = q.size(0);
   int64_t h_qo = q.size(1);
-  int64_t s_q = q.size(2);
-  int64_t d = q.size(3);
+  int64_t d = q.size(2);
 
-  int64_t h_kv = k_cache.size(1);
-  int64_t page_size = k_cache.size(2);
+  int64_t h_kv = k_cache.size(2);
+  int64_t page_size = k_cache.size(1);
   int64_t s_kv = (k_cache.size(0) / b) * page_size;
 
   int64_t total_num_pages = k_cache.size(0);
@@ -312,6 +312,9 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   config.gridDimY = h_qo;
   config.gridDimZ = 1;
 
+  std::cout << "config.gridDimX: " << config.gridDimX << " config.gridDimY: " << config.gridDimY
+            << " config.gridDimZ: " << config.gridDimZ << std::endl;
+
   config.blockDimX = NUM_THREADS;
   config.blockDimY = 1;
   config.blockDimZ = 1;
@@ -322,8 +325,11 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   // Step 4: Set up the launch arguments
 
-  auto qo_strides = q.strides();
-  auto kv_strides = k_cache.strides();
+  // auto qo_strides = q.strides();
+  auto kv_strides = v_cache.strides();
+
+  std::cout << "ANE kv_strides: " << kv_strides[0] << " " << kv_strides[1] << " " << kv_strides[2]
+            << std::endl;
 
   std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
@@ -334,6 +340,11 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   std::array<uint32_t, DIMS_QKV> tensor_box_size_q = {64, TILE_M_1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {64, std::min(TILE_N_1, page_size), 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_v = {64, std::min(TILE_N_1, page_size), 1, 1};
+
+  std::cout << "tensor_size_kv: " << tensor_size_kv[0] << " " << tensor_size_kv[1] << " "
+            << tensor_size_kv[2] << " " << tensor_size_kv[3] << std::endl;
+  std::cout << "ANE tma_tensor_stride_kv: " << tensor_stride_kv[0] << " " << tensor_stride_kv[1]
+            << " " << tensor_stride_kv[2] << std::endl;
 
   uint64_t batch_offset_qo = 0;
 
@@ -363,7 +374,7 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
                                 tensor_box_size_v.data(), tma::cudaTmaDescFormat::BF16_RN,
                                 tma::cudaTmaDescSwizzle::SWIZZLE_128B);
 
-  create_packed_tma_desc_prefill(b, actual_seq_lens_q_data, d, h_qo, qo_strides,
+  create_packed_tma_desc_prefill(b, actual_seq_lens_q_data, d, h_qo,
                                  tensor_traversal_stride_qkv.data(), tensor_box_size_q.data(),
                                  packed_tma_desc_q, packed_tma_desc_o, q, out,
                                  batch_offset_array_data);
@@ -373,12 +384,14 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   cudnn_sdpa::AttentionDescriptor_t attn_desc{
       static_cast<uint32_t>(b),    static_cast<uint32_t>(h_qo),       static_cast<uint32_t>(h_kv),
-      static_cast<uint32_t>(h_kv), static_cast<uint32_t>(s_q),        static_cast<uint32_t>(s_kv),
+      static_cast<uint32_t>(h_kv), static_cast<uint32_t>(s_qo),       static_cast<uint32_t>(s_kv),
       static_cast<uint32_t>(d),    static_cast<uint32_t>(h_qo / h_kv)};
+
+  std::cout << "attn_desc: group count q_heads_per_kv " << attn_desc.q_heads_per_kv << std::endl;
 
   float attn_scale = scale;
 
-  cudnn_sdpa::strides_t lse_strides = {h_qo * s_q, 1, h_qo, 1};
+  cudnn_sdpa::strides_t lse_strides = {h_qo * s_qo, 1, h_qo, 1};
 
   cudnn_sdpa::FastDivisor_t page_size_div;
   setFastDivisor(page_size_div, page_size);
@@ -392,38 +405,42 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   void* actual_seq_lens_kv_gpu_pointer = actual_seq_lens_kv_gpu.data_ptr<int32_t>();
   void* block_tables_pointer = block_tables.data_ptr<int32_t>();
 
-  // auto print_cudaTmaDescTiled = [](tma::cudaTmaDescTiled* desc) {
-  //   std::cout << "Addr " << desc->tensor_common0;
-  //   std::cout << " common1 " << desc->tensor_common1;
-  //   std::cout << " stride " << desc->tensor_stride_lower[0];
-  //   std::cout << " stride " << desc->tensor_stride_lower[1];
-  //   std::cout << " stride " << desc->tensor_stride_lower[2];
-  //   std::cout << " stride " << desc->tensor_stride_lower[3];
-  //   std::cout << " stride " << desc->tensor_stride_upper;
-  //   std::cout << " size " << desc->tensor_size[0];
-  //   std::cout << " size " << desc->tensor_size[1];
-  //   std::cout << " size " << desc->tensor_size[2];
-  //   std::cout << " size " << desc->tensor_size[3];
-  //   std::cout << " size " << desc->tensor_size[4];
-  //   std::cout << " stride " << desc->traversal_stride_box_0;
-  //   std::cout << " box_size_end " << desc->box_size_end;
-  //   std::cout << std::endl;
-  // };
+  auto print_cudaTmaDescTiled = [](tma::cudaTmaDescTiled* desc) {
+    std::cout << "Addr " << desc->tensor_common0;
+    std::cout << " common1 " << desc->tensor_common1;
+    std::cout << " stride " << (desc->tensor_stride_lower[0] << 4);
+    std::cout << " stride " << (desc->tensor_stride_lower[1] << 4);
+    std::cout << " stride " << (desc->tensor_stride_lower[2] << 4);
+    std::cout << " stride " << (desc->tensor_stride_lower[3] << 4);
+    std::cout << " stride " << desc->tensor_stride_upper;
+    std::cout << " size " << desc->tensor_size[0];
+    std::cout << " size " << desc->tensor_size[1];
+    std::cout << " size " << desc->tensor_size[2];
+    std::cout << " size " << desc->tensor_size[3];
+    std::cout << " size " << desc->tensor_size[4];
+    std::cout << " stride " << desc->traversal_stride_box_0;
+    std::cout << " box_size_end " << desc->box_size_end;
+    std::cout << std::endl;
+  };
 
-  // std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
-  // for (auto i = 0; i < b; i++) {
-  //   std::cout << std::hex;
-  //   std::cout << "q: ";
-  //   tma::cudaTmaDescTiled* q_desc =
-  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
-  //   print_cudaTmaDescTiled(q_desc);
-  //   std::cout << std::endl << "o: ";
-  //   tma::cudaTmaDescTiled* o_desc =
-  //   reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
-  //   print_cudaTmaDescTiled(o_desc);
-  //   std::cout << std::endl;
-  // }
-  // std::cout << std::dec << std::endl;
+  std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
+  for (auto i = 0; i < b; i++) {
+    std::cout << std::hex;
+    std::cout << "q: ";
+    tma::cudaTmaDescTiled* q_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
+    print_cudaTmaDescTiled(q_desc);
+    std::cout << std::endl << "o: ";
+    tma::cudaTmaDescTiled* o_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
+    print_cudaTmaDescTiled(o_desc);
+    std::cout << std::endl;
+  }
+
+  std::cout << std::hex;
+  std::cout << "tma_desc_k: " << std::endl;
+  print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&tma_desc_k));
+  std::cout << "tma_desc_v: " << std::endl;
+  print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&tma_desc_v));
+  std::cout << std::dec << std::endl;
 
   void* args[14];
   args[0] = (void*)&attn_desc;
@@ -448,22 +465,22 @@ void prefill(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
     throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
   }
 
-  // // Copy output data to host array
-  // size_t output_size = b * h_qo * s_q * d * sizeof(uint16_t);
-  // uint16_t* host_output = new uint16_t[output_size / sizeof(uint16_t)];
-  // cudaMemcpyAsync(host_output, out.data_ptr(), output_size, cudaMemcpyDeviceToHost, stream);
+  // Copy output data to host array
+  size_t output_size = q.size(0) * h_qo * d * sizeof(uint16_t);
+  uint16_t* host_output = new uint16_t[output_size / sizeof(uint16_t)];
+  cudaMemcpyAsync(host_output, out.data_ptr(), output_size, cudaMemcpyDeviceToHost, stream);
 
-  // cudaStreamSynchronize(stream);
-  // // Print each element
-  // std::cout << "Output tensor elements:" << std::endl;
-  // for (size_t i = 0; i < output_size / sizeof(uint16_t); i++) {
-  //   __nv_bfloat16 f = *(reinterpret_cast<__nv_bfloat16*>(&(host_output[i])));
-  //   std::cout << i << " " << float(f) << " " << std::dec << std::endl;
-  // }
-  // std::cout << std::endl;
+  cudaStreamSynchronize(stream);
+  // Print each element
+  std::cout << "Output tensor elements:" << std::endl;
+  for (size_t i = 0; i < output_size / sizeof(uint16_t); i++) {
+    __nv_bfloat16 f = *(reinterpret_cast<__nv_bfloat16*>(&(host_output[i])));
+    std::cout << i << " " << std::hex << host_output[i] << " " << std::dec << std::endl;
+  }
+  std::cout << std::endl;
 
   // Clean up
-  // delete[] host_output;
+  delete[] host_output;
 }
 
 static int32_t compute_split_factor(int32_t b, int32_t h_kv, int32_t h_qo, int32_t s_kv,
@@ -576,7 +593,6 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   // Step 2: Extract attention descriptor
 
-  TORCH_CHECK(q.dim() >= 4, "Decode Input tensor q must have at least 4 dimensions");
   TORCH_CHECK(k_cache.dim() >= 3, "Input tensor k_cache must have at least 3 dimensions");
 
   int64_t b = q.size(0);
@@ -607,9 +623,10 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   auto qo_strides = q.strides();
   auto kv_strides = k_cache.strides();
 
-  // std::cout << "qo_strides: " << qo_strides[0] << ", " << qo_strides[1] << ", " << qo_strides[2]
-  // << std::endl; std::cout << "kv_strides: " << kv_strides[0] << ", " << kv_strides[1] << ", " <<
-  // kv_strides[2] << std::endl;
+  std::cout << "qo_strides: " << qo_strides[0] << ", " << qo_strides[1] << ", " << qo_strides[2]
+            << std::endl;
+  std::cout << "kv_strides: " << kv_strides[0] << ", " << kv_strides[1] << ", " << kv_strides[2]
+            << std::endl;
 
   std::array<uint32_t, DIMS_QKV> tensor_size_qo = {d, s_q, h_qo, b};
   std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};

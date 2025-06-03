@@ -7,6 +7,8 @@ from ..jit import get_cudnn_fmha_gen_module
 
 
 def cudnn_batch_prefill_with_kv_cache(
+    bs: int,
+    s_q: int,
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -51,11 +53,7 @@ def cudnn_batch_prefill_with_kv_cache(
         Query and KV heads can have different sizes (num_heads_qo >= num_heads_kv)
     """
 
-    bs = q.shape[0]
     h_qo = q.shape[1]
-    s_q = q.shape[2]
-    d_vo = v_cache.shape[3]
-
     assert causal, "Currently only supports causal attention"
     assert use_cuda_graph == False, "Currently only supports use_cuda_graph == False"
 
@@ -76,6 +74,8 @@ def cudnn_batch_prefill_with_kv_cache(
 
     run_func = get_cudnn_fmha_gen_module().prefill
     run_func(
+        bs,
+        s_q,
         q,
         k_cache,
         v_cache,
