@@ -14,14 +14,120 @@ namespace flashinfer {
 
 namespace trtllm_moe_allreduce_fusion {
 
-static constexpr int kElemsPerAccess = 8;
+namespace details {
+
+static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
+}  // namespace details
+
+enum class FP4QuantizationSFLayout {
+  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
+  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
+  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
+  // columns to the nearest multiple of 4.
+  //
+  // The scale factor block rows map to data block rows in an interleaved pattern:
+  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
+  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
+  //
+  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
+  SWIZZLED,
+  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
+  // kernels standard.
+  LINEAR
+};
+
+namespace utils {
+#define FINAL_MASK 0xffffffff
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceSumV2(T* val) {
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+      val[i] += __shfl_xor_sync(FINAL_MASK, val[i], mask, 32);
+  }
+  return (T)(0.0f);
+}
+
+template <typename T, int NUM>
+__inline__ __device__ T blockReduceSumV2(T* val) {
+  static __shared__ T shared[NUM][33];
+  int lane = threadIdx.x & 0x1f;
+  int wid = threadIdx.x >> 5;
+
+  warpReduceSumV2<T, NUM>(val);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < NUM; i++) {
+      shared[i][wid] = val[i];
+    }
+  }
+
+  __syncthreads();
+
+  bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+    val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
+  }
+  warpReduceSumV2<T, NUM>(val);
+  return (T)0.0f;
+}
+
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
+                                                       int colIdx, std::optional<int> numRows,
+                                                       int numCols, SFType* SFout,
+                                                       FP4QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+
+  // One pair of threads write one SF to global memory.
+  // TODO: stage through smem for packed STG.32
+  // is it better than STG.8 from 4 threads ?
+  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
+    if (layout == FP4QuantizationSFLayout::SWIZZLED) {
+      // SF vector index (16 elements share one SF in the K dimension).
+      // numRows and numCols are unpadded.
+      int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+      int32_t mIdx = rowIdx;
+
+      auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else if (layout == FP4QuantizationSFLayout::LINEAR) {
+      // Linear row-major layout, no padding required.
+      int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+
+      int32_t numKTiles = numCols / CVT_FP4_SF_VEC_SIZE;
+      int64_t mTileStride = numKTiles;
+
+      int64_t BTileStride = numRows.value_or(0) * mTileStride;
+
+      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else {
+      return nullptr;
+    }
+  }
+#endif
+  return nullptr;
+}
+}  // namespace utils
+
+// struct __device_builtin__ __builtin_align__(16) float4
+// {
+//     float x, y, z, w;
+// };
+
+template <typename T>
 struct AllReduceFusionParams {
   int nranks;
   int rank;
-  nvinfer1::DataType dtype;
   // size = token_num * hidden_dim
   int size;
   int hidden_dim;
@@ -34,16 +140,20 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
-  float* scale_factor;
+  // todo(review): why float* scale_factor in trt-llm?
+  float scale_factor;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
 };
 
-struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams {
+template <typename T>
+struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams<T> {
   // * moe reduction specific params
   // Refer to kernel implementation on layout of those params
   // number of active experts on current device
-  int* moe_reduction_device_num_experts = nullptr;
+
+  // todo(review): why int* moe_reduction_device_num_experts = nullptr; in trt-llm?
+  int moe_reduction_device_num_experts = 0;
   // per token per expert fp32 scale
   float* moe_reduction_scale_input = nullptr;
   // per token per expert input
@@ -93,32 +203,32 @@ struct LamportComm {
   int flag_value;
 };
 
-template <typename DType, typename PackedType>
-__device__ __forceinline__ PackedType add128(PackedType const& a, PackedType const& b) {
-  static constexpr int kMathCount = sizeof(PackedType) / sizeof(DType);
-  PackedType c;
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& a,
+                                                      const vec_t<T, VEC_SIZE>& b) {
+  vec_t<T, VEC_SIZE> ret;
 #pragma unroll
-  for (int i = 0; i < kMathCount; ++i) {
-    reinterpret_cast<DType*>(&c)[i] =
-        reinterpret_cast<DType const*>(&a)[i] + reinterpret_cast<DType const*>(&b)[i];
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    ret[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
   }
-  return c;
+  return ret;
 }
 
-template <typename DType, typename PackedType>
-__device__ __forceinline__ PackedType rms_norm(PackedType const& residual, PackedType const& gamma,
-                                               float const eps, int hidden_dim) {
-  static constexpr int kMathCount = sizeof(PackedType) / sizeof(DType);
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
+                                                       vec_t<T, VEC_SIZE> const& gamma,
+                                                       float const eps, int hidden_dim) {
+  namespace cg = cooperative_groups;
   __shared__ float s_val;
-  PackedType norm_out;
+  vec_t<T, VEC_SIZE> norm_out;
   cg::cluster_group cluster = cg::this_cluster();
   float acc = 0.f;
 #pragma unroll
-  for (int i = 0; i < kMathCount; ++i) {
-    float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    float v = static_cast<float>(residual[i]);
     acc += v * v;
   }
-  tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+  utils::blockReduceSumV2<float, 1>(&acc);
   if (cluster.num_blocks() > 1) {
     if (threadIdx.x == 0) {
       s_val = acc;
@@ -137,30 +247,33 @@ __device__ __forceinline__ PackedType rms_norm(PackedType const& residual, Packe
   }
   __syncthreads();
 #pragma unroll
-  for (int i = 0; i < kMathCount; ++i) {
-    reinterpret_cast<DType*>(&norm_out)[i] =
-        static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) *
-                           s_val * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    norm_out[i] =
+        static_cast<T>(static_cast<float>(residual[i]) * s_val * static_cast<float>(gamma[i]));
   }
   return norm_out;
 }
 
-template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typename PackedType>
-__device__ __forceinline__ void fused_op(PackedType const& val, int access_id, int token_id,
-                                         int access_id_in_token, AllReduceFusionParams& params) {
-  float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
-  float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-  residual_val = add128<DType>(val, residual_val);
+template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
+                                         int access_id_in_token, AllReduceFusionParams<T>& params) {
+  vec_t<T, VEC_SIZE> residual_val;
+  vec_t<T, VEC_SIZE> gamma_val;
+  residual_val.load(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.residual_in) + access_id);
+  gamma_val.load(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.rms_gamma) + access_id_in_token);
+  residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+    residual_val.store(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.residual_out) + access_id);
   }
-  float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+  vec_t<T, VEC_SIZE> norm_val =
+      rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
-    reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
+    norm_val.store(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.norm_out) + access_id);
   }
   if constexpr (QuantOut) {
-    PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+    vec_t<T, VEC_SIZE> pack_val;
+    pack_val.cast_load(norm_val);
+    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
         params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
@@ -168,21 +281,50 @@ __device__ __forceinline__ void fused_op(PackedType const& val, int access_id, i
   }
 }
 
-__device__ __forceinline__ bool is_neg_zero(float v) {
-  return *reinterpret_cast<uint32_t*>(&v) == 0x80000000;
-}
+template <typename T>
+struct neg_zero {
+  static constexpr T value = -T(0);
+};
 
-__device__ __forceinline__ bool is_neg_zero(float4 v) {
-  return is_neg_zero(v.x) || is_neg_zero(v.y) || is_neg_zero(v.z) || is_neg_zero(v.w);
-}
+template <>
+struct neg_zero<half> {
+  static constexpr unsigned short neg_zero_bits = 0x8000U;
+  static constexpr __half value = __half_raw{neg_zero_bits};
+};
 
-__device__ __forceinline__ float4 get_neg_zero() {
-  float4 vec;
+template <>
+struct neg_zero<nv_bfloat16> {
+  static constexpr unsigned short neg_zero_bits = 0x8000U;
+  static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
+};
+
+template <typename T>
+__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
+
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    reinterpret_cast<uint32_t*>(&vec)[i] = 0x80000000;
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    if (vec[i] == neg_zero_v<T>) {
+      return true;
+    }
   }
-  return vec;
+  return false;
+}
+
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    vec[i] = (vec[i] == neg_zero_v<T>) ? static_cast<T>(0.f) : vec[i];
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void set_neg_zero(T* addr) {
+  vec_t<T, details::kBytesPerAccess / sizeof(T)> val;
+  val.fill(neg_zero_v<T>);
+  val.store_global_volatile(addr);
 }
 
 __device__ __forceinline__ float4 ld_global_volatile(float4* addr) {
@@ -207,15 +349,15 @@ int get_sm_count() {
   return sm_count;
 }
 
-bool use_oneshot(int token_num) { return token_num <= kOneShotMaxToken; }
+bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
 
 /////////////////////////////////////////////////////////////////
 //                  * MoE Reduction Fusion *                   //
 /////////////////////////////////////////////////////////////////
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
 __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
-    MoeReductionAllReduceFusionParams params) {
+    MoeReductionAllReduceFusionParams<T> params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
@@ -224,6 +366,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
+
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
 
   // Each token is handled by one cluster
   // which token is handled by current cluster
@@ -236,31 +380,36 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   int access_id_in_token = cluster.thread_rank();
   // Across all token, which kElemsPerAccess is handled by current thread (in unit of
   // kElemsPerAccess)
-  int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
+  int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
   // Persistent kernel
   // stride to next token handled by current cta
   int token_stride = grid.num_clusters();
   // stride in unit of kElemsPerAccess
-  int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
+  int access_stride = token_stride * params.hidden_dim / VEC_SIZE;
   // Total number of access in unit of kElemsPerAccess to handle (token_num * hidden_dim)
   // This is within one rank
-  int tot_access = params.size / kElemsPerAccess;
-  float4 clear_vec = get_neg_zero();
+
+  int tot_access = params.size / VEC_SIZE;
+  vec_t<T, VEC_SIZE> clear_vec;
+  clear_vec.fill(neg_zero_v<T>);
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / kElemsPerAccess;
+  int clear_access = comm.clear_size / VEC_SIZE;
 
   // * MoE related
   int threadid_in_cluster = cluster.thread_rank();
   // Start Offset within one token's hidden_size of element
   // Current thread handle token[thread_offset_within_token : thread_offset_within_token +
   // kElemsPerAccess]
-  int thread_offset_within_token = threadid_in_cluster * kElemsPerAccess;
 
+  // todo(review): review this
+  int thread_offset_within_token = threadid_in_cluster * VEC_SIZE;
+
+  // todo(review): review this
   union ACC_TYPE {
-    float4 packed;
-    DType unpacked[kElemsPerAccess];
+    vec_t<T, VEC_SIZE> packed;
+    T unpacked[VEC_SIZE];
   };
 
   // Persistent Kernel
@@ -276,8 +425,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
     ACC_TYPE accumulator;
 #pragma unroll
-    for (int i = 0; i < kElemsPerAccess; ++i) {
-      accumulator.unpacked[i] = static_cast<DType>(0);
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      accumulator.unpacked[i] = static_cast<T>(0);
     }
 
     // * Iterate through all active expert
@@ -288,9 +437,10 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       int thread_offset_across_actexp_token =
           actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
       ACC_TYPE actexp_i_data;
-      actexp_i_data.packed = reinterpret_cast<float4 const*>(
+
+      actexp_i_data.packed = reinterpret_cast<vec_t<T, VEC_SIZE> const*>(
           params.moe_reduction_active_experts_token_input)[thread_offset_across_actexp_token /
-                                                           kElemsPerAccess];
+                                                           VEC_SIZE];
 
       // * Load active expert i's token j's scale
       int thread_offset_scale = actexp_i * num_token + token_id;
@@ -299,72 +449,76 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
       // * acc += scale(data)
 #pragma unroll
-      for (int i = 0; i < kElemsPerAccess; ++i) {
+      for (int i = 0; i < VEC_SIZE; ++i) {
         // assume computation is done in ScaleType
-        accumulator.unpacked[i] += static_cast<DType>(
+        accumulator.unpacked[i] += static_cast<T>(
             (static_cast<float>(actexp_i_data.unpacked[i]) * actexp_i_token_j_scale));
       }
     }
 
     // * FC2 + reduced(gGEMM2)
     ACC_TYPE fc2_data;
-    fc2_data.packed = reinterpret_cast<float4 const*>(
-        params.moe_reduction_token_input)[thread_offset_across_token / kElemsPerAccess];
+    fc2_data.packed = reinterpret_cast<vec_t<T, VEC_SIZE> const*>(
+        params.moe_reduction_token_input)[thread_offset_across_token / VEC_SIZE];
 #pragma unroll
-    for (int i = 0; i < kElemsPerAccess; ++i) {
+    for (int i = 0; i < VEC_SIZE; ++i) {
       accumulator.unpacked[i] += fc2_data.unpacked[i];
     }
 
     // * AR Store
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
+    int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
     int idx = access_id;
-    float val[4] = {accumulator.packed.x, accumulator.packed.y, accumulator.packed.z,
-                    accumulator.packed.w};
+    vec_t<T, VEC_SIZE> val;
+    val.load(accumulator.packed);
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      // Handle two bf16/fp16 at one time
-      if (is_neg_zero(val[i])) {
-        val[i] = 0.f;
-      }
+    if (has_neg_zero(val)) {
+      val.fill(0.f);
     }
+    // for (int i = 0; i < 4; ++i) {
+    //   // Handle two bf16/fp16 at one time
+    //   if (is_neg_zero(val[i])) {
+    //     val[i] = 0.f;
+    //   }
+    // }
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
-      reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
-          *reinterpret_cast<float4*>(val);
+      reinterpret_cast<vec_t<T, VEC_SIZE>*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
+          val;
     }
   }
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    reinterpret_cast<vec_t<T, VEC_SIZE>*>(comm.clear_buf)[idx] = clear_vec;
   }
 
   // * AR Load + Fusion
   for (int idx = access_id, tidx = token_id; idx < tot_access;
        idx += access_stride, tidx += token_stride) {
     // * AR Load
-    float4 vals[NRanks];
+    vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
     while (!done) {
       done = true;
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r] = ld_global_volatile(
-            &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
-        done &= !is_neg_zero(vals[r]);
+        vals[r].load_global_volatile(&reinterpret_cast<vec_t<T, VEC_SIZE>*>(
+            comm.data_bufs[params.rank])[r * tot_access + idx]);
+        done &= !has_neg_zero(vals[r]);
       }
     }
-    float4 sum_val = vals[0];
+    vec_t<T, VEC_SIZE> sum_val = vals[0];
 #pragma unroll
     for (int r = 1; r < NRanks; ++r) {
-      sum_val = add128<DType>(sum_val, vals[r]);
+      sum_val = vec_add<T, VEC_SIZE>(sum_val, vals[r]);
     }
 
     // * Fuse
-    fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+    fused_op<ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx, access_id_in_token,
+                                                          params);
   }
   comm.update(params.size * NRanks);
   cudaTriggerProgrammaticLaunchCompletion();
@@ -375,28 +529,28 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #endif
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
-void launch_oneshot_moereduce_lamport(MoeReductionAllReduceFusionParams const& params,
-                                      cudaLaunchConfig_t& cfg) {
-  TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+cudaError_t launch_oneshot_moereduce_lamport(MoeReductionAllReduceFusionParams<T> const& params,
+                                             cudaLaunchConfig_t& cfg) {
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
       &cfg,
-      moereduce_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut,
-                                                        QuantOut>,
+      moereduce_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut, QuantOut>,
       params));
+  return cudaSuccess;
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
-void moereduction_allreduce_fusion_kernel_launcher(
-    MoeReductionAllReduceFusionParams const& params) {
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+cudaError_t moereduction_allreduce_fusion_kernel_launcher(
+    MoeReductionAllReduceFusionParams<T> const& params, bool launch_with_pdl) {
   int token_num = params.size / params.hidden_dim;
   bool oneshot = use_oneshot(token_num);
   // Only support one shot
-  TLLM_CHECK(oneshot);
+  FLASHINFER_CHECK(oneshot, "only support one shot");
   // Each token is handled by one cluster
   int cluster_num = token_num;
   // Total number of threads (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
-  int threads_per_token = params.hidden_dim / kElemsPerAccess;
+  int threads_per_token = params.hidden_dim * sizeof(T) / details::kBytesPerAccess;
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
   int warps_per_token = (threads_per_token + 31) / 32;
@@ -405,7 +559,8 @@ void moereduction_allreduce_fusion_kernel_launcher(
     cluster_size /= 2;
   }
   int block_size = warps_per_token / cluster_size * 32;
-  TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
+  FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
+                   "block_size <= 1024 && cluster_size > 0");
   int sm_count = get_sm_count();
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
@@ -415,8 +570,7 @@ void moereduction_allreduce_fusion_kernel_launcher(
   cfg.dynamicSmemBytes = 0;
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed =
-      tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+  attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
@@ -424,55 +578,74 @@ void moereduction_allreduce_fusion_kernel_launcher(
   cfg.attrs = attribute;
   cfg.numAttrs = 2;
   if (oneshot) {
-    launch_oneshot_moereduce_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut>(params, cfg);
+    FLASHINFER_CUDA_CALL(
+        (launch_oneshot_moereduce_lamport<T, NRanks, ResidualOut, NormOut, QuantOut>(params, cfg)));
   }
+  return cudaSuccess;
 }
 
-void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& params) {
-#define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                       \
-  return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, \
-                                                       QUANT_OUT>(params);
-#define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                     \
-  if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF) {        \
-    MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                  \
-  } else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16) { \
-    MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);         \
-  }
-
-  TLLM_CHECK(params.residual_in && params.rms_gamma);
-  TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input &&
-             params.moe_reduction_token_input);
-  TLLM_CHECK(params.size % params.hidden_dim == 0);
-  TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
+template <typename T>
+cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T> const& params,
+                                             bool launch_with_pdl) {
+  FLASHINFER_CHECK(params.residual_in && params.rms_gamma, "residual_in and rms_gamma must be set");
+  FLASHINFER_CHECK(params.moe_reduction_scale_input &&
+                       params.moe_reduction_active_experts_token_input &&
+                       params.moe_reduction_token_input,
+                   "moe_reduction_scale_input, moe_reduction_active_experts_token_input and "
+                   "moe_reduction_token_input must be set");
+  FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
+  FLASHINFER_CHECK(params.hidden_dim * sizeof(T) % details::kBytesPerAccess == 0,
+                   "hidden_dim * sizeof(T) must be a multiple of kBytesPerAccess");
   if (params.residual_out && not params.norm_out && params.quant_out) {
     // pattern1: AR+Add_RMS+Quant
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-    MOE_DISPATCH0(2, true, false, true);
-    MOE_DISPATCH0(4, true, false, true);
-    MOE_DISPATCH0(8, true, false, true);
-    MOE_DISPATCH0(16, true, false, true);
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, false, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, false, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, false, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, false, true>(
+        params, launch_with_pdl)));
+    return cudaSuccess;
   } else if (not params.residual_out && params.norm_out && not params.quant_out) {
     // pattern2: AR+AddRMS
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 norm_out
-    MOE_DISPATCH0(2, false, true, false);
-    MOE_DISPATCH0(4, false, true, false);
-    MOE_DISPATCH0(8, false, true, false);
-    MOE_DISPATCH0(16, false, true, false);
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, false>(
+        params, launch_with_pdl)));
+    return cudaSuccess;
   } else if (params.residual_out && params.norm_out && not params.quant_out) {
-    MOE_DISPATCH0(2, true, true, false);
-    MOE_DISPATCH0(4, true, true, false);
-    MOE_DISPATCH0(8, true, true, false);
-    MOE_DISPATCH0(16, true, true, false);
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, false>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, false>(
+        params, launch_with_pdl)));
+    return cudaSuccess;
   } else if (params.residual_out && params.norm_out && params.quant_out) {
     // for test
-    MOE_DISPATCH0(2, true, true, true);
-    MOE_DISPATCH0(4, true, true, true);
-    MOE_DISPATCH0(8, true, true, true);
-    MOE_DISPATCH0(16, true, true, true);
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true>(
+        params, launch_with_pdl)));
+    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true>(
+        params, launch_with_pdl)));
+    return cudaSuccess;
   }
-  TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");
+  FLASHINFER_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
+  return cudaErrorNotSupported;
 }
 }  // namespace trtllm_moe_allreduce_fusion
 
