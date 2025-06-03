@@ -579,6 +579,14 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
     )
 
+    trtllm_lamport_initialize_all(
+        ipc_handles[4][rank],
+        ipc_handles[5][rank],
+        ipc_handles[6][rank],
+        lamport_buffer_size // 2,
+        torch.float16,
+    )
+
     return ipc_handles
 
 

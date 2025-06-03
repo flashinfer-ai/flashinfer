@@ -89,15 +89,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 inp1_ref = inp1.clone()
                                 out1 = torch.empty_like(inp1)
 
-                                # lamport init to negative zero
-                                comm.trtllm_lamport_initialize_all(
-                                    workspace[4][rank],
-                                    workspace[5][rank],
-                                    workspace[6][rank],
-                                    message_size,
-                                    dtype,
-                                )
-
                                 # init params for each fusion op
                                 bias = torch.randn(
                                     hiddenSize, dtype=dtype, device=device
