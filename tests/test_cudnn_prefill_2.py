@@ -27,6 +27,12 @@ def test_cudnn_prefill(
     causal,
     return_lse,
 ):
+
+    print("Running test_cudnn_prefill")
+    print(
+        f"batch_size: {batch_size}, s_qo: {s_qo}, s_kv: {s_kv}, page_size: {page_size}, num_kv_heads: {num_kv_heads}, num_qo_heads: {num_qo_heads}, head_dim: {head_dim}, causal: {causal}, return_lse: {return_lse}"
+    )
+
     # test set up basics
     seed = 0
     torch.manual_seed(seed)
@@ -45,10 +51,9 @@ def test_cudnn_prefill(
     print(f"num_kv_heads: {num_kv_heads}")
 
     print(f"actual_seq_lens_kv: {actual_seq_lens_kv.flatten()}")
+    print(f"actual_seq_lens_q: {actual_seq_lens_q.flatten()}")
 
     q = torch.randn(cumsum_s_qo, num_qo_heads, head_dim, device=device).half()
-
-    # q[:,1,:] = 1.0
 
     print(f"q.shape: {q.shape}, q.stride: {q.stride()}")
     # print(q[:,:,0:12])
@@ -59,32 +64,36 @@ def test_cudnn_prefill(
 
     print(f"total_num_pages: {total_num_pages}")
 
-    # k_cache = torch.randn(total_num_pages, page_size, num_kv_heads, head_dim, device=device).half()
-    # v_cache_experimental = torch.randn(total_num_pages, page_size, num_kv_heads, head_dim, device=device).half()
-
-    # v_cache = v_cache_experimental.view(total_num_pages, page_size, num_kv_heads, head_dim).permute(0, 2, 1, 3)
-    # v_cache = v_cache_experimental
-
     # PARTIALLY INTERLEAVED KV CACHE
-    kv_cache_shape = (total_num_pages, 2, page_size, num_kv_heads, head_dim)
+    kv_cache_shape = (total_num_pages, 2, num_kv_heads, page_size, head_dim)
     kv_cache = torch.randn(size=kv_cache_shape).half().to(device)
-    k_cache = kv_cache[:, 0, :, :, :]
-
+    kv_cache = kv_cache.as_strided(
+        kv_cache.shape,
+        (
+            2 * page_size * num_kv_heads * head_dim,
+            page_size * num_kv_heads * head_dim,
+            head_dim,
+            num_kv_heads * head_dim,
+            1,
+        ),
+    )
+    k_cache_view = kv_cache[:, 0, :, :, :]
     v_cache_view = kv_cache[:, 1, :, :, :]
 
-    # for i in range(total_num_pages):
-    #     k_cache[i,:,:,:] = i
-    #     v_cache_view[i,:,:,:] = i + 1000
-
-    v_cache = v_cache_view.permute(0, 2, 1, 3)
+    v_cache = v_cache_view.as_strided(
+        v_cache_view.shape,
+        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
+    )
+    k_cache = k_cache_view.as_strided(
+        k_cache_view.shape,
+        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
+    )
 
     print(f"kv_cache.shape: {kv_cache.shape}, kv_cache.stride: {kv_cache.stride()}")
     print(f"v_cache.shape: {v_cache.shape}, v_cache.stride: {v_cache.stride()}")
     print(
         f"v_cache_view.shape: {v_cache_view.shape}, v_cache_view.stride: {v_cache_view.stride()}"
     )
-
-    # END PARTIALLY INTERLEAVED KV CACHE
 
     # Now initialize the page tables
     block_tables = torch.tensor(
@@ -131,6 +140,8 @@ def test_cudnn_prefill(
     torch.save(output, "output.pt")
 
     torch.save(v_cache, "v_cache.pt")
+    v_cache_contiguous = v_cache.contiguous()
+    torch.save(v_cache_contiguous, "v_cache_contiguous.pt")
     torch.save(v_cache_view, "v_cache_view.pt")
     torch.save(k_cache, "k_cache.pt")
     torch.save(kv_cache, "kv_cache.pt")
@@ -147,28 +158,53 @@ def test_cudnn_prefill(
         .int()
         .to(device)
     )
+    print(f"qo_indptr: {qo_indptr}")
 
     kv_indptr = (
         torch.cat(
             [
                 torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_kv_device.view(-1), dim=0),
+                torch.cumsum(
+                    (actual_seq_lens_kv_device.flatten() + page_size - 1) // page_size,
+                    dim=0,
+                ),
             ]
         )
         .int()
         .to(device)
     )
 
-    kv_indices = torch.arange(total_num_pages, device=device).int().to(device)
-    kv_last_page_len = (
-        torch.full((batch_size,), page_size, device=device).int().to(device)
+    print(f"kv_indptr: {kv_indptr}")
+
+    # kv_indices
+    kv_indices = (
+        torch.arange(0, total_num_pages, num_pages_per_seq, device=device)
+        .int()
+        .to(device)
     )
+
+    print(f"kv_indices: {kv_indices}")
+
+    # kv_last_page_len
+    kv_last_page_len = (
+        torch.where(
+            actual_seq_lens_kv_device.flatten() % page_size == 0,
+            torch.full((batch_size,), page_size, device=device),
+            actual_seq_lens_kv_device.flatten() % page_size,
+        )
+        .int()
+        .to(device)
+    )
+
+    print(f"kv_last_page_len: {kv_last_page_len}")
+
+    # Workspace buffer
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
     )
 
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, "NHD"
+        workspace_buffer_ref, "HND"
     )
     wrapper.plan(
         qo_indptr,
@@ -190,4 +226,16 @@ def test_cudnn_prefill(
 
     torch.save(output_ref, "output_ref.pt")
 
+    print("output")
+    print(f"output.shape: {output.shape}, output.stride: {output.stride()}")
+    print(output[0:2, 0:3, 0:10])
+
+    print("output_ref")
+    print(
+        f"output_ref.shape: {output_ref.shape}, output_ref.stride: {output_ref.stride()}"
+    )
+    print(output_ref[0:2, 0:3, 0:10])
     # print(output_ref)
+
+    print("Checking if output and output_ref are close")
+    torch.testing.assert_close(output, output_ref)
