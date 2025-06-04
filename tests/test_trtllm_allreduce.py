@@ -168,9 +168,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     tolerance = 1e-2 if dtype == torch.float16 else 5e-2
 
                                     if fusion_op_code == comm.AllReduceFusionOp.NONE:
-                                        # torch.testing.assert_close(
-                                        #     out1, inp1_ref, atol=tolerance, rtol=3e-2
-                                        # )
                                         if not torch.allclose(
                                             out1, inp1_ref, atol=tolerance, rtol=3e-2
                                         ):
@@ -202,12 +199,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                             )
                                         ref_half = ref_float.to(dtype)
 
-                                        # torch.testing.assert_close(
-                                        #     inter_buffer,
-                                        #     ref_half,
-                                        #     atol=tolerance,
-                                        #     rtol=3e-2,
-                                        # )
                                         if not torch.allclose(
                                             inter_buffer,
                                             ref_half,
@@ -238,12 +229,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                             torch.float32
                                         )
                                         normed_half = normed_float.to(dtype)
-                                        # torch.testing.assert_close(
-                                        #     out1,
-                                        #     normed_half.view(-1),
-                                        #     atol=tolerance,
-                                        #     rtol=3e-2,
-                                        # )
+
                                         if not torch.allclose(
                                             out1,
                                             normed_half.view(-1),
