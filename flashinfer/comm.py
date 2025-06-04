@@ -573,7 +573,9 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         lamport_buffer_size,
         lamport_buffer_size,
     ]:
-        ipc_handles.append(create_shared_buffer(size, group))
+        # all sizes should be aligned to 1LU << 21 bytes (2MB)
+        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
         f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
