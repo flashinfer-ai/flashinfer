@@ -46,6 +46,8 @@ from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .fp4_quantization import fp4_quantize
+from .fused_moe import cutlass_fused_moe
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
