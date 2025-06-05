@@ -16,9 +16,9 @@
  */
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
+#include "pytorch_extension_utils.h"
 
 #include <c10/cuda/CUDAStream.h>
-#include <torch/extension.h>
 #include <vector>
 
 using namespace flashinfer::trtllm_alltoall;
