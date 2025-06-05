@@ -110,7 +110,6 @@ class JitSpec:
 
     def build_and_load(self, class_name: str = None):
         if self.aot_path.exists():
-            print("yy" * 100, self.aot_path)
             so_path = self.aot_path
         else:
             so_path = self.jit_library_path
