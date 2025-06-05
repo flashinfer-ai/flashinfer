@@ -7,7 +7,7 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("batch_size", [1, 4, 8])
 @pytest.mark.parametrize("s_qo", [8, 37, 1024])
 @pytest.mark.parametrize("s_kv", [8, 54, 2048])
 @pytest.mark.parametrize("page_size", [1, 2, 8, 128])
@@ -39,10 +39,10 @@ def test_cudnn_prefill(
     device = "cuda:0"
 
     actual_seq_lens_q = torch.randint(
-        1, 1 + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
     actual_seq_lens_kv = torch.randint(
-        1, 1 + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
@@ -53,10 +53,11 @@ def test_cudnn_prefill(
     print(f"actual_seq_lens_kv: {actual_seq_lens_kv.flatten()}")
     print(f"actual_seq_lens_q: {actual_seq_lens_q.flatten()}")
 
-    q = torch.randn(cumsum_s_qo, num_qo_heads, head_dim, device=device).half()
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
 
     print(f"q.shape: {q.shape}, q.stride: {q.stride()}")
-    # print(q[:,:,0:12])
 
     # Initialize KV Cache
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
@@ -66,7 +67,7 @@ def test_cudnn_prefill(
 
     # PARTIALLY INTERLEAVED KV CACHE
     kv_cache_shape = (total_num_pages, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).half().to(device)
+    kv_cache = torch.randn(size=kv_cache_shape, dtype=torch.bfloat16).to(device)
     kv_cache = kv_cache.as_strided(
         kv_cache.shape,
         (
@@ -88,6 +89,9 @@ def test_cudnn_prefill(
         k_cache_view.shape,
         (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
     )
+
+    for i in range(v_cache.shape[0]):
+        v_cache[i, :, :, :] = i
 
     print(f"kv_cache.shape: {kv_cache.shape}, kv_cache.stride: {kv_cache.stride()}")
     print(f"v_cache.shape: {v_cache.shape}, v_cache.stride: {v_cache.stride()}")
@@ -177,11 +181,15 @@ def test_cudnn_prefill(
     print(f"kv_indptr: {kv_indptr}")
 
     # kv_indices
-    kv_indices = (
-        torch.arange(0, total_num_pages, num_pages_per_seq, device=device)
-        .int()
-        .to(device)
-    )
+    kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
+    for i in range(len(kv_indptr) - 1):
+        start_idx = kv_indptr[i]
+        end_idx = kv_indptr[i + 1]
+        kv_indices[start_idx:end_idx] = torch.arange(
+            i * num_pages_per_seq,
+            i * num_pages_per_seq + (end_idx - start_idx),
+            device=device,
+        )
 
     print(f"kv_indices: {kv_indices}")
 
@@ -217,7 +225,7 @@ def test_cudnn_prefill(
         page_size,
         pos_encoding_mode="NONE",
         causal=True,
-        q_data_type=torch.float16,
+        q_data_type=torch.bfloat16,
     )
 
     output_ref = wrapper.run(q, kv_cache)
