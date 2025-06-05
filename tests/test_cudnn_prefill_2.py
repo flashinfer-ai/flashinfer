@@ -35,14 +35,14 @@ def test_cudnn_prefill(
     torch.manual_seed(seed)
     device = "cuda:0"
 
-    actual_seq_lens_q = torch.randint(
+    tokens_per_seq = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
     actual_seq_lens_kv = torch.randint(
         s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
-    cumsum_s_qo = torch.sum(actual_seq_lens_q)
+    cumsum_s_qo = torch.sum(tokens_per_seq)
     q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
     )
@@ -91,30 +91,28 @@ def test_cudnn_prefill(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output, lse = flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
-        batch_size,
-        s_qo,
         q,
         k_cache,
         v_cache,
         scale,
         workspace_buffer,
-        actual_seq_lens_q,
+        s_qo,
+        tokens_per_seq,
         actual_seq_lens_kv,
         block_tables,
-        num_pages_per_seq,
         causal,
         return_lse,
         use_cuda_graph=False,
     )
     torch.cuda.synchronize()
 
-    actual_seq_lens_q_device = actual_seq_lens_q.to(device)
+    tokens_per_seq_device = tokens_per_seq.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
     qo_indptr = (
         torch.cat(
             [
                 torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_q_device.view(-1), dim=0),
+                torch.cumsum(tokens_per_seq_device.view(-1), dim=0),
             ]
         )
         .int()

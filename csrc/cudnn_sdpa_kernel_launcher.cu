@@ -237,8 +237,8 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
 void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tensor v_cache,
              double scale, at::Tensor workspace_buffer, at::Tensor actual_seq_lens_q,
              at::Tensor actual_seq_lens_kv, at::Tensor actual_seq_lens_q_gpu,
-             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, int64_t num_pages_per_seq,
-             bool causal, bool return_lse, at::Tensor out, at::Tensor lse,
+             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, bool causal,
+             bool return_lse, at::Tensor out, at::Tensor lse,
              std::optional<at::Tensor> batch_offset_array, bool use_cuda_graph) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr int64_t TILE_M_1 = 128;
@@ -247,7 +247,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   constexpr int32_t NUM_THREADS = 512;
 
   auto device = q.device();
-
   const CUstream stream = at::cuda::getCurrentCUDAStream(device.index());
 
   int64_t* batch_offset_array_data = nullptr;
@@ -283,29 +282,43 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   int64_t page_size = k_cache.size(2);
   int64_t s_kv = (k_cache.size(0) / b) * page_size;
 
+  int64_t num_pages_per_seq = std::ceil(s_kv / page_size);
+
   int64_t total_num_pages = k_cache.size(0);
 
   // Step 3: Setup the launch configuration
 
   CUlaunchConfig config;
 
-  CUlaunchAttribute attrs[1];
+  constexpr int NUM_ATTRS = 1;
+  CUlaunchAttribute attrs[NUM_ATTRS];
+  config.numAttrs = NUM_ATTRS;
   attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
   attrs[0].value.clusterDim.x = 1;
   attrs[0].value.clusterDim.y = 1;
   attrs[0].value.clusterDim.z = 1;
-
-  auto actual_seq_lens_q_data = actual_seq_lens_q.data_ptr<int32_t>();
-  auto actual_seq_lens_kv_data = actual_seq_lens_kv.data_ptr<int32_t>();
-
-  uint32_t actual_num_tiles_per_head = std::transform_reduce(
-      actual_seq_lens_q_data, actual_seq_lens_q_data + b, 0U, std::plus<>(), [](int32_t seq_len) {
-        return static_cast<uint32_t>(std::ceil(seq_len / (TILE_M_1 * 2.0f)));
-      });
+  config.attrs = attrs;
 
   config.sharedMemBytes = SMEM_SIZE;
+  config.hStream = stream;
 
-  config.gridDimX = actual_num_tiles_per_head;
+  if (use_cuda_graph == false) {
+    TORCH_CHECK(actual_seq_lens_q.is_cuda() == false,
+                "actual_seq_lens_q must be on the same device as q");
+    TORCH_CHECK(actual_seq_lens_kv.is_cuda() == false,
+                "actual_seq_lens_kv must be on the same device as q");
+    auto actual_seq_lens_q_data = actual_seq_lens_q.data_ptr<int32_t>();
+    auto actual_seq_lens_kv_data = actual_seq_lens_kv.data_ptr<int32_t>();
+
+    uint32_t actual_num_tiles_per_head = std::transform_reduce(
+        actual_seq_lens_q_data, actual_seq_lens_q_data + b, 0U, std::plus<>(), [](int32_t seq_len) {
+          return static_cast<uint32_t>(std::ceil(seq_len / (TILE_M_1 * 2.0f)));
+        });
+    config.gridDimX = actual_num_tiles_per_head;
+  } else {
+    config.gridDimX = q.size(0) / (TILE_M_1 * 2.0f);
+  }
+
   config.gridDimY = h_qo;
   config.gridDimZ = 1;
 
@@ -313,13 +326,8 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   config.blockDimY = 1;
   config.blockDimZ = 1;
 
-  config.hStream = stream;
-  config.numAttrs = 1;
-  config.attrs = attrs;
-
   // Step 4: Set up the launch arguments
 
-  // auto qo_strides = q.strides();
   auto kv_strides = v_cache.strides();
 
   std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
@@ -333,7 +341,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   std::array<uint32_t, DIMS_QKV> tensor_box_size_v = {64, std::min(TILE_N_1, page_size), 1, 1};
 
   uint64_t batch_offset_qo = 0;
-
   int8_t* workspace_start = workspace_buffer.data_ptr<int8_t>();
 
   // These tensors are allocated in the workspace buffer
@@ -360,13 +367,16 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
                                 tensor_box_size_v.data(), tma::cudaTmaDescFormat::BF16_RN,
                                 tma::cudaTmaDescSwizzle::SWIZZLE_128B);
 
-  create_packed_tma_desc_prefill(b, actual_seq_lens_q_data, d, h_qo,
-                                 tensor_traversal_stride_qkv.data(), tensor_box_size_q.data(),
-                                 packed_tma_desc_q, packed_tma_desc_o, q, out,
-                                 batch_offset_array_data);
+  if (use_cuda_graph == false) {
+    auto actual_seq_lens_q_data = actual_seq_lens_q.data_ptr<int32_t>();
+    create_packed_tma_desc_prefill(b, actual_seq_lens_q_data, d, h_qo,
+                                   tensor_traversal_stride_qkv.data(), tensor_box_size_q.data(),
+                                   packed_tma_desc_q, packed_tma_desc_o, q, out,
+                                   batch_offset_array_data);
 
-  cudaMemcpyAsync(workspace_start, packed_tma_desc.get(), sizeof(tma::cudaTmaDesc) * 2 * b,
-                  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(workspace_start, packed_tma_desc.get(), sizeof(tma::cudaTmaDesc) * 2 * b,
+                    cudaMemcpyHostToDevice, stream);
+  }
 
   cudnn_sdpa::AttentionDescriptor_t attn_desc{
       static_cast<uint32_t>(b),    static_cast<uint32_t>(h_qo),       static_cast<uint32_t>(h_kv),
