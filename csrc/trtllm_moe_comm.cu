@@ -68,12 +68,12 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
     torch::Tensor backwardRecvRankLocalIndices = torch::empty(
         {maxTokenCountPerRank * maxSendRanksPerToken}, gatheredTargetRankIds.options().dtype(torch::kInt32));
 
-    tensorrt_llm::kernels::MoeExpertParallelInfo expertParallelInfo;
+    flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
     expertParallelInfo.expertCount = expertCount;
     expertParallelInfo.topK = topK;
 
-    tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
-    tensorrt_llm::kernels::moeAllToAllPrepareIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank,
+    flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
+    flashinfer::trtllm_alltoall::moeAllToAllPrepareIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank,
         gatheredTargetRankIds.data_ptr<int>(), realRankTokenCountCumSumPtr, localGatherIndices.data_ptr<int>(),
         sendRankCountCumSum.data_ptr<int>(), sendRankLocalIndices.data_ptr<int>(), recvRankCountCumSum.data_ptr<int>(),
         recvRankLocalIndices.data_ptr<int>(), backwardRecvRankLocalIndices.data_ptr<int>(), stream);
@@ -117,12 +117,12 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    tensorrt_llm::kernels::MoeExpertParallelInfo expertParallelInfo;
+    flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
     expertParallelInfo.expertCount = expertCount;
     expertParallelInfo.topK = topK;
 
-    tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
-    tensorrt_llm::kernels::moeLocalGather(worldInfo, expertParallelInfo, maxTokenCountPerRank, localMaxTokenCount,
+    flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
+    flashinfer::trtllm_alltoall::moeLocalGather(worldInfo, expertParallelInfo, maxTokenCountPerRank, localMaxTokenCount,
         recvRankCumSum.data_ptr<int>(), localGatherIndices.data_ptr<int>(), gatheredExpertIds.data_ptr<int>(),
         gatheredScales.data_ptr<float>(), localExpertIds.data_ptr<int>(), localScales.data_ptr<float>(), stream);
 }
@@ -153,8 +153,8 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
 
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 
-    tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
-    tensorrt_llm::kernels::SendRecvDataInfo sendRecvDataInfo;
+    flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
+    flashinfer::trtllm_alltoall::SendRecvDataInfo sendRecvDataInfo;
 
     size_t eltSize = input.dtype().itemsize();
     size_t eltCountPerU64 = sizeof(uint64_t) / eltSize;
@@ -162,7 +162,7 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     sendRecvDataInfo.vectorSizeInU64 = input.size(1) / eltCountPerU64;
     sendRecvDataInfo.DoPreCompute();
 
-    tensorrt_llm::kernels::SendRecvDispls sendDispls, recvDispls;
+    flashinfer::trtllm_alltoall::SendRecvDispls sendDispls, recvDispls;
     sendDispls.dataPtr = static_cast<uint64_t*>(input.data_ptr());
     sendDispls.rankCountCumSum = sendRankCumSum.data_ptr<int>();
     sendDispls.rankLocalIndices = sendIndices.data_ptr<int>();
@@ -173,24 +173,24 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     recvDispls.rankLocalIndices = recvIndices.data_ptr<int>();
     recvDispls.vectorStrideInU64 = output.stride(0) / eltCountPerU64;
 
-    tensorrt_llm::kernels::MoeCommWorkspace workspace;
+    flashinfer::trtllm_alltoall::MoeCommWorkspace workspace;
     workspace.workspacePtr = allWorkspaces.data_ptr<uint64_t>();
     workspace.rankStrideInU64 = allWorkspaces.stride(0);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    tensorrt_llm::kernels::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls, workspace, stream);
+    flashinfer::trtllm_alltoall::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls, workspace, stream);
 }
 
 int64_t getWorkspaceSizePerRank(int64_t epSize)
 {
     int epSize32 = static_cast<int>(epSize);
-    return tensorrt_llm::kernels::getMoeCommWorkspaceSize(epSize32);
+    return flashinfer::trtllm_alltoall::getMoeCommWorkspaceSize(epSize32);
 }
 
 void setMaxUsableSmCount(int64_t maxSmCount)
 {
-    tensorrt_llm::kernels::setMaxUsableSmCount(maxSmCount);
+    flashinfer::trtllm_alltoall::setMaxUsableSmCount(maxSmCount);
 }
 
 
