@@ -2017,6 +2017,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.launch_dependents;");
+#endif
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
