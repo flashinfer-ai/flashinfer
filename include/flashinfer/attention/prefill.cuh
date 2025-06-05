@@ -1414,6 +1414,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
 
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h,
                                 group_size, &qo_smem, tid);
 
@@ -1564,6 +1568,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         }
       }
     }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
@@ -1651,6 +1658,14 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                    " and report the issue to the developers.";
         FLASHINFER_ERROR(err_msg.str());
       } else {
+        // PDL launch config
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+
         constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
         auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
         size_t smem_size = sizeof(typename KTraits::SharedStorage);
@@ -1679,7 +1694,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
         } else {
           // Use cooperative groups to increase occupancy
           params.partition_kv = true;
@@ -1692,7 +1707,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), num_chunks, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
           if constexpr (AttentionVariant::use_softmax) {
             FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
                                              HEAD_DIM_VO, stream));
@@ -1818,6 +1833,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
 
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n,
                                 q_stride_h, group_size, &qo_smem, tid);
@@ -1996,6 +2015,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         }
       }
     }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
@@ -2111,6 +2132,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
     DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
@@ -2119,6 +2141,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                             (kv_head_idx * group_size) * o_stride_h;
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
 
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n,
                                 q_stride_h, group_size, &qo_smem, tid);
@@ -2375,6 +2401,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         }
       }
     }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
@@ -2392,7 +2423,8 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream) {
+                                                    float* tmp_s, cudaStream_t stream,
+                                                    bool enable_pdl = true) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2459,12 +2491,27 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      // PDL launch config
+      cudaLaunchAttribute attribute[1];
+      cudaLaunchConfig_t config;
+      if (enable_pdl) {
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+      }
+
       if (tmp_v == nullptr) {
         // do not partition kv
         params.partition_kv = false;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
       } else {
         // partition kv
         params.partition_kv = true;
@@ -2473,16 +2520,21 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
         } else {
-          FLASHINFER_CUDA_CALL(
-              VariableLengthAttentionSum(tmp_v, params.merge_indptr, o, params.max_total_num_rows,
-                                         params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+              tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
+              num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
         }
       }
     }
@@ -2494,7 +2546,8 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream) {
+                                                   float* tmp_s, cudaStream_t stream,
+                                                   bool enable_pdl = true) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2562,12 +2615,27 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      // PDL launch config
+      cudaLaunchAttribute attribute[1];
+      cudaLaunchConfig_t config;
+      if (enable_pdl) {
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+      }
+
       if (tmp_v == nullptr) {
         // do not partition kv
         params.partition_kv = false;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
       } else {
         params.partition_kv = true;
         auto o = params.o;
@@ -2575,16 +2643,21 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        }
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
         } else {
-          FLASHINFER_CUDA_CALL(
-              VariableLengthAttentionSum(tmp_v, params.merge_indptr, o, params.max_total_num_rows,
-                                         params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+              tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
+              num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
         }
       }
     }

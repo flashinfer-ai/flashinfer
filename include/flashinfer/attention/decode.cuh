@@ -253,12 +253,14 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;
+
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
                 __powf(rope_rcp_theta,
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
+
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(q + qo_head_idx * q_stride_h, freq, seq_len - 1);
   } else {
@@ -446,17 +448,24 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     int32_t q_rope_offset_val = q_rope_offset == nullptr ? (kv_len - 1) : q_rope_offset[batch_idx];
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;
+
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
                 __powf(rope_rcp_theta,
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
         q + batch_idx * q_stride_n + qo_head_idx * q_stride_h, freq, q_rope_offset_val);
   } else {
-    // do not apply rotary embedding to q matrix
+// do not apply rotary embedding to q matrix
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
     q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
   }
 
@@ -589,6 +598,9 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
@@ -669,14 +681,14 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
                                         vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
       if (seq_len <= 256 || tmp == nullptr) {
         // no need to use partition-kv kernel
         dim3 nblks = dim3(1, num_kv_heads);
         dim3 nthrs = dim3(bdx, bdy, bdz);
         params.kv_chunk_size = seq_len;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
       } else {
         // use partition-kv kernel
         int num_blocks_per_sm = 0;
@@ -705,8 +717,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         params.lse = tmp_lse;
         params.kv_chunk_size = kv_chunk_size;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(
               MergeStates(tmp, tmp_lse, o, lse, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
@@ -722,7 +733,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream) {
+                                                  float* tmp_s, cudaStream_t stream,
+                                                  bool enable_pdl = true) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -750,15 +762,27 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                                             vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
+      // PDL launch config
+      cudaLaunchAttribute attribute[1];
+      cudaLaunchConfig_t config;
+      if (enable_pdl) {
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+      }
       if (tmp_v == nullptr) {
         // do not use partition-kv kernel
         dim3 nblks(padded_batch_size, num_kv_heads);
         dim3 nthrs(bdx, bdy, bdz);
         params.partition_kv = false;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+        } else {
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        }
       } else {
         // use partition-kv kernel
         params.partition_kv = true;
@@ -769,16 +793,20 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         void* args[] = {(void*)&params};
         dim3 nblks(padded_batch_size, num_kv_heads);
         dim3 nthrs(bdx, bdy, bdz);
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                         params.paged_kv.batch_size, nullptr,
-                                                         num_qo_heads, HEAD_DIM, stream));
+        if (enable_pdl) {
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, params.o_indptr, o,
-                                                          params.paged_kv.batch_size, nullptr,
-                                                          num_qo_heads, HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        }
+        if constexpr (AttentionVariant::use_softmax) {
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
+              num_qo_heads, HEAD_DIM, stream, enable_pdl));
+        } else {
+          FLASHINFER_CUDA_CALL(
+              VariableLengthAttentionSum(tmp_v, params.o_indptr, o, params.paged_kv.batch_size,
+                                         nullptr, num_qo_heads, HEAD_DIM, stream, enable_pdl));
         }
       }
     });
@@ -917,11 +945,15 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   uint32_t qo_head_idx[tile_size_qo_heads];
 
   vec_t<float, vec_size_kpe> freq;
+
 #pragma unroll
   for (uint32_t i = 0; i < vec_size_kpe; ++i) {
     freq[i] = rope_rcp_scale * __powf(rope_rcp_theta, float(2 * ((tx * vec_size_kpe + i) / 2)) /
                                                           float(head_dim_kpe));
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
   // load q_nope and q_pe tile
 #pragma unroll
   for (int i = 0; i < tile_size_qo_heads; ++i) {
@@ -1042,11 +1074,15 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
       }
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Params::DTypeO* tmp_v,
-                                                     float* tmp_s, cudaStream_t stream) {
+                                                     float* tmp_s, cudaStream_t stream,
+                                                     bool enable_pdl = true) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -1077,13 +1113,28 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
+    // PDL launch config
+    cudaLaunchAttribute attribute[1];
+    cudaLaunchConfig_t config;
+    if (enable_pdl) {
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = 1;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+    }
+
     if (tmp_v == nullptr) {
       // do not use partition-kv kernel
       dim3 nblks(padded_batch_size, gdy);
       dim3 nthrs(bdx, bdy, bdz);
       params.partition_kv = false;
       void* args[] = {(void*)&params};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      if (enable_pdl) {
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+      } else {
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+      }
     } else {
       // use partition-kv kernel
       params.partition_kv = true;
@@ -1094,10 +1145,15 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
       void* args[] = {(void*)&params};
       dim3 nblks(padded_batch_size, gdy);
       dim3 nthrs(bdx, bdy, bdz);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-      FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                     params.paged_kv.batch_size, nullptr,
-                                                     num_qo_heads, HEAD_DIM_CKV, stream));
+      if (enable_pdl) {
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+      } else {
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+      }
+      FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+          tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr, num_qo_heads,
+          HEAD_DIM_CKV, stream, enable_pdl));
     }
   });
   return cudaSuccess;
