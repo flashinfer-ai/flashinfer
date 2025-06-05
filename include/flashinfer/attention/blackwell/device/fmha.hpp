@@ -183,7 +183,7 @@ class FMHA {
 
   /// Primary run() entry point API that is static allowing users to create and manage their own
   /// params. Supplied params struct must be construct by calling Kernel::to_underling_arguments()
-  static Status run(Params& params, cudaStream_t stream = nullptr) {
+  static Status run(Params& params, cudaStream_t stream = nullptr, bool launch_with_pdl = true) {
     CUTLASS_TRACE_HOST("FMHA::run()");
     dim3 const block = Kernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);
@@ -199,8 +199,8 @@ class FMHA {
                    cute::size<2>(typename Kernel::ClusterShape{}));
       void const* kernel = (void const*)device_kernel<Kernel>;
       void* kernel_params[] = {&params};
-      launch_result =
-          ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel, kernel_params);
+      launch_result = ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel,
+                                              kernel_params, launch_with_pdl);
     } else {
       launch_result = Status::kSuccess;
       device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);

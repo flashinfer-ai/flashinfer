@@ -11,6 +11,8 @@ from torch.utils.cpp_extension import _get_cuda_arch_flags
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
 from .comm import gen_comm_module
+from .fp4_quantization import gen_fp4_quantization_sm100_module
+from .fused_moe import gen_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -19,6 +21,7 @@ from .jit import (
     gen_batch_mla_module,
     gen_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
+    gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
 )
@@ -317,7 +320,10 @@ def gen_all_modules(
     if has_sm90:
         jit_specs.append(gen_gemm_sm90_module())
     if has_sm100:
+        jit_specs.append(gen_fused_moe_sm100_module())
+        jit_specs.append(gen_fp4_quantization_sm100_module())
         jit_specs.append(gen_gemm_sm100_module())
+
     jit_specs += [
         gen_cascade_module(),
         gen_comm_module(),
@@ -486,6 +492,7 @@ def main():
         project_root / "3rdparty" / "cutlass" / "include",
         project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
     ]
+    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
 
     # Update workdir
     jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
@@ -511,7 +518,49 @@ def main():
 
     # Generate JIT specs
     print("Generating JIT specs...")
-    jit_specs = gen_all_modules(
+    jit_specs = [
+        gen_jit_spec(
+            "logging",
+            [
+                jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
+            ],
+            extra_include_paths=[
+                jit_env.SPDLOG_INCLUDE_DIR,
+                jit_env.FLASHINFER_INCLUDE_DIR,
+            ],
+        ),
+        gen_jit_spec(
+            "trtllm_utils",
+            [
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "delayStream.cu",
+            ],
+            extra_include_paths=[
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "cutlass_extensions"
+                / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "internal_cutlass_kernels"
+                / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "internal_cutlass_kernels",
+            ],
+        ),
+    ]
+    jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
         fa2_head_dim_,

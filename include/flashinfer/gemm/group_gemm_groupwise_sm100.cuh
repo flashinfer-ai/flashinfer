@@ -31,7 +31,7 @@ using namespace cute;
 
 template <typename ScaleConfig, typename DTypeIn, typename DTypeSF, typename DTypeOut,
           typename ProblemShape, typename StrideA, typename StrideB, typename StrideC,
-          typename LayoutSFA, typename LayoutSFB>
+          typename LayoutSFA, typename LayoutSFB, bool ScaleMajorK>
 __global__ void compute_sm100_cutlass_group_gemm_args(
     DTypeIn* A, DTypeIn* B, DTypeSF* SFA, DTypeSF* SFB, DTypeOut* C, int* m_indptr, int max_m,
     int n, int k, int batch_size, int scale_granularity_m, int scale_granularity_n,
@@ -45,22 +45,29 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_C[i] = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
-  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(max_m, n, k, 1));
-  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
   A_ptr[i] = A + int64_t(m_indptr[i]) * int64_t(k);
   B_ptr[i] = B + int64_t(i) * int64_t(k) * int64_t(n);
   C_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
   D_ptr[i] = C + int64_t(m_indptr[i]) * int64_t(n);
-  SFA_ptr[i] = SFA + int64_t(m_indptr[i]) / int64_t(scale_granularity_m);
+  if (ScaleMajorK) {
+    layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+    SFA_ptr[i] = SFA + int64_t(m_indptr[i]) * int64_t(k) / int64_t(scale_granularity_k) /
+                           int64_t(scale_granularity_m);
+  } else {
+    layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(max_m, n, k, 1));
+    SFA_ptr[i] = SFA + int64_t(m_indptr[i]) / int64_t(scale_granularity_m);
+  }
+  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
   SFB_ptr[i] = SFB + int64_t(i) * int64_t(k) * int64_t(n) / int64_t(scale_granularity_n) /
                          int64_t(scale_granularity_k);
+
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
-template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, int MmaSM,
-          typename DTypeIn, typename DTypeOut>
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
+          int MmaSM, typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_buffer_size_in_bytes,
                                                  void* float_buffer,
                                                  size_t float_buffer_size_in_bytes, DTypeIn* A,
@@ -97,9 +104,13 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   using MmaTileShape_MNK = Shape<cute::Int<MmaSM * 128>, _128, _128>;
   using ClusterShape_MNK = Shape<cute::Int<MmaSM>, _1, _1>;
 
-  using ScaleConfig =
+  using ScaleConfig = std::conditional_t<
+      ScaleMajorK,
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
-                                                 ScaleGranularityK>;
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                 ScaleGranularityK, UMMA::Major::MN,
+                                                 UMMA::Major::MN>>;
 
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
@@ -184,7 +195,7 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* int_buffer, size_t int_bu
   auto prepare_args_kernel =
       compute_sm100_cutlass_group_gemm_args<ScaleConfig, ElementA, float, ElementC,
                                             ProblemShape::UnderlyingProblemShape, StrideA, StrideB,
-                                            StrideC, LayoutSFA, LayoutSFB>;
+                                            StrideC, LayoutSFA, LayoutSFB, ScaleMajorK>;
 
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
       &config, prepare_args_kernel, A, B, SFA, SFB, C, m_indptr, max_m, n, k, batch_size,

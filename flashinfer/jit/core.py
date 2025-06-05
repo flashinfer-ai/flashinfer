@@ -71,6 +71,7 @@ class JitSpec:
     extra_cuda_cflags: Optional[List[str]]
     extra_ldflags: Optional[List[str]]
     extra_include_dirs: Optional[List[Path]]
+    is_class: bool = False
 
     @property
     def ninja_path(self) -> Path:
@@ -107,15 +108,21 @@ class JitSpec:
         with FileLock(tmpdir / f"{self.name}.lock", thread_local=False):
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
-    def build_and_load(self):
+    def build_and_load(self, class_name: str = None):
         if self.aot_path.exists():
+            print("yy" * 100, self.aot_path)
             so_path = self.aot_path
         else:
             so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose)
-        torch.ops.load_library(so_path)
-        return getattr(torch.ops, self.name)
+        load_class = class_name is not None
+        loader = torch.classes if load_class else torch.ops
+        loader.load_library(so_path)
+        if load_class:
+            cls = torch._C._get_custom_class_python_wrapper(self.name, class_name)
+            return cls
+        return getattr(loader, self.name)
 
 
 def gen_jit_spec(

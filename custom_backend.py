@@ -33,6 +33,7 @@ def _create_data_dir():
         dst.symlink_to(src, target_is_directory=True)
 
     ln("3rdparty/cutlass", "cutlass")
+    ln("3rdparty/spdlog", "spdlog")
     ln("csrc", "csrc")
     ln("include", "include")
     ln("tvm_binding", "tvm_binding")

@@ -19,8 +19,28 @@
 #include <exception>
 #include <sstream>
 
-namespace flashinfer {
+#define FLASHINFER_ERROR(message) throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, message)
 
+template <typename T>
+void write_to_stream(std::ostringstream& oss, T&& val) {
+  oss << std::forward<T>(val);
+}
+
+template <typename T, typename... Args>
+void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
+  oss << std::forward<T>(val) << " ";
+  write_to_stream(oss, std::forward<Args>(args)...);
+}
+
+#define FLASHINFER_CHECK(condition, ...) \
+  if (!(condition)) {                    \
+    std::ostringstream oss;              \
+    write_to_stream(oss, __VA_ARGS__);   \
+    std::cerr << oss.str() << std::endl; \
+    FLASHINFER_ERROR(oss.str());         \
+  }
+
+namespace flashinfer {
 class Error : public std::exception {
  private:
   std::string message_;
@@ -35,13 +55,6 @@ class Error : public std::exception {
 
   virtual const char* what() const noexcept override { return message_.c_str(); }
 };
-
-#define FLASHINFER_ERROR(message) throw Error(__FUNCTION__, __FILE__, __LINE__, message)
-
-#define FLASHINFER_CHECK(condition, message) \
-  if (!(condition)) {                        \
-    FLASHINFER_ERROR(message);               \
-  }
 
 }  // namespace flashinfer
 

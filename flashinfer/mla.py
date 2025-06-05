@@ -63,10 +63,6 @@ def gen_mla_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
         ],
-        extra_include_paths=[
-            jit_env.CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "77_blackwell_fmha",
-            jit_env.CUTLASS_INCLUDE_DIRS[0] / ".." / "examples" / "common",
-        ],
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
 

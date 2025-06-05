@@ -47,6 +47,7 @@ def generate_ninja_build_for_op(
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
+    system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
@@ -115,7 +116,7 @@ def generate_ninja_build_for_op(
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags"
+        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",

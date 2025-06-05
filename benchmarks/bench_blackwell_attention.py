@@ -44,20 +44,27 @@ def bench_fmha_blackwell(
     kv_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
     )
-
-    o, lse = flashinfer.prefill.fmha_varlen(
-        q, k, v, qo_segment_offsets, kv_segment_offsets, causal=causal
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=dtype, device="cuda"),
+        kv_layout="NHD",
+        backend="cutlass",
     )
-
+    wrapper.plan(
+        qo_segment_offsets,
+        kv_segment_offsets,
+        num_heads,
+        num_heads,
+        head_dim,
+        head_dim_vo=head_dim,
+        causal=causal,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
     ms = do_bench(
-        lambda: flashinfer.prefill.fmha_varlen(
-            q,
-            k,
-            v,
-            qo_segment_offsets,
-            kv_segment_offsets,
-            causal=causal,
-        )
+        lambda: wrapper.run(q, k, v),
+        warmup=100,
+        rep=1000,
     )
 
     def flops(ms):
