@@ -64,10 +64,7 @@ def cudnn_batch_prefill_with_kv_cache(
             raise ValueError("lse must have shape (bs, s_q, h_qo)")
 
     if out is None:
-        out = torch.zeros_like(q)
-        print(
-            f"out.shape: {out.shape}, out.stride: {out.stride()}, out.data_ptr: {hex(out.data_ptr())}"
-        )
+        out = torch.empty_like(q)
 
     actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
     actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device)

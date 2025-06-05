@@ -71,7 +71,7 @@ enum KernelType { PREFILL, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
-                                "e45df03b80f22d0b7bc43e9beda1b73373b5b2c8bd545666632a9a30e2911f19");
+                                "124f544858cd7e929d8f52fe9c4a1ecdaa25300fa93a7fd8c9ec58506e97203c");
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
                                "47cd6058cd981abebe86d32600aaab793fd04b4e35d6d9964a5fbcf4b5c18431");
@@ -95,8 +95,6 @@ static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_dat
     const uint32_t actual_s_q = static_cast<uint32_t>(actual_seq_lens_q_data[i]);
 
     batch_offset_qo = batch_offset_array ? batch_offset_array[i] : batch_offset_qo;
-    std::cout << "actual_s_q: " << actual_s_q << " batch_offset_qo: " << batch_offset_qo
-              << std::endl;
     std::array<uint32_t, DIMS_QKV> packed_tensor_size_qo = {d, actual_s_q, h_qo, 1};
     std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_qo = {h_qo * d * BYTES_PER_ELEMENT,
                                                                   d * BYTES_PER_ELEMENT, 0};
@@ -116,7 +114,6 @@ static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_dat
 
     batch_offset_qo += static_cast<int64_t>(actual_s_q) * d * h_qo *
                        BYTES_PER_ELEMENT;  // Becomes a no-op if batch_offset_array is provided
-    std::cout << "batch_offset_qo: " << batch_offset_qo << std::endl;
   }
 }
 
@@ -312,9 +309,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   config.gridDimY = h_qo;
   config.gridDimZ = 1;
 
-  std::cout << "config.gridDimX: " << config.gridDimX << " config.gridDimY: " << config.gridDimY
-            << " config.gridDimZ: " << config.gridDimZ << std::endl;
-
   config.blockDimX = NUM_THREADS;
   config.blockDimY = 1;
   config.blockDimZ = 1;
@@ -328,9 +322,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   // auto qo_strides = q.strides();
   auto kv_strides = v_cache.strides();
 
-  std::cout << "kv_strides: " << kv_strides[0] << " " << kv_strides[1] << " " << kv_strides[2]
-            << std::endl;
-
   std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
   std::array<uint64_t, DIMS_QKV - 1> tensor_stride_kv = {kv_strides[2] * (BYTES_PER_ELEMENT),
@@ -340,11 +331,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
   std::array<uint32_t, DIMS_QKV> tensor_box_size_q = {64, TILE_M_1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {64, std::min(TILE_N_1, page_size), 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_v = {64, std::min(TILE_N_1, page_size), 1, 1};
-
-  std::cout << "tensor_size_kv: " << tensor_size_kv[0] << " " << tensor_size_kv[1] << " "
-            << tensor_size_kv[2] << " " << tensor_size_kv[3] << std::endl;
-  std::cout << "ANE tma_tensor_stride_kv: " << tensor_stride_kv[0] << " " << tensor_stride_kv[1]
-            << " " << tensor_stride_kv[2] << std::endl;
 
   uint64_t batch_offset_qo = 0;
 
@@ -387,8 +373,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
       static_cast<uint32_t>(h_kv), static_cast<uint32_t>(s_qo),       static_cast<uint32_t>(s_kv),
       static_cast<uint32_t>(d),    static_cast<uint32_t>(h_qo / h_kv)};
 
-  std::cout << "attn_desc: group count q_heads_per_kv " << attn_desc.q_heads_per_kv << std::endl;
-
   float attn_scale = scale;
 
   cudnn_sdpa::strides_t lse_strides = {h_qo * s_qo, 1, h_qo, 1};
@@ -423,25 +407,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
     std::cout << std::endl;
   };
 
-  std::cout << "packed_tma_desc_q: " << std::hex << std::endl;
-  for (auto i = 0; i < b; i++) {
-    std::cout << std::hex;
-    std::cout << "q: ";
-    tma::cudaTmaDescTiled* q_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]);
-    print_cudaTmaDescTiled(q_desc);
-    std::cout << std::endl << "o: ";
-    tma::cudaTmaDescTiled* o_desc = reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]);
-    print_cudaTmaDescTiled(o_desc);
-    std::cout << std::endl;
-  }
-
-  std::cout << std::hex;
-  std::cout << "tma_desc_k: " << std::endl;
-  print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&tma_desc_k));
-  std::cout << "tma_desc_v: " << std::endl;
-  print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&tma_desc_v));
-  std::cout << std::dec << std::endl;
-
   void* args[14];
   args[0] = (void*)&attn_desc;
   args[1] = (void*)&packed_tma_desc_q_dev;
@@ -464,34 +429,6 @@ void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tens
     cuGetErrorString(err_launch, &errstr);
     throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
   }
-
-  // Copy output data to host array
-  size_t output_size = q.size(0) * h_qo * d * sizeof(uint16_t);
-  uint16_t* host_output = new uint16_t[output_size / sizeof(uint16_t)];
-  cudaMemcpyAsync(host_output, out.data_ptr(), output_size, cudaMemcpyDeviceToHost, stream);
-
-  // Copy the first page of v_cache to host
-  uint16_t* host_v_cache = new uint16_t[page_size * h_kv * d];
-  cudaMemcpyAsync(host_v_cache, v_cache.data_ptr(), page_size * h_kv * d * sizeof(uint16_t),
-                  cudaMemcpyDeviceToHost, stream);
-
-  cudaStreamSynchronize(stream);
-
-  std::cout << "First page of v_cache:" << std::endl;
-  for (size_t i = 0; i < page_size * h_kv * d; i++) {
-    std::cout << i << " " << std::hex << host_v_cache[i] << " " << std::dec << std::endl;
-  }
-
-  // Print each element
-  std::cout << "Output tensor elements:" << std::endl;
-  for (size_t i = 0; i < output_size / sizeof(uint16_t); i++) {
-    __nv_bfloat16 f = *(reinterpret_cast<__nv_bfloat16*>(&(host_output[i])));
-    std::cout << i << " " << std::hex << host_output[i] << " " << std::dec << std::endl;
-  }
-  std::cout << std::endl;
-
-  // Clean up
-  delete[] host_output;
 }
 
 static int32_t compute_split_factor(int32_t b, int32_t h_kv, int32_t h_qo, int32_t s_kv,
