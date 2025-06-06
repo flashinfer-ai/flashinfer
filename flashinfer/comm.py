@@ -410,6 +410,22 @@ def get_comm_module():
     )
 
 
+def gen_nvshmem_module() -> JitSpec:
+    return gen_jit_spec(
+        "nvshmem",
+        [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
+        extra_include_paths=[jit_env.get_nvshmem_include_dir()],
+        extra_ldflags=[f"-L{jit_env.get_nvshmem_lib_dir()}", "-lnvshmem"],
+    )
+
+
+@functools.cache
+def get_nvshmem_module():
+    module = gen_nvshmem_module().build_and_load()
+
+    return module
+
+
 def init_custom_ar(
     ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
 ) -> int:
