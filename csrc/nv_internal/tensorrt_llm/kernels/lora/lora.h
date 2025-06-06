@@ -17,11 +17,10 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
-
 #include <cassert>
 #include <vector>
 
+#include "tensorrt_llm/common/NvInferRuntime.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 
 namespace tensorrt_llm::kernels {

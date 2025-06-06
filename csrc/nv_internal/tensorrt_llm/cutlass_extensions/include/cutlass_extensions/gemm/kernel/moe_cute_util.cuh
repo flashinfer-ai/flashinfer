@@ -16,12 +16,7 @@
  */
 
 #pragma once
-#include <cutlass/cutlass.h>
-#include <cutlass/layout/layout.h>
-#include <cutlass/numeric_conversion.h>
-
-#include <cute/algorithm/copy.hpp>
-#include <cute/atom/copy_atom.hpp>
+#include "cute/tensor.hpp"
 
 template <typename Element, typename Layout, int Alignment, int SizeK>
 struct DefaultGemm_TensorOpSm80_OperandA;
