@@ -17,11 +17,361 @@ namespace trtllm_moe_allreduce_fusion {
 
 namespace details {
 
+static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
+static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
 }  // namespace details
+
+namespace maths {
+// // ============================== Cast ==============================
+template <typename T_OUT, typename T_IN>
+__device__ inline T_OUT cuda_cast(T_IN val) {
+  return val;
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int2>(int2 val) {
+  return make_float2(val.x, val.y);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, float>(float val) {
+  return make_float2(val, val);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, half2>(half2 val) {
+  return __half22float2(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float2>(float2 val) {
+  return __float22half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float>(float val) {
+  return __float2half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, half>(half val) {
+  return __half2half2(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, half>(half val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  union {
+    half fp16;
+    int16_t int16_in;
+  };
+
+  fp16 = val;
+  asm volatile("cvt.rni.sat.s8.f16 %0, %1;" : "=h"(int16) : "h"(int16_in));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, half2>(half2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, float>(float val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, float2>(float2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_half2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_float2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int32_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int8_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast(__nv_bfloat16 val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline float cuda_cast<float, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __bfloat162float(val);
+}
+
+inline __device__ float2 bf1622float2(const __nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = __low2float(val);
+  f_val.y = __high2float(val);
+  return f_val;
+#else
+  return __bfloat1622float2(val);
+#endif
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622float2(val);
+}
+
+template <>
+__device__ inline half cuda_cast<half, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __float2half(__bfloat162float(val));
+}
+
+inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = max(min(__low2float(val), 127.f), -128.f);
+  f_val.y = max(min(__high2float(val), 127.f), -128.f);
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(f_val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(f_val.y));
+  return int16;
+#else
+  val = __hmin2(val, make_bfloat162(127., 127.));
+  val = __hmax2(val, make_bfloat162(-128., -128.));
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(val.y));
+  return int16;
+#endif
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622int16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, float>(float val) {
+  return __float2bfloat16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, half>(half val) {
+  return __float2bfloat16(__half2float(val));
+}
+
+inline __device__ __nv_bfloat162 bf162bf162(const __nv_bfloat16 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  __nv_bfloat162 val2;
+  val2.x = val;
+  val2.y = val;
+  return val2;
+#else
+  return __bfloat162bfloat162(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, __nv_bfloat16>(__nv_bfloat16 val) {
+  return bf162bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float>(float val) {
+  return __float2bfloat162_rn(val);
+}
+
+inline __device__ __nv_bfloat162 float22bf162(const float2 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  return __floats2bfloat162_rn(val.x, val.y);
+#else
+  return __float22bfloat162_rn(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float2>(float2 val) {
+  return float22bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  __nv_bfloat162 res;
+  res.x = cuda_cast<__nv_bfloat16>(int8[0]);
+  res.y = cuda_cast<__nv_bfloat16>(int8[1]);
+  return res;
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val) {
+  return float22bf162(__half22float2(val));
+}
+
+// // ============================== Abs ==============================
+template <typename T>
+__device__ inline T cuda_abs(T val) {
+  assert(false);
+  return {};
+}
+
+template <>
+__device__ inline float cuda_abs(float val) {
+  return fabs(val);
+}
+
+template <>
+__device__ inline float2 cuda_abs(float2 val) {
+  return make_float2(fabs(val.x), fabs(val.y));
+}
+
+template <>
+__device__ inline half cuda_abs(half val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline half2 cuda_abs(half2 val) {
+  return __habs2(val);
+}
+
+#if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
+template <>
+__device__ inline __nv_bfloat16 cuda_abs(__nv_bfloat16 val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val) {
+  return __habs2(val);
+}
+#endif
+
+// // ============================== Max ==============================
+template <typename To, typename Ti>
+__device__ inline To cuda_max(Ti val) {
+  return cuda_cast<To>(val);
+};
+
+template <>
+__device__ inline float cuda_max(float2 val) {
+  return fmaxf(val.x, val.y);
+}
+
+template <>
+__device__ inline half cuda_max(half2 val) {
+  return __hmax(val.x, val.y);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  return __hmax(val.x, val.y);
+#else
+  assert(0);
+  asm volatile("brkpt;\n" ::);
+  return __nv_bfloat16(0);
+#endif
+}
+
+// Binary maximum: compute the max of two values.
+template <typename T>
+__device__ inline T cuda_max(T val1, T val2) {
+  return (val1 > val2) ? val1 : val2;
+}
+
+template <>
+__device__ inline float2 cuda_max(float2 val1, float2 val2) {
+  float2 out;
+  out.x = fmaxf(val1.x, val2.x);
+  out.y = fmaxf(val1.y, val2.y);
+  return out;
+}
+
+template <>
+__device__ inline half2 cuda_max(half2 val1, half2 val2) {
+  return __hmax2(val1, val2);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 val2) {
+  return __hmax2(val1, val2);
+}
+
+// // ============================== Reciprocal ==============================
+// Fast reciprocal.
+inline __device__ float reciprocal_approximate_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
+}
+}  // namespace maths
 
 enum class FP4QuantizationSFLayout {
   // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
@@ -80,6 +430,46 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
+inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
+                                                  std::optional<int> numRows, int numCols) {
+  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  // batched tensor
+  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+  int64_t innerMStride = 4 * innerKStride;  // 4
+
+  // M tile layout [32, 4] is column-major.
+  int32_t outerMIdx = (mIdx % 32);
+  int64_t outerMStride = 4 * innerMStride;  // 16
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = 32 * outerMStride;  // 512
+
+  // SF vector size 16. We round the "numCols" up to a multiple of 64.
+  int factor = details::CVT_FP4_SF_VEC_SIZE * 4;
+  int32_t numKTiles = (numCols + factor - 1) / factor;
+  int32_t mTileIdx = mIdx / (32 * 4);
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  // Each SF block has 128 rows so pad rows to the multiple of 128.
+  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+  int64_t bTileStride = numMTiles * mTileStride;
+
+  // Compute the global offset.
+  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
+                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
+                     innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                        int colIdx, std::optional<int> numRows,
@@ -104,7 +494,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
       // Linear row-major layout, no padding required.
       int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
-      int32_t numKTiles = numCols / CVT_FP4_SF_VEC_SIZE;
+      int32_t numKTiles = numCols / details::CVT_FP4_SF_VEC_SIZE;
       int64_t mTileStride = numKTiles;
 
       int64_t BTileStride = numRows.value_or(0) * mTileStride;
@@ -141,7 +531,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFSca
   // Get the SF (max value of the vector / max value of e2m1).
   // maximum value of e2m1 = 6.0.
   // TODO: use half as compute data type.
-  float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+  float SFValue = SFScaleVal * (vecMax * maths::reciprocal_approximate_ftz(6.0f));
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
@@ -158,9 +548,9 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFSca
   }
   // Get the output scale.
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  float outputScale =
-      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                   : 0.0f;
+  float outputScale = SFValue != 0 ? maths::reciprocal_approximate_ftz(
+                                         SFValue * maths::reciprocal_approximate_ftz(SFScaleVal))
+                                   : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
@@ -168,14 +558,14 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFSca
   }
 
   // Convert the input to float.
-  float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+  float2 fp2Vals[details::CVT_FP4_ELTS_PER_THREAD / 2];
 
 #pragma unroll
-  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+  for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec.elts[i]);
+      fp2Vals[i] = __half22float2(vec[i]);
     } else {
-      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+      fp2Vals[i] = __bfloat1622float2(vec[i]);
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
@@ -191,11 +581,6 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFSca
 #endif
 }
 }  // namespace utils
-
-// struct __device_builtin__ __builtin_align__(16) float4
-// {
-//     float x, y, z, w;
-// };
 
 template <typename T>
 struct AllReduceFusionParams {
@@ -291,9 +676,9 @@ template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
                                                        vec_t<T, VEC_SIZE> const& gamma,
                                                        float const eps, int hidden_dim) {
-  namespace cg = cooperative_groups;
   __shared__ float s_val;
   vec_t<T, VEC_SIZE> norm_out;
+  namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   float acc = 0.f;
 #pragma unroll
@@ -321,37 +706,137 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
   __syncthreads();
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    norm_out[i] =
-        static_cast<T>(static_cast<float>(residual[i]) * s_val * static_cast<float>(gamma[i]));
+    norm_out[i] = static_cast<float>(residual[i]) * s_val * static_cast<float>(gamma[i]);
   }
   return norm_out;
+}
+
+// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
+        "f"(array[6]), "f"(array[7]));
+  return val;
+#else
+  // static_assert(false, "not supported.");
+  return 0;
+#endif
+}
+
+// Quantizes the provided PackedVec into the uint32_t output
+template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
+__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
+                                         uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Get absolute maximum values among the local 8 values.
+  auto localMax = maths::cuda_abs(vec[0]);
+
+// Local maximum value.
+#pragma unroll
+  for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = maths::cuda_max(localMax, maths::cuda_abs(vec[i]));
+  }
+
+  // Get the absolute maximum among all 16 values (two threads).
+  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  // Get the final absolute maximum values.
+  float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
+
+  // Get the SF (max value of the vector / max value of e2m1).
+  // maximum value of e2m1 = 6.0.
+  // TODO: use half as compute data type.
+  float SFValue = SFScaleVal * (vecMax * maths::reciprocal_approximate_ftz(6.0f));
+  // 8 bits representation of the SF.
+  uint8_t fp8SFVal;
+  // Write the SF to global memory (STG.8).
+  if constexpr (UE8M0_SF) {
+    __nv_fp8_e8m0 tmp;
+    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    SFValue = static_cast<float>(tmp);
+    fp8SFVal = tmp.__x;
+  } else {
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+  }
+  // Get the output scale.
+  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+  float outputScale = SFValue != 0 ? maths::reciprocal_approximate_ftz(
+                                         SFValue * maths::reciprocal_approximate_ftz(SFScaleVal))
+                                   : 0.0f;
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[details::CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<T, half>) {
+      fp2Vals[i] = __half22float2(vec[i]);
+    } else {
+      fp2Vals[i] = __bfloat1622float2(vec[i]);
+    }
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+
+  // Convert to e2m1 values.
+  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
 }
 
 template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
   vec_t<T, VEC_SIZE> residual_val;
+  residual_val.load(reinterpret_cast<T*>(params.residual_in) +
+                    access_id * details::kBytesPerAccess);
   vec_t<T, VEC_SIZE> gamma_val;
-  residual_val.load(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.residual_in) + access_id);
-  gamma_val.load(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.rms_gamma) + access_id_in_token);
+  gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) +
+                 access_id_in_token * details::kBytesPerAccess);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    residual_val.store(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.residual_out) + access_id);
+    residual_val.store(reinterpret_cast<T*>(params.residual_out) +
+                       access_id * details::kBytesPerAccess);
   }
-  vec_t<T, VEC_SIZE> norm_val =
-      rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+  vec_t<T, VEC_SIZE> norm_val;
+  norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
-    norm_val.store(reinterpret_cast<vec_t<T, VEC_SIZE>*>(params.norm_out) + access_id);
+    norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * details::kBytesPerAccess);
   }
   if constexpr (QuantOut) {
-    // todo: review and fix it
-    // vec_t<T, VEC_SIZE> pack_val;
-    // pack_val.cast_load(norm_val);
+    // PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
         params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+    // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
+    //     cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-        utils::cvt_warp_fp16_to_fp4(norm_val, *params.scale_factor, sf_out);
+        cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }
 }
 
@@ -370,6 +855,11 @@ template <>
 struct neg_zero<nv_bfloat16> {
   static constexpr unsigned short neg_zero_bits = 0x8000U;
   static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
+};
+
+template <>
+struct neg_zero<float> {
+  static constexpr unsigned int neg_zero_bits = 0x80000000U;
 };
 
 template <typename T>
@@ -396,17 +886,9 @@ __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 
 template <typename T>
 __device__ __forceinline__ void set_neg_zero(T* addr) {
-  vec_t<T, details::kBytesPerAccess / sizeof(T)> val;
+  vec_t<T, 16 / sizeof(T)> val;
   val.fill(neg_zero_v<T>);
   val.store_global_volatile(addr);
-}
-
-__device__ __forceinline__ float4 ld_global_volatile(float4* addr) {
-  float4 val;
-  asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-               : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-               : "l"(addr));
-  return val;
 }
 
 int get_sm_count() {
@@ -441,28 +923,26 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
 
-  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-
   // Each token is handled by one cluster
   // which token is handled by current cluster
   int token_id = grid.cluster_rank();
   // total number of token
   int num_token = params.size / params.hidden_dim;
-  // Each thread handle kElemsPerAccess num elem in token. Total cluster.num_threads() to handle one
-  // token For current token, which kElemsPerAccess is handled by current thread (in unit of
-  // kElemsPerAccess)
+  // Each thread handle VEC_SIZE num elem in token. Total cluster.num_threads() to handle one
+  // token For current token, which VEC_SIZE is handled by current thread (in unit of
+  // VEC_SIZE)
   int access_id_in_token = cluster.thread_rank();
-  // Across all token, which kElemsPerAccess is handled by current thread (in unit of
-  // kElemsPerAccess)
+  // Across all token, which VEC_SIZE is handled by current thread (in unit of
+  // VEC_SIZE)
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
   int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
   // Persistent kernel
   // stride to next token handled by current cta
   int token_stride = grid.num_clusters();
-  // stride in unit of kElemsPerAccess
+  // stride in unit of VEC_SIZE
   int access_stride = token_stride * params.hidden_dim / VEC_SIZE;
-  // Total number of access in unit of kElemsPerAccess to handle (token_num * hidden_dim)
+  // Total number of access in unit of VEC_SIZE to handle (token_num * hidden_dim)
   // This is within one rank
-
   int tot_access = params.size / VEC_SIZE;
   vec_t<T, VEC_SIZE> clear_vec;
   clear_vec.fill(neg_zero_v<T>);
@@ -475,16 +955,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   int threadid_in_cluster = cluster.thread_rank();
   // Start Offset within one token's hidden_size of element
   // Current thread handle token[thread_offset_within_token : thread_offset_within_token +
-  // kElemsPerAccess]
-
-  // todo(review): review this
+  // VEC_SIZE]
   int thread_offset_within_token = threadid_in_cluster * VEC_SIZE;
-
-  // todo(review): review this
-  union ACC_TYPE {
-    vec_t<T, VEC_SIZE> packed;
-    T unpacked[VEC_SIZE];
-  };
 
   // Persistent Kernel
   // Each cluster iterate through all token it need to handle
@@ -497,75 +969,56 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     // Offset within (num_token, hidden_size) in unit of element
     int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
 
-    ACC_TYPE accumulator;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      accumulator.unpacked[i] = static_cast<T>(0);
-    }
+    vec_t<T, VEC_SIZE> accumulator;
+    accumulator.fill(0.f);
 
     // * Iterate through all active expert
-    int num_actexp = *(params.moe_reduction_device_num_experts);
+    int num_actexp = params.moe_reduction_device_num_experts;
     for (int actexp_i = 0; actexp_i < num_actexp; ++actexp_i) {
       // * Load active expert i's token j's partial data
       // Offset within (num_act_exp, num_token, hidden_size) in unit of element
       int thread_offset_across_actexp_token =
           actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
-      ACC_TYPE actexp_i_data;
-
-      actexp_i_data.packed = reinterpret_cast<vec_t<T, VEC_SIZE> const*>(
-          params.moe_reduction_active_experts_token_input)[thread_offset_across_actexp_token /
-                                                           VEC_SIZE];
+      vec_t<T, VEC_SIZE> actexp_i_data;
+      actexp_i_data.load(reinterpret_cast<T*>(params.moe_reduction_active_experts_token_input) +
+                         thread_offset_across_actexp_token);
 
       // * Load active expert i's token j's scale
       int thread_offset_scale = actexp_i * num_token + token_id;
       float actexp_i_token_j_scale =
           reinterpret_cast<float const*>(params.moe_reduction_scale_input)[thread_offset_scale];
 
-      // * acc += scale(data)
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         // assume computation is done in ScaleType
-        accumulator.unpacked[i] += static_cast<T>(
-            (static_cast<float>(actexp_i_data.unpacked[i]) * actexp_i_token_j_scale));
+        accumulator[i] +=
+            static_cast<T>((static_cast<float>(actexp_i_data[i]) * actexp_i_token_j_scale));
       }
     }
 
-    // * FC2 + reduced(gGEMM2)
-    ACC_TYPE fc2_data;
-    fc2_data.packed = reinterpret_cast<vec_t<T, VEC_SIZE> const*>(
-        params.moe_reduction_token_input)[thread_offset_across_token / VEC_SIZE];
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      accumulator.unpacked[i] += fc2_data.unpacked[i];
-    }
+    vec_t<T, VEC_SIZE> fc2_data;
+    fc2_data.load(reinterpret_cast<T*>(params.moe_reduction_token_input) +
+                  thread_offset_across_token);
+    accumulator = vec_add<T, VEC_SIZE>(accumulator, fc2_data);
 
     // * AR Store
     int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
     int idx = access_id;
-    vec_t<T, VEC_SIZE> val;
-    val.load(accumulator.packed);
 
-#pragma unroll
-    if (has_neg_zero(val)) {
-      val.fill(0.f);
-    }
-    // for (int i = 0; i < 4; ++i) {
-    //   // Handle two bf16/fp16 at one time
-    //   if (is_neg_zero(val[i])) {
-    //     val[i] = 0.f;
-    //   }
-    // }
+    remove_neg_zero<T, VEC_SIZE>(accumulator);
+
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
-      reinterpret_cast<vec_t<T, VEC_SIZE>*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
-          val;
+      int offset = (params.rank * tot_access + idx) * details::kBytesPerAccess;
+      accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
   }
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    reinterpret_cast<vec_t<T, VEC_SIZE>*>(comm.clear_buf)[idx] = clear_vec;
+    int offset = idx * details::kBytesPerAccess;
+    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf + offset));
   }
 
   // * AR Load + Fusion
@@ -579,9 +1032,9 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r].load_global_volatile(&reinterpret_cast<vec_t<T, VEC_SIZE>*>(
-            comm.data_bufs[params.rank])[r * tot_access + idx]);
-        done &= !has_neg_zero(vals[r]);
+        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
+                                     (r * tot_access + idx) * details::kBytesPerAccess);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
     }
     vec_t<T, VEC_SIZE> sum_val = vals[0];
@@ -624,7 +1077,7 @@ cudaError_t moereduction_allreduce_fusion_kernel_launcher(
   int cluster_num = token_num;
   // Total number of threads (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
-  int threads_per_token = params.hidden_dim * sizeof(T) / details::kBytesPerAccess;
+  int threads_per_token = params.hidden_dim / details::kBytesPerAccess * sizeof(T);
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
   int warps_per_token = (threads_per_token + 31) / 32;
@@ -674,48 +1127,68 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
     // pattern1: AR+Add_RMS+Quant
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, false, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, false, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, false, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, false, true>(
-        params, launch_with_pdl)));
+    if (params.nranks == 2) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, false, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 4) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, false, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 8) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, false, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 16) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, false, true>(
+          params, launch_with_pdl)));
+    }
     return cudaSuccess;
   } else if (not params.residual_out && params.norm_out && not params.quant_out) {
     // pattern2: AR+AddRMS
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 norm_out
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, false>(
-        params, launch_with_pdl)));
+    if (params.nranks == 2) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 4) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 8) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 16) {
+      FLASHINFER_CUDA_CALL(
+          (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, false>(
+              params, launch_with_pdl)));
+    }
     return cudaSuccess;
   } else if (params.residual_out && params.norm_out && not params.quant_out) {
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, false>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, false>(
-        params, launch_with_pdl)));
+    if (params.nranks == 2) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 4) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 8) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, false>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 16) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, false>(
+          params, launch_with_pdl)));
+    }
     return cudaSuccess;
   } else if (params.residual_out && params.norm_out && params.quant_out) {
-    // for test
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true>(
-        params, launch_with_pdl)));
-    FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true>(
-        params, launch_with_pdl)));
+    if (params.nranks == 2) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 4) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 8) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true>(
+          params, launch_with_pdl)));
+    } else if (params.nranks == 16) {
+      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true>(
+          params, launch_with_pdl)));
+    }
     return cudaSuccess;
   }
   FLASHINFER_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
