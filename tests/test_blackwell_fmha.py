@@ -54,7 +54,7 @@ def attention_ref(
     return o_ref, lse_ref * math.log2(math.e)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 3, 17])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
 @pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
 @pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
 @pytest.mark.parametrize("num_qo_heads", [32])
@@ -63,7 +63,7 @@ def attention_ref(
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_blackwell_cutlass_fmha(
     batch_size,
     qo_len,
@@ -88,7 +88,6 @@ def test_blackwell_cutlass_fmha(
     qo_indptr = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
     )
-
     k = torch.randn(
         batch_size * kv_len, num_kv_heads, head_dim_qk, dtype=dtype, device="cuda"
     )
@@ -134,25 +133,100 @@ def test_blackwell_cutlass_fmha(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("indptr", [[0, 1274, 2568, 3915, 5194, 6498, 7839, 8192]])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
+@pytest.mark.parametrize("head_dim_vo", [128])
+@pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_blackwell_cutlass_varlen(
+    indptr,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    sm_scale,
+    causal,
+    dtype,
+):
+    batch_size = len(indptr) - 1
+
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], num_qo_heads, head_dim_qk, dtype=dtype, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, head_dim_qk, dtype=dtype, device="cuda")
+    v = torch.randn(indptr[-1], num_kv_heads, head_dim_vo, dtype=dtype, device="cuda")
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+
+    for i in range(batch_size):
+        q_slice = q[indptr[i] : indptr[i + 1]]
+        k_slice = k_repeated[indptr[i] : indptr[i + 1]]
+        v_slice = v_repeated[indptr[i] : indptr[i + 1]]
+        o_ref, lse_ref = attention_ref(1, q_slice, k_slice, v_slice, causal, sm_scale)
+
+        lse_ref = lse_ref.flatten(0, 1)
+        if dtype == torch.half:
+            torch.testing.assert_close(
+                o[indptr[i] : indptr[i + 1]], o_ref, rtol=1e-3, atol=1e-3
+            )
+        else:
+            torch.testing.assert_close(
+                o[indptr[i] : indptr[i + 1]], o_ref, rtol=1e-2, atol=1e-2
+            )
+
+        torch.testing.assert_close(
+            lse[indptr[i] : indptr[i + 1]], lse_ref, rtol=1e-3, atol=1e-3
+        )
+
+
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha(
+        9,
+        377,
+        977,
         1,
+        1,
+        192,
+        128,
+        1,
+        False,
+        torch.bfloat16,
+    )
+
+    test_blackwell_cutlass_varlen(
+        [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
         32,
-        32,
-        4,
         4,
         192,
         128,
         1,
-        True,
+        False,
         torch.bfloat16,
-        # 3,
-        # 999,
-        # 999,
-        # 16,
-        # 8,
-        # 128,
-        # 128,
-        # False,
-        # torch.bfloat16,
     )

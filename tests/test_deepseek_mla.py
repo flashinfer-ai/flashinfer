@@ -634,12 +634,17 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     head_dim_kpe = 64
     total_page_num = 8192
 
-    q_nope_pe = torch.randn(
-        batch_size,
-        num_local_heads,
-        head_dim_ckv + head_dim_kpe,
-        dtype=dtype,
-        device="cuda",
+    # NOTE(Zihao): use larger scale to detect bugs such as
+    # https://github.com/flashinfer-ai/flashinfer/pull/1055
+    q_nope_pe = (
+        torch.randn(
+            batch_size,
+            num_local_heads,
+            head_dim_ckv + head_dim_kpe,
+            dtype=dtype,
+            device="cuda",
+        )
+        * 100
     )
     ckv_kpe = torch.randn(
         total_page_num,

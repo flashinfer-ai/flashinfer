@@ -31,7 +31,7 @@
 
 #pragma once
 
-#include "common/pow_2.hpp"
+#include "../common/pow_2.hpp"
 #include "cute/arch/simd_sm100.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/arch/arch.h"
