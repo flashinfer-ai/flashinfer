@@ -55,19 +55,14 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         launch_with_pdls = [True, False]
 
         # create workspace for moe allreduce fusion
-        # todo(Yingyi): update workspace init implementation
-        ipc_handles, workspace_ptrs = (
+        ipc_handles, workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 rank, world_size, MAX_TOKEN_NUM, HIDDEN_SIZE, group=group
             )
         )
 
-        # todo(Yingyi): lamport init here?
-
         test_loop = 1
 
-        # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR
-        flag_value = 1
         for token_num in token_nums:
             for active_expert_num in candidate_active_expert_num:
                 for fusion_code in fusion_codes:
@@ -144,8 +139,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     - 100.0
                                 )
 
-                                # todo(Yingyi): lamport init here?
-
                                 if (
                                     fusion_code
                                     == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
@@ -156,7 +149,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_ptrs,
+                                        workspace_ptr=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -179,7 +172,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_ptrs,
+                                        workspace_ptr=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -205,7 +198,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_ptrs,
+                                        workspace_ptr=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -231,7 +224,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_ptrs,
+                                        workspace_ptr=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,

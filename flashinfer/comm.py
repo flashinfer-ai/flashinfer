@@ -423,7 +423,7 @@ def get_comm_module():
             "tp_rank",
             "token_num",
             "hidden_dim",
-            "workspace_ptr",
+            "workspace_ptrs",
             "launch_with_pdl",
             "residual_in",
             "rms_gamma",
@@ -446,7 +446,7 @@ def get_comm_module():
         world_rank: int,
         token_num: int,
         hidden_dim: int,
-        workspace_ptr: int,
+        workspace_ptrs: torch.Tensor,
         launch_with_pdl: bool,
         residual_in: torch.Tensor,
         rms_gamma: torch.Tensor,
@@ -468,7 +468,7 @@ def get_comm_module():
             world_rank,
             token_num,
             hidden_dim,
-            workspace_ptr,
+            workspace_ptrs,
             launch_with_pdl,
             residual_in,
             rms_gamma,
@@ -730,6 +730,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
     )
 
+    # Initialize lamport buffer
+    trtllm_lamport_initialize(
+        ipc_handles[2][tp_rank], lamport_buffer_size, torch.float16
+    )
+
     # initialize workspace
     workspace = list()
     # add ipc handles to workspace
@@ -754,7 +759,12 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # add flag_ptr to workspace
     workspace.append(flag_ptr)
 
-    return workspace
+    # Store workspace pointers in device tensor
+    workspace_tensor = torch.tensor(
+        workspace, dtype=torch.int64, device=torch.device("cuda")
+    )
+
+    return ipc_handles, workspace_tensor
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
@@ -844,7 +854,7 @@ def trtllm_moe_allreduce_fusion(
     world_rank: int,
     token_num: int,
     hidden_dim: int,
-    workspace_ptr: int,
+    workspace_ptrs: torch.Tensor,
     launch_with_pdl: bool,
     residual_in: torch.Tensor,
     rms_gamma: torch.Tensor,
@@ -866,7 +876,7 @@ def trtllm_moe_allreduce_fusion(
         world_rank,
         token_num,
         hidden_dim,
-        workspace_ptr,
+        workspace_ptrs,
         launch_with_pdl,
         residual_in,
         rms_gamma,

@@ -7,7 +7,7 @@ using namespace flashinfer::trtllm_moe_allreduce_fusion;
 
 void trtllm_moe_allreduce_fusion(
     at::Tensor& allreduce_in, int64_t world_size, int64_t world_rank, int64_t token_num,
-    int64_t hidden_size, int64_t workspace_ptr, bool launch_with_pdl, at::Tensor& residual_in,
+    int64_t hidden_size, at::Tensor& workspace_ptrs, bool launch_with_pdl, at::Tensor& residual_in,
     at::Tensor& rms_gamma, double rms_eps, double scale_factor,
     int64_t moe_reduction_device_num_experts, at::Tensor& moe_reduction_scale_input,
     at::Tensor& moe_reduction_active_experts_token_input, at::Tensor& moe_reduction_token_input,
@@ -20,7 +20,7 @@ void trtllm_moe_allreduce_fusion(
   params.rank = world_rank;
   params.size = token_num * hidden_size;
   params.hidden_dim = hidden_size;
-  params.workspace = reinterpret_cast<void**>(workspace_ptr);
+  params.workspace = reinterpret_cast<void**>(workspace_ptrs.data_ptr());
 
   params.allreduce_in = reinterpret_cast<void*>(allreduce_in.data_ptr());
   params.residual_in = reinterpret_cast<void*>(residual_in.data_ptr());
