@@ -455,7 +455,8 @@ struct EpilogueMoeFusedFinalizeBuilder {
       decltype(detail::sm90_get_epilogue_smem_swizzle_layout_atom<StrideD, ElementAccumulator,
                                                                   EpilogueTile>());
   using CopyAtomR2S =
-      decltype(detail::sm90_get_smem_store_op_for_accumulator<StrideD, ElementAccumulator>());
+      decltype(detail::sm90_get_smem_store_op_for_accumulator<StrideD, ElementAccumulator,
+                                                              EpilogueTile>());
   using CopyAtomS2R = DefaultCopy;
   using CopyAtomR2G = decltype(detail::get_vectorized_atomic_add_op<ElementD, EpiTileN>());
 
