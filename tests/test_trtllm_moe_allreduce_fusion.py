@@ -40,7 +40,11 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
     try:
         device = torch.device(f"cuda:{rank}")
-        token_nums = [64, 256, 2048]
+        token_nums = [
+            64,
+            256,
+            2048,
+        ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
         candidate_active_expert_num = [8, 12, 16]
         fusion_codes = [
             MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
@@ -53,6 +57,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.FP4QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
+        # launch_with_pdls = [True] # todo(Yingyi): fix blocking issue with False
 
         # create workspace for moe allreduce fusion
         ipc_handles, workspace_tensor = (
@@ -69,7 +74,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                     for swizzled_layout_code in swizzled_layout_codes:
                         for launch_with_pdl in launch_with_pdls:
                             print(
-                                f"test RANK {rank}: {world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} start"
+                                f"test RANK {rank}: {token_num}-{active_expert_num}-{world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} start"
                             )
                             torch.cuda.synchronize()
                             for _ in range(test_loop):
@@ -185,8 +190,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         layout_code=swizzled_layout_code,
                                         residual_out=None,
                                         norm_out=norm_out,
-                                        quant_out=quant_out,
-                                        scale_out=scale_out,
+                                        quant_out=None,
+                                        scale_out=None,
                                     )
                                 elif (
                                     fusion_code
@@ -250,7 +255,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # todo: check correctness
                             print(
-                                f"test RANK {rank}: {world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} passed"
+                                f"test RANK {rank}: {token_num}-{active_expert_num}-{world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} passed"
                             )
     finally:
         dist.barrier(group=group)

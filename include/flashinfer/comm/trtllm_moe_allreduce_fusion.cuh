@@ -640,6 +640,10 @@ struct LamportComm {
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
     }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      printf("rank %d: flag_value %d, clear_size %d, counter %d\n", rank, flag_value, clear_size,
+             *counter_ptr);
+    }
   }
 
   __device__ __forceinline__ void update(int new_clear_size) {
@@ -839,22 +843,29 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VE
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
   vec_t<T, VEC_SIZE> residual_val;
-  residual_val.load(reinterpret_cast<T*>(params.residual_in) +
-                    access_id * details::kBytesPerAccess);
+  // todo: review this
+  // float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
+  residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
+
   vec_t<T, VEC_SIZE> gamma_val;
-  gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) +
-                 access_id_in_token * details::kBytesPerAccess);
+  // todo: review this
+  // float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
+  gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    residual_val.store(reinterpret_cast<T*>(params.residual_out) +
-                       access_id * details::kBytesPerAccess);
+    // todo: review this
+    // reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+    residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
   norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
-    norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * details::kBytesPerAccess);
+    // todo: review this
+    // reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
+    norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
   if constexpr (QuantOut) {
+    // todo: review this
     // PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
@@ -1006,6 +1017,10 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       int thread_offset_across_actexp_token =
           actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
       vec_t<T, VEC_SIZE> actexp_i_data;
+      // todo: review this
+      // reinterpret_cast<float4
+      // const*>(params.moe_reduction_active_experts_token_input)[thread_offset_across_actexp_token
+      // / kElemsPerAccess];
       actexp_i_data.load(reinterpret_cast<T*>(params.moe_reduction_active_experts_token_input) +
                          thread_offset_across_actexp_token);
 
@@ -1017,12 +1032,20 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         // assume computation is done in ScaleType
+        // todo: review this
+        // accumulator.unpacked[i] +=
+        // static_cast<DType>((static_cast<float>(actexp_i_data.unpacked[i]) *
+        // actexp_i_token_j_scale));
         accumulator[i] +=
             static_cast<T>((static_cast<float>(actexp_i_data[i]) * actexp_i_token_j_scale));
       }
     }
 
+    // * FC2 + reduced(gGEMM2)
     vec_t<T, VEC_SIZE> fc2_data;
+    // todo: review this
+    // reinterpret_cast<float4 const*>(params.moe_reduction_token_input)[thread_offset_across_token
+    // / kElemsPerAccess];
     fc2_data.load(reinterpret_cast<T*>(params.moe_reduction_token_input) +
                   thread_offset_across_token);
     accumulator = vec_add<T, VEC_SIZE>(accumulator, fc2_data);
@@ -1036,15 +1059,20 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
-      int offset = (params.rank * tot_access + idx) * details::kBytesPerAccess;
+      int offset = (params.rank * tot_access + idx) * VEC_SIZE;
+      // todo: review this
+      // reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
+      // *reinterpret_cast<float4*>(val);
       accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
   }
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    int offset = idx * details::kBytesPerAccess;
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf + offset));
+    int offset = idx * VEC_SIZE;
+    // todo: review this
+    // reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + offset);
   }
 
   // * AR Load + Fusion
@@ -1054,12 +1082,16 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
     while (!done) {
+      printf("Rank %d poll AR Load with flag %d\n", params.rank, *comm.flag_ptr);
       done = true;
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
+        // todo: review this
+        // vals[r] = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r *
+        // tot_access + idx]);
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                     (r * tot_access + idx) * details::kBytesPerAccess);
+                                     (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
     }
@@ -1074,6 +1106,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
                                                           params);
   }
   comm.update(params.size * NRanks);
+  // printf("Rank %d after update counter with flag %d\n", params.rank, *comm.flag_ptr);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
