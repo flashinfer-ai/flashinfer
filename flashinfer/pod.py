@@ -118,9 +118,13 @@ class PODWithPagedKVCacheWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
-        paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
-        paged_kv_indices_buffer: Optional[torch.Tensor] = None,
-        paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
+        qo_indptr_buffer_p: Optional[torch.Tensor] = None,
+        paged_kv_indptr_buffer_p: Optional[torch.Tensor] = None,
+        paged_kv_indices_buffer_p: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_buffer_p: Optional[torch.Tensor] = None,
+        paged_kv_indptr_buffer_d: Optional[torch.Tensor] = None,
+        paged_kv_indices_buffer_d: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_buffer_d: Optional[torch.Tensor] = None,
         jit_args: Optional[List[Any]] = None,
     ) -> None:
         r"""Constructor of :class:`PODWithPagedKVCacheWrapper`.
@@ -140,21 +144,35 @@ class PODWithPagedKVCacheWrapper:
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        indptr_buffer : Optional[torch.Tensor]
-            The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
+        qo_indptr_buffer_p: Optional[torch.Tensor]
+            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+
+        paged_kv_indptr_buffer_p: Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the indptr of the prefill paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        indices_buffer : Optional[torch.Tensor]
-            The user reserved buffer on GPU to store the page indices of the paged kv cache,
+        paged_kv_indices_buffer_p: Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the page indices of the prefill paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        last_page_len_buffer : Optional[torch.Tensor]
-            The user reserved buffer on GPU to store the number of entries in the last page, the
+        paged_kv_last_page_len_buffer_p: Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the number of entries in the last page for prefill, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
+
+        paged_kv_indptr_buffer_d: Optional[torch.Tensor]
+            Same as ``paged_kv_indptr_buffer_p`` but for decode.
+
+        paged_kv_indices_buffer_d: Optional[torch.Tensor]
+            Same as ``paged_kv_indices_buffer_p`` but for decode.
+
+        paged_kv_last_page_len_buffer_d: Optional[torch.Tensor]
+            Same as ``paged_kv_last_page_len_buffer_p`` but for decode.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -255,9 +273,9 @@ class PODWithPagedKVCacheWrapper:
 
     def plan(
         self,
-        indptr: torch.Tensor,
-        indices: torch.Tensor,
-        last_page_len: torch.Tensor,
+        indptr_d: torch.Tensor,
+        indices_d: torch.Tensor,
+        last_page_len_d: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -276,11 +294,11 @@ class PODWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
-        indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
-        last_page_len : torch.Tensor
+        indptr_d : torch.Tensor
+            The indptr of the paged kv cache for decode, shape: ``[batch_size + 1]``
+        indices_d : torch.Tensor
+            The page indices of the paged kv cache for decode, shape: ``[qo_indptr[-1]]``
+        last_page_len_d : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``
         num_qo_heads : int
@@ -324,7 +342,7 @@ class PODWithPagedKVCacheWrapper:
         """
         # Logits soft cap is not supported currently
         logits_soft_cap = False
-        batch_size = len(last_page_len)
+        batch_size = len(last_page_len_d)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
@@ -337,33 +355,34 @@ class PODWithPagedKVCacheWrapper:
                         batch_size, self._fixed_batch_size
                     )
                 )
-            if len(indices) > len(self._paged_kv_indices_buf):
+            if len(indices_d) > len(self._paged_kv_indices_buf):
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf.copy_(indptr, non_blocking=non_blocking)
+            self._paged_kv_indptr_buf.copy_(indptr_d, non_blocking=non_blocking)
             self._paged_kv_last_page_len_buf.copy_(
-                last_page_len, non_blocking=non_blocking
+                last_page_len_d, non_blocking=non_blocking
             )
-            self._paged_kv_indices_buf[: len(indices)].copy_(
-                indices, non_blocking=(indices.device == self.device) and non_blocking
+            self._paged_kv_indices_buf[: len(indices_d)].copy_(
+                indices_d,
+                non_blocking=(indices_d.device == self.device) and non_blocking,
             )
         else:
-            self._paged_kv_indptr_buf = indptr.to(
+            self._paged_kv_indptr_buf = indptr_d.to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_indices_buf = indices.to(
+            self._paged_kv_indices_buf = indices_d.to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_last_page_len_buf = last_page_len.to(
+            self._paged_kv_last_page_len_buf = last_page_len_d.to(
                 self.device, non_blocking=non_blocking
             )
             self._qo_indptr_buf = qo_indptr_host.to(
                 self.device, non_blocking=non_blocking
             )
 
-        indptr_host = indptr.to("cpu")
-        last_page_len_host = last_page_len.to("cpu")
+        indptr_host = indptr_d.to("cpu")
+        last_page_len_host = last_page_len_d.to("cpu")
 
         if data_type is not None:
             if q_data_type is None:
@@ -387,7 +406,7 @@ class PODWithPagedKVCacheWrapper:
                 q_data_type,
                 kv_data_type,
                 q_data_type,
-                indptr.dtype,
+                indptr_d.dtype,
                 head_dim,  # head_dim_qk
                 head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
@@ -413,7 +432,7 @@ class PODWithPagedKVCacheWrapper:
             False,  # causal
         )
 
-        self._indptr_type = indptr.dtype
+        self._indptr_type = indptr_d.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap

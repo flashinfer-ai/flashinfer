@@ -89,7 +89,7 @@ def run_bench(
         wrapper_pod.plan(
             d_kv_indptr.to(device),
             kv_indices_d.to(device),
-            last_page_len=last_page_len_d,
+            last_page_len_d=last_page_len_d,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
