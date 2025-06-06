@@ -80,7 +80,7 @@ struct FwdRunner {
                          double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len) {
+                         int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -149,7 +149,7 @@ struct FwdRunner {
     }
 
     // Run
-    status = op.run();
+    status = op.run(stream);
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
@@ -167,12 +167,13 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len) {
+                         int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
       workspace_buffer, q, k, v, qo_segment_offsets, kv_segment_offsets, work_indptr,
       qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code, sm_scale,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n,
-      k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len);
+      k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len,
+      stream);
 }
 
 };  // namespace flashinfer
