@@ -99,7 +99,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
                                                                         QO_TILE_LEN, Params>(
-      params, tmp_v, tmp_s, enable_pdl, /*stream=*/stream);
+      params, tmp_v, tmp_s, /*stream=*/stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
