@@ -86,9 +86,9 @@ def attention_varlen_ref(
     return o, lse
 
 
-@pytest.mark.parametrize("batch_size", [1])  # [1, 2, 3, 9, 17])
-@pytest.mark.parametrize("qo_len", [2, 4, 13])  # [1, 17, 177, 377, 977])
-@pytest.mark.parametrize("kv_len", [2, 4, 13])  # [1, 17, 544, 977, 1999])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
+@pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
+@pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
@@ -114,11 +114,8 @@ def test_blackwell_cutlass_fmha(
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
     torch.manual_seed(42)
-    q = (
-        torch.randn(
-            batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
-        )
-        * 10
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
     )
     qo_indptr = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
@@ -170,11 +167,11 @@ def test_blackwell_cutlass_fmha(
 
 @pytest.mark.parametrize("indptr", VARLEN_INDPTR_PARAMS)
 @pytest.mark.parametrize("num_qo_heads", [32])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("head_dim_qk", [128])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize("head_dim_qk", [192, 128])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("sm_scale", [1.0 / math.sqrt(128)])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_blackwell_cutlass_varlen(
     indptr,
@@ -220,10 +217,7 @@ def test_blackwell_cutlass_varlen(
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-
-    s = torch.cuda.Stream()  # Create a new stream.
-    with torch.cuda.stream(s):
-        o, lse = wrapper.run(q, k, v, return_lse=True)
+    o, lse = wrapper.run(q, k, v, return_lse=True)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
     k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
@@ -232,8 +226,6 @@ def test_blackwell_cutlass_varlen(
     o_ref, lse_ref = attention_varlen_ref(
         q, k_repeated, v_repeated, qo_indptr, kv_indptr, causal, sm_scale
     )
-
-    print(o, o_ref)
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
