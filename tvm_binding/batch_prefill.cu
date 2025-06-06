@@ -27,15 +27,15 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream,
-                                                   bool enable_pdl = true);
+                                                   float* tmp_s, bool enable_pdl,
+                                                   cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream,
-                                                    bool enable_pdl = true);
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -75,14 +75,12 @@ IntTuple BatchPrefillWithKVCachePlan(
   return IntTuple{plan_info_vec.begin(), plan_info_vec.end()};
 }
 
-void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
-                                      DLTensor* int_workspace_buffer, IntTuple plan_info_vec,
-                                      DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* qo_indptr,
-                                      DLTensor* kv_indptr, DLTensor* q_rope_offset,
-                                      DLTensor* k_rope_offset, DLTensor* o, DLTensor* lse,
-                                      int64_t mask_mode_code, int64_t pos_encoding_mode_code,
-                                      int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
-                                      TVMStreamHandle cuda_stream) {
+void BatchPrefillWithRaggedKVCacheRun(
+    DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer, IntTuple plan_info_vec,
+    DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* qo_indptr, DLTensor* kv_indptr,
+    DLTensor* q_rope_offset, DLTensor* k_rope_offset, DLTensor* o, DLTensor* lse,
+    int64_t mask_mode_code, int64_t pos_encoding_mode_code, int64_t layout, int64_t window_left,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream) {
   PrefillPlanInfo plan_info;
   std::vector<int64_t> plan_info_vec_(plan_info_vec->data,
                                       plan_info_vec->data + plan_info_vec->size);
@@ -214,7 +212,7 @@ void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              RaggedParams>(params, tmp_v, tmp_s, stream);
+              RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 
         CHECK(status == cudaSuccess)
@@ -230,8 +228,8 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
                                      DLTensor* paged_kv_last_page_len, DLTensor* q_rope_offset,
                                      DLTensor* paged_kv_rope_pos_offset, DLTensor* o, DLTensor* lse,
                                      int64_t mask_mode_code, int64_t pos_encoding_mode_code,
-                                     int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
-                                     TVMStreamHandle cuda_stream) {
+                                     int64_t layout, int64_t window_left, bool enable_pdl,
+                                     ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream) {
   PrefillPlanInfo plan_info;
   std::vector<int64_t> plan_info_vec_(plan_info_vec->data,
                                       plan_info_vec->data + plan_info_vec->size);
@@ -373,7 +371,7 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, stream);
+              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 
         CHECK(status == cudaSuccess)

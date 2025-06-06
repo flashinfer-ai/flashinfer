@@ -43,7 +43,9 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     at::Tensor paged_ckv_cache, at::Tensor paged_kpe_cache, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o, float sm_scale,
     int window_left, float logits_soft_cap, float rope_scale, float rope_theta,
-    std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
+    std::optional<at::Tensor> maybe_lse,
+    bool enable_pdl,  // fake placeholder, sm80 does not support pdl
+    int64_t cuda_stream) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
 
@@ -97,7 +99,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
                                                                         QO_TILE_LEN, Params>(
-      params, tmp_v, tmp_s, /*stream=*/stream);
+      params, tmp_v, tmp_s, enable_pdl, /*stream=*/stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }

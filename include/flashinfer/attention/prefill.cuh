@@ -1413,11 +1413,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
-
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
-#endif
-
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h,
                                 group_size, &qo_smem, tid);
 
@@ -1568,9 +1563,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         }
       }
     }
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
-#endif
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
@@ -2417,8 +2409,8 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream,
-                                                    bool enable_pdl = true) {
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2526,11 +2518,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
+              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
         }
       }
     }
@@ -2542,8 +2534,8 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream,
-                                                   bool enable_pdl = true) {
+                                                   float* tmp_s, bool enable_pdl,
+                                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2651,11 +2643,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, stream, enable_pdl));
+              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
         }
       }
     }

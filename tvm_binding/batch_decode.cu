@@ -27,8 +27,8 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream,
-                                                  bool enable_pdl = true);
+                                                  float* tmp_s, bool enable_pdl,
+                                                  cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -87,7 +87,7 @@ void BatchDecodeWithPagedKVCacheRun(
     DLTensor* q, DLTensor* paged_kv_cache, DLTensor* paged_kv_indptr, DLTensor* paged_kv_indices,
     DLTensor* paged_kv_last_page_len, DLTensor* q_rope_offset, DLTensor* paged_kv_rope_pos_offset,
     DLTensor* o, DLTensor* lse, int64_t pos_encoding_mode_code, int64_t kv_layout_code,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream) {
+    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream) {
   DecodePlanInfo plan_info;
   std::vector<int64_t> plan_info_vec_(plan_info_vec->data,
                                       plan_info_vec->data + plan_info_vec->size);
@@ -208,9 +208,8 @@ void BatchDecodeWithPagedKVCacheRun(
 
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
-                                                              AttentionVariant>(params, tmp_v,
-                                                                                tmp_s,
-                                                                                /*stream=*/stream);
+                                                              AttentionVariant>(
+                params, tmp_v, tmp_s, enable_pdl, stream);
         CHECK(status == cudaSuccess)
             << "BatchDecodeWithPagedKVCache failed with error " << cudaGetErrorString(status);
         return true;

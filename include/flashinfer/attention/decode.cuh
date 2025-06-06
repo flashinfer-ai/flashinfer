@@ -735,8 +735,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream,
-                                                  bool enable_pdl = true) {
+                                                  float* tmp_s, bool enable_pdl,
+                                                  cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -808,11 +808,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
-              num_qo_heads, HEAD_DIM, stream, enable_pdl));
+              num_qo_heads, HEAD_DIM, enable_pdl, stream));
         } else {
           FLASHINFER_CUDA_CALL(
               VariableLengthAttentionSum(tmp_v, params.o_indptr, o, params.paged_kv.batch_size,
-                                         nullptr, num_qo_heads, HEAD_DIM, stream, enable_pdl));
+                                         nullptr, num_qo_heads, HEAD_DIM, enable_pdl, stream));
         }
       }
     });
@@ -1087,8 +1087,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
 
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Params::DTypeO* tmp_v,
-                                                     float* tmp_s, cudaStream_t stream,
-                                                     bool enable_pdl = true) {
+                                                     float* tmp_s, bool enable_pdl,
+                                                     cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -1162,7 +1162,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
       }
       FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
           tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr, num_qo_heads,
-          HEAD_DIM_CKV, stream, enable_pdl));
+          HEAD_DIM_CKV, enable_pdl, stream));
     }
   });
   return cudaSuccess;
