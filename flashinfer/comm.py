@@ -252,7 +252,7 @@ def gen_comm_module() -> JitSpec:
     return gen_jit_spec(
         "comm",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "comm_pybind.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
