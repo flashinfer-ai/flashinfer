@@ -103,7 +103,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     - 1.0
                                 )
                                 scale_factor = (
-                                    torch.rand(device=device)
+                                    torch.rand(1, dtype=torch.float32, device=device)
                                     * (SCALE_FACTOR_RANGE[1] - SCALE_FACTOR_RANGE[0])
                                     + SCALE_FACTOR_RANGE[0]
                                 )
@@ -149,7 +149,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_tensor,
+                                        workspace_ptrs=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -172,7 +172,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_tensor,
+                                        workspace_ptrs=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -198,7 +198,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_tensor,
+                                        workspace_ptrs=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -224,7 +224,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         world_rank=rank,
                                         token_num=token_num,
                                         hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptr=workspace_tensor,
+                                        workspace_ptrs=workspace_tensor,
                                         launch_with_pdl=launch_with_pdl,
                                         residual_in=residual_in,
                                         rms_gamma=rms_gamma,
@@ -312,3 +312,5 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
 
 if __name__ == "__main__":
     mod = comm.get_comm_module()
+
+    test_trtllm_moe_allreduce_fusion(2, torch.float16)

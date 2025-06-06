@@ -768,7 +768,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # initialize flag values to 0
     cudart.cudaMemset(flag_ptr, 0, 5 * 4)
     # add flag_ptr to workspace
-    workspace.append(flag_ptr)
+    workspace.append(flag_ptr.value)
 
     # Store workspace pointers in device tensor
     workspace_tensor = torch.tensor(

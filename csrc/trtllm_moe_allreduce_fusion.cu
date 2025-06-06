@@ -11,9 +11,9 @@ void trtllm_moe_allreduce_fusion(
     at::Tensor& rms_gamma, double rms_eps, double scale_factor,
     int64_t moe_reduction_device_num_experts, at::Tensor& moe_reduction_scale_input,
     at::Tensor& moe_reduction_active_experts_token_input, at::Tensor& moe_reduction_token_input,
-    std::optional<int64_t> layout_code, std::optional<at::Tensor>& residual_out,
-    std::optional<at::Tensor>& norm_out, std::optional<at::Tensor>& quant_out,
-    std::optional<at::Tensor>& scale_out) {
+    std::optional<int64_t> layout_code, std::optional<at::Tensor> residual_out,
+    std::optional<at::Tensor> norm_out, std::optional<at::Tensor> quant_out,
+    std::optional<at::Tensor> scale_out) {
   const c10::cuda::OptionalCUDAGuard device_guard(allreduce_in.device());
   MoeReductionAllReduceFusionParams<half> params;
   params.nranks = world_size;
@@ -49,4 +49,8 @@ void trtllm_moe_allreduce_fusion(
   auto status = moereduction_allreduce_fusion_op(params, launch_with_pdl);
   TORCH_CHECK(status == cudaSuccess, "moereduction_allreduce_fusion_op failed with error code ",
               cudaGetErrorString(status));
+}
+
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("trtllm_moe_allreduce_fusion", &trtllm_moe_allreduce_fusion);
 }
