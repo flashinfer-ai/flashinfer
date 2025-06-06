@@ -1573,7 +1573,7 @@ template <typename T>
 using vec2_dtype_t = typename vec2_dtype<T>::type;
 
 template <typename T, size_t VEC_SIZE>
-vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int i) {
+FLASHINFER_INLINE vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int i) {
   static_assert(VEC_SIZE % 2 == 0, "VEC_SIZE must be a multiple of 2");
   return ((vec2_dtype_t<T>*)&(vec[0]))[i];
 }

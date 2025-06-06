@@ -737,6 +737,32 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #endif
 }
 
+// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
+        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+  return val;
+#else
+  // static_assert(false, "not supported.");
+  return 0;
+#endif
+}
+
 // Quantizes the provided PackedVec into the uint32_t output
 template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
@@ -752,7 +778,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   }
 
   // Get the absolute maximum among all 16 values (two threads).
-  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
   // Get the final absolute maximum values.
   float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
 
@@ -791,9 +817,9 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 #pragma unroll
   for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     if constexpr (std::is_same_v<T, half>) {
-      fp2Vals[i] = __half22float2(vec[i]);
+      fp2Vals[i] = __half22float2(get_vec2_element(vec, i));
     } else {
-      fp2Vals[i] = __bfloat1622float2(vec[i]);
+      fp2Vals[i] = __bfloat1622float2(get_vec2_element(vec, i));
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
