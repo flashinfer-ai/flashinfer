@@ -762,6 +762,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                                             vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      dim3 nblks(padded_batch_size, num_kv_heads);
+      dim3 nthrs(bdx, bdy, bdz);
+
       // PDL launch config
       cudaLaunchAttribute attribute[1];
       cudaLaunchConfig_t config;
@@ -770,16 +773,17 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
         config.attrs = attribute;
         config.numAttrs = 1;
+        config.gridDim = nblks;
+        config.blockDim = nthrs;
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
       }
       if (tmp_v == nullptr) {
         // do not use partition-kv kernel
-        dim3 nblks(padded_batch_size, num_kv_heads);
-        dim3 nthrs(bdx, bdy, bdz);
         params.partition_kv = false;
         void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
         } else {
           FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
         }
@@ -791,11 +795,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
-        dim3 nblks(padded_batch_size, num_kv_heads);
-        dim3 nthrs(bdx, bdy, bdz);
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
         } else {
           FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
         }
@@ -1113,6 +1114,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
+    dim3 nblks(padded_batch_size, gdy);
+    dim3 nthrs(bdx, bdy, bdz);
+
     // PDL launch config
     cudaLaunchAttribute attribute[1];
     cudaLaunchConfig_t config;
@@ -1121,19 +1125,21 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
       attribute[0].val.programmaticStreamSerializationAllowed = 1;
       config.attrs = attribute;
       config.numAttrs = 1;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
     }
 
     if (tmp_v == nullptr) {
       // do not use partition-kv kernel
-      dim3 nblks(padded_batch_size, gdy);
-      dim3 nthrs(bdx, bdy, bdz);
       params.partition_kv = false;
-      void* args[] = {(void*)&params};
       if (enable_pdl) {
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
       } else {
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        void* args[] = {(void*)&params};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       }
     } else {
       // use partition-kv kernel
@@ -1142,14 +1148,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
       auto lse = params.lse;
       params.o = tmp_v;
       params.lse = tmp_s;
-      void* args[] = {(void*)&params};
-      dim3 nblks(padded_batch_size, gdy);
-      dim3 nthrs(bdx, bdy, bdz);
       if (enable_pdl) {
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
       } else {
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        void* args[] = {(void*)&params};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       }
       FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
           tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr, num_qo_heads,

@@ -697,10 +697,14 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
       cudaLaunchConfig_t config;
       config.attrs = attribute;
       config.numAttrs = 1;
-      FLASHINFER_CUDA_CALL(
-          cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
+                                              max_seq_len, seq_len, num_heads));
     } else {
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
   });
   return cudaSuccess;
@@ -744,10 +748,14 @@ cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum
       cudaLaunchConfig_t config;
       config.attrs = attribute;
       config.numAttrs = 1;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
       FLASHINFER_CUDA_CALL(
-          cudaLaunchKernelEx(&config, kernel, nblks, nthrs, args, smem_size, stream));
+          cudaLaunchKernelEx(&config, kernel, v, indptr, v_sum, max_seq_len, seq_len, num_heads));
     } else {
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
   });
   return cudaSuccess;

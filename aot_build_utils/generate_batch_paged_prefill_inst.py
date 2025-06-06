@@ -45,7 +45,7 @@ def get_cu_file_str(
                 """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{cta_tile_q}, {head_dim_qk}, {head_dim_vo}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
     Params params,
     {dtype_out}* tmp_v,
-    float* tmp_s, cudaStream_t stream);
+    float* tmp_s, cudaStream_t stream, bool enable_pdl = true);
     """.format(
                     cta_tile_q=cta_tile_q,
                     head_dim_qk=head_dim_qk,

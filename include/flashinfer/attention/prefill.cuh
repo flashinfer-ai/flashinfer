@@ -1658,14 +1658,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                    " and report the issue to the developers.";
         FLASHINFER_ERROR(err_msg.str());
       } else {
-        // PDL launch config
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config;
-        config.attrs = attribute;
-        config.numAttrs = 1;
-
         constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
         auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
         size_t smem_size = sizeof(typename KTraits::SharedStorage);
@@ -1694,7 +1686,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         } else {
           // Use cooperative groups to increase occupancy
           params.partition_kv = true;
@@ -1706,8 +1698,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           void* args[] = {(void*)&params};
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), num_chunks, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+
           FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
           if constexpr (AttentionVariant::use_softmax) {
             FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
                                              HEAD_DIM_VO, stream));
@@ -2500,6 +2493,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
         config.attrs = attribute;
         config.numAttrs = 1;
+        config.gridDim = nblks;
+        config.blockDim = nthrs;
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
       }
 
       if (tmp_v == nullptr) {
@@ -2507,8 +2504,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         params.partition_kv = false;
         void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -2522,8 +2518,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -2624,16 +2619,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
         config.attrs = attribute;
         config.numAttrs = 1;
+        config.gridDim = nblks;
+        config.blockDim = nthrs;
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
       }
 
       if (tmp_v == nullptr) {
         // do not partition kv
         params.partition_kv = false;
-        void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
+          void* args[] = {(void*)&params};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
@@ -2643,11 +2641,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         auto lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
-        void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernelEx(&config, (void*)kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
+          void* args[] = {(void*)&params};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
