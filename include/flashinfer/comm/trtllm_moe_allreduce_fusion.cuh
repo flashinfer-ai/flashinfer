@@ -741,14 +741,14 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
                                          uint8_t* SFout) {
+  using T2 = vec2_dtype_t<T>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
-  auto localMax = maths::cuda_abs(vec[0]);
+  auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
 
-// Local maximum value.
 #pragma unroll
   for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    localMax = maths::cuda_max(localMax, maths::cuda_abs(vec[i]));
+    localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
   }
 
   // Get the absolute maximum among all 16 values (two threads).

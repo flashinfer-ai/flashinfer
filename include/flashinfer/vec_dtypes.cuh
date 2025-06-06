@@ -31,6 +31,40 @@ namespace flashinfer {
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
+template <typename T>
+struct vec2_dtype {
+  using type = T;
+};
+
+template <>
+struct vec2_dtype<half> {
+  using type = half2;
+};
+
+template <>
+struct vec2_dtype<__nv_bfloat16> {
+  using type = __nv_bfloat162;
+};
+
+template <>
+struct vec2_dtype<__nv_fp8_e4m3> {
+  using type = __nv_fp8x2_e4m3;
+};
+
+template <>
+struct vec2_dtype<__nv_fp8_e5m2> {
+  using type = __nv_fp8x2_e5m2;
+};
+
+template <typename T>
+using vec2_dtype_t = typename vec2_dtype<T>::type;
+
+template <typename T, size_t VEC_SIZE>
+vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int i) {
+  static_assert(VEC_SIZE % 2 == 0, "VEC_SIZE must be a multiple of 2");
+  return ((vec2_dtype_t<T>*)vec)[i];
+}
+
 __device__ __forceinline__ void st_global_release(int4 const& val, int4* addr) {
   asm volatile("st.release.global.sys.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(val.x), "r"(val.y),
                "r"(val.z), "r"(val.w), "l"(addr));
