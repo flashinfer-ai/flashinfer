@@ -783,10 +783,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
       if (tmp_v == nullptr) {
         // do not use partition-kv kernel
         params.partition_kv = false;
-        void* args[] = {(void*)&params};
+
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
+          void* args[] = {(void*)&params};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
@@ -797,10 +798,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         auto lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
-        void* args[] = {(void*)&params};
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
         } else {
+          void* args[] = {(void*)&params};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
