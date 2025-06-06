@@ -485,10 +485,10 @@ def single_decode_with_kv_cache(
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    head_dim = q.shape[-1]
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:
-        head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
     if q_scale is not None:
         sm_scale *= q_scale
