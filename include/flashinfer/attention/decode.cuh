@@ -688,7 +688,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         dim3 nthrs = dim3(bdx, bdy, bdz);
         params.kv_chunk_size = seq_len;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
         // use partition-kv kernel
         int num_blocks_per_sm = 0;
@@ -717,7 +718,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         params.lse = tmp_lse;
         params.kv_chunk_size = kv_chunk_size;
         void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(
               MergeStates(tmp, tmp_lse, o, lse, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
@@ -785,7 +787,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
         } else {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
       } else {
         // use partition-kv kernel
@@ -798,7 +801,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         if (enable_pdl) {
           FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
         } else {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
