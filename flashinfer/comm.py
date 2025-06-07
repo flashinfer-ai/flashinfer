@@ -743,7 +743,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     # Initialize lamport buffer
     trtllm_lamport_initialize(
-        ipc_handles[2][tp_rank], lamport_buffer_size, torch.float16
+        ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
     )
 
     # initialize workspace
