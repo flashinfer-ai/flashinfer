@@ -25,7 +25,7 @@ jobs:
         cuda: ["11.8", "12.4"]
         torch: ["2.5"]
 
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, Linux, x86_64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,7 +74,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, Linux, x86_64]
     steps:
       - uses: actions/download-artifact@v4
         with:
