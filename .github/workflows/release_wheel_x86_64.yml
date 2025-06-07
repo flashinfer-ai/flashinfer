@@ -1,5 +1,5 @@
 # Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
-name: Release
+name: Release x86_64 wheel
 on:
   workflow_dispatch:
     inputs:
