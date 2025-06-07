@@ -96,7 +96,8 @@ class AllToAllChannelCommunicatorBase {
   static int getMaxUsableSmCount() {
     AllToAllChannelCommunicatorBase::maxSmCountUsed = true;
     if (AllToAllChannelCommunicatorBase::maxSmCount == -1) {
-      int smCount = tensorrt_llm::common::getMultiProcessorCount();
+      int smCount = 32;  // TODO: call getMultiProcessorCount
+                         //   int smCount = tensorrt_llm::common::getMultiProcessorCount();
       AllToAllChannelCommunicatorBase::maxSmCount = smCount;
     }
     return AllToAllChannelCommunicatorBase::maxSmCount;
@@ -785,7 +786,7 @@ void computeSendRecvIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expe
       sendRankLocalIndices, recvRankLocalIndices, backwardRecvRankLocalIndices);
 }
 
-void moeAllToAllPrepareIndices(
+cudaError_t moeAllToAllPrepareIndices(
     MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
     int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
     // indices of gatheredTargetRankIds that has the local rank in topK
@@ -806,19 +807,21 @@ void moeAllToAllPrepareIndices(
     cudaStream_t stream) {
   FLASHINFER_CHECK(worldInfo.epSize <= 1024,
                    "Only worldInfo.epSize less than or equal to 1024 supported now.");
-  TLLM_CUDA_CHECK(cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
-  TLLM_CUDA_CHECK(cudaMemsetAsync(recvRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
+  FLASHINFER_CUDA_CALL(
+      cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
+  FLASHINFER_CUDA_CALL(
+      cudaMemsetAsync(recvRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
   int maxSendRanksPerToken = std::max(worldInfo.epSize, expertParallelInfo.topK);
 
-  TLLM_CUDA_CHECK(cudaMemsetAsync(localGatherIndices, -1,
-                                  maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
-  TLLM_CUDA_CHECK(cudaMemsetAsync(
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(
+      localGatherIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(
       sendRankLocalIndices, -1, maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
-  TLLM_CUDA_CHECK(cudaMemsetAsync(recvRankLocalIndices, -1,
-                                  maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
-  TLLM_CUDA_CHECK(cudaMemsetAsync(backwardRecvRankLocalIndices, -1,
-                                  maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int),
-                                  stream));
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(
+      recvRankLocalIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
+  FLASHINFER_CUDA_CALL(cudaMemsetAsync(backwardRecvRankLocalIndices, -1,
+                                       maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int),
+                                       stream));
   computeSendRecvRankCount(worldInfo, expertParallelInfo, maxTokenCountPerRank,
                            realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum,
                            recvRankCountCumSum, stream);

@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/types.h>
 
 #include <vector>
 
@@ -24,9 +27,9 @@
 
 using namespace flashinfer::trtllm_alltoall;
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds,
-                        c10::optional<torch::Tensor> realRankTokenCountCumSum,
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
+                        c10::optional<at::Tensor> realRankTokenCountCumSum,
                         int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
                         int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(gatheredTargetRankIds, torch::kInt32);
@@ -57,18 +60,18 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds,
 
   int maxSendRanksPerToken = std::max(epSize, topK);
 
-  torch::Tensor localGatherIndices = torch::empty(
+  at::Tensor localGatherIndices = torch::empty(
       {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-  torch::Tensor sendRankCountCumSum =
+  at::Tensor sendRankCountCumSum =
       torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-  torch::Tensor sendRankLocalIndices =
+  at::Tensor sendRankLocalIndices =
       torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
                    gatheredTargetRankIds.options().dtype(torch::kInt32));
-  torch::Tensor recvRankCountCumSum =
+  at::Tensor recvRankCountCumSum =
       torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-  torch::Tensor recvRankLocalIndices = torch::empty(
+  at::Tensor recvRankLocalIndices = torch::empty(
       {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-  torch::Tensor backwardRecvRankLocalIndices =
+  at::Tensor backwardRecvRankLocalIndices =
       torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
                    gatheredTargetRankIds.options().dtype(torch::kInt32));
 
@@ -89,9 +92,9 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds,
                          recvRankCountCumSum, recvRankLocalIndices, backwardRecvRankLocalIndices);
 }
 
-void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherIndices,
-                      torch::Tensor gatheredExpertIds, torch::Tensor gatheredScales,
-                      torch::Tensor localExpertIds, torch::Tensor localScales,
+void moeLocalGatherOp(at::Tensor recvRankCumSum, at::Tensor localGatherIndices,
+                      at::Tensor gatheredExpertIds, at::Tensor gatheredScales,
+                      at::Tensor localExpertIds, at::Tensor localScales,
                       int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
                       int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(recvRankCumSum, torch::kInt32);
@@ -140,9 +143,9 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
       localExpertIds.data_ptr<int>(), localScales.data_ptr<float>(), stream);
 }
 
-void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor sendIndices,
-               torch::Tensor output, torch::Tensor recvRankCumSum, torch::Tensor recvIndices,
-               torch::Tensor allWorkspaces, int64_t epRank, int64_t epSize) {
+void moeCommOp(at::Tensor input, at::Tensor sendRankCumSum, at::Tensor sendIndices,
+               at::Tensor output, at::Tensor recvRankCumSum, at::Tensor recvIndices,
+               at::Tensor allWorkspaces, int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(sendRankCumSum, torch::kInt32);
   CHECK_INPUT_TYPE(sendIndices, torch::kInt32);
   CHECK_INPUT_TYPE(recvRankCumSum, torch::kInt32);
@@ -218,7 +221,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m) {
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m) {
-  m.impl("moe_comm_prepare_indices", &torch_ext::moeCommPrepareIndicesOp);
+  m.impl("moe_comm_prepare_indices", &moeCommPrepareIndicesOp);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m) {
@@ -232,7 +235,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m) {
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m) {
-  m.impl("moe_local_gather", &torch_ext::moeLocalGatherOp);  //
+  m.impl("moe_local_gather", &moeLocalGatherOp);  //
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m) {
@@ -242,18 +245,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m) {
       "Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m) { m.impl("moe_comm", &torch_ext::moeCommOp); }
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m) { m.impl("moe_comm", &moeCommOp); }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m) {
   m.def("get_moe_commworkspace_size_per_rank(int ep_size) -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m) {
-  m.impl("get_moe_commworkspace_size_per_rank", &torch_ext::getWorkspaceSizePerRank);
+  m.impl("get_moe_commworkspace_size_per_rank", &getWorkspaceSizePerRank);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m) { m.def("set_moe_max_usable_sm_count(int max_sm_count) -> ()"); }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m) {
-  m.impl("set_moe_max_usable_sm_count", &torch_ext::setMaxUsableSmCount);
+  m.impl("set_moe_max_usable_sm_count", &setMaxUsableSmCount);
 }
