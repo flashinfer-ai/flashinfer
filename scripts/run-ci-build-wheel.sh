@@ -40,7 +40,7 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade setuptools wheel build
+pip install --upgrade setuptools packaging wheel build
 echo "::endgroup::"
 
 
