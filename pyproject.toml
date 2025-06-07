@@ -23,7 +23,7 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
