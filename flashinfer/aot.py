@@ -31,7 +31,7 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
-from .utils import is_sm90a_supported, is_sm100a_supported
+from .utils import version_at_least
 
 
 def gen_fa2(
@@ -483,12 +483,12 @@ def main():
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
     gencode_flags = _get_cuda_arch_flags()
-    has_sm90 = (
-        any("compute_90" in flag for flag in gencode_flags) and is_sm90a_supported()
+    has_sm90 = any("compute_90" in flag for flag in gencode_flags) and version_at_least(
+        torch.cuda.version, "12.3"
     )
-    has_sm100 = (
-        any("compute_100" in flag for flag in gencode_flags) and is_sm100a_supported()
-    )
+    has_sm100 = any(
+        "compute_100" in flag for flag in gencode_flags
+    ) and version_at_least(torch.cuda.version, "12.8")
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
