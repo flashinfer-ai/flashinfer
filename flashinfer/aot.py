@@ -31,6 +31,7 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
+from .utils import is_sm90a_supported, is_sm100a_supported
 
 
 def gen_fa2(
@@ -482,8 +483,12 @@ def main():
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
     gencode_flags = _get_cuda_arch_flags()
-    has_sm90 = any("compute_90" in flag for flag in gencode_flags)
-    has_sm100 = any("compute_100" in flag for flag in gencode_flags)
+    has_sm90 = (
+        any("compute_90" in flag for flag in gencode_flags) and is_sm90a_supported()
+    )
+    has_sm100 = (
+        any("compute_100" in flag for flag in gencode_flags) and is_sm100a_supported()
+    )
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
@@ -528,38 +533,41 @@ def main():
                 jit_env.SPDLOG_INCLUDE_DIR,
                 jit_env.FLASHINFER_INCLUDE_DIR,
             ],
-        ),
-        gen_jit_spec(
-            "trtllm_utils",
-            [
-                jit_env.FLASHINFER_CSRC_DIR
-                / "nv_internal"
-                / "tensorrt_llm"
-                / "kernels"
-                / "delayStream.cu",
-            ],
-            extra_include_paths=[
-                jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-                jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-                jit_env.FLASHINFER_CSRC_DIR
-                / "nv_internal"
-                / "tensorrt_llm"
-                / "cutlass_extensions"
-                / "include",
-                jit_env.FLASHINFER_CSRC_DIR
-                / "nv_internal"
-                / "tensorrt_llm"
-                / "kernels"
-                / "internal_cutlass_kernels"
-                / "include",
-                jit_env.FLASHINFER_CSRC_DIR
-                / "nv_internal"
-                / "tensorrt_llm"
-                / "kernels"
-                / "internal_cutlass_kernels",
-            ],
-        ),
+        )
     ]
+    if has_sm90:
+        jit_specs.append(
+            gen_jit_spec(
+                "trtllm_utils",
+                [
+                    jit_env.FLASHINFER_CSRC_DIR
+                    / "nv_internal"
+                    / "tensorrt_llm"
+                    / "kernels"
+                    / "delayStream.cu",
+                ],
+                extra_include_paths=[
+                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+                    jit_env.FLASHINFER_CSRC_DIR
+                    / "nv_internal"
+                    / "tensorrt_llm"
+                    / "cutlass_extensions"
+                    / "include",
+                    jit_env.FLASHINFER_CSRC_DIR
+                    / "nv_internal"
+                    / "tensorrt_llm"
+                    / "kernels"
+                    / "internal_cutlass_kernels"
+                    / "include",
+                    jit_env.FLASHINFER_CSRC_DIR
+                    / "nv_internal"
+                    / "tensorrt_llm"
+                    / "kernels"
+                    / "internal_cutlass_kernels",
+                ],
+            ),
+        )
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
