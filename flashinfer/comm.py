@@ -240,6 +240,10 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
         ],
+        extra_include_paths=[
+            jit_env.SPDLOG_INCLUDE_DIR,
+            jit_env.FLASHINFER_INCLUDE_DIR,
+        ],
     )
 
 
