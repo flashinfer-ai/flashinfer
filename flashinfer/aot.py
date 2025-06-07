@@ -484,11 +484,11 @@ def main():
         raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
     gencode_flags = _get_cuda_arch_flags()
     has_sm90 = any("compute_90" in flag for flag in gencode_flags) and version_at_least(
-        torch.cuda.version, "12.3"
+        torch.version.cuda, "12.3"
     )
     has_sm100 = any(
         "compute_100" in flag for flag in gencode_flags
-    ) and version_at_least(torch.cuda.version, "12.8")
+    ) and version_at_least(torch.version.cuda, "12.8")
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
