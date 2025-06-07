@@ -158,6 +158,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        enable_pdl: bool,
         *args,
     ) -> None:
         run_func(
@@ -174,6 +175,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
             maybe_lse,
             kv_layout_code,
             window_left,
+            enable_pdl,
             *args,
         )
 
@@ -192,6 +194,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        enable_pdl: bool,
         *args,
     ) -> None:
         pass
@@ -238,6 +241,7 @@ def get_batch_decode_module(*args):
             maybe_lse: Optional[torch.Tensor],
             kv_layout_code: int,
             window_left: int,
+            enable_pdl: bool,
             alibi_slopes: Optional[torch.Tensor],
             logits_soft_cap: float,
             sm_scale: float,
@@ -258,6 +262,7 @@ def get_batch_decode_module(*args):
                 maybe_lse,
                 kv_layout_code,
                 window_left,
+                enable_pdl,
                 alibi_slopes,
                 logits_soft_cap,
                 sm_scale,
@@ -280,6 +285,7 @@ def get_batch_decode_module(*args):
             maybe_lse: Optional[torch.Tensor],
             kv_layout_code: int,
             window_left: int,
+            enable_pdl: bool,
             alibi_slopes: Optional[torch.Tensor],
             logits_soft_cap: float,
             sm_scale: float,
@@ -1063,6 +1069,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1097,7 +1104,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1165,6 +1174,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 MaskMode.NON_CAUSAL.value,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                enable_pdl,
             ]
 
             if self._jit_module is not None:
@@ -1203,6 +1213,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 lse,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                enable_pdl,
             ]
 
             if self._jit_module is not None:
@@ -1576,6 +1587,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1603,7 +1615,9 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1670,6 +1684,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             rope_scale,
             rope_theta,
             lse,
+            enable_pdl,
         )
         out = [out, lse] if return_lse else [out]
         if v_scale is not None:

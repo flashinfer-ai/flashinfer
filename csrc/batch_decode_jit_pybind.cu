@@ -29,8 +29,8 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
                                     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
                                     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
                                     at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                                    int64_t kv_layout_code,
-                                    int64_t window_left ADDITIONAL_FUNC_PARAMS);
+                                    int64_t kv_layout_code, int64_t window_left,
+                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batched decode with paged KV-Cache plan

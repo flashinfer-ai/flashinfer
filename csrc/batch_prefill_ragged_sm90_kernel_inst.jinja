@@ -10,7 +10,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
      {{ mask_mode }},
      /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
      /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},
-     {{ variant_name }}>(RaggedParams& params, cudaStream_t stream);
+     {{ variant_name }}>(RaggedParams& params, bool enable_pdl, cudaStream_t stream);
 {% endfor %}
 
 };  // namespace flashinfer

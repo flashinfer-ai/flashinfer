@@ -8,6 +8,6 @@ namespace flashinfer {
 template cudaError_t
 BatchDecodeWithPagedKVCacheDispatched<{{ head_dim_qk }}, {{ pos_encoding_mode }}, {{ variant_name }}, Params>(
     Params params, {{ dtype_o }}* tmp_v,
-    float* tmp_s, cudaStream_t stream);
+    float* tmp_s, bool enable_pdl, cudaStream_t stream);
 
 };

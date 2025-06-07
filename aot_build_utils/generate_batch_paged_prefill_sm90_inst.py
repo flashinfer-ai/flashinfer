@@ -45,7 +45,7 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
      {attention_variant},
      Params>
-    (Params& params, cudaStream_t stream);
+    (Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithPagedKVCacheDispatched
     <{head_dim_qk},
@@ -55,7 +55,7 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
      {attention_variant},
      Params>
-    (Params& params, cudaStream_t stream);
+    (Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithPagedKVCacheDispatched
     <{head_dim_qk},
@@ -65,7 +65,7 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
      {attention_variant},
      Params>
-    (Params& params, cudaStream_t stream);
+    (Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithPagedKVCacheDispatched
     <{head_dim_qk},
@@ -75,7 +75,7 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
      {attention_variant},
      Params>
-    (Params& params, cudaStream_t stream);
+    (Params& params, bool enable_pdl, cudaStream_t stream);
     """.format(
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,

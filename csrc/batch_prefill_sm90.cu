@@ -28,11 +28,13 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream);
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                    cudaStream_t stream);
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                   cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -68,13 +70,11 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   return vec_to_tensor(plan_info.ToVector());
 }
 
-void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
-                                          at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-                                          at::Tensor q, at::Tensor k, at::Tensor v,
-                                          at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
-                                          std::optional<at::Tensor> maybe_lse,
-                                          int64_t mask_mode_code, int64_t layout,
-                                          int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+void BatchPrefillWithRaggedKVCacheSM90Run(
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+    at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_indptr, at::Tensor kv_indptr,
+    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
+    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -150,7 +150,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
           cudaError_t status = BatchPrefillWithRaggedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
-              AttentionVariant>(params, stream);
+              AttentionVariant>(params, enable_pdl, stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithRaggedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));
@@ -164,7 +164,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
     at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -250,7 +250,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
           cudaError_t status = BatchPrefillWithPagedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
-              AttentionVariant>(params, stream);
+              AttentionVariant>(params, enable_pdl, stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));
