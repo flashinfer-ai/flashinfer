@@ -735,7 +735,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     ipc_handles = list()
     for size in [buffer_size, flag_size, lamport_buffer_size]:
-        ipc_handles.append(create_shared_buffer(size, group))
+        # todo(review): confirm we need this alignment
+        # all sizes should be aligned to 1LU << 21 bytes (2MB)
+        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
@@ -765,8 +768,12 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     """
     # malloc cuda memory of int32_t * 5
     flag_ptr = cudart.cudaMalloc(5 * 4)
-    # initialize flag values to 0
+    # initialize the flag to [0,0,0,lamport_comm_size,0]
     cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+    # Set flag_ptr[3] = lamport_comm_size
+    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder='little')
+    cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
+    print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
 
