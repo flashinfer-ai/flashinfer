@@ -16,6 +16,7 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_cudnn_prefill(
     batch_size,
     s_qo,
@@ -26,6 +27,7 @@ def test_cudnn_prefill(
     head_dim,
     causal,
     return_lse,
+    use_cuda_graph,
 ):
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
@@ -102,7 +104,7 @@ def test_cudnn_prefill(
         block_tables,
         causal,
         return_lse,
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
     )
     torch.cuda.synchronize()
 

@@ -55,7 +55,6 @@ def cudnn_batch_prefill_with_kv_cache(
     num_sequences = actual_seq_lens_q.shape[0]
 
     assert causal, "Currently only supports causal attention"
-    assert use_cuda_graph == False, "Currently only supports use_cuda_graph == False"
 
     if return_lse:
         if lse is None:
