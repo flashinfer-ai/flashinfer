@@ -843,30 +843,20 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VE
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
   vec_t<T, VEC_SIZE> residual_val;
-  // todo: review this
-  // float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
   residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
 
   vec_t<T, VEC_SIZE> gamma_val;
-  // todo: review this
-  // float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
   gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    // todo: review this
-    // reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
     residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
   norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
-    // todo: review this
-    // reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
   if constexpr (QuantOut) {
-    // todo: review this
-    // PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
         params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
@@ -1070,8 +1060,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     int offset = idx * VEC_SIZE;
-    // todo: review this
-    // reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + offset);
   }
 
@@ -1087,9 +1075,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        // todo: review this
-        // vals[r] = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r *
-        // tot_access + idx]);
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
@@ -1136,7 +1121,7 @@ cudaError_t moereduction_allreduce_fusion_kernel_launcher(
   int cluster_num = token_num;
   // Total number of threads (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
-  int threads_per_token = params.hidden_dim / details::kBytesPerAccess * sizeof(T);
+  int threads_per_token = params.hidden_dim * sizeof(T) / details::kBytesPerAccess;
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
   int warps_per_token = (threads_per_token + 31) / 32;

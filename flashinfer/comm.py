@@ -593,6 +593,32 @@ def create_shared_buffer(
     dist.barrier(group=group)
     return pointers
 
+# todo: replace with this new create_shared_buffer
+# def create_shared_buffer(
+#         size_in_bytes: int, group: Optional[ProcessGroup] = None
+#     ) -> List[int]:
+#         """
+#         Creates a shared buffer and returns a list of pointers
+#         representing the buffer on all processes in the group.
+#         """
+#         pointer = cudart.cudaMalloc(size_in_bytes)
+#         handle = cudart.cudaIpcGetMemHandle(pointer)
+#         if group is None:
+#             group = dist.group.WORLD
+#         world_size = dist.get_world_size(group=group)
+#         rank = dist.get_rank(group=group)
+#         handles = [None] * world_size
+#         dist.all_gather_object(handles, handle, group=group)
+
+#         pointers: List[int] = []
+#         for i, h in enumerate(handles):
+#             if i == rank:
+#                 pointers.append(pointer.value)
+#             else:
+#                 pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
+
+#         dist.barrier(group=group)
+#         return pointers
 
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
