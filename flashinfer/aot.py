@@ -517,6 +517,7 @@ def main():
     print("  use_sliding_window:", use_sliding_window_)
     print("  use_logits_soft_cap:", use_logits_soft_cap_)
     print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
+    print("  torch.version.cuda:", torch.version.cuda)
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
     print("  add_gemma:", add_gemma)
