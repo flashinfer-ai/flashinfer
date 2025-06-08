@@ -144,7 +144,7 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(q_rope.data_ptr()), static_cast<c_type*>(k_rope.data_ptr()),
-        static_cast<float*>(cos_sin_cache.data_ptr()), static_cast<int32_t*>(pos_ids.data_ptr()),
+        static_cast<float*>(cos_sin_cache.data_ptr()), static_cast<int64_t*>(pos_ids.data_ptr()),
         nnz, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h, k_stride_n,
         k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h, interleave,
         stream);
