@@ -682,8 +682,9 @@ bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken;
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& params,
                                              bool launch_with_pdl) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
   FLASH_CHECK(params.size % params.hidden_dim == 0);
-  FLASH_CHECK(params.hidden_dim % (details::kBytesPerAccess / sizeof(T)) == 0);
+  FLASH_CHECK(params.hidden_dim % VEC_SIZE == 0);
   static int SM = utils::getSMVersion();
   int token_num = params.size / params.hidden_dim;
   bool oneshot = params.use_oneshot;
@@ -701,7 +702,7 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
       token_num_per_ranks[r] = token_num_per_rank + (remaining_token > r ? 1 : 0);
     }
   }
-  int threads_per_token = params.hidden_dim / (details::kBytesPerAccess / sizeof(T));
+  int threads_per_token = params.hidden_dim / VEC_SIZE;
   int cluster_size;
   if (SM >= 90) {
     cluster_size = 8;
