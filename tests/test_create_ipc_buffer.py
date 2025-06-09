@@ -1,6 +1,7 @@
 # Adapted from vllm/tests
 
 import ctypes
+
 import torch
 import torch.distributed as dist
 
@@ -43,13 +44,16 @@ for p in pointers:
     pointer = ctypes.c_void_p(p)
     for cur_rank in range(world_size):
         # Fix pointer arithmetic by casting to int, adding offset, then back to c_void_p
-        offset_pointer = ctypes.c_void_p(p + cur_rank * (buffer_size_in_bytes // world_size))
+        offset_pointer = ctypes.c_void_p(
+            p + cur_rank * (buffer_size_in_bytes // world_size)
+        )
         cudart.cudaMemcpy(host_data, offset_pointer, buffer_size_in_bytes // world_size)
         for i in range(buffer_size_in_bytes // world_size):
             assert ord(host_data[i]) == cur_rank, (
                 f"Rank {rank} failed"
                 f" to verify buffer {p}. Expected {cur_rank}, "
-                f"got {ord(host_data[i])}")
+                f"got {ord(host_data[i])}"
+            )
 
 print(f"Rank {rank} verified all buffers.\n")
 
