@@ -1,3 +1,5 @@
+# Adapted from vllm/tests
+
 import ctypes
 import torch
 import torch.distributed as dist
@@ -16,8 +18,8 @@ world_size = dist.get_world_size()
 cudart = CudaRTLibrary()
 cudart.cudaSetDevice(rank)
 
-buffer_size_in_bytes = 131072
-byte_value = 65536
+buffer_size_in_bytes = 1024
+byte_value = rank
 
 pointers = comm.create_shared_buffer(buffer_size_in_bytes)
 
@@ -26,11 +28,10 @@ print(f"Rank {rank} init ipc buffer {pointers}")
 dist.barrier()
 torch.cuda.synchronize()
 
-if rank == 0:
-    # the first rank tries to write to all buffers
-    for p in pointers:
-        pointer = ctypes.c_void_p(p)
-        cudart.cudaMemset(pointer, byte_value, buffer_size_in_bytes)
+# tries to write to all buffers
+for p in pointers:
+    pointer = ctypes.c_void_p(p + rank * (buffer_size_in_bytes // world_size))
+    cudart.cudaMemset(pointer, byte_value, buffer_size_in_bytes // world_size)
 
 dist.barrier()
 torch.cuda.synchronize()
@@ -40,12 +41,15 @@ host_data = (ctypes.c_char * buffer_size_in_bytes)()
 # all ranks read from all buffers, and check if the data is correct
 for p in pointers:
     pointer = ctypes.c_void_p(p)
-    cudart.cudaMemcpy(host_data, pointer, buffer_size_in_bytes)
-    for i in range(buffer_size_in_bytes):
-        assert ord(host_data[i]) == byte_value, (
-            f"Rank {rank} failed"
-            f" to verify buffer {p}. Expected {byte_value}, "
-            f"got {ord(host_data[i])}")
+    for cur_rank in range(world_size):
+        # Fix pointer arithmetic by casting to int, adding offset, then back to c_void_p
+        offset_pointer = ctypes.c_void_p(p + cur_rank * (buffer_size_in_bytes // world_size))
+        cudart.cudaMemcpy(host_data, offset_pointer, buffer_size_in_bytes // world_size)
+        for i in range(buffer_size_in_bytes // world_size):
+            assert ord(host_data[i]) == cur_rank, (
+                f"Rank {rank} failed"
+                f" to verify buffer {p}. Expected {cur_rank}, "
+                f"got {ord(host_data[i])}")
 
 print(f"Rank {rank} verified all buffers.\n")
 
