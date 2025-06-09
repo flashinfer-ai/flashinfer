@@ -483,7 +483,11 @@ def create_shared_buffer(
         if i == rank:
             pointers.append(pointer.value)
         else:
-            pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
+            try:
+                pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
+            except Exception as e:
+                print(f"Rank {rank}: Failed to open IPC handle from rank {i}: {e}")
+                raise
 
     dist.barrier(group=group)
     return pointers
