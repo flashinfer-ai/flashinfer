@@ -317,45 +317,47 @@ class FusedOp {
     }
   }
 
+  template <typename T>
   __device__ __forceinline__ void update(int access_id) {
     if (m_access_id != access_id) {
       m_access_id = access_id;
       if constexpr (HasResidual<Pattern>) {
-        m_residual_val = reinterpret_cast<float4*>(m_params.residual_in)[m_access_id];
+        m_residual_val.load(reinterpret_cast<T*>(m_params.residual_in) + m_access_id * VEC_SIZE);
       }
     }
   }
 
-  __device__ __forceinline__ void operator()(float4 val, int token_id) {
+  template <typename T, uint32_t VEC_SIZE>
+  __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
-      reinterpret_cast<float4*>(m_params.allreduce_out)[m_access_id] = val;
+      val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
     }
     if constexpr (HasResidual<Pattern>) {
-      val = add128<DType>(val, m_residual_val);
+      val = vec_add<T, VEC_SIZE>(val, m_residual_val);
       if constexpr (HasResidualOut<Pattern>) {
-        reinterpret_cast<float4*>(m_params.residual_out)[m_access_id] = val;
+        val.store(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
       }
     }
     if constexpr (HasRMSNorm<Pattern>) {
       val = rms_norm(val, m_gamma_val);
       if constexpr (HasNormOut<Pattern>) {
-        reinterpret_cast<float4*>(m_params.norm_out)[m_access_id] = val;
+        val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&val);
-      auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+      auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
           std::nullopt, token_id, m_access_id_in_token, std::nullopt, m_params.hidden_dim,
           reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
-          cvt_warp_fp16_to_fp4(pack_val, m_scale_factor, sf_out);
+          cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<DType, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-            static_cast<float>(reinterpret_cast<DType*>(&val)[i]) * m_scale_factor);
+            static_cast<float>(val[i]) * m_scale_factor);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else {
