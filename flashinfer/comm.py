@@ -556,27 +556,18 @@ def meta_size() -> int:
 def create_shared_buffer(
     size_in_bytes: int, group: Optional[ProcessGroup] = None
 ) -> List[int]:
+    """
+    Creates a shared buffer and returns a list of pointers
+    representing the buffer on all processes in the group.
+    """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
     if group is None:
         group = dist.group.WORLD
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
-
-    handle_bytes = ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
-    input_tensor = torch.tensor(bytearray(handle_bytes), dtype=torch.uint8).to(
-        f"cuda:{rank}"
-    )
-    gathered_tensors = [torch.empty_like(input_tensor) for _ in range(world_size)]
-    dist.all_gather(gathered_tensors, input_tensor, group=group)
-
-    handles = []
-    handle_type = type(handle)
-    for tensor in gathered_tensors:
-        bytes_data = tensor.cpu().numpy().tobytes()
-        handle_obj = handle_type()
-        ctypes.memmove(ctypes.addressof(handle_obj), bytes_data, len(bytes_data))
-        handles.append(handle_obj)
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
 
     pointers: List[int] = []
     for i, h in enumerate(handles):
@@ -584,8 +575,7 @@ def create_shared_buffer(
             pointers.append(pointer.value)
         else:
             try:
-                opened_ptr = cudart.cudaIpcOpenMemHandle(h)
-                pointers.append(opened_ptr.value)
+                pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
             except Exception as e:
                 print(f"Rank {rank}: Failed to open IPC handle from rank {i}: {e}")
                 raise

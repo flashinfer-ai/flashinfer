@@ -65,8 +65,6 @@ def _apply_rope(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    indptr = indptr.int()
-    offsets = offsets.int()
     get_module_attr("apply_rope")(
         q,
         k,
@@ -113,8 +111,6 @@ def _apply_llama31_rope(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    indptr = indptr.int()
-    offsets = offsets.int()
     get_module_attr("apply_llama31_rope")(
         q,
         k,
@@ -163,7 +159,6 @@ def _apply_rope_pos_ids(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    pos_ids = pos_ids.int()
     get_module_attr("apply_rope_pos_ids")(
         q,
         k,
@@ -204,7 +199,6 @@ def _apply_rope_pos_ids_cos_sin_cache(
     pos_ids: torch.Tensor,
     interleave: bool,
 ) -> None:
-    pos_ids = pos_ids.int()
     get_module_attr("apply_rope_pos_ids_cos_sin_cache")(
         q,
         k,
@@ -247,7 +241,6 @@ def _apply_llama31_rope_pos_ids(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    pos_ids = pos_ids.int()
     get_module_attr("apply_llama31_rope_pos_ids")(
         q,
         k,

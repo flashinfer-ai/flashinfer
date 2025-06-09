@@ -25,7 +25,6 @@
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
-#include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -33,6 +32,8 @@
 #include <optional>
 #include <random>
 #include <utility>
+
+#include "tensorrt_llm/common/NvInferRuntime.h"
 
 namespace tensorrt_llm::kernels {
 

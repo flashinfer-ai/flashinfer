@@ -146,6 +146,7 @@ def test_rope(
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("interleave", [True, False])
+@pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -157,6 +158,7 @@ def test_rope_pos_ids(
     partial_rotary_factor,
     inplace,
     interleave,
+    idtype,
 ):
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
@@ -171,13 +173,13 @@ def test_rope_pos_ids(
         :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
     ].reshape(nnz, num_kv_heads, head_dim)
     indptr = torch.tensor(
-        [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+        [i * qkv_len for i in range(batch_size + 1)], dtype=idtype, device="cuda:0"
     )
-    offsets = torch.full((batch_size,), offset, dtype=torch.int32, device="cuda:0")
+    offsets = torch.full((batch_size,), offset, dtype=idtype, device="cuda:0")
 
     pos_ids = torch.cat(
         [
-            torch.arange(offset, qkv_len + offset, dtype=torch.int32)
+            torch.arange(offset, qkv_len + offset, dtype=idtype)
             for _ in range(batch_size)
         ]
     ).to("cuda:0")
