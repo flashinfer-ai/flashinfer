@@ -3,7 +3,7 @@
 #include <flashinfer/attention/variants.cuh>
 
 // using namespace flashinfer;
-
+// avoid "at::Layout" is ambiguous error
 using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
