@@ -793,6 +793,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
 
+    for i in range(len(workspace)):
+        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
+
     # Store workspace pointers in device tensor
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
