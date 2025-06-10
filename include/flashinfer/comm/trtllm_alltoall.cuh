@@ -50,6 +50,15 @@ constexpr int RECV_FIFO_ENTRY_U64 = RECV_FIFO_ENTRY_BYTES / sizeof(uint64_t);
 constexpr int RECV_FIFO_TOTAL_BYTES = RECV_FIFO_DEPTH * RECV_FIFO_ENTRY_BYTES;
 constexpr int RECV_FIFO_TOTAL_U64 = RECV_FIFO_TOTAL_BYTES / sizeof(uint64_t);
 
+static int getMultiProcessorCount() {
+  int device_id;
+  int multi_processor_count;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device_id));
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, device_id));
+  return multi_processor_count;
+}
+
 class AllToAllChannelCommunicatorBase {
  public:
   static constexpr int GROUP_COUNT_PER_BLOCK = 8;
@@ -82,8 +91,7 @@ class AllToAllChannelCommunicatorBase {
   static void setMaxUsableSmCount(int maxUsableSmCount) {
     FLASHINFER_CHECK(AllToAllChannelCommunicatorBase::maxSmCountUsed == false,
                      "setMaxUsableSmCount can be called only before it is used");
-    int smCount = 32;  // TODO: call getMultiProcessorCount;
-    // int smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int smCount = getMultiProcessorCount();
     if (maxUsableSmCount > smCount) {
       FLASHINFER_LOG_WARN(
           "setMaxUsableSmCount, maxUsableSmCount=%d, larger than smCount=%d, using smCount instead",
@@ -96,8 +104,7 @@ class AllToAllChannelCommunicatorBase {
   static int getMaxUsableSmCount() {
     AllToAllChannelCommunicatorBase::maxSmCountUsed = true;
     if (AllToAllChannelCommunicatorBase::maxSmCount == -1) {
-      int smCount = 32;  // TODO: call getMultiProcessorCount
-                         //   int smCount = tensorrt_llm::common::getMultiProcessorCount();
+      int smCount = getMultiProcessorCount();
       AllToAllChannelCommunicatorBase::maxSmCount = smCount;
     }
     return AllToAllChannelCommunicatorBase::maxSmCount;
