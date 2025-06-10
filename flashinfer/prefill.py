@@ -45,6 +45,7 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
+    device_support_pdl,
     is_float8,
     is_sm100a_supported,
     register_custom_op,
@@ -243,6 +244,7 @@ def get_batch_prefill_module(backend):
                 mask_mode: int,
                 layout: int,
                 window_left: int,
+                enable_pdl: bool,
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
@@ -270,6 +272,7 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        enable_pdl,
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
@@ -297,6 +300,7 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        enable_pdl,
                         maybe_prefix_len_ptr,
                         maybe_token_pos_in_items_ptr,
                         maybe_max_item_len_ptr,
@@ -322,6 +326,7 @@ def get_batch_prefill_module(backend):
                 mask_mode: int,
                 layout: int,
                 window_left: int,
+                enable_pdl: bool,
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
@@ -365,6 +370,7 @@ def get_batch_prefill_module(backend):
                 mask_mode: int,
                 layout: int,
                 window_left: int,
+                enable_pdl: bool,
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
@@ -398,6 +404,7 @@ def get_batch_prefill_module(backend):
                         mask_mode,
                         layout,
                         window_left,
+                        enable_pdl,
                         maybe_custom_mask,
                         maybe_mask_indptr,
                         maybe_alibi_slopes,
@@ -428,6 +435,7 @@ def get_batch_prefill_module(backend):
                             mask_mode,
                             layout,
                             window_left,
+                            enable_pdl,
                             maybe_prefix_len_ptr,
                             maybe_token_pos_in_items_ptr,
                             maybe_max_item_len_ptr,
@@ -452,6 +460,7 @@ def get_batch_prefill_module(backend):
                             mask_mode,
                             layout,
                             window_left,
+                            enable_pdl,
                             scale_q,
                             scale_k,
                             scale_v,
@@ -476,6 +485,7 @@ def get_batch_prefill_module(backend):
                 mask_mode: int,
                 layout: int,
                 window_left: int,
+                enable_pdl: bool,
                 maybe_custom_mask: Optional[torch.Tensor],
                 maybe_mask_indptr: Optional[torch.Tensor],
                 maybe_alibi_slopes: Optional[torch.Tensor],
@@ -1644,6 +1654,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1657,6 +1668,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1669,6 +1681,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1702,7 +1715,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1712,6 +1727,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -1802,6 +1819,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
+            enable_pdl,
         ]
 
         if self._jit_module is not None:
@@ -2408,6 +2426,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2420,6 +2439,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -2431,6 +2451,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
@@ -2451,7 +2472,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2461,6 +2484,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -2542,6 +2567,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
+            enable_pdl,
         ]
         if self._jit_module is not None:
             run_args.extend(list(args))

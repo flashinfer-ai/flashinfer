@@ -542,7 +542,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream) {
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                    cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -562,7 +563,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                   cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.

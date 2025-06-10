@@ -15,12 +15,13 @@ limitations under the License.
 """
 
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
 from .jit import JitSpec
 from .jit import gen_act_and_mul_module as gen_act_and_mul_module_impl
-from .utils import register_custom_op, register_fake_op
+from .utils import device_support_pdl, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
 __device__ __forceinline__ float silu(const float& val) {
@@ -68,13 +69,15 @@ def get_act_and_mul_module(act_func_name: str):
 
         @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
         def _act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
+            out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
         ) -> None:
+            if enable_pdl is None:
+                enable_pdl = device_support_pdl(input.device)
             fn(out, input, enable_pdl)
 
         @register_fake_op(f"flashinfer::{fname}")
         def _fake_act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
+            out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
         ) -> None:
             pass
 
@@ -95,7 +98,7 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 
 def silu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused SiLU and Mul operation.
 
@@ -118,6 +121,8 @@ def silu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -137,7 +142,7 @@ def silu_and_mul(
 
 
 def gelu_tanh_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused GeLU Tanh and Mul operation.
 
@@ -160,6 +165,8 @@ def gelu_tanh_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
@@ -175,7 +182,7 @@ def gelu_tanh_and_mul(
 
 
 def gelu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
     r"""Fused GeLU and Mul operation.
 
@@ -198,6 +205,8 @@ def gelu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
     if out is not None:
