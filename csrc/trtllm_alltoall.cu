@@ -210,53 +210,10 @@ void setMaxUsableSmCount(int64_t maxSmCount) {
   flashinfer::trtllm_alltoall::setMaxUsableSmCount(maxSmCount);
 }
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m) {
-  m.def(
-      "moe_comm_prepare_indices(Tensor gathered_target_rank_ids, Tensor? "
-      "real_rank_token_count_cum_sum, int "
-      "max_token_count_per_rank, int expert_count, int top_k, int ep_rank, int ep_size) -> "
-      "(Tensor, Tensor, Tensor, "
-      "Tensor, "
-      "Tensor, Tensor)");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m) {
-  m.impl("moe_comm_prepare_indices", &moeCommPrepareIndicesOp);
-}
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m) {
-  m.def(
-      "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor "
-      "gathered_expert_ids, Tensor "
-      "gathered_scales, Tensor local_expert_ids, Tensor local_scales, int "
-      "max_token_count_per_rank, int "
-      "expert_count, int "
-      "top_k, int ep_rank, int ep_size) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m) {
-  m.impl("moe_local_gather", &moeLocalGatherOp);  //
-}
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m) {
-  m.def(
-      "moe_comm(Tensor input, Tensor send_rank_cum_sum, Tensor send_indices, Tensor output, Tensor "
-      "recv_rank_cum_sum, "
-      "Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m) { m.impl("moe_comm", &moeCommOp); }
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m) {
-  m.def("get_moe_commworkspace_size_per_rank(int ep_size) -> int");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m) {
-  m.impl("get_moe_commworkspace_size_per_rank", &getWorkspaceSizePerRank);
-}
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m) { m.def("set_moe_max_usable_sm_count(int max_sm_count) -> ()"); }
-
-TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m) {
-  m.impl("set_moe_max_usable_sm_count", &setMaxUsableSmCount);
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("moe_comm_prepare_indices", &moeCommPrepareIndicesOp);
+  m.def("moe_local_gather", &moeLocalGatherOp);
+  m.def("moe_comm", &moeCommOp);
+  m.def("set_moe_max_usable_sm_count", &setMaxUsableSmCount);
+  m.def("get_moe_commworkspace_size_per_rank", &getWorkspaceSizePerRank);
 }
