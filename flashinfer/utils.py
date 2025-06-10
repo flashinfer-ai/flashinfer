@@ -498,3 +498,8 @@ def get_trtllm_utils_module():
 
 def delay_kernel(stream_delay_micro_secs):
     get_trtllm_utils_module().delay_kernel(stream_delay_micro_secs)
+
+
+def device_support_pdl(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major >= 9

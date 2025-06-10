@@ -36,6 +36,7 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    device_support_pdl,
 )
 
 _pod_modules = {}
@@ -460,9 +461,13 @@ class PODWithPagedKVCacheWrapper:
         v_scale: Optional[float] = None,
         return_lse_d: bool = False,
         use_fp16_qk_reduction: bool = False,
+        enable_pdl: Optional[bool] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute POD-attention for a batch of requests."""
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q_p.device)
+
         # Currently unsupported
         logits_soft_cap_p = None
         logits_soft_cap_d = None
@@ -596,6 +601,7 @@ class PODWithPagedKVCacheWrapper:
             sm_scale_d,
             1.0 / rope_scale_d,
             1.0 / rope_theta_d,
+            enable_pdl,
         )
 
         if v_scale is not None:

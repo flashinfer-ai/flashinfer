@@ -45,6 +45,7 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
+    device_support_pdl,
     is_float8,
     is_sm100a_supported,
     register_custom_op,
@@ -1653,7 +1654,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1667,7 +1668,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1680,7 +1681,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1726,6 +1727,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -2423,7 +2426,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2436,7 +2439,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -2448,7 +2451,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
-        enable_pdl: bool = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
@@ -2481,6 +2484,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
