@@ -12,10 +12,9 @@ def cudnn_batch_decode_with_kv_cache(
     v_cache: torch.Tensor,
     scale: float,
     workspace_buffer: torch.Tensor,
-    actual_seq_lens_q: torch.Tensor,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: torch.Tensor,
-    num_pages_per_seq: int,
+    use_cuda_graph: bool = False,
     batch_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -43,14 +42,13 @@ def cudnn_batch_decode_with_kv_cache(
     """
 
     bs = q.shape[0]
-    s_q = q.shape[1]
-    h_qo = q.shape[2]
+    s_q = 1
+    h_qo = q.shape[1]
     d_vo = v_cache.shape[3]
 
     if out is None:
-        out = torch.empty(bs, s_q, h_qo, d_vo, device=q.device, dtype=q.dtype)
+        out = torch.empty(bs, h_qo, d_vo, device=q.device, dtype=q.dtype)
 
-    actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
     actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device)
 
     run_func = get_cudnn_fmha_gen_module().decode
@@ -60,14 +58,12 @@ def cudnn_batch_decode_with_kv_cache(
         v_cache,
         scale,
         workspace_buffer,
-        actual_seq_lens_q,
         actual_seq_lens_kv,
-        actual_seq_lens_q_gpu,
         actual_seq_lens_kv_gpu,
         block_tables,
-        num_pages_per_seq,
         out,
         batch_offsets,
+        use_cuda_graph,
     )
 
     return out
