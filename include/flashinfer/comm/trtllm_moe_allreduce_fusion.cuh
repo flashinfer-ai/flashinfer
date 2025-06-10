@@ -884,7 +884,7 @@ struct neg_zero<half> {
 template <>
 struct neg_zero<nv_bfloat16> {
   static constexpr unsigned short neg_zero_bits = 0x8000U;
-  static constexpr t __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
+  static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
 };
 
 template <>
