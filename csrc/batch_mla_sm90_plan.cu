@@ -40,7 +40,7 @@ at::Tensor BatchMLAPagedAttentionSM90Plan(at::Tensor float_workspace_buffer,
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  cudaError_t status =
+  Status status =
       MLAPlan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
               int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
               int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),

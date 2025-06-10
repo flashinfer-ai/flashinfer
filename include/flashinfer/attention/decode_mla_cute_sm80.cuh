@@ -508,9 +508,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
 
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, uint32_t QO_TILE_LEN,
           typename AttentionVariant, typename Params>
-cudaError_t BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params,
-                                                             typename Params::DTypeO* tmp_v,
-                                                             float* tmp_s, cudaStream_t stream) {
+Status BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params,
+                                                        typename Params::DTypeO* tmp_v,
+                                                        float* tmp_s, cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -524,7 +524,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params,
   auto kernel =
       BatchDecodeWithPagedKVCacheKernelMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, Params>;
 
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   if (tmp_v == nullptr) {
@@ -533,7 +533,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params,
     dim3 nthrs(k_warps * 32);
     params.partition_kv = false;
     void* args[] = {(void*)&params};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   } else {
     // use partition-kv kernel
     params.partition_kv = true;
@@ -544,10 +544,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params,
     void* args[] = {(void*)&params};
     dim3 nblks(padded_batch_size, gdy);
     dim3 nthrs(k_warps * 32);
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                   params.paged_kv.batch_size, nullptr,
-                                                   num_qo_heads, HEAD_DIM_CKV, stream));
+    FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    FLASHINFER_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
+                                              params.paged_kv.batch_size, nullptr, num_qo_heads,
+                                              HEAD_DIM_CKV, stream));
   }
 
   return cudaSuccess;

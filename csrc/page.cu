@@ -98,7 +98,7 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
         static_cast<c_type*>(paged_v_cache.data_ptr()), kv_cache_strides,
         static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-    cudaError_t status =
+    Status status =
         AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
                            static_cast<c_type*>(append_value.data_ptr()),
                            static_cast<int32_t*>(batch_indices.data_ptr()),
@@ -125,7 +125,7 @@ void block_sparse_indices_to_vector_sparse_offsets(
   const c10::cuda::OptionalCUDAGuard device_guard(block_sparse_indices.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
+  Status status = BlockSparseIndicesToVectorSparseOffset(
       static_cast<int32_t*>(block_sparse_indices.data_ptr()),
       static_cast<int32_t*>(block_sparse_indptr.data_ptr()),
       static_cast<int32_t*>(vector_sparse_offsets.data_ptr()),
@@ -201,12 +201,11 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
         ckv_strides, static_cast<c_type*>(kpe_cache.data_ptr()), kpe_strides,
         static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-    cudaError_t status =
-        AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv.data_ptr()),
-                              static_cast<c_type*>(append_kpe.data_ptr()),
-                              static_cast<int32_t*>(batch_indices.data_ptr()),
-                              static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n,
-                              append_kpe_stride_n, stream);
+    Status status = AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv.data_ptr()),
+                                          static_cast<c_type*>(append_kpe.data_ptr()),
+                                          static_cast<int32_t*>(batch_indices.data_ptr()),
+                                          static_cast<int32_t*>(positions.data_ptr()), nnz,
+                                          append_ckv_stride_n, append_kpe_stride_n, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "AppendPagedKVMlaCache failed with error: ", cudaGetErrorString(status));
     return true;

@@ -27,14 +27,14 @@ namespace flashinfer {
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream);
+Status BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                              float* tmp_s, cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream);
+Status BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                               float* tmp_s, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -55,7 +55,7 @@ at::Tensor BatchPrefillWithKVCachePlan(
 
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-  cudaError_t status = PrefillPlan<IdType>(
+  Status status = PrefillPlan<IdType>(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
@@ -179,7 +179,7 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
         }
 
-        cudaError_t status = cudaSuccess;
+        Status status = cudaSuccess;
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
@@ -313,7 +313,7 @@ void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
         }
 
-        cudaError_t status = cudaSuccess;
+        Status status = cudaSuccess;
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<

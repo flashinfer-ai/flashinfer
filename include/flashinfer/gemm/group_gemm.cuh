@@ -20,6 +20,7 @@
 
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
+#include "../status.h"
 
 namespace flashinfer {
 
@@ -44,10 +45,10 @@ namespace group_gemm {
   }
 
 template <typename DType>
-cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                                  void* all_problems, int64_t batch_size, void* x, void* w, void* y,
-                                  void* x_ld, void* w_ld, void* y_ld, bool weight_column_major,
-                                  cudaStream_t stream) {
+Status CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                             void* all_problems, int64_t batch_size, void* x, void* w, void* y,
+                             void* x_ld, void* w_ld, void* y_ld, bool weight_column_major,
+                             cudaStream_t stream) {
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   int device;

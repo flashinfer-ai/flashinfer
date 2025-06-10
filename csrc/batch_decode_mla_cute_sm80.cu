@@ -22,7 +22,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
 
   auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80<
       HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, AttentionVariant, Params>;
-  cudaError_t status =
+  Status status =
       DecodePlan<HEAD_DIM_CKV, flashinfer::PosEncodingMode::kNone, AttentionVariant, Params>(
           static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
           static_cast<void*>(int_workspace_buffer.data_ptr()),
@@ -95,8 +95,8 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   params.padded_batch_size = plan_info.padded_batch_size;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                                                        QO_TILE_LEN, Params>(
+  Status status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
+                                                                   QO_TILE_LEN, Params>(
       params, tmp_v, tmp_s, /*stream=*/stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));

@@ -30,7 +30,7 @@ void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopPRenormProb<float>(
+  Status status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
       top_p_val, vocab_size, stream);
@@ -49,7 +49,7 @@ void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopKRenormProb<float>(
+  Status status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
       top_k_val, vocab_size, stream);
@@ -69,7 +69,7 @@ void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopKMaskLogits<float>(
+  Status status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
       top_k_val, vocab_size, stream);

@@ -45,7 +45,7 @@ void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
   auto stream = at::cuda::getCurrentCUDAStream();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v_a.scalar_type(), c_type, [&] {
-    cudaError_t status =
+    Status status =
         MergeState(static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
                    static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
                    static_cast<c_type*>(v_merged.data_ptr()),
@@ -90,7 +90,7 @@ void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Te
   const c10::cuda::OptionalCUDAGuard device_guard(v.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
-    cudaError_t status = MergeStateInPlace(
+    Status status = MergeStateInPlace(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
         num_heads, head_dim, mask_ptr, stream);
@@ -120,7 +120,7 @@ void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_
   const c10::cuda::OptionalCUDAGuard device_guard(v.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
-    cudaError_t status = MergeStates(
+    Status status = MergeStates(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_merged.data_ptr()), static_cast<float*>(s_merged.data_ptr()),
         num_index_sets, seq_len, num_heads, head_dim, stream);

@@ -25,7 +25,7 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
           typename AttentionVariant, typename Params>
-cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
+Status SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -82,10 +82,9 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
 
         ADDITIONAL_PARAMS_SETTER
 
-        cudaError_t status =
-            SinglePrefillWithKVCacheDispatched<HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE,
-                                               USE_SLIDING_WINDOW, AttentionVariant>(params,
-                                                                                     stream);
+        Status status = SinglePrefillWithKVCacheDispatched<HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE,
+                                                           USE_SLIDING_WINDOW, AttentionVariant>(
+            params, stream);
         TORCH_CHECK(status == cudaSuccess, "single_prefill_with_kv_cache_sm90 failed with error: " +
                                                std::string(cudaGetErrorString(status)));
         return true;

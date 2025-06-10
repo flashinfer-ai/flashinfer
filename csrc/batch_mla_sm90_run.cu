@@ -119,9 +119,8 @@ void BatchMLAPagedAttentionSM90Run(at::Tensor float_workspace_buffer,
 
         params.sm_scale = sm_scale;
 
-        cudaError_t status =
-            mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
-                params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        Status status = mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
+            params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 
         TORCH_CHECK(status == cudaSuccess,
                     "Failed to run MLA, error: ", cudaGetErrorString(status));

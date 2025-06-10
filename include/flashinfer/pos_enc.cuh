@@ -575,7 +575,7 @@ __global__ void BatchQKApplyRotaryKernel(
   }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
+Status BatchQKApplyRotaryPosIdsCosSinCache(
     DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_sin_cache, IdType* pos_ids,
     uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim,
     uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
@@ -583,8 +583,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     bool interleave, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -620,21 +620,21 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
                                                                 DType, IdType>;
 
       int num_blocks_per_sm_0 = 0;
-      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
+      FLASHINFER_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm_0, kernel_0,
+                                                                    num_threads, /*smem_size=*/0));
       uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
 
       if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
         dim3 nblks(nblks_x);
         dim3 nthrs(bdx, bdy);
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
       } else {
         dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel_1 =
             BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<INTERLEAVE, HEAD_DIM, vec_size,
                                                                      bdx, DType, IdType>;
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
       }
     });
   });
@@ -643,20 +643,21 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
 }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryPosIds(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ pos_ids, uint32_t nnz,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, uint32_t head_dim,
-    size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
-    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
-    bool interleave, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+Status BatchQKApplyRotaryPosIds(DType* q, DType* k, DType* q_rope, DType* k_rope,
+                                IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads,
+                                uint32_t num_kv_heads, uint32_t rotary_dim, uint32_t head_dim,
+                                size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
+                                size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h,
+                                size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
+                                float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
   float smooth_b = 0.f;
   int dev_id = 0;
   int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -691,21 +692,21 @@ cudaError_t BatchQKApplyRotaryPosIds(
           BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
 
       int num_blocks_per_sm_0 = 0;
-      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
+      FLASHINFER_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm_0, kernel_0,
+                                                                    num_threads, /*smem_size=*/0));
       uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
       if (nblks_x >= num_ctas_0) {
         dim3 nblks(nblks_x);
         dim3 nthrs(bdx, bdy);
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
       } else {
         dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel_1 = BatchQKApplyRotaryPosIdsHeadParallelismKernel<INTERLEAVE, HEAD_DIM,
                                                                       vec_size, bdx, DType, IdType>;
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
       }
     });
   });
@@ -714,14 +715,14 @@ cudaError_t BatchQKApplyRotaryPosIds(
 }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
-                               IdType* __restrict__ indptr, IdType* __restrict__ offsets,
-                               uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                               uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n,
-                               size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
-                               size_t q_rope_stride_n, size_t q_rope_stride_h,
-                               size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
-                               float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+Status BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
+                          IdType* __restrict__ indptr, IdType* __restrict__ offsets,
+                          uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                          uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n,
+                          size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
+                          size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
+                          size_t k_rope_stride_h, bool interleave, float rope_scale,
+                          float rope_theta, cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -758,7 +759,7 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 
@@ -766,13 +767,13 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
 }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__ k,
-                                      IdType* __restrict__ indptr, IdType* __restrict__ offsets,
-                                      uint32_t batch_size, uint32_t num_qo_heads,
-                                      uint32_t num_kv_heads, uint32_t rotary_dim, uint32_t head_dim,
-                                      size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
-                                      size_t k_stride_h, bool interleave, float rope_scale,
-                                      float rope_theta, cudaStream_t stream = nullptr) {
+Status BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__ k,
+                                 IdType* __restrict__ indptr, IdType* __restrict__ offsets,
+                                 uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                 uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n,
+                                 size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
+                                 bool interleave, float rope_scale, float rope_theta,
+                                 cudaStream_t stream = nullptr) {
   return BatchQKApplyRotary<DType, IdType>(
       q, k, q, k, indptr, offsets, batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim,
       q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_stride_n, q_stride_h, k_stride_n,
@@ -780,14 +781,16 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
 }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyLlama31Rotary(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ indptr,
-    IdType* __restrict__ offsets, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
-    size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
-    size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
-    float low_freq_factor, float high_freq_factor, float old_context_length,
-    cudaStream_t stream = nullptr) {
+Status BatchQKApplyLlama31Rotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
+                                 IdType* __restrict__ indptr, IdType* __restrict__ offsets,
+                                 uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                 uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n,
+                                 size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
+                                 size_t q_rope_stride_n, size_t q_rope_stride_h,
+                                 size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
+                                 float rope_scale, float rope_theta, float low_freq_factor,
+                                 float high_freq_factor, float old_context_length,
+                                 cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
@@ -824,7 +827,7 @@ cudaError_t BatchQKApplyLlama31Rotary(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 
@@ -832,7 +835,7 @@ cudaError_t BatchQKApplyLlama31Rotary(
 }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyLlama31RotaryPosIds(
+Status BatchQKApplyLlama31RotaryPosIds(
     DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, uint32_t head_dim,
     size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
@@ -875,7 +878,7 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 

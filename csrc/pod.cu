@@ -26,11 +26,11 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODI
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q,
           MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
           typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp,
-                                           DecodeParams decode_params,
-                                           typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
-                                           cudaStream_t stream);
+Status PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
+                                      typename PrefillParams::DTypeO* tmp,
+                                      DecodeParams decode_params,
+                                      typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
+                                      cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -260,7 +260,7 @@ void pod_with_kv_cache_tensor(
                              USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
         // DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
         constexpr size_t CTA_TILE_Q = 16;
-        cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
+        Status status = flashinfer::PODWithKVCacheTensorDispatched<
             HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
             CTA_TILE_Q, MASK_MODE_D, PrefillAttentionVariant, DecodeAttentionVariant>(
             prefill_params, static_cast<DTypeO*>(tmp_p.data_ptr()), decode_params, tmp_v, tmp_s,

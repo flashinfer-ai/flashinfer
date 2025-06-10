@@ -18,6 +18,7 @@
 
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
+#include "../status.h"
 #include "../utils.cuh"
 
 namespace flashinfer {
@@ -28,10 +29,10 @@ using namespace cute;
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
           typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
-                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
-                                            float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
-                                            int l, cudaStream_t stream) {
+Status CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                       DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                       float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k, int l,
+                                       cudaStream_t stream) {
   using ElementA = DTypeIn;                   // Element type for A matrix operand
   using LayoutA = cutlass::layout::RowMajor;  // Layout type for A matrix operand
   constexpr int AlignmentA =
@@ -134,10 +135,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
   auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 32 * 1024 * 1024,
                                                            "sm100_groupwise_gemm_float_workspace");
 
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-  CUTLASS_CHECK(gemm.run(stream));
-  return cudaSuccess;
+  FLASHINFER_CALL(gemm.can_implement(arguments));
+  FLASHINFER_CALL(gemm.initialize(arguments, workspace_ptr));
+  FLASHINFER_CALL(gemm.run(stream));
+  return Status::Success();
 }
 
 }  // namespace gemm

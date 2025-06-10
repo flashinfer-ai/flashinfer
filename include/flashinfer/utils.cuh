@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "exception.h"
+#include "status.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -37,22 +38,22 @@
 #endif
 
 #ifndef NDEBUG
-#define FLASHINFER_CUDA_CALL(func, ...)                                                     \
-  {                                                                                         \
-    cudaError_t e = (func);                                                                 \
-    if (e != cudaSuccess) {                                                                 \
-      std::cerr << "CUDA Error: " << cudaGetErrorString(e) << " (" << e << ") " << __FILE__ \
-                << ": line " << __LINE__ << " at function " << STR(func) << std::endl;      \
-      return e;                                                                             \
-    }                                                                                       \
+#define FLASHINFER_CALL(func, ...)                                                         \
+  {                                                                                        \
+    flashinfer::Status e = (func);                                                         \
+    if (!e.success()) {                                                                    \
+      std::cerr << flashinfer::error_string(e) << " " << __FILE__ << ": line " << __LINE__ \
+                << " at function " << STR(func) << std::endl;                              \
+      return e;                                                                            \
+    }                                                                                      \
   }
 #else
-#define FLASHINFER_CUDA_CALL(func, ...) \
-  {                                     \
-    cudaError_t e = (func);             \
-    if (e != cudaSuccess) {             \
-      return e;                         \
-    }                                   \
+#define FLASHINFER_CALL(func, ...) \
+  {                                \
+    flashinfer::Status e = (func); \
+    if (!e.success()) {            \
+      return e;                    \
+    }                              \
   }
 #endif
 

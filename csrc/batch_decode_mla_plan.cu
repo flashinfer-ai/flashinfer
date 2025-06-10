@@ -25,7 +25,7 @@ at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
   auto work_estimation_func =
       BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE,
                                                              AttentionVariant, Params>;
-  cudaError_t status =
+  Status status =
       DecodePlan<HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama, AttentionVariant, Params>(
           static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
           static_cast<void*>(int_workspace_buffer.data_ptr()),

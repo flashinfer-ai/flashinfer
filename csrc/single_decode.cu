@@ -23,8 +23,8 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
-cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
-                                              cudaStream_t stream);
+Status SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
+                                         cudaStream_t stream);
 }  // namespace flashinfer
 
 using namespace flashinfer;
@@ -93,7 +93,7 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
 
         ADDITIONAL_PARAMS_SETTER
 
-        cudaError_t status =
+        Status status =
             flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                           AttentionVariant>(
                 params, static_cast<DTypeO*>(tmp.data_ptr()), stream);

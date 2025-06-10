@@ -27,7 +27,7 @@ void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y) {
   int64_t num_elements = x.numel();
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = quantization::PackBits(
+  Status status = quantization::PackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()), num_elements,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
 
@@ -49,7 +49,7 @@ void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_i
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = quantization::SegmentPackBits(
+  Status status = quantization::SegmentPackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()),
       static_cast<int32_t*>(input_indptr.data_ptr()),
       static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,

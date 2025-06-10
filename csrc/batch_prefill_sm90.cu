@@ -28,11 +28,11 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream);
+Status BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream);
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
+Status BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -54,7 +54,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  cudaError_t status =
+  Status status =
       PrefillSM90Plan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
                       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
                       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
@@ -148,7 +148,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status = BatchPrefillWithRaggedKVCacheDispatched<
+          Status status = BatchPrefillWithRaggedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
               AttentionVariant>(params, stream);
           TORCH_CHECK(status == cudaSuccess,
@@ -248,7 +248,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status = BatchPrefillWithPagedKVCacheDispatched<
+          Status status = BatchPrefillWithPagedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
               AttentionVariant>(params, stream);
           TORCH_CHECK(status == cudaSuccess,

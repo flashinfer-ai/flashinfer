@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/status.h>
+
 #include <flashinfer/cutlass_utils.cuh>
 
 #include "pytorch_extension_utils.h"
@@ -38,11 +40,11 @@ namespace flashinfer {
 namespace group_gemm {
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
-                                      void* int_buffer, size_t int_buffer_size_in_bytes,
-                                      void* all_problems, int64_t batch_size, void* x, void* w,
-                                      void* y, void* x_stride, void* w_stride, void* y_stride,
-                                      bool weight_column_major, cudaStream_t stream);
+Status CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                 void* int_buffer, size_t int_buffer_size_in_bytes,
+                                 void* all_problems, int64_t batch_size, void* x, void* w, void* y,
+                                 void* x_stride, void* w_stride, void* y_stride,
+                                 bool weight_column_major, cudaStream_t stream);
 
 }  // namespace group_gemm
 }  // namespace flashinfer
@@ -68,8 +70,7 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
                 all_problems.data_ptr(), batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(),
                 y_ptr.data_ptr(), x_stride.data_ptr(), weight_stride.data_ptr(),
                 y_stride.data_ptr(), weight_column_major, stream);
-        TORCH_CHECK(status == cudaSuccess,
-                    "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
+        TORCH_CHECK(status.success(), "Failed to run CutlassSegmentGEMM: ", status.error_message());
         return true;
       });
 }

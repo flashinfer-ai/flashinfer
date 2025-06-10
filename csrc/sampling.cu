@@ -44,7 +44,7 @@ void sampling_from_logits(at::Tensor logits, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::SamplingFromLogits(
+  Status status = sampling::SamplingFromLogits(
       static_cast<float*>(logits.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       batch_size, vocab_size, deterministic, philox_seed, philox_offset, stream);
@@ -71,7 +71,7 @@ void sampling_from_probs(at::Tensor probs, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::SamplingFromProb(
+  Status status = sampling::SamplingFromProb(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       batch_size, vocab_size, deterministic, philox_seed, philox_offset, stream);
@@ -99,7 +99,7 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
+  Status status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
@@ -131,7 +131,7 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
+  Status status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
       maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
@@ -163,7 +163,7 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
+  Status status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
       has_min_p_arr ? static_cast<float*>(maybe_min_p_arr->data_ptr()) : nullptr,
       static_cast<int*>(output.data_ptr()),
@@ -198,7 +198,7 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TopKTopPSamplingFromProb<float, int>(
+  Status status = sampling::TopKTopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr,
@@ -244,7 +244,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
 
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
+  Status status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()), static_cast<int*>(output_token_ids.data_ptr()),
       static_cast<int*>(output_accepted_token_num.data_ptr()),

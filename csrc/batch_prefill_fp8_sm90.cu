@@ -28,7 +28,7 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
+Status BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -50,7 +50,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  cudaError_t status =
+  Status status =
       PrefillSM90Plan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
                       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
                       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
@@ -166,7 +166,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status =
+          Status status =
               BatchFP8PrefillWithPagedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
                                                         AttentionVariant>(params, stream);

@@ -20,6 +20,7 @@
 
 #include "flashinfer/utils.cuh"
 #include "math.cuh"
+#include "status.h"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -105,9 +106,9 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
 }
 
 template <typename T>
-cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
-                    uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
-                    bool enable_pdl = false, cudaStream_t stream = 0) {
+Status RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
+               uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
+               bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -131,10 +132,10 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
+    FLASHINFER_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    FLASHINFER_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
+                                       stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -233,9 +234,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
 }
 
 template <typename T>
-cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
-                            uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
-                            bool enable_pdl = false, cudaStream_t stream = 0) {
+Status FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
+                       uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
+                       bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -260,19 +261,19 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
+    FLASHINFER_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d,
-                                            stride_input, stride_residual, weight_bias, eps));
+    FLASHINFER_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d, stride_input,
+                                       stride_residual, weight_bias, eps));
   });
 
   return cudaSuccess;
 }
 
 template <typename T>
-cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
-                         uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
-                         bool enable_pdl = false, cudaStream_t stream = 0) {
+Status GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
+                    uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
+                    bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -296,18 +297,18 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
+    FLASHINFER_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    FLASHINFER_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
+                                       stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
 
 template <typename T>
-cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
-                                 uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
-                                 bool enable_pdl = false, cudaStream_t stream = 0) {
+Status GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
+                            uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
+                            bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -333,10 +334,10 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
+    FLASHINFER_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d,
-                                            stride_input, stride_residual, weight_bias, eps));
+    FLASHINFER_CALL(cudaLaunchKernelEx(&config, kernel, input, residual, weight, d, stride_input,
+                                       stride_residual, weight_bias, eps));
   });
 
   return cudaSuccess;

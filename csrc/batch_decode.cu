@@ -26,8 +26,8 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
-cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream);
+Status BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                             float* tmp_s, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -61,7 +61,7 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
         DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
               GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
-          cudaError_t status = DecodePlan<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
+          Status status = DecodePlan<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
               static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
               static_cast<void*>(int_workspace_buffer.data_ptr()),
               static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
@@ -184,7 +184,7 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         }
         params.padded_batch_size = plan_info.padded_batch_size;
 
-        cudaError_t status =
+        Status status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                               AttentionVariant>(params, tmp_v,
                                                                                 tmp_s,

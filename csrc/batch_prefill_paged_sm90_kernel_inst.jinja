@@ -4,7 +4,7 @@
 namespace flashinfer {
 
 {% for same_scheduler_for_all_heads in ["true", "false"] %}
-template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+template Status BatchPrefillWithPagedKVCacheDispatched
     <{{ head_dim_qk }},
      {{ head_dim_vo }},
      {{ mask_mode }},

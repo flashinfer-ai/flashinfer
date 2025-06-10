@@ -20,6 +20,7 @@
 
 #include "../../cutlass_utils.cuh"
 #include "../../exception.h"
+#include "../../status.h"
 #include "../mask.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
@@ -290,7 +291,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename Params>
-cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
+Status SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
   using DTypeKV = typename KernelTraits::DTypeKV;
   using DTypeO = typename KernelTraits::DTypeO;
@@ -334,27 +335,26 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
   cudaGetDevice(&device);
   int multiprocessor_count;
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int num_ctas = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(num_ctas);
   void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+  FLASHINFER_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
   return cudaSuccess;
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
-cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
-                                                               cudaStream_t stream) {
+Status BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
   using DTypeKV = typename KernelTraits::DTypeKV;
   using DTypeO = typename KernelTraits::DTypeO;
@@ -407,27 +407,26 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
   cudaGetDevice(&device);
   int multiprocessor_count;
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
   void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+  FLASHINFER_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
   return cudaSuccess;
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
-                                                                cudaStream_t stream) {
+Status BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
   using DTypeKV = typename KernelTraits::DTypeKV;
   using DTypeO = typename KernelTraits::DTypeO;
@@ -482,19 +481,19 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
   cudaGetDevice(&device);
   int multiprocessor_count;
-  FLASHINFER_CUDA_CALL(
+  FLASHINFER_CALL(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
   void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+  FLASHINFER_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
   return cudaSuccess;
 }
@@ -522,7 +521,7 @@ constexpr auto getCTATileSize() {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
-cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
+Status SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -536,13 +535,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
       LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-  cudaError_t status = cudaGetLastError();
+  Status status = cudaGetLastError();
   return status;
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream) {
+Status BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -556,13 +555,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
       LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  cudaError_t status = cudaGetLastError();
+  Status status = cudaGetLastError();
   return status;
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
+Status BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -607,8 +606,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t 
   } else {
     return cudaErrorNotSupported;
   }
-  cudaError_t status = cudaGetLastError();
-  return status;
+  return cudaGetLastError();
 };
 
 }  // namespace flashinfer

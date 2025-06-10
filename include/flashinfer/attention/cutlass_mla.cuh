@@ -128,23 +128,23 @@ typename T::Fmha::Arguments args_from_options(void* out_ptr, void* lse_ptr, void
 }
 
 template <typename Element>
-cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr, void* q_absorbed_ptr,
-                   void* ckv_kpe_cache_ptr, void* seq_lens_ptr, void* page_table_ptr, int batches,
-                   int page_count_per_seq, int page_count_total, int page_size, int device_index,
-                   cudaStream_t stream) {
+Status runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr, void* q_absorbed_ptr,
+              void* ckv_kpe_cache_ptr, void* seq_lens_ptr, void* page_table_ptr, int batches,
+              int page_count_per_seq, int page_count_total, int page_size, int device_index,
+              cudaStream_t stream) {
   using MlaSm100Type = MlaSm100<Element>;
   typename MlaSm100Type::Fmha fmha;
   auto arguments = args_from_options<MlaSm100Type>(
       out_ptr, lse_ptr, q_absorbed_ptr, ckv_kpe_cache_ptr, seq_lens_ptr, page_table_ptr, batches,
       page_count_per_seq, page_count_total, page_size, device_index);
 
-  CUTLASS_CHECK(fmha.can_implement(arguments));
+  FLASHINFER_CALL(fmha.can_implement(arguments));
 
-  CUTLASS_CHECK(fmha.initialize(arguments, workspace_ptr, stream));
+  FLASHINFER_CALL(fmha.initialize(arguments, workspace_ptr, stream));
 
-  CUTLASS_CHECK(fmha.run(arguments, workspace_ptr, stream));
+  FLASHINFER_CALL(fmha.run(arguments, workspace_ptr, stream));
 
-  return cudaSuccess;
+  return Status::Success();
 }
 
 }  // namespace attention

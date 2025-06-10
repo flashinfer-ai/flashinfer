@@ -57,7 +57,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
                        static_cast<c_type*>(input.data_ptr()), d);
 
-    cudaError_t err = cudaGetLastError();
+    Status err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
@@ -89,7 +89,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
                        static_cast<c_type*>(input.data_ptr()), d);
 
-    cudaError_t err = cudaGetLastError();
+    Status err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
@@ -120,7 +120,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
                        static_cast<c_type*>(input.data_ptr()), d);
 
-    cudaError_t err = cudaGetLastError();
+    Status err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;

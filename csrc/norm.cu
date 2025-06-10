@@ -37,10 +37,10 @@ void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double e
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::RMSNorm(
-        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
-        static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
-        output.stride(0), eps, enable_pdl, stream);
+    Status status = norm::RMSNorm(static_cast<c_type*>(input.data_ptr()),
+                                  static_cast<c_type*>(weight.data_ptr()),
+                                  static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size,
+                                  input.stride(0), output.stride(0), eps, enable_pdl, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "RMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
@@ -67,7 +67,7 @@ void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weig
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::FusedAddRMSNorm(
+    Status status = norm::FusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()), batch_size, hidden_size, input.stride(0),
         residual.stride(0), eps, enable_pdl, stream);
@@ -94,7 +94,7 @@ void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, do
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::GemmaRMSNorm(
+    Status status = norm::GemmaRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
         static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
         output.stride(0), eps, enable_pdl, stream);
@@ -124,7 +124,7 @@ void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor
   const c10::cuda::OptionalCUDAGuard device_guard(device);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::GemmaFusedAddRMSNorm(
+    Status status = norm::GemmaFusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()), batch_size, hidden_size, input.stride(0),
         residual.stride(0), eps, enable_pdl, stream);

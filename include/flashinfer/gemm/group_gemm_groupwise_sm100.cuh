@@ -21,6 +21,7 @@
 
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
+#include "../status.h"
 #include "../utils.cuh"
 
 namespace flashinfer {
@@ -57,11 +58,10 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, typename DTypeIn,
           typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* float_buffer,
-                                                 size_t float_buffer_size_in_bytes, DTypeIn* A,
-                                                 DTypeIn* B, float* SFA, float* SFB, DTypeOut* C,
-                                                 int* m_indptr, int cum_m, int n, int k,
-                                                 int batch_size, cudaStream_t stream) {
+Status CutlassGroupwiseScaledGroupGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                            DTypeIn* A, DTypeIn* B, float* SFA, float* SFB,
+                                            DTypeOut* C, int* m_indptr, int cum_m, int n, int k,
+                                            int batch_size, cudaStream_t stream) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
 
   using ElementA = DTypeIn;                   // Element type for A matrix operand
@@ -188,10 +188,10 @@ cudaError_t CutlassGroupwiseScaledGroupGEMMSM100(void* float_buffer,
   auto workspace_ptr = float_allocator.aligned_alloc<void>(
       workspace_size, 32 * 1024 * 1024, "sm100_groupwise_group_gemm_float_workspace");
 
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-  CUTLASS_CHECK(gemm.run(stream));
-  return cudaSuccess;
+  FLASHINFER_CALL(gemm.can_implement(arguments));
+  FLASHINFER_CALL(gemm.initialize(arguments, workspace_ptr));
+  FLASHINFER_CALL(gemm.run(stream));
+  return Status::Success();
 }
 
 }  // namespace gemm

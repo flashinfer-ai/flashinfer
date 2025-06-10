@@ -18,6 +18,7 @@
 
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
+#include "../status.h"
 #include "../utils.cuh"
 
 namespace flashinfer {
@@ -35,25 +36,12 @@ using namespace cute;
     __VA_ARGS__                                                     \
   }
 
-/**
- * Panic wrapper for unwinding CUTLASS errors
- */
-#define CUTLASS_CHECK(status)                                                                    \
-  {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
-                << std::endl;                                                                    \
-      exit(EXIT_FAILURE);                                                                        \
-    }                                                                                            \
-  }
-
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
-                                      void* int_buffer, size_t int_buffer_size_in_bytes,
-                                      void* all_problems, int64_t batch_size, void* x, void* w,
-                                      void* y, void* x_stride, void* w_stride, void* y_stride,
-                                      bool weight_column_major, cudaStream_t stream) {
+Status CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                 void* int_buffer, size_t int_buffer_size_in_bytes,
+                                 void* all_problems, int64_t batch_size, void* x, void* w, void* y,
+                                 void* x_stride, void* w_stride, void* y_stride,
+                                 bool weight_column_major, cudaStream_t stream) {
   auto compute_capacity = GetCudaComputeCapability();
   if (compute_capacity.first < 9) {
     std::cerr << "CutlassSegmentGEMMSM90Run requires compute capability of at least 9.0"
@@ -145,13 +133,13 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
       auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 64,
                                                                "sm90_group_gemm_float_workspace");
 
-      CUTLASS_CHECK(gemm.can_implement(arguments));
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-      CUTLASS_CHECK(gemm.run(stream));
+      FLASHINFER_CALL(gemm.can_implement(arguments));
+      FLASHINFER_CALL(gemm.initialize(arguments, workspace_ptr));
+      FLASHINFER_CALL(gemm.run(stream));
     }
   });
 
-  return cudaSuccess;
+  return Status::Success();
 }
 
 }  // namespace group_gemm

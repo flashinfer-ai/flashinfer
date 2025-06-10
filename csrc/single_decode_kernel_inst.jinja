@@ -5,7 +5,7 @@ using namespace flashinfer;
 
 namespace flashinfer {
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<
+template Status SingleDecodeWithKVCacheDispatched<
     {{ head_dim_qk }}, {{ pos_encoding_mode }}, {{ variant_name }}, Params>(
     Params params, {{ dtype_o }}* tmp,
     cudaStream_t stream);

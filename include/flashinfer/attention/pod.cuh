@@ -173,11 +173,11 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODI
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_D,
           MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
           typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp_p,
-                                           DecodeParams decode_params,
-                                           typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
-                                           cudaStream_t stream) {
+Status PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
+                                      typename PrefillParams::DTypeO* tmp_p,
+                                      DecodeParams decode_params,
+                                      typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
+                                      cudaStream_t stream) {
   static_assert(std::is_same<typename PrefillParams::DTypeQ, typename DecodeParams::DTypeQ>::value);
   static_assert(
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
@@ -249,10 +249,10 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                 float>::type;
 
   int dev_id = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CALL(cudaGetDevice(&dev_id));
   int max_smem_per_sm = 0;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
-                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  FLASHINFER_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
+                                         cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
   // TODO(Zihao): fix the following computation
   const int num_ctas_per_sm = max_smem_per_sm > (16 * HEAD_DIM_QK * sizeof(DTypeQ_D) * 16) ? 2 : 1;
@@ -344,9 +344,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             // Prefill: decide num_splits for split-kv
             int num_blocks_per_sm = 0;
             int num_sm = 0;
-            FLASHINFER_CUDA_CALL(
+            FLASHINFER_CALL(
                 cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-            FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            FLASHINFER_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &num_blocks_per_sm, kernel, num_threads_p, smem_size_p));
             uint32_t max_num_kv_chunks =
                 (num_blocks_per_sm * num_sm) /
@@ -414,31 +414,30 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             // Setup kernel arguments
             void* args[] = {(void*)&xsize, (void*)&prefill_params, (void*)&decode_params,
                             (void*)&tbAssign};
-            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+            FLASHINFER_CALL(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
             // Launch kernel
-            FLASHINFER_CUDA_CALL(
-                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            FLASHINFER_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 
             // Post-kernel stuff for split-kv prefill
             if (!(num_chunks <= 1 || tmp_p == nullptr)) {
               if constexpr (PrefillAttentionVariant::use_softmax) {
-                FLASHINFER_CUDA_CALL(MergeStates(tmp_p, tmp_lse, o_p, lse_p, num_chunks, qo_len,
-                                                 num_qo_heads, HEAD_DIM_VO, stream));
+                FLASHINFER_CALL(MergeStates(tmp_p, tmp_lse, o_p, lse_p, num_chunks, qo_len,
+                                            num_qo_heads, HEAD_DIM_VO, stream));
               } else {
-                FLASHINFER_CUDA_CALL(AttentionSum(tmp_p, o_p, num_chunks, qo_len, num_qo_heads,
-                                                  HEAD_DIM_VO, stream));
+                FLASHINFER_CALL(AttentionSum(tmp_p, o_p, num_chunks, qo_len, num_qo_heads,
+                                             HEAD_DIM_VO, stream));
               }
             }
             // Post-kernel stuff for split-kv decode
             if (tmp_v != nullptr) {
               if constexpr (DecodeAttentionVariant::use_softmax) {
-                FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+                FLASHINFER_CALL(VariableLengthMergeStates(
                     tmp_v, tmp_s, decode_params.merge_indptr, o_d, lse_d,
                     decode_params.max_total_num_rows, decode_params.total_num_rows, num_qo_heads,
                     HEAD_DIM_VO, stream));
               } else {
-                FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+                FLASHINFER_CALL(VariableLengthAttentionSum(
                     tmp_v, decode_params.merge_indptr, o_d, decode_params.max_total_num_rows,
                     decode_params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
               }

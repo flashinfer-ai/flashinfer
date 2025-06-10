@@ -25,7 +25,7 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
           typename AttentionVariant, typename Params>
-cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
+Status SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -91,7 +91,7 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
         // Currently only support same quantization precision
         static_assert(std::is_same_v<DTypeQ, DTypeKV>);
 
-        cudaError_t status =
+        Status status =
             SingleFP8PrefillWithKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
                                                   AttentionVariant>(params, stream);
         TORCH_CHECK(status == cudaSuccess, "single_prefill_with_kv_cache_sm90 failed with error: " +
