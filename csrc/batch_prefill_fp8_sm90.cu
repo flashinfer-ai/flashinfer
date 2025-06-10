@@ -174,7 +174,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           cudaError_t status =
               BatchFP8PrefillWithPagedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                        AttentionVariant>(params, stream);
+                                                        AttentionVariant>(params, enable_pdl,
+                                                                          stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));
