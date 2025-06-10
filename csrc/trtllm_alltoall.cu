@@ -214,6 +214,6 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("moe_comm_prepare_indices", &moeCommPrepareIndicesOp);
   m.def("moe_local_gather", &moeLocalGatherOp);
   m.def("moe_comm", &moeCommOp);
-  m.def("set_moe_max_usable_sm_count", static_cast<void(*)(int64_t)>(&setMaxUsableSmCount));
+  m.def("set_moe_max_usable_sm_count", static_cast<void (*)(int64_t)>(&setMaxUsableSmCount));
   m.def("get_moe_commworkspace_size_per_rank", &getWorkspaceSizePerRank);
 }
