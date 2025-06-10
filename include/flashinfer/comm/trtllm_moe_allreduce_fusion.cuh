@@ -884,7 +884,7 @@ struct neg_zero<half> {
 template <>
 struct neg_zero<nv_bfloat16> {
   static constexpr unsigned short neg_zero_bits = 0x8000U;
-  static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
+  static constexpr t __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
 };
 
 template <>
@@ -894,6 +894,35 @@ struct neg_zero<float> {
 
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
+
+template <typename T>
+__device__ bool is_negative_zero(T) {
+  return false;
+}
+
+// float specialization
+template <>
+__device__ bool is_negative_zero<float>(float x) {
+  return (__float_as_int(x) == 0x80000000);
+}
+
+// double specialization
+template <>
+__device__ bool is_negative_zero<double>(double x) {
+  return (__double_as_longlong(x) == 0x8000000000000000ULL);
+}
+
+// __half specialization
+template <>
+__device__ bool is_negative_zero<__half>(__half x) {
+  return (__half_as_ushort(x) == 0x8000);
+}
+
+// __nv_bfloat16 specialization
+template <>
+__device__ bool is_negative_zero<__nv_bfloat16>(__nv_bfloat16 x) {
+  return (__bfloat16_as_ushort(x) == 0x8000);
+}
 
 template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
@@ -910,7 +939,7 @@ template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    vec[i] = (vec[i] == neg_zero_v<T>) ? static_cast<T>(0.f) : vec[i];
+    vec[i] = (is_negative_zero(vec[i])) ? static_cast<T>(0.f) : vec[i];
   }
 }
 
@@ -1096,11 +1125,12 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       //     printf(
       //         "Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank,
       //         blockIdx.x, threadIdx.x,
-      //         reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) * VEC_SIZE,
-      //         *comm.flag_ptr);
+      //         reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) *
+      //         VEC_SIZE, *comm.flag_ptr);
       //     // print the values
       //     for (int i = 0; i < VEC_SIZE; ++i) {
-      //       printf("Rank %d [%d-%d] get value %d: %f is_neg_zero: %d\n", params.rank, blockIdx.x, threadIdx.x, i,
+      //       printf("Rank %d [%d-%d] get value %d: %f is_neg_zero: %d\n", params.rank, blockIdx.x,
+      //       threadIdx.x, i,
       //              static_cast<float>(vals[r][i]), vals[r][i] == neg_zero_v<T>);
       //     }
       //     printf("Rank %d [%d-%d] has_neg_zero: %d\n", params.rank,
@@ -1115,9 +1145,9 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     printf("Rank %d [%d-%d] get values final\n", params.rank, blockIdx.x, threadIdx.x);
     for (int r = 0; r < NRanks; ++r) {
       for (int i = 0; i < VEC_SIZE; ++i) {
-          printf("Rank %d [%d-%d] get value %d final: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
-                static_cast<float>(vals[r][i]));
-        }
+        printf("Rank %d [%d-%d] get value %d final: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
+               static_cast<float>(vals[r][i]));
+      }
     }
 
     vec_t<T, VEC_SIZE> sum_val = vals[0];
@@ -1132,7 +1162,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
   }
   comm.update(params.size * NRanks);
   printf("Rank %d [%d-%d] after update counter with flag %d\n", params.rank, blockIdx.x,
-  threadIdx.x, *comm.flag_ptr);
+         threadIdx.x, *comm.flag_ptr);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
