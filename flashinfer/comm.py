@@ -583,6 +583,7 @@ def create_shared_buffer(
     dist.barrier(group=group)
     return pointers
 
+
 # todo: replace with this new create_shared_buffer
 # def create_shared_buffer(
 #         size_in_bytes: int, group: Optional[ProcessGroup] = None
@@ -609,6 +610,7 @@ def create_shared_buffer(
 
 #         dist.barrier(group=group)
 #         return pointers
+
 
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
@@ -787,7 +789,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # initialize the flag to [0,0,0,lamport_comm_size,0]
     cudart.cudaMemset(flag_ptr, 0, 5 * 4)
     # Set flag_ptr[3] = lamport_comm_size
-    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder='little')
+    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
     cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
     print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace

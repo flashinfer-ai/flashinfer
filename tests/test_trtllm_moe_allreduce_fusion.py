@@ -43,24 +43,24 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         device = torch.device(f"cuda:{rank}")
         token_nums = [
             1,
-            # 64,
-            # 256,
-            # 2048,
+            64,
+            256,
+            2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
-        # candidate_active_expert_num = [8, 12, 16]
-        candidate_active_expert_num = [8]
+        candidate_active_expert_num = [8, 12, 16]
+        # candidate_active_expert_num = [8]
         fusion_codes = [
             MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
-            # MoEAllReduceFusionType.NORM_OUT,
-            # MoEAllReduceFusionType.RESIDUAL_NORM_OUT,
-            # MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT,
+            MoEAllReduceFusionType.NORM_OUT,
+            MoEAllReduceFusionType.RESIDUAL_NORM_OUT,
+            MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT,
         ]
         swizzled_layout_codes = [
             comm.FP4QuantizationSFLayout.LINEAR,
-            # comm.FP4QuantizationSFLayout.SWIZZLED,
+            comm.FP4QuantizationSFLayout.SWIZZLED,
         ]
-        # launch_with_pdls = [True, False]
-        launch_with_pdls = [True]
+        launch_with_pdls = [True, False]
+        # launch_with_pdls = [True]
 
         # create workspace for moe allreduce fusion
         ipc_handles, workspace_tensor = (
@@ -69,7 +69,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             )
         )
 
-        test_loop = 2
+        test_loop = 5
 
         for token_num in token_nums:
             for active_expert_num in candidate_active_expert_num:
@@ -252,7 +252,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     raise ValueError(
                                         f"Invalid fusion code: {fusion_code}"
                                     )
-                                
+
                                 # Synchronize to wait for kernel completion
                                 # torch.cuda.synchronize()
 

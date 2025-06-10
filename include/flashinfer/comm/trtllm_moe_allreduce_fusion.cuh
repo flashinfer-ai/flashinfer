@@ -641,9 +641,11 @@ struct LamportComm {
       atomicAdd(counter_ptr, 1);
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      printf("Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, data_buf[1] %p, clear_buf %p\n",
-             rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
-             clear_buf);
+      printf(
+          "Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, "
+          "data_buf[1] %p, clear_buf %p\n",
+          rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
+          clear_buf);
     }
   }
 
@@ -1037,8 +1039,9 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     remove_neg_zero<T, VEC_SIZE>(accumulator);
 
     // debug only
+    int flag = *comm.flag_ptr;
     for (int i = 0; i < VEC_SIZE; ++i) {
-      accumulator[i] = static_cast<T>(i + 10 * params.rank);
+      accumulator[i] = static_cast<T>(flag * 100 + i + 10 * params.rank + 0.1);
     }
 
 #pragma unroll
@@ -1046,10 +1049,16 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       // STG.128 to remote rank
       int offset = (params.rank * tot_access + idx) * VEC_SIZE;
       accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
-      printf("Rank %d [%d-%d] store vec_t values at address %p with flag %d \n", params.rank, blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[r]) + offset, *comm.flag_ptr);
+      asm volatile("fence.sc.sys;");
+      // printf("Rank %d [%d-%d] store vec_t values at address index %d with flag %d \n",
+      // params.rank, blockIdx.x, threadIdx.x, offset, *comm.flag_ptr);
+      printf("Rank %d [%d-%d] store vec_t values at address %p with flag %d \n", params.rank,
+             blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[r]) + offset,
+             *comm.flag_ptr);
       // print the values
       for (int i = 0; i < VEC_SIZE; ++i) {
-        printf("Rank %d [%d-%d] store value %d: %f\n", params.rank, blockIdx.x, threadIdx.x, i, static_cast<float>(accumulator[i]));
+        printf("Rank %d [%d-%d] store value %d: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
+               static_cast<float>(accumulator[i]));
       }
     }
   }
@@ -1071,29 +1080,46 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       // printf("Rank %d poll AR Load with flag %d\n", params.rank, *comm.flag_ptr);
       done = true;
 #pragma unroll
-      for (int r = 0; r < NRanks; ++r) {
+      for (int r_i = 0; r_i < NRanks; ++r_i) {
+        int r = (r_i + params.rank) % NRanks;
         // LDG.128 from local rank
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
-        // printf("Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank, blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) * VEC_SIZE, *comm.flag_ptr);
+        asm volatile("fence.sc.sys;");
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
       count++;
-      if (count == 1500) {
-        for (int r = 0; r < NRanks; ++r) {
-          // last load for print
-          vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                      (r * tot_access + idx) * VEC_SIZE);
-          printf("Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank, blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) * VEC_SIZE, *comm.flag_ptr);
-          // print the values
-          for (int i = 0; i < VEC_SIZE; ++i) {
-            printf("Rank %d [%d-%d] get value %d: %f\n", params.rank, blockIdx.x, threadIdx.x, i, static_cast<float>(vals[r][i]));
-          }
-        }
-        printf("Rank %d [%d-%d] break after 1500 counts\n", params.rank, blockIdx.x, threadIdx.x);
-        break;
-      }
+      // if (count == 1500000) {
+      //   for (int r = 0; r < NRanks; ++r) {
+      //     printf("Rank %d [%d-%d] breaks at %d start\n", params.rank,
+      //         blockIdx.x, threadIdx.x, count);
+      //     printf(
+      //         "Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank,
+      //         blockIdx.x, threadIdx.x,
+      //         reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) * VEC_SIZE,
+      //         *comm.flag_ptr);
+      //     // print the values
+      //     for (int i = 0; i < VEC_SIZE; ++i) {
+      //       printf("Rank %d [%d-%d] get value %d: %f is_neg_zero: %d\n", params.rank, blockIdx.x, threadIdx.x, i,
+      //              static_cast<float>(vals[r][i]), vals[r][i] == neg_zero_v<T>);
+      //     }
+      //     printf("Rank %d [%d-%d] has_neg_zero: %d\n", params.rank,
+      //         blockIdx.x, threadIdx.x,
+      //         has_neg_zero<T, VEC_SIZE>(vals[r]));
+      //   }
+      //   printf("Rank %d [%d-%d] breaks at %d end\n", params.rank,
+      //         blockIdx.x, threadIdx.x, count);
+      //   // break;
+      // }
     }
+    printf("Rank %d [%d-%d] get values final\n", params.rank, blockIdx.x, threadIdx.x);
+    for (int r = 0; r < NRanks; ++r) {
+      for (int i = 0; i < VEC_SIZE; ++i) {
+          printf("Rank %d [%d-%d] get value %d final: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
+                static_cast<float>(vals[r][i]));
+        }
+    }
+
     vec_t<T, VEC_SIZE> sum_val = vals[0];
 #pragma unroll
     for (int r = 1; r < NRanks; ++r) {
@@ -1105,7 +1131,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
                                                           params);
   }
   comm.update(params.size * NRanks);
-  // printf("Rank %d [%d-%d] after update counter with flag %d\n", params.rank, blockIdx.x, threadIdx.x, *comm.flag_ptr);
+  printf("Rank %d [%d-%d] after update counter with flag %d\n", params.rank, blockIdx.x,
+  threadIdx.x, *comm.flag_ptr);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 

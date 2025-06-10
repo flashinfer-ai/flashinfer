@@ -3,8 +3,8 @@ set flag_ptr[3] = lamport_comm_size:  131072
 test RANK 1: 1-8-2-torch.float16-0-1-True start
 [2025-06-07 22:39:10.431] [info] lamportInitialize start: buffer: 0x75a461c00000, size: 196608
 Rank 1: flag_value 0, clear_size 0, counter 1, comm_size 131072, data_buf[0] 0x76557de00000, data_buf[1] 0x76557dc00000, clear_buf 0x76557dc40000
-Rank 1 [0-0] store vec_t values at address 0x76557de00020 with flag 0 
-Rank 1 [0-1] store vec_t values at address 0x76557de00030 with flag 0 
+Rank 1 [0-0] store vec_t values at address 0x76557de00020 with flag 0
+Rank 1 [0-1] store vec_t values at address 0x76557de00030 with flag 0
 Rank 1 [0-0] store value 0: 10.000000
 Rank 1 [0-1] store value 0: 10.000000
 Rank 1 [0-0] store value 1: 11.000000
@@ -21,8 +21,8 @@ Rank 1 [0-0] store value 6: 16.000000
 Rank 1 [0-1] store value 6: 16.000000
 Rank 1 [0-0] store value 7: 17.000000
 Rank 1 [0-1] store value 7: 17.000000
-Rank 1 [0-0] store vec_t values at address 0x76557dc00020 with flag 0 
-Rank 1 [0-1] store vec_t values at address 0x76557dc00030 with flag 0 
+Rank 1 [0-0] store vec_t values at address 0x76557dc00020 with flag 0
+Rank 1 [0-1] store vec_t values at address 0x76557dc00030 with flag 0
 Rank 1 [0-0] store value 0: 10.000000
 Rank 1 [0-1] store value 0: 10.000000
 Rank 1 [0-0] store value 1: 11.000000
@@ -78,8 +78,8 @@ Rank 1 [0-1] get value 7: 17.000000
 Rank 1 [0-0] break after 1500 counts
 Rank 1 [0-1] break after 1500 counts
 Rank 1: flag_value 1, clear_size 32, counter 1, comm_size 131072, data_buf[0] 0x76557de20000, data_buf[1] 0x76557dc20000, clear_buf 0x76557dc00000
-Rank 1 [0-0] store vec_t values at address 0x76557de20020 with flag 1 
-Rank 1 [0-1] store vec_t values at address 0x76557de20030 with flag 1 
+Rank 1 [0-0] store vec_t values at address 0x76557de20020 with flag 1
+Rank 1 [0-1] store vec_t values at address 0x76557de20030 with flag 1
 Rank 1 [0-0] store value 0: 10.000000
 Rank 1 [0-1] store value 0: 10.000000
 Rank 1 [0-0] store value 1: 11.000000
@@ -96,8 +96,8 @@ Rank 1 [0-0] store value 6: 16.000000
 Rank 1 [0-1] store value 6: 16.000000
 Rank 1 [0-0] store value 7: 17.000000
 Rank 1 [0-1] store value 7: 17.000000
-Rank 1 [0-0] store vec_t values at address 0x76557dc20020 with flag 1 
-Rank 1 [0-1] store vec_t values at address 0x76557dc20030 with flag 1 
+Rank 1 [0-0] store vec_t values at address 0x76557dc20020 with flag 1
+Rank 1 [0-1] store vec_t values at address 0x76557dc20030 with flag 1
 Rank 1 [0-0] store value 0: 10.000000
 Rank 1 [0-1] store value 0: 10.000000
 Rank 1 [0-0] store value 1: 11.000000
@@ -156,8 +156,8 @@ test RANK 1: 1-8-2-torch.float16-0-1-True passed
 set flag_ptr[3] = lamport_comm_size:  131072
 test RANK 0: 1-8-2-torch.float16-0-1-True start
 Rank 0: flag_value 0, clear_size 0, counter 1, comm_size 131072, data_buf[0] 0x75a461c00000, data_buf[1] 0x75a461e00000, clear_buf 0x75a461c40000
-Rank 0 [0-0] store vec_t values at address 0x75a461c00000 with flag 0 
-Rank 0 [0-1] store vec_t values at address 0x75a461c00010 with flag 0 
+Rank 0 [0-0] store vec_t values at address 0x75a461c00000 with flag 0
+Rank 0 [0-1] store vec_t values at address 0x75a461c00010 with flag 0
 Rank 0 [0-0] store value 0: 0.000000
 Rank 0 [0-1] store value 0: 0.000000
 Rank 0 [0-0] store value 1: 1.000000
@@ -174,8 +174,8 @@ Rank 0 [0-0] store value 6: 6.000000
 Rank 0 [0-1] store value 6: 6.000000
 Rank 0 [0-0] store value 7: 7.000000
 Rank 0 [0-1] store value 7: 7.000000
-Rank 0 [0-0] store vec_t values at address 0x75a461e00000 with flag 0 
-Rank 0 [0-1] store vec_t values at address 0x75a461e00010 with flag 0 
+Rank 0 [0-0] store vec_t values at address 0x75a461e00000 with flag 0
+Rank 0 [0-1] store vec_t values at address 0x75a461e00010 with flag 0
 Rank 0 [0-0] store value 0: 0.000000
 Rank 0 [0-1] store value 0: 0.000000
 Rank 0 [0-0] store value 1: 1.000000
@@ -231,8 +231,8 @@ Rank 0 [0-1] get value 7: -0.000000
 Rank 0 [0-0] break after 1500 counts
 Rank 0 [0-1] break after 1500 counts
 Rank 0: flag_value 1, clear_size 32, counter 1, comm_size 131072, data_buf[0] 0x75a461c20000, data_buf[1] 0x75a461e20000, clear_buf 0x75a461c00000
-Rank 0 [0-0] store vec_t values at address 0x75a461c20000 with flag 1 
-Rank 0 [0-1] store vec_t values at address 0x75a461c20010 with flag 1 
+Rank 0 [0-0] store vec_t values at address 0x75a461c20000 with flag 1
+Rank 0 [0-1] store vec_t values at address 0x75a461c20010 with flag 1
 Rank 0 [0-0] store value 0: 0.000000
 Rank 0 [0-1] store value 0: 0.000000
 Rank 0 [0-0] store value 1: 1.000000
@@ -249,8 +249,8 @@ Rank 0 [0-0] store value 6: 6.000000
 Rank 0 [0-1] store value 6: 6.000000
 Rank 0 [0-0] store value 7: 7.000000
 Rank 0 [0-1] store value 7: 7.000000
-Rank 0 [0-0] store vec_t values at address 0x75a461e20000 with flag 1 
-Rank 0 [0-1] store vec_t values at address 0x75a461e20010 with flag 1 
+Rank 0 [0-0] store vec_t values at address 0x75a461e20000 with flag 1
+Rank 0 [0-1] store vec_t values at address 0x75a461e20010 with flag 1
 Rank 0 [0-0] store value 0: 0.000000
 Rank 0 [0-1] store value 0: 0.000000
 Rank 0 [0-0] store value 1: 1.000000
