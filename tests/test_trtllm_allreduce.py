@@ -168,7 +168,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     tolerance = 1e-2 if dtype == torch.float16 else 8e-2
 
                                     if fusion_op_code == comm.AllReduceFusionOp.NONE:
-                                        assert torch.allclose(
+                                        torch.testing.assert_close(
                                             out1, inp1_ref, atol=tolerance, rtol=3e-2
                                         )
                                     elif (
@@ -190,8 +190,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                                 + bias_float[i % hidden_size]
                                             )
                                         ref_half = ref_float.to(dtype)
-
-                                        assert torch.allclose(
+                                        torch.testing.assert_close(
                                             inter_buffer,
                                             ref_half,
                                             atol=tolerance,
@@ -213,7 +212,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                             torch.float32
                                         )
                                         normed_half = normed_float.to(dtype)
-                                        assert torch.allclose(
+                                        torch.testing.assert_close(
                                             out1,
                                             normed_half.view(-1),
                                             atol=tolerance,
