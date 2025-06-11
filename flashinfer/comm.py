@@ -421,14 +421,50 @@ def get_comm_module():
         torch.Tensor,
         torch.Tensor,
     ]:
-        return module.moe_comm_prepare_indices(
+        device = gathered_target_rank_ids.device
+        max_send_ranks_per_token = max(top_k, ep_size)
+        local_gather_indices = torch.empty(
+            (max_token_count_per_rank * ep_size), device=device, dtype=torch.int
+        )
+        send_rank_count_cum_sum = torch.empty(
+            (ep_size,), device=device, dtype=torch.int
+        )
+        send_rank_local_indices = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token),
+            device=device,
+            dtype=torch.int,
+        )
+        recv_rank_count_cum_sum = torch.empty((ep_size), device=device, dtype=torch.int)
+        recv_rank_local_indices = torch.empty(
+            (max_token_count_per_rank * ep_size), device=device, dtype=torch.int
+        )
+        backward_recv_rank_local_indice = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token),
+            device=device,
+            dtype=torch.int,
+        )
+        module.moe_comm_prepare_indices(
             gathered_target_rank_ids,
             real_rank_token_count_cum_sum,
+            local_gather_indices,
+            send_rank_count_cum_sum,
+            send_rank_local_indices,
+            recv_rank_count_cum_sum,
+            recv_rank_local_indices,
+            backward_recv_rank_local_indice,
             max_token_count_per_rank,
             expert_count,
             top_k,
             ep_rank,
             ep_size,
+        )
+        return (
+            local_gather_indices,
+            send_rank_count_cum_sum,
+            send_rank_local_indices,
+            recv_rank_count_cum_sum,
+            recv_rank_local_indices,
+            backward_recv_rank_local_indice,
         )
 
     @register_custom_op(

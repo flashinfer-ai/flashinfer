@@ -22,11 +22,13 @@
 
 using namespace flashinfer::trtllm_alltoall;
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
-                        std::optional<at::Tensor> realRankTokenCountCumSum,
-                        int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
-                        int64_t epRank, int64_t epSize) {
+void moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
+                             std::optional<at::Tensor> realRankTokenCountCumSum,
+                             at::Tensor localGatherIndices, at::Tensor sendRankCountCumSum,
+                             at::Tensor sendRankLocalIndices, at::Tensor recvRankCountCumSum,
+                             at::Tensor recvRankLocalIndices,
+                             at::Tensor backwardRecvRankLocalIndices, int64_t maxTokenCountPerRank,
+                             int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(gatheredTargetRankIds, at::ScalarType::Int);
   TORCH_CHECK(gatheredTargetRankIds.dim() == 2, "gatheredTargetRankIds must be a 2D tensor");
   TORCH_CHECK(gatheredTargetRankIds.size(1) == topK,
@@ -55,20 +57,29 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
 
   int maxSendRanksPerToken = std::max(static_cast<int>(epSize), static_cast<int>(topK));
 
-  at::Tensor localGatherIndices = torch::empty(
-      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
-  at::Tensor sendRankCountCumSum =
-      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
-  at::Tensor sendRankLocalIndices =
-      torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
-                   gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
-  at::Tensor recvRankCountCumSum =
-      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
-  at::Tensor recvRankLocalIndices = torch::empty(
-      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
-  at::Tensor backwardRecvRankLocalIndices =
-      torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
-                   gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
+  CHECK_INPUT_TYPE(localGatherIndices, at::ScalarType::Int);
+  TORCH_CHECK(localGatherIndices.dim() == 1);
+  TORCH_CHECK(localGatherIndices.size(0) == maxTokenCountPerRank * epSize);
+
+  CHECK_INPUT_TYPE(sendRankCountCumSum, at::ScalarType::Int);
+  TORCH_CHECK(sendRankCountCumSum.dim() == 1);
+  TORCH_CHECK(sendRankCountCumSum.size(0) == epSize)
+
+  CHECK_INPUT_TYPE(sendRankLocalIndices, at::ScalarType::Int);
+  TORCH_CHECK(sendRankLocalIndices.dim() == 1);
+  TORCH_CHECK(sendRankLocalIndices.size(0) == maxTokenCountPerRank * maxSendRanksPerToken);
+
+  CHECK_INPUT_TYPE(recvRankCountCumSum, at::ScalarType::Int);
+  TORCH_CHECK(recvRankCountCumSum.dim() == 1);
+  TORCH_CHECK(recvRankCountCumSum.size(0) == epSize);
+
+  CHECK_INPUT_TYPE(recvRankLocalIndices, at::ScalarType::Int);
+  TORCH_CHECK(recvRankLocalIndices.dim() == 1);
+  TORCH_CHECK(recvRankLocalIndices.size(0) == maxTokenCountPerRank * epSize);
+
+  CHECK_INPUT_TYPE(backwardRecvRankLocalIndices, at::ScalarType::Int);
+  TORCH_CHECK(backwardRecvRankLocalIndices.dim() == 1);
+  TORCH_CHECK(backwardRecvRankLocalIndices.size(0) == maxTokenCountPerRank * maxSendRanksPerToken);
 
   flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
   expertParallelInfo.expertCount = static_cast<int>(expertCount);
@@ -85,9 +96,6 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
       recvRankLocalIndices.data_ptr<int>(), backwardRecvRankLocalIndices.data_ptr<int>(), stream);
   TORCH_CHECK(cudaResult == cudaSuccess,
               "CUDA error in moeAllToAllPrepareIndices: ", cudaGetErrorString(cudaResult));
-
-  return std::make_tuple(localGatherIndices, sendRankCountCumSum, sendRankLocalIndices,
-                         recvRankCountCumSum, recvRankLocalIndices, backwardRecvRankLocalIndices);
 }
 
 void moeLocalGatherOp(at::Tensor recvRankCumSum, at::Tensor localGatherIndices,
