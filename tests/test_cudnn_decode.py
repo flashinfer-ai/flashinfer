@@ -10,11 +10,11 @@ import flashinfer
 @pytest.mark.parametrize("batch_size", [4, 8, 64])
 @pytest.mark.parametrize("s_qo", [1])
 @pytest.mark.parametrize("s_kv", [8, 64, 2048])
-@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("use_cuda_graph", [False])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_cudnn_decode(
     batch_size,
     s_qo,

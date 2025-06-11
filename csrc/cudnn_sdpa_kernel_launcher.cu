@@ -84,6 +84,90 @@ auto get_cudnn_cubin(KernelType kernel_type) -> std::string {
 }
 
 __global__ static void __launch_bounds__(128)
+    qkv_tma_setup_decode(const unsigned int b, const unsigned int h_qo, const unsigned int h_kv,
+                         const unsigned int d, const unsigned int total_num_pages,
+                         const unsigned int page_size, const unsigned int split_factor,
+                         const unsigned int tile_m_1, const unsigned int tile_n_1,
+                         const unsigned int kv_strides_2, const unsigned int kv_strides_1,
+                         const unsigned int kv_strides_0, void* q_ptr, const void* k_ptr,
+                         const void* v_ptr, void* o_ptr, void* partial_o_ptr,
+                         tma::cudaTmaDesc* tma_desc_q_array, tma::cudaTmaDesc* tma_desc_k,
+                         tma::cudaTmaDesc* tma_desc_v, tma::cudaTmaDesc* tma_desc_o_array,
+                         tma::cudaTmaDesc* tma_desc_partial_o_array, int64_t* batch_strides_dev) {
+  const int tid = threadIdx.x;
+
+  constexpr unsigned int DIMS_QKV = 4;
+  constexpr unsigned int BYTES_PER_ELEMENT = 2;
+
+  std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_qo = {64, 1, 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_kv = {64, std::min(tile_n_1, page_size), 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_partial_o = {32, 1, 1, 1};
+
+  std::array<uint32_t, DIMS_QKV> tensor_size_qo = {d, 1 /* s_qo */, h_qo, b};
+  std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
+
+  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_qo = {h_qo * d * BYTES_PER_ELEMENT,
+                                                         d * BYTES_PER_ELEMENT, 0};
+  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_kv = {kv_strides_2 * (BYTES_PER_ELEMENT),
+                                                         kv_strides_1 * (BYTES_PER_ELEMENT),
+                                                         kv_strides_0 * (BYTES_PER_ELEMENT)};
+
+  std::array<uint32_t, DIMS_QKV> tensor_size_partial_o = {d, split_factor, h_qo, b};
+  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_partial_o = {
+      h_qo * d * b * sizeof(float), d * b * sizeof(float), d * h_qo * sizeof(float)};
+
+  tma::cudaSetTmaTileDescriptor(
+      reinterpret_cast<tma::cudaTmaDesc*>(tma_desc_k), k_ptr, DIMS_QKV, tensor_size_kv.data(),
+      tensor_stride_kv.data(), tensor_traversal_stride_qkv.data(), tensor_box_size_kv.data(),
+      tma::cudaTmaDescFormat::BF16_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
+
+  tma::cudaSetTmaTileDescriptor(
+      reinterpret_cast<tma::cudaTmaDesc*>(tma_desc_v), v_ptr, DIMS_QKV, tensor_size_kv.data(),
+      tensor_stride_kv.data(), tensor_traversal_stride_qkv.data(), tensor_box_size_kv.data(),
+      tma::cudaTmaDescFormat::BF16_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
+
+  int64_t batch_offset_qo = 0;
+  int64_t batch_offset_partial_o = 0;
+#pragma unroll 1
+  for (int i = 0; i < b; ++i) {
+    batch_strides_dev[i] = batch_offset_qo;
+    uint16_t* per_batch_q_ptr = reinterpret_cast<uint16_t*>(q_ptr + batch_offset_qo);
+    uint16_t* per_batch_out_ptr = reinterpret_cast<uint16_t*>(o_ptr + batch_offset_qo);
+    // The two below comes from half
+    float* per_batch_partial_o_ptr =
+        reinterpret_cast<float*>(partial_o_ptr + (batch_offset_partial_o));
+
+    tma::cudaTmaDesc desc_q;
+    tma::cudaTmaDesc desc_o;
+    tma::cudaTmaDesc desc_partial_o;
+
+    tma::cudaSetTmaTileDescriptor(&desc_q, (void*)per_batch_q_ptr, DIMS_QKV, tensor_size_qo.data(),
+                                  tensor_stride_qo.data(), tensor_traversal_stride_qkv.data(),
+                                  tensor_box_size_qo.data(), tma::cudaTmaDescFormat::BF16_RN,
+                                  tma::cudaTmaDescSwizzle::SWIZZLE_128B);
+
+    tma::cudaSetTmaTileDescriptor(
+        &desc_o, (void*)per_batch_out_ptr, DIMS_QKV, tensor_size_qo.data(), tensor_stride_qo.data(),
+        tensor_traversal_stride_qkv.data(), tensor_box_size_qo.data(),
+        tma::cudaTmaDescFormat::BF16_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
+
+    tma::cudaSetTmaTileDescriptor(&desc_partial_o, (void*)per_batch_partial_o_ptr, DIMS_QKV,
+                                  tensor_size_partial_o.data(), tensor_stride_partial_o.data(),
+                                  tensor_traversal_stride_qkv.data(),
+                                  tensor_box_size_partial_o.data(), tma::cudaTmaDescFormat::F32_RN,
+                                  tma::cudaTmaDescSwizzle::SWIZZLE_128B);
+
+    reinterpret_cast<tma::cudaTmaDesc*>(tma_desc_q_array)[i] = desc_q;
+    reinterpret_cast<tma::cudaTmaDesc*>(tma_desc_o_array)[i] = desc_o;
+    reinterpret_cast<tma::cudaTmaDesc*>(tma_desc_partial_o_array)[i] = desc_partial_o;
+
+    batch_offset_qo += d * h_qo * BYTES_PER_ELEMENT;
+    batch_offset_partial_o += d * h_qo * sizeof(float);
+  }
+}
+
+__global__ static void __launch_bounds__(128)
     qkv_tma_setup_prefill(const unsigned int b, const unsigned int h_qo, const unsigned int h_kv,
                           const unsigned int d, const unsigned int page_size,
                           const unsigned int total_num_pages,
@@ -677,9 +761,6 @@ void decode_2(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale
   // Step 3: Compute split factor
   int32_t split_factor = compute_split_factor(b, h_kv, h_qo, s_kv, sm_count);
 
-  std::cout << "split_factor: " << split_factor << " total_num_pages: " << total_num_pages
-            << std::endl;
-
   // Partial O dims [B, H, split_factor, D]
 
   cudnn_sdpa::strides_t lse_strides = {h_qo * s_q, 1, h_qo, 1};
@@ -953,6 +1034,7 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
   std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_qo = {64, 1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_kv = {64, std::min(TILE_N_1, page_size), 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_partial_o = {32, 1, 1, 1};
 
   std::array<uint32_t, DIMS_QKV> tensor_size_qo = {d, 1 /* s_qo */, h_qo, b};
   std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
@@ -965,10 +1047,9 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
                                                          kv_strides[1] * (BYTES_PER_ELEMENT),
                                                          kv_strides[0] * (BYTES_PER_ELEMENT)};
 
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_partial_o = {32, 1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_size_partial_o = {d, split_factor, h_qo, b};
-  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_partial_o = {h_qo * d * sizeof(float),
-                                                                d * sizeof(float), 1};
+  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_partial_o = {
+      h_qo * d * b * sizeof(float), d * b * sizeof(float), d * h_qo * sizeof(float)};
   uint16_t* q_ptr = reinterpret_cast<uint16_t*>(q.data_ptr());
   uint16_t* out_ptr = reinterpret_cast<uint16_t*>(out.data_ptr());
   float* partial_o_ptr = reinterpret_cast<float*>(partial_o_dev);
@@ -1070,8 +1151,11 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   int64_t s_qo = 1;
 
-  // TODO: Add support for split_factor > 1
-  int32_t split_factor = 1;
+  int32_t split_factor = compute_split_factor(b, h_kv, h_qo, max_skv, sm_count);
+
+  split_factor = 1;
+
+  // TORCH_CHECK(split_factor == 1, "Split factor > 1 not supported yet");
 
   // Set up TMA descriptors for Q, K, V, O
   auto qo_strides = q.strides();
@@ -1085,17 +1169,11 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   attrs[0].value.clusterDim.y = 1;
   attrs[0].value.clusterDim.z = 1;
 
-  const unsigned int CTAs_x = split_factor;  // Number of CTAs per row
   const unsigned int CTAs_y = h_kv * std::ceil(1.f * (h_qo / h_kv) / 64);
-  const unsigned int CTAs_z = b;
 
-  config.gridDimX = CTAs_x;
+  config.gridDimX = split_factor;  // Number of CTAs per row
   config.gridDimY = CTAs_y;
-  config.gridDimZ = CTAs_z;
-
-  config.blockDimX = NUM_THREADS;
-  config.blockDimY = 1;
-  config.blockDimZ = 1;
+  config.gridDimZ = b;
 
   config.blockDimX = NUM_THREADS;
   config.blockDimY = 1;
@@ -1115,39 +1193,6 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   int8_t* batch_strides_dev = tma_descriptor_start + ((3 * b + 2) * sizeof(tma::cudaTmaDesc));
 
-  int8_t* lse_dev = batch_strides_dev + (b * sizeof(int64_t));
-
-  std::unique_ptr<tma::cudaTmaDesc[]> tma_desc_host(new tma::cudaTmaDesc[(3 * b) + 2]);
-
-  tma::cudaTmaDesc* tma_desc_q = tma_desc_host.get();
-  tma::cudaTmaDesc* tma_desc_o = tma_desc_host.get() + b;
-  tma::cudaTmaDesc* tma_desc_partial_o = tma_desc_host.get() + b * 2;
-  tma::cudaTmaDesc* tma_desc_k = tma_desc_host.get() + b * 3;
-  tma::cudaTmaDesc* tma_desc_v = tma_desc_host.get() + (b * 3) + 1;
-
-  setup_tma_desc_decode(b, max_skv, h_qo, h_kv, d, total_num_pages, q, out, k_cache, v_cache,
-                        split_factor, page_size, partial_o_dev, tma_desc_q, tma_desc_o,
-                        tma_desc_partial_o, tma_desc_k, tma_desc_v);
-
-  std::unique_ptr<int64_t[]> batch_strides(new int64_t[b]);
-  for (int i = 0; i < b; i++) {
-    batch_strides[i] = (i)*d * h_qo;
-  }
-  cudaMemcpyAsync(batch_strides_dev, batch_strides.get(), sizeof(int64_t) * b,
-                  cudaMemcpyHostToDevice, stream);
-
-  cudaMemcpyAsync(tma_descriptor_start, tma_desc_host.get(), sizeof(tma::cudaTmaDesc) * (3 * b + 2),
-                  cudaMemcpyHostToDevice, stream);
-
-  cudnn_sdpa::AttentionDescriptor_t attnDesc{b, h_qo, h_kv, h_kv, s_qo, max_skv, d, h_qo / h_kv};
-
-  cudnn_sdpa::FastDivisor_t page_size_div;
-  setFastDivisor(page_size_div, page_size);
-
-  uint32_t page_size32 = static_cast<uint32_t>(page_size);
-  uint32_t num_pages_per_seq32 = static_cast<uint32_t>(max_skv / page_size);
-
-  void* args[15];
   tma::cudaTmaDesc* packed_tma_desc_q_dev =
       reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start);
   tma::cudaTmaDesc* packed_tma_desc_o_dev =
@@ -1158,12 +1203,61 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
       reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc) * 3);
   tma::cudaTmaDesc* tma_desc_v_dev = reinterpret_cast<tma::cudaTmaDesc*>(
       tma_descriptor_start + (sizeof(tma::cudaTmaDesc) * ((b * 3) + 1)));
+
+  int8_t* lse_dev = batch_strides_dev + (b * sizeof(int64_t));
+
+  if (use_cuda_graph) {
+    dim3 grid(1, 1, 1);
+    dim3 block(128, 1, 1);
+    qkv_tma_setup_decode<<<grid, block, 0, stream>>>(
+        b, h_qo, h_kv, d, total_num_pages, page_size, split_factor, 1, TILE_N_1, kv_strides[2],
+        kv_strides[1], kv_strides[0], q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+        out.data_ptr(), partial_o_dev, packed_tma_desc_q_dev, tma_desc_k_dev, tma_desc_v_dev,
+        packed_tma_desc_o_dev, packed_tma_desc_partial_o_dev,
+        reinterpret_cast<int64_t*>(batch_strides_dev));
+  } else {
+    std::unique_ptr<tma::cudaTmaDesc[]> tma_desc_host(new tma::cudaTmaDesc[(3 * b) + 2]);
+
+    tma::cudaTmaDesc* tma_desc_q = tma_desc_host.get();
+    tma::cudaTmaDesc* tma_desc_o = tma_desc_host.get() + b;
+    tma::cudaTmaDesc* tma_desc_partial_o = tma_desc_host.get() + b * 2;
+    tma::cudaTmaDesc* tma_desc_k = tma_desc_host.get() + b * 3;
+    tma::cudaTmaDesc* tma_desc_v = tma_desc_host.get() + (b * 3) + 1;
+
+    setup_tma_desc_decode(b, max_skv, h_qo, h_kv, d, total_num_pages, q, out, k_cache, v_cache,
+                          split_factor, page_size, partial_o_dev, tma_desc_q, tma_desc_o,
+                          tma_desc_partial_o, tma_desc_k, tma_desc_v);
+
+    std::unique_ptr<int64_t[]> batch_strides(new int64_t[b]);
+    for (int i = 0; i < b; i++) {
+      batch_strides[i] = (i)*d * h_qo;
+    }
+    cudaMemcpyAsync(batch_strides_dev, batch_strides.get(), sizeof(int64_t) * b,
+                    cudaMemcpyHostToDevice, stream);
+
+    cudaMemcpyAsync(tma_descriptor_start, tma_desc_host.get(),
+                    sizeof(tma::cudaTmaDesc) * (3 * b + 2), cudaMemcpyHostToDevice, stream);
+  }
+
+  cudnn_sdpa::AttentionDescriptor_t attnDesc{b, h_qo, h_kv, h_kv, s_qo, max_skv, d, h_qo / h_kv};
+
+  cudnn_sdpa::FastDivisor_t page_size_div;
+  setFastDivisor(page_size_div, page_size);
+
+  uint32_t page_size32 = static_cast<uint32_t>(page_size);
+  uint32_t num_pages_per_seq32 = static_cast<uint32_t>(max_skv / page_size);
+
+  void* args[15];
+
   float attn_scale = scale;
   void* actual_seq_lens_q_gpu_pointer = nullptr;
   void* actual_seq_lens_kv_gpu_pointer = actual_seq_lens_kv_gpu.data_ptr<int32_t>();
   void* block_tables_pointer = block_tables.data_ptr<int32_t>();
 
-  cudnn_sdpa::strides_t lse_strides = {h_qo * s_qo, 1, h_qo, 1};
+  cudnn_sdpa::strides_t lse_strides = {h_qo, 1, h_qo, 1};
+  cudnn_sdpa::strides_t partial_lse_strides = {h_qo, 1, h_qo * b, 1};
+
+  cudnn_sdpa::strides_t partial_o_strides = {split_factor * h_qo * d, h_qo * d, d, 1};
 
   args[0] = (void*)&attnDesc;
   args[1] = (void*)&packed_tma_desc_q_dev;
@@ -1171,9 +1265,10 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   args[3] = (void*)&split_factor;
   args[4] = (void*)&attn_scale;
   args[5] = (void*)&lse_dev;
-  args[6] = (void*)&lse_strides;
+  args[6] = split_factor == 1 ? (void*)&lse_strides : (void*)&partial_lse_strides;
   args[7] = (void*)&tma_desc_v_dev;
-  args[8] = &packed_tma_desc_o_dev;
+  args[8] =
+      split_factor == 1 ? (void*)&packed_tma_desc_o_dev : (void*)&packed_tma_desc_partial_o_dev;
   args[9] = (void*)&actual_seq_lens_q_gpu_pointer;
   args[10] = (void*)&actual_seq_lens_kv_gpu_pointer;
   args[11] = (void*)&block_tables_pointer;
@@ -1187,6 +1282,60 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   if (err_launch != CUDA_SUCCESS) {
     std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
     throw std::runtime_error("cuLaunchKernelEx failed for decode");
+  }
+
+  // Now setting up the reduction kernel
+  if (split_factor > 1) {
+    // TODO: Add support for split_factor > 1
+    void* args_lean_attn_reduction[11];
+    void* o_dev = out.data_ptr();
+
+    void* lse_final_dev = nullptr;
+
+    cudnn_sdpa::strides_t o_strides = {h_qo * d, d, 1};
+
+    args_lean_attn_reduction[0] = (void*)&attnDesc;
+    args_lean_attn_reduction[1] = (void*)&split_factor;
+    args_lean_attn_reduction[2] = (void*)&o_dev;
+    args_lean_attn_reduction[3] = (void*)&partial_o_dev;
+    args_lean_attn_reduction[4] = (void*)&lse_final_dev;
+    args_lean_attn_reduction[5] = (void*)&lse_dev;
+    args_lean_attn_reduction[6] = (void*)&o_strides;
+    args_lean_attn_reduction[7] = (void*)&partial_o_strides;
+    args_lean_attn_reduction[8] = (void*)&lse_strides;
+    args_lean_attn_reduction[9] = (void*)&partial_lse_strides;
+    args_lean_attn_reduction[10] = (void*)&batch_strides_dev;
+
+    // Launch config for reduction kernel
+
+    CUlaunchConfig reduction_config;
+
+    reduction_config.gridDimX = h_qo;
+    reduction_config.gridDimY = b;  // Same as CTAs_z of main kernel
+    reduction_config.gridDimZ = 1;
+
+    reduction_config.blockDimX = 128;  // 128 threads per block
+    reduction_config.blockDimY = 1;
+    reduction_config.blockDimZ = 1;
+
+    reduction_config.sharedMemBytes = REDUCTION_MEM_SIZE;
+
+    CUlaunchAttribute reduction_attrs[1];
+    reduction_attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    reduction_attrs[0].value.clusterDim.x = 1;
+    reduction_attrs[0].value.clusterDim.y = 1;
+    reduction_attrs[0].value.clusterDim.z = 1;
+
+    reduction_config.hStream = stream;
+    reduction_config.numAttrs = 1;
+    reduction_config.attrs = reduction_attrs;
+
+    auto err_launch = cuLaunchKernelEx(&reduction_config, lean_attn_reduction,
+                                       (void**)args_lean_attn_reduction, nullptr);
+    if (err_launch != CUDA_SUCCESS) {
+      std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
+      throw std::runtime_error("cuLaunchKernelEx failed for decode");
+    }
   }
 }
 
