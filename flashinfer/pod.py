@@ -382,7 +382,8 @@ class PODWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            self._cached_module = get_batch_prefill_module("fa2")(
+            self._cached_module = get_batch_prefill_module(
+                "fa2",
                 q_data_type,
                 kv_data_type,
                 q_data_type,
