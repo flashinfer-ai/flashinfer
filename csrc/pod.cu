@@ -30,7 +30,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                            typename PrefillParams::DTypeO* tmp,
                                            DecodeParams decode_params,
                                            typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
-                                           cudaStream_t stream);
+                                           bool enable_pdl, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -51,7 +51,8 @@ void pod_with_kv_cache_tensor(
     std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
     int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
     std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d) {
+    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
+    bool enable_pdl) {
   // Prefill setup
   unsigned int head_dim_qk = q_p.size(2);
   unsigned int kv_len_p, qo_len_p, num_kv_heads, num_qo_heads;
@@ -264,7 +265,7 @@ void pod_with_kv_cache_tensor(
             HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
             CTA_TILE_Q, MASK_MODE_D, PrefillAttentionVariant, DecodeAttentionVariant>(
             prefill_params, static_cast<DTypeO*>(tmp_p.data_ptr()), decode_params, tmp_v, tmp_s,
-            stream);
+            enable_pdl, stream);
         TORCH_CHECK(status == cudaSuccess, "PODWithKVCache kernel launch failed, error: " +
                                                std::string(cudaGetErrorString(status)));
         //});

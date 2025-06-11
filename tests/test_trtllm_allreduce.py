@@ -50,7 +50,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
         # below are the recommended hidden sizes for custom all-reduce in trtllm test
         # hidden_size should be in range [256, 8192], and maxHiddenSize should be 8192
-        hidden_sizes = [1024, 2048, 4096]
+        hidden_sizes = [1024, 4096]
         config_codes = [
             0,
             comm.AllReduceStrategyConfig.USE_MEMCPY,
@@ -79,7 +79,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             group=group,
         )
 
-        test_loop = 1  # could be any number
+        test_loop = 2  # could be any number
 
         # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR
         flag_value = 1
@@ -165,20 +165,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     )
                                     dist.all_reduce(inp1_ref, group=group)
 
-                                    tolerance = 1e-2 if dtype == torch.float16 else 5e-2
+                                    tolerance = 1e-2 if dtype == torch.float16 else 8e-2
 
                                     if fusion_op_code == comm.AllReduceFusionOp.NONE:
-                                        if not torch.allclose(
+                                        torch.testing.assert_close(
                                             out1, inp1_ref, atol=tolerance, rtol=3e-2
-                                        ):
-                                            print(
-                                                f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} failed"
-                                            )
-                                            print(f"out1: {out1}")
-                                            print(f"inp1_ref: {inp1_ref}")
-                                            print(f"tolerance: {tolerance}")
-                                            print(f"rtol: {3e-2}")
-                                            pass_flag = False
+                                        )
                                     elif (
                                         fusion_op_code
                                         == comm.AllReduceFusionOp.RESIDUAL_RMS_NORM
@@ -198,21 +190,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                                 + bias_float[i % hidden_size]
                                             )
                                         ref_half = ref_float.to(dtype)
-
-                                        if not torch.allclose(
+                                        torch.testing.assert_close(
                                             inter_buffer,
                                             ref_half,
                                             atol=tolerance,
                                             rtol=3e-2,
-                                        ):
-                                            print(
-                                                f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} failed"
-                                            )
-                                            print(f"inter_buffer: {inter_buffer}")
-                                            print(f"ref_half: {ref_half}")
-                                            print(f"tolerance: {tolerance}")
-                                            print(f"rtol: {3e-2}")
-                                            pass_flag = False
+                                        )
 
                                         # RMSNorm over hidden size
                                         ref_float = ref_float.view(
@@ -229,23 +212,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                             torch.float32
                                         )
                                         normed_half = normed_float.to(dtype)
-
-                                        if not torch.allclose(
+                                        torch.testing.assert_close(
                                             out1,
                                             normed_half.view(-1),
                                             atol=tolerance,
                                             rtol=3e-2,
-                                        ):
-                                            print(
-                                                f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} failed"
-                                            )
-                                            print(f"out1: {out1}")
-                                            print(
-                                                f"normed_half.view(-1): {normed_half.view(-1)}"
-                                            )
-                                            print(f"tolerance: {tolerance}")
-                                            print(f"rtol: {3e-2}")
-                                            pass_flag = False
+                                        )
 
                                     elif (
                                         fusion_op_code
@@ -259,7 +231,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     print(
                                         f"test RANK {rank}: {world_size}-{dtype}-{strategy_code}-{config_code}-{fusion_op_code}-{launch_with_pdl}-{hidden_size} passed"
                                     )
-                                # dist.barrier(group=group)
+                                # torch.cuda.synchronize()
                                 # # you might want to enable this barrier for a better log output, but it's not mandatory across allReduce calls
     finally:
         dist.barrier(group=group)

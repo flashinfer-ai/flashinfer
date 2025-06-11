@@ -22,7 +22,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
-from .utils import register_custom_op, register_fake_op
+from .utils import device_support_pdl, register_custom_op, register_fake_op
 
 _norm_module = None
 
@@ -57,7 +57,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -82,6 +82,8 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if out is None:
         out = torch.empty_like(input)
     _rmsnorm(out, input, weight, eps, enable_pdl)
@@ -94,8 +96,10 @@ def _rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    enable_pdl: bool,
+    enable_pdl: Optional[bool],
 ) -> None:
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     get_module_attr("rmsnorm")(out, input, weight, eps, enable_pdl)
 
 
@@ -105,7 +109,7 @@ def _rmsnorm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    enable_pdl: bool,
+    enable_pdl: Optional[bool],
 ) -> None:
     pass
 
@@ -116,7 +120,7 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -140,6 +144,8 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     get_module_attr("fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
 
 
@@ -149,7 +155,7 @@ def _fused_add_rmsnorm_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     pass
 
@@ -159,7 +165,7 @@ def gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Gemma-style root mean square normalization.
 
@@ -184,6 +190,8 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     if out is None:
         out = torch.empty_like(input)
     _gemma_rmsnorm(out, input, weight, eps, enable_pdl)
@@ -196,8 +204,10 @@ def _gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    enable_pdl: bool,
+    enable_pdl: Optional[bool],
 ) -> None:
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     get_module_attr("gemma_rmsnorm")(out, input, weight, eps, enable_pdl)
 
 
@@ -207,7 +217,7 @@ def _gemma_rmsnorm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    enable_pdl: bool,
+    enable_pdl: Optional[bool],
 ) -> None:
     pass
 
@@ -220,7 +230,7 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
@@ -244,6 +254,8 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     get_module_attr("gemma_fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
 
 
@@ -253,6 +265,6 @@ def _gemma_fused_add_rmsnorm_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     pass

@@ -28,5 +28,5 @@ template cudaError_t PODWithKVCacheTensorDispatched<
     {{ variant_name_d }}, PrefillParams, DecodeParams>(
             PrefillParams prefill_params, {{ dtype_o }}* tmp,
             DecodeParams decode_params, {{ dtype_o }}* tmp_v,
-            float *tmp_s, cudaStream_t stream);
+            float *tmp_s, bool enable_pdl, cudaStream_t stream);
 };

@@ -10,7 +10,7 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched
      {{ mask_mode }},
      /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
      /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},
-     {{ variant_name }}, PagedParams>(PagedParams& params, cudaStream_t stream);
+     {{ variant_name }}, PagedParams>(PagedParams& params, bool enable_pdl, cudaStream_t stream);
 {% endfor %}
 
 };  // namespace flashinfer
