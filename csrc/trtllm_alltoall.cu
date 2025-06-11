@@ -15,11 +15,6 @@
  * limitations under the License.
  */
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAStream.h>
-#include <torch/types.h>
-
 #include <vector>
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
@@ -29,10 +24,10 @@ using namespace flashinfer::trtllm_alltoall;
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
-                        c10::optional<at::Tensor> realRankTokenCountCumSum,
+                        std::optional<at::Tensor> realRankTokenCountCumSum,
                         int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
                         int64_t epRank, int64_t epSize) {
-  CHECK_INPUT_TYPE(gatheredTargetRankIds, torch::kInt32);
+  CHECK_INPUT_TYPE(gatheredTargetRankIds, at::ScalarType::Int);
   TORCH_CHECK(gatheredTargetRankIds.dim() == 2, "gatheredTargetRankIds must be a 2D tensor");
   TORCH_CHECK(gatheredTargetRankIds.size(1) == topK,
               "gatheredTargetRankIds must have topK columns");
@@ -41,7 +36,7 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
   if (realRankTokenCountCumSum.has_value()) {
     TORCH_CHECK(realRankTokenCountCumSum.value().dim() == 1,
                 "realRankTokenCountCumSum must be a 1D tensor");
-    TORCH_CHECK(realRankTokenCountCumSum.value().dtype() == torch::kInt32,
+    TORCH_CHECK(realRankTokenCountCumSum.value().dtype() == at::ScalarType::Int,
                 "realRankTokenCountCumSum must be a int32 tensor");
     TORCH_CHECK(realRankTokenCountCumSum.value().size(0) == epSize,
                 "realRankTokenCountCumSum must have epSize elements");
@@ -61,19 +56,19 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
   int maxSendRanksPerToken = std::max(static_cast<int>(epSize), static_cast<int>(topK));
 
   at::Tensor localGatherIndices = torch::empty(
-      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
   at::Tensor sendRankCountCumSum =
-      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
   at::Tensor sendRankLocalIndices =
       torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
-                   gatheredTargetRankIds.options().dtype(torch::kInt32));
+                   gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
   at::Tensor recvRankCountCumSum =
-      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+      torch::empty({epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
   at::Tensor recvRankLocalIndices = torch::empty(
-      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+      {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
   at::Tensor backwardRecvRankLocalIndices =
       torch::empty({maxTokenCountPerRank * maxSendRanksPerToken},
-                   gatheredTargetRankIds.options().dtype(torch::kInt32));
+                   gatheredTargetRankIds.options().dtype(at::ScalarType::Int));
 
   flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
   expertParallelInfo.expertCount = static_cast<int>(expertCount);
@@ -100,12 +95,12 @@ void moeLocalGatherOp(at::Tensor recvRankCumSum, at::Tensor localGatherIndices,
                       at::Tensor localExpertIds, at::Tensor localScales,
                       int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
                       int64_t epRank, int64_t epSize) {
-  CHECK_INPUT_TYPE(recvRankCumSum, torch::kInt32);
-  CHECK_INPUT_TYPE(localGatherIndices, torch::kInt32);
-  CHECK_INPUT_TYPE(gatheredExpertIds, torch::kInt32);
-  CHECK_INPUT_TYPE(gatheredScales, torch::kFloat32);
-  CHECK_INPUT_TYPE(localExpertIds, torch::kInt32);
-  CHECK_INPUT_TYPE(localScales, torch::kFloat32);
+  CHECK_INPUT_TYPE(recvRankCumSum, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(localGatherIndices, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(gatheredExpertIds, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(gatheredScales, at::ScalarType::Float);
+  CHECK_INPUT_TYPE(localExpertIds, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(localScales, at::ScalarType::Float);
 
   TORCH_CHECK(maxTokenCountPerRank > 0, "maxTokenCountPerRank must be greater than 0");
   TORCH_CHECK(expertCount > 0, "expertCount must be greater than 0");
@@ -149,12 +144,13 @@ void moeLocalGatherOp(at::Tensor recvRankCumSum, at::Tensor localGatherIndices,
 void moeCommOp(at::Tensor input, at::Tensor sendRankCumSum, at::Tensor sendIndices,
                at::Tensor output, at::Tensor recvRankCumSum, at::Tensor recvIndices,
                at::Tensor allWorkspaces, int64_t epRank, int64_t epSize) {
-  CHECK_INPUT_TYPE(sendRankCumSum, torch::kInt32);
-  CHECK_INPUT_TYPE(sendIndices, torch::kInt32);
-  CHECK_INPUT_TYPE(recvRankCumSum, torch::kInt32);
-  CHECK_INPUT_TYPE(recvIndices, torch::kInt32);
+  CHECK_INPUT_TYPE(sendRankCumSum, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(sendIndices, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(recvRankCumSum, at::ScalarType::Int);
+  CHECK_INPUT_TYPE(recvIndices, at::ScalarType::Int);
   // allWorkspaces is a uint64 tensor, but may not be contiguous
-  TORCH_CHECK(allWorkspaces.dtype() == torch::kUInt64, "allWorkspaces must be a uint64 tensor");
+  TORCH_CHECK(allWorkspaces.dtype() == at::ScalarType::UInt64,
+              "allWorkspaces must be a uint64 tensor");
 
   TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
   TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
