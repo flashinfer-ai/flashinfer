@@ -1,7 +1,6 @@
 import pytest
 import torch
 from torch.nn import functional as F
-from vllm import _custom_ops as ops
 
 import flashinfer
 import flashinfer.fused_moe as fused_moe
@@ -12,13 +11,26 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 
+def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
+    fp8_traits_max = FLOAT8_E4M3_MAX
+    fp8_traits_min = -FLOAT8_E4M3_MAX
+    fp8_max = torch.tensor(fp8_traits_max).float()
+    one = torch.tensor(1.0).float()
+
+    x_max = x.abs().max().float()
+    scale = x_max / fp8_max
+    iscale = one / scale
+    out = (x.float() * iscale).clamp(fp8_traits_min, fp8_traits_max).to(FP8_DTYPE)
+    return out, scale.view((1,))
+
+
 def gen_tensor(shape, dtype, stype=None, scale=1.0):
     x = torch.randn(*shape, dtype=dtype).cuda() * scale
     return x.to(stype) if stype else x
 
 
 def cast_to_representable(x):
-    x_q, x_scale = ops.scaled_fp8_quant(x, scale=None)
+    x_q, x_scale = dynamic_per_tensor_fp8_quant(x)
     x = x_q.to(x.dtype) * x_scale.to(x.dtype)
     return x
 
@@ -251,10 +263,8 @@ def test_moe_fp8(
         w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
         w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
 
-        _, s31 = ops.scaled_fp8_quant(w31, scale=None)
-        _, s2 = ops.scaled_fp8_quant(w2, scale=None)
-        w31_quant, _ = ops.scaled_fp8_quant(w31, scale=s31)
-        w2_quant, _ = ops.scaled_fp8_quant(w2, scale=s2)
+        w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
+        w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
 
         w31_weight.data[expert_id].copy_(w31_quant)
         w2_weight.data[expert_id].copy_(w2_quant)
@@ -275,7 +285,7 @@ def test_moe_fp8(
     flash_output = torch.empty_like(ref_output)
     # For fp8, the hidden_state expects quantized.
     _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
-    x_quant, hidden_states_scale = ops.scaled_fp8_quant(x)
+    x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
     hidden_states_scale = torch.tensor(hidden_states_scale[0]).cuda()
     quant_scales = [
         torch.squeeze(w1_scales * hidden_states_scale).float(),
@@ -301,7 +311,10 @@ def test_moe_fp8(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-@pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
+@pytest.mark.parametrize(
+    "otype, wtype",
+    [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
+)
 @pytest.mark.parametrize("quantized_input", [False, True])
 def test_moe_nvfp4(
     batch_size,

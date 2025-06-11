@@ -137,10 +137,13 @@ def fp4_quantize(
     if sf_vec_size != 16:
         raise NotImplementedError("sf_vec_size can only be 16")
 
-    return get_fp4_quantization_sm100_module().fp4_quantize_sm100(
+    assert input.shape[-1] % sf_vec_size == 0
+    x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,
         sf_use_ue8m0,
         is_sf_swizzled_layout,
     )
+    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    return x_q, sf

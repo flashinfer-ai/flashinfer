@@ -641,8 +641,11 @@ struct LamportComm {
       atomicAdd(counter_ptr, 1);
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      printf("rank %d: flag_value %d, clear_size %d, counter %d\n", rank, flag_value, clear_size,
-             *counter_ptr);
+      printf(
+          "Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, "
+          "data_buf[1] %p, clear_buf %p\n",
+          rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
+          clear_buf);
     }
   }
 
@@ -892,6 +895,35 @@ struct neg_zero<float> {
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
 
+template <typename T>
+__device__ bool is_negative_zero(T) {
+  return false;
+}
+
+// float specialization
+template <>
+__device__ bool is_negative_zero<float>(float x) {
+  return (__float_as_int(x) == 0x80000000);
+}
+
+// double specialization
+template <>
+__device__ bool is_negative_zero<double>(double x) {
+  return (__double_as_longlong(x) == 0x8000000000000000ULL);
+}
+
+// __half specialization
+template <>
+__device__ bool is_negative_zero<__half>(__half x) {
+  return (__half_as_ushort(x) == 0x8000);
+}
+
+// __nv_bfloat16 specialization
+template <>
+__device__ bool is_negative_zero<__nv_bfloat16>(__nv_bfloat16 x) {
+  return (__bfloat16_as_ushort(x) == 0x8000);
+}
+
 template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
@@ -907,7 +939,7 @@ template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    vec[i] = (vec[i] == neg_zero_v<T>) ? static_cast<T>(0.f) : vec[i];
+    vec[i] = (is_negative_zero(vec[i])) ? static_cast<T>(0.f) : vec[i];
   }
 }
 
@@ -1007,10 +1039,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       int thread_offset_across_actexp_token =
           actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
       vec_t<T, VEC_SIZE> actexp_i_data;
-      // todo: review this
-      // reinterpret_cast<float4
-      // const*>(params.moe_reduction_active_experts_token_input)[thread_offset_across_actexp_token
-      // / kElemsPerAccess];
       actexp_i_data.load(reinterpret_cast<T*>(params.moe_reduction_active_experts_token_input) +
                          thread_offset_across_actexp_token);
 
@@ -1022,10 +1050,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         // assume computation is done in ScaleType
-        // todo: review this
-        // accumulator.unpacked[i] +=
-        // static_cast<DType>((static_cast<float>(actexp_i_data.unpacked[i]) *
-        // actexp_i_token_j_scale));
         accumulator[i] +=
             static_cast<T>((static_cast<float>(actexp_i_data[i]) * actexp_i_token_j_scale));
       }
@@ -1033,9 +1057,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
     // * FC2 + reduced(gGEMM2)
     vec_t<T, VEC_SIZE> fc2_data;
-    // todo: review this
-    // reinterpret_cast<float4 const*>(params.moe_reduction_token_input)[thread_offset_across_token
-    // / kElemsPerAccess];
     fc2_data.load(reinterpret_cast<T*>(params.moe_reduction_token_input) +
                   thread_offset_across_token);
     accumulator = vec_add<T, VEC_SIZE>(accumulator, fc2_data);
@@ -1046,14 +1067,28 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
     remove_neg_zero<T, VEC_SIZE>(accumulator);
 
+    // debug only
+    int flag = *comm.flag_ptr;
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      accumulator[i] = static_cast<T>(flag * 100 + i + 10 * params.rank + 0.1);
+    }
+
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
       int offset = (params.rank * tot_access + idx) * VEC_SIZE;
-      // todo: review this
-      // reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
-      // *reinterpret_cast<float4*>(val);
-      accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
+      accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
+      asm volatile("fence.sc.sys;");
+      // printf("Rank %d [%d-%d] store vec_t values at address index %d with flag %d \n",
+      // params.rank, blockIdx.x, threadIdx.x, offset, *comm.flag_ptr);
+      printf("Rank %d [%d-%d] store vec_t values at address %p with flag %d \n", params.rank,
+             blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[r]) + offset,
+             *comm.flag_ptr);
+      // print the values
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        printf("Rank %d [%d-%d] store value %d: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
+               static_cast<float>(accumulator[i]));
+      }
     }
   }
 
@@ -1069,17 +1104,52 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     // * AR Load
     vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
+    int count = 0;
     while (!done) {
-      printf("Rank %d poll AR Load with flag %d\n", params.rank, *comm.flag_ptr);
+      // printf("Rank %d poll AR Load with flag %d\n", params.rank, *comm.flag_ptr);
       done = true;
 #pragma unroll
-      for (int r = 0; r < NRanks; ++r) {
+      for (int r_i = 0; r_i < NRanks; ++r_i) {
+        int r = (r_i + params.rank) % NRanks;
         // LDG.128 from local rank
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
+        asm volatile("fence.sc.sys;");
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
+      count++;
+      // if (count == 1500000) {
+      //   for (int r = 0; r < NRanks; ++r) {
+      //     printf("Rank %d [%d-%d] breaks at %d start\n", params.rank,
+      //         blockIdx.x, threadIdx.x, count);
+      //     printf(
+      //         "Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank,
+      //         blockIdx.x, threadIdx.x,
+      //         reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) *
+      //         VEC_SIZE, *comm.flag_ptr);
+      //     // print the values
+      //     for (int i = 0; i < VEC_SIZE; ++i) {
+      //       printf("Rank %d [%d-%d] get value %d: %f is_neg_zero: %d\n", params.rank, blockIdx.x,
+      //       threadIdx.x, i,
+      //              static_cast<float>(vals[r][i]), vals[r][i] == neg_zero_v<T>);
+      //     }
+      //     printf("Rank %d [%d-%d] has_neg_zero: %d\n", params.rank,
+      //         blockIdx.x, threadIdx.x,
+      //         has_neg_zero<T, VEC_SIZE>(vals[r]));
+      //   }
+      //   printf("Rank %d [%d-%d] breaks at %d end\n", params.rank,
+      //         blockIdx.x, threadIdx.x, count);
+      //   // break;
+      // }
     }
+    printf("Rank %d [%d-%d] get values final\n", params.rank, blockIdx.x, threadIdx.x);
+    for (int r = 0; r < NRanks; ++r) {
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        printf("Rank %d [%d-%d] get value %d final: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
+               static_cast<float>(vals[r][i]));
+      }
+    }
+
     vec_t<T, VEC_SIZE> sum_val = vals[0];
 #pragma unroll
     for (int r = 1; r < NRanks; ++r) {
@@ -1091,7 +1161,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
                                                           params);
   }
   comm.update(params.size * NRanks);
-  // printf("Rank %d after update counter with flag %d\n", params.rank, *comm.flag_ptr);
+  printf("Rank %d [%d-%d] after update counter with flag %d\n", params.rank, blockIdx.x,
+         threadIdx.x, *comm.flag_ptr);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 

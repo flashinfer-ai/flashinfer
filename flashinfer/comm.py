@@ -560,12 +560,18 @@ def create_shared_buffer(
     Creates a shared buffer and returns a list of pointers
     representing the buffer on all processes in the group.
     """
+    """
+    Creates a shared buffer and returns a list of pointers
+    representing the buffer on all processes in the group.
+    """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
     if group is None:
         group = dist.group.WORLD
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
 
@@ -762,6 +768,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
+
+    for i in range(len(workspace)):
+        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
 
     # Store workspace pointers in device tensor
     workspace_tensor = torch.tensor(

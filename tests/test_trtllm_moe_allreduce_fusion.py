@@ -12,7 +12,8 @@ import flashinfer.comm as comm
 
 # Usage: test var, temp
 MAX_TOKEN_NUM = 2048
-HIDDEN_SIZE = 7168
+# HIDDEN_SIZE = 7168
+HIDDEN_SIZE = 16
 MAX_EXPERT_NUM = 16
 SCALE_FACTOR_RANGE = (-5, 5)
 
@@ -41,11 +42,13 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     try:
         device = torch.device(f"cuda:{rank}")
         token_nums = [
+            1,
             64,
             256,
             2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
         candidate_active_expert_num = [8, 12, 16]
+        # candidate_active_expert_num = [8]
         fusion_codes = [
             MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
             MoEAllReduceFusionType.NORM_OUT,
@@ -57,7 +60,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.FP4QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
-        # launch_with_pdls = [True] # todo(Yingyi): fix blocking issue with False
+        # launch_with_pdls = [True]
 
         # create workspace for moe allreduce fusion
         ipc_handles, workspace_tensor = (
@@ -66,7 +69,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             )
         )
 
-        test_loop = 1
+        test_loop = 5
 
         for token_num in token_nums:
             for active_expert_num in candidate_active_expert_num:
@@ -249,6 +252,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     raise ValueError(
                                         f"Invalid fusion code: {fusion_code}"
                                     )
+
+                                # Synchronize to wait for kernel completion
+                                # torch.cuda.synchronize()
 
                                 # todo: get ref result for each fusion op
                                 # dist.all_reduce(inp1_ref, group=group)
