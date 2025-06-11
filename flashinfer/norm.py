@@ -43,10 +43,7 @@ def get_norm_module():
 
 @cache
 def get_module_attr(attr: str) -> Any:
-    global _norm_module
-    if _norm_module is None:
-        get_norm_module()
-    return getattr(_norm_module, attr).default
+    return getattr(get_norm_module, attr).default
 
 
 def rmsnorm(
