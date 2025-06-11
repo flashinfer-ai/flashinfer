@@ -1723,9 +1723,8 @@ cudaError_t lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2,
   status = lamportInitialize<T>(buffer_2, size / sizeof(T), stream);
   FLASHINFER_CHECK(status == cudaSuccess, "lamportInitialize failed with error code " +
                                               std::string(cudaGetErrorString(status)));
-
-  return cudaSuccess;
   cudaDeviceSynchronize();
+  return cudaSuccess;
 }
 
 }  // namespace trtllm_allreduce
