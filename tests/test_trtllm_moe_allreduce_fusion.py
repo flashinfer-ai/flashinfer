@@ -13,7 +13,7 @@ import flashinfer.comm as comm
 # Usage: test var, temp
 MAX_TOKEN_NUM = 2048
 # HIDDEN_SIZE = 7168
-HIDDEN_SIZE = 16
+HIDDEN_SIZE = 8 # debug-only
 MAX_EXPERT_NUM = 16
 SCALE_FACTOR_RANGE = (-5, 5)
 
@@ -60,7 +60,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             comm.FP4QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
-        # launch_with_pdls = [True]
 
         # create workspace for moe allreduce fusion
         ipc_handles, workspace_tensor = (
@@ -68,6 +67,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                 rank, world_size, MAX_TOKEN_NUM, HIDDEN_SIZE, group=group
             )
         )
+        dist.barrier(group=group) # must sync after create_workspace
 
         test_loop = 5
 
@@ -84,7 +84,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 message_size = token_num * HIDDEN_SIZE
 
                                 inp1 = (
-                                    torch.randn(
+                                    torch.rand(
                                         message_size, dtype=dtype, device=device
                                     )
                                     * 200.0
@@ -95,7 +95,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # init params for each fusion op
                                 residual_in = (
-                                    torch.randn(
+                                    torch.rand(
                                         message_size, dtype=dtype, device=device
                                     )
                                     * 200.0
@@ -106,7 +106,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 quant_out = torch.empty_like(residual_in)
                                 scale_out = torch.empty_like(residual_in)
                                 rms_gamma = (
-                                    torch.randn(HIDDEN_SIZE, dtype=dtype, device=device)
+                                    torch.rand(HIDDEN_SIZE, dtype=dtype, device=device)
                                     * 2.0
                                     - 1.0
                                 )
@@ -120,7 +120,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # init moe params
                                 # [device_num_expert, m]
                                 moe_reduction_scale_input = (
-                                    torch.randn(
+                                    torch.rand(
                                         MAX_EXPERT_NUM * MAX_TOKEN_NUM,
                                         dtype=torch.float32,
                                         device=device,
@@ -130,7 +130,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
                                 # [device_num_expert, m, 7168]
                                 moe_reduction_active_experts_token_input = (
-                                    torch.randn(
+                                    torch.rand(
                                         MAX_EXPERT_NUM * message_size,
                                         dtype=dtype,
                                         device=device,
@@ -140,7 +140,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
                                 # [m, 7168]
                                 moe_reduction_token_input = (
-                                    torch.randn(
+                                    torch.rand(
                                         message_size, dtype=dtype, device=device
                                     )
                                     * 200.0
@@ -253,13 +253,11 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         f"Invalid fusion code: {fusion_code}"
                                     )
 
-                                # Synchronize to wait for kernel completion
-                                # torch.cuda.synchronize()
-
                                 # todo: get ref result for each fusion op
                                 # dist.all_reduce(inp1_ref, group=group)
 
                                 # todo: check correctness
+                            torch.cuda.synchronize()
                             print(
                                 f"test RANK {rank}: {token_num}-{active_expert_num}-{world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} passed"
                             )

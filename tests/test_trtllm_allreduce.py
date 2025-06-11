@@ -79,6 +79,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             group=group,
         )
 
+        dist.barrier(group=group) # must sync after create_workspace
+
         test_loop = 2  # could be any number
 
         # NOTE: the barrier flag should be initialized to 1, and incremented by 1 for each AR

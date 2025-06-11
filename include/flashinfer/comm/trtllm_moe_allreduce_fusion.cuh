@@ -640,13 +640,13 @@ struct LamportComm {
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
     }
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-      printf(
-          "Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, "
-          "data_buf[1] %p, clear_buf %p\n",
-          rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
-          clear_buf);
-    }
+    // if (blockIdx.x == 0 && threadIdx.x == 0) {
+    //   printf(
+    //       "Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, "
+    //       "data_buf[1] %p, clear_buf %p\n",
+    //       rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
+    //       clear_buf);
+    // }
   }
 
   __device__ __forceinline__ void update(int new_clear_size) {
@@ -1077,18 +1077,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
       int offset = (params.rank * tot_access + idx) * VEC_SIZE;
-      accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
-      asm volatile("fence.sc.sys;");
-      // printf("Rank %d [%d-%d] store vec_t values at address index %d with flag %d \n",
-      // params.rank, blockIdx.x, threadIdx.x, offset, *comm.flag_ptr);
-      printf("Rank %d [%d-%d] store vec_t values at address %p with flag %d \n", params.rank,
-             blockIdx.x, threadIdx.x, reinterpret_cast<T*>(comm.data_bufs[r]) + offset,
-             *comm.flag_ptr);
-      // print the values
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        printf("Rank %d [%d-%d] store value %d: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
-               static_cast<float>(accumulator[i]));
-      }
+      accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
   }
 
@@ -1114,39 +1103,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
         // LDG.128 from local rank
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
-        asm volatile("fence.sc.sys;");
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
-      }
-      count++;
-      // if (count == 1500000) {
-      //   for (int r = 0; r < NRanks; ++r) {
-      //     printf("Rank %d [%d-%d] breaks at %d start\n", params.rank,
-      //         blockIdx.x, threadIdx.x, count);
-      //     printf(
-      //         "Rank %d [%d-%d] get vec_t values at address %p with flag %d\n", params.rank,
-      //         blockIdx.x, threadIdx.x,
-      //         reinterpret_cast<T*>(comm.data_bufs[params.rank]) + (r * tot_access + idx) *
-      //         VEC_SIZE, *comm.flag_ptr);
-      //     // print the values
-      //     for (int i = 0; i < VEC_SIZE; ++i) {
-      //       printf("Rank %d [%d-%d] get value %d: %f is_neg_zero: %d\n", params.rank, blockIdx.x,
-      //       threadIdx.x, i,
-      //              static_cast<float>(vals[r][i]), vals[r][i] == neg_zero_v<T>);
-      //     }
-      //     printf("Rank %d [%d-%d] has_neg_zero: %d\n", params.rank,
-      //         blockIdx.x, threadIdx.x,
-      //         has_neg_zero<T, VEC_SIZE>(vals[r]));
-      //   }
-      //   printf("Rank %d [%d-%d] breaks at %d end\n", params.rank,
-      //         blockIdx.x, threadIdx.x, count);
-      //   // break;
-      // }
-    }
-    printf("Rank %d [%d-%d] get values final\n", params.rank, blockIdx.x, threadIdx.x);
-    for (int r = 0; r < NRanks; ++r) {
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        printf("Rank %d [%d-%d] get value %d final: %f\n", params.rank, blockIdx.x, threadIdx.x, i,
-               static_cast<float>(vals[r][i]));
       }
     }
 
@@ -1161,8 +1118,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
                                                           params);
   }
   comm.update(params.size * NRanks);
-  printf("Rank %d [%d-%d] after update counter with flag %d\n", params.rank, blockIdx.x,
-         threadIdx.x, *comm.flag_ptr);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
