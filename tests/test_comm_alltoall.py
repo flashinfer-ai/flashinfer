@@ -96,6 +96,41 @@ LOCAL_GATHER_PARAMS = [
     (9, 64, 1024, 3, 1029),
 ]
 
+# Multi-GPU test parameters - requires multiple physical GPUs
+MULTI_GPU_PARAMS = [
+    (2, 100, 256, torch.float16),  # 2 GPUs, small data
+    (2, 500, 1024, torch.float16),  # 2 GPUs, medium data
+    (2, 1000, 2048, torch.bfloat16),  # 2 GPUs, large data
+    (4, 200, 512, torch.float16),  # 4 GPUs, small data (if available)
+    (4, 800, 1024, torch.float16),  # 4 GPUs, medium data (if available)
+]
+
+MULTI_GPU_PREPARE_INDICES_PARAMS = [
+    (0, 2, 128, 4, 100),  # 2 GPUs
+    (1, 2, 128, 4, 100),
+    (0, 4, 256, 8, 200),  # 4 GPUs (if available)
+    (2, 4, 256, 8, 200),
+]
+
+
+def get_available_gpu_count():
+    """Get the number of available GPUs."""
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
+def requires_gpus(min_gpus):
+    """Decorator to skip test if insufficient GPUs are available."""
+
+    def decorator(func):
+        return pytest.mark.skipif(
+            get_available_gpu_count() < min_gpus,
+            reason=f"Requires at least {min_gpus} GPUs, but only {get_available_gpu_count()} available",
+        )(func)
+
+    return decorator
+
 
 @pytest.mark.parametrize(
     "input_entry_count,output_entry_count,vector_dim,send_recv_count,dtype",
@@ -542,6 +577,163 @@ def test_moe_local_gather(
 
     assert torch.equal(local_expert_ids, ref_local_expert_ids)
     assert torch.equal(local_scales, ref_local_scales)
+
+
+@requires_gpus(2)
+@pytest.mark.parametrize(
+    "num_gpus,input_entry_per_rank,vector_dim,dtype", MULTI_GPU_PARAMS
+)
+def test_moe_alltoall_multi_gpu(num_gpus, input_entry_per_rank, vector_dim, dtype):
+    """Test MOE alltoall operations on multiple GPUs (single-rank per GPU)."""
+    available_gpus = get_available_gpu_count()
+    if num_gpus > available_gpus:
+        pytest.skip(
+            f"Test requires {num_gpus} GPUs, but only {available_gpus} available"
+        )
+
+    # Test each GPU independently to validate multi-GPU capability
+    # This simulates what would happen in distributed training with one rank per GPU
+    for gpu_id in range(num_gpus):
+        torch.cuda.set_device(gpu_id)
+
+        # Create input data on this specific GPU
+        input_tensor = torch.randn(
+            input_entry_per_rank,
+            vector_dim,
+            dtype=dtype,
+            device=torch.device(f"cuda:{gpu_id}"),
+        )
+        output_tensor = torch.zeros(
+            input_entry_per_rank,
+            vector_dim,
+            dtype=dtype,
+            device=torch.device(f"cuda:{gpu_id}"),
+        )
+
+        # For multi-GPU testing, simulate a single rank scenario on each GPU
+        # This validates that the communication functions work properly on each GPU
+        world_size = 1  # Single rank per GPU for this test
+
+        # Create target rank IDs (all targeting rank 0 since world_size=1)
+        target_rank_ids = torch.zeros(
+            input_entry_per_rank, dtype=torch.int32, device=f"cuda:{gpu_id}"
+        )
+
+        # Compute send patterns
+        send_counts = (
+            torch.ones(world_size, dtype=torch.int32, device=f"cuda:{gpu_id}")
+            * input_entry_per_rank
+        )
+        send_cumsum = torch.cumsum(send_counts, dim=0).to(torch.int32)
+        send_indices = torch.arange(
+            input_entry_per_rank, dtype=torch.int32, device=f"cuda:{gpu_id}"
+        )
+
+        # Compute recv patterns (same as send for single rank)
+        recv_counts = send_counts.clone()
+        recv_cumsum = send_cumsum.clone()
+        recv_indices = send_indices.clone()
+
+        # Create workspace
+        workspace_size = comm.get_moe_commworkspace_size_per_rank(world_size)
+        workspace = torch.zeros(
+            world_size, workspace_size, dtype=torch.uint64, device=f"cuda:{gpu_id}"
+        )
+
+        # Execute communication on this GPU
+        comm.moe_comm(
+            input_tensor,
+            send_cumsum,
+            send_indices,
+            output_tensor,
+            recv_cumsum,
+            recv_indices,
+            workspace,
+            0,  # rank 0
+            world_size,
+        )
+
+        # Validate results on this GPU
+        assert output_tensor.shape == (input_entry_per_rank, vector_dim)
+        assert output_tensor.dtype == dtype
+        assert output_tensor.device.index == gpu_id
+
+        # For single rank scenario, output should match input
+        torch.testing.assert_close(output_tensor, input_tensor, rtol=1e-3, atol=1e-4)
+
+        # Log memory usage for this GPU
+        memory_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2  # MB
+
+
+@requires_gpus(2)
+@pytest.mark.parametrize(
+    "ep_rank,ep_size,expert_count,top_k,max_token_count_per_rank",
+    MULTI_GPU_PREPARE_INDICES_PARAMS,
+)
+def test_moe_alltoall_prepare_indices_multi_gpu(
+    ep_rank, ep_size, expert_count, top_k, max_token_count_per_rank
+):
+    """Test MOE prepare indices functionality across multiple GPUs."""
+    available_gpus = get_available_gpu_count()
+    if ep_size > available_gpus:
+        pytest.skip(
+            f"Test requires {ep_size} GPUs, but only {available_gpus} available"
+        )
+
+    # Use the GPU corresponding to the rank
+    gpu_id = ep_rank % available_gpus
+    torch.cuda.set_device(gpu_id)
+
+    # Generate test data on the specific GPU
+    gathered_target_rank_ids = torch.randint(
+        0,
+        ep_size,
+        (ep_size * max_token_count_per_rank, top_k),
+        dtype=torch.int32,
+        device=torch.device(f"cuda:{gpu_id}"),
+    )
+
+    # Call the prepare indices function
+    (
+        local_gather_indices,
+        send_rank_count_cumsum,
+        send_rank_local_indices,
+        recv_rank_count_cumsum,
+        recv_rank_local_indices,
+        backward_recv_rank_local_indices,
+    ) = comm.moe_comm_prepare_indices(
+        gathered_target_rank_ids,
+        None,  # No real rank token count cumsum for simplicity
+        max_token_count_per_rank,
+        expert_count,
+        top_k,
+        ep_rank,
+        ep_size,
+    )
+
+    # Validate shapes and properties
+    assert local_gather_indices.shape[0] <= max_token_count_per_rank * ep_size
+    assert send_rank_count_cumsum.shape[0] == ep_size
+    assert recv_rank_count_cumsum.shape[0] == ep_size
+    assert send_rank_local_indices.shape[0] <= max_token_count_per_rank * max(
+        ep_size, top_k
+    )
+    assert recv_rank_local_indices.shape[0] <= max_token_count_per_rank * ep_size
+    assert backward_recv_rank_local_indices.shape[0] <= max_token_count_per_rank * max(
+        ep_size, top_k
+    )
+
+    # Validate that all tensors are on the correct GPU
+    assert local_gather_indices.device.index == gpu_id
+    assert send_rank_count_cumsum.device.index == gpu_id
+    assert recv_rank_count_cumsum.device.index == gpu_id
+    assert send_rank_local_indices.device.index == gpu_id
+    assert recv_rank_local_indices.device.index == gpu_id
+    assert backward_recv_rank_local_indices.device.index == gpu_id
+
+    # Basic validation - cumulative sums should be non-decreasing
+    assert torch.all(send_rank_count_cumsum[1:] >= send_rank_count_cumsum[:-1])
+    assert torch.all(recv_rank_count_cumsum[1:] >= recv_rank_count_cumsum[:-1])
 
 
 if __name__ == "__main__":
