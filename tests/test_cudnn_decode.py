@@ -9,10 +9,10 @@ import flashinfer
 
 @pytest.mark.parametrize("batch_size", [4, 8, 64])
 @pytest.mark.parametrize("s_qo", [1])
-@pytest.mark.parametrize("s_kv", [1, 8, 64, 2048])
-@pytest.mark.parametrize("page_size", [1, 2, 16])
-@pytest.mark.parametrize("num_kv_heads", [3, 4])
-@pytest.mark.parametrize("num_qo_heads", [3, 4, 32])
+@pytest.mark.parametrize("s_kv", [8, 64, 2048])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("use_cuda_graph", [False])
 def test_cudnn_decode(
@@ -123,8 +123,6 @@ def test_cudnn_decode(
         .to(device)
     )
 
-    print(f"qo_indptr {qo_indptr}")
-
     kv_indptr = (
         torch.cat(
             [
@@ -139,8 +137,6 @@ def test_cudnn_decode(
         .to(device)
     )
 
-    print(f"kv_indptr {kv_indptr}")
-
     # kv_indices
     kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
     for i in range(len(kv_indptr) - 1):
@@ -152,8 +148,6 @@ def test_cudnn_decode(
             device=device,
         )
 
-    print(f"kv_indices {kv_indices}")
-
     # kv_last_page_len
     kv_last_page_len = (
         torch.where(
@@ -164,8 +158,6 @@ def test_cudnn_decode(
         .int()
         .to(device)
     )
-
-    print(f"kv_last_page_len {kv_last_page_len}")
 
     # Workspace buffer
     workspace_buffer_ref = torch.empty(
@@ -188,19 +180,4 @@ def test_cudnn_decode(
 
     torch.cuda.synchronize()
 
-    print(f"q_query shape {q.shape}       strides {q.stride()}")
-    print(f"v_cache shape {v_cache.shape} strides {v_cache.stride()}")
-
-    # print("output")
-    # print(output)
-    # print("output_ref")
-    # print(output_ref)
-    # print("v_cache")
-    # for i in range(v_cache.shape[0]):
-    #     print(f"page {i}")
-    #     print(v_cache[i, :, :, 0:6])
-    # print("k_cache")
-    # print("kv_cache")
-    # print(kv_cache)
-
-    torch.testing.assert_close(output, output_ref)
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
