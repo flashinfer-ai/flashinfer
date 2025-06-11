@@ -117,8 +117,9 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
 
 template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
 __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
-                                                       float* s_smem) {
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+                                                       float* s_smem,
+                                                       const uint32_t tx = threadIdx.x,
+                                                       const uint32_t ty = threadIdx.y) {
   constexpr uint32_t head_dim = vec_size * bdx;
   st.o.cast_store(v_smem + ty * head_dim + tx * vec_size);
   s_smem[ty] = st.get_lse();
