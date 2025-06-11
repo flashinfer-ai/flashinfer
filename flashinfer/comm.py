@@ -238,11 +238,6 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
-        ],
-        extra_include_paths=[
-            jit_env.SPDLOG_INCLUDE_DIR,
-            jit_env.FLASHINFER_INCLUDE_DIR,
         ],
     )
 
@@ -401,6 +396,33 @@ def get_comm_module():
             lamport_peer_comm_buffer_ptrs_2,
         )
 
+    return SimpleNamespace(
+        init_custom_ar=init_custom_ar,
+        dispose=dispose,
+        get_graph_buffer_ipc_meta=get_graph_buffer_ipc_meta,
+        register_buffer=register_buffer,
+        register_graph_buffers=register_graph_buffers,
+        meta_size=meta_size,
+        all_reduce=all_reduce,
+        trtllm_lamport_initialize=trtllm_lamport_initialize,
+        trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
+        trtllm_custom_all_reduce=trtllm_custom_all_reduce,
+    )
+
+
+def gen_comm_alltoall_module() -> JitSpec:
+    return gen_jit_spec(
+        "comm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
+        ],
+    )
+
+
+@functools.cache
+def get_comm_alltoall_module():
+    module = gen_comm_alltoall_module().build_and_load()
+
     @register_custom_op(
         "flashinfer::moe_comm_prepare_indices",
         mutates_args=[],
@@ -544,16 +566,6 @@ def get_comm_module():
         return module.get_moe_commworkspace_size_per_rank(ep_size)
 
     return SimpleNamespace(
-        init_custom_ar=init_custom_ar,
-        dispose=dispose,
-        get_graph_buffer_ipc_meta=get_graph_buffer_ipc_meta,
-        register_buffer=register_buffer,
-        register_graph_buffers=register_graph_buffers,
-        meta_size=meta_size,
-        all_reduce=all_reduce,
-        trtllm_lamport_initialize=trtllm_lamport_initialize,
-        trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
-        trtllm_custom_all_reduce=trtllm_custom_all_reduce,
         moe_comm_prepare_indices=moe_comm_prepare_indices,
         moe_local_gather=moe_local_gather,
         moe_comm=moe_comm,
@@ -896,7 +908,7 @@ def moe_comm_prepare_indices(
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    return get_comm_module().moe_comm_prepare_indices(
+    return get_comm_alltoall_module().moe_comm_prepare_indices(
         gathered_target_rank_ids,
         real_rank_token_count_cum_sum,
         max_token_count_per_rank,
@@ -920,7 +932,7 @@ def moe_local_gather(
     ep_rank: int,
     ep_size: int,
 ) -> None:
-    get_comm_module().moe_local_gather(
+    get_comm_alltoall_module().moe_local_gather(
         recv_rank_cum_sum,
         local_gather_indices,
         gathered_expert_ids,
@@ -946,7 +958,7 @@ def moe_comm(
     ep_rank: int,
     ep_size: int,
 ) -> None:
-    get_comm_module().moe_comm(
+    get_comm_alltoall_module().moe_comm(
         input,
         send_rank_cum_sum,
         send_indices,
@@ -962,10 +974,10 @@ def moe_comm(
 def set_moe_max_usable_sm_count(
     max_sm_count: int,
 ) -> None:
-    get_comm_module().set_moe_max_usable_sm_count(max_sm_count)
+    get_comm_alltoall_module().set_moe_max_usable_sm_count(max_sm_count)
 
 
 def get_moe_commworkspace_size_per_rank(
     ep_size: int,
 ) -> int:
-    return get_comm_module().get_moe_commworkspace_size_per_rank(ep_size)
+    return get_comm_alltoall_module().get_moe_commworkspace_size_per_rank(ep_size)
