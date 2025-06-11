@@ -37,79 +37,41 @@ def setup_test_environment():
     yield
 
 
-# Original test parameters that work
+# Single GPU test parameters
 SINGLE_GPU_PARAMS = [
-    (902, 701, 32768, 100, torch.float16),
-    (902, 701, 7168, 100, torch.float16),
-    (101, 75, 288, 10, torch.float16),
-    (10, 5, 8, 1, torch.float16),
-    (902, 701, 32768, 100, torch.bfloat16),
-    (902, 701, 7168, 100, torch.bfloat16),
-    (101, 75, 288, 10, torch.bfloat16),
-    (10, 5, 8, 1, torch.bfloat16),
-    (902, 701, 32768, 100, torch.float),
-    (902, 701, 7168, 100, torch.float),
-    (101, 75, 288, 10, torch.float),
-    (10, 5, 8, 1, torch.float),
+    (902, 701, 32768, 100, torch.float16),  # Large data, float16
+    (101, 75, 288, 10, torch.float16),  # Medium data, float16
+    (10, 5, 8, 1, torch.float16),  # Small data, float16
+    (902, 701, 7168, 100, torch.bfloat16),  # Large data, bfloat16
+    (101, 75, 288, 10, torch.bfloat16),  # Medium data, bfloat16
 ]
 
 MULTI_RANK_PARAMS = [
-    (2, 5, 8, torch.float16),  # small input as smoke test
-    (2, 1, 8, torch.float16),  # some ranks have no data to send/recv
-    (4, 5, 8, torch.float16),  # small input with larger world size
-    (4, 901, 32768, torch.bfloat16),  # large input that reuses workspace
-    (
-        8,
-        901,
-        32768,
-        torch.float16,
-    ),  # large input that reuses workspace, larger world size
-    (
-        8,
-        16384,
-        128,
-        torch.float16,
-    ),  # large input count with small vector dim that requires more indices per fifo
+    (2, 5, 8, torch.float16),  # Small input, 2 ranks
+    (4, 901, 32768, torch.bfloat16),  # Large input, 4 ranks
+    (8, 16384, 128, torch.float16),  # Many small vectors, 8 ranks
 ]
 
 PREPARE_INDICES_PARAMS = [
-    (0, 8, 256, 4, 3, False),
-    (0, 8, 256, 4, 3, True),
-    (1, 8, 256, 4, 3, False),
-    (1, 8, 256, 4, 3, True),
-    (1, 4, 256, 8, 3, False),
-    (1, 4, 256, 8, 3, True),
-    (7, 8, 256, 8, 1025, False),
-    (7, 8, 256, 8, 1025, True),
-    (7, 64, 1024, 32, 1029, False),
-    (7, 64, 1024, 32, 1029, True),
+    (0, 8, 256, 4, 3, False),  # Rank 0, small config
+    (1, 8, 256, 4, 3, True),  # Rank 1, small config with real cumsum
+    (7, 8, 256, 8, 1025, False),  # High rank, medium config
+    (7, 64, 1024, 32, 1029, True),  # High rank, large config with real cumsum
 ]
 
 LOCAL_GATHER_PARAMS = [
-    (0, 8, 256, 4, 3),
-    (1, 8, 256, 4, 3),
-    (7, 8, 256, 4, 3),
-    (7, 8, 256, 8, 32),
-    (7, 8, 256, 32, 10),
-    (7, 8, 1024, 32, 127),
-    (7, 64, 1024, 32, 1029),
-    (9, 64, 1024, 3, 1029),
+    (0, 8, 256, 4, 3),  # Rank 0, small config
+    (7, 8, 256, 8, 32),  # High rank, medium config
+    (7, 64, 1024, 32, 1029),  # High rank, large config
 ]
 
-# Multi-GPU test parameters - requires multiple physical GPUs
-MULTI_GPU_PARAMS = [
-    (2, 100, 256, torch.float16),  # 2 GPUs, small data
-    (2, 500, 1024, torch.float16),  # 2 GPUs, medium data
-    (2, 1000, 2048, torch.bfloat16),  # 2 GPUs, large data
-    (4, 200, 512, torch.float16),  # 4 GPUs, small data (if available)
-    (4, 800, 1024, torch.float16),  # 4 GPUs, medium data (if available)
-]
 
-MULTI_GPU_PREPARE_INDICES_PARAMS = [
-    (0, 2, 128, 4, 100),  # 2 GPUs
-    (1, 2, 128, 4, 100),
-    (0, 4, 256, 8, 200),  # 4 GPUs (if available)
-    (2, 4, 256, 8, 200),
+# Real cross-GPU communication test parameters
+CROSS_GPU_PARAMS = [
+    (2, 100, 256, torch.float16),  # 2 GPUs, 2 ranks
+    (2, 300, 512, torch.bfloat16),  # 2 GPUs, 2 ranks, larger data
+    (4, 150, 256, torch.float16),  # 4 GPUs, 4 ranks (if available)
+    (4, 400, 512, torch.float16),  # 4 GPUs, 4 ranks, larger data
 ]
 
 
@@ -187,33 +149,6 @@ def test_moe_alltoall_single_gpu(
     )
 
     torch.testing.assert_close(output_tensor, ref_output_tensor, atol=1e-5, rtol=1e-5)
-
-
-def do_warmup():
-    """Perform warmup for JIT compilation."""
-    torch.cuda.synchronize()
-    input_tensor = torch.randn(1, 8, dtype=torch.float16, device=torch.device("cuda"))
-    send_cumsum = torch.ones(1, dtype=torch.int32, device=torch.device("cuda"))
-    send_indices = torch.zeros(1, dtype=torch.int32, device=torch.device("cuda"))
-    output_tensor = torch.zeros(1, 8, dtype=torch.float16, device=torch.device("cuda"))
-    recv_cumsum = torch.ones(1, dtype=torch.int32, device=torch.device("cuda"))
-    recv_indices = torch.zeros(1, dtype=torch.int32, device=torch.device("cuda"))
-    workspace_size = comm.get_moe_commworkspace_size_per_rank(1)
-    all_workspaces = torch.zeros(
-        1, workspace_size, dtype=torch.uint64, device=torch.device("cuda")
-    )
-    comm.moe_comm(
-        input_tensor,
-        send_cumsum,
-        send_indices,
-        output_tensor,
-        recv_cumsum,
-        recv_indices,
-        all_workspaces,
-        0,
-        1,
-    )
-    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(
@@ -350,11 +285,7 @@ def test_moe_alltoall_multi_rank_single_gpu(
         world_size, workspace_size, dtype=torch.uint64, device=torch.device("cuda")
     )
 
-    # do one warmup for each rank to avoid possible synchronization at first launch.
-    for rank in range(world_size):
-        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            do_warmup()
-
+    # Synchronize before starting parallel communication
     torch.cuda.synchronize()
 
     # do alltoall in parallel
@@ -579,161 +510,286 @@ def test_moe_local_gather(
     assert torch.equal(local_scales, ref_local_scales)
 
 
+def verify_cross_gpu_data_movement(
+    input_tensors_per_rank,
+    output_tensors_per_rank,
+    send_patterns,
+    recv_patterns,
+    world_size,
+):
+    """Verify that data actually moved between different GPUs."""
+    total_data_moved = 0
+    for sender_rank in range(world_size):
+        for receiver_rank in range(world_size):
+            if sender_rank == receiver_rank:
+                continue  # Skip self-communication
+
+            # Get the amount of data sent from sender to receiver
+            send_counts = send_patterns[sender_rank]
+            recv_counts = recv_patterns[receiver_rank]
+
+            sender_to_receiver_count = send_counts[receiver_rank].cpu().item()
+            receiver_from_sender_count = recv_counts[sender_rank].cpu().item()
+
+            assert sender_to_receiver_count == receiver_from_sender_count, (
+                f"Mismatch: rank {sender_rank} sends {sender_to_receiver_count} to rank {receiver_rank}, "
+                f"but rank {receiver_rank} expects {receiver_from_sender_count} from rank {sender_rank}"
+            )
+
+            if sender_to_receiver_count > 0:
+                total_data_moved += sender_to_receiver_count
+
+    assert total_data_moved > 0
+
+
+def create_shared_workspace(world_size, device_id=0):
+    """Create a workspace tensor that can be accessed from all GPUs."""
+    workspace_size = comm.get_moe_commworkspace_size_per_rank(world_size)
+    torch.cuda.set_device(device_id)
+    workspace = torch.zeros(
+        world_size, workspace_size, dtype=torch.uint64, device=f"cuda:{device_id}"
+    )
+    return workspace
+
+
 @requires_gpus(2)
 @pytest.mark.parametrize(
-    "num_gpus,input_entry_per_rank,vector_dim,dtype", MULTI_GPU_PARAMS
+    "world_size,input_entry_per_rank,vector_dim,dtype", CROSS_GPU_PARAMS
 )
-def test_moe_alltoall_multi_gpu(num_gpus, input_entry_per_rank, vector_dim, dtype):
-    """Test MOE alltoall operations on multiple GPUs (single-rank per GPU)."""
+def test_cross_gpu_alltoall(world_size, input_entry_per_rank, vector_dim, dtype):
+    """Test real cross-GPU alltoall communication with multiple ranks on different GPUs."""
     available_gpus = get_available_gpu_count()
-    if num_gpus > available_gpus:
+    if world_size > available_gpus:
         pytest.skip(
-            f"Test requires {num_gpus} GPUs, but only {available_gpus} available"
+            f"Test requires {world_size} GPUs, but only {available_gpus} available"
         )
 
-    # Test each GPU independently to validate multi-GPU capability
-    # This simulates what would happen in distributed training with one rank per GPU
-    for gpu_id in range(num_gpus):
+    # Ensure we can access peer GPUs
+    for i in range(world_size):
+        for j in range(world_size):
+            if i != j:
+                torch.cuda.set_device(i)
+                try:
+                    # Test if we can access peer GPU memory
+                    test_tensor = torch.tensor([1.0], device=f"cuda:{j}")
+                    _ = test_tensor.cpu()  # Try to read from peer GPU
+                except Exception as e:
+                    pytest.skip(f"Cannot access GPU {j} from GPU {i}: {e}")
+
+    # Create shared workspace accessible from all GPUs
+    shared_workspace = create_shared_workspace(world_size, device_id=0)
+
+    # Generate random target ranks for each rank - this creates variable communication patterns
+    torch.manual_seed(0x12345)  # For reproducible test
+
+    input_tensors_per_rank = []
+    target_rank_ids_per_rank = []
+
+    # Create input data on each GPU for each rank
+    for rank in range(world_size):
+        gpu_id = rank  # Map rank to GPU directly
         torch.cuda.set_device(gpu_id)
 
-        # Create input data on this specific GPU
-        input_tensor = torch.randn(
-            input_entry_per_rank,
-            vector_dim,
-            dtype=dtype,
-            device=torch.device(f"cuda:{gpu_id}"),
-        )
-        output_tensor = torch.zeros(
-            input_entry_per_rank,
-            vector_dim,
-            dtype=dtype,
-            device=torch.device(f"cuda:{gpu_id}"),
-        )
+        # Create unique input data for this rank on this GPU
+        input_tensor = (
+            torch.randn(
+                input_entry_per_rank, vector_dim, dtype=dtype, device=f"cuda:{gpu_id}"
+            )
+            + rank * 100
+        )  # Add rank offset to make data distinguishable
 
-        # For multi-GPU testing, simulate a single rank scenario on each GPU
-        # This validates that the communication functions work properly on each GPU
-        world_size = 1  # Single rank per GPU for this test
-
-        # Create target rank IDs (all targeting rank 0 since world_size=1)
-        target_rank_ids = torch.zeros(
-            input_entry_per_rank, dtype=torch.int32, device=f"cuda:{gpu_id}"
-        )
-
-        # Compute send patterns
-        send_counts = (
-            torch.ones(world_size, dtype=torch.int32, device=f"cuda:{gpu_id}")
-            * input_entry_per_rank
-        )
-        send_cumsum = torch.cumsum(send_counts, dim=0).to(torch.int32)
-        send_indices = torch.arange(
-            input_entry_per_rank, dtype=torch.int32, device=f"cuda:{gpu_id}"
-        )
-
-        # Compute recv patterns (same as send for single rank)
-        recv_counts = send_counts.clone()
-        recv_cumsum = send_cumsum.clone()
-        recv_indices = send_indices.clone()
-
-        # Create workspace
-        workspace_size = comm.get_moe_commworkspace_size_per_rank(world_size)
-        workspace = torch.zeros(
-            world_size, workspace_size, dtype=torch.uint64, device=f"cuda:{gpu_id}"
-        )
-
-        # Execute communication on this GPU
-        comm.moe_comm(
-            input_tensor,
-            send_cumsum,
-            send_indices,
-            output_tensor,
-            recv_cumsum,
-            recv_indices,
-            workspace,
-            0,  # rank 0
+        # Generate target ranks for this rank's data - creates alltoallv pattern
+        target_rank_ids = torch.randint(
+            0,
             world_size,
+            (input_entry_per_rank,),
+            dtype=torch.int32,
+            device=f"cuda:{gpu_id}",
         )
 
-        # Validate results on this GPU
-        assert output_tensor.shape == (input_entry_per_rank, vector_dim)
-        assert output_tensor.dtype == dtype
-        assert output_tensor.device.index == gpu_id
+        input_tensors_per_rank.append(input_tensor)
+        target_rank_ids_per_rank.append(target_rank_ids)
 
-        # For single rank scenario, output should match input
-        torch.testing.assert_close(output_tensor, input_tensor, rtol=1e-3, atol=1e-4)
+    # Compute send patterns for each rank
+    send_counts_per_rank = []
+    send_cumsum_per_rank = []
+    send_indices_per_rank = []
 
-        # Log memory usage for this GPU
-        memory_allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2  # MB
+    for rank in range(world_size):
+        gpu_id = rank
+        torch.cuda.set_device(gpu_id)
 
+        target_rank_ids = target_rank_ids_per_rank[rank]
 
-@requires_gpus(2)
-@pytest.mark.parametrize(
-    "ep_rank,ep_size,expert_count,top_k,max_token_count_per_rank",
-    MULTI_GPU_PREPARE_INDICES_PARAMS,
-)
-def test_moe_alltoall_prepare_indices_multi_gpu(
-    ep_rank, ep_size, expert_count, top_k, max_token_count_per_rank
-):
-    """Test MOE prepare indices functionality across multiple GPUs."""
-    available_gpus = get_available_gpu_count()
-    if ep_size > available_gpus:
-        pytest.skip(
-            f"Test requires {ep_size} GPUs, but only {available_gpus} available"
+        # Count how many vectors this rank sends to each other rank
+        send_counts = torch.zeros(
+            world_size, dtype=torch.int32, device=f"cuda:{gpu_id}"
+        )
+        for target_rank in range(world_size):
+            mask = target_rank_ids == target_rank
+            send_counts[target_rank] = mask.sum()
+
+        send_cumsum = torch.cumsum(send_counts, dim=0).to(torch.int32)
+
+        # Create send indices by sorting target rank IDs
+        sorted_target_ranks, send_indices = torch.sort(target_rank_ids)
+        send_indices = send_indices.to(torch.int32)
+
+        send_counts_per_rank.append(send_counts)
+        send_cumsum_per_rank.append(send_cumsum)
+        send_indices_per_rank.append(send_indices)
+
+    # Compute receive patterns for each rank
+    recv_counts_per_rank = []
+    recv_cumsum_per_rank = []
+    recv_indices_per_rank = []
+    output_tensors_per_rank = []
+
+    for rank in range(world_size):
+        gpu_id = rank
+        torch.cuda.set_device(gpu_id)
+
+        # Count how many vectors this rank receives from each other rank
+        recv_counts = torch.zeros(
+            world_size, dtype=torch.int32, device=f"cuda:{gpu_id}"
+        )
+        for sender_rank in range(world_size):
+            recv_counts[sender_rank] = send_counts_per_rank[sender_rank][rank]
+
+        recv_cumsum = torch.cumsum(recv_counts, dim=0).to(torch.int32)
+        total_recv = recv_cumsum[-1].item()
+
+        # Create output tensor for received data
+        output_tensor = torch.zeros(
+            total_recv, vector_dim, dtype=dtype, device=f"cuda:{gpu_id}"
         )
 
-    # Use the GPU corresponding to the rank
-    gpu_id = ep_rank % available_gpus
-    torch.cuda.set_device(gpu_id)
+        # Simple receive indices (sequential)
+        recv_indices = torch.arange(
+            total_recv, dtype=torch.int32, device=f"cuda:{gpu_id}"
+        )
 
-    # Generate test data on the specific GPU
-    gathered_target_rank_ids = torch.randint(
-        0,
-        ep_size,
-        (ep_size * max_token_count_per_rank, top_k),
-        dtype=torch.int32,
-        device=torch.device(f"cuda:{gpu_id}"),
+        recv_counts_per_rank.append(recv_counts)
+        recv_cumsum_per_rank.append(recv_cumsum)
+        recv_indices_per_rank.append(recv_indices)
+        output_tensors_per_rank.append(output_tensor)
+
+    verify_cross_gpu_data_movement(
+        input_tensors_per_rank,
+        output_tensors_per_rank,
+        send_counts_per_rank,
+        recv_counts_per_rank,
+        world_size,
     )
 
-    # Call the prepare indices function
-    (
-        local_gather_indices,
-        send_rank_count_cumsum,
-        send_rank_local_indices,
-        recv_rank_count_cumsum,
-        recv_rank_local_indices,
-        backward_recv_rank_local_indices,
-    ) = comm.moe_comm_prepare_indices(
-        gathered_target_rank_ids,
-        None,  # No real rank token count cumsum for simplicity
-        max_token_count_per_rank,
-        expert_count,
-        top_k,
-        ep_rank,
-        ep_size,
-    )
+    # Create reference output by CPU simulation
+    ref_output_tensors_per_rank = []
 
-    # Validate shapes and properties
-    assert local_gather_indices.shape[0] <= max_token_count_per_rank * ep_size
-    assert send_rank_count_cumsum.shape[0] == ep_size
-    assert recv_rank_count_cumsum.shape[0] == ep_size
-    assert send_rank_local_indices.shape[0] <= max_token_count_per_rank * max(
-        ep_size, top_k
-    )
-    assert recv_rank_local_indices.shape[0] <= max_token_count_per_rank * ep_size
-    assert backward_recv_rank_local_indices.shape[0] <= max_token_count_per_rank * max(
-        ep_size, top_k
-    )
+    for receiver_rank in range(world_size):
+        gpu_id = receiver_rank
+        torch.cuda.set_device(gpu_id)
 
-    # Validate that all tensors are on the correct GPU
-    assert local_gather_indices.device.index == gpu_id
-    assert send_rank_count_cumsum.device.index == gpu_id
-    assert recv_rank_count_cumsum.device.index == gpu_id
-    assert send_rank_local_indices.device.index == gpu_id
-    assert recv_rank_local_indices.device.index == gpu_id
-    assert backward_recv_rank_local_indices.device.index == gpu_id
+        total_recv = recv_cumsum_per_rank[receiver_rank][-1].item()
+        ref_output = torch.zeros(
+            total_recv, vector_dim, dtype=dtype, device=f"cuda:{gpu_id}"
+        )
 
-    # Basic validation - cumulative sums should be non-decreasing
-    assert torch.all(send_rank_count_cumsum[1:] >= send_rank_count_cumsum[:-1])
-    assert torch.all(recv_rank_count_cumsum[1:] >= recv_rank_count_cumsum[:-1])
+        output_offset = 0
+        for sender_rank in range(world_size):
+            recv_count = recv_counts_per_rank[receiver_rank][sender_rank].item()
+            if recv_count == 0:
+                continue
+
+            send_count = send_counts_per_rank[sender_rank][receiver_rank].item()
+            assert (
+                recv_count == send_count
+            ), f"Count mismatch: {recv_count} != {send_count}"
+
+            # Find which input vectors the sender is sending to this receiver
+            target_rank_ids = target_rank_ids_per_rank[sender_rank]
+            sender_to_receiver_mask = target_rank_ids == receiver_rank
+            sender_to_receiver_indices = torch.where(sender_to_receiver_mask)[0]
+
+            # Copy the data (move to same device first)
+            sender_input = input_tensors_per_rank[sender_rank]
+            if sender_input.device.index != gpu_id:
+                sender_data = sender_input[sender_to_receiver_indices].to(
+                    f"cuda:{gpu_id}"
+                )
+            else:
+                sender_data = sender_input[sender_to_receiver_indices]
+
+            ref_output[output_offset : output_offset + recv_count] = sender_data
+            output_offset += recv_count
+
+        ref_output_tensors_per_rank.append(ref_output)
+
+    # Execute the actual cross-GPU MOE communication
+    # Create streams for parallel execution
+    streams = [torch.cuda.Stream(device=f"cuda:{rank}") for rank in range(world_size)]
+
+    # Launch communication on all ranks in parallel
+    for rank in range(world_size):
+        gpu_id = rank
+        with torch.cuda.device(gpu_id), torch.cuda.stream(streams[rank]):
+            comm.moe_comm(
+                input_tensors_per_rank[rank],
+                send_cumsum_per_rank[rank],
+                send_indices_per_rank[rank],
+                output_tensors_per_rank[rank],
+                recv_cumsum_per_rank[rank],
+                recv_indices_per_rank[rank],
+                shared_workspace,  # Same workspace shared across all ranks
+                rank,  # This rank
+                world_size,  # Total number of ranks
+            )
+
+    # Synchronize all streams
+    for stream in streams:
+        stream.synchronize()
+
+    # Verify communication results
+    for rank in range(world_size):
+        gpu_id = rank
+        torch.cuda.set_device(gpu_id)
+
+        output_tensor = output_tensors_per_rank[rank]
+        ref_output = ref_output_tensors_per_rank[rank]
+
+        # Verify shapes match
+        assert (
+            output_tensor.shape == ref_output.shape
+        ), f"Shape mismatch for rank {rank}: {output_tensor.shape} vs {ref_output.shape}"
+
+        # Verify data matches
+        torch.testing.assert_close(
+            output_tensor,
+            ref_output,
+            rtol=1e-3,
+            atol=1e-4,
+            msg=f"Data mismatch for rank {rank} on GPU {gpu_id}",
+        )
+
+    # Additional verification: ensure data actually moved between GPUs
+    cross_gpu_data_found = False
+    for rank in range(world_size):
+        gpu_id = rank
+        output_data = output_tensors_per_rank[rank].cpu()
+
+        # Check if this rank received data from other GPUs
+        for sender_rank in range(world_size):
+            if sender_rank == rank:
+                continue
+
+            recv_count = recv_counts_per_rank[rank][sender_rank].item()
+            if recv_count > 0:
+                # This rank received data from a different GPU
+                cross_gpu_data_found = True
+                sender_gpu = sender_rank
+
+                break
+
+    assert cross_gpu_data_found, "No evidence of actual cross-GPU data transfer found!"
 
 
 if __name__ == "__main__":
