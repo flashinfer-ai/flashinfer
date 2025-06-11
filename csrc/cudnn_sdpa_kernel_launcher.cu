@@ -74,7 +74,7 @@ void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
                                 "942eaf580377478005bf0fb99f96dd8414d80b53ef85c083804b220bb4fd30a9");
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
-                               "ea0265d62eab200437791e2b97350e6393540c08a2a1523e26294b8a62f00c18");
+                               "5709edd1d6d3c5fcce6ff0ee435e44c4406d5b5474a219bb4aaf9f3b4ab83ba8");
 }
 
 auto get_cudnn_cubin(KernelType kernel_type) -> std::string {
