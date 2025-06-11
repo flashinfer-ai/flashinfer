@@ -496,7 +496,8 @@ def single_decode_with_kv_cache(
 
     if use_tensor_cores:
         out = torch.empty_like(q.unsqueeze(0))
-        get_single_prefill_module("fa2")(
+        get_single_prefill_module(
+            "fa2",
             q.dtype,
             k.dtype,
             q.dtype,
