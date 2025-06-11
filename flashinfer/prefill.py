@@ -52,12 +52,6 @@ from .utils import (
     register_fake_op,
 )
 
-_single_prefill_modules = {}
-_single_prefill_sm90_modules = {}
-_batch_prefill_modules = {}
-_batch_prefill_sm90_modules = {}
-_batch_prefill_jit_modules = {}
-
 
 @functools.cache
 def get_fmha_module(
@@ -88,437 +82,415 @@ def get_fmha_module(
         raise ValueError("SM100A is not supported on this device")
 
 
-def get_single_prefill_module(backend):
-    def backend_module(*args):
-        global _single_prefill_modules, _single_prefill_sm90_modules
-        modules_dict = (
-            _single_prefill_modules
-            if backend == "fa2"
-            else _single_prefill_sm90_modules
-        )
-        if args not in modules_dict:
-            uri = get_single_prefill_uri(backend, *args)
-            module = gen_single_prefill_module(backend, *args).build_and_load()
-            run_func = module.run.default
+@functools.cache
+def get_single_prefill_module(backend, *args):
+    uri = get_single_prefill_uri(backend, *args)
+    module = gen_single_prefill_module(backend, *args).build_and_load()
+    run_func = module.run.default
 
-            # torch library for single_prefill_with_kv_cache
+    # torch library for single_prefill_with_kv_cache
 
-            @register_custom_op(
-                f"flashinfer::{uri}_run", mutates_args=("tmp", "o", "maybe_lse")
+    @register_custom_op(
+        f"flashinfer::{uri}_run", mutates_args=("tmp", "o", "maybe_lse")
+    )
+    def run_single_prefill(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        tmp: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        maybe_packed_custom_mask: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        scale_q: Optional[torch.Tensor],
+        scale_k: Optional[torch.Tensor],
+        scale_v: Optional[torch.Tensor],
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        if backend == "fa3":
+            if not is_float8(q):
+                run_func(
+                    q,
+                    k,
+                    v,
+                    tmp,
+                    o,
+                    maybe_lse,
+                    mask_mode,
+                    layout,
+                    window_left,
+                    logits_soft_cap,
+                    sm_scale,
+                )
+            else:
+                # FP8 enabled
+                run_func(
+                    q,
+                    k,
+                    v,
+                    tmp,
+                    o,
+                    maybe_lse,
+                    mask_mode,
+                    layout,
+                    window_left,
+                    scale_q,
+                    scale_k,
+                    scale_v,
+                    sm_scale,
+                )
+        else:
+            run_func(
+                q,
+                k,
+                v,
+                tmp,
+                o,
+                maybe_lse,
+                mask_mode,
+                layout,
+                window_left,
+                maybe_packed_custom_mask,
+                maybe_alibi_slopes,
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
             )
-            def run_single_prefill(
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                tmp: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_packed_custom_mask: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                scale_q: Optional[torch.Tensor],
-                scale_k: Optional[torch.Tensor],
-                scale_v: Optional[torch.Tensor],
-                rope_scale: float,
-                rope_theta: float,
-            ) -> None:
-                if backend == "fa3":
-                    if not is_float8(q):
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            logits_soft_cap,
-                            sm_scale,
-                        )
-                    else:
-                        # FP8 enabled
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            scale_q,
-                            scale_k,
-                            scale_v,
-                            sm_scale,
-                        )
-                else:
-                    run_func(
-                        q,
-                        k,
-                        v,
-                        tmp,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        maybe_packed_custom_mask,
-                        maybe_alibi_slopes,
-                        logits_soft_cap,
-                        sm_scale,
-                        1.0 / rope_scale,  # rope_rcp_scale
-                        1.0 / rope_theta,  # rope_rcp_theta
-                    )
-                return o
+        return o
 
-            @register_fake_op(f"flashinfer::{uri}_run")
-            def _fake_run_single_prefill(
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                tmp: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_packed_custom_mask: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-            ) -> None:
-                pass
+    @register_fake_op(f"flashinfer::{uri}_run")
+    def _fake_run_single_prefill(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        tmp: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        maybe_packed_custom_mask: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        pass
 
-            # Register the module
-            modules_dict[args] = SimpleNamespace(run=run_single_prefill)
-
-        return modules_dict[args]
-
-    return backend_module
+    # Register the module
+    return SimpleNamespace(run=run_single_prefill)
 
 
-def get_batch_prefill_module(backend):
-    def backend_module(*args):
-        global _batch_prefill_modules, _batch_prefill_sm90_modules
-        modules_dict = (
-            _batch_prefill_modules if backend == "fa2" else _batch_prefill_sm90_modules
-        )
-        if args not in modules_dict:
-            uri = get_batch_prefill_uri(backend, *args)
-            module = gen_batch_prefill_module(backend, *args).build_and_load()
-            plan_func = module.plan.default
-            ragged_run_func = module.ragged_run.default
-            paged_run_func = module.paged_run.default
+@functools.cache
+def get_batch_prefill_module(backend, *args):
+    uri = get_batch_prefill_uri(backend, *args)
+    module = gen_batch_prefill_module(backend, *args).build_and_load()
+    plan_func = module.plan.default
+    ragged_run_func = module.ragged_run.default
+    paged_run_func = module.paged_run.default
 
-            # torch library for ragged_run
+    # torch library for ragged_run
 
-            @register_custom_op(
-                f"flashinfer::{uri}_ragged_run",
-                mutates_args=(
-                    "float_workspace_buffer",
-                    "int_workspace_buffer",
-                    "o",
-                    "maybe_lse",
-                ),
+    @register_custom_op(
+        f"flashinfer::{uri}_ragged_run",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def ragged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+    ) -> None:
+        if backend == "fa2":
+            ragged_run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                o,
+                maybe_lse,
+                mask_mode,
+                layout,
+                window_left,
+                enable_pdl,
+                maybe_custom_mask,
+                maybe_mask_indptr,
+                maybe_alibi_slopes,
+                maybe_prefix_len_ptr,
+                maybe_token_pos_in_items_ptr,
+                maybe_max_item_len_ptr,
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
+                token_pos_in_items_len,
             )
-            def ragged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                kv_indptr: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                enable_pdl: bool,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                if backend == "fa2":
-                    ragged_run_func(
-                        float_workspace_buffer,
-                        int_workspace_buffer,
-                        plan_info_vec,
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        kv_indptr,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        enable_pdl,
-                        maybe_custom_mask,
-                        maybe_mask_indptr,
-                        maybe_alibi_slopes,
-                        maybe_prefix_len_ptr,
-                        maybe_token_pos_in_items_ptr,
-                        maybe_max_item_len_ptr,
-                        logits_soft_cap,
-                        sm_scale,
-                        1.0 / rope_scale,  # rope_rcp_scale
-                        1.0 / rope_theta,  # rope_rcp_theta
-                        token_pos_in_items_len,
-                    )
-                else:
-                    ragged_run_func(
-                        float_workspace_buffer,
-                        int_workspace_buffer,
-                        plan_info_vec,
-                        q,
-                        k,
-                        v,
-                        qo_indptr,
-                        kv_indptr,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        enable_pdl,
-                        maybe_prefix_len_ptr,
-                        maybe_token_pos_in_items_ptr,
-                        maybe_max_item_len_ptr,
-                        logits_soft_cap,
-                        sm_scale,
-                        token_pos_in_items_len,
-                    )
-
-                return o
-
-            @register_fake_op(f"flashinfer::{uri}_ragged_run")
-            def _fake_ragged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                kv_indptr: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                enable_pdl: bool,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                pass
-
-            # torch library for paged_run
-
-            @register_custom_op(
-                f"flashinfer::{uri}_paged_run",
-                mutates_args=(
-                    "float_workspace_buffer",
-                    "int_workspace_buffer",
-                    "paged_k_cache",
-                    "paged_v_cache",
-                    "o",
-                    "maybe_lse",
-                ),
+        else:
+            ragged_run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                o,
+                maybe_lse,
+                mask_mode,
+                layout,
+                window_left,
+                enable_pdl,
+                maybe_prefix_len_ptr,
+                maybe_token_pos_in_items_ptr,
+                maybe_max_item_len_ptr,
+                logits_soft_cap,
+                sm_scale,
+                token_pos_in_items_len,
             )
-            def paged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                paged_k_cache: torch.Tensor,
-                paged_v_cache: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                paged_kv_indptr: torch.Tensor,
-                paged_kv_indices: torch.Tensor,
-                paged_kv_last_page_len: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                enable_pdl: bool,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                scale_q: Optional[torch.Tensor],
-                scale_k: Optional[torch.Tensor],
-                scale_v: Optional[torch.Tensor],
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                if backend == "fa2":
-                    assert not is_float8(q)
-                    paged_run_func(
-                        float_workspace_buffer,
-                        int_workspace_buffer,
-                        plan_info_vec,
-                        q,
-                        paged_k_cache,
-                        paged_v_cache,
-                        qo_indptr,
-                        paged_kv_indptr,
-                        paged_kv_indices,
-                        paged_kv_last_page_len,
-                        o,
-                        maybe_lse,
-                        mask_mode,
-                        layout,
-                        window_left,
-                        enable_pdl,
-                        maybe_custom_mask,
-                        maybe_mask_indptr,
-                        maybe_alibi_slopes,
-                        maybe_prefix_len_ptr,
-                        maybe_token_pos_in_items_ptr,
-                        maybe_max_item_len_ptr,
-                        logits_soft_cap,
-                        sm_scale,
-                        1.0 / rope_scale,  # rope_rcp_scale
-                        1.0 / rope_theta,  # rope_rcp_theta
-                        token_pos_in_items_len,
-                    )
-                else:
-                    if not is_float8(q):
-                        paged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            paged_k_cache,
-                            paged_v_cache,
-                            qo_indptr,
-                            paged_kv_indptr,
-                            paged_kv_indices,
-                            paged_kv_last_page_len,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            enable_pdl,
-                            maybe_prefix_len_ptr,
-                            maybe_token_pos_in_items_ptr,
-                            maybe_max_item_len_ptr,
-                            logits_soft_cap,
-                            sm_scale,
-                            token_pos_in_items_len,
-                        )
-                    else:
-                        paged_run_func(
-                            float_workspace_buffer,
-                            int_workspace_buffer,
-                            plan_info_vec,
-                            q,
-                            paged_k_cache,
-                            paged_v_cache,
-                            qo_indptr,
-                            paged_kv_indptr,
-                            paged_kv_indices,
-                            paged_kv_last_page_len,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            enable_pdl,
-                            scale_q,
-                            scale_k,
-                            scale_v,
-                            sm_scale,
-                        )
-                return o
 
-            @register_fake_op(f"flashinfer::{uri}_paged_run")
-            def _fake_paged_run(
-                float_workspace_buffer: torch.Tensor,
-                int_workspace_buffer: torch.Tensor,
-                plan_info_vec: List[int],
-                q: torch.Tensor,
-                paged_k_cache: torch.Tensor,
-                paged_v_cache: torch.Tensor,
-                qo_indptr: torch.Tensor,
-                paged_kv_indptr: torch.Tensor,
-                paged_kv_indices: torch.Tensor,
-                paged_kv_last_page_len: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                enable_pdl: bool,
-                maybe_custom_mask: Optional[torch.Tensor],
-                maybe_mask_indptr: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                maybe_prefix_len_ptr: Optional[torch.Tensor],
-                maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
-                maybe_max_item_len_ptr: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
-                token_pos_in_items_len: int,
-            ) -> None:
-                pass
+        return o
 
-            # Register the module.
-            #
-            # Note that plan is not part of model logic. It should not be included in
-            # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-            modules_dict[args] = SimpleNamespace(
-                plan=plan_func,
-                ragged_run=ragged_run,
-                paged_run=paged_run,
+    @register_fake_op(f"flashinfer::{uri}_ragged_run")
+    def _fake_ragged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+    ) -> None:
+        pass
+
+    # torch library for paged_run
+
+    @register_custom_op(
+        f"flashinfer::{uri}_paged_run",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "paged_k_cache",
+            "paged_v_cache",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def paged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        scale_q: Optional[torch.Tensor],
+        scale_k: Optional[torch.Tensor],
+        scale_v: Optional[torch.Tensor],
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+    ) -> None:
+        if backend == "fa2":
+            assert not is_float8(q)
+            paged_run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                paged_k_cache,
+                paged_v_cache,
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                o,
+                maybe_lse,
+                mask_mode,
+                layout,
+                window_left,
+                enable_pdl,
+                maybe_custom_mask,
+                maybe_mask_indptr,
+                maybe_alibi_slopes,
+                maybe_prefix_len_ptr,
+                maybe_token_pos_in_items_ptr,
+                maybe_max_item_len_ptr,
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
+                token_pos_in_items_len,
             )
-        return modules_dict[args]
+        else:
+            if not is_float8(q):
+                paged_run_func(
+                    float_workspace_buffer,
+                    int_workspace_buffer,
+                    plan_info_vec,
+                    q,
+                    paged_k_cache,
+                    paged_v_cache,
+                    qo_indptr,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len,
+                    o,
+                    maybe_lse,
+                    mask_mode,
+                    layout,
+                    window_left,
+                    enable_pdl,
+                    maybe_prefix_len_ptr,
+                    maybe_token_pos_in_items_ptr,
+                    maybe_max_item_len_ptr,
+                    logits_soft_cap,
+                    sm_scale,
+                    token_pos_in_items_len,
+                )
+            else:
+                paged_run_func(
+                    float_workspace_buffer,
+                    int_workspace_buffer,
+                    plan_info_vec,
+                    q,
+                    paged_k_cache,
+                    paged_v_cache,
+                    qo_indptr,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len,
+                    o,
+                    maybe_lse,
+                    mask_mode,
+                    layout,
+                    window_left,
+                    enable_pdl,
+                    scale_q,
+                    scale_k,
+                    scale_v,
+                    sm_scale,
+                )
+        return o
 
-    return backend_module
+    @register_fake_op(f"flashinfer::{uri}_paged_run")
+    def _fake_paged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+    ) -> None:
+        pass
+
+    # Register the module.
+    #
+    # Note that plan is not part of model logic. It should not be included in
+    # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    return SimpleNamespace(
+        plan=plan_func,
+        ragged_run=ragged_run,
+        paged_run=paged_run,
+    )
 
 
+@functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
-    global _batch_prefill_jit_modules
-    if module_name in _batch_prefill_jit_modules:
-        return _batch_prefill_jit_modules[module_name]
-
     plan_func = jit_module.plan.default
     ragged_run_func = jit_module.ragged_run.default
     paged_run_func = jit_module.paged_run.default
@@ -659,13 +631,11 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     #
     # Note that plan is not part of model logic. It should not be included in
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-    _batch_prefill_jit_modules[module_name] = SimpleNamespace(
+    return SimpleNamespace(
         plan=plan_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
-
-    return _batch_prefill_jit_modules[module_name]
 
 
 def single_prefill_with_kv_cache_with_jit_module(
@@ -947,14 +917,14 @@ def single_prefill_with_kv_cache(
             q.dtype,
             k.dtype,
         )
-    module_getter = get_single_prefill_module(backend)
 
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
     out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
 
-    module_getter(
+    module = get_single_prefill_module(
+        backend,
         q.dtype,
         k.dtype,
         out.dtype,
@@ -964,7 +934,9 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
-    ).run(
+    )
+
+    module.run(
         q,
         k,
         v,
@@ -1568,8 +1540,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
 
-            self._cached_module = get_batch_prefill_module(self._backend)(
-                *get_module_args
+            self._cached_module = get_batch_prefill_module(
+                self._backend, *get_module_args
             )
 
         if self._backend == "fa3":
@@ -2352,8 +2324,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "cutlass":
                 self._cached_module = get_fmha_module(*get_module_args)
             else:
-                self._cached_module = get_batch_prefill_module(self._backend)(
-                    *get_module_args
+                self._cached_module = get_batch_prefill_module(
+                    self._backend, *get_module_args
                 )
 
         if self._backend == "cutlass":

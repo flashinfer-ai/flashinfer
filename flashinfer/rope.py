@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from functools import cache
+import functools
 from typing import Any, Optional, Tuple
 
 import torch
@@ -23,8 +23,6 @@ from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
-
-_rope_module = None
 
 
 def gen_rope_module() -> JitSpec:
@@ -37,19 +35,14 @@ def gen_rope_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_rope_module():
-    global _rope_module
-    if _rope_module is None:
-        _rope_module = gen_rope_module().build_and_load()
-    return _rope_module
+    return gen_rope_module().build_and_load()
 
 
-@cache
+@functools.cache
 def get_module_attr(attr: str) -> Any:
-    global _rope_module
-    if _rope_module is None:
-        get_rope_module()
-    return getattr(_rope_module, attr).default
+    return getattr(get_rope_module(), attr).default
 
 
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))

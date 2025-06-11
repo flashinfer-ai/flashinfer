@@ -46,7 +46,7 @@ def gen_gemm_module() -> JitSpec:
     )
 
 
-@functools.tools
+@functools.cache
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
