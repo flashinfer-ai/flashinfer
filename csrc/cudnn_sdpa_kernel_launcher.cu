@@ -1209,11 +1209,31 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
   if (use_cuda_graph) {
     dim3 grid(1, 1, 1);
     dim3 block(128, 1, 1);
+    auto kid = get_kernel_id(h_qo / h_kv);
+    int64_t TILE_M_1 = 1;
+    switch (kid) {
+      case 0:
+        TILE_M_1 = 1;
+        break;
+      case 1:
+        TILE_M_1 = 8;
+        break;
+      case 2:
+        TILE_M_1 = 16;
+        break;
+      case 3:
+        TILE_M_1 = 32;
+        break;
+      case 4:
+        TILE_M_1 = 64;
+        break;
+    }
+
     qkv_tma_setup_decode<<<grid, block, 0, stream>>>(
-        b, h_qo, h_kv, d, total_num_pages, page_size, split_factor, 1, TILE_N_1, kv_strides[2],
-        kv_strides[1], kv_strides[0], q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
-        out.data_ptr(), partial_o_dev, packed_tma_desc_q_dev, tma_desc_k_dev, tma_desc_v_dev,
-        packed_tma_desc_o_dev, packed_tma_desc_partial_o_dev,
+        b, h_qo, h_kv, d, total_num_pages, page_size, split_factor, TILE_M_1, TILE_N_1,
+        kv_strides[2], kv_strides[1], kv_strides[0], q.data_ptr(), k_cache.data_ptr(),
+        v_cache.data_ptr(), out.data_ptr(), partial_o_dev, packed_tma_desc_q_dev, tma_desc_k_dev,
+        tma_desc_v_dev, packed_tma_desc_o_dev, packed_tma_desc_partial_o_dev,
         reinterpret_cast<int64_t*>(batch_strides_dev));
   } else {
     std::unique_ptr<tma::cudaTmaDesc[]> tma_desc_host(new tma::cudaTmaDesc[(3 * b) + 2]);
