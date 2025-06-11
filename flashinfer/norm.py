@@ -41,11 +41,6 @@ def get_norm_module():
     return gen_norm_module().build_and_load()
 
 
-@cache
-def get_module_attr(attr: str) -> Any:
-    return getattr(get_norm_module, attr).default
-
-
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -94,7 +89,7 @@ def _rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("rmsnorm")(out, input, weight, eps, enable_pdl)
+    get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -140,7 +135,7 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
+    get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
@@ -202,7 +197,7 @@ def _gemma_rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("gemma_rmsnorm")(out, input, weight, eps, enable_pdl)
+    get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
@@ -250,7 +245,7 @@ def gemma_fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("gemma_fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
+    get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_fused_add_rmsnorm")

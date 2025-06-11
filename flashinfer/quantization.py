@@ -40,17 +40,12 @@ def get_quantization_module():
     return gen_quantization_module().build_and_load()
 
 
-@functools.cache
-def get_module_attr(attr: str) -> Any:
-    return getattr(get_quantization_module(), attr).default
-
-
 @register_custom_op("flashinfer::packbits", mutates_args=())
 def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
     device = x.device
     x = x.to(torch.bool)
     y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
-    get_module_attr("packbits")(x, bitorder, y)
+    get_quantization_module().packbits(x, bitorder, y)
     return y
 
 
@@ -149,5 +144,5 @@ def segment_packbits(
     indptr = indptr.to(torch.int32)
     indptr_new = indptr_new.to(torch.int32)
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-    get_module_attr("segment_packbits")(x, indptr, indptr_new, bitorder, y)
+    get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
     return y, indptr_new

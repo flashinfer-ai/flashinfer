@@ -40,11 +40,6 @@ def get_rope_module():
     return gen_rope_module().build_and_load()
 
 
-@functools.cache
-def get_module_attr(attr: str) -> Any:
-    return getattr(get_rope_module(), attr).default
-
-
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
 def _apply_rope(
     q: torch.Tensor,
@@ -58,7 +53,7 @@ def _apply_rope(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    get_module_attr("apply_rope")(
+    get_rope_module().apply_rope(
         q,
         k,
         q_rope,
@@ -104,7 +99,7 @@ def _apply_llama31_rope(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    get_module_attr("apply_llama31_rope")(
+    get_rope_module().apply_llama31_rope(
         q,
         k,
         q_rope,
@@ -152,7 +147,7 @@ def _apply_rope_pos_ids(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    get_module_attr("apply_rope_pos_ids")(
+    get_rope_module().apply_rope_pos_ids(
         q,
         k,
         q_rope,
@@ -192,7 +187,7 @@ def _apply_rope_pos_ids_cos_sin_cache(
     pos_ids: torch.Tensor,
     interleave: bool,
 ) -> None:
-    get_module_attr("apply_rope_pos_ids_cos_sin_cache")(
+    get_rope_module().apply_rope_pos_ids_cos_sin_cache(
         q,
         k,
         q_rope,
@@ -234,7 +229,7 @@ def _apply_llama31_rope_pos_ids(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    get_module_attr("apply_llama31_rope_pos_ids")(
+    get_rope_module().apply_llama31_rope_pos_ids(
         q,
         k,
         q_rope,
