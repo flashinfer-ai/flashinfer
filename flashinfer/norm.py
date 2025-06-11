@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from functools import cache
 from typing import Any, Optional
 
@@ -23,8 +24,6 @@ from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
 from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-_norm_module = None
 
 
 def gen_norm_module() -> JitSpec:
@@ -37,11 +36,9 @@ def gen_norm_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_norm_module():
-    global _norm_module
-    if _norm_module is None:
-        _norm_module = gen_norm_module().build_and_load()
-    return _norm_module
+    return gen_norm_module().build_and_load()
 
 
 @cache

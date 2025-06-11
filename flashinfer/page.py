@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from functools import cache
 from typing import Any, Optional, Tuple, Union
 
@@ -30,8 +31,6 @@ from .utils import (
     register_fake_op,
 )
 
-_page_module = None
-
 
 def gen_page_module() -> JitSpec:
     return gen_jit_spec(
@@ -43,19 +42,14 @@ def gen_page_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_page_module():
-    global _page_module
-    if _page_module is None:
-        _page_module = gen_page_module().build_and_load()
-    return _page_module
+    return gen_page_module().build_and_load()
 
 
-@cache
+@functools.cache
 def get_module_attr(attr: str) -> Any:
-    global _page_module
-    if _page_module is None:
-        get_page_module()
-    return getattr(_page_module, attr).default
+    return getattr(get_page_module(), attr).default
 
 
 def block_sparse_indices_to_vector_sparse_offsets(

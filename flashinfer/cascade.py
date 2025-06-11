@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from functools import cache
 from typing import Any, List, Optional, Tuple
 
@@ -26,8 +27,6 @@ from .jit import gen_jit_spec
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
 
-_cascade_module = None
-
 
 def gen_cascade_module() -> JitSpec:
     return gen_jit_spec(
@@ -39,11 +38,9 @@ def gen_cascade_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_cascade_module():
-    global _cascade_module
-    if _cascade_module is None:
-        _cascade_module = gen_cascade_module().build_and_load()
-    return _cascade_module
+    return gen_cascade_module().build_and_load()
 
 
 @cache

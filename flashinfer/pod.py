@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import math
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
@@ -39,17 +40,11 @@ from .utils import (
     device_support_pdl,
 )
 
-_pod_modules = {}
 
-
+@functools.cache
 def get_pod_module(*args):
-    global _pod_modules
-    if args not in _pod_modules:
-        module = gen_pod_module(*args).build_and_load()
-        run_tensor = module.pod_with_kv_cache_tensor.default
-        # Register the module
-        _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
-    return _pod_modules[args]
+    module = gen_pod_module(*args).build_and_load()
+    return SimpleNamespace(run_tensor=module.pod_with_kv_cache_tensor.default)
 
 
 class PODWithPagedKVCacheWrapper:
