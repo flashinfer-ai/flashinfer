@@ -603,10 +603,10 @@ __global__ void computeSendRecvRankCountKernel(MoeEpWorldInfo worldInfo,
   }
 }
 
-void computeSendRecvRankCount(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-                              int maxTokenCountPerRank, int const* realRankTokenCountCumSum,
-                              int const* gatheredTargetRankIds, int* sendRankCount,
-                              int* recvRankCount, cudaStream_t stream) {
+void computeSendRecvRankCount(const MoeEpWorldInfo& worldInfo,
+                              MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
+                              int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+                              int* sendRankCount, int* recvRankCount, cudaStream_t stream) {
   FLASHINFER_CHECK(expertParallelInfo.topK <= 32,
                    "Only topK less than or equal to 32 supported now.");
   int threadsPerBlock = 1024;
@@ -644,25 +644,28 @@ __global__ void inplaceSendRecvRankCumSumKernel(MoeEpWorldInfo worldInfo, int* s
   }
 }
 
-void inplaceSendRecvRankCumSum(MoeEpWorldInfo worldInfo, int* sendRankCount, int* recvRankCount,
-                               cudaStream_t stream) {
-  FLASHINFER_CHECK(worldInfo.epSize <= 1024,
-                   "Only worldInfo.epSize less than or equal to 1024 supported now.");
+void inplaceSendRecvRankCumSum(const MoeEpWorldInfo& worldInfo, int* sendRankCount,
+                               int* recvRankCount, cudaStream_t stream) {
+  int epSize = worldInfo.epSize;
+  int epRank = worldInfo.epRank;
+
+  FLASHINFER_CHECK(epSize <= 1024, "Only epSize less than or equal to 1024 supported now.");
+
   auto* kernelPtr = inplaceSendRecvRankCumSumKernel<1024>;
   int blockSize = 1024;
-  if (worldInfo.epSize <= 32) {
+  if (epSize <= 32) {
     kernelPtr = inplaceSendRecvRankCumSumKernel<32>;
     blockSize = 32;
-  } else if (worldInfo.epSize <= 64) {
+  } else if (epSize <= 64) {
     kernelPtr = inplaceSendRecvRankCumSumKernel<64>;
     blockSize = 64;
-  } else if (worldInfo.epSize <= 128) {
+  } else if (epSize <= 128) {
     kernelPtr = inplaceSendRecvRankCumSumKernel<128>;
     blockSize = 128;
-  } else if (worldInfo.epSize <= 256) {
+  } else if (epSize <= 256) {
     kernelPtr = inplaceSendRecvRankCumSumKernel<256>;
     blockSize = 256;
-  } else if (worldInfo.epSize <= 512) {
+  } else if (epSize <= 512) {
     kernelPtr = inplaceSendRecvRankCumSumKernel<512>;
     blockSize = 512;
   }
@@ -763,12 +766,13 @@ __global__ void computeSendRecvIndicesKernel(
   }
 }
 
-void computeSendRecvIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-                            int maxTokenCountPerRank, int const* realRankTokenCountCumSum,
-                            int const* gatheredTargetRankIds, int const* sendRankCountCumSum,
-                            int const* recvRankCountCumSum, int* localGatherIndices,
-                            int* sendRankLocalIndices, int* recvRankLocalIndices,
-                            int* backwardRecvRankLocalIndices, cudaStream_t stream) {
+void computeSendRecvIndices(const MoeEpWorldInfo& worldInfo,
+                            MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
+                            int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+                            int const* sendRankCountCumSum, int const* recvRankCountCumSum,
+                            int* localGatherIndices, int* sendRankLocalIndices,
+                            int* recvRankLocalIndices, int* backwardRecvRankLocalIndices,
+                            cudaStream_t stream) {
   FLASHINFER_CHECK(expertParallelInfo.topK <= 32,
                    "Only topK less than or equal to 32 supported now.");
   int threadsPerBlock = 1024;
@@ -814,6 +818,7 @@ cudaError_t moeAllToAllPrepareIndices(
     cudaStream_t stream) {
   FLASHINFER_CHECK(worldInfo.epSize <= 1024,
                    "Only worldInfo.epSize less than or equal to 1024 supported now.");
+
   FLASHINFER_CUDA_CALL(
       cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
   FLASHINFER_CUDA_CALL(
@@ -832,11 +837,13 @@ cudaError_t moeAllToAllPrepareIndices(
   computeSendRecvRankCount(worldInfo, expertParallelInfo, maxTokenCountPerRank,
                            realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum,
                            recvRankCountCumSum, stream);
+
   inplaceSendRecvRankCumSum(worldInfo, sendRankCountCumSum, recvRankCountCumSum, stream);
   computeSendRecvIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank,
                          realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum,
                          recvRankCountCumSum, localGatherIndices, sendRankLocalIndices,
                          recvRankLocalIndices, backwardRecvRankLocalIndices, stream);
+  return cudaSuccess;
 }
 
 template <int kThreadsGroupSize>

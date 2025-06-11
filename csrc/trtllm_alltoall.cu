@@ -58,7 +58,7 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  int maxSendRanksPerToken = std::max(epSize, topK);
+  int maxSendRanksPerToken = std::max(static_cast<int>(epSize), static_cast<int>(topK));
 
   at::Tensor localGatherIndices = torch::empty(
       {maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
@@ -76,17 +76,20 @@ moeCommPrepareIndicesOp(at::Tensor gatheredTargetRankIds,
                    gatheredTargetRankIds.options().dtype(torch::kInt32));
 
   flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
-  expertParallelInfo.expertCount = expertCount;
-  expertParallelInfo.topK = topK;
+  expertParallelInfo.expertCount = static_cast<int>(expertCount);
+  expertParallelInfo.topK = static_cast<int>(topK);
 
   flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
                                                            static_cast<int>(epRank)};
-  flashinfer::trtllm_alltoall::moeAllToAllPrepareIndices(
-      worldInfo, expertParallelInfo, maxTokenCountPerRank, gatheredTargetRankIds.data_ptr<int>(),
-      realRankTokenCountCumSumPtr, localGatherIndices.data_ptr<int>(),
-      sendRankCountCumSum.data_ptr<int>(), sendRankLocalIndices.data_ptr<int>(),
-      recvRankCountCumSum.data_ptr<int>(), recvRankLocalIndices.data_ptr<int>(),
-      backwardRecvRankLocalIndices.data_ptr<int>(), stream);
+
+  auto cudaResult = flashinfer::trtllm_alltoall::moeAllToAllPrepareIndices(
+      worldInfo, expertParallelInfo, static_cast<int>(maxTokenCountPerRank),
+      gatheredTargetRankIds.data_ptr<int>(), realRankTokenCountCumSumPtr,
+      localGatherIndices.data_ptr<int>(), sendRankCountCumSum.data_ptr<int>(),
+      sendRankLocalIndices.data_ptr<int>(), recvRankCountCumSum.data_ptr<int>(),
+      recvRankLocalIndices.data_ptr<int>(), backwardRecvRankLocalIndices.data_ptr<int>(), stream);
+  TORCH_CHECK(cudaResult == cudaSuccess,
+              "CUDA error in moeAllToAllPrepareIndices: ", cudaGetErrorString(cudaResult));
 
   return std::make_tuple(localGatherIndices, sendRankCountCumSum, sendRankLocalIndices,
                          recvRankCountCumSum, recvRankLocalIndices, backwardRecvRankLocalIndices);
@@ -131,13 +134,13 @@ void moeLocalGatherOp(at::Tensor recvRankCumSum, at::Tensor localGatherIndices,
   auto stream = at::cuda::getCurrentCUDAStream();
 
   flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
-  expertParallelInfo.expertCount = expertCount;
-  expertParallelInfo.topK = topK;
+  expertParallelInfo.expertCount = static_cast<int>(expertCount);
+  expertParallelInfo.topK = static_cast<int>(topK);
 
   flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
                                                            static_cast<int>(epRank)};
   flashinfer::trtllm_alltoall::moeLocalGather(
-      worldInfo, expertParallelInfo, maxTokenCountPerRank, localMaxTokenCount,
+      worldInfo, expertParallelInfo, static_cast<int>(maxTokenCountPerRank), localMaxTokenCount,
       recvRankCumSum.data_ptr<int>(), localGatherIndices.data_ptr<int>(),
       gatheredExpertIds.data_ptr<int>(), gatheredScales.data_ptr<float>(),
       localExpertIds.data_ptr<int>(), localScales.data_ptr<float>(), stream);
