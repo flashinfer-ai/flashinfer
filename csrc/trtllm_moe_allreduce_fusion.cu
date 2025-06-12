@@ -5,6 +5,23 @@
 
 using namespace flashinfer::trtllm_moe_allreduce_fusion;
 
+#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(scalar_type, c_type, ...)                           \
+  [&] {                                                                                           \
+    switch (scalar_type) {                                                                        \
+      case at::ScalarType::Half: {                                                                \
+        using c_type = half;                                                                      \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
+      case at::ScalarType::BFloat16: {                                                            \
+        using c_type = __nv_bfloat16;                                                             \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
+      default:                                                                                    \
+        TORCH_CHECK(false,                                                                        \
+                    "Unsupported dtype in DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE: ", scalar_type); \
+    }                                                                                             \
+  }()
+
 void trtllm_moe_allreduce_fusion(
     at::Tensor& allreduce_in, int64_t world_size, int64_t world_rank, int64_t token_num,
     int64_t hidden_size, at::Tensor& workspace_ptrs, bool launch_with_pdl, at::Tensor& residual_in,
@@ -15,40 +32,47 @@ void trtllm_moe_allreduce_fusion(
     std::optional<at::Tensor> norm_out, std::optional<at::Tensor> quant_out,
     std::optional<at::Tensor> scale_out) {
   const c10::cuda::OptionalCUDAGuard device_guard(allreduce_in.device());
-  MoeReductionAllReduceFusionParams<half> params;
-  params.nranks = world_size;
-  params.rank = world_rank;
-  params.size = token_num * hidden_size;
-  params.hidden_dim = hidden_size;
-  params.workspace = reinterpret_cast<void**>(workspace_ptrs.data_ptr());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
-  params.allreduce_in = reinterpret_cast<void*>(allreduce_in.data_ptr());
-  params.residual_in = reinterpret_cast<void*>(residual_in.data_ptr());
-  params.residual_out =
-      residual_out.has_value() ? reinterpret_cast<void*>(residual_out.value().data_ptr()) : nullptr;
-  params.norm_out =
-      norm_out.has_value() ? reinterpret_cast<void*>(norm_out.value().data_ptr()) : nullptr;
-  params.quant_out =
-      quant_out.has_value() ? reinterpret_cast<void*>(quant_out.value().data_ptr()) : nullptr;
-  params.scale_out =
-      scale_out.has_value() ? reinterpret_cast<void*>(scale_out.value().data_ptr()) : nullptr;
-  params.rms_gamma = reinterpret_cast<void*>(rms_gamma.data_ptr());
-  params.rms_eps = static_cast<float>(rms_eps);
-  params.scale_factor = static_cast<float>(scale_factor);
-  params.layout = layout_code.has_value()
-                      ? static_cast<FP4QuantizationSFLayout>(layout_code.value())
-                      : FP4QuantizationSFLayout::SWIZZLED;
-  params.stream = at::cuda::getCurrentCUDAStream();
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(allreduce_in.scalar_type(), c_type, [&] {
+    MoeReductionAllReduceFusionParams<c_type> params;
+    params.nranks = world_size;
+    params.rank = world_rank;
+    params.size = token_num * hidden_size;
+    params.hidden_dim = hidden_size;
+    params.workspace = reinterpret_cast<void**>(workspace_ptrs.data_ptr());
 
-  params.moe_reduction_device_num_experts = moe_reduction_device_num_experts;
-  params.moe_reduction_scale_input = reinterpret_cast<float*>(moe_reduction_scale_input.data_ptr());
-  params.moe_reduction_active_experts_token_input =
-      reinterpret_cast<void*>(moe_reduction_active_experts_token_input.data_ptr());
-  params.moe_reduction_token_input = reinterpret_cast<void*>(moe_reduction_token_input.data_ptr());
+    params.allreduce_in = reinterpret_cast<void*>(allreduce_in.data_ptr());
+    params.residual_in = reinterpret_cast<void*>(residual_in.data_ptr());
+    params.residual_out = residual_out.has_value()
+                              ? reinterpret_cast<void*>(residual_out.value().data_ptr())
+                              : nullptr;
+    params.norm_out =
+        norm_out.has_value() ? reinterpret_cast<void*>(norm_out.value().data_ptr()) : nullptr;
+    params.quant_out =
+        quant_out.has_value() ? reinterpret_cast<void*>(quant_out.value().data_ptr()) : nullptr;
+    params.scale_out =
+        scale_out.has_value() ? reinterpret_cast<void*>(scale_out.value().data_ptr()) : nullptr;
+    params.rms_gamma = reinterpret_cast<void*>(rms_gamma.data_ptr());
+    params.rms_eps = static_cast<float>(rms_eps);
+    params.scale_factor = static_cast<float>(scale_factor);
+    params.layout = layout_code.has_value()
+                        ? static_cast<FP4QuantizationSFLayout>(layout_code.value())
+                        : FP4QuantizationSFLayout::SWIZZLED;
+    params.stream = stream;
 
-  auto status = moereduction_allreduce_fusion_op(params, launch_with_pdl);
-  TORCH_CHECK(status == cudaSuccess, "moereduction_allreduce_fusion_op failed with error code ",
-              cudaGetErrorString(status));
+    params.moe_reduction_device_num_experts = moe_reduction_device_num_experts;
+    params.moe_reduction_scale_input =
+        reinterpret_cast<float*>(moe_reduction_scale_input.data_ptr());
+    params.moe_reduction_active_experts_token_input =
+        reinterpret_cast<void*>(moe_reduction_active_experts_token_input.data_ptr());
+    params.moe_reduction_token_input =
+        reinterpret_cast<void*>(moe_reduction_token_input.data_ptr());
+
+    auto status = moereduction_allreduce_fusion_op(params, launch_with_pdl);
+    TORCH_CHECK(status == cudaSuccess, "moereduction_allreduce_fusion_op failed with error code ",
+                cudaGetErrorString(status));
+  });
 }
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {

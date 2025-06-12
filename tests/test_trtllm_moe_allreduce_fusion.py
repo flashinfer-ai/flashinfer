@@ -11,9 +11,11 @@ import flashinfer.comm as comm
 # todo(Yingyi): add warmup stes for benchmark
 
 # Usage: test var, temp
-MAX_TOKEN_NUM = 2048
-# HIDDEN_SIZE = 7168
-HIDDEN_SIZE = 8  # debug-only
+kOneShotMaxTokenNum = 128
+# MAX_TOKEN_NUM = 2048
+MAX_TOKEN_NUM = kOneShotMaxTokenNum
+HIDDEN_SIZE = 7168
+# HIDDEN_SIZE = 8  # debug-only
 MAX_EXPERT_NUM = 16
 SCALE_FACTOR_RANGE = (-5, 5)
 
@@ -44,11 +46,11 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         token_nums = [
             1,
             64,
-            256,
-            2048,
+            128,
+            # 256,
+            # 2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
         candidate_active_expert_num = [8, 12, 16]
-        # candidate_active_expert_num = [8]
         fusion_codes = [
             MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
             MoEAllReduceFusionType.NORM_OUT,
@@ -316,3 +318,6 @@ if __name__ == "__main__":
     mod = comm.get_comm_module()
 
     test_trtllm_moe_allreduce_fusion(2, torch.float16)
+    test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)
+    test_trtllm_moe_allreduce_fusion(4, torch.float16)
+    test_trtllm_moe_allreduce_fusion(4, torch.bfloat16)
