@@ -13,7 +13,7 @@ import flashinfer.comm as comm
 # Usage: test var, temp
 MAX_TOKEN_NUM = 2048
 # HIDDEN_SIZE = 7168
-HIDDEN_SIZE = 8 # debug-only
+HIDDEN_SIZE = 8  # debug-only
 MAX_EXPERT_NUM = 16
 SCALE_FACTOR_RANGE = (-5, 5)
 
@@ -67,7 +67,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                 rank, world_size, MAX_TOKEN_NUM, HIDDEN_SIZE, group=group
             )
         )
-        dist.barrier(group=group) # must sync after create_workspace
 
         test_loop = 5
 
@@ -77,16 +76,14 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                     for swizzled_layout_code in swizzled_layout_codes:
                         for launch_with_pdl in launch_with_pdls:
                             print(
-                                f"test RANK {rank}: {token_num}-{active_expert_num}-{world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} start"
+                                f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
                             )
                             torch.cuda.synchronize()
                             for _ in range(test_loop):
                                 message_size = token_num * HIDDEN_SIZE
 
                                 inp1 = (
-                                    torch.rand(
-                                        message_size, dtype=dtype, device=device
-                                    )
+                                    torch.rand(message_size, dtype=dtype, device=device)
                                     * 200.0
                                     - 100.0
                                 )
@@ -95,9 +92,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # init params for each fusion op
                                 residual_in = (
-                                    torch.rand(
-                                        message_size, dtype=dtype, device=device
-                                    )
+                                    torch.rand(message_size, dtype=dtype, device=device)
                                     * 200.0
                                     - 100.0
                                 )
@@ -140,9 +135,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 )
                                 # [m, 7168]
                                 moe_reduction_token_input = (
-                                    torch.rand(
-                                        message_size, dtype=dtype, device=device
-                                    )
+                                    torch.rand(message_size, dtype=dtype, device=device)
                                     * 200.0
                                     - 100.0
                                 )
@@ -259,7 +252,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # todo: check correctness
                             torch.cuda.synchronize()
                             print(
-                                f"test RANK {rank}: {token_num}-{active_expert_num}-{world_size}-{dtype}-{fusion_code}-{swizzled_layout_code}-{launch_with_pdl} passed"
+                                f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
                             )
     finally:
         dist.barrier(group=group)

@@ -777,6 +777,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
 
+    dist.barrier(group=group)  # must sync after create_workspace
+
     return ipc_handles, workspace_tensor
 
 
