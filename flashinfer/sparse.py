@@ -412,8 +412,8 @@ class BlockSparseAttentionWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            self._cached_module = get_batch_prefill_module(self._backend)(
-                *get_module_args
+            self._cached_module = get_batch_prefill_module(
+                self._backend, *get_module_args
             )
 
             kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
