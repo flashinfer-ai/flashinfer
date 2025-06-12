@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from types import SimpleNamespace
 from typing import Optional
 
@@ -51,40 +52,34 @@ act_func_def_str = {
 }
 
 
-_jit_modules = {}
-
-
 def gen_act_and_mul_module(act_func_name: str) -> JitSpec:
     return gen_act_and_mul_module_impl(act_func_name, act_func_def_str[act_func_name])
 
 
+@functools.cache
 def get_act_and_mul_module(act_func_name: str):
-    global _jit_modules
-    if act_func_name not in _jit_modules:
-        module = gen_act_and_mul_module(act_func_name).build_and_load()
+    module = gen_act_and_mul_module(act_func_name).build_and_load()
 
-        # torch library for act_and_mul
-        fname = f"{act_func_name}_and_mul"
-        fn = getattr(module, fname).default
+    # torch library for act_and_mul
+    fname = f"{act_func_name}_and_mul"
+    fn = getattr(module, fname).default
 
-        @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
-        def _act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
-        ) -> None:
-            if enable_pdl is None:
-                enable_pdl = device_support_pdl(input.device)
-            fn(out, input, enable_pdl)
+    @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
+    def _act_and_mul(
+        out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
+    ) -> None:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        fn(out, input, enable_pdl)
 
-        @register_fake_op(f"flashinfer::{fname}")
-        def _fake_act_and_mul(
-            out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
-        ) -> None:
-            pass
+    @register_fake_op(f"flashinfer::{fname}")
+    def _fake_act_and_mul(
+        out: torch.Tensor, input: torch.Tensor, enable_pdl: Optional[bool] = None
+    ) -> None:
+        pass
 
-        # Register the module
-        _jit_modules[act_func_name] = SimpleNamespace(**{fname: _act_and_mul})
-
-    return _jit_modules[act_func_name]
+    # Register the module
+    return SimpleNamespace(**{fname: _act_and_mul})
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:

@@ -672,6 +672,8 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         torch.float16,
     )
 
+    dist.barrier(group=group)  # must sync after create_workspace
+
     return ipc_handles
 
 

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from functools import cache
 from typing import Any, Optional
 
@@ -23,8 +24,6 @@ from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
 from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-_norm_module = None
 
 
 def gen_norm_module() -> JitSpec:
@@ -37,19 +36,9 @@ def gen_norm_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_norm_module():
-    global _norm_module
-    if _norm_module is None:
-        _norm_module = gen_norm_module().build_and_load()
-    return _norm_module
-
-
-@cache
-def get_module_attr(attr: str) -> Any:
-    global _norm_module
-    if _norm_module is None:
-        get_norm_module()
-    return getattr(_norm_module, attr).default
+    return gen_norm_module().build_and_load()
 
 
 def rmsnorm(
@@ -100,7 +89,7 @@ def _rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("rmsnorm")(out, input, weight, eps, enable_pdl)
+    get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -146,7 +135,7 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
+    get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
@@ -208,7 +197,7 @@ def _gemma_rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("gemma_rmsnorm")(out, input, weight, eps, enable_pdl)
+    get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
@@ -256,7 +245,7 @@ def gemma_fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_module_attr("gemma_fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
+    get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_fused_add_rmsnorm")
