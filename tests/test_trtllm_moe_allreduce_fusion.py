@@ -389,6 +389,7 @@ def multi_process_parallel(
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_trtllm_moe_allreduce_fusion(world_size, dtype):
+    torch.manual_seed(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
         raise ValueError(
@@ -407,6 +408,8 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
 
 if __name__ == "__main__":
     mod = comm.get_comm_module()
+    # set random seed
+    torch.manual_seed(42)
 
     test_trtllm_moe_allreduce_fusion(2, torch.float16)
     test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)

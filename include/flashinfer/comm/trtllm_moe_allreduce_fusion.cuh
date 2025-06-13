@@ -640,13 +640,6 @@ struct LamportComm {
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
     }
-    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //   printf(
-    //       "Rank %d: flag_value %d, clear_size %d, counter %d, comm_size %d, data_buf[0] %p, "
-    //       "data_buf[1] %p, clear_buf %p\n",
-    //       rank, flag_value, clear_size, *counter_ptr, comm_size, data_bufs[0], data_bufs[1],
-    //       clear_buf);
-    // }
   }
 
   __device__ __forceinline__ void update(int new_clear_size) {
@@ -928,7 +921,7 @@ template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    if (vec[i] == neg_zero_v<T>) {
+    if (is_negative_zero(vec[i])) {
       return true;
     }
   }
@@ -1067,12 +1060,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
     remove_neg_zero<T, VEC_SIZE>(accumulator);
 
-    // debug only
-    int flag = *comm.flag_ptr;
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      accumulator[i] = static_cast<T>(flag * 100 + i + 10 * params.rank + 0.1);
-    }
-
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
@@ -1093,7 +1080,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     // * AR Load
     vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
-    int count = 0;
     while (!done) {
       // printf("Rank %d poll AR Load with flag %d\n", params.rank, *comm.flag_ptr);
       done = true;
