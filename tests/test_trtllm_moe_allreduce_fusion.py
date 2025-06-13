@@ -118,7 +118,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # [device_num_expert, m]
                                 moe_reduction_scale_input = (
                                     torch.rand(
-                                        MAX_EXPERT_NUM * MAX_TOKEN_NUM,
+                                        active_expert_num * token_num,
                                         dtype=torch.float32,
                                         device=device,
                                     )
@@ -128,7 +128,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # [device_num_expert, m, 7168]
                                 moe_reduction_active_experts_token_input = (
                                     torch.rand(
-                                        MAX_EXPERT_NUM * message_size,
+                                        active_expert_num * message_size,
                                         dtype=dtype,
                                         device=device,
                                     )
@@ -252,12 +252,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # 1. MoE Reduction
                                 moe_expert_out = (
                                     moe_reduction_active_experts_token_input.view(
-                                        MAX_EXPERT_NUM, message_size
-                                    )[:active_expert_num, :]
+                                        active_expert_num, message_size
+                                    )
                                 )
                                 moe_scales = moe_reduction_scale_input.view(
-                                    MAX_EXPERT_NUM, MAX_TOKEN_NUM
-                                )[:active_expert_num, :token_num]
+                                    active_expert_num, token_num
+                                )
                                 moe_expert_out = moe_expert_out.view(
                                     active_expert_num, token_num, HIDDEN_SIZE
                                 )
