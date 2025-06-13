@@ -1,13 +1,23 @@
 # === Required Dependencies for Core Functionality ===
-find_package(CUDAToolkit REQUIRED)
+if(FLASHINFER_ENABLE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  find_package(Thrust REQUIRED)
+endif()
+
+# === HIP Dependencies ===
+if(FLASHINFER_ENABLE_HIP)
+  # Check for HIP
+  include(ConfigureRocmPath)
+  find_package(HIP REQUIRED)
+  message(STATUS "Found HIP: ${HIP_VERSION}")
+endif()
+
 find_package(Python3 REQUIRED)
 if(NOT Python3_FOUND)
   message(
     FATAL_ERROR
       "Python3 not found it is required to generate the kernel sources.")
 endif()
-
-find_package(Thrust REQUIRED)
 
 # === Test Dependencies ===
 if(FLASHINFER_UNITTESTS)
@@ -151,26 +161,28 @@ set(FLASHINFER_GENERATED_SOURCE_DIR_ROOT
     CACHE INTERNAL "FlashInfer generated source root directory")
 
 # === CUTLASS Configuration ===
-if(FLASHINFER_CUTLASS_DIR)
-  if(IS_ABSOLUTE ${FLASHINFER_CUTLASS_DIR})
-    set(CUTLASS_DIR ${FLASHINFER_CUTLASS_DIR})
+if(FLASHINFER_ENABLE_CUDA)
+  if(FLASHINFER_CUTLASS_DIR)
+    if(IS_ABSOLUTE ${FLASHINFER_CUTLASS_DIR})
+      set(CUTLASS_DIR ${FLASHINFER_CUTLASS_DIR})
+    else()
+      set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/${FLASHINFER_CUTLASS_DIR}")
+    endif()
+
+    list(APPEND CMAKE_PREFIX_PATH ${CUTLASS_DIR})
+    set(CUTLASS_INCLUDE_DIRS
+        "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include"
+        CACHE INTERNAL "CUTLASS include directories")
+
+    message(STATUS "CUTLASS include directories: ${CUTLASS_INCLUDE_DIRS}")
   else()
-    set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/${FLASHINFER_CUTLASS_DIR}")
+    message(
+      FATAL_ERROR "FLASHINFER_CUTLASS_DIR must be set to the path of CUTLASS")
   endif()
-
-  list(APPEND CMAKE_PREFIX_PATH ${CUTLASS_DIR})
-  set(CUTLASS_INCLUDE_DIRS
-      "${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include"
-      CACHE INTERNAL "CUTLASS include directories")
-
-  message(STATUS "CUTLASS include directories: ${CUTLASS_INCLUDE_DIRS}")
-else()
-  message(
-    FATAL_ERROR "FLASHINFER_CUTLASS_DIR must be set to the path of CUTLASS")
 endif()
 
 # === Python dependencies for PyTorch extensions ===
-if(FLASHINFER_AOT_TORCH_EXTS_CUDA)
+if(FLASHINFER_AOT_TORCH_EXTS)
   find_package(
     Python
     COMPONENTS Interpreter Development.Module
@@ -182,7 +194,11 @@ if(FLASHINFER_AOT_TORCH_EXTS_CUDA)
     OUTPUT_VARIABLE TORCH_CMAKE_PREFIX COMMAND_ECHO STDOUT
     OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
   set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH};${TORCH_CMAKE_PREFIX})
-  find_package(CUDA)
+
+  if(FLASHINFER_ENABLE_CUDA)
+    find_package(CUDA)
+  endif()
+
   # Find PyTorch
   find_package(Torch REQUIRED)
 

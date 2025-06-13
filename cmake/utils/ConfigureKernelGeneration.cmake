@@ -49,7 +49,8 @@ function(flashinfer_configure_kernel_generation)
       --enable_f16 ${FLASHINFER_ENABLE_F16}
       --enable_bf16 ${FLASHINFER_ENABLE_BF16}
       --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3}
-      --enable_fp8_e5m2 ${FLASHINFER_ENABLE_FP8_E5M2})
+      --enable_fp8_e5m2 ${FLASHINFER_ENABLE_FP8_E5M2}
+      --generate_hip ${FLASHINFER_ENABLE_HIP})
 
   # Command to generate dispatch include file
   set(AOT_GENERATE_DISPATCH_INC_COMMAND

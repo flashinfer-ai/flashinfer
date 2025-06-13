@@ -101,7 +101,7 @@ if(FLASHINFER_BUILD_KERNELS
    OR FLASHINFER_UNITTESTS
    OR FLASHINFER_CXX_BENCHMARKS)
 
-  set(FLASHINFER_KERNEL_TARGETS decode_kernels prefill_kernels)
+  set(FLASHINFER_KERNEL_TARGETS "")
 
   add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
   add_library(flashinfer::decode_kernels ALIAS decode_kernels)
@@ -110,11 +110,26 @@ if(FLASHINFER_BUILD_KERNELS
     target_link_libraries(decode_kernels PRIVATE Boost::math)
   endif()
 
-  add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
-  add_library(flashinfer::prefill_kernels ALIAS prefill_kernels)
-  target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
-    target_link_libraries(prefill_kernels PRIVATE Boost::math)
+  list(APPEND FLASHINFER_KERNEL_TARGETS decode_kernels)
+
+  # NOTE: The prefill_kernels is not yet supported on HIP
+  if(FLASHINFER_ENABLE_CUDA)
+    add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
+    add_library(flashinfer::prefill_kernels ALIAS prefill_kernels)
+    target_include_directories(prefill_kernels
+                               PRIVATE ${FLASHINFER_INCLUDE_DIR})
+    if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+      target_link_libraries(prefill_kernels PRIVATE Boost::math)
+    endif()
+    list(APPEND FLASHINFER_KERNEL_TARGETS prefill_kernels)
+  endif()
+
+  if(FLASHINFER_ENABLE_HIP)
+    set_source_files_properties(${DECODE_KERNELS_SRCS} PROPERTIES LANGUAGE HIP)
+    foreach(flag ${FLASHINFER_HIPCC_FLAGS})
+      target_compile_options(decode_kernels
+                             PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${flag}>)
+    endforeach()
   endif()
 
   if(FLASHINFER_ENABLE_SM90)
@@ -130,6 +145,14 @@ if(FLASHINFER_BUILD_KERNELS
     if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
       target_link_libraries(prefill_kernels_sm90 PRIVATE Boost::math)
     endif()
+  endif()
+
+  if(FLASHINFER_ENABLE_HIP)
+    set_target_properties(
+      ${FLASHINFER_KERNEL_TARGETS}
+      PROPERTIES HIP_SOURCES_PROPERTY_FORMAT 1
+                 HIP_SEPARABLE_COMPILATION ON
+                 LINKER_LANGUAGE HIP)
   endif()
 
   # Only for non-wheel builds: Install libraries and export targets

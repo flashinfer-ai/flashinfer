@@ -117,16 +117,25 @@ function(flashinfer_generate_config_python)
   # Torch info block if AOT enabled
   set(TORCH_INFO_BLOCK "# No PyTorch information available")
   set(aot_torch_exts_cuda "False")
-  set(aot_torch_exts_cuda_archs "[]") # Default empty list
-  if(FLASHINFER_AOT_TORCH_EXTS_CUDA)
+  set(aot_torch_exts_cuda_archs "[]")
+  set(aot_torch_exts_hip "False")
+  set(aot_torch_exts_hip_archs "[]")
+
+  if(FLASHINFER_AOT_TORCH_EXTS)
     set(TORCH_INFO_BLOCK "import torch\n")
     string(APPEND TORCH_INFO_BLOCK "torch_version = torch.__version__\n")
-    string(APPEND TORCH_INFO_BLOCK "cuda_version = torch.version.cuda\n")
-
-    # Add to info dict
     list(APPEND INFO_DICT_ENTRIES "'torch_version': torch_version,")
-    list(APPEND INFO_DICT_ENTRIES "'cuda_version': cuda_version,")
-    list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_cuda': True,")
+    if(FLASHINFER_ENABLE_CUDA)
+      string(APPEND TORCH_INFO_BLOCK "cuda_version = torch.version.cuda\n")
+      list(APPEND INFO_DICT_ENTRIES "'cuda_version': cuda_version,")
+      list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_cuda': True,")
+      list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_hip': False,")
+    elseif(FLASHINFER_ENABLE_HIP)
+      string(APPEND TORCH_INFO_BLOCK "hip_version = torch.version.hip\n")
+      list(APPEND INFO_DICT_ENTRIES "'hip_version': hip_version,")
+      list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_cuda': False,")
+      list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_hip': True,")
+    endif()
 
     # Format CUDA architectures as a Python list
     if(FLASHINFER_CUDA_ARCHITECTURES)
@@ -144,12 +153,21 @@ function(flashinfer_generate_config_python)
       message(STATUS "AOT CUDA architectures: ${aot_torch_exts_cuda_archs}")
     endif()
 
-    message(
-      STATUS
-        "Final aot_torch_exts_cuda_archs value: ${aot_torch_exts_cuda_archs}")
+    if(FLASHINFER_HIP_ARCHITECTURES)
+      set(CLEAN_ARCHS "")
+      foreach(arch ${FLASHINFER_HIP_ARCHITECTURES})
+        list(APPEND CLEAN_ARCHS ${arch})
+      endforeach()
 
-    # Add specific SM90 information since that's especially relevant for
-    # FlashInfer
+      list(REMOVE_DUPLICATES CLEAN_ARCHS)
+      list(SORT CLEAN_ARCHS)
+
+      string(REPLACE ";" ", " ARCHS_STR "${CLEAN_ARCHS}")
+      set(aot_torch_exts_hip_archs "[${ARCHS_STR}]")
+      message(STATUS "AOT HIP architectures: ${aot_torch_exts_hip_archs}")
+    endif()
+
+    # Add specific SM90 information
     if(FLASHINFER_ENABLE_SM90)
       list(APPEND INFO_DICT_ENTRIES "'aot_torch_exts_cuda_sm90': True,")
       # Include the special SM90 head dimensions if available

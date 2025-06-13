@@ -1,3 +1,50 @@
+# SPDX-FileCopyrightText: 2025 Advanced Micro Devices, Inc.
+#
+# SPDX-License-Identifier: Apache 2.0
+
+function(_get_abi_flags)
+  execute_process(
+    COMMAND
+      ${Python_EXECUTABLE} -c
+      "import torch, torch._C as _C; print(getattr(_C, '_PYBIND11_COMPILER_TYPE', '_gcc'))"
+    OUTPUT_VARIABLE TORCH_PYBIND11_COMPILER_TYPE
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  execute_process(
+    COMMAND
+      ${Python_EXECUTABLE} -c
+      "import torch, torch._C as _C; print(getattr(_C, '_PYBIND11_STDLIB', '_libstdcpp'))"
+    OUTPUT_VARIABLE TORCH_PYBIND11_STDLIB
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  execute_process(
+    COMMAND
+      ${Python_EXECUTABLE} -c
+      "import torch, torch._C as _C; print(getattr(_C, '_PYBIND11_BUILD_ABI', '_cxxabi1011'))"
+    OUTPUT_VARIABLE TORCH_PYBIND11_BUILD_ABI
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  execute_process(
+    COMMAND ${Python_EXECUTABLE} -c
+            "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+    OUTPUT_VARIABLE TORCH_CXX11_ABI
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  set(TORCH_PYBIND11_COMPILER_TYPE
+      "${TORCH_PYBIND11_COMPILER_TYPE}"
+      PARENT_SCOPE)
+  set(TORCH_PYBIND11_STDLIB
+      "${TORCH_PYBIND11_STDLIB}"
+      PARENT_SCOPE)
+  set(TORCH_PYBIND11_BUILD_ABI
+      "${TORCH_PYBIND11_BUILD_ABI}"
+      PARENT_SCOPE)
+  set(TORCH_CXX11_ABI
+      "${TORCH_CXX11_ABI}"
+      PARENT_SCOPE)
+
+endfunction()
+
 function(_add_torch_extension)
   set(options PY_LIMITED_API)
   set(oneValueArgs EXT_NAME MIN_PYTHON_ABI)
@@ -21,6 +68,15 @@ function(_add_torch_extension)
   # Set position-independent code flag (required for Python modules)
   set_target_properties(${arg_EXT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+  if(FLASHINFER_ENABLE_HIP)
+    set_source_files_properties(${arg_SOURCES} PROPERTIES LANGUAGE HIP)
+    set_target_properties(
+      ${arg_EXT_NAME}
+      PROPERTIES HIP_SOURCES_PROPERTY_FORMAT 1
+                 HIP_SEPARABLE_COMPILATION ON
+                 LINKER_LANGUAGE HIP)
+  endif()
+
   # Find Python include directories
   if(arg_PY_LIMITED_API)
     # For limited API, we need a specific version format
@@ -39,15 +95,18 @@ function(_add_torch_extension)
       elseif(MAJOR EQUAL 3 AND MINOR EQUAL 11)
         set(PY_VERSION_HEX "0x030B0000")
       else()
-        set(PY_VERSION_HEX "0x03080000") # Default to 3.8
+        set(PY_VERSION_HEX "0x03090000") # Default to 3.9
       endif()
     else()
-      # Default to Python 3.8
-      set(PY_VERSION_HEX "0x03080000")
+      # Default to Python 3.9
+      set(PY_VERSION_HEX "0x03090000")
     endif()
 
     target_compile_definitions(${arg_EXT_NAME}
                                PRIVATE "Py_LIMITED_API=${PY_VERSION_HEX}")
+  else()
+    # Add torch_python only if not using limited API
+    list(APPEND LIBS_TO_LINK torch_python)
   endif()
 
   # Explicitly add Python include directories
@@ -69,31 +128,6 @@ function(_add_torch_extension)
   # Prepare libraries to link
   set(LIBS_TO_LINK ${arg_LINK_LIBS} ${COMMON_LIBS})
 
-  # Handle PY_LIMITED_API and conditional libraries
-  if(arg_PY_LIMITED_API)
-    # Handle configurable Python ABI version
-    if(DEFINED arg_MIN_PYTHON_ABI)
-      # Parse the version string (format: 3.8, 3.9, etc.)
-      string(REPLACE "." ";" VERSION_LIST ${arg_MIN_PYTHON_ABI})
-      list(GET VERSION_LIST 0 MAJOR)
-      list(GET VERSION_LIST 1 MINOR)
-
-      # Convert to hex format: 0x030X0000
-      math(EXPR PY_VERSION_HEX "(${MAJOR} << 24) | (${MINOR} << 16)")
-      # Format it as hex with leading 0x
-      string(REGEX REPLACE "^(.+)$" "0x\\1" PY_VERSION_HEX "${PY_VERSION_HEX}")
-    else()
-      # Default to Python 3.8
-      set(PY_VERSION_HEX "0x03080000")
-    endif()
-
-    target_compile_definitions(${arg_EXT_NAME}
-                               PRIVATE "Py_LIMITED_API=${PY_VERSION_HEX}")
-  else()
-    # Add torch_python only if not using limited API
-    list(APPEND LIBS_TO_LINK torch_python)
-  endif()
-
   # Add link libraries
   if(DEFINED LIBS_TO_LINK)
     target_link_libraries(${arg_EXT_NAME} PRIVATE ${LIBS_TO_LINK})
@@ -104,27 +138,24 @@ function(_add_torch_extension)
     target_compile_options(${arg_EXT_NAME} PRIVATE ${arg_COMPILE_FLAGS})
   endif()
 
-  set(CXX11_ABI 0)
-  if(FLASHINFER_USE_CXX11_ABI)
-    set(CXX11_ABI 1)
-  endif()
+  # Get the PYBIND11 and CXX ABI flags from torch
+  _get_abi_flags()
 
   target_compile_definitions(
     ${arg_EXT_NAME}
     PRIVATE TORCH_EXTENSION_NAME=${arg_EXT_NAME}
-            PYBIND11_COMPILER_TYPE="_gcc"
-            PYBIND11_STDLIB="_libstdcpp"
-            PYBIND11_BUILD_ABI="_cxxabi1011"
-            NDEBUG
+            PYBIND11_COMPILER_TYPE=${TORCH_PYBIND11_COMPILER_TYPE}
+            PYBIND11_STDLIB=${TORCH_PYBIND11_STDLIB}
+            PYBIND11_BUILD_ABI=${TORCH_PYBIND11_BUILD_ABI}
+            $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
             TORCH_API_INCLUDE_EXTENSION_H
-            _GLIBCXX_USE_CXX11_ABI=${CXX11_ABI})
+            _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 
   if(arg_PY_LIMITED_API)
     set_target_properties(
       ${arg_EXT_NAME} PROPERTIES SUFFIX ".abi3${CMAKE_SHARED_MODULE_SUFFIX}")
   endif()
 
-  # Use only the simple, standard linking flags PyTorch uses (no exotic flags)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(
       ${arg_EXT_NAME}
@@ -146,6 +177,11 @@ function(_add_torch_extension)
 
   # Set up Python module naming conventions (no lib prefix)
   set_target_properties(${arg_EXT_NAME} PROPERTIES PREFIX "")
+
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include(Diagnostics)
+    flashinfer_diagnose_target(${arg_EXT_NAME})
+  endif()
 
 endfunction()
 
@@ -340,17 +376,34 @@ endfunction()
     across Python versions. When enabled, torch_python is not linked.
 
   ``MIN_PYTHON_ABI``
-    Minimum Python version for limited API compatibility (default: "3.8").
+    Minimum Python version for limited API compatibility (default: "3.9").
     Only relevant when PY_LIMITED_API is set.
 #]=======================================================================]
 function(add_hip_torch_extension)
-  set(options PY_LIMITED_API) # Removed DLINK from here
+  set(options PY_LIMITED_API)
   set(oneValueArgs EXT_NAME MIN_PYTHON_ABI)
   set(multiValueArgs SOURCES LINK_LIBS LINK_LIB_DIRS COMPILE_FLAGS INCLUDE_DIRS)
 
   cmake_parse_arguments(PARSE_ARGV 0 arg "${options}" "${oneValueArgs}"
                         "${multiValueArgs}")
 
+  # ############################################################################
+  # HACKISH: Remove the NO_HALF flags from the torch_hip target
+  get_target_property(TORCH_HIP_INTERFACE_OPTIONS torch_hip
+                      INTERFACE_COMPILE_OPTIONS)
+
+  set(FILTERED_OPTIONS "")
+  foreach(opt IN LISTS TORCH_HIP_INTERFACE_OPTIONS)
+    if(NOT opt MATCHES ".*__HIP_NO_HALF_OPERATORS__.*"
+       AND NOT opt MATCHES ".*__HIP_NO_HALF_CONVERSIONS__.*")
+      list(APPEND FILTERED_OPTIONS ${opt})
+    endif()
+  endforeach()
+
+  # Set the modified options back to the target
+  set_property(TARGET torch_hip PROPERTY INTERFACE_COMPILE_OPTIONS
+                                         ${FILTERED_OPTIONS})
+  # ############################################################################
   # HIP specific libraries
   set(HIP_SPECIFIC_LIBS amdhip64 c10_hip torch_hip)
 
@@ -365,21 +418,16 @@ function(add_hip_torch_extension)
     set(arg_PY_LIMITED_API OFF)
   endif()
 
+  # cmake-format: off
   _add_torch_extension(
-    EXT_NAME
-    ${arg_EXT_NAME}
-    SOURCES
-    ${arg_SOURCES}
-    LINK_LIBS
-    ${arg_LINK_LIBS}
-    LINK_LIB_DIRS
-    ${arg_LINK_LIB_DIRS}
-    COMPILE_FLAGS
-    ${arg_COMPILE_FLAGS}
-    INCLUDE_DIRS
-    ${arg_INCLUDE_DIRS}
-    MIN_PYTHON_ABI
-    ${arg_MIN_PYTHON_ABI}
-    PY_LIMITED_API
-    ${arg_PY_LIMITED_API})
+    EXT_NAME ${arg_EXT_NAME}
+    SOURCES ${arg_SOURCES}
+    LINK_LIBS ${arg_LINK_LIBS}
+    LINK_LIB_DIRS ${arg_LINK_LIB_DIRS}
+    COMPILE_FLAGS ${arg_COMPILE_FLAGS}
+    INCLUDE_DIRS ${arg_INCLUDE_DIRS}
+    MIN_PYTHON_ABI ${arg_MIN_PYTHON_ABI}
+    PY_LIMITED_API ${arg_PY_LIMITED_API}
+  )
+  # cmake-format: on
 endfunction()
