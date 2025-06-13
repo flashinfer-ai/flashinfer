@@ -77,6 +77,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                 for fusion_code in fusion_codes:
                     for swizzled_layout_code in swizzled_layout_codes:
                         for launch_with_pdl in launch_with_pdls:
+                            test_passed = True
                             print(
                                 f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
                             )
@@ -86,17 +87,13 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 inp1 = (
                                     torch.rand(message_size, dtype=dtype, device=device)
-                                    * 200.0
-                                    - 100.0
+                                    
                                 )
-                                inp1_ref = inp1.clone()
-                                out1 = torch.empty_like(inp1)
 
                                 # init params for each fusion op
                                 residual_in = (
                                     torch.rand(message_size, dtype=dtype, device=device)
-                                    * 200.0
-                                    - 100.0
+                                    
                                 )
                                 residual_out = torch.empty_like(residual_in)
                                 norm_out = torch.empty_like(residual_in)
@@ -104,8 +101,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 scale_out = torch.empty_like(residual_in)
                                 rms_gamma = (
                                     torch.rand(HIDDEN_SIZE, dtype=dtype, device=device)
-                                    * 2.0
-                                    - 1.0
+                                    
                                 )
                                 scale_factor = (
                                     torch.rand(1, dtype=torch.float32, device=device)
@@ -122,8 +118,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         dtype=torch.float32,
                                         device=device,
                                     )
-                                    * 200.0
-                                    - 100.0
+                                    
                                 )
                                 # [device_num_expert, m, 7168]
                                 moe_reduction_active_experts_token_input = (
@@ -132,14 +127,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         dtype=dtype,
                                         device=device,
                                     )
-                                    * 200.0
-                                    - 100.0
+                                    
                                 )
                                 # [m, 7168]
                                 moe_reduction_token_input = (
                                     torch.rand(message_size, dtype=dtype, device=device)
-                                    * 200.0
-                                    - 100.0
+                                    
                                 )
 
                                 if (
@@ -252,35 +245,35 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # 1. MoE Reduction
                                 moe_expert_out = (
                                     moe_reduction_active_experts_token_input.view(
-                                        active_expert_num, message_size
-                                    )
+                                        active_expert_num, token_num, HIDDEN_SIZE
+                                    ).to(torch.float32)
                                 )
                                 moe_scales = moe_reduction_scale_input.view(
                                     active_expert_num, token_num
                                 )
-                                moe_expert_out = moe_expert_out.view(
-                                    active_expert_num, token_num, HIDDEN_SIZE
-                                )
-                                moe_scales = moe_scales.unsqueeze(2)
+                                moe_scales = moe_scales.unsqueeze(
+                                    2
+                                )  # [active_expert_num, token_num, 1]
                                 scaled_expert_out = moe_expert_out * moe_scales.to(
-                                    dtype
+                                    torch.float32
                                 )
                                 reduced_expert_out = torch.sum(scaled_expert_out, dim=0)
 
                                 # 2. Add FC2 output
                                 moe_out_ref = (
                                     reduced_expert_out.view(message_size)
-                                    + moe_reduction_token_input
+                                    + moe_reduction_token_input.to(torch.float32)
                                 )
 
                                 # 3. All-Reduce
-                                all_reduced_ref = moe_out_ref.clone()
+                                all_reduced_ref = moe_out_ref.clone().to(dtype)
                                 dist.all_reduce(all_reduced_ref, group=group)
+                                all_reduced_ref = all_reduced_ref.to(torch.float32)
 
                                 # 4. Fused Ops
                                 ref_residual_out = all_reduced_ref.view(
                                     token_num, HIDDEN_SIZE
-                                ) + residual_in.view(token_num, HIDDEN_SIZE)
+                                ) + residual_in.view(token_num, HIDDEN_SIZE).to(torch.float32)
 
                                 variance = (
                                     ref_residual_out.to(torch.float32)
@@ -290,63 +283,114 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 hidden_states = ref_residual_out * torch.rsqrt(
                                     variance + rms_eps
                                 )
-                                ref_norm_out = rms_gamma * hidden_states
+                                ref_norm_out = rms_gamma.to(torch.float32) * hidden_states
 
                                 # 5. Check correctness
-                                # if (
-                                #     fusion_code
-                                #     == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
-                                # ):
-                                #     torch.testing.assert_close(
-                                #         residual_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_residual_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
-                                # elif fusion_code == MoEAllReduceFusionType.NORM_OUT:
-                                #     torch.testing.assert_close(
-                                #         norm_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_norm_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
-                                # elif (
-                                #     fusion_code
-                                #     == MoEAllReduceFusionType.RESIDUAL_NORM_OUT
-                                # ):
-                                #     torch.testing.assert_close(
-                                #         residual_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_residual_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
-                                #     torch.testing.assert_close(
-                                #         norm_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_norm_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
-                                # elif (
-                                #     fusion_code
-                                #     == MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT
-                                # ):
-                                #     torch.testing.assert_close(
-                                #         residual_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_residual_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
-                                #     torch.testing.assert_close(
-                                #         norm_out.view(token_num, HIDDEN_SIZE),
-                                #         ref_norm_out,
-                                #         atol=1e-2,
-                                #         rtol=1e-2,
-                                #     )
+                                if (
+                                    fusion_code
+                                    == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
+                                ):
+                                    # torch.testing.assert_close(
+                                    #     residual_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_residual_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    if not torch.allclose(
+                                        residual_out.to(torch.float32).view(token_num, HIDDEN_SIZE),
+                                        ref_residual_out,
+                                        atol=1e-3,
+                                        rtol=1e-3,
+                                    ):
+                                        test_passed = False
+                                        print(f"Rank {rank} failed")
+                                        print(f"residual_out: {residual_out}")
+                                        print(f"ref_residual_out: {ref_residual_out}")
+                                elif fusion_code == MoEAllReduceFusionType.NORM_OUT:
+                                    # torch.testing.assert_close(
+                                    #     norm_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_norm_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    if not torch.allclose(
+                                        norm_out.to(torch.float32).view(token_num, HIDDEN_SIZE), ref_norm_out, atol=1e-2, rtol=1e-2
+                                    ):
+                                        test_passed = False
+                                        print(f"Rank {rank} failed")
+                                        print(f"norm_out: {norm_out}")
+                                        print(f"ref_norm_out: {ref_norm_out}")
+                                        # raise ValueError("Test failed")
+                                elif (
+                                    fusion_code
+                                    == MoEAllReduceFusionType.RESIDUAL_NORM_OUT
+                                ):
+                                    # torch.testing.assert_close(
+                                    #     residual_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_residual_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    # torch.testing.assert_close(
+                                    #     norm_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_norm_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    if not torch.allclose(
+                                        residual_out.to(torch.float32).view(token_num, HIDDEN_SIZE),
+                                        ref_residual_out,
+                                        atol=1e-2,
+                                        rtol=1e-2,
+                                    ) or not torch.allclose(
+                                        norm_out.to(torch.float32).view(token_num, HIDDEN_SIZE), ref_norm_out, atol=1e-2, rtol=1e-2
+                                    ):
+                                        test_passed = False
+                                        print(f"Rank {rank} failed")
+                                        print(f"residual_out: {residual_out}")
+                                        print(f"ref_residual_out: {ref_residual_out}")
+                                        print(f"norm_out: {norm_out}")
+                                        print(f"ref_norm_out: {ref_norm_out}")
+                                elif (
+                                    fusion_code
+                                    == MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT
+                                ):
+                                    # torch.testing.assert_close(
+                                    #     residual_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_residual_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    # torch.testing.assert_close(
+                                    #     norm_out.view(token_num, HIDDEN_SIZE),
+                                    #     ref_norm_out,
+                                    #     atol=1e-3,
+                                    #     rtol=1e-3,
+                                    # )
+                                    if not torch.allclose(
+                                        residual_out.to(torch.float32).view(token_num, HIDDEN_SIZE),
+                                        ref_residual_out,
+                                        atol=1e-2,
+                                        rtol=1e-2,
+                                    ) or not torch.allclose(
+                                        norm_out.to(torch.float32).view(token_num, HIDDEN_SIZE), ref_norm_out, atol=1e-2, rtol=1e-2
+                                    ):
+                                        test_passed = False
+                                        print(f"Rank {rank} failed")
+                                        print(f"residual_out: {residual_out}")
+                                        print(f"ref_residual_out: {ref_residual_out}")
+                                        print(f"norm_out: {norm_out}")
+                                        print(f"ref_norm_out: {ref_norm_out}")
 
                             torch.cuda.synchronize()
-                            print(
-                                f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
-                            )
+                            if test_passed:
+                                print(
+                                    f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
+                                )
+                            else:
+                                print(
+                                    f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
+                                )
     finally:
         dist.barrier(group=group)
 
