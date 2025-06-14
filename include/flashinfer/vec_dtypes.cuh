@@ -1544,6 +1544,40 @@ struct vec_t<float, vec_size> {
   }
 };
 
+template <typename T>
+struct vec2_dtype {
+  using type = T;
+};
+
+template <>
+struct vec2_dtype<half> {
+  using type = half2;
+};
+
+template <>
+struct vec2_dtype<__nv_bfloat16> {
+  using type = __nv_bfloat162;
+};
+
+template <>
+struct vec2_dtype<__nv_fp8_e4m3> {
+  using type = __nv_fp8x2_e4m3;
+};
+
+template <>
+struct vec2_dtype<__nv_fp8_e5m2> {
+  using type = __nv_fp8x2_e5m2;
+};
+
+template <typename T>
+using vec2_dtype_t = typename vec2_dtype<T>::type;
+
+template <typename T, size_t VEC_SIZE>
+FLASHINFER_INLINE vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int i) {
+  static_assert(VEC_SIZE % 2 == 0, "VEC_SIZE must be a multiple of 2");
+  return ((vec2_dtype_t<T>*)&(vec[0]))[i];
+}
+
 }  // namespace flashinfer
 
 #endif  // VEC_DTYPES_CUH_
