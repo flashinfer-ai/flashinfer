@@ -721,7 +721,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
     flag_size = tp_size * BarrierFlagCount * 4
-    lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
+    # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
+    # enable larger workspace for cases > OneShotMaxToken
+    lamport_comm_size = tp_size * max_token_num * hidden_dim * 2
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -733,6 +735,99 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
         ipc_handles.append(create_shared_buffer(aligned_size, group))
+
+    print(
+        f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    )
+
+    # Initialize lamport buffer
+    trtllm_lamport_initialize(
+        ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+    )
+
+    # initialize workspace
+    workspace = list()
+    # add ipc handles to workspace
+    for ipc_handle in ipc_handles:
+        for rank in range(tp_size):
+            workspace.append(ipc_handle[rank])
+
+    # add flags to workspace
+    """
+    NOTE:
+    The flags are for the lamport communication states.
+    atomic flag read counter: kernel_flag_ptr[0] = 0;
+    non-lamport flag: kernel_flag_ptr[1] = 0;
+    lamport flag: kernel_flag_ptr[2] = 0;
+    lamport triple buffer offset: kernel_flag_ptr[3] = lamport_comm_size;
+    lamport clear size: kernel_flag_ptr[4] = 0;
+    """
+    # malloc cuda memory of int32_t * 5
+    flag_ptr = cudart.cudaMalloc(5 * 4)
+    # initialize the flag to [0,0,0,lamport_comm_size,0]
+    cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+    # Set flag_ptr[3] = lamport_comm_size
+    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
+    cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
+    print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
+    # add flag_ptr to workspace
+    workspace.append(flag_ptr.value)
+
+    for i in range(len(workspace)):
+        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
+
+    # Store workspace pointers in device tensor
+    workspace_tensor = torch.tensor(
+        workspace, dtype=torch.int64, device=torch.device("cuda")
+    )
+
+    dist.barrier(group=group)  # must sync after create_workspace
+
+    return ipc_handles, workspace_tensor
+
+def trtllm_create_ipc_workspace_for_all_reduce_fusion_debug(
+    tp_rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim,
+    group: Optional[ProcessGroup] = None,
+) -> List[int]:
+    """
+    Note:
+    We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion on the local rank.
+    They are sized as follows:
+    [buffer_size, flag_size, lamport_buffer_size * 3]
+    where:
+    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
+    - flag_size: tp_size * BarrierFlagCount * sizeof(int)
+    - lamport_buffer_size: tp_size * max(max_token_num, OneShotMaxToken) * tp_size * hidden_dim * sizeof(half)
+
+    The workspace is passed as workspace field in AllReduceFusionParams.
+
+    We use tp_size and world_size here interchangeably (allReduceFusion).
+
+    Reference: trtllm, cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
+    """
+
+    buffer_size = tp_size * max_token_num * hidden_dim * 2
+    flag_size = tp_size * BarrierFlagCount * 4
+    # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
+    # enable larger workspace for cases > OneShotMaxToken
+    lamport_comm_size = tp_size * max_token_num * hidden_dim * 2
+    lamport_buffer_size = lamport_comm_size * 3
+
+    # we should init 3 buffers for all reduce fusion:
+    # [buffer_size, flag_size, lamport_buffer_size]
+
+    ipc_handles = list()
+    for size in [buffer_size, flag_size, lamport_buffer_size]:
+        # todo(review): confirm we need this alignment
+        # all sizes should be aligned to 1LU << 21 bytes (2MB)
+        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        # ipc_handles.append(create_shared_buffer(aligned_size, group))
+        ptr = cudart.cudaMalloc(aligned_size)
+        ipc_handles.append(ptr.value)
+        
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"

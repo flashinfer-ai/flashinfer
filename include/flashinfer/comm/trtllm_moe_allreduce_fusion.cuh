@@ -509,24 +509,76 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   return nullptr;
 }
 
+// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
+        "f"(array[6]), "f"(array[7]));
+  return val;
+#else
+  // static_assert(false, "not supported.");
+  return 0;
+#endif
+}
+
+// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
+        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+  return val;
+#else
+  // static_assert(false, "not supported.");
+  return 0;
+#endif
+}
+
 // Quantizes the provided PackedVec into the uint32_t output
-template <class Type, uint32_t VEC_SIZE, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFScaleVal,
+template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
+__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
                                          uint8_t* SFout) {
+  using T2 = vec2_dtype_t<T>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
-  auto localMax = cuda_abs(vec.elts[0]);
+  auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
 
-// Local maximum value.
 #pragma unroll
-  for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
   }
 
   // Get the absolute maximum among all 16 values (two threads).
-  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
   // Get the final absolute maximum values.
-  float vecMax = float(cuda_max(localMax.x, localMax.y));
+  float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
 
   // Get the SF (max value of the vector / max value of e2m1).
   // maximum value of e2m1 = 6.0.
@@ -562,10 +614,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<Type, VEC_SIZE>& vec, float SFSca
 
 #pragma unroll
   for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec[i]);
+    if constexpr (std::is_same_v<T, half>) {
+      fp2Vals[i] = __half22float2(get_vec2_element(vec, i));
     } else {
-      fp2Vals[i] = __bfloat1622float2(vec[i]);
+      fp2Vals[i] = __bfloat1622float2(get_vec2_element(vec, i));
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
@@ -711,130 +763,6 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
   return norm_out;
 }
 
-// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
-inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
-        "f"(array[6]), "f"(array[7]));
-  return val;
-#else
-  // static_assert(false, "not supported.");
-  return 0;
-#endif
-}
-
-// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
-inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
-        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
-  return val;
-#else
-  // static_assert(false, "not supported.");
-  return 0;
-#endif
-}
-
-// Quantizes the provided PackedVec into the uint32_t output
-template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
-                                         uint8_t* SFout) {
-  using T2 = vec2_dtype_t<T>;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Get absolute maximum values among the local 8 values.
-  auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
-
-#pragma unroll
-  for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
-  }
-
-  // Get the absolute maximum among all 16 values (two threads).
-  localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  // Get the final absolute maximum values.
-  float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
-
-  // Get the SF (max value of the vector / max value of e2m1).
-  // maximum value of e2m1 = 6.0.
-  // TODO: use half as compute data type.
-  float SFValue = SFScaleVal * (vecMax * maths::reciprocal_approximate_ftz(6.0f));
-  // 8 bits representation of the SF.
-  uint8_t fp8SFVal;
-  // Write the SF to global memory (STG.8).
-  if constexpr (UE8M0_SF) {
-    __nv_fp8_e8m0 tmp;
-    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-    SFValue = static_cast<float>(tmp);
-    fp8SFVal = tmp.__x;
-  } else {
-    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
-    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
-    fp8SFVal = tmp.__x;
-    SFValue = static_cast<float>(tmp);
-  }
-  // Get the output scale.
-  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  float outputScale = SFValue != 0 ? maths::reciprocal_approximate_ftz(
-                                         SFValue * maths::reciprocal_approximate_ftz(SFScaleVal))
-                                   : 0.0f;
-
-  if (SFout) {
-    // Write the SF to global memory (STG.8).
-    *SFout = fp8SFVal;
-  }
-
-  // Convert the input to float.
-  float2 fp2Vals[details::CVT_FP4_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<T, half>) {
-      fp2Vals[i] = __half22float2(get_vec2_element(vec, i));
-    } else {
-      fp2Vals[i] = __bfloat1622float2(get_vec2_element(vec, i));
-    }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
-  }
-
-  // Convert to e2m1 values.
-  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
-
-  // Write the e2m1 values to global memory.
-  return e2m1Vec;
-#else
-  return 0;
-#endif
-}
-
 template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
@@ -859,7 +787,7 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
     //     cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-        cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
+        utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }
 }
 
@@ -1128,7 +1056,11 @@ cudaError_t moereduction_allreduce_fusion_kernel_launcher(
   int token_num = params.size / params.hidden_dim;
   bool oneshot = use_oneshot(token_num);
   // Only support one shot
-  FLASHINFER_CHECK(oneshot, "only support one shot");
+  if (oneshot == false) {
+    FLASHINFER_LOG_WARN("expect one shot but got %d tokens, expect performance degradation",
+                        token_num);
+  }
+  // FLASHINFER_CHECK(oneshot, "only support one shot");
   // Each token is handled by one cluster
   int cluster_num = token_num;
   // Total number of threads (within one cluster) that's need to handle one token
