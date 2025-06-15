@@ -15,10 +15,8 @@ limitations under the License.
 """
 
 import functools
-import logging
 import math
-from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -31,18 +29,10 @@ from .utils import (
     _unpack_paged_kv_cache,
 )
 
-_batch_attention_modules = {}
 
-
-def get_holistic_attention_module():
-    def backend_module(*args):
-        global _batch_attention_modules
-        modules_dict = _batch_attention_modules
-        if args not in modules_dict:
-            module = gen_batch_attention_module(*args).build_and_load()
-        return module
-
-    return backend_module
+@functools.cache
+def get_holistic_attention_module(*args):
+    return gen_batch_attention_module(*args).build_and_load()
 
 
 class BatchAttention:
@@ -97,7 +87,7 @@ class BatchAttention:
             head_dim_vo,
             PosEncodingMode["NONE"].value,
         )
-        self.module = get_holistic_attention_module()(*get_module_args)
+        self.module = get_holistic_attention_module(*get_module_args)
 
         qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
