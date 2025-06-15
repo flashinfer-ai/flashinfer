@@ -16,17 +16,19 @@ limitations under the License.
 
 import ctypes
 import functools
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from flashinfer.mapping import Mapping
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import register_custom_op
 
 # NOTE(Zihao): we should use cuda-python instead of ctypes cuda runtime bindings.
@@ -231,13 +233,95 @@ class CudaRTLibrary:
 cudart = CudaRTLibrary()
 
 
+def get_mpi_include_lib_path():
+    import pathlib
+    import shlex
+    import subprocess
+
+    cmd = ["mpicc", "-show"]
+    output = subprocess.check_output(cmd, text=True)
+    # Parse the output to extract include and library paths
+    parts = shlex.split(output)
+    include_dirs = []
+    lib_dirs = []
+
+    i = 0
+    while i < len(parts):
+        if parts[i] == "-I" and i + 1 < len(parts):
+            include_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-I"):
+            include_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        elif parts[i] == "-L" and i + 1 < len(parts):
+            lib_dirs.append(pathlib.Path(parts[i + 1]))
+            i += 2
+        elif parts[i].startswith("-L"):
+            lib_dirs.append(pathlib.Path(parts[i][2:]))
+            i += 1
+        else:
+            i += 1
+
+    # Return the first include directory found, or None if none found
+    include_dir = include_dirs[0] if include_dirs else None
+
+    return include_dir, lib_dirs
+
+def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
+    dim = dim % input.ndim
+    output_shape = [
+        val if idx != dim else -1 for idx, val in enumerate(input.shape)
+    ]
+    numel_base = -math.prod(output_shape)
+    return {'output_shape': output_shape, 'numel_base': numel_base}
+
+def filter_valid_input(
+        input_list: List[torch.Tensor]
+) -> Tuple[List[torch.Tensor], List[bool]]:
+    func_valid = lambda x: x is not None
+    valid_list = list(map(func_valid, input_list))
+    input_list = list(filter(func_valid, input_list))
+    return input_list, valid_list
+
+def restore_full_output(output_list: List[torch.Tensor],
+                        valid_list: List[bool]) -> List[torch.Tensor]:
+    index_list = list(accumulate(map(int, valid_list)))
+    output_list = list(
+        map(lambda valid, index: output_list[index - 1]
+            if valid else None, valid_list, index_list))
+    return output_list
+
+
+
 def gen_comm_module() -> JitSpec:
+    mpi_include_path, mpi_lib_path = get_mpi_include_lib_path()
+    mpi_lib_path = str(mpi_lib_path[0])
+    print(mpi_include_path, mpi_lib_path)
     return gen_jit_spec(
         "comm",
         [
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_allgather.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_reducescatter.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/opUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/runtime/utils/mpiUtils.cpp",
+        ],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            mpi_include_path,
+        ],
+        extra_ldflags=[f"-L{mpi_lib_path}", "-lmpi", "-L/usr/lib/aarch64-linux-gnu/ -lnccl"],
+        extra_cuda_cflags= sm100a_nvcc_flags + [
+            "-DENABLE_MULTI_DEVICE",
+        ],
+        extra_cflags=[
+            "-DENABLE_MULTI_DEVICE",
         ],
     )
 
@@ -396,6 +480,149 @@ def get_comm_module():
             lamport_peer_comm_buffer_ptrs_2,
         )
 
+    @register_custom_op(
+        "flashinfer::all_gather",
+        mutates_args=[],
+    )
+    def all_gather(
+        input: Union[torch.Tensor, List[torch.Tensor]],
+        mapping: Mapping,
+        dim: int = -1,
+        sizes: Optional[List[int]] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if mapping.tp_size == 1:
+            return input
+
+        if sizes is not None:
+            assert len(sizes) == len(mapping.tp_group)
+            if isinstance(input, torch.Tensor):
+                assert input.shape[dim] == sizes[mapping.tp_rank]
+            else:
+                assert all([
+                    val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                    if val is not None
+                ])
+            # 'sizes' is not needed if all inputs in the same TP group have the same shape
+            for split_size in sizes[1:]:
+                if split_size != sizes[0]:
+                    break
+            else:
+                sizes = None
+
+        # Inputs are reshaped in this way to pass necessary shape information to the allgather op
+        if isinstance(input, torch.Tensor):
+            torch_op = module.trtllm_allgather
+            output_info = get_output_info(input, dim)
+            input = input.contiguous().view(-1, output_info['numel_base'])
+        else:
+            input, valid = filter_valid_input(input)
+            torch_op = module.trtllm_allgather_list
+            output_info = [get_output_info(val, dim) for val in input]
+            input = [
+                val.contiguous().view(-1, val_info['numel_base'])
+                for val, val_info in zip(input, output_info)
+            ]
+
+        output = torch_op(
+            input,
+            sizes,
+            mapping.tp_group,
+        )
+
+        def convert_output(x, x_info):
+            if dim == 0:
+                x = x.view(x_info['output_shape'])
+            else:
+                if sizes is None:
+                    x_list = x.chunk(mapping.tp_size)
+                else:
+                    x_list = x.split(sizes)
+                x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
+                            dim=dim)
+            return x
+
+        if isinstance(input, torch.Tensor):
+            output = convert_output(output, output_info)
+        else:
+            output = [
+                convert_output(val, val_info)
+                for val, val_info in zip(output, output_info)
+            ]
+            output = restore_full_output(output, valid)
+        return output
+
+    @register_custom_op(
+        "flashinfer::reduces_catter",
+        mutates_args=[],
+    )
+    def reduce_scatter(
+        input: Union[torch.Tensor, List[torch.Tensor]],
+        mapping: Mapping,
+        dim: int = -1,
+        sizes: Optional[List[int]] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if mapping.tp_size == 1:
+            return input
+
+        if sizes is not None:
+            assert len(sizes) == len(mapping.tp_group)
+            sum_split_size = sum(sizes)
+            if isinstance(input, torch.Tensor):
+                assert input.shape[dim] == sum_split_size
+            else:
+                assert all([
+                    val.shape[dim] == sum_split_size for val in input
+                    if val is not None
+                ])
+            # 'sizes' is not needed if all outputs in the same TP group have the same shape
+            for split_size in sizes[1:]:
+                if split_size != sizes[0]:
+                    break
+            else:
+                sizes = None
+
+        def convert_input(x, x_info):
+            # Inputs are reshaped in this way to pass necessary shape information to the reducescatter op
+            if dim == 0:
+                x = x.contiguous().view(-1, x_info['numel_base'])
+            else:
+                if sizes is None:
+                    x_list = x.chunk(mapping.tp_size, dim=dim)
+                else:
+                    x_list = x.split(sizes, dim=dim)
+                x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
+            return x
+
+        if isinstance(input, torch.Tensor):
+            torch_op = module.reducescatter
+            output_info = get_output_info(input, dim)
+            input = convert_input(input, output_info)
+        else:
+            input, valid = filter_valid_input(input)
+            torch_op = module.reducescatter_list
+            output_info = [get_output_info(val, dim) for val in input]
+            input = [
+                convert_input(val, val_info)
+                for val, val_info in zip(input, output_info)
+            ]
+
+        output = torch_op(
+            input,
+            sizes,
+            mapping.tp_group,
+        )
+
+        if isinstance(input, torch.Tensor):
+            output = output.view(output_info['output_shape'])
+        else:
+            output = [
+                val.view(val_info['output_shape'])
+                for val, val_info in zip(output, output_info)
+            ]
+            output = restore_full_output(output, valid)
+        return output
+
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -404,6 +631,8 @@ def get_comm_module():
         register_graph_buffers=register_graph_buffers,
         meta_size=meta_size,
         all_reduce=all_reduce,
+        all_gather=all_gather,
+        reduce_scatter=reduce_scatter,
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
@@ -722,4 +951,30 @@ def trtllm_custom_all_reduce(
         lamport_peer_comm_buffer_ptrs_0,
         lamport_peer_comm_buffer_ptrs_1,
         lamport_peer_comm_buffer_ptrs_2,
+    )
+
+def all_gather(        
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return get_comm_module().all_gather(
+        input,
+        mapping,
+        dim,
+        sizes,
+    )
+
+def reduce_scatter(        
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    return get_comm_module().reduce_scatter(
+        input,
+        mapping,
+        dim,
+        sizes,
     )
