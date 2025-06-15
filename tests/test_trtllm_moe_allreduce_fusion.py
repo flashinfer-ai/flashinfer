@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 import torch
 import torch.distributed as dist
+import numpy as np
 
 import flashinfer.comm as comm
 
@@ -44,19 +45,19 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     try:
         device = torch.device(f"cuda:{rank}")
         token_nums = [
-            1,
-            64,
+            # 1,
+            # 64,
             128,
-            256,
-            2048,
+            # 256,
+            # 2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
-        candidate_active_expert_num = [8, 12, 16]
-        # candidate_active_expert_num = [1]
+        # candidate_active_expert_num = [8, 12, 16]
+        candidate_active_expert_num = [1]
         fusion_codes = [
             MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
-            MoEAllReduceFusionType.NORM_OUT,
-            MoEAllReduceFusionType.RESIDUAL_NORM_OUT,
-            MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT,
+            # MoEAllReduceFusionType.NORM_OUT,
+            # MoEAllReduceFusionType.RESIDUAL_NORM_OUT,
+            # MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT,
         ]
         swizzled_layout_codes = [
             comm.FP4QuantizationSFLayout.LINEAR,
@@ -121,21 +122,38 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                                 # init moe params
                                 # [device_num_expert, m]
-                                moe_reduction_scale_input = torch.randn(
+                                # moe_reduction_scale_input = torch.randn(
+                                #     active_expert_num * token_num,
+                                #     dtype=torch.float32,
+                                #     device=device,
+                                # )
+
+                                # debug-only
+                                # set moe_reduction_scale_input to 1.0
+                                moe_reduction_scale_input = torch.ones(
                                     active_expert_num * token_num,
                                     dtype=torch.float32,
                                     device=device,
                                 )
+                                moe_reduction_scale_input_clone = moe_reduction_scale_input.clone()
+
                                 # [device_num_expert, m, 7168]
                                 moe_reduction_active_experts_token_input = torch.randn(
                                     active_expert_num * message_size,
                                     dtype=dtype,
                                     device=device,
                                 )
+                                moe_reduction_active_experts_token_input_clone = moe_reduction_active_experts_token_input.clone()
                                 # [m, 7168]
                                 moe_reduction_token_input = torch.randn(
                                     message_size, dtype=dtype, device=device
                                 )
+                                moe_reduction_token_input_clone = moe_reduction_token_input.clone()
+
+                                # debug-only
+                                # print first 10 elements of moe_reduction_active_experts_token_input and moe_reduction_token_input
+                                print(f"moe_reduction_active_experts_token_input: {moe_reduction_active_experts_token_input}")
+                                print(f"moe_reduction_token_input: {moe_reduction_token_input}")
 
                                 if (
                                     fusion_code
@@ -243,14 +261,16 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         f"Invalid fusion code: {fusion_code}"
                                     )
 
+                                torch.cuda.synchronize()
+
                                 # == Calculate reference output ==
                                 # 1. MoE Reduction
                                 moe_expert_out = (
-                                    moe_reduction_active_experts_token_input.view(
+                                    moe_reduction_active_experts_token_input_clone.view(
                                         active_expert_num, token_num, HIDDEN_SIZE
                                     ).to(torch.float32)
                                 )
-                                moe_scales = moe_reduction_scale_input.view(
+                                moe_scales = moe_reduction_scale_input_clone.view(
                                     active_expert_num, token_num
                                 ).to(torch.float32)
                                 moe_scales = moe_scales.unsqueeze(
@@ -266,7 +286,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 # 2. Add FC2 output
                                 moe_out_ref = reduced_expert_out.view(
                                     message_size
-                                ) + moe_reduction_token_input.to(
+                                ) + moe_reduction_token_input_clone.to(
                                     torch.float32
                                 )  # [message_size]
 
@@ -287,10 +307,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     .pow(2)
                                     .mean(dim=-1, keepdim=True)
                                 )
-                                # hidden_states = ref_residual_out * torch.rsqrt(
-                                #     variance + rms_eps
-                                # )
-                                hidden_states = ref_residual_out.to(torch.float32)
+                                hidden_states = ref_residual_out * torch.rsqrt(
+                                    variance + rms_eps
+                                )
                                 ref_norm_out = (
                                     rms_gamma.to(torch.float32) * hidden_states
                                 )
@@ -305,16 +324,29 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     fusion_code
                                     == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
                                 ):
-                                    if not torch.allclose(
-                                        residual_out.to(torch.float32),
-                                        ref_residual_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
+                                    # if not torch.allclose(
+                                    #     residual_out.to(torch.float32),
+                                    #     ref_residual_out,
+                                    #     atol=1e-2,
+                                    #     rtol=1e-2,
+                                    # ):
+                                    #     test_passed = False
+                                    #     print(f"Rank {rank} residual_out mismatch")
+                                    #     print(f"residual_out: {residual_out}")
+                                    #     print(f"ref_residual_out: {ref_residual_out}")
+                                    
+                                    # if not torch.allclose(
+                                    #     residual_out.to(torch.float32),
+                                    #     all_reduced_ref.view(token_num, HIDDEN_SIZE),
+                                    #     atol=1e-2,
+                                    #     rtol=1e-2,
+                                    # ):
+                                    if rank == 0:
+                                        all_reduced_ref = all_reduced_ref.view(token_num, HIDDEN_SIZE)
                                         test_passed = False
-                                        print(f"Rank {rank} residual_out mismatch")
-                                        print(f"residual_out: {residual_out}")
-                                        print(f"ref_residual_out: {ref_residual_out}")
+                                        print(f"Rank {rank} all_reduce_out mismatch")
+                                        print(f"all_reduce_out: {residual_out}")
+                                        print(f"ref_all_reduce_out: {all_reduced_ref}")
 
                                     # # TODO(yingyi): add support for swizzled layout
                                     # if (
@@ -477,7 +509,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     #         print(f"dequant_out: {dequant_out}")
                                     #         print(f"ref_norm_out: {ref_norm_out}")
 
-                            torch.cuda.synchronize()
                             dist.barrier(group=group)
                             if test_passed:
                                 print(
@@ -630,7 +661,10 @@ def dequantize_fp4_e2m1_tensor(quant_tensor_int32: torch.Tensor) -> torch.Tensor
 if __name__ == "__main__":
     mod = comm.get_comm_module()
     # set random seed
+    # torch.manual_seed(42)
+    np.random.seed(42)
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
     test_trtllm_moe_allreduce_fusion(2, torch.float16)
     # test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)

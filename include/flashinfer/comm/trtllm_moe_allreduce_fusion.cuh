@@ -773,7 +773,8 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
+    // residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
+    val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
   norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
@@ -994,6 +995,22 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       int offset = (params.rank * tot_access + idx) * VEC_SIZE;
       accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
+
+    if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
+      printf("Rank %d store to rank %d: ", params.rank, 0);
+      for (int i = 0; i < 1; ++i) {
+        printf("%f ", static_cast<float>(accumulator[i]));
+      }
+      printf("\n");
+    }
+
+    if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
+      printf("Rank %d store to rank %d: ", params.rank, 1);
+      for (int i = 0; i < 1; ++i) {
+        printf("%f ", static_cast<float>(accumulator[i]));
+      }
+      printf("\n");
+    }
   }
 
   // * Clear previous buffer
@@ -1019,6 +1036,22 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
+    }
+
+    // debug-only
+    if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
+      printf("Rank %d vals[%d]: ", params.rank, 1);
+      for (int i = 0; i < 1; ++i) {
+        printf("%f ", static_cast<float>(vals[1][i]));
+      }
+      printf("\n");
+    }
+    if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
+      printf("Rank %d vals[%d]: ", params.rank, 0);
+      for (int i = 0; i < 1; ++i) {
+        printf("%f ", static_cast<float>(vals[0][i]));
+      }
+      printf("\n");
     }
 
     vec_t<T, VEC_SIZE> sum_val = vals[0];
