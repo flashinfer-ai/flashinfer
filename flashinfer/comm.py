@@ -316,7 +316,7 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
             mpi_include_path,
         ],
-        extra_ldflags=[f"-L{mpi_lib_path}", "-lmpi", "-L/usr/lib/aarch64-linux-gnu/ -lnccl"],
+        extra_ldflags=["-lnccl", f"-L{mpi_lib_path}", "-lmpi"],
         extra_cuda_cflags= sm100a_nvcc_flags + [
             "-DENABLE_MULTI_DEVICE",
         ],

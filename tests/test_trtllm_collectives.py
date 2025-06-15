@@ -104,3 +104,4 @@ def test_trtllm_reduce_scatter(dtype):
     _run_reduce_scatter_worker(rank, world_size, dtype)
 
     print(f"reduce_scatter with tp = {world_size}: OK")
+
