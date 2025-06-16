@@ -17,6 +17,7 @@ limitations under the License.
 import ctypes
 import functools
 import math
+import os
 from dataclasses import dataclass
 from itertools import accumulate
 from types import SimpleNamespace
@@ -270,6 +271,40 @@ def get_mpi_include_lib_path():
     return include_dir, lib_dirs
 
 
+def get_nccl_include_lib_path():
+    import pathlib
+    import subprocess
+
+    # Try to find NCCL paths from environment variables first
+    nccl_include_path = os.environ.get("NCCL_INCLUDE_PATH")
+    nccl_lib_path = os.environ.get("NCCL_LIB_PATH")
+
+    if nccl_include_path and nccl_lib_path:
+        return nccl_include_path, [nccl_lib_path]
+
+    # Find NCCL library using find command
+    try:
+        lib_output = subprocess.check_output(
+            ["find", "/usr", "-name", "libnccl*.so"], text=True
+        ).strip()
+        if lib_output:
+            lib_path = pathlib.Path(lib_output.split("\n")[0]).parent
+            # Find corresponding include path
+            include_output = subprocess.check_output(
+                ["find", "/usr/include", "-name", "nccl.h"], text=True
+            ).strip()
+            if include_output:
+                include_path = pathlib.Path(include_output.split("\n")[0]).parent
+                return include_path, [lib_path]
+    except subprocess.CalledProcessError:
+        pass
+
+    raise RuntimeError(
+        "Could not find NCCL include or library paths. "
+        "Please set NCCL_INCLUDE_PATH and NCCL_LIB_PATH environment variables."
+    )
+
+
 def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
     dim = dim % input.ndim
     output_shape = [val if idx != dim else -1 for idx, val in enumerate(input.shape)]
@@ -302,8 +337,11 @@ def restore_full_output(
 
 def gen_comm_module() -> JitSpec:
     mpi_include_path, mpi_lib_path = get_mpi_include_lib_path()
+    nccl_include_path, nccl_lib_path = get_nccl_include_lib_path()
     mpi_lib_path = str(mpi_lib_path[0])
+    nccl_lib_path = str(nccl_lib_path[0])
     print(mpi_include_path, mpi_lib_path)
+    print(nccl_include_path, nccl_lib_path)
     return gen_jit_spec(
         "comm",
         [
@@ -322,8 +360,9 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
             mpi_include_path,
+            nccl_include_path,
         ],
-        extra_ldflags=["-lnccl", f"-L{mpi_lib_path}", "-lmpi"],
+        extra_ldflags=[f"-L{mpi_lib_path}", "-lmpi", f"-L{nccl_lib_path}", "-lnccl"],
         extra_cuda_cflags=sm100a_nvcc_flags
         + [
             "-DENABLE_MULTI_DEVICE",
