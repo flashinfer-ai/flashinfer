@@ -87,10 +87,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             scale_out = torch.empty(
                                 message_size, dtype=dtype, device=device
                             )
-                            # get the byte size of scale_out
-                            print(
-                                f"scale_out byte size: {scale_out.element_size() * scale_out.numel()}"
-                            )
                             rms_gamma = torch.randn(
                                 HIDDEN_SIZE, dtype=dtype, device=device
                             )
@@ -168,12 +164,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )  # [token_num, HIDDEN_SIZE]
 
                             # 3. All-Reduce
-                            all_reduced_ref = moe_out_ref.clone().to(dtype)
-                            dist.all_reduce(all_reduced_ref, group=group)
-                            all_reduced_ref = all_reduced_ref.to(torch.float32)
+                            all_reduce_ref = moe_out_ref.clone().to(dtype)
+                            dist.all_reduce(all_reduce_ref, group=group)
+                            all_reduce_ref = all_reduce_ref.to(torch.float32)
 
                             # 4. Fused Ops
-                            ref_residual_out = all_reduced_ref + residual_in_clone.view(
+                            ref_residual_out = all_reduce_ref + residual_in_clone.view(
                                 token_num, HIDDEN_SIZE
                             ).to(torch.float32)
 
@@ -225,25 +221,25 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             # 6.1 Check allreduce_out
                             if not torch.allclose(
                                 all_reduce_out.to(torch.float32),
-                                all_reduced_ref,
+                                all_reduce_ref,
                                 atol=tolerance,
                                 rtol=1e-2,
                             ):
                                 test_passed = False
                                 print(f"Rank {rank} allreduce_out mismatch")
                                 print(f"all_reduce_out: {all_reduce_out}")
-                                print(f"all_reduced_ref: {all_reduced_ref}")
+                                print(f"all_reduce_ref: {all_reduce_ref}")
                                 # Print max diff elements for allreduce_out
                                 max_diff = torch.max(
                                     torch.abs(
                                         all_reduce_out.to(torch.float32)
-                                        - all_reduced_ref
+                                        - all_reduce_ref
                                     )
                                 )
                                 max_diff_idx = torch.argmax(
                                     torch.abs(
                                         all_reduce_out.to(torch.float32)
-                                        - all_reduced_ref
+                                        - all_reduce_ref
                                     )
                                 )
                                 print(f"Rank {rank} allreduce_out max diff: {max_diff}")
@@ -254,11 +250,11 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     f"Rank {rank} allreduce_out value at max diff: {all_reduce_out.view(-1)[max_diff_idx]}"
                                 )
                                 print(
-                                    f"Rank {rank} allreduce_out ref value at max diff: {all_reduced_ref.view(-1)[max_diff_idx]}"
+                                    f"Rank {rank} allreduce_out ref value at max diff: {all_reduce_ref.view(-1)[max_diff_idx]}"
                                 )
                             torch.testing.assert_close(
                                 all_reduce_out.to(torch.float32),
-                                all_reduced_ref,
+                                all_reduce_ref,
                                 atol=tolerance,
                                 rtol=1e-2,
                             )
