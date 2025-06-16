@@ -52,6 +52,7 @@ from .fused_moe import cutlass_fused_moe
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
+from .moe_mapping import Mapping as MoE_Mapping
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
