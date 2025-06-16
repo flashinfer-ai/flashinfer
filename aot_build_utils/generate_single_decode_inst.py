@@ -18,7 +18,11 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import dtype_literal, pos_encoding_mode_literal
+from .literal_map import (
+    dtype_literal,
+    dtype_literal_hip,
+    pos_encoding_mode_literal,
+)
 
 
 def get_cu_file_str(
@@ -28,46 +32,88 @@ def get_cu_file_str(
     dtype_q,
     dtype_kv,
     dtype_out,
+    generate_hip,
 ):
-    content = """#include <flashinfer/attention_impl.cuh>
+    if generate_hip:
+        content = """#include <flashinfer/hip/attention_impl.hip.h>
 
-namespace flashinfer {{
+    namespace flashinfer {{
 
-using Params = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
+    using Params = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
-    /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
-    Params params,
-    {dtype_out}* tmp,
-    cudaStream_t stream);
+    template hipError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        hipStream_t stream);
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
-    /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
-    Params params,
-    {dtype_out}* tmp,
-    cudaStream_t stream);
+    template hipError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        hipStream_t stream);
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
-    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
-    Params params,
-    {dtype_out}* tmp,
-    cudaStream_t stream);
+    template hipError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        hipStream_t stream);
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
-    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
-    Params params,
-    {dtype_out}* tmp,
-    cudaStream_t stream);
+    template hipError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        hipStream_t stream);
 
-}}
-    """.format(
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-        dtype_q=dtype_literal[dtype_q],
-        dtype_kv=dtype_literal[dtype_kv],
-        dtype_out=dtype_literal[dtype_out],
-    )
+    }}
+        """.format(
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
+            dtype_q=dtype_literal_hip[dtype_q],
+            dtype_kv=dtype_literal_hip[dtype_kv],
+            dtype_out=dtype_literal_hip[dtype_out],
+        )
+    else:
+        content = """#include <flashinfer/attention_impl.cuh>
+
+    namespace flashinfer {{
+
+    using Params = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
+
+    template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        cudaStream_t stream);
+
+    template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        cudaStream_t stream);
+
+    template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        cudaStream_t stream);
+
+    template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim_qk}, {pos_encoding_mode}, DefaultAttention<
+        /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+        Params params,
+        {dtype_out}* tmp,
+        cudaStream_t stream);
+
+    }}
+        """.format(
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
+            dtype_q=dtype_literal[dtype_q],
+            dtype_kv=dtype_literal[dtype_kv],
+            dtype_out=dtype_literal[dtype_out],
+        )
     return content
 
 

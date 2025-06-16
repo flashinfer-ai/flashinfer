@@ -44,6 +44,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     enable_bf16: bool = args.enable_bf16
     enable_fp8_e4m3: bool = args.enable_fp8_e4m3
     enable_fp8_e5m2: bool = args.enable_fp8_e5m2
+    generate_hip: bool = args.generate_hip
 
     path.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +88,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                 dtype_q,
                 dtype_kv,
                 dtype_out,
+                generate_hip,
             )
             for use_sliding_window in [True, False]:
                 for use_logits_soft_cap in [True, False]:
@@ -125,6 +127,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                     dtype_kv,
                     dtype_out,
                     idtype,
+                    generate_hip,
                 )
                 for use_sliding_window in [True, False]:
                     for use_logits_soft_cap in [True, False]:
@@ -324,6 +327,15 @@ if __name__ == "__main__":
         default=True,
         nargs="?",
         help="Enable fp8_e5m2",
+    )
+    parser.add_argument(
+        "--generate_hip",
+        type=lambda x: (
+            x if isinstance(x, int) else (x.lower() == "true" or x.lower() == "on")
+        ),
+        default=False,
+        nargs="?",
+        help="Generate HIP code",
     )
     args = parser.parse_args()
     get_instantiation_cu(args)

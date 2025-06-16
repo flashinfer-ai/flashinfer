@@ -34,6 +34,14 @@ dtype_literal = {
     "e5m2": "__nv_fp8_e5m2",
 }
 
+dtype_literal_hip = {
+    "f16": "half",
+    "bf16": "hip_bfloat16",
+    "f32": "float",
+    "e4m3": "__hip_fp8_e4m3_fnuz",
+    "e5m2": "__hip_fp8_e5m2_fnuz",
+}
+
 idtype_literal = {
     "i32": "int32_t",
     "u32": "uint32_t",
