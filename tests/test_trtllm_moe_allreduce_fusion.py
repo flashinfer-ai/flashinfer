@@ -85,7 +85,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 message_size // 2, dtype=torch.uint8, device=device
                             )
                             scale_out = torch.empty(
-                                message_size // 16, dtype=torch.uint8, device=device
+                                message_size // 8, dtype=torch.uint8, device=device
                             )
                             rms_gamma = torch.randn(
                                 HIDDEN_SIZE, dtype=dtype, device=device
@@ -99,19 +99,19 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                             # init moe params
                             # [device_num_expert, m]
-                            # moe_reduction_scale_input = torch.randn(
-                            #     active_expert_num * token_num,
-                            #     dtype=torch.float32,
-                            #     device=device,
-                            # )
-
-                            # debug-only
-                            # set moe_reduction_scale_input to 1.0
-                            moe_reduction_scale_input = torch.ones(
+                            moe_reduction_scale_input = torch.randn(
                                 active_expert_num * token_num,
                                 dtype=torch.float32,
                                 device=device,
                             )
+
+                            # debug-only
+                            # set moe_reduction_scale_input to 1.0
+                            # moe_reduction_scale_input = torch.ones(
+                            #     active_expert_num * token_num,
+                            #     dtype=torch.float32,
+                            #     device=device,
+                            # )
                             moe_reduction_scale_input_clone = (
                                 moe_reduction_scale_input.clone()
                             )
@@ -132,14 +132,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             moe_reduction_token_input_clone = (
                                 moe_reduction_token_input.clone()
                             )
-
-                            # debug-only
-                            # print(
-                            #     f"moe_reduction_active_experts_token_input: {moe_reduction_active_experts_token_input}"
-                            # )
-                            # print(
-                            #     f"moe_reduction_token_input: {moe_reduction_token_input}"
-                            # )
 
                             # == Calculate reference output ==
                             # 1. MoE Reduction
@@ -258,6 +250,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} allreduce_out ref value at max diff: {all_reduced_ref.view(-1)[max_diff_idx]}"
                                 )
+                            torch.testing.assert_close(
+                                all_reduce_out.to(torch.float32),
+                                all_reduced_ref,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            )
 
                             # 6.2 Check residual_out
                             if not torch.allclose(
@@ -293,7 +291,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} residual_out ref value at max diff: {ref_residual_out.view(-1)[max_diff_idx]}"
                                 )
-
+                            torch.testing.assert_close(
+                                residual_out.to(torch.float32),
+                                ref_residual_out,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            )
                             # 6.3 Check norm_out
                             if not torch.allclose(
                                 norm_out.to(torch.float32),
@@ -322,7 +325,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} norm_out ref value at max diff: {ref_norm_out.view(-1)[max_diff_idx]}"
                                 )
-
+                            torch.testing.assert_close(
+                                norm_out.to(torch.float32),
+                                ref_norm_out,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            )
                             # 6.4 Check quant_out
                             # todo
 
@@ -377,7 +385,9 @@ def multi_process_parallel(
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_trtllm_moe_allreduce_fusion(world_size, dtype):
+    np.random.seed(42)
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
         raise ValueError(
@@ -392,87 +402,6 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
-
-
-def dequantize_fp8_e4m3_tensor(scale_tensor_uint8: torch.Tensor) -> torch.Tensor:
-    """Dequantize a tensor of FP8 E4M3 values."""
-    sign = ((scale_tensor_uint8 >> 7) & 1).float()
-    exp = ((scale_tensor_uint8 >> 3) & 0b1111).float()
-    mant = (scale_tensor_uint8 & 0b111).float()
-
-    val = torch.zeros_like(scale_tensor_uint8, dtype=torch.float32)
-
-    # Handle subnormal numbers
-    is_subnormal = exp == 0
-    # Handle normal numbers
-    is_normal = (exp > 0) & (exp < 15)
-
-    # Normal numbers (bias 7)
-    val[is_normal] = (
-        ((-1.0) ** sign[is_normal])
-        * (2.0 ** (exp[is_normal] - 7.0))
-        * (1.0 + mant[is_normal] / 8.0)
-    )
-    # Subnormal numbers (bias 7)
-    # value = (-1)^S * 2^(1-bias) * (0.M) = (-1)^S * 2^(-6) * (M/8)
-    val[is_subnormal] = (
-        ((-1.0) ** sign[is_subnormal]) * (2.0**-6.0) * (mant[is_subnormal] / 8.0)
-    )
-    # Inf/NaN cases (exp=15) will be dequantized to 0, which is a reasonable default.
-    return val
-
-
-def dequantize_fp4_e2m1_tensor(quant_tensor_int32: torch.Tensor) -> torch.Tensor:
-    """Dequantize a tensor of FP4 E2M1 values packed in int32."""
-    shape = quant_tensor_int32.shape
-    # PyTorch does not support uint32, so we use int32 and view it as uint8
-    quant_tensor_uint8 = quant_tensor_int32.view(torch.uint8)
-
-    # Unpack each uint32 into four uint8
-    unpacked_bytes = quant_tensor_uint8.view(shape[:-1] + (-1, 4))
-    b0 = unpacked_bytes[..., 0]
-    b1 = unpacked_bytes[..., 1]
-    b2 = unpacked_bytes[..., 2]
-    b3 = unpacked_bytes[..., 3]
-
-    # Unpack each uint8 into two 4-bit nibbles
-    fp4_0 = b0 & 0x0F
-    fp4_1 = b0 >> 4
-    fp4_2 = b1 & 0x0F
-    fp4_3 = b1 >> 4
-    fp4_4 = b2 & 0x0F
-    fp4_5 = b2 >> 4
-    fp4_6 = b3 & 0x0F
-    fp4_7 = b3 >> 4
-
-    # Stack and transpose to get (..., 8) shape
-    fp4_vals = torch.stack(
-        [fp4_0, fp4_1, fp4_2, fp4_3, fp4_4, fp4_5, fp4_6, fp4_7], dim=-1
-    )
-
-    sign = ((fp4_vals >> 3) & 1).float()
-    exp = ((fp4_vals >> 1) & 0b11).float()
-    mant = (fp4_vals & 0b1).float()
-
-    val = torch.zeros_like(fp4_vals, dtype=torch.float32)
-
-    is_subnormal = exp == 0
-    # The kernel comment notes a max value of 6.0, which implies that the
-    # maximum exponent (3) is used for normal numbers, not Inf/NaN.
-    is_normal = exp > 0
-
-    # Normal numbers (bias 1)
-    val[is_normal] = (
-        ((-1.0) ** sign[is_normal])
-        * (2.0 ** (exp[is_normal] - 1.0))
-        * (1.0 + mant[is_normal] / 2.0)
-    )
-
-    # Subnormal numbers (bias 1)
-    # value = (-1)^S * 2^(1-bias) * (0.M)
-    val[is_subnormal] = ((-1.0) ** sign[is_subnormal]) * (mant[is_subnormal] / 2.0)
-
-    return val.view(shape[:-1] + (-1,))
 
 
 if __name__ == "__main__":
