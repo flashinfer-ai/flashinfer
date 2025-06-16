@@ -788,6 +788,15 @@ std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_fl
   return result;
 }
 
+inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+                                int num_qo_tiles, int group_size) {
+  if (qo_tile_idx + 1 == num_qo_tiles) {
+    return kv_len;
+  }
+  int kv_len_init = kv_len - qo_len;  // right aligned
+  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
+}
+
 struct PrefillPlanSM90Info {
   int64_t qo_tile_indices_offset;
   int64_t qo_indptr_offset;
@@ -986,15 +995,6 @@ inline cudaError_t PrefillSM90Plan(
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
-}
-
-inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
-                                int num_qo_tiles, int group_size) {
-  if (qo_tile_idx + 1 == num_qo_tiles) {
-    return kv_len;
-  }
-  int kv_len_init = kv_len - qo_len;  // right aligned
-  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
 }
 
 template <uint32_t NUM_TASKS>
