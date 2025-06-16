@@ -474,7 +474,7 @@ template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                        int colIdx, std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
-                                                       FP4QuantizationSFLayout layout) {
+                                                       FP4QuantizationSFLayout layout, int range) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
@@ -489,6 +489,9 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
       int32_t mIdx = rowIdx;
 
       auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+      if (SFOffset > range) {
+        printf(" swizzled SFOffset: %ld\n", SFOffset);
+      }
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else if (layout == FP4QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
@@ -500,6 +503,9 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
       int64_t BTileStride = numRows.value_or(0) * mTileStride;
 
       int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      if (SFOffset > range) {
+        printf(" linear SFOffset: %ld\n", SFOffset);
+      }
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else {
       return nullptr;
@@ -565,7 +571,6 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
 template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
                                          uint8_t* SFout) {
-  using T2 = vec2_dtype_t<T>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
@@ -785,13 +790,12 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
   if constexpr (QuantOut) {
-    // todo(yingyi): enable quant after having vec_t utils? - T2 is pack of 2 T
-    // vec_t<T2, VEC_SIZE / 2> pack_val;
-    // auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-    //     std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
-    //     params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
-    // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-    //     utils::cvt_warp_fp16_to_fp4<T2, VEC_SIZE / 2>(pack_val, params.scale_factor, sf_out);
+    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+        std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
+        params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout,
+        params.size * sizeof(T));
+    reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
+        utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }
 }
 
