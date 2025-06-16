@@ -1115,34 +1115,74 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
   FLASHINFER_CHECK(params.hidden_dim * sizeof(T) % details::kBytesPerAccess == 0,
                    "hidden_dim * sizeof(T) must be a multiple of kBytesPerAccess");
+  FLASHINFER_CHECK(
+      params.allreduce_out || params.residual_out || params.norm_out || params.quant_out,
+      "at least one of allreduce_out, residual_out, norm_out, quant_out must be set");
 
-#define DISPATCH_MOEREDUCTION_KERNEL(T, PARAMS, LAUNCH_WITH_PDL, AR, RES, RMS, QUANT)   \
-  do {                                                                                  \
-    switch ((PARAMS).nranks) {                                                          \
-      case 2:                                                                           \
-        FLASHINFER_CUDA_CALL(                                                           \
-            (moereduction_allreduce_fusion_kernel_launcher<T, 2, AR, RES, RMS, QUANT>(  \
-                (PARAMS), (LAUNCH_WITH_PDL))));                                         \
-        break;                                                                          \
-      case 4:                                                                           \
-        FLASHINFER_CUDA_CALL(                                                           \
-            (moereduction_allreduce_fusion_kernel_launcher<T, 4, AR, RES, RMS, QUANT>(  \
-                (PARAMS), (LAUNCH_WITH_PDL))));                                         \
-        break;                                                                          \
-      case 8:                                                                           \
-        FLASHINFER_CUDA_CALL(                                                           \
-            (moereduction_allreduce_fusion_kernel_launcher<T, 8, AR, RES, RMS, QUANT>(  \
-                (PARAMS), (LAUNCH_WITH_PDL))));                                         \
-        break;                                                                          \
-      case 16:                                                                          \
-        FLASHINFER_CUDA_CALL(                                                           \
-            (moereduction_allreduce_fusion_kernel_launcher<T, 16, AR, RES, RMS, QUANT>( \
-                (PARAMS), (LAUNCH_WITH_PDL))));                                         \
-        break;                                                                          \
-      default:                                                                          \
-        FLASHINFER_CHECK(false, "Unsupported nranks");                                  \
-    }                                                                                   \
-    return cudaSuccess;                                                                 \
+#define DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, AR, RES, RMS, QUANT) \
+  do {                                                                                      \
+    switch ((PARAMS).nranks) {                                                              \
+      case 2:                                                                               \
+        FLASHINFER_CUDA_CALL(                                                               \
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, AR, RES, RMS, QUANT>(      \
+                (PARAMS), (LAUNCH_WITH_PDL))));                                             \
+        break;                                                                              \
+      case 4:                                                                               \
+        FLASHINFER_CUDA_CALL(                                                               \
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, AR, RES, RMS, QUANT>(      \
+                (PARAMS), (LAUNCH_WITH_PDL))));                                             \
+        break;                                                                              \
+      case 8:                                                                               \
+        FLASHINFER_CUDA_CALL(                                                               \
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, AR, RES, RMS, QUANT>(      \
+                (PARAMS), (LAUNCH_WITH_PDL))));                                             \
+        break;                                                                              \
+      case 16:                                                                              \
+        FLASHINFER_CUDA_CALL(                                                               \
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, AR, RES, RMS, QUANT>(     \
+                (PARAMS), (LAUNCH_WITH_PDL))));                                             \
+        break;                                                                              \
+      default:                                                                              \
+        FLASHINFER_CHECK(false, "Unsupported nranks");                                      \
+    }                                                                                       \
+    return cudaSuccess;                                                                     \
+  } while (0)
+
+#define DISPATCH_MOEREDUCTION_PATTERN(T, PARAMS, LAUNCH_WITH_PDL)                                \
+  do {                                                                                           \
+    bool AR = (PARAMS).allreduce_out;                                                            \
+    bool RES = (PARAMS).residual_out;                                                            \
+    bool NORM = (PARAMS).norm_out;                                                               \
+    bool QUANT = (PARAMS).quant_out;                                                             \
+                                                                                                 \
+    if (AR && RES && !NORM && QUANT) {                                                           \
+      /* AR + Residual + Quant */                                                                \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, true, true, false, true);   \
+    } else if (!AR && RES && !NORM && QUANT) {                                                   \
+      /* Residual + Quant */                                                                     \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, false, true, false, true);  \
+    } else if (AR && !RES && NORM && !QUANT) {                                                   \
+      /* AR + RMS */                                                                             \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, true, false, true, false);  \
+    } else if (!AR && !RES && NORM && !QUANT) {                                                  \
+      /* RMS only */                                                                             \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, false, false, true, false); \
+    } else if (AR && RES && NORM && !QUANT) {                                                    \
+      /* AR + Add + RMS */                                                                       \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, true, true, true, false);   \
+    } else if (!AR && RES && NORM && !QUANT) {                                                   \
+      /* Add + RMS */                                                                            \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, false, true, true, false);  \
+    } else if (AR && RES && NORM && QUANT) {                                                     \
+      /* AR + Add + RMS + Quant */                                                               \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, true, true, true, true);    \
+    } else if (!AR && RES && NORM && QUANT) {                                                    \
+      /* Add + RMS + Quant */                                                                    \
+      DISPATCH_MOEREDUCTION_KERNEL_RANKS(T, PARAMS, LAUNCH_WITH_PDL, false, true, true, true);   \
+    } else {                                                                                     \
+      FLASHINFER_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");                  \
+      return cudaErrorNotSupported;                                                              \
+    }                                                                                            \
   } while (0)
 
   // hidden_dim (d) = 7168 for dpsk moe, and hence 128 tokens as one-shot threshold
@@ -1163,32 +1203,7 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
   // [m, d] bf16 allreduce_in, [m, d] bf16 residual_in
   // [m, d] bf16 residual_out, [m, d] bf16 norm_out, [m, d] fp4 quant_out
 
-  if (params.allreduce_out && params.residual_out && !params.norm_out && params.quant_out) {
-    // AR + Residual + Quant
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, true, true, false, true);
-  } else if (!params.allreduce_out && params.residual_out && !params.norm_out && params.quant_out) {
-    // Residual + Quant
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, false, true, false, true);
-  } else if (params.allreduce_out && !params.residual_out && params.norm_out && !params.quant_out) {
-    // AR + RMS
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, true, false, true, false);
-  } else if (!params.allreduce_out && !params.residual_out && params.norm_out &&
-             !params.quant_out) {
-    // RMS only
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, false, false, true, false);
-  } else if (params.allreduce_out && params.residual_out && params.norm_out && !params.quant_out) {
-    // AR + Add + RMS
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, true, true, true, false);
-  } else if (!params.allreduce_out && params.residual_out && params.norm_out && !params.quant_out) {
-    // Add + RMS
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, false, true, true, false);
-  } else if (params.allreduce_out && params.residual_out && params.norm_out && params.quant_out) {
-    // AR + Add + RMS + Quant
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, true, true, true, true);
-  } else if (!params.allreduce_out && params.residual_out && params.norm_out && params.quant_out) {
-    // Add + RMS + Quant
-    DISPATCH_MOEREDUCTION_KERNEL(T, params, launch_with_pdl, false, true, true, true);
-  }
+  DISPATCH_MOEREDUCTION_PATTERN(T, params, launch_with_pdl);
 
   FLASHINFER_CHECK(false, "allreduce_fusion_kernel: unsupported pattern!");
   return cudaErrorNotSupported;
