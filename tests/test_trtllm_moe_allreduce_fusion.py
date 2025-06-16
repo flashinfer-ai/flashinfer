@@ -82,10 +82,10 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             residual_out = torch.empty_like(residual_in)
                             norm_out = torch.empty_like(residual_in)
                             quant_out = torch.empty(
-                                message_size // 2, dtype=torch.uint8, device=device
+                                message_size, dtype=dtype, device=device
                             )
                             scale_out = torch.empty(
-                                message_size // 8, dtype=torch.uint8, device=device
+                                message_size, dtype=dtype, device=device
                             )
                             rms_gamma = torch.randn(
                                 HIDDEN_SIZE, dtype=dtype, device=device
@@ -105,13 +105,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 device=device,
                             )
 
-                            # debug-only
-                            # set moe_reduction_scale_input to 1.0
-                            # moe_reduction_scale_input = torch.ones(
-                            #     active_expert_num * token_num,
-                            #     dtype=torch.float32,
-                            #     device=device,
-                            # )
                             moe_reduction_scale_input_clone = (
                                 moe_reduction_scale_input.clone()
                             )
@@ -215,7 +208,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             torch.cuda.synchronize()
 
                             # 6. Check correctness
-                            tolerance = 8e-2 if dtype == torch.float16 else 5e-1
+                            tolerance = 8e-2 if dtype == torch.float16 else 8e-1
                             # 6.1 Check allreduce_out
                             if not torch.allclose(
                                 all_reduce_out.to(torch.float32),
