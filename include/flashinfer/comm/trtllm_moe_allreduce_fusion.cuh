@@ -768,7 +768,6 @@ template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, type
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
   if constexpr (AllReduceOut) {
-    // printf("Rank %d store to allreduce_out: ", params.rank);
     val.store(reinterpret_cast<T*>(params.allreduce_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> residual_val;
@@ -786,13 +785,13 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
   if constexpr (QuantOut) {
-    // auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+    // todo(yingyi): enable quant after having vec_t utils? - T2 is pack of 2 T
+    // vec_t<T2, VEC_SIZE / 2> pack_val;
+    // auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
     //     std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
     //     params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
-    // // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-    // //     cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
     // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-    //     utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
+    //     utils::cvt_warp_fp16_to_fp4<T2, VEC_SIZE / 2>(pack_val, params.scale_factor, sf_out);
   }
 }
 

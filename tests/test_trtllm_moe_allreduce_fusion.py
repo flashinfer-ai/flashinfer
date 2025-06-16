@@ -395,17 +395,3 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
-
-
-if __name__ == "__main__":
-    mod = comm.get_comm_module()
-    # set random seed
-    # torch.manual_seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    test_trtllm_moe_allreduce_fusion(2, torch.float16)
-    test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)
-    test_trtllm_moe_allreduce_fusion(4, torch.float16)
-    test_trtllm_moe_allreduce_fusion(4, torch.bfloat16)
