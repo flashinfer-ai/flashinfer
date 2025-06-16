@@ -2,32 +2,21 @@ import multiprocessing as mp
 import socket
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-import numpy as np
 
 import flashinfer.comm as comm
 
-# todo(Yingyi): add warmup stes for benchmark
+# todo(Yingyi): add benchmark and quant test
 
-# Usage: test var, temp
+# Usage: test var
 kOneShotMaxTokenNum = 128
 MAX_TOKEN_NUM = 2048
-# MAX_TOKEN_NUM = kOneShotMaxTokenNum
-# HIDDEN_SIZE = 7168
-HIDDEN_SIZE = 16  # debug-only
+HIDDEN_SIZE = 7168
 MAX_EXPERT_NUM = 16
-SCALE_FACTOR_RANGE = (-5, 5)
-
-
-# Usage: The fusion type code is used to indicate the test type only
-# for trtllm_moe_allreduce_fusion, pass required tensor and skip the rest as None to indicate the fusion type
-class MoEAllReduceFusionType:
-    RESIDUAL_QUANT_OUT = 0
-    NORM_OUT = 1
-    RESIDUAL_NORM_OUT = 2
-    RESIDUAL_NORM_QUANT_OUT = 3
+SCALE_FACTOR_RANGE = (-1, 1)
 
 
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
@@ -45,20 +34,14 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     try:
         device = torch.device(f"cuda:{rank}")
         token_nums = [
-            # 1,
-            # 64,
+            1,
+            64,
             128,
-            # 256,
-            # 2048,
+            256,
+            2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
         # candidate_active_expert_num = [8, 12, 16]
-        candidate_active_expert_num = [1]
-        fusion_codes = [
-            MoEAllReduceFusionType.RESIDUAL_QUANT_OUT,
-            # MoEAllReduceFusionType.NORM_OUT,
-            # MoEAllReduceFusionType.RESIDUAL_NORM_OUT,
-            # MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT,
-        ]
+        candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
             comm.FP4QuantizationSFLayout.LINEAR,
             comm.FP4QuantizationSFLayout.SWIZZLED,
@@ -72,452 +55,286 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             )
         )
 
-        # ipc_handles, workspace_tensor = (
-        #     comm.trtllm_create_ipc_workspace_for_all_reduce_fusion_debug(
-        #         rank, world_size, MAX_TOKEN_NUM, HIDDEN_SIZE, group=group
-        #     )
-        # )
-
         test_loop = 1  # make it 5 after debug
 
         for token_num in token_nums:
             for active_expert_num in candidate_active_expert_num:
-                for fusion_code in fusion_codes:
-                    for swizzled_layout_code in swizzled_layout_codes:
-                        for launch_with_pdl in launch_with_pdls:
-                            test_passed = True
-                            # print(
-                            #     f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
+                for swizzled_layout_code in swizzled_layout_codes:
+                    for launch_with_pdl in launch_with_pdls:
+                        dist.barrier(group=group)
+                        test_passed = True
+                        print(
+                            f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
+                        )
+                        dist.barrier(group=group)
+                        torch.cuda.synchronize()
+                        for _ in range(test_loop):
+                            message_size = token_num * HIDDEN_SIZE
+
+                            residual_in = torch.randn(
+                                message_size, dtype=dtype, device=device
+                            )
+                            residual_in_clone = residual_in.clone()
+
+                            all_reduce_out = torch.zeros(
+                                message_size, dtype=dtype, device=device
+                            )
+                            residual_out = torch.empty_like(residual_in)
+                            norm_out = torch.empty_like(residual_in)
+                            quant_out = torch.empty(
+                                message_size // 2, dtype=torch.uint8, device=device
+                            )
+                            scale_out = torch.empty(
+                                message_size // 16, dtype=torch.uint8, device=device
+                            )
+                            rms_gamma = torch.randn(
+                                HIDDEN_SIZE, dtype=dtype, device=device
+                            )
+                            scale_factor = (
+                                torch.rand(1, dtype=torch.float32, device=device)
+                                * (SCALE_FACTOR_RANGE[1] - SCALE_FACTOR_RANGE[0])
+                                + SCALE_FACTOR_RANGE[0]
+                            )
+                            rms_eps = 1e-3
+
+                            # init moe params
+                            # [device_num_expert, m]
+                            # moe_reduction_scale_input = torch.randn(
+                            #     active_expert_num * token_num,
+                            #     dtype=torch.float32,
+                            #     device=device,
                             # )
-                            dist.barrier(group=group)
-                            torch.cuda.synchronize()
-                            for _ in range(test_loop):
-                                message_size = token_num * HIDDEN_SIZE
 
-                                inp1 = torch.randn(
-                                    message_size, dtype=dtype, device=device
-                                )
+                            # debug-only
+                            # set moe_reduction_scale_input to 1.0
+                            moe_reduction_scale_input = torch.ones(
+                                active_expert_num * token_num,
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            moe_reduction_scale_input_clone = (
+                                moe_reduction_scale_input.clone()
+                            )
 
-                                # init params for each fusion op
-                                residual_in = torch.randn(
-                                    message_size, dtype=dtype, device=device
-                                )
-                                residual_out = torch.empty_like(residual_in)
-                                norm_out = torch.empty_like(residual_in)
-                                quant_out = torch.empty(
-                                    message_size // 2, dtype=torch.uint8, device=device
-                                )
-                                scale_out = torch.empty(
-                                    message_size // 16, dtype=torch.uint8, device=device
-                                )
-                                rms_gamma = torch.randn(
-                                    HIDDEN_SIZE, dtype=dtype, device=device
-                                )
-                                scale_factor = (
-                                    torch.rand(1, dtype=torch.float32, device=device)
-                                    * (SCALE_FACTOR_RANGE[1] - SCALE_FACTOR_RANGE[0])
-                                    + SCALE_FACTOR_RANGE[0]
-                                )
-                                rms_eps = 1e-3
+                            # [device_num_expert, m, 7168]
+                            moe_reduction_active_experts_token_input = torch.randn(
+                                active_expert_num * message_size,
+                                dtype=dtype,
+                                device=device,
+                            )
+                            moe_reduction_active_experts_token_input_clone = (
+                                moe_reduction_active_experts_token_input.clone()
+                            )
+                            # [m, 7168]
+                            moe_reduction_token_input = torch.randn(
+                                message_size, dtype=dtype, device=device
+                            )
+                            moe_reduction_token_input_clone = (
+                                moe_reduction_token_input.clone()
+                            )
 
-                                # init moe params
-                                # [device_num_expert, m]
-                                # moe_reduction_scale_input = torch.randn(
-                                #     active_expert_num * token_num,
-                                #     dtype=torch.float32,
-                                #     device=device,
-                                # )
+                            # debug-only
+                            # print(
+                            #     f"moe_reduction_active_experts_token_input: {moe_reduction_active_experts_token_input}"
+                            # )
+                            # print(
+                            #     f"moe_reduction_token_input: {moe_reduction_token_input}"
+                            # )
 
-                                # debug-only
-                                # set moe_reduction_scale_input to 1.0
-                                moe_reduction_scale_input = torch.ones(
-                                    active_expert_num * token_num,
-                                    dtype=torch.float32,
-                                    device=device,
-                                )
-                                moe_reduction_scale_input_clone = moe_reduction_scale_input.clone()
-
-                                # [device_num_expert, m, 7168]
-                                moe_reduction_active_experts_token_input = torch.randn(
-                                    active_expert_num * message_size,
-                                    dtype=dtype,
-                                    device=device,
-                                )
-                                moe_reduction_active_experts_token_input_clone = moe_reduction_active_experts_token_input.clone()
-                                # [m, 7168]
-                                moe_reduction_token_input = torch.randn(
-                                    message_size, dtype=dtype, device=device
-                                )
-                                moe_reduction_token_input_clone = moe_reduction_token_input.clone()
-
-                                # debug-only
-                                # print first 10 elements of moe_reduction_active_experts_token_input and moe_reduction_token_input
-                                print(f"moe_reduction_active_experts_token_input: {moe_reduction_active_experts_token_input}")
-                                print(f"moe_reduction_token_input: {moe_reduction_token_input}")
-
-                                if (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
-                                ):
-                                    comm.trtllm_moe_allreduce_fusion(
-                                        inp=inp1,
-                                        world_size=world_size,
-                                        world_rank=rank,
-                                        token_num=token_num,
-                                        hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptrs=workspace_tensor,
-                                        launch_with_pdl=launch_with_pdl,
-                                        residual_in=residual_in,
-                                        rms_gamma=rms_gamma,
-                                        rms_eps=rms_eps,
-                                        scale_factor=scale_factor,
-                                        moe_reduction_device_num_experts=active_expert_num,
-                                        moe_reduction_scale_input=moe_reduction_scale_input,
-                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
-                                        moe_reduction_token_input=moe_reduction_token_input,
-                                        layout_code=swizzled_layout_code,
-                                        residual_out=residual_out,
-                                        norm_out=None,
-                                        quant_out=quant_out,
-                                        scale_out=scale_out,
-                                    )
-                                elif fusion_code == MoEAllReduceFusionType.NORM_OUT:
-                                    comm.trtllm_moe_allreduce_fusion(
-                                        inp=inp1,
-                                        world_size=world_size,
-                                        world_rank=rank,
-                                        token_num=token_num,
-                                        hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptrs=workspace_tensor,
-                                        launch_with_pdl=launch_with_pdl,
-                                        residual_in=residual_in,
-                                        rms_gamma=rms_gamma,
-                                        rms_eps=rms_eps,
-                                        scale_factor=scale_factor,
-                                        moe_reduction_device_num_experts=active_expert_num,
-                                        moe_reduction_scale_input=moe_reduction_scale_input,
-                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
-                                        moe_reduction_token_input=moe_reduction_token_input,
-                                        layout_code=swizzled_layout_code,
-                                        residual_out=None,
-                                        norm_out=norm_out,
-                                        quant_out=None,
-                                        scale_out=None,
-                                    )
-                                elif (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_NORM_OUT
-                                ):
-                                    comm.trtllm_moe_allreduce_fusion(
-                                        inp=inp1,
-                                        world_size=world_size,
-                                        world_rank=rank,
-                                        token_num=token_num,
-                                        hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptrs=workspace_tensor,
-                                        launch_with_pdl=launch_with_pdl,
-                                        residual_in=residual_in,
-                                        rms_gamma=rms_gamma,
-                                        rms_eps=rms_eps,
-                                        scale_factor=scale_factor,
-                                        moe_reduction_device_num_experts=active_expert_num,
-                                        moe_reduction_scale_input=moe_reduction_scale_input,
-                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
-                                        moe_reduction_token_input=moe_reduction_token_input,
-                                        layout_code=swizzled_layout_code,
-                                        residual_out=residual_out,
-                                        norm_out=norm_out,
-                                        quant_out=None,
-                                        scale_out=None,
-                                    )
-                                elif (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT
-                                ):
-                                    comm.trtllm_moe_allreduce_fusion(
-                                        inp=inp1,
-                                        world_size=world_size,
-                                        world_rank=rank,
-                                        token_num=token_num,
-                                        hidden_dim=HIDDEN_SIZE,
-                                        workspace_ptrs=workspace_tensor,
-                                        launch_with_pdl=launch_with_pdl,
-                                        residual_in=residual_in,
-                                        rms_gamma=rms_gamma,
-                                        rms_eps=rms_eps,
-                                        scale_factor=scale_factor,
-                                        moe_reduction_device_num_experts=active_expert_num,
-                                        moe_reduction_scale_input=moe_reduction_scale_input,
-                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
-                                        moe_reduction_token_input=moe_reduction_token_input,
-                                        layout_code=swizzled_layout_code,
-                                        residual_out=residual_out,
-                                        norm_out=norm_out,
-                                        quant_out=quant_out,
-                                        scale_out=scale_out,
-                                    )
-                                else:
-                                    raise ValueError(
-                                        f"Invalid fusion code: {fusion_code}"
-                                    )
-
-                                torch.cuda.synchronize()
-
-                                # == Calculate reference output ==
-                                # 1. MoE Reduction
-                                moe_expert_out = (
-                                    moe_reduction_active_experts_token_input_clone.view(
-                                        active_expert_num, token_num, HIDDEN_SIZE
-                                    ).to(torch.float32)
-                                )
-                                moe_scales = moe_reduction_scale_input_clone.view(
-                                    active_expert_num, token_num
+                            # == Calculate reference output ==
+                            # 1. MoE Reduction
+                            moe_expert_out = (
+                                moe_reduction_active_experts_token_input_clone.view(
+                                    active_expert_num, token_num, HIDDEN_SIZE
                                 ).to(torch.float32)
-                                moe_scales = moe_scales.unsqueeze(
-                                    2
-                                )  # [active_expert_num, token_num, 1]
-                                scaled_expert_out = moe_expert_out * moe_scales.to(
-                                    torch.float32
-                                )  # [active_expert_num, token_num, HIDDEN_SIZE]
-                                reduced_expert_out = torch.sum(
-                                    scaled_expert_out, dim=0
-                                )  # [token_num, HIDDEN_SIZE]
+                            )
+                            moe_scales = moe_reduction_scale_input_clone.view(
+                                active_expert_num, token_num
+                            ).to(torch.float32)
+                            moe_scales = moe_scales.unsqueeze(
+                                2
+                            )  # [active_expert_num, token_num, 1]
+                            scaled_expert_out = moe_expert_out * moe_scales.to(
+                                torch.float32
+                            )  # [active_expert_num, token_num, HIDDEN_SIZE]
+                            reduced_expert_out = torch.sum(
+                                scaled_expert_out, dim=0
+                            )  # [token_num, HIDDEN_SIZE]
 
-                                # 2. Add FC2 output
-                                moe_out_ref = reduced_expert_out.view(
-                                    message_size
-                                ) + moe_reduction_token_input_clone.to(
-                                    torch.float32
-                                )  # [message_size]
-
-                                # 3. All-Reduce
-                                all_reduced_ref = moe_out_ref.clone().to(dtype)
-                                dist.all_reduce(all_reduced_ref, group=group)
-                                all_reduced_ref = all_reduced_ref.to(torch.float32)
-
-                                # 4. Fused Ops
-                                ref_residual_out = all_reduced_ref.view(
+                            # 2. Add FC2 output
+                            moe_out_ref = (
+                                reduced_expert_out
+                                + moe_reduction_token_input_clone.view(
                                     token_num, HIDDEN_SIZE
-                                ) + residual_in.view(token_num, HIDDEN_SIZE).to(
-                                    torch.float32
+                                ).to(torch.float32)
+                            )  # [token_num, HIDDEN_SIZE]
+
+                            # 3. All-Reduce
+                            all_reduced_ref = moe_out_ref.clone().to(dtype)
+                            dist.all_reduce(all_reduced_ref, group=group)
+                            all_reduced_ref = all_reduced_ref.to(torch.float32)
+
+                            # 4. Fused Ops
+                            ref_residual_out = all_reduced_ref + residual_in_clone.view(
+                                token_num, HIDDEN_SIZE
+                            ).to(torch.float32)
+
+                            variance = (
+                                ref_residual_out.to(torch.float32)
+                                .pow(2)
+                                .mean(dim=-1, keepdim=True)
+                            )
+                            hidden_states = ref_residual_out * torch.rsqrt(
+                                variance + rms_eps
+                            )
+                            ref_norm_out = rms_gamma.to(torch.float32) * hidden_states
+
+                            # 5. Run kernel
+                            torch.cuda.synchronize()
+
+                            comm.trtllm_moe_allreduce_fusion(
+                                world_size=world_size,
+                                world_rank=rank,
+                                token_num=token_num,
+                                hidden_dim=HIDDEN_SIZE,
+                                workspace_ptrs=workspace_tensor,
+                                launch_with_pdl=launch_with_pdl,
+                                residual_in=residual_in,
+                                rms_gamma=rms_gamma,
+                                rms_eps=rms_eps,
+                                scale_factor=scale_factor,
+                                moe_reduction_device_num_experts=active_expert_num,
+                                moe_reduction_scale_input=moe_reduction_scale_input,
+                                moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+                                moe_reduction_token_input=moe_reduction_token_input,
+                                layout_code=swizzled_layout_code,
+                                allreduce_out=all_reduce_out,
+                                residual_out=residual_out,
+                                norm_out=norm_out,
+                                quant_out=quant_out,
+                                scale_out=scale_out,
+                            )
+
+                            # match shape
+                            all_reduce_out = all_reduce_out.view(token_num, HIDDEN_SIZE)
+                            residual_out = residual_out.view(token_num, HIDDEN_SIZE)
+                            norm_out = norm_out.view(token_num, HIDDEN_SIZE)
+
+                            torch.cuda.synchronize()
+
+                            # 6. Check correctness
+                            tolerance = 1e-2 if dtype == torch.float16 else 1e-1
+                            # 6.1 Check allreduce_out
+                            if not torch.allclose(
+                                all_reduce_out.to(torch.float32),
+                                all_reduced_ref,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            ):
+                                test_passed = False
+                                print(f"Rank {rank} allreduce_out mismatch")
+                                print(f"all_reduce_out: {all_reduce_out}")
+                                print(f"all_reduced_ref: {all_reduced_ref}")
+                                # Print max diff elements for allreduce_out
+                                max_diff = torch.max(
+                                    torch.abs(
+                                        all_reduce_out.to(torch.float32)
+                                        - all_reduced_ref
+                                    )
                                 )
-
-                                variance = (
-                                    ref_residual_out.to(torch.float32)
-                                    .pow(2)
-                                    .mean(dim=-1, keepdim=True)
+                                max_diff_idx = torch.argmax(
+                                    torch.abs(
+                                        all_reduce_out.to(torch.float32)
+                                        - all_reduced_ref
+                                    )
                                 )
-                                hidden_states = ref_residual_out * torch.rsqrt(
-                                    variance + rms_eps
-                                )
-                                ref_norm_out = (
-                                    rms_gamma.to(torch.float32) * hidden_states
-                                )
-
-                                # 5. Check correctness
-                                # match shape
-                                residual_out = residual_out.view(token_num, HIDDEN_SIZE)
-                                norm_out = norm_out.view(token_num, HIDDEN_SIZE)
-
-                                # fusion code 0: residual+quant
-                                if (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_QUANT_OUT
-                                ):
-                                    # if not torch.allclose(
-                                    #     residual_out.to(torch.float32),
-                                    #     ref_residual_out,
-                                    #     atol=1e-2,
-                                    #     rtol=1e-2,
-                                    # ):
-                                    #     test_passed = False
-                                    #     print(f"Rank {rank} residual_out mismatch")
-                                    #     print(f"residual_out: {residual_out}")
-                                    #     print(f"ref_residual_out: {ref_residual_out}")
-                                    
-                                    # if not torch.allclose(
-                                    #     residual_out.to(torch.float32),
-                                    #     all_reduced_ref.view(token_num, HIDDEN_SIZE),
-                                    #     atol=1e-2,
-                                    #     rtol=1e-2,
-                                    # ):
-                                    if rank == 0:
-                                        all_reduced_ref = all_reduced_ref.view(token_num, HIDDEN_SIZE)
-                                        test_passed = False
-                                        print(f"Rank {rank} all_reduce_out mismatch")
-                                        print(f"all_reduce_out: {residual_out}")
-                                        print(f"ref_all_reduce_out: {all_reduced_ref}")
-
-                                    # # TODO(yingyi): add support for swizzled layout
-                                    # if (
-                                    #     swizzled_layout_code
-                                    #     == comm.FP4QuantizationSFLayout.LINEAR
-                                    # ):
-                                    #     num_scales = token_num * HIDDEN_SIZE // 16
-                                    #     dequant_scales = dequantize_fp8_e4m3_tensor(
-                                    #         scale_out[:num_scales]
-                                    #     )
-                                    #     dequant_data = dequantize_fp4_e2m1_tensor(
-                                    #         quant_out.view(torch.int32)[
-                                    #             : num_scales * 2
-                                    #         ]
-                                    #     )
-                                    #     dequant_out = (
-                                    #         dequant_data.view(token_num, HIDDEN_SIZE)
-                                    #         * dequant_scales.view(
-                                    #             token_num, -1
-                                    #         ).repeat_interleave(16, dim=1)
-                                    #         / scale_factor.item()
-                                    #     )
-                                    #     if not torch.allclose(
-                                    #         dequant_out,
-                                    #         ref_norm_out,
-                                    #         atol=1e-2,
-                                    #         rtol=1e-2,
-                                    #     ):
-                                    #         print(
-                                    #             f"Rank {rank}: Quantization check mismatch"
-                                    #         )
-                                    #         print(f"dequant_out: {dequant_out}")
-                                    #         print(f"ref_norm_out: {ref_norm_out}")
-
-                                # fusion code 1: norm
-                                elif fusion_code == MoEAllReduceFusionType.NORM_OUT:
-                                    if not torch.allclose(
-                                        norm_out.to(torch.float32),
-                                        ref_norm_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
-                                        test_passed = False
-                                        print(f"Rank {rank} norm_out mismatch")
-                                        print(f"norm_out: {norm_out}")
-                                        print(f"ref_norm_out: {ref_norm_out}")
-
-                                    # # TODO(yingyi): add support for swizzled layout
-                                    # if (
-                                    #     swizzled_layout_code
-                                    #     == comm.FP4QuantizationSFLayout.LINEAR
-                                    # ):
-                                    #     num_scales = token_num * HIDDEN_SIZE // 16
-                                    #     dequant_scales = dequantize_fp8_e4m3_tensor(
-                                    #         scale_out[:num_scales]
-                                    #     )
-                                    #     dequant_data = dequantize_fp4_e2m1_tensor(
-                                    #         quant_out.view(torch.int32)[
-                                    #             : num_scales * 2
-                                    #         ]
-                                    #     )
-                                    #     dequant_out = (
-                                    #         dequant_data.view(token_num, HIDDEN_SIZE)
-                                    #         * dequant_scales.view(
-                                    #             token_num, -1
-                                    #         ).repeat_interleave(16, dim=1)
-                                    #         / scale_factor.item()
-                                    #     )
-                                    #     if not torch.allclose(
-                                    #         dequant_out,
-                                    #         ref_norm_out,
-                                    #         atol=1e-2,
-                                    #         rtol=1e-2,
-                                    #     ):
-                                    #         print(f"Rank {rank}: Quantization check mismatch")
-                                    #         print(f"dequant_out: {dequant_out}")
-                                    #         print(f"ref_norm_out: {ref_norm_out}")
-
-                                # fusion code 2: residual+norm
-                                elif (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_NORM_OUT
-                                ):
-                                    if not torch.allclose(
-                                        residual_out.to(torch.float32),
-                                        ref_residual_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
-                                        test_passed = False
-                                        print(f"Rank {rank} residual_out mismatch")
-                                        print(f"residual_out: {residual_out}")
-                                        print(f"ref_residual_out: {ref_residual_out}")
-
-                                    if not torch.allclose(
-                                        norm_out.to(torch.float32),
-                                        ref_norm_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
-                                        test_passed = False
-                                        print(f"Rank {rank} norm_out mismatch")
-                                # fusion code 3: residual+norm+quant
-                                elif (
-                                    fusion_code
-                                    == MoEAllReduceFusionType.RESIDUAL_NORM_QUANT_OUT
-                                ):
-                                    if not torch.allclose(
-                                        residual_out.to(torch.float32),
-                                        ref_residual_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
-                                        test_passed = False
-                                        print(f"Rank {rank} residual_out mismatch")
-                                        print(f"residual_out: {residual_out}")
-                                        print(f"ref_residual_out: {ref_residual_out}")
-
-                                    if not torch.allclose(
-                                        norm_out.to(torch.float32),
-                                        ref_norm_out,
-                                        atol=1e-2,
-                                        rtol=1e-2,
-                                    ):
-                                        test_passed = False
-                                        print(f"Rank {rank} norm_out mismatch")
-                                        print(f"norm_out: {norm_out}")
-                                        print(f"ref_norm_out: {ref_norm_out}")
-
-                                    # # TODO(yingyi): add support for swizzled layout
-                                    # if (
-                                    #     swizzled_layout_code
-                                    #     == comm.FP4QuantizationSFLayout.LINEAR
-                                    # ):
-                                    #     num_scales = token_num * HIDDEN_SIZE // 16
-                                    #     dequant_scales = dequantize_fp8_e4m3_tensor(
-                                    #         scale_out[:num_scales]
-                                    #     )
-                                    #     dequant_data = dequantize_fp4_e2m1_tensor(
-                                    #         quant_out.view(torch.int32)[
-                                    #             : num_scales * 2
-                                    #         ]
-                                    #     )
-                                    #     dequant_out = (
-                                    #         dequant_data.view(token_num, HIDDEN_SIZE)
-                                    #         * dequant_scales.view(
-                                    #             token_num, -1
-                                    #         ).repeat_interleave(16, dim=1)
-                                    #         / scale_factor.item()
-                                    #     )
-                                    #     if not torch.allclose(
-                                    #         dequant_out,
-                                    #         ref_norm_out,
-                                    #         atol=1e-2,
-                                    #         rtol=1e-2,
-                                    #     ):
-                                    #         print(
-                                    #             f"Rank {rank}: Quantization check mismatch"
-                                    #         )
-                                    #         print(f"dequant_out: {dequant_out}")
-                                    #         print(f"ref_norm_out: {ref_norm_out}")
-
-                            dist.barrier(group=group)
-                            if test_passed:
+                                print(f"Rank {rank} allreduce_out max diff: {max_diff}")
                                 print(
-                                    f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
+                                    f"Rank {rank} allreduce_out max diff idx: {max_diff_idx}"
                                 )
-                            else:
                                 print(
-                                    f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-fusion{fusion_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
+                                    f"Rank {rank} allreduce_out value at max diff: {all_reduce_out.view(-1)[max_diff_idx]}"
                                 )
+                                print(
+                                    f"Rank {rank} allreduce_out ref value at max diff: {all_reduced_ref.view(-1)[max_diff_idx]}"
+                                )
+
+                            # 6.2 Check residual_out
+                            if not torch.allclose(
+                                residual_out.to(torch.float32),
+                                ref_residual_out,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            ):
+                                test_passed = False
+                                print(f"Rank {rank} residual_out mismatch")
+                                print(f"residual_out: {residual_out}")
+                                print(f"ref_residual_out: {ref_residual_out}")
+                                # Print max diff elements for residual_out
+                                max_diff = torch.max(
+                                    torch.abs(
+                                        residual_out.to(torch.float32)
+                                        - ref_residual_out
+                                    )
+                                )
+                                max_diff_idx = torch.argmax(
+                                    torch.abs(
+                                        residual_out.to(torch.float32)
+                                        - ref_residual_out
+                                    )
+                                )
+                                print(f"Rank {rank} residual_out max diff: {max_diff}")
+                                print(
+                                    f"Rank {rank} residual_out max diff idx: {max_diff_idx}"
+                                )
+                                print(
+                                    f"Rank {rank} residual_out value at max diff: {residual_out.view(-1)[max_diff_idx]}"
+                                )
+                                print(
+                                    f"Rank {rank} residual_out ref value at max diff: {ref_residual_out.view(-1)[max_diff_idx]}"
+                                )
+
+                            # 6.3 Check norm_out
+                            if not torch.allclose(
+                                norm_out.to(torch.float32),
+                                ref_norm_out,
+                                atol=tolerance,
+                                rtol=1e-2,
+                            ):
+                                test_passed = False
+                                print(f"Rank {rank} norm_out mismatch")
+                                print(f"norm_out: {norm_out}")
+                                print(f"ref_norm_out: {ref_norm_out}")
+                                # Print max diff elements for norm_out
+                                max_diff = torch.max(
+                                    torch.abs(norm_out.to(torch.float32) - ref_norm_out)
+                                )
+                                max_diff_idx = torch.argmax(
+                                    torch.abs(norm_out.to(torch.float32) - ref_norm_out)
+                                )
+                                print(f"Rank {rank} norm_out max diff: {max_diff}")
+                                print(
+                                    f"Rank {rank} norm_out max diff idx: {max_diff_idx}"
+                                )
+                                print(
+                                    f"Rank {rank} norm_out value at max diff: {norm_out.view(-1)[max_diff_idx]}"
+                                )
+                                print(
+                                    f"Rank {rank} norm_out ref value at max diff: {ref_norm_out.view(-1)[max_diff_idx]}"
+                                )
+
+                            # 6.4 Check quant_out
+                            # todo
+
+                        dist.barrier(group=group)
+                        if test_passed:
+                            print(
+                                f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
+                            )
+                        else:
+                            print(
+                                f"test RANK {rank}: token{token_num}-expert{active_expert_num}-tp{world_size}-{dtype}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
+                            )
     finally:
         dist.barrier(group=group)
 
@@ -667,6 +484,6 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(42)
 
     test_trtllm_moe_allreduce_fusion(2, torch.float16)
-    # test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)
-    # test_trtllm_moe_allreduce_fusion(4, torch.float16)
-    # test_trtllm_moe_allreduce_fusion(4, torch.bfloat16)
+    test_trtllm_moe_allreduce_fusion(2, torch.bfloat16)
+    test_trtllm_moe_allreduce_fusion(4, torch.float16)
+    test_trtllm_moe_allreduce_fusion(4, torch.bfloat16)

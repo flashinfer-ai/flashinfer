@@ -418,7 +418,6 @@ def get_comm_module():
     @register_custom_op(
         "flashinfer::trtllm_moe_allreduce_fusion",
         mutates_args=[
-            "inp",
             "out",
             "tp_size",
             "tp_rank",
@@ -435,6 +434,7 @@ def get_comm_module():
             "moe_reduction_active_experts_token_input",
             "moe_reduction_token_input",
             "layout_code",
+            "allreduce_out",
             "residual_out",
             "norm_out",
             "quant_out",
@@ -442,7 +442,6 @@ def get_comm_module():
         ],
     )
     def trtllm_moe_allreduce_fusion(
-        inp: torch.Tensor,
         world_size: int,
         world_rank: int,
         token_num: int,
@@ -458,13 +457,13 @@ def get_comm_module():
         moe_reduction_active_experts_token_input: torch.Tensor,
         moe_reduction_token_input: torch.Tensor,
         layout_code: Optional[FP4QuantizationSFLayout],
+        allreduce_out: Optional[torch.Tensor],
         residual_out: Optional[torch.Tensor],
         norm_out: Optional[torch.Tensor],
         quant_out: Optional[torch.Tensor],
         scale_out: Optional[torch.Tensor],
     ) -> None:
         module.trtllm_moe_allreduce_fusion(
-            inp,
             world_size,
             world_rank,
             token_num,
@@ -480,6 +479,7 @@ def get_comm_module():
             moe_reduction_active_experts_token_input,
             moe_reduction_token_input,
             layout_code,
+            allreduce_out,
             residual_out,
             norm_out,
             quant_out,
@@ -785,6 +785,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     return ipc_handles, workspace_tensor
 
+
 def trtllm_create_ipc_workspace_for_all_reduce_fusion_debug(
     tp_rank: int,
     tp_size: int,
@@ -827,7 +828,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion_debug(
         # ipc_handles.append(create_shared_buffer(aligned_size, group))
         ptr = cudart.cudaMalloc(aligned_size)
         ipc_handles.append(ptr.value)
-        
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
@@ -961,7 +961,6 @@ def trtllm_custom_all_reduce(
 
 
 def trtllm_moe_allreduce_fusion(
-    inp: torch.Tensor,
     world_size: int,
     world_rank: int,
     token_num: int,
@@ -977,30 +976,31 @@ def trtllm_moe_allreduce_fusion(
     moe_reduction_active_experts_token_input: torch.Tensor,
     moe_reduction_token_input: torch.Tensor,
     layout_code: Optional[FP4QuantizationSFLayout],
+    allreduce_out: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
     norm_out: Optional[torch.Tensor],
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
 ) -> None:
     get_comm_module().trtllm_moe_allreduce_fusion(
-        inp,
-        world_size,
-        world_rank,
-        token_num,
-        hidden_dim,
-        workspace_ptrs,
-        launch_with_pdl,
-        residual_in,
-        rms_gamma,
-        rms_eps,
-        scale_factor,
-        moe_reduction_device_num_experts,
-        moe_reduction_scale_input,
-        moe_reduction_active_experts_token_input,
-        moe_reduction_token_input,
-        layout_code,
-        residual_out,
-        norm_out,
-        quant_out,
-        scale_out,
+        world_size=world_size,
+        world_rank=world_rank,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=workspace_ptrs,
+        launch_with_pdl=launch_with_pdl,
+        residual_in=residual_in,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        scale_factor=scale_factor,
+        moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+        moe_reduction_scale_input=moe_reduction_scale_input,
+        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+        moe_reduction_token_input=moe_reduction_token_input,
+        layout_code=layout_code,
+        allreduce_out=allreduce_out,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
     )

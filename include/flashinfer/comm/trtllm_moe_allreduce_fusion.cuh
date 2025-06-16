@@ -642,7 +642,7 @@ struct AllReduceFusionParams {
   int size;
   int hidden_dim;
   void** workspace;
-  void* allreduce_in;
+  void* allreduce_out;
   void* residual_in;
   void* residual_out;
   void* norm_out;
@@ -763,9 +763,14 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
   return norm_out;
 }
 
-template <bool ResidualOut, bool NormOut, bool QuantOut, typename T, uint32_t VEC_SIZE>
+template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, typename T,
+          uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
+  if constexpr (AllReduceOut) {
+    // printf("Rank %d store to allreduce_out: ", params.rank);
+    val.store(reinterpret_cast<T*>(params.allreduce_out) + access_id * VEC_SIZE);
+  }
   vec_t<T, VEC_SIZE> residual_val;
   residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
 
@@ -773,23 +778,22 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    // residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
-    val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
+    residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
   norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
-  if constexpr (QuantOut) {
-    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-        std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
-        params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
-    // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-    //     cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
-    reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-        utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
-  }
+  // if constexpr (QuantOut) {
+  //   auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+  //       std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
+  //       params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+  //   // reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
+  //   //     cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
+  //   reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
+  //       utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
+  // }
 }
 
 template <typename T>
@@ -892,7 +896,7 @@ bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken;
 //                  * MoE Reduction Fusion *                   //
 /////////////////////////////////////////////////////////////////
 
-template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+template <typename T, int NRanks, bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut>
 __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     MoeReductionAllReduceFusionParams<T> params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -996,21 +1000,22 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       accumulator.store(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
 
-    if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
-      printf("Rank %d store to rank %d: ", params.rank, 0);
-      for (int i = 0; i < 1; ++i) {
-        printf("%f ", static_cast<float>(accumulator[i]));
-      }
-      printf("\n");
-    }
-
-    if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
-      printf("Rank %d store to rank %d: ", params.rank, 1);
-      for (int i = 0; i < 1; ++i) {
-        printf("%f ", static_cast<float>(accumulator[i]));
-      }
-      printf("\n");
-    }
+    // debug-only
+    // if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
+    //   printf("Rank %d store to rank %d: ", params.rank, 0);
+    //   for (int i = 0; i < 1; ++i) {
+    //     printf("%f ", static_cast<float>(accumulator[i]));
+    //   }
+    //   printf("\n");
+    // }
+    // if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
+    //   printf("Rank %d store to rank %d: ", params.rank, 1);
+    //   for (int i = 0; i < 1; ++i) {
+    //     printf("%f ", static_cast<float>(accumulator[i]));
+    //   }
+    //   printf("\n");
+    // }
+    // debug-only
   }
 
   // * Clear previous buffer
@@ -1039,20 +1044,21 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // debug-only
-    if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
-      printf("Rank %d vals[%d]: ", params.rank, 1);
-      for (int i = 0; i < 1; ++i) {
-        printf("%f ", static_cast<float>(vals[1][i]));
-      }
-      printf("\n");
-    }
-    if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
-      printf("Rank %d vals[%d]: ", params.rank, 0);
-      for (int i = 0; i < 1; ++i) {
-        printf("%f ", static_cast<float>(vals[0][i]));
-      }
-      printf("\n");
-    }
+    // if (thread_offset_within_token == 0 && params.rank == 0 && token_id == 0) {
+    //   printf("Rank %d vals from rank 1: ", params.rank);
+    //   for (int i = 0; i < 1; ++i) {
+    //     printf("%f ", static_cast<float>(vals[1][i]));
+    //   }
+    //   printf("\n");
+    // }
+    // if (thread_offset_within_token == 0 && params.rank == 1 && token_id == 0) {
+    //   printf("Rank %d vals from rank 0: ", params.rank);
+    //   for (int i = 0; i < 1; ++i) {
+    //     printf("%f ", static_cast<float>(vals[0][i]));
+    //   }
+    //   printf("\n");
+    // }
+    // debug-only
 
     vec_t<T, VEC_SIZE> sum_val = vals[0];
 #pragma unroll
@@ -1061,8 +1067,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // * Fuse
-    fused_op<ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx, access_id_in_token,
-                                                          params);
+    fused_op<AllReduceOut, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
+                                                                        access_id_in_token, params);
   }
   comm.update(params.size * NRanks);
   cudaTriggerProgrammaticLaunchCompletion();
@@ -1073,25 +1079,27 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #endif
 }
 
-template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+template <typename T, int NRanks, bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut>
 cudaError_t launch_oneshot_moereduce_lamport(MoeReductionAllReduceFusionParams<T> const& params,
                                              cudaLaunchConfig_t& cfg) {
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
       &cfg,
-      moereduce_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut, QuantOut>,
+      moereduce_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, AllReduceOut, ResidualOut,
+                                                        NormOut, QuantOut>,
       params));
   return cudaSuccess;
 }
 
-template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+template <typename T, int NRanks, bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut>
 cudaError_t moereduction_allreduce_fusion_kernel_launcher(
     MoeReductionAllReduceFusionParams<T> const& params, bool launch_with_pdl) {
   int token_num = params.size / params.hidden_dim;
   bool oneshot = use_oneshot(token_num);
-  // Only support one shot
+  // todo(yingyi): support token_num > oneshot max token in another kernel
   if (oneshot == false) {
     FLASHINFER_LOG_WARN("expect one shot but got %d tokens, expect performance degradation",
                         token_num);
+    oneshot = true;
   }
   // FLASHINFER_CHECK(oneshot, "only support one shot");
   // Each token is handled by one cluster
@@ -1127,7 +1135,8 @@ cudaError_t moereduction_allreduce_fusion_kernel_launcher(
   cfg.numAttrs = 2;
   if (oneshot) {
     FLASHINFER_CUDA_CALL(
-        (launch_oneshot_moereduce_lamport<T, NRanks, ResidualOut, NormOut, QuantOut>(params, cfg)));
+        (launch_oneshot_moereduce_lamport<T, NRanks, AllReduceOut, ResidualOut, NormOut, QuantOut>(
+            params, cfg)));
   }
   return cudaSuccess;
 }
@@ -1148,67 +1157,162 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
     // pattern1: AR+Add_RMS+Quant
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-    if (params.nranks == 2) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, false, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 4) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, false, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 8) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, false, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 16) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, false, true>(
-          params, launch_with_pdl)));
+    if (params.allreduce_out) {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, false, true>(
+                params, launch_with_pdl)));
+      }
+    } else {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, false, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, false, true>(
+                params, launch_with_pdl)));
+      }
     }
     return cudaSuccess;
   } else if (not params.residual_out && params.norm_out && not params.quant_out) {
     // pattern2: AR+AddRMS
     // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
     // [m, 7168] bf16 norm_out
-    if (params.nranks == 2) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 4) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 8) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 16) {
-      FLASHINFER_CUDA_CALL(
-          (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, false>(
-              params, launch_with_pdl)));
+    if (params.allreduce_out) {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, true, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, true, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, true, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, true, false, true, false>(
+                params, launch_with_pdl)));
+      }
+    } else {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, false, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, false, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, false, false, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, false, true, false>(
+                params, launch_with_pdl)));
+      }
     }
     return cudaSuccess;
   } else if (params.residual_out && params.norm_out && not params.quant_out) {
-    if (params.nranks == 2) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 4) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 8) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, false>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 16) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, false>(
-          params, launch_with_pdl)));
+    if (params.allreduce_out) {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true, false>(
+                params, launch_with_pdl)));
+      }
+    } else {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, true, false>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, true, false>(
+                params, launch_with_pdl)));
+      }
     }
     return cudaSuccess;
   } else if (params.residual_out && params.norm_out && params.quant_out) {
-    if (params.nranks == 2) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 4) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 8) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true>(
-          params, launch_with_pdl)));
-    } else if (params.nranks == 16) {
-      FLASHINFER_CUDA_CALL((moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true>(
-          params, launch_with_pdl)));
+    if (params.allreduce_out) {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, true, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, true, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, true, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, true, true, true, true>(
+                params, launch_with_pdl)));
+      }
+    } else {
+      if (params.nranks == 2) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 2, false, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 4) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 4, false, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 8) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 8, false, true, true, true>(
+                params, launch_with_pdl)));
+      } else if (params.nranks == 16) {
+        FLASHINFER_CUDA_CALL(
+            (moereduction_allreduce_fusion_kernel_launcher<T, 16, false, true, true, true>(
+                params, launch_with_pdl)));
+      }
     }
     return cudaSuccess;
   }
@@ -1216,5 +1320,4 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
   return cudaErrorNotSupported;
 }
 }  // namespace trtllm_moe_allreduce_fusion
-
 }  // namespace flashinfer
