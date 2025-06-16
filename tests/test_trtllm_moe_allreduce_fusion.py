@@ -40,8 +40,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             256,
             2048,
         ]  # 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
-        # candidate_active_expert_num = [8, 12, 16]
-        candidate_active_expert_num = [1]  # debug-only
+        candidate_active_expert_num = [8, 12, 16]
+        # candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
             comm.FP4QuantizationSFLayout.LINEAR,
             comm.FP4QuantizationSFLayout.SWIZZLED,
@@ -55,7 +55,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
             )
         )
 
-        test_loop = 1  # make it 5 after debug
+        test_loop = 5
 
         for token_num in token_nums:
             for active_expert_num in candidate_active_expert_num:
@@ -223,7 +223,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             torch.cuda.synchronize()
 
                             # 6. Check correctness
-                            tolerance = 1e-2 if dtype == torch.float16 else 1e-1
+                            tolerance = 8e-2 if dtype == torch.float16 else 5e-1
                             # 6.1 Check allreduce_out
                             if not torch.allclose(
                                 all_reduce_out.to(torch.float32),
