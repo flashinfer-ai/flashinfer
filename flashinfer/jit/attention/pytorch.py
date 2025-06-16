@@ -387,6 +387,26 @@ def get_batch_prefill_uri(
     )
 
 
+def get_batch_attention_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+) -> str:
+    return (
+        f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}"
+    )
+
+
 def gen_single_decode_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -828,6 +848,49 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+    )
+
+
+def gen_batch_attention_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+):
+    uri = get_batch_attention_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+    )
+    additional_tensor_names = []
+    additional_tensor_dtypes = []
+    additional_scalar_names = []
+    additional_scalar_dtypes = []
+    variant_name = f"StandardAttention"
+    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+
+    return gen_customize_batch_attention_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
     )
 
 
@@ -1420,6 +1483,93 @@ def trtllm_fmha_gen_module():
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
+    )
+
+
+def gen_customize_batch_attention_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+):
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+    }
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    (additional_params_decl, additional_func_params, additional_params_setter) = (
+        generate_additional_params(
+            additional_tensor_names,
+            additional_tensor_dtypes,
+            additional_scalar_names,
+            additional_scalar_dtypes,
+        )
+    )
+
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
+    ) as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "batch_attention_paged_kernel_inst.jinja"
+    ) as f:
+        paged_kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs |= {
+        "additional_params_decl": additional_params_decl,
+        "additional_func_params": additional_func_params,
+        "additional_params_setter": additional_params_setter,
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+    for mask_mode in [0, 1, 2, 3]:
+        dest_path = gen_directory / f"batch_attention_paged_kernel_mask_{mask_mode}.cu"
+        source_paths.append(dest_path)
+        source = paged_kernel_inst_templ.render(
+            mask_mode=mask_mode_literal[mask_mode],
+            **kwargs,
+        )
+        write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_attention.cu",
+        "batch_attention_jit_pybind.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "batch_attention_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+    return gen_jit_spec(
+        uri,
+        source_paths,
     )
 
 

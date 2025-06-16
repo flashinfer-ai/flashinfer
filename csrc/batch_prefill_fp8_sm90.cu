@@ -28,7 +28,8 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
+cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                      cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -70,7 +71,9 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
                                           at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
                                           std::optional<at::Tensor> maybe_lse,
                                           int64_t mask_mode_code, int64_t layout,
-                                          int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+                                          int64_t window_left,
+                                          bool enable_pdl  // placeholder
+                                              ADDITIONAL_FUNC_PARAMS) {
   return;  // TODO: Implement this function
 }
 
@@ -79,7 +82,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
     at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -171,7 +174,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           cudaError_t status =
               BatchFP8PrefillWithPagedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                        AttentionVariant>(params, stream);
+                                                        AttentionVariant>(params, enable_pdl,
+                                                                          stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));

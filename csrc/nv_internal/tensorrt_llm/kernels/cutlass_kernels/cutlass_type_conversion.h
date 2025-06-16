@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -26,6 +25,7 @@
 #include "cutlass/float8.h"
 #include "cutlass/float_subbyte.h"
 #include "cutlass/half.h"
+#include "tensorrt_llm/common/NvInferRuntime.h"
 
 namespace tensorrt_llm {
 namespace kernels {

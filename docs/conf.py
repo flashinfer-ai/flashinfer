@@ -22,7 +22,7 @@ autodoc_mock_imports = [
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = f"2023-2024, {author}"
+copyright = f"2023-2025, {author}"
 
 package_version = (root / "version.txt").read_text().strip()
 version = package_version

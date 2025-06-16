@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from functools import cache
+import functools
 from typing import Any, Tuple
 
 import torch
@@ -23,8 +23,6 @@ from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
 from .utils import register_custom_op, register_fake_op
-
-_quantization_module = None
 
 
 def gen_quantization_module() -> JitSpec:
@@ -37,19 +35,9 @@ def gen_quantization_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_quantization_module():
-    global _quantization_module
-    if _quantization_module is None:
-        _quantization_module = gen_quantization_module().build_and_load()
-    return _quantization_module
-
-
-@cache
-def get_module_attr(attr: str) -> Any:
-    global _quantization_module
-    if _quantization_module is None:
-        get_quantization_module()
-    return getattr(_quantization_module, attr).default
+    return gen_quantization_module().build_and_load()
 
 
 @register_custom_op("flashinfer::packbits", mutates_args=())
@@ -57,7 +45,7 @@ def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
     device = x.device
     x = x.to(torch.bool)
     y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
-    get_module_attr("packbits")(x, bitorder, y)
+    get_quantization_module().packbits(x, bitorder, y)
     return y
 
 
@@ -156,5 +144,5 @@ def segment_packbits(
     indptr = indptr.to(torch.int32)
     indptr_new = indptr_new.to(torch.int32)
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-    get_module_attr("segment_packbits")(x, indptr, indptr_new, bitorder, y)
+    get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
     return y, indptr_new

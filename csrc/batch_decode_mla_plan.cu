@@ -13,7 +13,10 @@ at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
                                               at::Tensor page_locked_int_workspace_buffer,
                                               at::Tensor indptr, int64_t batch_size,
                                               int64_t num_qo_heads, int64_t page_size,
-                                              bool enable_cuda_graph, int64_t cuda_stream) {
+                                              bool enable_cuda_graph) {
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =

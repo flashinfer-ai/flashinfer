@@ -321,6 +321,18 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
   }
 }
 
+#define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
+  {                                                    \
+    _Pragma("unroll 1") for (; (COND1); (iter) -= 1) { \
+      constexpr bool WITH_MASK = true;                 \
+      __VA_ARGS__                                      \
+    }                                                  \
+    _Pragma("unroll 1") for (; (COND2); (iter) -= 1) { \
+      constexpr bool WITH_MASK = false;                \
+      __VA_ARGS__                                      \
+    }                                                  \
+  }
+
 /*!
  * \brief Return x - y if x > y, otherwise return 0.
  */

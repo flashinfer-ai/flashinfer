@@ -24,6 +24,7 @@ from . import env as env
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import cudnn_fmha_gen_module as cudnn_fmha_gen_module
+from .attention import gen_batch_attention_module as gen_batch_attention_module
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
@@ -52,6 +53,7 @@ from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_sampling_tvm_binding as gen_sampling_tvm_binding
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
+from .attention import get_batch_attention_uri as get_batch_attention_uri
 from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
 from .attention import get_batch_mla_uri as get_batch_mla_uri

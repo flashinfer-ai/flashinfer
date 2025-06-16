@@ -88,6 +88,10 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
   int k_stride_h = k.stride(1);
   int v_stride_n = v.stride(0);
   int v_stride_h = v.stride(1);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(qo_segment_offsets.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
   DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, [&] {
     using cutlass_type_in = cutlass_dtype_t<DTypeIn>;
     using cutlass_type_out = cutlass_dtype_t<DTypeOut>;
@@ -111,7 +115,7 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
         maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
         mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
         q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len,
-        total_kv_len, max_qo_len);
+        total_kv_len, max_qo_len, stream);
     TORCH_CHECK(status == cudaSuccess, "Cutlass FMHA forward pass failed",
                 cudaGetErrorString(status));
 
