@@ -67,7 +67,7 @@ static std::once_flag init_cudnn_cubin_flag;
 constexpr size_t DIMS_QKV = 4;
 constexpr int32_t BYTES_PER_ELEMENT = 2;
 
-enum KernelType { PREFILL, DECODE };
+enum KernelType { PREFILL, PREFILL_DEEPSEEK, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
@@ -75,6 +75,10 @@ void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
                                "5709edd1d6d3c5fcce6ff0ee435e44c4406d5b5474a219bb4aaf9f3b4ab83ba8");
+
+  cubin_map[PREFILL_DEEPSEEK] =
+      getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d192_bf16",
+               "44a7bde6999113f67ef34689d2b91b4c5f247c68d9daa0b6ef86166588592676");
 }
 
 auto get_cudnn_cubin(KernelType kernel_type) -> std::string {
@@ -277,56 +281,6 @@ static void create_packed_tma_desc_prefill(int b, int32_t* actual_seq_lens_q_dat
   }
 }
 
-static void create_packed_tma_desc_decode(int b, int64_t d, int64_t h_qo,
-                                          uint32_t* tensor_traversal_stride_qkv,
-                                          tma::cudaTmaDesc* packed_tma_desc_q,
-                                          tma::cudaTmaDesc* packed_tma_desc_o,
-                                          tma::cudaTmaDesc* packed_tma_desc_partial_o, at::Tensor q,
-                                          at::Tensor out,
-                                          // int64_t* batch_offset_array,
-                                          uint32_t split_factor, int8_t* partial_o_dev) {
-  int64_t batch_offset_qo = 0;
-  const uint32_t actual_s_q = 1;
-
-  constexpr unsigned int TILE_M_1 = 128;
-
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_q = {64, TILE_M_1, 1, 1};
-  std::array<uint32_t, DIMS_QKV> packed_tensor_size_qo = {d, actual_s_q, h_qo, 1};
-  std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_qo = {h_qo * d * BYTES_PER_ELEMENT,
-                                                                d * BYTES_PER_ELEMENT, 0};
-
-  // std::array<uint32_t, DIMS_QKV>     packed_tensor_size_partial_o   = {d, split_factor, h_qo, 1};
-  // std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_partial_o = {h_qo * d * sizeof(float),
-  //   h_qo * d *sizeof(float), d * sizeof(float) };
-  // std::array<uint32_t, DIMS_QKV> packed_tensor_box_size_partial_o   = {32, 1, 1, 1};
-
-  for (int i = 0; i < b; ++i) {
-    // batch_offset_qo = batch_offset_array ? batch_offset_array[i] : batch_offset_qo;
-    uint16_t* q_ptr = reinterpret_cast<uint16_t*>(q.data_ptr() + batch_offset_qo);
-    uint16_t* out_ptr = reinterpret_cast<uint16_t*>(out.data_ptr() + batch_offset_qo);
-    float* partial_out_ptr =
-        reinterpret_cast<float*>(partial_o_dev + (batch_offset_qo * sizeof(float)));
-
-    tma::cudaSetTmaTileDescriptor(
-        &packed_tma_desc_q[i], q_ptr, DIMS_QKV, packed_tensor_size_qo.data(),
-        packed_tensor_stride_qo.data(), tensor_traversal_stride_qkv, tensor_box_size_q.data(),
-        tma::cudaTmaDescFormat::BF16_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
-
-    tma::cudaSetTmaTileDescriptor(
-        &packed_tma_desc_o[i], out_ptr, DIMS_QKV, packed_tensor_size_qo.data(),
-        packed_tensor_stride_qo.data(), tensor_traversal_stride_qkv, tensor_box_size_q.data(),
-        tma::cudaTmaDescFormat::BF16_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
-
-    // tma::cudaSetTmaTileDescriptor(
-    //     &packed_tma_desc_partial_o[i], partial_out_ptr, DIMS_QKV,
-    //     packed_tensor_size_partial_o.data(), packed_tensor_stride_partial_o.data(),
-    //     tensor_traversal_stride_qkv, packed_tensor_box_size_partial_o.data(),
-    //     tma::cudaTmaDescFormat::F32_RN, tma::cudaTmaDescSwizzle::SWIZZLE_128B);
-
-    batch_offset_qo += static_cast<uint64_t>(actual_s_q) * d * h_qo;
-  }
-}
-
 void setup_prefill(CUfunction* hfunc) {
   // Use cu++filt to get the kernel name
   std::string kernel_name =
@@ -397,11 +351,11 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
   }
 };
 
-void prefill(int64_t b, int64_t s_qo, at::Tensor q, at::Tensor k_cache, at::Tensor v_cache,
-             double scale, at::Tensor workspace_buffer, at::Tensor actual_seq_lens_q,
-             at::Tensor actual_seq_lens_kv, at::Tensor actual_seq_lens_q_gpu,
-             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, bool causal,
-             bool return_lse, at::Tensor out, at::Tensor lse,
+void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor k_cache,
+             at::Tensor v_cache, double scale, at::Tensor workspace_buffer,
+             at::Tensor actual_seq_lens_q, at::Tensor actual_seq_lens_kv,
+             at::Tensor actual_seq_lens_q_gpu, at::Tensor actual_seq_lens_kv_gpu,
+             at::Tensor block_tables, bool causal, bool return_lse, at::Tensor out, at::Tensor lse,
              std::optional<at::Tensor> batch_offset_array, bool use_cuda_graph) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr int64_t TILE_M_1 = 128;
@@ -684,322 +638,6 @@ int32_t get_kernel_id(int32_t q_heads_per_kv) {
     kernel_id = 4;
   }
   return kernel_id;
-}
-
-void decode_2(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
-              at::Tensor workspace_buffer, at::Tensor actual_seq_lens_kv,
-              at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, int64_t num_pages_per_seq,
-              at::Tensor out, std::optional<at::Tensor> batch_offset_array, bool use_cuda_graph) {
-  constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
-  constexpr size_t REDUCTION_MEM_SIZE = 128 * 1024;
-  constexpr int64_t TILE_N_1 = 128;
-
-  constexpr int32_t NUM_THREADS = 384;
-
-  int64_t* batch_offset_array_data = nullptr;
-  if (batch_offset_array.has_value()) {
-    batch_offset_array_data = batch_offset_array.value().data_ptr<int64_t>();
-  }
-
-  auto device = q.device();
-
-  const CUstream stream = at::cuda::getCurrentCUDAStream(device.index());
-
-  // Step 1: Setup the kernel pointer
-
-  constexpr int NUM_DECODE_KERNELS = 5;
-  static CUfunction hfunc_decode[NUM_DECODE_KERNELS] = {nullptr, nullptr, nullptr, nullptr,
-                                                        nullptr};
-  static CUfunction lean_attn_reduction{nullptr};
-
-  static uint32_t sm_count = 0;
-
-  if (hfunc_decode[0] == nullptr) {
-    setup_decode(hfunc_decode, &lean_attn_reduction);
-
-    for (int i = 0; i < NUM_DECODE_KERNELS; i++) {
-      if (hfunc_decode[i] != nullptr) {
-        cuErrCheck(cuFuncSetAttribute(hfunc_decode[i],
-                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_SIZE));
-        cuErrCheck(cuFuncSetAttribute(hfunc_decode[i],
-                                      CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
-        cuErrCheck(cuFuncSetAttribute(hfunc_decode[i],
-                                      CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
-      }
-    }
-    if (lean_attn_reduction != nullptr) {
-      cuErrCheck(cuFuncSetAttribute(lean_attn_reduction,
-                                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                    REDUCTION_MEM_SIZE));
-      cuErrCheck(cuFuncSetAttribute(lean_attn_reduction,
-                                    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
-      cuErrCheck(cuFuncSetAttribute(lean_attn_reduction,
-                                    CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
-    }
-
-    // Get number of SMs perf GPU
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    sm_count = prop.multiProcessorCount;
-  }
-
-  // Step 2: Extract attention descriptor
-
-  TORCH_CHECK(k_cache.dim() >= 3, "Input tensor k_cache must have at least 3 dimensions");
-
-  int64_t b = q.size(0);
-  int64_t h_qo = q.size(1);
-  int64_t d = q.size(2);
-  int64_t s_q = 1;
-
-  int64_t h_kv = k_cache.size(1);
-  int64_t page_size = k_cache.size(2);
-  int64_t s_kv = (k_cache.size(0) / b) * page_size;
-
-  int64_t total_num_pages = k_cache.size(0);
-
-  // Step 3: Compute split factor
-  int32_t split_factor = compute_split_factor(b, h_kv, h_qo, s_kv, sm_count);
-
-  // Partial O dims [B, H, split_factor, D]
-
-  cudnn_sdpa::strides_t lse_strides = {h_qo * s_q, 1, h_qo, 1};
-
-  cudnn_sdpa::strides_t partial_o_strides = {split_factor * h_qo * d, h_qo * d, d, 1};
-  cudnn_sdpa::strides_t partial_lse_strides = {h_qo, 1, h_qo * split_factor, 1};
-
-  // Set up TMA descriptors for Q, K, V, O
-  auto qo_strides = q.strides();
-  auto kv_strides = k_cache.strides();
-
-  std::cout << "qo_strides: " << qo_strides[0] << ", " << qo_strides[1] << ", " << qo_strides[2]
-            << std::endl;
-  std::cout << "kv_strides: " << kv_strides[0] << ", " << kv_strides[1] << ", " << kv_strides[2]
-            << std::endl;
-
-  // // Setup TMA desc for partial tensor O for Lean Attention
-  // std::array<uint32_t, DIMS_QKV> tensor_size_partial_o = {d, split_factor, h_qo, b};
-  // std::array<uint64_t, DIMS_QKV - 1> tensor_stride_partial_o = {
-  //     partial_o_strides[2] * sizeof(float), partial_o_strides[1] * sizeof(float),
-  //     partial_o_strides[0] * sizeof(float)};
-  // std::array<uint32_t, DIMS_QKV> tensor_box_size_partial_o = {32, 1, 1, 1};
-
-  // Launch config for main kernel
-  CUlaunchConfig config;
-
-  CUlaunchAttribute attrs[1];
-  attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-  attrs[0].value.clusterDim.x = 1;
-  attrs[0].value.clusterDim.y = 1;
-  attrs[0].value.clusterDim.z = 1;
-
-  const unsigned int CTAs_x = split_factor;  // Number of CTAs per row
-  const unsigned int CTAs_y = h_kv * std::ceil(1.f * (h_qo / h_kv) / 64);
-  const unsigned int CTAs_z = b;
-
-  config.gridDimX = CTAs_x;
-  config.gridDimY = CTAs_y;
-  config.gridDimZ = CTAs_z;
-
-  config.blockDimX = NUM_THREADS;
-  config.blockDimY = 1;
-  config.blockDimZ = 1;
-
-  config.attrs = attrs;
-  config.sharedMemBytes = SMEM_SIZE;
-
-  config.hStream = stream;
-  config.numAttrs = 1;
-  config.attrs = attrs;
-
-  int8_t* workspace_start = workspace_buffer.data_ptr<int8_t>();
-  int8_t* partial_o_dev = workspace_start;
-
-  int8_t* tma_descriptor_start =
-      partial_o_dev + (b * s_q * h_qo * d * sizeof(float) * split_factor);
-
-  int8_t* batch_strides_dev = tma_descriptor_start + (3 * b * sizeof(tma::cudaTmaDesc));
-
-  int8_t* lse_dev = batch_strides_dev + (b * sizeof(int64_t));
-
-  // These TMA descriptors are allocated in the host and passed by value
-  tma::cudaTmaDesc tma_desc_k, tma_desc_v;
-
-  /* KV cache TMA descriptors */
-
-  std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
-  std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
-  std::array<uint64_t, DIMS_QKV - 1> tensor_stride_kv = {kv_strides[2] * (BYTES_PER_ELEMENT),
-                                                         kv_strides[1] * (BYTES_PER_ELEMENT),
-                                                         kv_strides[0] * (BYTES_PER_ELEMENT)};
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_kv = {64, std::min(TILE_N_1, page_size), 1, 1};
-
-  tma::cudaSetTmaTileDescriptor(&tma_desc_k, k_cache.data_ptr(), DIMS_QKV, tensor_size_kv.data(),
-                                tensor_stride_kv.data(), tensor_traversal_stride_qkv.data(),
-                                tensor_box_size_kv.data(), tma::cudaTmaDescFormat::BF16_RN,
-                                tma::cudaTmaDescSwizzle::SWIZZLE_128B);
-
-  tma::cudaSetTmaTileDescriptor(&tma_desc_v, v_cache.data_ptr(), DIMS_QKV, tensor_size_kv.data(),
-                                tensor_stride_kv.data(), tensor_traversal_stride_qkv.data(),
-                                tensor_box_size_kv.data(), tma::cudaTmaDescFormat::BF16_RN,
-                                tma::cudaTmaDescSwizzle::SWIZZLE_128B);
-
-  // These tensors are allocated in the workspace buffer
-  // Using 3 * b for q, o and partial_o
-  std::unique_ptr<tma::cudaTmaDesc[]> packed_tma_desc(new tma::cudaTmaDesc[3 * b]);
-  auto packed_tma_desc_q = packed_tma_desc.get();
-  auto packed_tma_desc_o = packed_tma_desc.get() + b;
-  auto packed_tma_desc_partial_o = packed_tma_desc.get() + 2 * b;
-
-  /* Query and output TMA descriptors */
-  create_packed_tma_desc_decode(b, d, h_qo, tensor_traversal_stride_qkv.data(), packed_tma_desc_q,
-                                packed_tma_desc_o, packed_tma_desc_partial_o, q, out, split_factor,
-                                partial_o_dev);
-
-  cudaMemcpyAsync(tma_descriptor_start, packed_tma_desc.get(), sizeof(tma::cudaTmaDesc) * 3 * b,
-                  cudaMemcpyHostToDevice, stream);
-
-  std::unique_ptr<int64_t[]> batch_strides(new int64_t[b]);
-
-  for (int i = 0; i < b; i++) {
-    batch_strides[i] = (batch_offset_array_data ? batch_offset_array_data[i] : i) * d * h_qo;
-  }
-
-  cudaMemcpyAsync(batch_strides_dev, batch_strides.get(), sizeof(int64_t) * b,
-                  cudaMemcpyHostToDevice, stream);
-
-  auto print_cudaTmaDescTiled = [](tma::cudaTmaDescTiled* desc) {
-    std::cout << std::hex;
-    printf("addr %p", desc->tensor_common0);
-    printf(" common1 %x", desc->tensor_common1);
-    printf(" stride %x", (desc->tensor_stride_lower[0] << 4));
-    printf(" stride %x", (desc->tensor_stride_lower[1] << 4));
-    std::cout << " stride " << (desc->tensor_stride_lower[2] << 4);
-    std::cout << " stride " << (desc->tensor_stride_lower[3] << 4);
-    std::cout << " stride " << desc->tensor_stride_upper;
-    std::cout << " size " << desc->tensor_size[0];
-    std::cout << " size " << desc->tensor_size[1];
-    std::cout << " size " << desc->tensor_size[2];
-    std::cout << " size " << desc->tensor_size[3];
-    std::cout << " size " << desc->tensor_size[4];
-    std::cout << " stride " << desc->traversal_stride_box_0;
-    std::cout << " box_size_end " << desc->box_size_end;
-    std::cout << std::dec;
-    std::cout << std::endl;
-  };
-
-  // for (int i = 0; i < b; i++) {
-  //   print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_q[i]));
-  //   print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&packed_tma_desc_o[i]));
-  // }
-  // print_cudaTmaDescTiled(reinterpret_cast<tma::cudaTmaDescTiled*>(&tma_desc_v));
-
-  // Prepare launch arguments
-  cudnn_sdpa::AttentionDescriptor_t attnDesc{b, h_qo, h_kv, h_kv, s_q, s_kv, d, h_qo / h_kv};
-
-  cudnn_sdpa::FastDivisor_t page_size_div;
-  setFastDivisor(page_size_div, page_size);
-
-  // void* lse_tensor_pointer = return_lse ? lse.data_ptr() : NULL;
-
-  void* actual_seq_lens_q_gpu_pointer = nullptr;
-  void* actual_seq_lens_kv_gpu_pointer = actual_seq_lens_kv_gpu.data_ptr<int32_t>();
-  void* block_tables_pointer = block_tables.data_ptr<int32_t>();
-
-  uint32_t page_size32 = static_cast<uint32_t>(page_size);
-  uint32_t num_pages_per_seq32 = static_cast<uint32_t>(num_pages_per_seq);
-
-  float attn_scale = scale;
-
-  void* args[15];
-
-  tma::cudaTmaDesc* packed_tma_desc_q_dev =
-      reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start);
-  tma::cudaTmaDesc* packed_tma_desc_o_dev =
-      reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc));
-  tma::cudaTmaDesc* packed_tma_desc_partial_o_dev =
-      reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc) * 2);
-
-  args[0] = (void*)&attnDesc;
-  args[1] = (void*)&packed_tma_desc_q_dev;
-  args[2] = (void*)&tma_desc_k;
-  args[3] = (void*)&split_factor;
-  args[4] = (void*)&attn_scale;
-  args[5] = (void*)&lse_dev;
-  args[6] = split_factor == 1 ? (void*)&lse_strides : (void*)&partial_lse_strides;
-  args[7] = (void*)&tma_desc_v;
-  args[8] =
-      split_factor == 1 ? (void*)&packed_tma_desc_o_dev : (void*)&packed_tma_desc_partial_o_dev;
-  args[9] = (void*)&actual_seq_lens_q_gpu_pointer;
-  args[10] = (void*)&actual_seq_lens_kv_gpu_pointer;
-  args[11] = (void*)&block_tables_pointer;
-  args[12] = (void*)&page_size32;
-  args[13] = (void*)&num_pages_per_seq32;
-  args[14] = (void*)&page_size_div;
-
-  auto kernel_id = get_kernel_id(attnDesc.q_heads_per_kv);
-
-  printf("kernel_id %d\n", kernel_id);
-
-  auto err_launch = cuLaunchKernelEx(&config, hfunc_decode[kernel_id], (void**)args, nullptr);
-  if (err_launch != CUDA_SUCCESS) {
-    std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
-    throw std::runtime_error("cuLaunchKernelEx failed for decode");
-  }
-
-  // Now setting up the reduction kernel
-
-  if (split_factor > 1) {
-    // Reduction kernel arg setup
-    void* args_lean_attn_reduction[11];
-
-    void* o_dev = out.data_ptr();
-
-    void* lse_final_dev = nullptr;
-
-    args_lean_attn_reduction[0] = (void*)&attnDesc;
-    args_lean_attn_reduction[1] = (void*)&split_factor;
-    args_lean_attn_reduction[2] = (void*)&o_dev;
-    args_lean_attn_reduction[3] = (void*)&partial_o_dev;
-    args_lean_attn_reduction[4] =
-        (void*)&lse_final_dev;  // Where final op is written not needed for decode
-    args_lean_attn_reduction[5] = (void*)&lse_dev;
-    // args_lean_attn_reduction[6] = (void*)&o_strides;
-    args_lean_attn_reduction[7] = (void*)&partial_o_strides;
-    args_lean_attn_reduction[8] = (void*)&lse_strides;
-    args_lean_attn_reduction[9] = (void*)&partial_lse_strides;
-    args_lean_attn_reduction[10] = (void*)&batch_strides_dev;
-    // Launch config for reduction kernel
-
-    CUlaunchConfig reduction_config;
-
-    reduction_config.gridDimX = h_qo;
-    reduction_config.gridDimY = b;  // Same as CTAs_z of main kernel
-    reduction_config.gridDimZ = 1;
-
-    reduction_config.blockDimX = 128;  // 128 threads per block
-    reduction_config.blockDimY = 1;
-    reduction_config.blockDimZ = 1;
-
-    reduction_config.sharedMemBytes = REDUCTION_MEM_SIZE;
-
-    CUlaunchAttribute reduction_attrs[1];
-    reduction_attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    reduction_attrs[0].value.clusterDim.x = 1;
-    reduction_attrs[0].value.clusterDim.y = 1;
-    reduction_attrs[0].value.clusterDim.z = 1;
-
-    reduction_config.hStream = stream;
-    reduction_config.numAttrs = 1;
-    reduction_config.attrs = reduction_attrs;
-
-    auto err_launch = cuLaunchKernelEx(&reduction_config, lean_attn_reduction,
-                                       (void**)args_lean_attn_reduction, nullptr);
-    if (err_launch != CUDA_SUCCESS) {
-      std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
-      throw std::runtime_error("cuLaunchKernelEx failed for decode");
-    }
-  }
 }
 
 void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, int64_t d,

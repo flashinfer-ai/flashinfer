@@ -12,12 +12,14 @@ def cudnn_batch_prefill_with_kv_cache(
     v_cache: torch.Tensor,
     scale: float,
     workspace_buffer: torch.Tensor,
+    *,
     max_token_per_sequence: int,
     actual_seq_lens_q: torch.Tensor,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: torch.Tensor,
     causal: bool,
     return_lse: bool,
+    max_sequence_kv: Optional[int] = None,
     batch_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -55,6 +57,10 @@ def cudnn_batch_prefill_with_kv_cache(
     num_sequences = actual_seq_lens_q.shape[0]
 
     assert causal, "Currently only supports causal attention"
+    assert return_lse, "Currently only supports return_lse = True"
+
+    if max_sequence_kv is None:
+        max_sequence_kv = max_token_per_sequence
 
     if return_lse:
         if lse is None:
@@ -81,14 +87,15 @@ def cudnn_batch_prefill_with_kv_cache(
     run_func = get_cudnn_fmha_gen_module().prefill
     run_func(
         num_sequences,
-        max_token_per_sequence,
+        max_token_per_sequence,  # max_s_qo
+        max_sequence_kv,  # max_s_kv
         q,
         k_cache,
         v_cache,
         scale,
         workspace_buffer,
-        actual_seq_lens_q,
-        actual_seq_lens_kv,
+        actual_seq_lens_q,  # actual_seq_lens_q
+        actual_seq_lens_kv,  # actual_seq_lens_kv
         actual_seq_lens_q_gpu,
         actual_seq_lens_kv_gpu,
         block_tables,
