@@ -69,8 +69,6 @@ __global__ __launch_bounds__(
   BlockPersistentRunner1::Run(params_1, &smem_storage_1);
   PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
 
-  __syncthreads();
-
   auto& smem_storage_2 =
       reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
 

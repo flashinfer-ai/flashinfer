@@ -788,6 +788,15 @@ std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_fl
   return result;
 }
 
+inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+                                int num_qo_tiles, int group_size) {
+  if (qo_tile_idx + 1 == num_qo_tiles) {
+    return kv_len;
+  }
+  int kv_len_init = kv_len - qo_len;  // right aligned
+  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
+}
+
 struct PrefillPlanSM90Info {
   int64_t qo_tile_indices_offset;
   int64_t qo_indptr_offset;
@@ -902,11 +911,10 @@ inline cudaError_t PrefillSM90Plan(
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
         // so the group_size in cost_function is always 1
-        cta_cost_heap.insert(
-            {cta_idx, accum_cost + cost_function(cta_tile_q, causal ? kv_len - (num_qo_tiles -
-                                                                                qo_tile_idx - 1) *
-                                                                                   cta_tile_q
-                                                                    : kv_len)});
+        int effective_kv_len =
+            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
+                   : kv_len;
+        cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
         cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
         cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
         cta_qo_len[cta_idx].push_back(qo_len);
@@ -987,15 +995,6 @@ inline cudaError_t PrefillSM90Plan(
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
-}
-
-inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
-                                int num_qo_tiles, int group_size) {
-  if (qo_tile_idx + 1 == num_qo_tiles) {
-    return kv_len;
-  }
-  int kv_len_init = kv_len - qo_len;
-  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
 }
 
 template <uint32_t NUM_TASKS>
