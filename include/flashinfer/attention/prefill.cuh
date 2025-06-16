@@ -780,7 +780,7 @@ __device__ __forceinline__ void logits_mask(
                                                                     8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
         const bool mask =
-            (!(MASK_MODE == MaskMode::kCausal
+            (!(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
                    ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
                    : kv_idx >= chunk_end)) &&
             variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
@@ -2238,7 +2238,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                  CTA_TILE_KV);
 
     const uint32_t mask_iteration =
-        (MASK_MODE == MaskMode::kCausal
+        (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
              ? min(chunk_size,
                    sub_if_greater_or_zero(kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size - qo_len,
                                           chunk_start))

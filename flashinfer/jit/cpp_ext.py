@@ -93,6 +93,20 @@ def generate_ninja_build_for_op(
         "-L$cuda_home/lib64",
         "-lcudart",
     ]
+
+    env_extra_ldflags = os.environ.get("FLASHINFER_EXTRA_LDFLAGS")
+    if env_extra_ldflags:
+        try:
+            import shlex
+
+            ldflags += shlex.split(env_extra_ldflags)
+        except ValueError as e:
+            print(
+                f"Warning: Could not parse FLASHINFER_EXTRA_LDFLAGS with shlex: {e}. Falling back to simple split.",
+                file=sys.stderr,
+            )
+            ldflags += env_extra_ldflags.split()
+
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
