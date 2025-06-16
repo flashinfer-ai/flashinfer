@@ -1428,23 +1428,24 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
     smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
 
-    const uint32_t num_iterations =
-        ceil_div(MASK_MODE == MaskMode::kCausal
-                     ? min(chunk_size,
-                           sub_if_greater_or_zero(
-                               kv_len - qo_len + ((bx + 1) * CTA_TILE_Q) / group_size, chunk_start))
-                     : chunk_size,
-                 CTA_TILE_KV);
+    const uint32_t num_iterations = ceil_div(
+        MASK_MODE == MaskMode::kCausal
+            ? min(chunk_size,
+                  sub_if_greater_or_zero(
+                      kv_len - qo_len + ceil_div(((bx + 1) * CTA_TILE_Q), group_size), chunk_start))
+            : chunk_size,
+        CTA_TILE_KV);
 
     const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * CTA_TILE_Q / group_size,
+        ceil_div(sub_if_greater_or_zero(kv_len + ceil_div((bx + 1) * CTA_TILE_Q, group_size),
                                         qo_len + window_left + chunk_start),
                  CTA_TILE_KV);
 
     const uint32_t mask_iteration =
         (MASK_MODE == MaskMode::kCausal
-             ? min(chunk_size, sub_if_greater_or_zero(
-                                   kv_len + (bx * CTA_TILE_Q) / group_size - qo_len, chunk_start))
+             ? min(chunk_size,
+                   sub_if_greater_or_zero(kv_len + ceil_div((bx * CTA_TILE_Q), group_size) - qo_len,
+                                          chunk_start))
              : chunk_size) /
         CTA_TILE_KV;
 
@@ -1850,22 +1851,24 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     const uint32_t num_iterations = ceil_div(
         (MASK_MODE == MaskMode::kCausal
-             ? min(chunk_size, sub_if_greater_or_zero(
-                                   kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                                   chunk_start))
+             ? min(chunk_size,
+                   sub_if_greater_or_zero(
+                       kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+                       chunk_start))
              : chunk_size),
         CTA_TILE_KV);
 
-    const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * CTA_TILE_Q / group_size,
-                                        qo_len + window_left + chunk_start),
-                 CTA_TILE_KV);
+    const uint32_t window_iteration = ceil_div(
+        sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),
+                               qo_len + window_left + chunk_start),
+        CTA_TILE_KV);
 
     const uint32_t mask_iteration =
         (MASK_MODE == MaskMode::kCausal
              ? min(chunk_size,
-                   sub_if_greater_or_zero(kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size - qo_len,
-                                          chunk_start))
+                   sub_if_greater_or_zero(
+                       kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
+                       chunk_start))
              : chunk_size) /
         CTA_TILE_KV;
 
@@ -2199,49 +2202,52 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t num_iterations = 0;
 
     if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-      num_iterations =
-          ceil_div((MASK_MODE == MaskMode::kCausal
-                        ? min(chunk_size,
-                              sub_if_greater_or_zero(
-                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                                  chunk_start))
-                        : chunk_size),
-                   CTA_TILE_KV);
+      num_iterations = ceil_div(
+          (MASK_MODE == MaskMode::kCausal
+               ? min(chunk_size,
+                     sub_if_greater_or_zero(
+                         kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+                         chunk_start))
+               : chunk_size),
+          CTA_TILE_KV);
     } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
       num_iterations_prefix = ceil_div(
-          min(min(chunk_size, sub_if_greater_or_zero(
-                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                                  chunk_start)),
+          min(min(chunk_size,
+                  sub_if_greater_or_zero(
+                      kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+                      chunk_start)),
               sub_if_greater_or_zero(__ldg(maybe_prefix_len_ptr + request_idx), chunk_start)),
           CTA_TILE_KV);
-      num_iterations_mask = max(
-          min(chunk_size,
-              sub_if_greater_or_zero(
-                  sub_if_greater_or_zero(kv_len - qo_len + (qo_tile_idx * CTA_TILE_Q) / group_size,
-                                         __ldg(maybe_max_item_len_ptr + request_idx)),
-                  chunk_start)) /
-              (CTA_TILE_KV),
-          num_iterations_prefix);
+      num_iterations_mask =
+          max(min(chunk_size,
+                  sub_if_greater_or_zero(
+                      sub_if_greater_or_zero(
+                          kv_len - qo_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size),
+                          __ldg(maybe_max_item_len_ptr + request_idx)),
+                      chunk_start)) /
+                  (CTA_TILE_KV),
+              num_iterations_prefix);
 
       num_iterations = max(
           num_iterations_mask,
-          ceil_div(
-              min(chunk_size, sub_if_greater_or_zero(
-                                  kv_len - qo_len + ((qo_tile_idx + 1) * CTA_TILE_Q) / group_size,
-                                  chunk_start)),
-              CTA_TILE_KV));
+          ceil_div(min(chunk_size,
+                       sub_if_greater_or_zero(
+                           kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
+                           chunk_start)),
+                   CTA_TILE_KV));
     }
 
-    const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * CTA_TILE_Q / group_size,
-                                        qo_len + window_left + chunk_start),
-                 CTA_TILE_KV);
+    const uint32_t window_iteration = ceil_div(
+        sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),
+                               qo_len + window_left + chunk_start),
+        CTA_TILE_KV);
 
     const uint32_t mask_iteration =
         (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
              ? min(chunk_size,
-                   sub_if_greater_or_zero(kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size - qo_len,
-                                          chunk_start))
+                   sub_if_greater_or_zero(
+                       kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
+                       chunk_start))
              : chunk_size) /
         CTA_TILE_KV;
 

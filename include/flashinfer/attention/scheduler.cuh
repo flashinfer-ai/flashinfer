@@ -794,7 +794,7 @@ inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int clu
     return kv_len;
   }
   int kv_len_init = kv_len - qo_len;  // right aligned
-  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
+  return min(kv_len_init + ceil_div((qo_tile_idx + 1) * cluster_tile_q, group_size), kv_len);
 }
 
 struct PrefillPlanSM90Info {
@@ -1190,7 +1190,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
-      for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
+      // NOTE (Yilong): this ordering correspoinds to the layout of reduction kernel
+      for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
         int remaining_len = causal
                                 ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
                                                        num_qo_tiles, gqa_group_size)

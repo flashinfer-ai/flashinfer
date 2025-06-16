@@ -137,8 +137,8 @@ def _run_attention(
 # -------------------------  PyTest test case  ----------------------------- #
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @pytest.mark.parametrize("page_block_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
-@pytest.mark.parametrize("gqa_group_size", [1, 4])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("gqa_group_size", [1, 4, 7])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])

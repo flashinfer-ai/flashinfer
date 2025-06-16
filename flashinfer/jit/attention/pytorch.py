@@ -894,49 +894,6 @@ def gen_batch_attention_module(
     )
 
 
-def gen_batch_attention_module(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim_qk: int,
-    head_dim_vo: int,
-    pos_encoding_mode: int,
-):
-    uri = get_batch_attention_uri(
-        dtype_q,
-        dtype_kv,
-        dtype_o,
-        dtype_idx,
-        head_dim_qk,
-        head_dim_vo,
-        pos_encoding_mode,
-    )
-    additional_tensor_names = []
-    additional_tensor_dtypes = []
-    additional_scalar_names = []
-    additional_scalar_dtypes = []
-    variant_name = f"StandardAttention"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
-
-    return gen_customize_batch_attention_module(
-        uri,
-        dtype_q,
-        dtype_kv,
-        dtype_o,
-        dtype_idx,
-        head_dim_qk,
-        head_dim_vo,
-        additional_tensor_names,
-        additional_tensor_dtypes,
-        additional_scalar_names,
-        additional_scalar_dtypes,
-        variant_name,
-        variant_decl,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-
-
 def gen_customize_single_decode_module(
     uri: str,
     dtype_q: torch.dtype,
