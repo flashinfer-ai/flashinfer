@@ -177,7 +177,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                            typename PrefillParams::DTypeO* tmp_p,
                                            DecodeParams decode_params,
                                            typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
-                                           cudaStream_t stream) {
+                                           bool enable_pdl, cudaStream_t stream) {
   static_assert(std::is_same<typename PrefillParams::DTypeQ, typename DecodeParams::DTypeQ>::value);
   static_assert(
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
@@ -419,7 +419,25 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                             (void*)&tbAssign};
             FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
             // Launch kernel
+            if (enable_pdl) {
+              cudaLaunchAttribute attribute[1];
+              cudaLaunchConfig_t config;
+              attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+              attribute[0].val.programmaticStreamSerializationAllowed = 1;
+              config.attrs = attribute;
+              config.numAttrs = 1;
+              config.gridDim = nblks;
+              config.blockDim = nthrs;
+              config.dynamicSmemBytes = smem_size;
+              config.stream = stream;
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, xsize, prefill_params,
+                                                      decode_params, tbAssign));
+            } else {
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 

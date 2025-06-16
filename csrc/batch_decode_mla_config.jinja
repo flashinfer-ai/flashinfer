@@ -2,8 +2,8 @@
 #include <flashinfer/attention/default_decode_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 
-using namespace flashinfer;
-
+// using namespace flashinfer;
+// avoid "at::Layout" is ambiguous error
 using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
@@ -16,6 +16,6 @@ constexpr int HEAD_DIM_KPE = {{ head_dim_kpe }};
 
 constexpr int QO_TILE_LEN = {{ qo_tile_len }};
 
-using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
+using Params = flashinfer::BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
 using AttentionVariant =
-    DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, /*use_alibi*/false>;
+    flashinfer::DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, /*use_alibi*/false>;

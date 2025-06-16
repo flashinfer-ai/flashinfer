@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -53,9 +54,6 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
         )
 
 
-_mla_module = None
-
-
 def gen_mla_module() -> JitSpec:
     return gen_jit_spec(
         "mla",
@@ -67,28 +65,14 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_mla_module():
-    global _mla_module
-    if _mla_module is None:
-        _mla_module = gen_mla_module().build_and_load()
-    return _mla_module
+    return gen_mla_module().build_and_load()
 
 
-_batch_mla_modules = {}
-_batch_mla_sm90_modules = {}
-
-
-def get_batch_mla_module(backend):
-    def backend_module(*args):
-        global _batch_mla_modules, _batch_mla_sm90_modules
-        modules_dict = (
-            _batch_mla_modules if backend == "fa2" else _batch_mla_sm90_modules
-        )
-        if args not in modules_dict:
-            modules_dict[args] = gen_batch_mla_module(backend, *args).build_and_load()
-        return modules_dict[args]
-
-    return backend_module
+@functools.cache
+def get_batch_mla_module(backend, *args):
+    return gen_batch_mla_module(backend, *args).build_and_load()
 
 
 class BatchMLAPagedAttentionWrapper:
@@ -276,7 +260,8 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
-        self._cached_module = get_batch_mla_module(self._backend)(
+        self._cached_module = get_batch_mla_module(
+            self._backend,
             q_data_type,
             kv_data_type,
             q_data_type,

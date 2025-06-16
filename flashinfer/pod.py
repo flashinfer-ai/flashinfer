@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import math
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
@@ -36,19 +37,14 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    device_support_pdl,
 )
 
-_pod_modules = {}
 
-
+@functools.cache
 def get_pod_module(*args):
-    global _pod_modules
-    if args not in _pod_modules:
-        module = gen_pod_module(*args).build_and_load()
-        run_tensor = module.pod_with_kv_cache_tensor.default
-        # Register the module
-        _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
-    return _pod_modules[args]
+    module = gen_pod_module(*args).build_and_load()
+    return SimpleNamespace(run_tensor=module.pod_with_kv_cache_tensor.default)
 
 
 class PODWithPagedKVCacheWrapper:
@@ -386,7 +382,8 @@ class PODWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            self._cached_module = get_batch_prefill_module("fa2")(
+            self._cached_module = get_batch_prefill_module(
+                "fa2",
                 q_data_type,
                 kv_data_type,
                 q_data_type,
@@ -460,9 +457,13 @@ class PODWithPagedKVCacheWrapper:
         v_scale: Optional[float] = None,
         return_lse_d: bool = False,
         use_fp16_qk_reduction: bool = False,
+        enable_pdl: Optional[bool] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute POD-attention for a batch of requests."""
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q_p.device)
+
         # Currently unsupported
         logits_soft_cap_p = None
         logits_soft_cap_d = None
@@ -596,6 +597,7 @@ class PODWithPagedKVCacheWrapper:
             sm_scale_d,
             1.0 / rope_scale_d,
             1.0 / rope_theta_d,
+            enable_pdl,
         )
 
         if v_scale is not None:

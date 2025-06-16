@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from . import pytorch, tvm
+from .pytorch import gen_batch_attention_module as gen_batch_attention_module
 from .pytorch import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .pytorch import gen_batch_decode_module as gen_batch_decode_module
 from .pytorch import gen_batch_mla_module as gen_batch_mla_module
@@ -35,6 +36,7 @@ from .pytorch import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_m
 from .pytorch import gen_pod_module as gen_pod_module
 from .pytorch import gen_single_decode_module as gen_single_decode_module
 from .pytorch import gen_single_prefill_module as gen_single_prefill_module
+from .pytorch import get_batch_attention_uri as get_batch_attention_uri
 from .pytorch import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .pytorch import get_batch_decode_uri as get_batch_decode_uri
 from .pytorch import get_batch_mla_uri as get_batch_mla_uri

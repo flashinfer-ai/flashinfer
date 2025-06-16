@@ -27,7 +27,8 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream);
+                                                  float* tmp_s, bool enable_pdl,
+                                                  cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -84,8 +85,8 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
                                     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
                                     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
                                     at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                                    int64_t kv_layout_code,
-                                    int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+                                    int64_t kv_layout_code, int64_t window_left,
+                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -187,7 +188,7 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                               AttentionVariant>(params, tmp_v,
-                                                                                tmp_s,
+                                                                                tmp_s, enable_pdl,
                                                                                 /*stream=*/stream);
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));

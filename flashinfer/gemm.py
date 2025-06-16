@@ -33,9 +33,6 @@ from .utils import (
     register_fake_op,
 )
 
-_gemm_module = None
-_gemm_module_sm90 = None
-
 
 def gen_gemm_module() -> JitSpec:
     return gen_jit_spec(
@@ -49,96 +46,93 @@ def gen_gemm_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_gemm_module():
-    global _gemm_module
-    if _gemm_module is None:
-        module = gen_gemm_module().build_and_load()
+    module = gen_gemm_module().build_and_load()
 
-        # torch library for bmm_fp8
+    # torch library for bmm_fp8
 
-        @register_custom_op(
-            "flashinfer::bmm_fp8", mutates_args=("workspace_buffer", "D")
+    @register_custom_op("flashinfer::bmm_fp8", mutates_args=("workspace_buffer", "D"))
+    def bmm_fp8(
+        workspace_buffer: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        D: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        cublas_handle = torch.cuda.current_blas_handle()
+        module.bmm_fp8.default(
+            A,
+            B,
+            D,
+            A_scale,
+            B_scale,
+            workspace_buffer,
+            cublas_handle,
         )
-        def bmm_fp8(
-            workspace_buffer: torch.Tensor,
-            A: torch.Tensor,
-            B: torch.Tensor,
-            D: torch.Tensor,
-            A_scale: torch.Tensor,
-            B_scale: torch.Tensor,
-        ) -> None:
-            cublas_handle = torch.cuda.current_blas_handle()
-            module.bmm_fp8.default(
-                A,
-                B,
-                D,
-                A_scale,
-                B_scale,
-                workspace_buffer,
-                cublas_handle,
-            )
 
-        @register_fake_op("flashinfer::bmm_fp8")
-        def _fake_bmm_fp8(
-            workspace_buffer: torch.Tensor,
-            A: torch.Tensor,
-            B: torch.Tensor,
-            D: torch.Tensor,
-            A_scale: torch.Tensor,
-            B_scale: torch.Tensor,
-        ) -> None:
-            pass
+    @register_fake_op("flashinfer::bmm_fp8")
+    def _fake_bmm_fp8(
+        workspace_buffer: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        D: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        pass
 
-        # torch library for cutlass_segment_gemm
+    # torch library for cutlass_segment_gemm
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=("y"))
-        def cutlass_segment_gemm(
-            workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_ld: torch.Tensor,
-            w_ld: torch.Tensor,
-            y_ld: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            module.cutlass_segment_gemm.default(
-                workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_ld,
-                w_ld,
-                y_ld,
-                empty_x_data,
-                weight_column_major,
-            )
-
-        @register_fake_op("flashinfer::cutlass_segment_gemm")
-        def _fake_cutlass_segment_gemm(
-            workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_ld: torch.Tensor,
-            w_ld: torch.Tensor,
-            y_ld: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            pass
-
-        # Register the module
-        _gemm_module = SimpleNamespace(
-            bmm_fp8=bmm_fp8,
-            cutlass_segment_gemm=cutlass_segment_gemm,
+    @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=("y"))
+    def cutlass_segment_gemm(
+        workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_ld: torch.Tensor,
+        w_ld: torch.Tensor,
+        y_ld: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        module.cutlass_segment_gemm.default(
+            workspace_buffer,
+            all_problems,
+            x_data,
+            w_data,
+            y_data,
+            x_ld,
+            w_ld,
+            y_ld,
+            empty_x_data,
+            weight_column_major,
         )
+
+    @register_fake_op("flashinfer::cutlass_segment_gemm")
+    def _fake_cutlass_segment_gemm(
+        workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_ld: torch.Tensor,
+        w_ld: torch.Tensor,
+        y_ld: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        pass
+
+    # Register the module
+    _gemm_module = SimpleNamespace(
+        bmm_fp8=bmm_fp8,
+        cutlass_segment_gemm=cutlass_segment_gemm,
+    )
 
     return _gemm_module
 
@@ -180,71 +174,68 @@ def gen_gemm_sm90_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_gemm_sm90_module():
-    global _gemm_module_sm90
-    if _gemm_module_sm90 is None:
-        module = gen_gemm_sm90_module().build_and_load()
+    module = gen_gemm_sm90_module().build_and_load()
 
-        # torch library for cutlass_segment_gemm_sm90
+    # torch library for cutlass_segment_gemm_sm90
 
-        @register_custom_op(
-            "flashinfer::cutlass_segment_gemm_sm90",
-            mutates_args=("workspace_buffer", "y"),
-        )
-        def cutlass_segment_gemm_sm90(
-            workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_stride: torch.Tensor,
-            w_stride: torch.Tensor,
-            y_stride: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            empty_y_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            module.cutlass_segment_gemm_sm90.default(
-                workspace_buffer,
-                int_workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_stride,
-                w_stride,
-                y_stride,
-                empty_x_data,
-                empty_y_data,
-                weight_column_major,
-            )
-
-        @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
-        def _fake_cutlass_segment_gemm_sm90(
-            workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_stride: torch.Tensor,
-            w_stride: torch.Tensor,
-            y_stride: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            empty_y_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            pass
-
-        # Register the module
-        _gemm_module_sm90 = SimpleNamespace(
-            cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
+    @register_custom_op(
+        "flashinfer::cutlass_segment_gemm_sm90",
+        mutates_args=("workspace_buffer", "y"),
+    )
+    def cutlass_segment_gemm_sm90(
+        workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_stride: torch.Tensor,
+        w_stride: torch.Tensor,
+        y_stride: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        empty_y_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        module.cutlass_segment_gemm_sm90.default(
+            workspace_buffer,
+            int_workspace_buffer,
+            all_problems,
+            x_data,
+            w_data,
+            y_data,
+            x_stride,
+            w_stride,
+            y_stride,
+            empty_x_data,
+            empty_y_data,
+            weight_column_major,
         )
 
-    return _gemm_module_sm90
+    @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
+    def _fake_cutlass_segment_gemm_sm90(
+        workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_stride: torch.Tensor,
+        w_stride: torch.Tensor,
+        y_stride: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        empty_y_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        pass
+
+    # Register the module
+    return SimpleNamespace(
+        cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
+    )
 
 
 def launch_compute_sm80_group_gemm_args(

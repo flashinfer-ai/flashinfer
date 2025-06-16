@@ -51,85 +51,76 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    device_support_pdl,
     register_custom_op,
     register_fake_op,
 )
 
-_single_decode_modules = {}
-_batch_decode_modules = {}
-_batch_decode_mla_modules = {}
-_batch_decode_jit_modules = {}
 
-
+@functools.cache
 def get_single_decode_module(*args):
-    global _single_decode_modules
-    if args not in _single_decode_modules:
-        uri = get_single_decode_uri(*args)
-        module = gen_single_decode_module(*args).build_and_load()
-        run_func = module.run.default
+    uri = get_single_decode_uri(*args)
+    module = gen_single_decode_module(*args).build_and_load()
+    run_func = module.run.default
 
-        # torch library for single_decode_with_kv_cache
+    # torch library for single_decode_with_kv_cache
 
-        @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "o"))
-        def run_single_decode(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            tmp: torch.Tensor,
-            o: torch.Tensor,
-            maybe_lse: Optional[torch.Tensor],
-            alibi_slopes: Optional[torch.Tensor],
-            kv_layout_code: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-        ) -> None:
-            run_func(
-                q,
-                k,
-                v,
-                tmp,
-                o,
-                maybe_lse,
-                kv_layout_code,
-                window_left,
-                alibi_slopes,
-                logits_soft_cap,
-                sm_scale,
-                1.0 / rope_scale,  # rope_rcp_scale
-                1.0 / rope_theta,  # rope_rcp_theta
-            )
+    @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "o"))
+    def run_single_decode(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        tmp: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        alibi_slopes: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        run_func(
+            q,
+            k,
+            v,
+            tmp,
+            o,
+            maybe_lse,
+            kv_layout_code,
+            window_left,
+            alibi_slopes,
+            logits_soft_cap,
+            sm_scale,
+            1.0 / rope_scale,  # rope_rcp_scale
+            1.0 / rope_theta,  # rope_rcp_theta
+        )
 
-        @register_fake_op(f"flashinfer::{uri}_run")
-        def _fake_run_single_decode(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            tmp: torch.Tensor,
-            o: torch.Tensor,
-            maybe_lse: Optional[torch.Tensor],
-            alibi_slopes: Optional[torch.Tensor],
-            kv_layout_code: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-        ) -> None:
-            pass
+    @register_fake_op(f"flashinfer::{uri}_run")
+    def _fake_run_single_decode(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        tmp: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        alibi_slopes: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        pass
 
-        # Register the module.
-        _single_decode_modules[args] = SimpleNamespace(run=run_single_decode)
-    return _single_decode_modules[args]
+    # Register the module.
+    return SimpleNamespace(run=run_single_decode)
 
 
+@functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
-    global _batch_decode_jit_modules
-    if module_name in _batch_decode_jit_modules:
-        return _batch_decode_jit_modules[module_name]
-
     plan_func = jit_module.plan.default
     run_func = jit_module.run.default
 
@@ -158,6 +149,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        enable_pdl: bool,
         *args,
     ) -> None:
         run_func(
@@ -174,6 +166,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
             maybe_lse,
             kv_layout_code,
             window_left,
+            enable_pdl,
             *args,
         )
 
@@ -192,111 +185,112 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         maybe_lse: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        enable_pdl: bool,
         *args,
     ) -> None:
         pass
 
-    _batch_decode_jit_modules[module_name] = SimpleNamespace(
+    return SimpleNamespace(
         plan=plan_func,
         run=run_batch_decode,
     )
-    return _batch_decode_jit_modules[module_name]
 
 
+@functools.cache
 def get_batch_decode_module(*args):
-    global _batch_decode_modules
-    if args not in _batch_decode_modules:
-        uri = get_batch_decode_uri(*args)
-        mod = gen_batch_decode_module(*args).build_and_load()
-        plan_func = mod.plan.default
-        run_func = mod.run.default
+    uri = get_batch_decode_uri(*args)
+    mod = gen_batch_decode_module(*args).build_and_load()
+    plan_func = mod.plan.default
+    run_func = mod.run.default
 
-        # torch library for batch_decode_with_paged_kv_cache_run
+    # torch library for batch_decode_with_paged_kv_cache_run
 
-        @register_custom_op(
-            f"flashinfer::{uri}_run",
-            mutates_args=(
-                "float_workspace_buffer",
-                "int_workspace_buffer",
-                "paged_k_cache",
-                "paged_v_cache",
-                "o",
-                "maybe_lse",
-            ),
+    @register_custom_op(
+        f"flashinfer::{uri}_run",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "paged_k_cache",
+            "paged_v_cache",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def run_batch_decode(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: Optional[torch.Tensor],
+        paged_v_cache: Optional[torch.Tensor],
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        run_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            q,
+            paged_k_cache,
+            paged_v_cache,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            o,
+            maybe_lse,
+            kv_layout_code,
+            window_left,
+            enable_pdl,
+            alibi_slopes,
+            logits_soft_cap,
+            sm_scale,
+            1.0 / rope_scale,  # rope_rcp_scale
+            1.0 / rope_theta,  # rope_rcp_theta
         )
-        def run_batch_decode(
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: Optional[torch.Tensor],
-            paged_v_cache: Optional[torch.Tensor],
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            o: torch.Tensor,
-            maybe_lse: Optional[torch.Tensor],
-            kv_layout_code: int,
-            window_left: int,
-            alibi_slopes: Optional[torch.Tensor],
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-        ) -> None:
-            run_func(
-                float_workspace_buffer,
-                int_workspace_buffer,
-                plan_info_vec,
-                q,
-                paged_k_cache,
-                paged_v_cache,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_len,
-                o,
-                maybe_lse,
-                kv_layout_code,
-                window_left,
-                alibi_slopes,
-                logits_soft_cap,
-                sm_scale,
-                1.0 / rope_scale,  # rope_rcp_scale
-                1.0 / rope_theta,  # rope_rcp_theta
-            )
 
-        @register_fake_op(f"flashinfer::{uri}_run")
-        def _fake_run_batch_decode(
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: Optional[torch.Tensor],
-            paged_v_cache: Optional[torch.Tensor],
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            o: torch.Tensor,
-            maybe_lse: Optional[torch.Tensor],
-            kv_layout_code: int,
-            window_left: int,
-            alibi_slopes: Optional[torch.Tensor],
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-        ) -> None:
-            pass
+    @register_fake_op(f"flashinfer::{uri}_run")
+    def _fake_run_batch_decode(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: Optional[torch.Tensor],
+        paged_v_cache: Optional[torch.Tensor],
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        kv_layout_code: int,
+        window_left: int,
+        enable_pdl: bool,
+        alibi_slopes: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+    ) -> None:
+        pass
 
-        # Register the module.
-        #
-        # Note that plan is not part of model logic. It should not be included in
-        # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-        _batch_decode_modules[args] = SimpleNamespace(
-            plan=plan_func,
-            run=run_batch_decode,
-        )
-    return _batch_decode_modules[args]
+    # Register the module.
+    #
+    # Note that plan is not part of model logic. It should not be included in
+    # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    return SimpleNamespace(
+        plan=plan_func,
+        run=run_batch_decode,
+    )
 
 
 @functools.cache
@@ -338,13 +332,9 @@ def single_decode_with_kv_cache_with_jit_module(
     return o
 
 
+@functools.cache
 def get_batch_decode_mla_module(*args):
-    global _batch_decode_mla_modules
-    if args not in _batch_decode_mla_modules:
-        _batch_decode_mla_modules[args] = gen_batch_decode_mla_module(
-            *args
-        ).build_and_load()
-    return _batch_decode_mla_modules[args]
+    return gen_batch_decode_mla_module(*args).build_and_load()
 
 
 @overload
@@ -506,7 +496,8 @@ def single_decode_with_kv_cache(
 
     if use_tensor_cores:
         out = torch.empty_like(q.unsqueeze(0))
-        get_single_prefill_module("fa2")(
+        get_single_prefill_module(
+            "fa2",
             q.dtype,
             k.dtype,
             q.dtype,
@@ -926,7 +917,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
-                self._cached_module = get_batch_prefill_module("fa2")(
+                self._cached_module = get_batch_prefill_module(
+                    "fa2",
                     q_data_type,
                     kv_data_type,
                     q_data_type,
@@ -1036,6 +1028,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1050,6 +1043,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1063,6 +1057,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1097,7 +1092,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1107,6 +1104,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -1165,6 +1164,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 MaskMode.NON_CAUSAL.value,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                enable_pdl,
             ]
 
             if self._jit_module is not None:
@@ -1203,6 +1203,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 lse,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                enable_pdl,
             ]
 
             if self._jit_module is not None:
@@ -1576,6 +1577,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: bool = False,  # fake placeholder (sm80)
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1603,7 +1605,9 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
-
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1670,6 +1674,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             rope_scale,
             rope_theta,
             lse,
+            enable_pdl,
         )
         out = [out, lse] if return_lse else [out]
         if v_scale is not None:

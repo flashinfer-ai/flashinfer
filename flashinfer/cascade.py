@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from functools import cache
 from typing import Any, List, Optional, Tuple
 
@@ -26,8 +27,6 @@ from .jit import gen_jit_spec
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
 
-_cascade_module = None
-
 
 def gen_cascade_module() -> JitSpec:
     return gen_jit_spec(
@@ -39,19 +38,9 @@ def gen_cascade_module() -> JitSpec:
     )
 
 
+@functools.cache
 def get_cascade_module():
-    global _cascade_module
-    if _cascade_module is None:
-        _cascade_module = gen_cascade_module().build_and_load()
-    return _cascade_module
-
-
-@cache
-def get_module_attr(attr: str) -> Any:
-    global _cascade_module
-    if _cascade_module is None:
-        get_cascade_module()
-    return getattr(_cascade_module, attr).default
+    return gen_cascade_module().build_and_load()
 
 
 @register_custom_op("flashinfer::merge_state", mutates_args=())
@@ -108,7 +97,7 @@ def merge_state(
     s_b = s_b.to(torch.float32)
     v_merged = torch.empty_like(v_a)
     s_merged = torch.empty_like(s_a)
-    get_module_attr("merge_state")(v_a, s_a, v_b, s_b, v_merged, s_merged)
+    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
     return v_merged, s_merged
 
 
@@ -167,7 +156,7 @@ def merge_state_in_place(
     """
     s = s.to(torch.float32)
     s_other = s_other.to(torch.float32)
-    get_module_attr("merge_state_in_place")(v, s, v_other, s_other, mask)
+    get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
 
 
 @register_fake_op("flashinfer::merge_state_in_place")
@@ -224,7 +213,7 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
     seq_len, _, num_heads, head_dim = v.size()
     v_merged = torch.empty(seq_len, num_heads, head_dim, dtype=v.dtype, device=device)
     s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=device)
-    get_module_attr("merge_states")(v, s, v_merged, s_merged)
+    get_cascade_module().merge_states(v, s, v_merged, s_merged)
     return v_merged, s_merged
 
 
