@@ -268,26 +268,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     f"Rank {rank} allreduce_out ref value at max diff: {all_reduce_ref.view(-1)[max_diff_idx]}"
                                 )
 
-                                # Draw distribution graph for allreduce_out vs reference
-                                import matplotlib.pyplot as plt
-
-                                plt.figure(figsize=(10, 6))
-                                plt.scatter(
-                                    all_reduce_out.to(torch.float32)
-                                    .cpu()
-                                    .numpy()
-                                    .flatten(),
-                                    all_reduce_ref.cpu().numpy().flatten(),
-                                    alpha=0.5,
-                                    s=1,
-                                )
-                                plt.plot([-1, 1], [-1, 1], "r--")  # Diagonal line
-                                plt.xlabel("Allreduce Output")
-                                plt.ylabel("Reference Output")
-                                plt.title(f"Distribution Plot (Rank {rank})")
-                                plt.savefig(f"allreduce_distribution_rank_{rank}.png")
-                                plt.close()
-
                             torch.testing.assert_close(
                                 all_reduce_out.to(torch.float32),
                                 all_reduce_ref,
@@ -329,20 +309,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} residual_out ref value at max diff: {ref_residual_out.view(-1)[max_diff_idx]}"
                                 )
-                                # Draw distribution graph for residual_out vs reference
-                                import matplotlib.pyplot as plt
-
-                                plt.figure(figsize=(10, 6))
-                                plt.scatter(
-                                    residual_out.to(torch.float32)
-                                    .cpu()
-                                    .numpy()
-                                    .flatten(),
-                                    ref_residual_out.cpu().numpy().flatten(),
-                                    alpha=0.5,
-                                    s=1,
-                                )
-                                plt.plot([-1, 1], [-1, 1], "r--")  # Diagonal line
                             torch.testing.assert_close(
                                 residual_out.to(torch.float32),
                                 ref_residual_out,
@@ -378,17 +344,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     f"Rank {rank} norm_out ref value at max diff: {ref_norm_out.view(-1)[max_diff_idx]}"
                                 )
 
-                                # Draw distribution graph for norm_out vs reference
-                                import matplotlib.pyplot as plt
-
-                                plt.figure(figsize=(10, 6))
-                                plt.scatter(
-                                    norm_out.to(torch.float32).cpu().numpy().flatten(),
-                                    ref_norm_out.cpu().numpy().flatten(),
-                                    alpha=0.5,
-                                    s=1,
-                                )
-                                plt.plot([-1, 1], [-1, 1], "r--")  # Diagonal line
                             torch.testing.assert_close(
                                 norm_out.to(torch.float32),
                                 ref_norm_out,
