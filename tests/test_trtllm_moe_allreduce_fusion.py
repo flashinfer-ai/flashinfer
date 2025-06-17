@@ -16,6 +16,9 @@ kOneShotMaxTokenNum = 128
 MAX_TOKEN_NUM = 2048
 HIDDEN_SIZE = 7168
 MAX_EXPERT_NUM = 16
+SF_VEC_SIZE = 16
+
+# temp var
 SCALE_FACTOR_RANGE = (-1, 1)
 
 
@@ -82,11 +85,32 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             residual_out = torch.empty_like(residual_in)
                             norm_out = torch.empty_like(residual_in)
                             quant_out = torch.empty(
-                                message_size, dtype=dtype, device=device
-                            )
-                            scale_out = torch.empty(
-                                message_size, dtype=dtype, device=device
-                            )
+                                message_size // 4, dtype=dtype, device=device
+                            )  # quant: fp16/bf16 -> fp4, reference: cpp/tensorrt_llm/thop/allreduceOp.cpp:L487
+
+                            scale_out = None
+                            assert (
+                                HIDDEN_SIZE % SF_VEC_SIZE == 0
+                            ), "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            if (
+                                swizzled_layout_code
+                                == comm.FP4QuantizationSFLayout.SWIZZLED
+                            ):
+                                padded_message_size = (
+                                    comm.compute_fp4_swizzled_layout_sf_size(
+                                        token_num, HIDDEN_SIZE // SF_VEC_SIZE
+                                    )
+                                )
+                                scale_out = torch.empty(
+                                    padded_message_size, dtype=dtype, device=device
+                                )
+                            else:
+                                scale_out = torch.empty(
+                                    message_size // SF_VEC_SIZE,
+                                    dtype=dtype,
+                                    device=device,
+                                )
+
                             rms_gamma = torch.randn(
                                 HIDDEN_SIZE, dtype=dtype, device=device
                             )
@@ -125,15 +149,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             moe_reduction_token_input_clone = (
                                 moe_reduction_token_input.clone()
                             )
-
-                            # todo(yingyi): fix swizzled layout code for quantization
-                            # issue: sf_out out_of_bound for swizzled layout code (larger scope than scale_out)
-                            # temp workaround: only use linear layout code for quantization
-                            if (
-                                swizzled_layout_code
-                                == comm.FP4QuantizationSFLayout.SWIZZLED
-                            ):
-                                quant_out = None
 
                             # == Calculate reference output ==
                             # 1. MoE Reduction
@@ -252,6 +267,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} allreduce_out ref value at max diff: {all_reduce_ref.view(-1)[max_diff_idx]}"
                                 )
+
                             torch.testing.assert_close(
                                 all_reduce_out.to(torch.float32),
                                 all_reduce_ref,
@@ -327,6 +343,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 print(
                                     f"Rank {rank} norm_out ref value at max diff: {ref_norm_out.view(-1)[max_diff_idx]}"
                                 )
+
                             torch.testing.assert_close(
                                 norm_out.to(torch.float32),
                                 ref_norm_out,
@@ -404,3 +421,7 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
+
+
+if __name__ == "__main__":
+    test_trtllm_moe_allreduce_fusion(world_size=2, dtype=torch.bfloat16)
