@@ -21,14 +21,13 @@
 #include <nvrtc.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
+#include <map>
 
 #include "cudnn_sdpa_utils.h"
 #include "pytorch_extension_utils.h"
-
-// TODO: Make sure this has a name space. Ask in the PR
-std::string getCubin(const std::string& kernelName, const std::string& sha256);
 
 namespace flashinfer {
 
@@ -136,11 +135,13 @@ __global__ static void __launch_bounds__(128)
 #pragma unroll 1
   for (int i = 0; i < b; ++i) {
     batch_strides_dev[i] = batch_offset_qo;
-    uint16_t* per_batch_q_ptr = reinterpret_cast<uint16_t*>(q_ptr + batch_offset_qo);
-    uint16_t* per_batch_out_ptr = reinterpret_cast<uint16_t*>(o_ptr + batch_offset_qo);
+    uint16_t* per_batch_q_ptr =
+        reinterpret_cast<uint16_t*>(static_cast<std::byte*>(q_ptr) + batch_offset_qo);
+    uint16_t* per_batch_out_ptr =
+        reinterpret_cast<uint16_t*>(static_cast<std::byte*>(o_ptr) + batch_offset_qo);
     // The two below comes from half
     float* per_batch_partial_o_ptr =
-        reinterpret_cast<float*>(partial_o_ptr + (batch_offset_partial_o));
+        reinterpret_cast<float*>(static_cast<std::byte*>(partial_o_ptr) + (batch_offset_partial_o));
 
     tma::cudaTmaDesc desc_q;
     tma::cudaTmaDesc desc_o;
@@ -421,7 +422,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   int64_t page_size = k_cache.size(2);
   int64_t s_kv = (k_cache.size(0) / b) * page_size;
 
-  int64_t num_pages_per_seq = std::ceil(s_kv / page_size);
+  int64_t num_pages_per_seq = static_cast<int64_t>(std::ceil(1.0 * s_kv / page_size));
 
   int64_t total_num_pages = k_cache.size(0);
 

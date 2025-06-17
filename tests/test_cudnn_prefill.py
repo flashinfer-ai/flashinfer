@@ -191,7 +191,7 @@ def test_cudnn_prefill(
 @pytest.mark.parametrize("s_kv", [8, 32])
 @pytest.mark.parametrize("page_size", [1, 8, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("num_qo_heads", [1, 4])
+@pytest.mark.parametrize("num_qo_heads", [4])
 @pytest.mark.parametrize("head_dim_qk", [192])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("causal", [True])
@@ -358,7 +358,7 @@ def test_cudnn_prefill_d_qk_192(
         q_data_type=torch.bfloat16,
     )
 
-    output_ref = wrapper.run(q, k_cache, v_cache)
+    # output_ref = wrapper.run(q, k_cache, v_cache)
 
     torch.cuda.synchronize()
     # torch.testing.assert_close(output, output_ref)

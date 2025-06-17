@@ -24,7 +24,7 @@ def cudnn_batch_prefill_with_kv_cache(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     use_cuda_graph: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Performs batched prefill attention with paged KV cache using cuDNN.
 
     Args:
