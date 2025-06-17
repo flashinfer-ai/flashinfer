@@ -21,4 +21,3 @@ set -u
 
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip3 install ninja pytest numpy scipy build pynvml
-conda install -y mpi4py
