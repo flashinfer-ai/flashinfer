@@ -77,7 +77,8 @@ def cudnn_batch_prefill_with_kv_cache(
             )
 
     if out is None:
-        out = torch.empty_like(q)
+        out_shape = (q.size(0), q.size(1), v_cache.size(3))
+        out = torch.empty(out_shape, device=q.device, dtype=q.dtype)
 
     if actual_seq_lens_q.is_cuda == False:
         actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)

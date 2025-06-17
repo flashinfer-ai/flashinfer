@@ -309,7 +309,7 @@ void setup_prefill(CUfunction* hfunc, int64_t d_qk, int64_t d_vo) {
             "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
             "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
 
-  std::string cubin = get_cudnn_cubin(PREFILL);
+  std::string cubin = get_cudnn_cubin(d_qk == 192 ? PREFILL_DEEPSEEK : PREFILL);
   if (cubin.empty()) {
     throw std::runtime_error("Failed to load cubin for prefill");
   }
@@ -396,6 +396,9 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
 
   static CUfunction hfunc{nullptr};
 
+  int64_t d_qk = q.size(2);
+  int64_t d_vo = v_cache.size(3);
+
   if (hfunc == nullptr) {
     setup_prefill(&hfunc, d_qk, d_vo);
 
@@ -413,8 +416,6 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   TORCH_CHECK(k_cache.dim() >= 3, "Input tensor k_cache must have at least 3 dimensions");
 
   int64_t h_qo = q.size(1);
-  int64_t d_qk = q.size(2);
-  int64_t d_vo = v_cache.size(3);
 
   int64_t h_kv = k_cache.size(1);
   int64_t page_size = k_cache.size(2);
