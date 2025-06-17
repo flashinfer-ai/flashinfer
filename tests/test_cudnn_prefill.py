@@ -219,14 +219,14 @@ def test_cudnn_prefill_d_qk_192(
     device = "cuda:0"
 
     actual_seq_lens_q = torch.randint(
-        1, 2 + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
     actual_seq_lens_kv = torch.randint(
         s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
-    q = torch.ones(
+    q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
 
@@ -234,12 +234,10 @@ def test_cudnn_prefill_d_qk_192(
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
 
-    print("total_num_pages: ", total_num_pages)
-
     k_cache_shape = (total_num_pages, num_kv_heads, page_size, head_dim_qk)
     v_cache_shape = (total_num_pages, num_kv_heads, page_size, head_dim_vo)
 
-    k_cache_ = torch.ones(size=k_cache_shape, dtype=torch.bfloat16).to(device)
+    k_cache_ = torch.randn(size=k_cache_shape, dtype=torch.bfloat16).to(device)
     k_cache = k_cache_.as_strided(
         k_cache_shape,
         (
@@ -259,9 +257,6 @@ def test_cudnn_prefill_d_qk_192(
             1,
         ),
     )
-
-    for i in range(page_size):
-        v_cache[0, :, i, :] = i + 1
 
     # Now initialize the page tables
     block_tables = torch.tensor(
@@ -364,13 +359,6 @@ def test_cudnn_prefill_d_qk_192(
     )
 
     output_ref = wrapper.run(q, k_cache, v_cache)
-
-    print("v_cache: ", hex(v_cache.data_ptr()))
-    print("k_cache: ", hex(k_cache.data_ptr()))
-    print("output: ", output[:, :, 0:5])
-    print("output_ref: ", output_ref[:, :, 0:5])
-    for i in range(page_size):
-        print(f"v_cache page {i}: {v_cache_[0, :, i, 0:5]}")
 
     torch.cuda.synchronize()
     # torch.testing.assert_close(output, output_ref)
