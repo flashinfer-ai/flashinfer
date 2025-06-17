@@ -58,21 +58,6 @@ cmdclass = {}
 install_requires = ["numpy", "torch", "ninja", "requests"]
 generate_build_meta({})
 
-cubin_utils_sources = [
-    "csrc/cubin_loader.cc",
-]
-
-ext_modules.append(
-    setuptools.Extension(
-        name="flashinfer.cubin_utils",
-        sources=cubin_utils_sources,
-        language="c++",
-        include_dirs=[pybind11.get_include()],
-        # py_limited_api=True,
-    )
-)
-
-
 if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
