@@ -68,6 +68,23 @@ class AllReduceFusionOp:
     MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
+class FP4QuantizationSFLayout:
+    # Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
+    # blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
+    # values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
+    # columns to the nearest multiple of 4.
+    #
+    # The scale factor block rows map to data block rows in an interleaved pattern:
+    # For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
+    # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
+    #
+    # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
+    SWIZZLED = 0
+    # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
+    # kernels standard.
+    LINEAR = 1
+
+
 class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
 
@@ -235,10 +252,11 @@ def gen_comm_module() -> JitSpec:
     return gen_jit_spec(
         "comm",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_comm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "comm_pybind.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
@@ -398,6 +416,77 @@ def get_comm_module():
             lamport_peer_comm_buffer_ptrs_2,
         )
 
+    @register_custom_op(
+        "flashinfer::trtllm_moe_allreduce_fusion",
+        mutates_args=[
+            "out",
+            "tp_size",
+            "tp_rank",
+            "token_num",
+            "hidden_dim",
+            "workspace_ptrs",
+            "launch_with_pdl",
+            "residual_in",
+            "rms_gamma",
+            "rms_eps",
+            "scale_factor",
+            "moe_reduction_device_num_experts",
+            "moe_reduction_scale_input",
+            "moe_reduction_active_experts_token_input",
+            "moe_reduction_token_input",
+            "layout_code",
+            "allreduce_out",
+            "residual_out",
+            "norm_out",
+            "quant_out",
+            "scale_out",
+        ],
+    )
+    def trtllm_moe_allreduce_fusion(
+        world_size: int,
+        world_rank: int,
+        token_num: int,
+        hidden_dim: int,
+        workspace_ptrs: torch.Tensor,
+        launch_with_pdl: bool,
+        residual_in: torch.Tensor,
+        rms_gamma: torch.Tensor,
+        rms_eps: float,
+        scale_factor: float,
+        moe_reduction_device_num_experts: int,
+        moe_reduction_scale_input: torch.Tensor,
+        moe_reduction_active_experts_token_input: torch.Tensor,
+        moe_reduction_token_input: torch.Tensor,
+        layout_code: Optional[FP4QuantizationSFLayout],
+        allreduce_out: Optional[torch.Tensor],
+        residual_out: Optional[torch.Tensor],
+        norm_out: Optional[torch.Tensor],
+        quant_out: Optional[torch.Tensor],
+        scale_out: Optional[torch.Tensor],
+    ) -> None:
+        module.trtllm_moe_allreduce_fusion(
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace_ptrs,
+            launch_with_pdl,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            scale_factor,
+            moe_reduction_device_num_experts,
+            moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input,
+            moe_reduction_token_input,
+            layout_code,
+            allreduce_out,
+            residual_out,
+            norm_out,
+            quant_out,
+            scale_out,
+        )
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -409,6 +498,7 @@ def get_comm_module():
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
+        trtllm_moe_allreduce_fusion=trtllm_moe_allreduce_fusion,
     )
 
 
@@ -471,6 +561,10 @@ def create_shared_buffer(
     Creates a shared buffer and returns a list of pointers
     representing the buffer on all processes in the group.
     """
+    """
+    Creates a shared buffer and returns a list of pointers
+    representing the buffer on all processes in the group.
+    """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
     if group is None:
@@ -479,17 +573,15 @@ def create_shared_buffer(
     rank = dist.get_rank(group=group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
 
     pointers: List[int] = []
     for i, h in enumerate(handles):
         if i == rank:
             pointers.append(pointer.value)
         else:
-            try:
-                pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
-            except Exception as e:
-                print(f"Rank {rank}: Failed to open IPC handle from rank {i}: {e}")
-                raise
+            pointers.append(cudart.cudaIpcOpenMemHandle(h).value)
 
     dist.barrier(group=group)
     return pointers
@@ -605,7 +697,7 @@ BarrierFlagCount = 256
 
 
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
-    rank: int,
+    tp_rank: int,
     tp_size: int,
     max_token_num: int,
     hidden_dim,
@@ -630,7 +722,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
     flag_size = tp_size * BarrierFlagCount * 4
-    lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
+    # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
+    # enable larger workspace for cases > OneShotMaxToken
+    lamport_comm_size = tp_size * max_token_num * hidden_dim * 2
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -638,12 +732,59 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     ipc_handles = list()
     for size in [buffer_size, flag_size, lamport_buffer_size]:
-        ipc_handles.append(create_shared_buffer(size, group))
+        # todo(review): confirm we need this alignment
+        # all sizes should be aligned to 1LU << 21 bytes (2MB)
+        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
-        f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+        f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
     )
-    return ipc_handles
+
+    # Initialize lamport buffer
+    trtllm_lamport_initialize(
+        ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+    )
+
+    # initialize workspace
+    workspace = list()
+    # add ipc handles to workspace
+    for ipc_handle in ipc_handles:
+        for rank in range(tp_size):
+            workspace.append(ipc_handle[rank])
+
+    # add flags to workspace
+    """
+    NOTE:
+    The flags are for the lamport communication states.
+    atomic flag read counter: kernel_flag_ptr[0] = 0;
+    non-lamport flag: kernel_flag_ptr[1] = 0;
+    lamport flag: kernel_flag_ptr[2] = 0;
+    lamport triple buffer offset: kernel_flag_ptr[3] = lamport_comm_size;
+    lamport clear size: kernel_flag_ptr[4] = 0;
+    """
+    # malloc cuda memory of int32_t * 5
+    flag_ptr = cudart.cudaMalloc(5 * 4)
+    # initialize the flag to [0,0,0,lamport_comm_size,0]
+    cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+    # Set flag_ptr[3] = lamport_comm_size
+    lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
+    cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
+    print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
+    # add flag_ptr to workspace
+    workspace.append(flag_ptr.value)
+
+    for i in range(len(workspace)):
+        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
+
+    # Store workspace pointers in device tensor
+    workspace_tensor = torch.tensor(
+        workspace, dtype=torch.int64, device=torch.device("cuda")
+    )
+
+    dist.barrier(group=group)  # must sync after create_workspace
+
+    return ipc_handles, workspace_tensor
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
@@ -659,6 +800,16 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
 
     for ipc_handle in workspace:
         free_shared_buffer(ipc_handle, group)
+
+
+# allReduce fused quant utils
+def compute_fp4_swizzled_layout_sf_size(total_row, total_column):
+    def pad_up(x, y):
+        return ((x + y - 1) // y) * y
+
+    padded_row = pad_up(total_row, 128)
+    padded_column = pad_up(total_column, 4)
+    return padded_row * padded_column
 
 
 def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
@@ -724,4 +875,50 @@ def trtllm_custom_all_reduce(
         lamport_peer_comm_buffer_ptrs_0,
         lamport_peer_comm_buffer_ptrs_1,
         lamport_peer_comm_buffer_ptrs_2,
+    )
+
+
+def trtllm_moe_allreduce_fusion(
+    world_size: int,
+    world_rank: int,
+    token_num: int,
+    hidden_dim: int,
+    workspace_ptrs: torch.Tensor,
+    launch_with_pdl: bool,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    rms_eps: float,
+    scale_factor: float,
+    moe_reduction_device_num_experts: int,
+    moe_reduction_scale_input: torch.Tensor,
+    moe_reduction_active_experts_token_input: torch.Tensor,
+    moe_reduction_token_input: torch.Tensor,
+    layout_code: Optional[FP4QuantizationSFLayout],
+    allreduce_out: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
+) -> None:
+    get_comm_module().trtllm_moe_allreduce_fusion(
+        world_size=world_size,
+        world_rank=world_rank,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=workspace_ptrs,
+        launch_with_pdl=launch_with_pdl,
+        residual_in=residual_in,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        scale_factor=scale_factor,
+        moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+        moe_reduction_scale_input=moe_reduction_scale_input,
+        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+        moe_reduction_token_input=moe_reduction_token_input,
+        layout_code=layout_code,
+        allreduce_out=allreduce_out,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
     )
