@@ -1,5 +1,6 @@
 # Include the custom torch extension helper module
 include(ConfigureTorchExtension)
+include(${CMAKE_SOURCE_DIR}/cmake/utils/ConfigurePrebuitUris.cmake)
 
 if(FLASHINFER_ENABLE_CUDA)
   message(STATUS "Building FlashInfer Torch CUDA Extnesion")
@@ -37,6 +38,7 @@ file(
   "${CMAKE_CURRENT_SOURCE_DIR}/flashinfer_ops_hip.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/norm_hip.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/page_hip.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/rope_hip.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/single_decode_hip.cu")
 
 # SM90-specific sources
@@ -74,31 +76,31 @@ set(COMMON_LIBS cublas cublasLt)
 
 # cmake-format: off
 if(FLASHINFER_ENABLE_HIP)
-    # Build an extension only with the decode kernels
-    add_hip_torch_extension(
-      EXT_NAME flashinfer_hip_kernels
-      SOURCES
-        ${KERNEL_HIP_SOURCES}
-      INCLUDE_DIRS
-        ${COMMON_HIP_INCLUDE_DIRS}
-      LINK_LIBS
-        $<$<TARGET_EXISTS:flashinfer::decode_kernels>:flashinfer::decode_kernels>
-      COMPILE_FLAGS
-        $<$<COMPILE_LANGUAGE:CXX>:-Wno-switch-bool>
-      PY_LIMITED_API ${FLASHINFER_PY_LIMITED_API}
-      MIN_PYTHON_ABI "${FLASHINFER_MIN_PYTHON_ABI}"
-    )
-    target_compile_definitions(flashinfer_hip_kernels
-                             PRIVATE FLASHINFER_ENABLE_HIP)
-    set_target_properties(
-      flashinfer_hip_kernels
-      PROPERTIES INSTALL_RPATH
-                 "${FLASHINFER_RPATH_BASE};${FLASHINFER_RPATH_BASE}/../lib"
-                 HIP_SOURCES_PROPERTY_FORMAT 1
-                HIP_SEPARABLE_COMPILATION ON
-                LINKER_LANGUAGE HIP)
-    # Install the extension to flashinfer directory
-    install(TARGETS flashinfer_hip_kernels DESTINATION flashinfer)
+  # Build an extension only with the decode kernels
+  add_hip_torch_extension(
+    EXT_NAME flashinfer_hip_kernels
+    SOURCES
+      ${KERNEL_HIP_SOURCES}
+    INCLUDE_DIRS
+      ${COMMON_HIP_INCLUDE_DIRS}
+    LINK_LIBS
+      $<$<TARGET_EXISTS:flashinfer::decode_kernels>:flashinfer::decode_kernels>
+    COMPILE_FLAGS
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-switch-bool>
+    PY_LIMITED_API ${FLASHINFER_PY_LIMITED_API}
+    MIN_PYTHON_ABI "${FLASHINFER_MIN_PYTHON_ABI}"
+  )
+  target_compile_definitions(flashinfer_hip_kernels
+                            PRIVATE FLASHINFER_ENABLE_HIP)
+  set_target_properties(
+    flashinfer_hip_kernels
+    PROPERTIES INSTALL_RPATH
+                "${FLASHINFER_RPATH_BASE};${FLASHINFER_RPATH_BASE}/../lib"
+                HIP_SOURCES_PROPERTY_FORMAT 1
+              HIP_SEPARABLE_COMPILATION ON
+              LINKER_LANGUAGE HIP)
+  # Install the extension to flashinfer directory
+  install(TARGETS flashinfer_hip_kernels DESTINATION flashinfer)
 
 elseif(FLASHINFER_ENABLE_CUDA)
   # Build an extension only with the decode kernels
@@ -158,4 +160,5 @@ if(FLASHINFER_ENABLE_SM90 AND KERNEL_SM90_SOURCES)
   install(TARGETS flashinfer_kernels_sm90 DESTINATION flashinfer)
 endif()
 
+flashinfer_configure_prebuilt_uris()
 message(STATUS "FlashInfer AOT PyTorch extensions configured")

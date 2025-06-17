@@ -15,7 +15,9 @@ limitations under the License.
 """
 
 import ctypes
+import importlib.util
 import os
+from typing import Optional, Set
 
 # Re-export
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
@@ -60,37 +62,70 @@ from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
-)
-if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
-    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+
+def _get_extension_path(name: str) -> Optional[str]:
+    """Try to find installed extension module"""
+    try:
+        spec = importlib.util.find_spec(name)
+        if spec and spec.origin:
+            return spec.origin
+        return None
+    except (ImportError, ModuleNotFoundError):
+        return None
 
 
+# noqa: F401
+has_prebuilt_ops = False
+from .core import logger
+
+# Try and Except to break circular dependencies
 try:
-    # Only try to import SM90 kernels if they were enabled during build
-    from .. import flashinfer_kernels  # noqa: F401
+    from ..__aot_prebuilt_uris__ import prebuilt_ops_uri
     from .. import __config__
 
-    if __config__.aot_torch_exts_cuda and 90 in __config__.aot_torch_exts_cuda_archs:
+    if __config__.get_info("aot_torch_exts_cuda"):
         try:
-            from .. import flashinfer_kernels_sm90  # noqa: F401
-        except ImportError:
-            from .core import logger
+            from .. import flashinfer_kernels
 
+            has_prebuilt_ops = True
+            kernels_path = _get_extension_path("flashinfer.flashinfer_kernels")
+            
+        except ImportError:
             logger.warning(
-                "SM90 kernels were enabled in build but couldn't be imported"
+                "CUDA kernels were enabled in build but couldn't be imported"
             )
 
-    from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
+        # Only try to import SM90 kernels if they were enabled during build
+        if 90 in __config__.get_info("aot_torch_exts_cuda_archs"):
+            try:
+                from .. import flashinfer_kernels_sm90  # noqa: F401
 
-    has_prebuilt_ops = True
-except ImportError as e:
-    if "undefined symbol" in str(e):
-        raise ImportError("Loading prebuilt ops failed.") from e
+                has_prebuilt_ops = True
+                kernels_sm90_path = _get_extension_path(
+                    "flashinfer.flashinfer_kernels_sm90"
+                )
+                
+            except ImportError:
+                logger.warning(
+                    "SM90 kernels were enabled in build but couldn't be imported"
+                )
 
-    from .core import logger
+    if __config__.get_info("aot_torch_exts_hip"):
+        try:
+            from .. import flashinfer_hip_kernels  # noqa: F401
+            logger.info("Loading prebuilt HIP kernels")
+            has_prebuilt_ops = True
 
+            kernels_hip_path = _get_extension_path(
+                "flashinfer.flashinfer_hip_kernels"
+            )
+
+        except ImportError as e:
+            print(e)
+            logger.warning("HIP kernels were enabled in build but couldn't be imported")
+
+except ImportError:
+    pass
+
+if not has_prebuilt_ops:
     logger.info("Prebuilt kernels not found, using JIT backend")
-    prebuilt_ops_uri = {}
-    has_prebuilt_ops = False

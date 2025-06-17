@@ -1,0 +1,13 @@
+#include <flashinfer/hip/attention/decode.hip.h>
+#include "single_decode_config_hip.inc"
+
+using namespace flashinfer;
+
+namespace flashinfer {
+
+template hipError_t SingleDecodeWithKVCacheDispatched<
+    {{ head_dim_qk }}, {{ pos_encoding_mode }}, {{ variant_name }}, Params>(
+    Params params, {{ dtype_o }}* tmp,
+    hipStream_t stream);
+
+};

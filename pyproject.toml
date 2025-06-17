@@ -14,7 +14,6 @@ authors = [
     {name = "FlashInfer Team"}
 ]
 dependencies = [
-    "torch>=2.4",
     "numpy",
 ]
 
@@ -27,12 +26,13 @@ dev = [
 requires = [
     "scikit-build-core>=0.4.3",
     "setuptools_scm>=8.0.0",
-    "torch >= 2.4",
+    "torch >= 2.6",
     "numpy",
 ]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
+cmake.build-type = "Release"
 editable.rebuild = true
 build.verbose = true
 logging.level = "INFO"
@@ -80,15 +80,18 @@ include = [
 # Base CMake definitions - applied to all builds
 [tool.scikit-build.cmake.define]
 FLASHINFER_CUTLASS_DIR = {env="FLASHINFER_CUTLASS_DIR", default="3rdparty/cutlass"}
-FLASHINFER_CUDA_ARCHITECTURES = "80"
+FLASHINFER_CUDA_ARCHITECTURES = {env="FLASHINFER_CUDA_ARCHITECTURES", default="80"}
+FLASHINFER_HIP_ARCHITECTURES = {env="FLASHINFER_HIP_ARCHITECTURES", default="gfx942"}
 TORCH_CUDA_ARCH_LIST = "8.0"
 FLASHINFER_BUILD_WHEELS="ON"
 FLASHINFER_AOT_TORCH_EXTS = {env="FLASHINFER_AOT_TORCH_EXTS", default="OFF"}
 FLASHINFER_ENABLE_F16="ON"
 FLASHINFER_ENABLE_BF16="ON"
-FLASHINFER_ENABLE_FP8="ON"
-FLASHINFER_ENABLE_FP8_E4M3="ON"
-FLASHINFER_ENABLE_FP8_E5M2="ON"
+FLASHINFER_ENABLE_FP8="OFF"
+FLASHINFER_ENABLE_FP8_E4M3="OFF"
+FLASHINFER_ENABLE_FP8_E5M2="OFF"
+FLASHINFER_ENABLE_CUDA = {env="FLASHINFER_ENABLE_CUDA", default="OFF"}
+FLASHINFER_ENABLE_HIP = {env="FLASHINFER_ENABLE_HIP", default="ON"}
 
 [tool.setuptools_scm]
 write_to = "flashinfer/_version.py"

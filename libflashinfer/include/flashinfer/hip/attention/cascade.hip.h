@@ -8,7 +8,6 @@
 #define FLASHINFER_CASCADE_CUH_
 
 #include "../cp_async.hip.h"
-#include "../math.hip.h"
 #include "../utils.hip.h"
 #include "state.hip.h"
 
@@ -228,7 +227,14 @@ __global__ void MergeStatesKernel(DTypeIn *__restrict__ V,
 
     if (num_index_sets == 0) {
         vec_t<DTypeO, vec_size> v;
-        v.fill(DTypeO(0.f));
+        const float zeroF = 0.f;
+        // Use type-specific conversion based on what DTypeO is
+        if constexpr (std::is_same_v<DTypeO, __hip_bfloat16>) {
+            v.fill(__float2bfloat16(zeroF));
+        }
+        else {
+            v.fill(DTypeO(zeroF));
+        }
         v.store(v_merged + (pos * num_heads + head_idx) * head_dim +
                 tx * vec_size);
         if (s_merged != nullptr) {
@@ -311,7 +317,7 @@ MergeStatesLargeNumIndexSetsKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
     float *s_smem =
         (float *)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
-
+    static_assert(bdy > 0);
 #pragma unroll
     for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch,
@@ -422,6 +428,7 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
     uint32_t cta_id = blockIdx.x;
     uint32_t num_ctas = gridDim.x;
     const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+    assert(num_ctas > 0);
     uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
     constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
     constexpr uint32_t head_dim = vec_size * bdx;
@@ -429,7 +436,7 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
     float *s_smem =
         (float *)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
-
+    static_assert(bdy > 0);
 #pragma unroll 1
     for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
         uint32_t pos = i / num_heads;
@@ -439,7 +446,14 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
 
         if (num_index_sets == 0) {
             vec_t<DTypeO, vec_size> v;
-            v.fill(DTypeO(0.f));
+            const float zeroF = 0.f;
+            // Use type-specific conversion based on what DTypeO is
+            if constexpr (std::is_same_v<DTypeO, __hip_bfloat16>) {
+                v.fill(__float2bfloat16(zeroF));
+            }
+            else {
+                v.fill(DTypeO(zeroF));
+            }
             v.store(v_merged + (pos * num_heads + head_idx) * head_dim +
                     tx * vec_size);
             if (s_merged != nullptr) {
@@ -542,6 +556,7 @@ PersistentVariableLengthAttentionSumKernel(DTypeIn *__restrict__ V,
     uint32_t cta_id = blockIdx.x;
     uint32_t num_ctas = gridDim.x;
     const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+    assert(num_ctas > 0);
     uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
     constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
     constexpr uint32_t head_dim = vec_size * bdx;
@@ -549,7 +564,7 @@ PersistentVariableLengthAttentionSumKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
 
     vec_t<float, vec_size> v_sum_vec;
-
+    static_assert(bdy > 0);
 #pragma unroll 1
     for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
         uint32_t pos = i / num_heads;
@@ -652,7 +667,8 @@ hipError_t MergeState(DTypeIn *v_a,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+        16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
+
         uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -690,7 +706,7 @@ hipError_t MergeStateInPlace(DType *v,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DType), HEAD_DIM / 32U);
+        16U / sizeof(DType) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DType);
         uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -728,8 +744,7 @@ hipError_t MergeStates(DTypeIn *v,
                        hipStream_t stream = nullptr)
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+        constexpr uint32_t vec_size = 16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         if (num_index_sets >= seq_len) {
             constexpr uint32_t num_threads = 128;
@@ -775,7 +790,7 @@ hipError_t AttentionSum(DTypeIn *v,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+        16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -805,10 +820,11 @@ hipError_t VariableLengthMergeStates(DTypeIn *v,
     CHECK_HIP_ERROR(hipGetDevice(&dev_id));
     CHECK_HIP_ERROR(hipDeviceGetAttribute(
         &num_sms, hipDeviceAttributeMultiprocessorCount, dev_id));
-
+    assert(num_sms > 0);
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+        constexpr uint32_t temp_1st = 16U / sizeof(DTypeIn);
+        constexpr uint32_t temp_2nd = HEAD_DIM / 32U;
+        constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         constexpr uint32_t num_threads = 128;
         constexpr uint32_t bdy = num_threads / bdx;
@@ -853,10 +869,11 @@ hipError_t VariableLengthAttentionSum(DTypeIn *v,
     CHECK_HIP_ERROR(hipGetDevice(&dev_id));
     CHECK_HIP_ERROR(hipDeviceGetAttribute(
         &num_sms, hipDeviceAttributeMultiprocessorCount, dev_id));
-
+    assert(num_sms > 0);
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t vec_size =
-            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+        constexpr uint32_t temp_1st = 16U / sizeof(DTypeIn);
+        constexpr uint32_t temp_2nd = HEAD_DIM / 32U;
+        constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         constexpr uint32_t num_threads = 128;
         constexpr uint32_t bdy = num_threads / bdx;

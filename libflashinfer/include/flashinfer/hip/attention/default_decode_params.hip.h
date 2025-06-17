@@ -3,10 +3,10 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
+#pragma once
 #ifndef FLASHINFER_DECODE_PARAMS_CUH_
 #define FLASHINFER_DECODE_PARAMS_CUH_
 
-#include "../layout.hip.h"
 #include "../page.hip.h"
 
 #include <hip/hip_runtime.h>

@@ -17,25 +17,24 @@ limitations under the License.
 """
 FlashInfer: Fast Attention Algorithms for LLM Inference
 """
+import ctypes
 import os
+import sys
 from pathlib import Path
-
+from .__aot_prebuilt_uris__ import prebuilt_ops_uri
 try:
     from .__config__ import __version__, get_info, show
-except ImportError:
-    __version__ = "0.0.0+dev"
 
-    def get_info(name=None):
-        info = {"version": __version__}
-        if name is None:
-            return info
-        return info.get(name)
+    if __config__.get_info("enable_cuda"):
+        cuda_lib_path = os.environ.get(
+            "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+        )
+        if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
+            ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
 
-    def show():
-        print("FlashInfer development configuration")
-        print(f"version: {__version__}")
-
-
+except ImportError as e:
+    print(f"Failed to import __config__: {e}")
+    raise e
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
@@ -124,4 +123,5 @@ __all__ = [
     "get_info",
     "get_tvm_binding_dir",
     "show",
+    "prebuilt_ops_uri"
 ]

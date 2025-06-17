@@ -10,10 +10,9 @@
 #define FLASHINFER_MATH_CUH_
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_runtime_api.h>
-
 #include <hip/hip_fp16.h>
 
+#include "hip_platform.h"
 #include <cstdint>
 
 namespace flashinfer::math
@@ -65,32 +64,18 @@ __forceinline__ __device__ float ptx_log2(float x) { return __log2f(x); }
 /// @return Returns 1 / x in round-to-nearest-even mod.
 __forceinline__ __device__ float ptx_rcp(float x) { return __frcp_rn(x); }
 
-// clang-format off
 template <typename T>
-__forceinline__ __device__ T shfl_xor_sync(T x, int lane_mask);
-
-// TODO: Fix this - Why is this 0xffffffffffffffff? How to paramterically
-// determine warp size?
-/// @brief Perform butterfly shuffle between threads in a warp
-/// @param x The value in the source lane
-/// @param lane_mask The mask to perform thread index xor with
-template<>
-__forceinline__ __device__ float shfl_xor_sync<float>(float x, int lane_mask) {
-  // 0xffffffffffffffff ensures the full warp is considered
-  return __shfl_xor_sync(0xffffffffffffffff, x, lane_mask);
+__forceinline__ __device__ T shfl_xor_sync(T x, int lane_mask)
+{
+    // FIXME (diptorupd): The shfl_xor_sync is used to implement a butterfly
+    // reduction pattern. The caller in decode.cuh most likely assumes that the
+    // warp size is 32 and the lane_mask is going from 16, 8, 4, 2, 1.
+    // Given that AMDGPU for CDNA3 has a warp size of 64, the lane_mask based on
+    // the warp size of 32 might lead to incorrect exchanges between the
+    // threads. The issue requires further investigation, for now I have hard
+    // coded the warp size to 32 when calling shfl_xor.
+    return __shfl_xor(x, lane_mask, 32);
 }
-
-// TODO: Fix this - Why is this 0xffffffffffffffff? How to paramterically
-// determine warp size?
-/// @brief Perform butterfly shuffle between threads in a warp
-/// @param x Vector of two values in the source lane
-/// @param lane_mask The mask to perform thread index xor with
-template<>
-__forceinline__ __device__ __half2 shfl_xor_sync<__half2>(__half2 x, int lane_mask) {
-  // 0xffffffffffffffff ensures the full warp is considered
-  return __shfl_xor_sync(0xffffffffffffffff, x, lane_mask);
-}
-// clang-format on
 
 /// @brief Wrapper for math intrinsic 1/sqrt(x)
 /// @param x Input param - float dtype
@@ -125,4 +110,4 @@ template <> __forceinline__ __device__ __half2 tanh<__half2>(__half2 x)
 }
 
 } // namespace flashinfer::math
-#endif // FLASHINFER_MATH_CUH_
+#endif  // FLASHINFER_MATH_CUH_

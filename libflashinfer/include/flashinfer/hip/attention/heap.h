@@ -3,6 +3,7 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
+#pragma once
 #ifndef FLASHINFER_ATTENTION_HEAP_H
 #define FLASHINFER_ATTENTION_HEAP_H
 

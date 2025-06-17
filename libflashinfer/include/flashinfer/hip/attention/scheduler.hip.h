@@ -3,6 +3,7 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
+#pragma once
 #ifndef FLASHINFER_ATTENTION_SCHEDULER_CUH_
 #define FLASHINFER_ATTENTION_SCHEDULER_CUH_
 
@@ -86,6 +87,7 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
     while (low < high) {
         uint32_t mid = (low + high) / 2;
         new_batch_size = 0;
+        assert(mid > 0);
         for (const IdType &elem : num_pages) {
             new_batch_size += ceil_div(elem, mid);
         }
@@ -97,6 +99,7 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
         }
     }
     new_batch_size = 0;
+    assert(low > 0);
     for (const IdType &elem : num_pages) {
         new_batch_size += ceil_div(std::max(elem, 1), low);
     }
@@ -120,9 +123,11 @@ PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
     int64_t low = min_kv_chunk_size;
     int64_t high = max_kv_len;
     constexpr int64_t min_kv_len = 1;
+    assert(qo_chunk_size > 0);
     while (low < high) {
         const int64_t mid = (low + high) / 2;
         int64_t new_batch_size = 0;
+        assert(mid > 0);
         for (uint32_t i = 0; i < batch_size; ++i) {
             new_batch_size +=
                 ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
@@ -176,15 +181,18 @@ inline hipError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
 {
     using DTypeKV = typename Params::DTypeKV;
     using IdType = typename Params::IdType;
-    constexpr uint32_t vec_size =
-        std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+    constexpr uint32_t temp_1st = 16UL / sizeof(DTypeKV);
+    constexpr uint32_t temp_2nd = HEAD_DIM / 32UL;
+    constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
     auto compute_capacity = GetCudaComputeCapability();
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(
         compute_capacity, NUM_STAGES_SMEM, {
             constexpr uint32_t bdx = HEAD_DIM / vec_size;
             static_assert(bdx <= 32);
             constexpr uint32_t bdy = GROUP_SIZE;
-            constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+            constexpr uint32_t num_threads = 128U < bdx * bdy ? bdx * bdy : 128U;
+            static_assert(bdx > 0);
+            static_assert(bdy > 0);
             constexpr uint32_t bdz = num_threads / (bdx * bdy);
             constexpr uint32_t tile_size_per_bdx =
                 GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
@@ -268,15 +276,17 @@ inline hipError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     auto compute_capacity = GetCudaComputeCapability();
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(
         compute_capacity, NUM_STAGES_SMEM, {
-            constexpr uint32_t vec_size_ckv =
-                std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+            constexpr uint32_t temp_1st = 16UL / sizeof(DTypeKV);
+            constexpr uint32_t temp_2nd = HEAD_DIM_CKV / 32UL;
+            constexpr uint32_t vec_size_ckv = temp_1st < temp_2nd ? temp_2nd : temp_1st;
             constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
             constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
             constexpr uint32_t bdy = 8;
             constexpr uint32_t tile_size_qo_heads = 2;
             constexpr uint32_t qo_heads_per_block = bdy * tile_size_qo_heads;
-            constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+            static_assert(qo_heads_per_block > 0);
+            constexpr uint32_t num_threads = 128U < bdx * bdy ? bdx * bdy : 128U;
             constexpr uint32_t bdz = num_threads / (bdx * bdy);
             gdy = ceil_div(num_qo_heads, qo_heads_per_block);
 
@@ -596,7 +606,7 @@ inline hipError_t DecodePlan(void *float_buffer,
 
     FLASHINFER_CUDA_CALL(hipMemcpyAsync(int_buffer, page_locked_int_buffer,
                                         num_bytes_to_copy,
-                                        cudaMemcpyHostToDevice, stream));
+                                        hipMemcpyHostToDevice, stream));
     return hipSuccess;
 }
 
@@ -921,7 +931,7 @@ inline hipError_t PrefillPlan(void *float_buffer,
     size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
     FLASHINFER_CUDA_CALL(hipMemcpyAsync(int_buffer, page_locked_int_buffer,
                                         num_bytes_to_copy,
-                                        cudaMemcpyHostToDevice, stream));
+                                        hipMemcpyHostToDevice, stream));
 
     return hipSuccess;
 }
@@ -1172,7 +1182,7 @@ inline hipError_t PrefillSM90Plan(void *float_buffer,
     size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
     FLASHINFER_CUDA_CALL(hipMemcpyAsync(int_buffer, page_locked_int_buffer,
                                         num_bytes_to_copy,
-                                        cudaMemcpyHostToDevice, stream));
+                                        hipMemcpyHostToDevice, stream));
     return hipSuccess;
 }
 
@@ -1351,6 +1361,7 @@ inline hipError_t MLAPlan(void *float_buffer,
         return ceil_div(x, 256) * 256;
     };
 
+    assert(num_clusters > 0);
     int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
 
     // step 1. load-balancing scheduling algorithm
@@ -1583,7 +1594,7 @@ inline hipError_t MLAPlan(void *float_buffer,
     size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
     FLASHINFER_CUDA_CALL(hipMemcpyAsync(int_buffer, page_locked_int_buffer,
                                         num_bytes_to_copy,
-                                        cudaMemcpyHostToDevice, stream));
+                                        hipMemcpyHostToDevice, stream));
 
     constexpr size_t sizeof_dtype_o = 2;
     AlignedAllocator float_allocator(float_buffer,

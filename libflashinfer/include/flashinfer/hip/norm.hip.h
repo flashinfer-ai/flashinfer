@@ -2,7 +2,7 @@
 // SPDX - FileCopyrightText : 2025 Advanced Micro Devices, Inc.
 //
 // SPDX - License - Identifier : Apache 2.0
-
+#pragma once
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
@@ -47,7 +47,7 @@ __global__ void RMSNormKernel(T *__restrict__ input,
 
     for (uint32_t i = 0; i < rounds; i++) {
         vec_t<T, VEC_SIZE> input_vec;
-        input_vec.fill(0.f);
+        input_vec.fill(0.0);
         if ((i * num_threads + thread_id) * VEC_SIZE < d) {
             input_vec.load(input + bx * stride_input +
                            i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -130,8 +130,8 @@ hipError_t RMSNorm(T *input,
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         auto kernel = RMSNormKernel<VEC_SIZE, T>;
-        FLASHINFER_CUDA_CALL(hipFuncSetAttribute(
-            kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        hipFuncSetAttribute(
+            (void*)kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         RMSNormKernel<VEC_SIZE, T><<<nblks, nthrs, smem_size, stream>>>(
             input, weight, output, d, stride_input, stride_output, weight_bias,
             eps);
@@ -271,8 +271,8 @@ hipError_t FusedAddRMSNorm(T *input,
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-        FLASHINFER_CUDA_CALL(hipFuncSetAttribute(
-            kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        hipFuncSetAttribute(
+            (void*)kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         FusedAddRMSNormKernel<VEC_SIZE, T><<<nblks, nthrs, smem_size, stream>>>(
             input, residual, weight, d, stride_input, stride_residual,
             weight_bias, eps);
@@ -304,8 +304,8 @@ hipError_t GemmaRMSNorm(T *input,
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         auto kernel = RMSNormKernel<VEC_SIZE, T>;
-        FLASHINFER_CUDA_CALL(hipFuncSetAttribute(
-            kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        hipFuncSetAttribute(
+            (void*)kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         RMSNormKernel<VEC_SIZE, T><<<nblks, nthrs, smem_size, stream>>>(
             input, weight, output, d, stride_input, stride_output, weight_bias,
             eps);
@@ -338,14 +338,11 @@ hipError_t GemmaFusedAddRMSNorm(T *input,
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
         auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-        FLASHINFER_CUDA_CALL(hipFuncSetAttribute(
-            kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        hipFuncSetAttribute(
+            (void*)kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         FusedAddRMSNormKernel<VEC_SIZE, T><<<nblks, nthrs, smem_size, stream>>>(
             input, residual, weight, d, stride_input, stride_residual,
             weight_bias, eps);
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &config, kernel, input, residual, weight, d, stride_input,
-            stride_residual, weight_bias, eps));
     });
 
     return hipSuccess;

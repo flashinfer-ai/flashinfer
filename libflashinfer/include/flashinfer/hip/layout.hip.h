@@ -25,20 +25,20 @@ enum class QKVLayout
     kHND = 1U
 };
 
-__host__ __device__ size_t get_elem_offset_impl(size_t elem_idx,
-                                                size_t head_idx,
-                                                size_t feat_idx,
-                                                size_t stride_n,
-                                                size_t stride_h)
+__host__ __device__ __inline__ size_t get_elem_offset_impl(size_t elem_idx,
+                                                           size_t head_idx,
+                                                           size_t feat_idx,
+                                                           size_t stride_n,
+                                                           size_t stride_h)
 {
     return elem_idx * stride_n + head_idx * stride_h + feat_idx;
 }
 
-__host__ auto get_qkv_strides(QKVLayout kv_layout,
-                              uint32_t kv_len,
-                              uint32_t num_qo_heads,
-                              uint32_t num_kv_heads,
-                              uint32_t head_dim)
+__host__ __inline__ auto get_qkv_strides(QKVLayout kv_layout,
+                                         uint32_t kv_len,
+                                         uint32_t num_qo_heads,
+                                         uint32_t num_kv_heads,
+                                         uint32_t head_dim)
 {
     const uint32_t q_stride_n = num_qo_heads * head_dim, q_stride_h = head_dim,
                    kv_stride_n = (kv_layout == QKVLayout::kNHD)

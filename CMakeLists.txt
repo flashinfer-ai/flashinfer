@@ -168,6 +168,7 @@ if(FLASHINFER_ENABLE_HIP)
     "-D__HIP_PLATFORM_AMD__=1"
     "-D__HIP_ROCclr__=1"
     "-fno-gpu-rdc"
+    "-fPIC"
   )
   # cmake-format: on
 

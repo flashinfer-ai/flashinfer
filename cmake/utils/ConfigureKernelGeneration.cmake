@@ -80,10 +80,18 @@ function(flashinfer_configure_kernel_generation)
     execute_process(
       COMMAND ${AOT_GENERATE_COMMAND}
       WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+      OUTPUT_VARIABLE PREBUILT_URI
       RESULT_VARIABLE GEN_RESULT)
     if(NOT GEN_RESULT EQUAL 0)
       message(FATAL_ERROR "Kernel generation failed with error ${GEN_RESULT}")
     endif()
+
+    set_property(GLOBAL PROPERTY FLASHINFER_PREBUILT_URIS "${PREBUILT_URI}")
+    set(FLASHINFER_PREBUILT_URIS_CACHE
+        "${PREBUILT_URI}"
+        CACHE STRING
+              "Cached value of FLASHINFER_PREBUILT_URIS_CACHE global property"
+              FORCE)
 
     execute_process(
       COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}

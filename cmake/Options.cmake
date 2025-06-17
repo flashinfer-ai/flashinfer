@@ -15,11 +15,9 @@
 
 # === BUILD COMPONENT OPTIONS ===
 # Core FlashInfer kernel libraries (C++ libraries used by all components)
-# flashinfer_option(FLASHINFER_BUILD_KERNELS
-#   "Build and install kernel libraries (required for AOT PyTorch extensions)" OFF)
 
 flashinfer_option(FLASHINFER_BUILD_KERNELS
-  "Build and install kernel libraries (required for AOT PyTorch extensions)" ON)
+  "Build and install kernel libraries (required for AOT PyTorch extensions)" OFF)
 
 flashinfer_option(FLASHINFER_TVM_BINDING "Build TVM binding support" OFF)
 flashinfer_option(FLASHINFER_DISTRIBUTED "Build distributed support" OFF)
@@ -86,6 +84,51 @@ flashinfer_option(FLASHINFER_HIP_ARCHITECTURES "AMD GPU architectures to target"
 if(FLASHINFER_AOT_TORCH_EXTS AND NOT (FLASHINFER_ENABLE_CUDA OR FLASHINFER_ENABLE_HIP))
   message(FATAL_ERROR "Building AOT PyTorch extensions require "
   "FLASHINFER_ENABLE_CUDA or FLASHINFER_ENABLE_HIP to be specified.")
+endif()
+
+# PyTorch extensions require kernels to be built
+if(FLASHINFER_AOT_TORCH_EXTS AND NOT FLASHINFER_BUILD_KERNELS)
+  message(STATUS "Building AOT PyTorch extensions require FLASHINFER_BUILD_KERNELS, enabling it")
+  set(FLASHINFER_BUILD_KERNELS ON CACHE BOOL "Build kernels (required by PyTorch extensions)" FORCE)
+endif()
+
+
+if(FLASHINFER_AOT_TORCH_EXTS)
+  get_property(HAS_CACHE_VAR CACHE FLASHINFER_PREBUILT_URIS_CACHE PROPERTY VALUE SET)
+  if(HAS_CACHE_VAR)
+    get_property(CACHED_VALUE CACHE FLASHINFER_PREBUILT_URIS_CACHE PROPERTY VALUE)
+    set_property(GLOBAL PROPERTY FLASHINFER_PREBUILT_URIS "${CACHED_VALUE}")
+    message(STATUS "Restored FLASHINFER_PREBUILT_URIS from cache")
+  else()
+    set_property(GLOBAL PROPERTY FLASHINFER_PREBUILT_URIS "")
+    set(FLASHINFER_PREBUILT_URIS_CACHE "" CACHE STRING
+        "Cached value of FLASHINFER_PREBUILT_URIS_CACHE global property" FORCE)
+  endif()
+endif()
+
+# Enabling both CUDA and HIP at the same time is not supported
+if(FLASHINFER_ENABLE_HIP AND FLASHINFER_ENABLE_CUDA)
+  message(FATAL_ERROR "Enabling both CUDA and HIP backends at the same time is not supported.")
+endif()
+
+# Handle CUDA architectures
+if(FLASHINFER_CUDA_ARCHITECTURES)
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES set to ${FLASHINFER_CUDA_ARCHITECTURES}.")
+else()
+  # No user-provided architectures, try to detect the CUDA archs based on where
+  # the project is being built
+  set(detected_archs "")
+  detect_cuda_architectures(detected_archs)
+  if(detected_archs)
+    set(FLASHINFER_CUDA_ARCHITECTURES ${detected_archs} CACHE STRING
+        "CUDA architectures" FORCE)
+    message(STATUS "Setting FLASHINFER_CUDA_ARCHITECTURES to detected values: ${FLASHINFER_CUDA_ARCHITECTURES}")
+  else()
+    # No architectures detected, use safe defaults
+    set(FLASHINFER_CUDA_ARCHITECTURES "75;80;86" CACHE STRING
+        "CUDA architectures to compile for" FORCE)
+    message(STATUS "No architectures detected, using defaults: ${FLASHINFER_CUDA_ARCHITECTURES}")
+  endif()
 endif()
 
 # PyTorch extensions require kernels to be built
