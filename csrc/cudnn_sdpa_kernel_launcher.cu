@@ -195,6 +195,8 @@ __global__ static void __launch_bounds__(128)
   constexpr unsigned int TILE_N_1 = 128;
   constexpr unsigned int BYTES_PER_ELEMENT = 2;
 
+  bool kv_cache_enabled = d_qk == 192 ? false : true;
+
   std::array<uint32_t, DIMS_QKV> tensor_size_k = {d_qk, page_size, h_kv, total_num_pages};
   std::array<uint64_t, DIMS_QKV - 1> tensor_stride_k = {k_strides_2 * (BYTES_PER_ELEMENT),
                                                         k_strides_1 * (BYTES_PER_ELEMENT),
@@ -203,7 +205,8 @@ __global__ static void __launch_bounds__(128)
   std::array<uint64_t, DIMS_QKV - 1> tensor_stride_v = {v_strides_2 * (BYTES_PER_ELEMENT),
                                                         v_strides_1 * (BYTES_PER_ELEMENT),
                                                         v_strides_0 * (BYTES_PER_ELEMENT)};
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {64, std::min(TILE_N_1, page_size), 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {
+      64, kv_cache_enabled ? std::min(TILE_N_1, page_size) : TILE_N_1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_box_size_q = {64, TILE_M_1, 1, 1};
   std::array<uint32_t, DIMS_QKV> tensor_traversal_stride_qkv = {1, 1, 1, 1};
 
@@ -304,7 +307,7 @@ void setup_prefill(CUfunction* hfunc, int64_t d_qk, int64_t d_vo) {
   std::string kernel_name =
       d_qk == 192
           ? "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
-            "128x128x192ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
+            "128x128x192ILb1ELb0EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
             "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE"
           : "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
             "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
@@ -420,11 +423,21 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
 
   int64_t h_kv = k_cache.size(1);
   int64_t page_size = k_cache.size(2);
-  int64_t s_kv = (k_cache.size(0) / b) * page_size;
+  int64_t s_kv = (d_qk == 192) ? k_cache.size(2) : (k_cache.size(0) / b) * page_size;
 
   int64_t num_pages_per_seq = static_cast<int64_t>(std::ceil(1.0 * s_kv / page_size));
 
   int64_t total_num_pages = k_cache.size(0);
+
+  if (d_qk == 192) {
+    TORCH_CHECK(b == total_num_pages, "No paged kv cache support for d_qk = 192");
+    TORCH_CHECK(page_size == s_kv,
+                "No paged kv cache support for d_qk = 192. Hence page_size must be equal to s_kv");
+    TORCH_CHECK(num_pages_per_seq == 1,
+                "No paged kv cache support for d_qk = 192. Hence num_pages_per_seq must be 1");
+  }
+
+  bool kv_cache_enabled = d_qk == 192 ? false : true;
 
   // Step 3: Setup the launch configuration
 
@@ -483,8 +496,10 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
                                                         v_strides[0] * (BYTES_PER_ELEMENT)};
 
   std::array<uint32_t, DIMS_QKV> tensor_box_size_q = {64, TILE_M_1, 1, 1};
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {64, std::min(TILE_N_1, page_size), 1, 1};
-  std::array<uint32_t, DIMS_QKV> tensor_box_size_v = {64, std::min(TILE_N_1, page_size), 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_k = {
+      64, kv_cache_enabled ? std::min(TILE_N_1, page_size) : TILE_N_1, 1, 1};
+  std::array<uint32_t, DIMS_QKV> tensor_box_size_v = {
+      64, kv_cache_enabled ? std::min(TILE_N_1, page_size) : TILE_N_1, 1, 1};
 
   uint64_t batch_offset_qo = 0;
   int8_t* workspace_start = workspace_buffer.data_ptr<int8_t>();
@@ -559,7 +574,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
 
   void* actual_seq_lens_q_gpu_pointer = actual_seq_lens_q_gpu.data_ptr<int32_t>();
   void* actual_seq_lens_kv_gpu_pointer = actual_seq_lens_kv_gpu.data_ptr<int32_t>();
-  void* block_tables_pointer = block_tables.data_ptr<int32_t>();
+  void* block_tables_pointer = d_qk == 192 ? NULL : block_tables.data_ptr<int32_t>();
 
   auto print_cudaTmaDescTiled = [](tma::cudaTmaDescTiled* desc) {
     std::cout << std::hex;

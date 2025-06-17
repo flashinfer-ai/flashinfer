@@ -189,29 +189,26 @@ def test_cudnn_prefill(
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo", [8, 17, 1024])
 @pytest.mark.parametrize("s_kv", [8, 32])
-@pytest.mark.parametrize("page_size", [1, 8, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
-@pytest.mark.parametrize("head_dim_qk", [192])
-@pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_cudnn_prefill_d_qk_192(
+def test_cudnn_prefill_deepseek(
     batch_size,
     s_qo,
     s_kv,
-    page_size,
     num_kv_heads,
     num_qo_heads,
-    head_dim_qk,
-    head_dim_vo,
     causal,
     return_lse,
     use_cuda_graph,
 ):
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
+
+    head_dim_qk = 192
+    head_dim_vo = 128
 
     # test set up basics
     seed = 0
@@ -230,18 +227,14 @@ def test_cudnn_prefill_d_qk_192(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
 
-    # Initialize KV Cache
-    num_pages_per_seq = (s_kv + page_size - 1) // page_size
-    total_num_pages = num_pages_per_seq * batch_size
-
-    k_cache_shape = (total_num_pages, num_kv_heads, page_size, head_dim_qk)
-    v_cache_shape = (total_num_pages, num_kv_heads, page_size, head_dim_vo)
+    k_cache_shape = (batch_size, num_kv_heads, s_kv, head_dim_qk)
+    v_cache_shape = (batch_size, num_kv_heads, s_kv, head_dim_vo)
 
     k_cache_ = torch.randn(size=k_cache_shape, dtype=torch.bfloat16).to(device)
     k_cache = k_cache_.as_strided(
         k_cache_shape,
         (
-            page_size * num_kv_heads * head_dim_qk,
+            s_kv * num_kv_heads * head_dim_qk,
             head_dim_qk,
             num_kv_heads * head_dim_qk,
             1,
@@ -251,21 +244,11 @@ def test_cudnn_prefill_d_qk_192(
     v_cache = v_cache_.as_strided(
         v_cache_shape,
         (
-            page_size * num_kv_heads * head_dim_vo,
+            s_kv * num_kv_heads * head_dim_vo,
             head_dim_vo,
             num_kv_heads * head_dim_vo,
             1,
         ),
-    )
-
-    # Now initialize the page tables
-    block_tables = torch.tensor(
-        [
-            [k + i * num_pages_per_seq for k in range(num_pages_per_seq)]
-            for i in range(batch_size)
-        ],
-        dtype=torch.int,
-        device=device,
     )
 
     # Initialize scale
@@ -283,7 +266,6 @@ def test_cudnn_prefill_d_qk_192(
         max_sequence_kv=s_kv,
         actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
         causal=causal,
         return_lse=return_lse,
         use_cuda_graph=use_cuda_graph,
@@ -303,60 +285,48 @@ def test_cudnn_prefill_d_qk_192(
         .to(device)
     )
 
-    kv_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(
-                    (actual_seq_lens_kv_device.flatten() + page_size - 1) // page_size,
-                    dim=0,
-                ),
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    # kv_indptr = (
+    #     torch.cat(
+    #         [
+    #             torch.tensor([0], device=device),
+    #             torch.cumsum(
+    #                 (actual_seq_lens_kv_device.flatten() + page_size - 1) // page_size,
+    #                 dim=0,
+    #             ),
+    #         ]
+    #     )
+    #     .int()
+    #     .to(device)
+    # )
 
-    # kv_indices
-    kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
-    for i in range(len(kv_indptr) - 1):
-        start_idx = kv_indptr[i]
-        end_idx = kv_indptr[i + 1]
-        kv_indices[start_idx:end_idx] = torch.arange(
-            i * num_pages_per_seq,
-            i * num_pages_per_seq + (end_idx - start_idx),
-            device=device,
-        )
+    # # kv_indices
+    # kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
+    # for i in range(len(kv_indptr) - 1):
+    #     start_idx = kv_indptr[i]
+    #     end_idx = kv_indptr[i + 1]
+    #     kv_indices[start_idx:end_idx] = torch.arange(
+    #         i * num_pages_per_seq,
+    #         i * num_pages_per_seq + (end_idx - start_idx),
+    #         device=device,
+    #     )
+    # # Workspace buffer
+    # workspace_buffer_ref = torch.empty(
+    #     128 * 1024 * 1024, dtype=torch.int8, device=device
+    # )
 
-    # kv_last_page_len
-    kv_last_page_len = (
-        torch.where(
-            actual_seq_lens_kv_device.flatten() % page_size == 0,
-            torch.full((batch_size,), page_size, device=device),
-            actual_seq_lens_kv_device.flatten() % page_size,
-        )
-        .int()
-        .to(device)
-    )
-
-    # Workspace buffer
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
-
-    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer_ref, "HND"
-    )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        causal=causal,
-        q_data_type=torch.bfloat16,
-    )
+    # wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+    #     workspace_buffer_ref, "HND"
+    # )
+    # wrapper.plan(
+    #     qo_indptr,
+    #     kv_indptr,
+    #     num_qo_heads,
+    #     num_kv_heads,
+    #     head_dim_qk,
+    #     head_dim_vo=head_dim_vo,
+    #     causal=causal,
+    #     q_data_type=torch.bfloat16,
+    # )
 
     # output_ref = wrapper.run(q, k_cache, v_cache)
 

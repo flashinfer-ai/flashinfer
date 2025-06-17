@@ -17,13 +17,9 @@ limitations under the License.
 import os
 import platform
 import re
-import shutil
 import subprocess
-import tempfile
-from functools import wraps
 from pathlib import Path
 
-import pybind11
 import setuptools
 
 root = Path(__file__).parent.resolve()

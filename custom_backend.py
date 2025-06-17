@@ -9,7 +9,7 @@ _data_dir = _root / "flashinfer" / "data"
 _aot_ops_dir = _root / "aot-ops"
 _aot_ops_package_dir = _root / "build" / "aot-ops-package-dir"
 
-_requires_for_aot = ["torch", "ninja", "numpy", "pybind11"]
+_requires_for_aot = ["torch", "ninja", "numpy"]
 
 
 def _rm_aot_ops_package_dir():

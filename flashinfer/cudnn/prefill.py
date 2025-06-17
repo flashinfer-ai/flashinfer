@@ -17,7 +17,7 @@ def cudnn_batch_prefill_with_kv_cache(
     max_sequence_kv: int,
     actual_seq_lens_q: torch.Tensor,
     actual_seq_lens_kv: torch.Tensor,
-    block_tables: torch.Tensor,
+    block_tables: Optional[torch.Tensor] = None,
     causal: bool,
     return_lse: bool,
     batch_offsets: Optional[torch.Tensor] = None,
@@ -29,16 +29,17 @@ def cudnn_batch_prefill_with_kv_cache(
 
     Args:
         q: Query tensor of shape (Total number of tokens, num_heads_qo, head_dim)
-        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim)
-        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim)
+        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (batch_size, num_heads_kv, s_kv, d_qk)
+        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (batch_size, num_heads_kv, s_kv, d_vo)
         scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
         workspace_buffer: Workspace buffer for cuDNN operations. Scales with batch size. 128 MB should be sufficient for most cases
-        actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device,
+        max_token_per_sequence: Maximum number of tokens per query sequence (s_qo_max)
+        max_sequence_kv: Maximum number of tokens per key/value sequence (s_kv_max)
+        actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device (cpu if cuda_graph is False)
         actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU
         block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
-        num_pages_per_seq: Number of pages allocated per sequence (max_s_kv / page_size)
         causal: Whether to apply causal masking (must be True)
-        return_lse: Whether to return log-sum-exp values
+        return_lse: Whether to return log-sum-exp values (must be True)
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
         use_cuda_graph: Whether to use CUDA graph for the prefill operation
@@ -51,13 +52,20 @@ def cudnn_batch_prefill_with_kv_cache(
         Currently only supports causal attention (causal must be True)
         Query and KV heads can have different sizes (num_heads_qo >= num_heads_kv)
         When using cuda graph, actual_seq_lens_q and actual_seq_lens_kv must be on the same device as q
+        Head dimension of query and key must be 128 or 192
+        Head dimension of value and output must be 128
     """
 
+    d_qk = q.shape[2]
     h_qo = q.shape[1]
     num_sequences = actual_seq_lens_q.shape[0]
 
     assert causal, "Currently only supports causal attention"
     assert return_lse, "Currently only supports return_lse = True"
+
+    assert (d_qk == 192 and block_tables is None) or (
+        d_qk == 128 and block_tables is not None
+    ), "Currently only supports if d_qk = 192 and block_tables is None or d_qk = 128 and block_tables is not None"
 
     if max_sequence_kv is None:
         max_sequence_kv = max_token_per_sequence
