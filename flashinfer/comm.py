@@ -24,6 +24,19 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from pplx_kernels.nvshmem import (
+    nvshmem_alloc_empty_unique_id,
+    nvshmem_barrier_all_on_current_stream,
+    nvshmem_finalize,
+    nvshmem_get_unique_id,
+    nvshmem_init,
+    nvshmem_malloc,
+    nvshmem_alltoall,
+    nvshmem_my_pe,
+    nvshmem_n_pes,
+    nvshmem_sum_reduce
+)
+
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
@@ -921,3 +934,53 @@ def trtllm_moe_allreduce_fusion(
         quant_out=quant_out,
         scale_out=scale_out,
     )
+
+
+class MNNVLAllReduce:
+    """
+    A specialized AllReduce implementation for Multi-Node NVLink communication.
+    This class handles MNNVL-specific allreduce operations, optimized for NVLink-enabled clusters.
+    """
+
+    def __init__(
+        self,
+        local_rank: int,
+        world_size: int,
+        max_buffer_elements: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.dtype = dtype
+        self.device = device
+        self.max_buffer_elements = max_buffer_elements
+        # init nvshmem
+        uid = nvshmem_get_unique_id() if self.local_rank == 0 else nvshmem_alloc_empty_unique_id()
+        torch.distributed.broadcast(uid, src=0)
+        nvshmem_init(uid, self.local_rank, self.world_size)
+
+        # allocate memory in nvshmem symm heap
+        self.symm_buffer_input = nvshmem_malloc(
+            [max_buffer_elements],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.symm_buffer_input.fill_(0)
+        self.symm_buffer_output = nvshmem_malloc(
+            [max_buffer_elements],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.symm_buffer_output.fill_(0)
+
+    def all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        self.symm_buffer_input[:inp.numel()].copy_(inp)
+        nvshmem_barrier_all_on_current_stream()
+        nvshmem_sum_reduce(self.symm_buffer_output, self.symm_buffer_input, inp.numel())
+        out.copy_(self.symm_buffer_output[:inp.numel()])
+
+    def __del__(self):
+        del self.symm_buffer_input
+        del self.symm_buffer_output
+        nvshmem_finalize()
