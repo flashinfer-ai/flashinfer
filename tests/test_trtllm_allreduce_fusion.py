@@ -72,7 +72,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     dist.barrier(group=group)
                                     test_passed = True
                                     print(
-                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
+                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
                                     )
                                     dist.barrier(group=group)
                                     torch.cuda.synchronize()
@@ -243,11 +243,11 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     dist.barrier(group=group)
                                     if test_passed:
                                         print(
-                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
                                         )
                                     else:
                                         print(
-                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
                                         )
     finally:
         dist.barrier(group=group)
