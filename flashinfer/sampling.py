@@ -41,6 +41,24 @@ def gen_sampling_module() -> JitSpec:
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
+    @register_custom_op("flashinfer::softmax", mutates_args=())
+    def softmax(
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = logits.float()
+        probs = torch.empty_like(logits, device=logits.device)
+        module.softmax.default(
+            logits,
+            probs,
+        )
+        return probs
+
+    @register_fake_op("flashinfer::softmax")
+    def _fake_softmax(
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(logits, device=logits.device)
+
     # torch library for sampling_from_logits
     @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
     def sampling_from_logits(
@@ -407,6 +425,7 @@ def get_sampling_module():
 
     # Register the module
     return SimpleNamespace(
+        softmax=softmax,
         sampling_from_probs=sampling_from_probs,
         sampling_from_logits=sampling_from_logits,
         top_p_sampling_from_probs=top_p_sampling_from_probs,
@@ -425,6 +444,45 @@ def _to_tensor_scalar_tuple(x):
         return (x, 0)
     else:
         return (None, x)
+
+
+def softmax(
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_.
+
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Input tensor of logits.
+
+    Returns
+    -------
+    probs : torch.Tensor
+        Tensor of the same shape as input containing the softmax probabilities.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> logits = torch.rand(batch_size, vocab_size).to(0)
+    >>> logits
+    tensor([[0.8823, 0.9150, 0.3829, 0.9593, 0.3904],
+            [0.6009, 0.2566, 0.7936, 0.9408, 0.1332],
+            [0.9346, 0.5936, 0.8694, 0.5677, 0.7411],
+            [0.4294, 0.8854, 0.5739, 0.2666, 0.6274]], device='cuda:0')
+    >>> probs = flashinfer.sampling.softmax(logits)
+    >>> probs
+    tensor([[0.2309, 0.2385, 0.1401, 0.2493, 0.1412],
+            [0.2019, 0.1431, 0.2448, 0.2837, 0.1265],
+            [0.2401, 0.1707, 0.2249, 0.1664, 0.1979],
+            [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
+    """
+    return get_sampling_module().softmax(logits)
 
 
 def sampling_from_logits(

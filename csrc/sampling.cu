@@ -25,6 +25,23 @@
 
 using namespace flashinfer;
 
+void softmax(at::Tensor logits, at::Tensor probs) {
+  CHECK_INPUT(logits);
+  CHECK_INPUT(probs);
+  auto device = logits.device();
+  CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  unsigned int batch_size = logits.size(0);
+  unsigned int vocab_size = logits.size(1);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t status = sampling::OnlineSoftmax(static_cast<float*>(logits.data_ptr()),
+                                               static_cast<float*>(probs.data_ptr()), batch_size,
+                                               vocab_size, stream);
+  TORCH_CHECK(status == cudaSuccess,
+              "OnlineSoftmax failed with error code " + std::string(cudaGetErrorString(status)));
+}
+
 void sampling_from_logits(at::Tensor logits, at::Tensor output,
                           std::optional<at::Tensor> maybe_indices, bool deterministic,
                           std::optional<at::Generator> gen_) {

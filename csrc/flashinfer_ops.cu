@@ -173,6 +173,8 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
 
 //========== sampling ==========
 
+void softmax(at::Tensor logits, at::Tensor probs);
+
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
                          std::optional<at::Generator> gen);
@@ -297,6 +299,8 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope_pos_ids_cos_sin_cache", apply_rope_pos_ids_cos_sin_cache);
 
   // sampling
+  // Softmax
+  m.def("softmax", softmax);
   // Sample from probabilities
   m.def("sampling_from_probs", sampling_from_probs);
   // Sample from logits
