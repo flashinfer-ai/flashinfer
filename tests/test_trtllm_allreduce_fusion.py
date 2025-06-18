@@ -36,7 +36,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
 
     try:
         device = torch.device(f"cuda:{rank}")
-        token_num = torch.randint(MIN_TOKEN_NUM, MAX_TOKEN_NUM + 1, (1,)).item()
+        token_nums = [1, 128, 1024, 2048]
         pattern_codes = [
             comm.AllReduceFusionPattern.kAllReduce,
             comm.AllReduceFusionPattern.kARResidualRMSNorm,
@@ -62,126 +62,127 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
 
         test_loop = 5
 
-        for pattern_code in pattern_codes:
-            for swizzled_layout_code in swizzled_layout_codes:
-                for launch_with_pdl in launch_with_pdls:
-                    for use_oneshot in use_oneshots:
-                        for trigger_completion_at_end in trigger_completion_at_ends:
-                            for fp32_acc in fp32_accs:
-                                dist.barrier(group=group)
-                                test_passed = True
-                                print(
-                                    f"test RANK {rank}: token{token_num}-hidden_dim{HIDDEN_SIZE}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
-                                )
-                                dist.barrier(group=group)
-                                torch.cuda.synchronize()
-                                for _ in range(test_loop):
-                                    message_size = token_num * hidden_dim
-
-                                    allreduce_in = torch.randn(
-                                        message_size, dtype=dtype, device=device
+        for token_num in token_nums:
+            for pattern_code in pattern_codes:
+                for swizzled_layout_code in swizzled_layout_codes:
+                    for launch_with_pdl in launch_with_pdls:
+                        for use_oneshot in use_oneshots:
+                            for trigger_completion_at_end in trigger_completion_at_ends:
+                                for fp32_acc in fp32_accs:
+                                    dist.barrier(group=group)
+                                    test_passed = True
+                                    print(
+                                        f"test RANK {rank}: token{token_num}-hidden_dim{HIDDEN_SIZE}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
                                     )
-                                    allreduce_in_clone = allreduce_in.clone()
+                                    dist.barrier(group=group)
+                                    torch.cuda.synchronize()
+                                    for _ in range(test_loop):
+                                        message_size = token_num * hidden_dim
 
-                                    all_reduce_out = torch.zeros(
-                                        message_size, dtype=dtype, device=device
-                                    )
+                                        allreduce_in = torch.randn(
+                                            message_size, dtype=dtype, device=device
+                                        )
+                                        allreduce_in_clone = allreduce_in.clone()
 
-                                    residual_in = torch.randn(
-                                        message_size, dtype=dtype, device=device
-                                    )
-                                    residual_in_clone = residual_in.clone()
+                                        all_reduce_out = torch.zeros(
+                                            message_size, dtype=dtype, device=device
+                                        )
 
-                                    residual_out = torch.empty_like(residual_in)
-                                    norm_out = torch.empty_like(residual_in)
-                                    quant_out = torch.empty(
-                                        message_size, dtype=dtype, device=device
-                                    )
+                                        residual_in = torch.randn(
+                                            message_size, dtype=dtype, device=device
+                                        )
+                                        residual_in_clone = residual_in.clone()
 
-                                    scale_out = None
-                                    assert (
-                                        hidden_dim % SF_VEC_SIZE == 0
-                                    ), "hidden_dim must be divisible by SF_VEC_SIZE"
-                                    if (
-                                        swizzled_layout_code
-                                        == comm.FP4QuantizationSFLayout.SWIZZLED
-                                    ):
-                                        # TODO(Yingyi): check this
-                                        padded_message_size = (
-                                            (token_num + 127) / 128 * 128
-                                        ) * ((hidden_dim + 63) / 64 * 4)
-                                        scale_out = torch.empty(
-                                            padded_message_size,
-                                            dtype=dtype,
-                                            device=device,
+                                        residual_out = torch.empty_like(residual_in)
+                                        norm_out = torch.empty_like(residual_in)
+                                        quant_out = torch.empty(
+                                            message_size, dtype=dtype, device=device
+                                        )
+
+                                        scale_out = None
+                                        assert (
+                                            hidden_dim % SF_VEC_SIZE == 0
+                                        ), "hidden_dim must be divisible by SF_VEC_SIZE"
+                                        if (
+                                            swizzled_layout_code
+                                            == comm.FP4QuantizationSFLayout.SWIZZLED
+                                        ):
+                                            # TODO(Yingyi): check this
+                                            padded_message_size = (
+                                                (token_num + 127) // 128 * 128
+                                            ) * ((hidden_dim + 63) // 64 * 4)
+                                            scale_out = torch.empty(
+                                                padded_message_size,
+                                                dtype=dtype,
+                                                device=device,
+                                            )
+                                        else:
+                                            scale_out = torch.empty(
+                                                message_size // SF_VEC_SIZE,
+                                                dtype=dtype,
+                                                device=device,
+                                            )
+
+                                        rms_gamma = torch.randn(
+                                            hidden_dim, dtype=dtype, device=device
+                                        )
+                                        scale_factor = (
+                                            torch.rand(
+                                                1, dtype=torch.float32, device=device
+                                            )
+                                            * (
+                                                SCALE_FACTOR_RANGE[1]
+                                                - SCALE_FACTOR_RANGE[0]
+                                            )
+                                            + SCALE_FACTOR_RANGE[0]
+                                        )
+                                        rms_eps = 1e-3
+
+                                        # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
+                                        comm.trtllm_allreduce_fusion(
+                                            allreduce_in=allreduce_in,
+                                            world_size=world_size,
+                                            world_rank=rank,
+                                            token_num=token_num,
+                                            hidden_dim=hidden_dim,
+                                            workspace_ptrs=workspace_tensor,
+                                            launch_with_pdl=launch_with_pdl,
+                                            use_oneshot=use_oneshot,
+                                            trigger_completion_at_end=trigger_completion_at_end,
+                                            fp32_acc=fp32_acc,
+                                            pattern_code=pattern_code,
+                                            allreduce_out=all_reduce_out,
+                                            residual_in=residual_in,
+                                            residual_out=residual_out,
+                                            norm_out=norm_out,
+                                            quant_out=quant_out,
+                                            scale_out=scale_out,
+                                            rms_gamma=rms_gamma,
+                                            rms_eps=rms_eps,
+                                            scale_factor=scale_factor,
+                                            layout_code=swizzled_layout_code,
+                                        )
+
+                                        # match shape
+                                        all_reduce_out = all_reduce_out.view(
+                                            token_num, hidden_dim
+                                        )
+                                        residual_out = residual_out.view(
+                                            token_num, hidden_dim
+                                        )
+                                        norm_out = norm_out.view(token_num, hidden_dim)
+
+                                        torch.cuda.synchronize()
+
+                                    dist.barrier(group=group)
+                                    if test_passed:
+                                        print(
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
                                         )
                                     else:
-                                        scale_out = torch.empty(
-                                            message_size // SF_VEC_SIZE,
-                                            dtype=dtype,
-                                            device=device,
+                                        print(
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
                                         )
-
-                                    rms_gamma = torch.randn(
-                                        hidden_dim, dtype=dtype, device=device
-                                    )
-                                    scale_factor = (
-                                        torch.rand(
-                                            1, dtype=torch.float32, device=device
-                                        )
-                                        * (
-                                            SCALE_FACTOR_RANGE[1]
-                                            - SCALE_FACTOR_RANGE[0]
-                                        )
-                                        + SCALE_FACTOR_RANGE[0]
-                                    )
-                                    rms_eps = 1e-3
-
-                                    # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
-                                    comm.trtllm_allreduce_fusion(
-                                        allreduce_in=allreduce_in,
-                                        world_size=world_size,
-                                        world_rank=rank,
-                                        token_num=token_num,
-                                        hidden_dim=hidden_dim,
-                                        workspace_ptrs=workspace_tensor,
-                                        launch_with_pdl=launch_with_pdl,
-                                        use_oneshot=use_oneshot,
-                                        trigger_completion_at_end=trigger_completion_at_end,
-                                        fp32_acc=fp32_acc,
-                                        pattern_code=pattern_code,
-                                        allreduce_out=all_reduce_out,
-                                        residual_in=residual_in,
-                                        residual_out=residual_out,
-                                        norm_out=norm_out,
-                                        quant_out=quant_out,
-                                        scale_out=scale_out,
-                                        rms_gamma=rms_gamma,
-                                        rms_eps=rms_eps,
-                                        scale_factor=scale_factor,
-                                        layout_code=swizzled_layout_code,
-                                    )
-
-                                    # match shape
-                                    all_reduce_out = all_reduce_out.view(
-                                        token_num, hidden_dim
-                                    )
-                                    residual_out = residual_out.view(
-                                        token_num, hidden_dim
-                                    )
-                                    norm_out = norm_out.view(token_num, hidden_dim)
-
-                                    torch.cuda.synchronize()
-
-                                dist.barrier(group=group)
-                                if test_passed:
-                                    print(
-                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} passed"
-                                    )
-                                else:
-                                    print(
-                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} failed"
-                                    )
     finally:
         dist.barrier(group=group)
 
@@ -257,5 +258,25 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
 
 if __name__ == "__main__":
     mod = comm.get_comm_module()
+    np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
-    test_trtllm_allreduce_fusion(world_size=2, dtype=torch.bfloat16, hidden_dim=2048)
+    test_trtllm_allreduce_fusion(world_size=2, dtype=torch.bfloat16, hidden_dim=16)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=1024)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=2048)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=4096)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=7168)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=8192)
+
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=1024)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=2048)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=4096)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=7168)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=8192)
+
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=1024)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=2048)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=4096)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=7168)
+    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=8192)
