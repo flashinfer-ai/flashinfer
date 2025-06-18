@@ -38,6 +38,25 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+def test_softmax(batch_size, vocab_size, distribution):
+    torch.manual_seed(42)
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    probs = flashinfer.sampling.softmax(logits)
+    probs_ref = torch.softmax(logits, dim=-1)
+
+    assert torch.allclose(probs, probs_ref)
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
