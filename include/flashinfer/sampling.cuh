@@ -310,7 +310,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
     float thread_sum = 0.0f;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      thread_sum += std::exp(logits_vec[j] - block_max);  // e^(-inf) is safe to add
+      thread_sum += __expf(logits_vec[j] - block_max);  // e^(-inf) is safe to add
     }
 
     float block_sum =
@@ -323,8 +323,8 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
 
     if (tx == 0) {
       float new_max = max(running_max, block_max);
-      running_denominator = running_denominator * std::exp(running_max - new_max) +
-                            block_sum * std::exp(block_max - new_max);
+      running_denominator = running_denominator * __expf(running_max - new_max) +
+                            block_sum * __expf(block_max - new_max);
       running_max = new_max;
 
       temp_storage.shared_state.max_val = running_max;
@@ -342,10 +342,21 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
   __syncthreads();
 
   // Pass 2: Normalize in place
-  for (uint32_t i = tx; i < d; i += BLOCK_THREADS) {
-    float logit = static_cast<float>(logits[bx * d + i]);
-    float prob = std::exp(logit - final_max) * inv_denominator;
-    output[bx * d + i] = static_cast<DType>(prob);
+  vec_t<DType, VEC_SIZE> prob_vec;
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
+      prob_vec[j] = static_cast<DType>(p);
+    }
+
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
   }
 }
 
