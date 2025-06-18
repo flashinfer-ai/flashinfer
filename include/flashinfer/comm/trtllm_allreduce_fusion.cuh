@@ -809,12 +809,15 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   if (oneshot) {
     bool trigger_completion_at_end = params.trigger_completion_at_end;
     if (trigger_completion_at_end) {
-      FLASHINFER_CUDA_CALL((launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, true>(params, cfg)));
+      FLASHINFER_CUDA_CALL(
+          (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, true>(params, cfg)));
     } else {
-      FLASHINFER_CUDA_CALL((launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, false>(params, cfg)));
+      FLASHINFER_CUDA_CALL(
+          (launch_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, false>(params, cfg)));
     }
   } else {
-    FLASHINFER_CUDA_CALL((launch_twoshot_sync<Pattern, T, NRanks, Fp32Acc>(params, cfg, begin_tokens, token_num_per_ranks)));
+    FLASHINFER_CUDA_CALL((launch_twoshot_sync<Pattern, T, NRanks, Fp32Acc>(
+        params, cfg, begin_tokens, token_num_per_ranks)));
   }
   return cudaSuccess;
 }
@@ -848,7 +851,7 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       if constexpr (!std::is_same_v<T, float>) {                                             \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);    \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float!");      \
+        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float!");           \
       }                                                                                      \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                              \
@@ -858,11 +861,11 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       if constexpr (!std::is_same_v<T, float>) {                                             \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks); \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float!");   \
+        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float!");        \
       }                                                                                      \
       break;                                                                                 \
     default:                                                                                 \
-      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern!");                 \
+      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern!");                      \
   }
 
   switch (params.nranks) {
