@@ -24,10 +24,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
-from .utils import register_custom_op
+from ..jit import JitSpec
+from ..jit import env as jit_env
+from ..jit import gen_jit_spec
+from ..utils import register_custom_op
 
 # NOTE(Zihao): we should use cuda-python instead of ctypes cuda runtime bindings.
 # However, cuda-python's API is not stable yet, so we use ctypes bindings instead.

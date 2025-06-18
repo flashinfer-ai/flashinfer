@@ -60,7 +60,9 @@ class DLTensor(ctypes.Structure):
 
 
 # Deleter type for DLManagedTensor
-DLManagedTensorDeleter = CFUNCTYPE(None, POINTER(ctypes.c_void_p))  # Not used directly here
+DLManagedTensorDeleter = CFUNCTYPE(
+    None, POINTER(ctypes.c_void_p)
+)  # Not used directly here
 
 
 # Define DLManagedTensor structure, with deleter prototype void(*deleter)(DLManagedTensor*)
@@ -101,12 +103,18 @@ class CapsuleWrapper:
             shape_array: The array containing tensor shape information
             managed_tensor: The DLManagedTensor instance that the capsule points to
         """
-        self.capsule = capsule  # The main PyCapsule object that can be passed to other libraries
+        self.capsule = (
+            capsule  # The main PyCapsule object that can be passed to other libraries
+        )
         self._shape_array = shape_array  # Keep reference to prevent garbage collection
-        self._managed_tensor = managed_tensor  # Keep reference to prevent garbage collection
+        self._managed_tensor = (
+            managed_tensor  # Keep reference to prevent garbage collection
+        )
 
 
-def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id):
+def create_dlpack_capsule(
+    ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id
+):
     """
     Parameters:
       ptr: GPU memory address obtained from cudaMalloc (Python int)
@@ -181,7 +189,12 @@ def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch
 
 
 def pack_strided_memory(
-    ptr: int, segment_size: int, segment_stride: int, num_segments: int, dtype: torch.dtype, dev_id
+    ptr: int,
+    segment_size: int,
+    segment_stride: int,
+    num_segments: int,
+    dtype: torch.dtype,
+    dev_id,
 ):
     """
     Pack GPU memory into a PyTorch tensor with specified stride.
