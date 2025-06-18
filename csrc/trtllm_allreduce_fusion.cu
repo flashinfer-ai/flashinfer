@@ -16,6 +16,10 @@ using namespace flashinfer::trtllm_allreduce_fusion;
         using c_type = __nv_bfloat16;                                                             \
         return __VA_ARGS__();                                                                     \
       }                                                                                           \
+      case at::ScalarType::Float: {                                                               \
+        using c_type = float;                                                                     \
+        return __VA_ARGS__();                                                                     \
+      }                                                                                           \
       default:                                                                                    \
         TORCH_CHECK(false,                                                                        \
                     "Unsupported dtype in DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE: ", scalar_type); \

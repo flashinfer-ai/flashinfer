@@ -458,6 +458,7 @@ struct neg_zero<nv_bfloat16> {
 template <>
 struct neg_zero<float> {
   static constexpr unsigned int neg_zero_bits = 0x80000000U;
+  static constexpr float value = -0.0f;
 };
 
 template <typename T>
@@ -608,36 +609,12 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     vec_t<T, VEC_SIZE> val;
     val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
     remove_neg_zero<T, VEC_SIZE>(val);
-    // debug only
-    // if (blockIdx.x == 0 && threadIdx.x == 0 && params.rank == 0) {
-    //   for (int i = 0; i < VEC_SIZE; ++i) {
-    //     printf("remove_neg_zero data: %f is_negative_zero: %d\n", static_cast<float>(val[i]),
-    //            is_negative_zero(val[i]));
-    //   }
-    //   printf("\n");
-    // }
-    // debug only
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // Push data to other ranks
       val.store(reinterpret_cast<T*>(comm.data_bufs[r]) +
                 (params.rank * tot_access + idx) * VEC_SIZE);
     }
-    // debug only
-    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //   for (int i = 0; i < VEC_SIZE; ++i) {
-    //     printf(
-    //         "rank %d store data: %f is_negative_zero: %d\n", params.rank,
-    //         static_cast<float>(reinterpret_cast<T*>(
-    //             comm.data_bufs[(params.rank + 1) %
-    //                            params.nranks])[(params.rank * tot_access + idx) * VEC_SIZE + i]),
-    //         is_negative_zero(reinterpret_cast<T*>(
-    //             comm.data_bufs[(params.rank + 1) %
-    //                            params.nranks])[(params.rank * tot_access + idx) * VEC_SIZE + i]));
-    //   }
-    //   printf("\n");
-    // }
-    // debug only
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     // Clear comm buffer that previous kernel used
@@ -650,12 +627,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
 
-    // debug only
-    // int count = 0;
-    // debug only
     while (!done) {
       done = true;
-      // count++;  // debug only
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
@@ -663,22 +636,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
-      // debug only
-      // if (count > 1000000) {
-      //   if (blockIdx.x == 0 && threadIdx.x == 0) {
-      //     printf("count: %d\n", count);
-      //     for (int r = 0; r < NRanks; ++r) {
-      //       for (int i = 0; i < VEC_SIZE; ++i) {
-      //         printf("load vals[%d][%d]: %f is_negative_zero: %d\n", r, i,
-      //                static_cast<float>(vals[r][i]), is_negative_zero(vals[r][i]));
-      //       }
-      //       printf("\n");
-      //     }
-      //   }
-      //   done = true;
-      //   break;
-      // }
-      // debug only
     }
     vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
     fused_op(sum_val, tidx);
