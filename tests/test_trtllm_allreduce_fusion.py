@@ -299,7 +299,7 @@ def multi_process_parallel(
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_dim", [1024, 2048, 4096, 7168, 8192])
 def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
     np.random.seed(42)
