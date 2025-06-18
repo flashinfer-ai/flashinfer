@@ -12,6 +12,10 @@ def cudnn_batch_decode_with_kv_cache(
     v_cache: torch.Tensor,
     scale: float,
     workspace_buffer: torch.Tensor,
+    *,
+    max_token_per_sequence: Optional[int] = 1,
+    max_sequence_kv: int,
+    actual_seq_lens_q: Optional[torch.Tensor] = None,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: torch.Tensor,
     use_cuda_graph: bool = False,
@@ -26,11 +30,15 @@ def cudnn_batch_decode_with_kv_cache(
         v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim)
         scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
         workspace_buffer: Workspace buffer for cuDNN operations. Scales with batch size. 128 MB should be sufficient for most cases
-        actual_seq_lens_q: Actual sequence lengths for queries per batch, shape (batch_size,) on CPU
+        max_token_per_sequence: Maximum number of tokens per query sequence (s_qo_max)
+        max_sequence_kv: Maximum number of tokens per key/value sequence (s_kv_max)
+        actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device (cpu if cuda_graph is False)
         actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU
-        block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq)
-        num_pages_per_seq: Number of pages allocated per sequence
+        block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
+        use_cuda_graph: Whether to use CUDA graph for the decode operation
+        batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
         out: Optional pre-allocated output tensor
+        lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
 
     Returns:
         Output tensor of shape (batch_size, seq_len_q, num_heads_qo, head_dim)
@@ -42,7 +50,7 @@ def cudnn_batch_decode_with_kv_cache(
     """
 
     bs = q.shape[0]
-    s_q = 1
+    s_q = max_token_per_sequence
     h_qo = q.shape[1]
     d_vo = v_cache.shape[3]
 

@@ -70,7 +70,7 @@ enum KernelType { PREFILL, PREFILL_DEEPSEEK, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
-                                "b617826d162e36fa7d303d77c94721a0c64510354b0f871470fdac12e2c973f8");
+                                "e28be53644df82d861f726e240386e950a0a9439d2c642a173af0beaabcea85d");
 
   cubin_map[DECODE] = getCubin("fmha/sm100/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
                                "88b830b244ce656a47a0a3922779332a4a4c1fb68c97ba10cc62823334a30946");
@@ -423,7 +423,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
 
   int64_t h_kv = k_cache.size(1);
   int64_t page_size = k_cache.size(2);
-  int64_t s_kv = (d_qk == 192) ? k_cache.size(2) : (k_cache.size(0) / b) * page_size;
+  int64_t s_kv = max_s_kv;
 
   int64_t num_pages_per_seq = static_cast<int64_t>(std::ceil(1.0 * s_kv / page_size));
 

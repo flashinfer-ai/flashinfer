@@ -43,6 +43,7 @@ def cudnn_batch_prefill_with_kv_cache(
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
         use_cuda_graph: Whether to use CUDA graph for the prefill operation
+        batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
 
     Returns:
         Output tensor of shape (batch_size, seq_len_q, num_heads_qo, head_dim)
