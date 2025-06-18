@@ -421,7 +421,3 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
-
-
-if __name__ == "__main__":
-    test_trtllm_moe_allreduce_fusion(world_size=2, dtype=torch.bfloat16)

@@ -15,7 +15,6 @@ import flashinfer.comm as comm
 kOneShotMaxTokenNum = 128
 MIN_TOKEN_NUM = 1
 MAX_TOKEN_NUM = 2048
-HIDDEN_SIZE = 7168
 SF_VEC_SIZE = 16
 
 # temp var
@@ -43,6 +42,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
             comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
             comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
             comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+            comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
         ]
         swizzled_layout_codes = [
             comm.FP4QuantizationSFLayout.LINEAR,
@@ -72,7 +72,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     dist.barrier(group=group)
                                     test_passed = True
                                     print(
-                                        f"test RANK {rank}: token{token_num}-hidden_dim{HIDDEN_SIZE}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
+                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl} start"
                                     )
                                     dist.barrier(group=group)
                                     torch.cuda.synchronize()
@@ -162,6 +162,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                             scale_factor=scale_factor,
                                             layout_code=swizzled_layout_code,
                                         )
+                                        torch.cuda.synchronize()
 
                                         # match shape
                                         all_reduce_out = all_reduce_out.view(
@@ -174,6 +175,71 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
 
                                         torch.cuda.synchronize()
 
+                                        # calculate reference
+                                        # allreduce_out
+                                        dist.all_reduce(allreduce_in_clone, group=group)
+                                        ref_allreduce_out = allreduce_in_clone.clone()
+                                        ref_allreduce_out = ref_allreduce_out.view(
+                                            token_num, hidden_dim
+                                        ).to(torch.float32)
+
+                                        # residual_out
+                                        ref_residual_out = (
+                                            ref_allreduce_out
+                                            + residual_in_clone.view(
+                                                token_num, hidden_dim
+                                            ).to(torch.float32)
+                                        )
+
+                                        # norm_out
+                                        variance = (
+                                            ref_residual_out.to(torch.float32)
+                                            .pow(2)
+                                            .mean(dim=-1, keepdim=True)
+                                        )
+                                        hidden_states = ref_residual_out * torch.rsqrt(
+                                            variance + rms_eps
+                                        )
+                                        ref_norm_out = (
+                                            rms_gamma.to(torch.float32) * hidden_states
+                                        )
+
+                                        # check correctness
+                                        tolerance = (
+                                            8e-2 if dtype == torch.float16 else 8e-1
+                                        )
+                                        # compare allreduce_out
+                                        if (
+                                            pattern_code
+                                            == comm.AllReduceFusionPattern.kAllReduce
+                                        ):
+                                            torch.testing.assert_close(
+                                                all_reduce_out.to(torch.float32),
+                                                ref_allreduce_out,
+                                                atol=tolerance,
+                                                rtol=1e-2,
+                                            )
+                                        elif (
+                                            pattern_code
+                                            == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+                                            or pattern_code
+                                            == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant
+                                        ):
+                                            torch.testing.assert_close(
+                                                residual_out.to(torch.float32),
+                                                ref_residual_out,
+                                                atol=tolerance,
+                                                rtol=1e-2,
+                                            )
+
+                                            torch.testing.assert_close(
+                                                norm_out.to(torch.float32),
+                                                ref_norm_out,
+                                                atol=tolerance,
+                                                rtol=1e-2,
+                                            )
+
+                                        # todo(Yingyi): check quant out
                                     dist.barrier(group=group)
                                     if test_passed:
                                         print(
@@ -262,21 +328,20 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    test_trtllm_allreduce_fusion(world_size=2, dtype=torch.bfloat16, hidden_dim=16)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=1024)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=2048)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=4096)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=7168)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=8192)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=1024)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=2048)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=4096)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=7168)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=8192)
 
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=1024)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=2048)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=4096)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=7168)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=8192)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=1024)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=2048)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=4096)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=7168)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=8192)
 
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=1024)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=2048)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=4096)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=7168)
-    # test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=8192)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=1024)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=2048)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=4096)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=7168)
+    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=8192)
