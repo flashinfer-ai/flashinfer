@@ -417,7 +417,7 @@ def gen_nvshmem_module() -> JitSpec:
         extra_include_paths=[jit_env.get_nvshmem_include_dir()],
         extra_ldflags=[
             f"-L{jit_env.get_nvshmem_lib_dir()}",
-            "-lnvshmem",
+            "-lnvshmem_device",
         ],
         needs_device_linking=True,
     )
@@ -425,6 +425,14 @@ def gen_nvshmem_module() -> JitSpec:
 
 @functools.cache
 def get_nvshmem_module():
+    from pathlib import Path
+
+    import nvidia.nvshmem
+
+    ctypes.CDLL(
+        Path(nvidia.nvshmem.__path__[0]) / "lib" / "libnvshmem_host.so.3",
+        mode=ctypes.RTLD_GLOBAL,
+    )
     module = gen_nvshmem_module().build_and_load()
 
     return module
