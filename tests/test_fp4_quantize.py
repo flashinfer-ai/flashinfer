@@ -61,7 +61,7 @@ def swizzle_sf(
         scaling_vector_size: Scaling factor (default 16).
 
     Returns:
-        Swizzled tensor of shape [padded_row, padded_col].
+        Swizzled tensor of shape [padded_row, padded_col // scaling_vector_size].
     """
     unswizzled_sf = unswizzled_sf.contiguous()
     factor = scaling_vector_size * 4
@@ -92,7 +92,9 @@ def swizzle_sf(
     return sf_swizzled.contiguous()
 
 
-def unswizzle_sf(sf: torch.Tensor, row: int, col: int, scaling_vector_size: int = 16):
+def unswizzle_sf(
+    sf: torch.Tensor, row: int, col: int, scaling_vector_size: int = 16
+) -> torch.Tensor:
     factor = scaling_vector_size * 4
     num_m_tiles = (row + 128 - 1) // 128
     num_k_tiles = (col + factor - 1) // factor
@@ -169,7 +171,7 @@ def recover_swizzled_scales(scale, m, n):
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_quantize_to_fp4(
+def test_fp4_quantization(
     dtype: torch.dtype,
     shape: tuple[int, int],
     seed: int,
@@ -178,6 +180,7 @@ def test_quantize_to_fp4(
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
+    torch.manual_seed(seed)
     m, n = shape
     x = torch.randn((m, n), dtype=dtype)
     tensor_amax = torch.abs(x).max().to(torch.float32)
@@ -185,7 +188,7 @@ def test_quantize_to_fp4(
     out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
 
     out, out_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False)
-    assert (n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible")
+    assert n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible"
     scale_ans = recover_swizzled_scales(
         out_scale.reshape(-1, n // BLOCK_SIZE).view(torch.float8_e4m3fn), m, n
     )
@@ -199,7 +202,7 @@ def test_quantize_to_fp4(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_quantize_to_fp4(
+def test_scale_swizzling(
     dtype: torch.dtype,
     shape: tuple[int, int],
     seed: int,
@@ -208,7 +211,7 @@ def test_quantize_to_fp4(
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
-    dtype = torch.float16
+    torch.manual_seed(seed)
     m, n = shape
     x = torch.randn((m, n), dtype=dtype)
     tensor_amax = torch.abs(x).max().to(torch.float32)
@@ -216,7 +219,7 @@ def test_quantize_to_fp4(
 
     _, unswizzled_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False, False)
     _, swizzled_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False, True)
-    assert (n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible")
+    assert n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible"
     recovered_unswizzled_scale = unswizzle_sf(
         swizzle_sf(unswizzled_scale, m, n),
         m,
