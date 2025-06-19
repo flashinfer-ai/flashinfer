@@ -68,6 +68,22 @@ class AllReduceFusionOp:
     MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
+class AllReduceFusionPattern:
+    # NOTE: for trtllm_allreduce_fusion
+    # Basic all-reduce pattern
+    kAllReduce = 0
+    # All-reduce followed by residual add and RMS norm
+    kARResidualRMSNorm = 1
+    # All-reduce followed by residual add, RMS norm and FP8 quantization
+    kARResidualRMSNormFP8Quant = 2
+    # All-reduce followed by residual add, RMS norm and FP4 quantization
+    kARResidualRMSNormFP4Quant = 3
+    # All-reduce followed by residual add, RMS norm and FP8 quantization, with norm output
+    kARResidualRMSNormOutFP8Quant = 4
+    # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
+    kARResidualRMSNormOutFP4Quant = 5
+
+
 class FP4QuantizationSFLayout:
     # Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
     # blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
@@ -255,6 +271,7 @@ def gen_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "comm_pybind.cu",
             jit_env.FLASHINFER_CSRC_DIR / "custom_all_reduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
         extra_cuda_cflags=sm100a_nvcc_flags,
@@ -416,6 +433,79 @@ def get_comm_module():
         )
 
     @register_custom_op(
+        "flashinfer::trtllm_allreduce_fusion",
+        mutates_args=[
+            "allreduce_in",
+            "world_size",
+            "world_rank",
+            "token_num",
+            "hidden_dim",
+            "workspace_ptrs",
+            "launch_with_pdl",
+            "use_oneshot",
+            "trigger_completion_at_end",
+            "fp32_acc",
+            "pattern_code",
+            "allreduce_out",
+            "residual_in",
+            "residual_out",
+            "norm_out",
+            "quant_out",
+            "scale_out",
+            "rms_gamma",
+            "rms_eps",
+            "scale_factor",
+            "layout_code",
+        ],
+    )
+    def trtllm_allreduce_fusion(
+        allreduce_in: torch.Tensor,
+        world_size: int,
+        world_rank: int,
+        token_num: int,
+        hidden_dim: int,
+        workspace_ptrs: torch.Tensor,
+        launch_with_pdl: bool,
+        use_oneshot: bool,
+        trigger_completion_at_end: bool,
+        fp32_acc: bool,
+        pattern_code: AllReduceFusionPattern,
+        allreduce_out: Optional[torch.Tensor],
+        residual_in: Optional[torch.Tensor],
+        residual_out: Optional[torch.Tensor],
+        norm_out: Optional[torch.Tensor],
+        quant_out: Optional[torch.Tensor],
+        scale_out: Optional[torch.Tensor],
+        rms_gamma: Optional[torch.Tensor],
+        rms_eps: Optional[float],
+        scale_factor: Optional[float],
+        layout_code: Optional[FP4QuantizationSFLayout],
+    ) -> None:
+        module.trtllm_allreduce_fusion(
+            allreduce_in,
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace_ptrs,
+            launch_with_pdl,
+            use_oneshot,
+            trigger_completion_at_end,
+            fp32_acc,
+            pattern_code,
+            allreduce_out,
+            residual_in,
+            residual_out,
+            norm_out,
+            quant_out,
+            scale_out,
+            rms_gamma,
+            rms_eps,
+            scale_factor,
+            layout_code,
+        )
+
+    @register_custom_op(
         "flashinfer::trtllm_moe_allreduce_fusion",
         mutates_args=[
             "out",
@@ -497,6 +587,7 @@ def get_comm_module():
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
+        trtllm_allreduce_fusion=trtllm_allreduce_fusion,
         trtllm_moe_allreduce_fusion=trtllm_moe_allreduce_fusion,
     )
 
@@ -700,6 +791,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_size: int,
     max_token_num: int,
     hidden_dim,
+    use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
     """
@@ -723,7 +815,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     flag_size = tp_size * BarrierFlagCount * 4
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     # enable larger workspace for cases > OneShotMaxToken
-    lamport_comm_size = tp_size * max_token_num * hidden_dim * 2
+    lamport_comm_size = (
+        tp_size * max_token_num * hidden_dim * 2
+        if not use_fp32_lamport
+        else tp_size * max_token_num * hidden_dim * 4
+    )
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -741,9 +837,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     # Initialize lamport buffer
-    trtllm_lamport_initialize(
-        ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
-    )
+    if use_fp32_lamport:
+        trtllm_lamport_initialize(
+            ipc_handles[2][tp_rank], lamport_buffer_size // 4, torch.float32
+        )
+    else:
+        trtllm_lamport_initialize(
+            ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+        )
 
     # initialize workspace
     workspace = list()
@@ -874,6 +975,54 @@ def trtllm_custom_all_reduce(
         lamport_peer_comm_buffer_ptrs_0,
         lamport_peer_comm_buffer_ptrs_1,
         lamport_peer_comm_buffer_ptrs_2,
+    )
+
+
+def trtllm_allreduce_fusion(
+    allreduce_in: torch.Tensor,
+    world_size: int,
+    world_rank: int,
+    token_num: int,
+    hidden_dim: int,
+    workspace_ptrs: torch.Tensor,
+    launch_with_pdl: bool,
+    use_oneshot: bool,
+    trigger_completion_at_end: bool,
+    fp32_acc: bool,
+    pattern_code: AllReduceFusionPattern,
+    allreduce_out: Optional[torch.Tensor],
+    residual_in: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
+    rms_gamma: Optional[torch.Tensor],
+    rms_eps: Optional[float],
+    scale_factor: Optional[float],
+    layout_code: Optional[FP4QuantizationSFLayout],
+) -> None:
+    get_comm_module().trtllm_allreduce_fusion(
+        allreduce_in=allreduce_in,
+        world_size=world_size,
+        world_rank=world_rank,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=workspace_ptrs,
+        launch_with_pdl=launch_with_pdl,
+        use_oneshot=use_oneshot,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        pattern_code=pattern_code,
+        allreduce_out=allreduce_out,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        scale_factor=scale_factor,
+        layout_code=layout_code,
     )
 
 
