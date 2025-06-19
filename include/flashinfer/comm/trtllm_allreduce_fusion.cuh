@@ -884,8 +884,7 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       DISPATCH_PATTERN(T, 16);
       break;
     default:
-      FLASHINFER_CHECK(
-          false,
+      FLASHINFER_ERROR(
           "allreduce_fusion_kernel: unsupported ranks number! Supported ranks: 2, 4, 8, 16.");
   }
 }

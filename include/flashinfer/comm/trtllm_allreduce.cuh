@@ -185,6 +185,12 @@ struct neg_zero<nv_bfloat16> {
   static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
 };
 
+template <>
+struct neg_zero<float> {
+  static constexpr unsigned int neg_zero_bits = 0x80000000U;
+  static constexpr float value = -0.0f;
+};
+
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
 

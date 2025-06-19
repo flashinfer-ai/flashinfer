@@ -791,6 +791,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_size: int,
     max_token_num: int,
     hidden_dim,
+    use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
     """
@@ -814,7 +815,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     flag_size = tp_size * BarrierFlagCount * 4
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     # enable larger workspace for cases > OneShotMaxToken
-    lamport_comm_size = tp_size * max_token_num * hidden_dim * 2
+    lamport_comm_size = (
+        tp_size * max_token_num * hidden_dim * 2
+        if not use_fp32_lamport
+        else tp_size * max_token_num * hidden_dim * 4
+    )
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -832,9 +837,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     # Initialize lamport buffer
-    trtllm_lamport_initialize(
-        ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
-    )
+    if use_fp32_lamport:
+        trtllm_lamport_initialize(
+            ipc_handles[2][tp_rank], lamport_buffer_size // 4, torch.float32
+        )
+    else:
+        trtllm_lamport_initialize(
+            ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+        )
 
     # initialize workspace
     workspace = list()

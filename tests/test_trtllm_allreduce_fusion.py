@@ -53,10 +53,17 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
         trigger_completion_at_ends = [True, False]
         fp32_accs = [True, False]
 
+        lamport_use_fp32 = dtype == torch.float32
+
         # create workspace for moe allreduce fusion
         ipc_handles, workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                rank, world_size, MAX_TOKEN_NUM, hidden_dim, group=group
+                rank,
+                world_size,
+                MAX_TOKEN_NUM,
+                hidden_dim,
+                group=group,
+                use_fp32_lamport=lamport_use_fp32,
             )
         )
 
@@ -69,6 +76,14 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                         for use_oneshot in use_oneshots:
                             for trigger_completion_at_end in trigger_completion_at_ends:
                                 for fp32_acc in fp32_accs:
+                                    if dtype == torch.float32 and (
+                                        pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant
+                                        or pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant
+                                    ):
+                                        continue
+
                                     dist.barrier(group=group)
                                     test_passed = True
                                     print(
@@ -299,7 +314,7 @@ def multi_process_parallel(
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("hidden_dim", [1024, 2048, 4096, 7168, 8192])
 def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
     np.random.seed(42)
@@ -320,28 +335,3 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
-
-
-if __name__ == "__main__":
-    mod = comm.get_comm_module()
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=1024)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=2048)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=4096)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=7168)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float16, hidden_dim=8192)
-
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=1024)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=2048)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=4096)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=7168)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.bfloat16, hidden_dim=8192)
-
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=1024)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=2048)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=4096)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=7168)
-    test_trtllm_allreduce_fusion(world_size=4, dtype=torch.float32, hidden_dim=8192)
