@@ -79,7 +79,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )
                             residual_in_clone = residual_in.clone()
 
-                            all_reduce_out = torch.zeros(
+                            moe_allreduce_out = torch.zeros(
                                 message_size, dtype=dtype, device=device
                             )
                             residual_out = torch.empty_like(residual_in)
@@ -179,14 +179,17 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )  # [token_num, HIDDEN_SIZE]
 
                             # 3. All-Reduce
-                            all_reduce_ref = moe_out_ref.clone().to(dtype)
-                            dist.all_reduce(all_reduce_ref, group=group)
-                            all_reduce_ref = all_reduce_ref.to(torch.float32)
+                            moe_allreduce_ref = moe_out_ref.clone().to(dtype)
+                            dist.all_reduce(moe_allreduce_ref, group=group)
+                            moe_allreduce_ref = moe_allreduce_ref.to(torch.float32)
 
                             # 4. Fused Ops
-                            ref_residual_out = all_reduce_ref + residual_in_clone.view(
-                                token_num, HIDDEN_SIZE
-                            ).to(torch.float32)
+                            ref_residual_out = (
+                                moe_allreduce_ref
+                                + residual_in_clone.view(token_num, HIDDEN_SIZE).to(
+                                    torch.float32
+                                )
+                            )
 
                             variance = (
                                 ref_residual_out.to(torch.float32)
@@ -217,7 +220,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
                                 moe_reduction_token_input=moe_reduction_token_input,
                                 layout_code=swizzled_layout_code,
-                                allreduce_out=all_reduce_out,
+                                moe_allreduce_out=moe_allreduce_out,
                                 residual_out=residual_out,
                                 norm_out=norm_out,
                                 quant_out=quant_out,
@@ -225,7 +228,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )
 
                             # match shape
-                            all_reduce_out = all_reduce_out.view(token_num, HIDDEN_SIZE)
+                            moe_allreduce_out = moe_allreduce_out.view(
+                                token_num, HIDDEN_SIZE
+                            )
                             residual_out = residual_out.view(token_num, HIDDEN_SIZE)
                             norm_out = norm_out.view(token_num, HIDDEN_SIZE)
 
@@ -235,26 +240,26 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             tolerance = 8e-2 if dtype == torch.float16 else 8e-1
                             # 6.1 Check allreduce_out
                             if not torch.allclose(
-                                all_reduce_out.to(torch.float32),
-                                all_reduce_ref,
+                                moe_allreduce_out.to(torch.float32),
+                                moe_allreduce_ref,
                                 atol=tolerance,
                                 rtol=1e-2,
                             ):
                                 test_passed = False
                                 print(f"Rank {rank} allreduce_out mismatch")
-                                print(f"all_reduce_out: {all_reduce_out}")
-                                print(f"all_reduce_ref: {all_reduce_ref}")
+                                print(f"moe_all_reduce_out: {moe_allreduce_out}")
+                                print(f"moe_all_reduce_ref: {moe_allreduce_ref}")
                                 # Print max diff elements for allreduce_out
                                 max_diff = torch.max(
                                     torch.abs(
-                                        all_reduce_out.to(torch.float32)
-                                        - all_reduce_ref
+                                        moe_allreduce_out.to(torch.float32)
+                                        - moe_allreduce_ref
                                     )
                                 )
                                 max_diff_idx = torch.argmax(
                                     torch.abs(
-                                        all_reduce_out.to(torch.float32)
-                                        - all_reduce_ref
+                                        moe_allreduce_out.to(torch.float32)
+                                        - moe_allreduce_ref
                                     )
                                 )
                                 print(f"Rank {rank} allreduce_out max diff: {max_diff}")
@@ -262,15 +267,15 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                     f"Rank {rank} allreduce_out max diff idx: {max_diff_idx}"
                                 )
                                 print(
-                                    f"Rank {rank} allreduce_out value at max diff: {all_reduce_out.view(-1)[max_diff_idx]}"
+                                    f"Rank {rank} allreduce_out value at max diff: {moe_allreduce_out.view(-1)[max_diff_idx]}"
                                 )
                                 print(
-                                    f"Rank {rank} allreduce_out ref value at max diff: {all_reduce_ref.view(-1)[max_diff_idx]}"
+                                    f"Rank {rank} allreduce_out ref value at max diff: {moe_allreduce_ref.view(-1)[max_diff_idx]}"
                                 )
 
                             torch.testing.assert_close(
-                                all_reduce_out.to(torch.float32),
-                                all_reduce_ref,
+                                moe_allreduce_out.to(torch.float32),
+                                moe_allreduce_ref,
                                 atol=tolerance,
                                 rtol=1e-2,
                             )
