@@ -62,6 +62,8 @@ class TllmGenFmhaKernel {
     }
   }
 
+  size_t getNumLoadedKernels() const { return mKernelMetaMap.size(); }
+
   inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler,
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeKv, int numTokensPerPage, int maxNumHeadsQPerKvInCta,
@@ -171,17 +173,18 @@ class TllmGenFmhaKernel {
       launch_config.sharedMemBytes = kernelMeta.mSharedMemBytes;
 
       // Debug info.
-      IKL_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = %s\n", kernelMeta.mFuncName);
+      IKL_LOG_DEBUG("TRTLLM-Gen launch info (in TllmGenFmhaKernel %s, %s, %s, %d): kernelName = %s",
+                    toStr(mDtypeQ), toStr(mDtypeKv), toStr(mDtypeOut), mSM, kernelMeta.mFuncName);
       IKL_LOG_DEBUG(
           "TRTLLM-Gen launch info: maxSeqLenQ = %d, "
           "maxSeqLenKv = %d, "
           "numHeadsQ = %d, "
-          "numHeadsKv = %d, batchSize = %d, kernelType = %d\n",
+          "numHeadsKv = %d, batchSize = %d, kernelType = %d",
           params.mMaxSeqLenQ, params.mMaxSeqLenKv, params.mNumHeadsQ, params.mNumHeadsKv,
           params.mBatchSize, static_cast<int>(params.mKernelType));
       IKL_LOG_DEBUG(
           "TRTLLM-Gen launch info: numCtasX = %d, numCtasY = %d, "
-          "numCtasZ = %d, uses2CtaMma = %d\n",
+          "numCtasZ = %d, uses2CtaMma = %d",
           numCtasX, numCtasY, numCtasZ, selectKernelParams.mUses2CtaMma);
 
       CUlaunchAttribute launch_attribute[3];
@@ -413,7 +416,10 @@ class TllmGenFmhaKernel {
         ", maxNumHeadsQPerKvInCta=" + std::to_string(maxNumHeadsQPerKvInCta) +
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma);
-    IKL_LOG_DEBUG("Searching for kernel traits: %s\n", info.c_str());
+    IKL_LOG_DEBUG(
+        "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %d) %s",
+        getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeKv), toStr(mDtypeOut), mSM,
+        info.c_str());
 
     return std::make_pair(
         hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(maskType),
@@ -503,6 +509,9 @@ class TllmFmhaKernelFactory {
       KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
+      IKL_LOG_DEBUG(
+          "Loading new kernel for dtypeQ=%s, dtypeKv=%s, dtypeOut=%s, sm=%d with %d loaded kernels",
+          toStr(dtypeQ), toStr(dtypeKv), toStr(dtypeOut), sm, newKernel->getNumLoadedKernels());
       return newKernel;
     }
     return findIter->second.get();

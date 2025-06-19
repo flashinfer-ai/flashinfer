@@ -12,7 +12,7 @@ def insert_runllm_widget(html_content):
     # RunLLM Widget script to be inserted for FlashInfer
     widget_script = """
     <!-- RunLLM Widget Script -->
-    <script type="module" id="runllm-widget-script" src="https://widget.runllm.com" crossorigin="true" version="stable" runllm-keyboard-shortcut="Mod+j" runllm-name="FlashInfer Assistant" runllm-position="BOTTOM_RIGHT" runllm-assistant-id="1048" async></script>
+    <script type="module" id="runllm-widget-script" src="https://widget.runllm.com" crossorigin="true" version="stable" runllm-keyboard-shortcut="Mod+j" runllm-name="FlashInfer Assistant" runllm-position="BOTTOM_RIGHT" runllm-assistant-id="1052" async></script>
     """
 
     # Find the closing body tag and insert the widget script before it

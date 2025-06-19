@@ -394,14 +394,20 @@ def determine_attention_backend(
         return "fa2"
 
 
+def version_at_least(version: str, base_version: str) -> bool:
+    from packaging import version as pkg_version
+
+    return pkg_version.parse(version) >= pkg_version.parse(base_version)
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
-    return major == 9 and torch.version.cuda >= "12.3"
+    return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
-    return major == 10 and torch.version.cuda >= "12.8"
+    return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -498,3 +504,8 @@ def get_trtllm_utils_module():
 
 def delay_kernel(stream_delay_micro_secs):
     get_trtllm_utils_module().delay_kernel(stream_delay_micro_secs)
+
+
+def device_support_pdl(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major >= 9

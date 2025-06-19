@@ -1,24 +1,28 @@
+
 #include <flashinfer/attention/decode_mla_cute_sm80.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <optional>
 
 #include "mla_config.inc"
+#include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int page_size, bool enable_cuda_graph,
-    int64_t cuda_stream) {
+at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
+                                              at::Tensor int_workspace_buffer,
+                                              at::Tensor page_locked_int_workspace_buffer,
+                                              at::Tensor indptr, int64_t batch_size,
+                                              int64_t num_qo_heads, int64_t page_size,
+                                              bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
   DecodePlanInfo plan_info;
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80<
       HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, AttentionVariant, Params>;
@@ -34,18 +38,19 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCachePlanMLA failed with error ",
               cudaGetErrorString(status));
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }
 
 void BatchDecodeWithPagedKVCacheRunMLA(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q_nope, at::Tensor q_pe,
-    at::Tensor paged_ckv_cache, at::Tensor paged_kpe_cache, at::Tensor paged_kv_indptr,
-    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o, float sm_scale,
-    int window_left, float logits_soft_cap, float rope_scale, float rope_theta,
-    std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+    at::Tensor q_nope, at::Tensor q_pe, at::Tensor paged_ckv_cache, at::Tensor paged_kpe_cache,
+    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
+    at::Tensor o, double sm_scale, int64_t window_left, double logits_soft_cap, double rope_scale,
+    double rope_theta, std::optional<at::Tensor> maybe_lse,
+    bool enable_pdl  // fake placeholder, sm80 does not support pdl
+) {
   DecodePlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
   auto device = q_nope.device();
   int64_t batch_size = q_nope.size(0);
@@ -94,7 +99,8 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   }
   params.padded_batch_size = plan_info.padded_batch_size;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(paged_ckv_cache.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
                                                                         QO_TILE_LEN, Params>(
       params, tmp_v, tmp_s, /*stream=*/stream);

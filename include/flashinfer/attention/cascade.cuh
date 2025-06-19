@@ -117,8 +117,9 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
 
 template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
 __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
-                                                       float* s_smem) {
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+                                                       float* s_smem,
+                                                       const uint32_t tx = threadIdx.x,
+                                                       const uint32_t ty = threadIdx.y) {
   constexpr uint32_t head_dim = vec_size * bdx;
   st.o.cast_store(v_smem + ty * head_dim + tx * vec_size);
   s_smem[ty] = st.get_lse();
@@ -360,6 +361,10 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
   DTypeIn* v_smem = (DTypeIn*)smem;
   float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
 
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
     uint32_t pos = i / num_heads;
@@ -434,6 +439,9 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
       s_merged[pos * num_heads + head_idx] = st.get_lse();
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
@@ -454,6 +462,9 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
   DTypeIn* v_smem = (DTypeIn*)smem;
 
   vec_t<float, vec_size> v_sum_vec;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
 
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
@@ -512,6 +523,9 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 
     v_sum_vec.cast_store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 /*!
@@ -648,7 +662,7 @@ cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uin
 template <typename DTypeIn, typename DTypeO, typename IdType>
 cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
                                       float* s_merged, uint32_t max_seq_len, uint32_t* seq_len,
-                                      uint32_t num_heads, uint32_t head_dim,
+                                      uint32_t num_heads, uint32_t head_dim, bool enable_pdl,
                                       cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
@@ -675,7 +689,24 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+    // PDL launch
+    if (enable_pdl) {
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = 1;
+      cudaLaunchConfig_t config;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
+                                              max_seq_len, seq_len, num_heads));
+    } else {
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    }
   });
   return cudaSuccess;
 }
@@ -683,7 +714,8 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
 template <typename DTypeIn, typename DTypeO, typename IdType>
 cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum,
                                        uint32_t max_seq_len, uint32_t* seq_len, uint32_t num_heads,
-                                       uint32_t head_dim, cudaStream_t stream = nullptr) {
+                                       uint32_t head_dim, bool enable_pdl,
+                                       cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   int num_blocks_per_sm = 0;
@@ -708,7 +740,24 @@ cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum
     void* args[] = {&v, &indptr, &v_sum, &max_seq_len, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+    if (enable_pdl) {
+      // PDL launch
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = 1;
+      cudaLaunchConfig_t config;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      FLASHINFER_CUDA_CALL(
+          cudaLaunchKernelEx(&config, kernel, v, indptr, v_sum, max_seq_len, seq_len, num_heads));
+    } else {
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    }
   });
   return cudaSuccess;
 }
