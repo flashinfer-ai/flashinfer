@@ -1192,14 +1192,16 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
 //                  * MoE Finalize Allreduce Fusion *                   //
 /////////////////////////////////////////////////////////////////
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
-          typename ScaleType = DType>
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
 __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     MoeFinalizeAllReduceFusionParams params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   cg::grid_group grid = cg::this_grid();
+
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
 
   // Each token is handled by one cluster
   // which token is handled by current cluster
@@ -1212,12 +1214,12 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
   int access_id_in_token = cluster.thread_rank();
   // Across all token, which kElemsPerAccess is handled by current thread (in unit of
   // kElemsPerAccess)
-  int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
+  int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
   // Persistent kernel
   // stride to next token handled by current cta
   int token_stride = grid.num_clusters();
   // stride in unit of kElemsPerAccess
-  int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
+  int access_stride = token_stride * params.hidden_dim / VEC_SIZE;
   // Total number of access in unit of kElemsPerAccess to handle (token_num * hidden_dim)
   // This is within one rank
   int tot_access = params.size / kElemsPerAccess;
@@ -1225,19 +1227,14 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
   cudaGridDependencySynchronize();
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / kElemsPerAccess;
+  int clear_access = comm.clear_size / VEC_SIZE;
 
   // * MoE related
   int threadid_in_cluster = cluster.thread_rank();
   // Start Offset within one token's hidden_size of element
   // Current thread handle token[thread_offset_within_token : thread_offset_within_token +
   // kElemsPerAccess]
-  int thread_offset_within_token = threadid_in_cluster * kElemsPerAccess;
-
-  union ACC_TYPE {
-    float4 packed;
-    DType unpacked[kElemsPerAccess];
-  };
+  int thread_offset_within_token = threadid_in_cluster * VEC_SIZE;
 
   int top_k = params.top_k;
   bool use_scale_factor = params.expert_scale_factor != nullptr;
@@ -1250,11 +1247,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // * MoE finalize
-    ACC_TYPE accumulator;
-#pragma unroll
-    for (int i = 0; i < kElemsPerAccess; ++i) {
-      accumulator.unpacked[i] = static_cast<DType>(0);
-    }
+    vec_t<T, VEC_SIZE> accumulator;
+    accumulator.fill(0.f);
 
     for (int k = 0; k < top_k; k++) {
       int const expanded_idx = token_id * top_k + k;
@@ -1270,16 +1264,15 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
             static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
       }
 
-      ACC_TYPE permuted_data;
-      permuted_data.packed = reinterpret_cast<float4 const*>(
-          params.allreduce_in)[thread_offset_across_token / kElemsPerAccess];
+      vec_t<T, VEC_SIZE> permuted_data;
+      permuted_data.load_global_volatile(reinterpret_cast<T*>(params.allreduce_in) +
+                                         thread_offset_across_token);
 
       // * acc += scale(data)
 #pragma unroll
-      for (int i = 0; i < kElemsPerAccess; ++i) {
+      for (int i = 0; i < VEC_SIZE; ++i) {
         // assume computation is done in ScaleType
-        accumulator.unpacked[i] +=
-            static_cast<DType>((static_cast<float>(permuted_data.unpacked[i]) * block_scale));
+        accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
       }
     }
 
@@ -1287,94 +1280,92 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     if (params.shared_expert_output) {
       // * Load shared expert output
       int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
-      ACC_TYPE shared_expert_output;
-      shared_expert_output.packed = reinterpret_cast<float4 const*>(
-          params.shared_expert_output)[thread_offset_across_token / kElemsPerAccess];
+      vec_t<T, VEC_SIZE> shared_expert_output;
+      shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
+                                thread_offset_across_token);
 #pragma unroll
-      for (int i = 0; i < kElemsPerAccess; ++i) {
-        accumulator.unpacked[i] += shared_expert_output.unpacked[i];
-      }
+      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
     }
 
     // * AR Store
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int idx = access_id;
-    alignas(16) float val[4] = {accumulator.packed.x, accumulator.packed.y, accumulator.packed.z,
-                                accumulator.packed.w};
+    int idx = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
+    remove_neg_zero<T, VEC_SIZE>(accumulator);
 
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      // Handle two bf16/fp16 at one time
-      if (is_neg_zero(val[i])) {
-        val[i] = 0.f;
-      }
-    }
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
-      reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx] =
-          *reinterpret_cast<float4*>(val);
+      int offset = (params.rank * tot_access + idx) * VEC_SIZE;
+      accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
   }
 
   // * Clear previous buffer
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
   }
 
   // * AR Load + Fusion
   for (int idx = access_id, tidx = token_id; idx < tot_access;
        idx += access_stride, tidx += token_stride) {
     // * AR Load
-    float4 vals[NRanks];
+    vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
     while (!done) {
       done = true;
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r] = ld_global_volatile(
-            &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
-        done &= !is_neg_zero(vals[r]);
+        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) +
+                                     (r * tot_access + idx) * VEC_SIZE);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
     }
-    float4 sum_val = vals[0];
+    vec_t<T, VEC_SIZE> sum_val = vals[0];
 #pragma unroll
     for (int r = 1; r < NRanks; ++r) {
-      sum_val = add128<DType>(sum_val, vals[r]);
+      sum_val = vec_add<T, VEC_SIZE>(sum_val, vals[r]);
     }
 
     // * Fuse
-    fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+    fused_op<ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx, access_id_in_token,
+                                                          params);
   }
   comm.update(params.size * NRanks);
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
-          typename ScaleType = DType>
-void launch_oneshot_moefinalize_lamport(MoeFinalizeAllReduceFusionParams const& params,
-                                        cudaLaunchConfig_t& cfg) {
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
+cudaError_t launch_oneshot_moefinalize_lamport(MoeFinalizeAllReduceFusionParams<T> const& params,
+                                               cudaLaunchConfig_t& cfg) {
   TLLM_CUDA_CHECK(cudaLaunchKernelEx(
       &cfg,
-      moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut,
-                                                          QuantOut, ScaleType>,
+      moefinalize_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut, QuantOut,
+                                                          ScaleType>,
       params));
+  return cudaSuccess;
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
-          typename ScaleType = DType>
-void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionParams const& params) {
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
+cudaError_t moefinalize_allreduce_fusion_kernel_launcher(
+    MoeFinalizeAllReduceFusionParams<T> const& params, bool launch_with_pdl) {
   int token_num = params.size / params.hidden_dim;
   bool oneshot = use_oneshot(token_num);
+  if (oneshot == false) {
+    FLASHINFER_LOG_WARN("expect one shot but got %d tokens, expect performance degradation",
+                        token_num);
+    oneshot = true;
+  }
   // Only support one shot
-  TLLM_CHECK(oneshot);
+  // FLASHINFER_CHECK(oneshot, "only support one shot");
   // Each token is handled by one cluster
   int cluster_num = token_num;
   // Total number of threads (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
-  int threads_per_token = params.hidden_dim / kElemsPerAccess;
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  int threads_per_token = params.hidden_dim / VEC_SIZE;
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
   int warps_per_token = (threads_per_token + 31) / 32;
@@ -1383,7 +1374,8 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
     cluster_size /= 2;
   }
   int block_size = warps_per_token / cluster_size * 32;
-  TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
+  FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
+                   "block_size <= 1024 && cluster_size > 0");
   int sm_count = get_sm_count();
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
@@ -1393,8 +1385,7 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
   cfg.dynamicSmemBytes = 0;
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed =
-      tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+  attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
@@ -1402,12 +1393,42 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
   cfg.attrs = attribute;
   cfg.numAttrs = 2;
   if (oneshot) {
-    launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>(
-        params, cfg);
+    FLASHINFER_CUDA_CALL(
+        (launch_oneshot_moefinalize_lamport<T, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>(
+            params, cfg)));
   }
+  return cudaSuccess;
 }
 
-void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params) {
+#define _DISPATCH_MOEFINALIZEREDUCTION_CASE(n_ranks_val, N_RANKS_VAR, res, rms, quant, RES, RMS, \
+                                            QUANT, ...)                                          \
+  case n_ranks_val: {                                                                            \
+    constexpr int N_RANKS_VAR = n_ranks_val;                                                     \
+    return DISPATCH_BOOL_(res, RES, [&]() -> cudaError_t {                                       \
+      return DISPATCH_BOOL_(rms, RMS, [&]() -> cudaError_t {                                     \
+        return DISPATCH_BOOL_(quant, QUANT, [&]() -> cudaError_t { return __VA_ARGS__(); });     \
+      });                                                                                        \
+    });                                                                                          \
+  }
+
+#define DISPATCH_MOEFINALIZEREDUCTION(n_ranks, res, rms, quant, N_RANKS, RES, RMS, QUANT, ...) \
+  [&]() -> cudaError_t {                                                                       \
+    switch (n_ranks) {                                                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(2, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(4, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(8, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(16, N_RANKS, res, rms, quant, RES, RMS, QUANT,       \
+                                          __VA_ARGS__)                                         \
+      default:                                                                                 \
+        FLASHINFER_CHECK(false, "Unsupported n_ranks");                                        \
+        return cudaErrorNotSupported;                                                          \
+    }                                                                                          \
+  }()
+
+cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params) {
 #define MOE_FINALIZE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)             \
   return moefinalize_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, \
                                                       QUANT_OUT>(params);
@@ -1420,40 +1441,20 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     MOE_FINALIZE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT); \
   }
 
-  TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
-  TLLM_CHECK(params.size % params.hidden_dim == 0);
-  TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
-  if (params.residual_out && not params.norm_out && params.quant_out) {
-    // pattern1: AR+Add_RMS+Quant
-    // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-    // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-    MOE_FINALIZE_DISPATCH0(2, true, false, true);
-    MOE_FINALIZE_DISPATCH0(4, true, false, true);
-    MOE_FINALIZE_DISPATCH0(8, true, false, true);
-    MOE_FINALIZE_DISPATCH0(16, true, false, true);
-  } else if (not params.residual_out && params.norm_out && not params.quant_out) {
-    // pattern2: AR+AddRMS
-    // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-    // [m, 7168] bf16 norm_out
-    MOE_FINALIZE_DISPATCH0(2, false, true, false);
-    MOE_FINALIZE_DISPATCH0(4, false, true, false);
-    MOE_FINALIZE_DISPATCH0(8, false, true, false);
-    MOE_FINALIZE_DISPATCH0(16, false, true, false);
-  } else if (params.residual_out && params.norm_out && not params.quant_out) {
-    MOE_FINALIZE_DISPATCH0(2, true, true, false);
-    MOE_FINALIZE_DISPATCH0(4, true, true, false);
-    MOE_FINALIZE_DISPATCH0(8, true, true, false);
-    MOE_FINALIZE_DISPATCH0(16, true, true, false);
-  } else if (params.residual_out && params.norm_out && params.quant_out) {
-    // for test
-    MOE_FINALIZE_DISPATCH0(2, true, true, true);
-    MOE_FINALIZE_DISPATCH0(4, true, true, true);
-    MOE_FINALIZE_DISPATCH0(8, true, true, true);
-    MOE_FINALIZE_DISPATCH0(16, true, true, true);
-  }
-  TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: unsupported pattern!");
-#undef MOE_FINALIZE_DISPATCH0
-#undef MOE_FINALIZE_DISPATCH1
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  FLASHINFER_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k,
+                   "allreduce_in, expanded_idx_to_permuted_idx and top_k must be set");
+  FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
+  FLASHINFER_CHECK(params.hidden_dim % VEC_SIZE == 0, "hidden_dim must be a multiple of VEC_SIZE");
+
+  auto status = DISPATCH_MOEFINALIZEREDUCTION(
+      params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
+      QUANT, [&]() -> cudaError_t {
+        FLASHINFER_CUDA_CALL(
+            (moefinalize_allreduce_fusion_kernel_launcher<T, N_RANKS, RES, RMS, QUANT>(
+                (params), (launch_with_pdl))));
+      });
+  return status;
 }
 }  // namespace trtllm_moe_allreduce_fusion
 }  // namespace flashinfer
