@@ -8,10 +8,69 @@
 #define FLASHINFER_CASCADE_CUH_
 
 #include "../cp_async.hip.h"
+#include "../math.hip.h"
 #include "../utils.hip.h"
 #include "state.hip.h"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+
+namespace fi::con
+{
+template <typename DTypeIn, typename DTypeOut>
+__host__ __device__ __inline__ DTypeOut explicit_casting(DTypeIn value)
+{
+    return DTypeOut(value);
+}
+
+template <>
+__host__ __device__ __inline__ float
+explicit_casting<__half, float>(__half value)
+{
+    return __half2float(value);
+}
+
+template <>
+__host__ __device__ __inline__ float
+explicit_casting<__hip_bfloat16, float>(__hip_bfloat16 value)
+{
+    return __bfloat162float(value);
+}
+
+template <>
+__host__ __device__ __inline__ __half
+explicit_casting<float, __half>(float value)
+{
+    return __float2half(value);
+}
+
+template <>
+__host__ __device__ __inline__ __hip_bfloat16
+explicit_casting<__half, __hip_bfloat16>(__half value)
+{
+    return __float2bfloat16(__half2float(value));
+}
+
+template <>
+__host__ __device__ __inline__ float explicit_casting<float, float>(float value)
+{
+    return value;
+}
+
+template <>
+__host__ __device__ __inline__ __half
+explicit_casting<__half, __half>(__half value)
+{
+    return value;
+}
+
+template <>
+__host__ __device__ __inline__ __hip_bfloat16
+explicit_casting<__hip_bfloat16, __hip_bfloat16>(__hip_bfloat16 value)
+{
+    return value;
+}
+} // namespace fi::con
 
 namespace flashinfer
 {
@@ -227,14 +286,7 @@ __global__ void MergeStatesKernel(DTypeIn *__restrict__ V,
 
     if (num_index_sets == 0) {
         vec_t<DTypeO, vec_size> v;
-        const float zeroF = 0.f;
-        // Use type-specific conversion based on what DTypeO is
-        if constexpr (std::is_same_v<DTypeO, __hip_bfloat16>) {
-            v.fill(__float2bfloat16(zeroF));
-        }
-        else {
-            v.fill(DTypeO(zeroF));
-        }
+        v.fill(fi::con::explicit_casting<float, DTypeO>(0.0f));
         v.store(v_merged + (pos * num_heads + head_idx) * head_dim +
                 tx * vec_size);
         if (s_merged != nullptr) {
@@ -317,7 +369,7 @@ MergeStatesLargeNumIndexSetsKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
     float *s_smem =
         (float *)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
-    static_assert(bdy > 0);
+
 #pragma unroll
     for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch,
@@ -428,7 +480,6 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
     uint32_t cta_id = blockIdx.x;
     uint32_t num_ctas = gridDim.x;
     const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
-    assert(num_ctas > 0);
     uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
     constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
     constexpr uint32_t head_dim = vec_size * bdx;
@@ -436,7 +487,7 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
     float *s_smem =
         (float *)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
-    static_assert(bdy > 0);
+
 #pragma unroll 1
     for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
         uint32_t pos = i / num_heads;
@@ -446,14 +497,7 @@ PersistentVariableLengthMergeStatesKernel(DTypeIn *__restrict__ V,
 
         if (num_index_sets == 0) {
             vec_t<DTypeO, vec_size> v;
-            const float zeroF = 0.f;
-            // Use type-specific conversion based on what DTypeO is
-            if constexpr (std::is_same_v<DTypeO, __hip_bfloat16>) {
-                v.fill(__float2bfloat16(zeroF));
-            }
-            else {
-                v.fill(DTypeO(zeroF));
-            }
+            v.fill(fi::con::explicit_casting<float, DTypeO>(0.0f));
             v.store(v_merged + (pos * num_heads + head_idx) * head_dim +
                     tx * vec_size);
             if (s_merged != nullptr) {
@@ -556,7 +600,6 @@ PersistentVariableLengthAttentionSumKernel(DTypeIn *__restrict__ V,
     uint32_t cta_id = blockIdx.x;
     uint32_t num_ctas = gridDim.x;
     const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
-    assert(num_ctas > 0);
     uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
     constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
     constexpr uint32_t head_dim = vec_size * bdx;
@@ -564,7 +607,7 @@ PersistentVariableLengthAttentionSumKernel(DTypeIn *__restrict__ V,
     DTypeIn *v_smem = (DTypeIn *)smem;
 
     vec_t<float, vec_size> v_sum_vec;
-    static_assert(bdy > 0);
+
 #pragma unroll 1
     for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
         uint32_t pos = i / num_heads;
@@ -667,8 +710,7 @@ hipError_t MergeState(DTypeIn *v_a,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-        16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
-
+            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
         uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -706,7 +748,7 @@ hipError_t MergeStateInPlace(DType *v,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-        16U / sizeof(DType) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DType);
+            std::max(16U / sizeof(DType), HEAD_DIM / 32U);
         uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -744,7 +786,8 @@ hipError_t MergeStates(DTypeIn *v,
                        hipStream_t stream = nullptr)
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t vec_size = 16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
+        constexpr uint32_t vec_size =
+            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         if (num_index_sets >= seq_len) {
             constexpr uint32_t num_threads = 128;
@@ -790,7 +833,7 @@ hipError_t AttentionSum(DTypeIn *v,
 {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size =
-        16U / sizeof(DTypeIn) < HEAD_DIM / 32U ? HEAD_DIM / 32U : 16U / sizeof(DTypeIn);
+            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t bdy = num_heads;
         dim3 nblks(seq_len);
@@ -820,11 +863,10 @@ hipError_t VariableLengthMergeStates(DTypeIn *v,
     CHECK_HIP_ERROR(hipGetDevice(&dev_id));
     CHECK_HIP_ERROR(hipDeviceGetAttribute(
         &num_sms, hipDeviceAttributeMultiprocessorCount, dev_id));
-    assert(num_sms > 0);
+
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t temp_1st = 16U / sizeof(DTypeIn);
-        constexpr uint32_t temp_2nd = HEAD_DIM / 32U;
-        constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
+        constexpr uint32_t vec_size =
+            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         constexpr uint32_t num_threads = 128;
         constexpr uint32_t bdy = num_threads / bdx;
@@ -869,11 +911,10 @@ hipError_t VariableLengthAttentionSum(DTypeIn *v,
     CHECK_HIP_ERROR(hipGetDevice(&dev_id));
     CHECK_HIP_ERROR(hipDeviceGetAttribute(
         &num_sms, hipDeviceAttributeMultiprocessorCount, dev_id));
-    assert(num_sms > 0);
+
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        constexpr uint32_t temp_1st = 16U / sizeof(DTypeIn);
-        constexpr uint32_t temp_2nd = HEAD_DIM / 32U;
-        constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
+        constexpr uint32_t vec_size =
+            std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         constexpr uint32_t num_threads = 128;
         constexpr uint32_t bdy = num_threads / bdx;

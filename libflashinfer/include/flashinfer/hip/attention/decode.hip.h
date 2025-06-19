@@ -7,14 +7,23 @@
 #ifndef FLASHINFER_DECODE_CUH_
 #define FLASHINFER_DECODE_CUH_
 
-#include "../hip_platform.h"
-#include <hip/hip_cooperative_groups.h>
+#define HIP_ENABLE_WARP_SYNC_BUILTINS 1
 
+#include "../cp_async.hip.h"
 #include "../pos_enc.hip.h"
-
+#include "../utils.hip.h"
+#include "../vec_dtypes.hip.h"
 #include "cascade.hip.h"
+#include "state.hip.h"
+
 #include "default_decode_params.hip.h"
 #include "variants.hip.h"
+
+#include <hip/hip_bf16.h>
+#include <hip/hip_cooperative_groups.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
 
 #include <iostream>
 
@@ -777,91 +786,111 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size,
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+template <uint32_t HEAD_DIM,
+          PosEncodingMode POS_ENCODING_MODE,
+          typename AttentionVariant,
           typename Params>
-hipError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
-                                              hipStream_t stream) {
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
-  const uint32_t num_qo_heads = params.num_qo_heads;
-  const uint32_t num_kv_heads = params.num_kv_heads;
-  const uint32_t seq_len = params.kv_len;
+hipError_t SingleDecodeWithKVCacheDispatched(Params params,
+                                             typename Params::DTypeO *tmp,
+                                             hipStream_t stream)
+{
+    using DTypeQ = typename Params::DTypeQ;
+    using DTypeKV = typename Params::DTypeKV;
+    using DTypeO = typename Params::DTypeO;
+    const uint32_t num_qo_heads = params.num_qo_heads;
+    const uint32_t num_kv_heads = params.num_kv_heads;
+    const uint32_t seq_len = params.kv_len;
+    constexpr uint32_t vec_size =
+        std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    auto compute_capacity = GetCudaComputeCapability();
+    static_assert(bdx <= 32U);
+    DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+        constexpr uint32_t bdy = GROUP_SIZE;
+        constexpr uint32_t num_threads = std::max(
+            get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
+        constexpr uint32_t bdz = num_threads / (bdx * bdy);
+        constexpr uint32_t tile_size_per_bdx =
+            GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
+        DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(
+            compute_capacity, NUM_STAGES_SMEM, {
+                const uint32_t smem_size = 2U * NUM_STAGES_SMEM * bdy *
+                                               tile_size_per_bdx * bdz *
+                                               HEAD_DIM * sizeof(DTypeKV) +
+                                           2U * bdy * bdz * sizeof(float);
+                auto kernel = SingleDecodeWithKVCacheKernel<
+                    POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
+                    vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+                FLASHINFER_CUDA_CALL(hipFuncSetAttribute(
+                    (void *)kernel, hipFuncAttributeMaxDynamicSharedMemorySize,
+                    smem_size));
+                if (seq_len <= 256 || tmp == nullptr) {
+                    // no need to use partition-kv kernel
+                    dim3 nblks = dim3(1, num_kv_heads);
+                    dim3 nthrs = dim3(bdx, bdy, bdz);
+                    params.kv_chunk_size = seq_len;
+                    void *args[] = {(void *)&params};
+                    SingleDecodeWithKVCacheKernel<
+                        POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
+                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>
+                        <<<nblks, nthrs, smem_size, stream>>>(params);
+                }
+                else {
+                    // use partition-kv kernel
+                    int num_blocks_per_sm = 0;
+                    int num_sm = 0;
+                    int dev_id = 0;
+                    FLASHINFER_CUDA_CALL(hipGetDevice(&dev_id));
+                    FLASHINFER_CUDA_CALL(hipDeviceGetAttribute(
+                        &num_sm, hipDeviceAttributeMultiprocessorCount,
+                        dev_id));
+                    FLASHINFER_CUDA_CALL(
+                        hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &num_blocks_per_sm, kernel, num_threads,
+                            smem_size));
+                    // TODO: FIX MAX OCCUPANCY SETTING num_blocks_per_sm TO 0 -
+                    // This causes floating point exception due to division by 0
+                    // uint32_t max_grid_size = uint32_t(num_blocks_per_sm) *
+                    // uint32_t(num_sm);
+                    uint32_t max_grid_size = uint32_t(1) * uint32_t(num_sm);
+                    uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
+                    uint32_t kv_chunk_size =
+                        max(ceil_div(seq_len, max_num_kv_chunks), 256);
+                    uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
+                    dim3 nblks = dim3(num_chunks, num_kv_heads);
+                    if (nblks.x == 0 || nblks.y == 0) {
+                        std::ostringstream err_msg;
+                        err_msg << "Invalid kernel configuration: nblks=("
+                                << nblks.x << "," << nblks.y << ")";
+                        FLASHINFER_ERROR(err_msg.str());
+                    }
+                    dim3 nthrs = dim3(bdx, bdy, bdz);
+                    float *tmp_lse =
+                        (float *)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
+                    auto o = params.o;
+                    params.o = tmp;
+                    params.lse = tmp_lse;
+                    params.kv_chunk_size = kv_chunk_size;
 
-  constexpr uint32_t temp1 = 16UL / sizeof(DTypeKV);
-  constexpr uint32_t temp2 = HEAD_DIM / 32UL;
-  constexpr uint32_t vec_size = temp1 < temp2 ? temp2 : temp1;
+                    SingleDecodeWithKVCacheKernel<
+                        POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
+                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>
+                        <<<nblks, nthrs, smem_size, stream>>>(params);
 
-  constexpr uint32_t bdx = HEAD_DIM / vec_size;
-  auto compute_capacity = GetCudaComputeCapability();
-  static_assert(bdx <= 32U);
-  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
-    constexpr uint32_t bdy = GROUP_SIZE;
-    
-    constexpr uint32_t temp_1st = get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV));
-    constexpr uint32_t temp_2nd = bdx * bdy;
-    constexpr uint32_t num_threads = temp_1st < temp_2nd ? temp_2nd : temp_1st;
-
-    constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
-    DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-      const uint32_t smem_size =
-          2U * NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          2U * bdy * bdz * sizeof(float);
-      auto kernel =
-          SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
-      FLASHINFER_CUDA_CALL(
-          hipFuncSetAttribute((void*)kernel, hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      if (seq_len <= 256 || tmp == nullptr) {
-        // no need to use partition-kv kernel
-        dim3 nblks = dim3(1, num_kv_heads);
-        dim3 nthrs = dim3(bdx, bdy, bdz);
-        params.kv_chunk_size = seq_len;
-        void* args[] = {(void*)&params};
-
-        FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-
-      } else {
-        // use partition-kv kernel
-        int num_blocks_per_sm = 0;
-        int num_sm = 0;
-        int dev_id = 0;
-        FLASHINFER_CUDA_CALL(hipGetDevice(&dev_id));
-        FLASHINFER_CUDA_CALL(
-            hipDeviceGetAttribute(&num_sm, hipDeviceAttributeMultiprocessorCount, dev_id));
-        FLASHINFER_CUDA_CALL(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &num_blocks_per_sm, kernel, num_threads, smem_size));
-        uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
-        uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-        uint32_t kv_chunk_size = max_num_kv_chunks > 0 ? max(ceil_div(seq_len, max_num_kv_chunks), 256) : 256;
-        uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
-        dim3 nblks = dim3(num_chunks, num_kv_heads);
-        if (nblks.x == 0 || nblks.y == 0) {
-          std::ostringstream err_msg;
-          err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y << ")";
-          FLASHINFER_ERROR(err_msg.str());
-        }
-        dim3 nthrs = dim3(bdx, bdy, bdz);
-        float* tmp_lse = (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
-        auto o = params.o;
-        auto lse = params.lse;
-        params.o = tmp;
-        params.lse = tmp_lse;
-        params.kv_chunk_size = kv_chunk_size;
-        void* args[] = {(void*)&params};
-        FLASHINFER_CUDA_CALL(
-            hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(
-              MergeStates(tmp, tmp_lse, o, lse, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
-        } else {
-          FLASHINFER_CUDA_CALL(AttentionSum(tmp, o, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
-        }
-      }
+                    if constexpr (AttentionVariant::use_softmax) {
+                        CHECK_HIP_ERROR(MergeStates(tmp, tmp_lse, o, nullptr,
+                                                    num_chunks, 1, num_qo_heads,
+                                                    HEAD_DIM, stream));
+                    }
+                    else {
+                        CHECK_HIP_ERROR(AttentionSum(tmp, o, num_chunks, 1,
+                                                     num_qo_heads, HEAD_DIM,
+                                                     stream));
+                    }
+                }
+            });
     });
-  });
-  return hipSuccess;
+    return hipSuccess;
 }
 
 template <uint32_t HEAD_DIM,
@@ -881,16 +910,14 @@ hipError_t BatchDecodeWithPagedKVCacheDispatched(Params params,
     const uint32_t num_kv_heads = params.paged_kv.num_heads;
     const uint32_t padded_batch_size = params.padded_batch_size;
 
-    constexpr uint32_t temp_1st = 16UL / sizeof(DTypeKV);
-    constexpr uint32_t temp_2nd = HEAD_DIM / 32UL;
-    constexpr uint32_t vec_size = temp_1st < temp_2nd ? temp_2nd : temp_1st;
-
+    constexpr uint32_t vec_size =
+        std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
     auto compute_capacity = GetCudaComputeCapability();
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     static_assert(bdx <= 32);
     DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
         constexpr uint32_t bdy = GROUP_SIZE;
-        constexpr uint32_t num_threads = (GROUP_SIZE == 6) ? 192U : (128U < bdx * bdy ? bdx * bdy : 128U);
+        constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
         constexpr uint32_t bdz = num_threads / (bdx * bdy);
         constexpr uint32_t tile_size_per_bdx =
             GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
@@ -934,16 +961,16 @@ hipError_t BatchDecodeWithPagedKVCacheDispatched(Params params,
                         vec_size, bdx, bdy, bdz, AttentionVariant, Params>
                         <<<nblks, nthrs, smem_size, stream>>>(params);
                     if constexpr (AttentionVariant::use_softmax) {
-                        hipError_t status = VariableLengthMergeStates(
+                        CHECK_HIP_ERROR(VariableLengthMergeStates(
                             tmp_v, tmp_s, params.o_indptr, o, lse,
                             params.paged_kv.batch_size, nullptr, num_qo_heads,
-                            HEAD_DIM, stream);
+                            HEAD_DIM, stream));
                     }
                     else {
-                        hipError_t status = VariableLengthAttentionSum(
+                        CHECK_HIP_ERROR(VariableLengthAttentionSum(
                             tmp_v, params.o_indptr, o,
                             params.paged_kv.batch_size, nullptr, num_qo_heads,
-                            HEAD_DIM, stream);
+                            HEAD_DIM, stream));
                     }
                 }
             });
@@ -1296,17 +1323,15 @@ BatchDecodeWithPagedKVCacheDispatchedMLA(Params params,
     const uint32_t num_qo_heads = params.num_qo_heads;
     const uint32_t padded_batch_size = params.padded_batch_size;
 
-    constexpr uint32_t temp_1st = 16UL / sizeof(DTypeKV);
-    constexpr uint32_t temp_2nd = HEAD_DIM_CKV / 32UL;
-    constexpr uint32_t vec_size_ckv = temp_1st < temp_2nd ? temp_2nd : temp_1st;
-
+    constexpr uint32_t vec_size_ckv =
+        std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
     constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
     constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
     constexpr uint32_t bdy = 8;
     constexpr uint32_t tile_size_qo_heads = 2;
     constexpr uint32_t qo_heads_per_block = bdy * tile_size_qo_heads;
-    constexpr uint32_t num_threads = 128U < bdx * bdy ? bdx * bdy : 128U;
+    constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     const uint32_t gdy = ceil_div(num_qo_heads, qo_heads_per_block);
 
@@ -1350,7 +1375,8 @@ BatchDecodeWithPagedKVCacheDispatchedMLA(Params params,
                     NUM_STAGES_SMEM, vec_size_ckv, vec_size_kpe, bdx, bdy, bdz,
                     tile_size_qo_heads, AttentionVariant, Params>
                     <<<nblks, nthrs, smem_size, stream>>>(params);
-                FI_GPU_CALL(VariableLengthMergeStates(
+
+                CHECK_HIP_ERROR(VariableLengthMergeStates(
                     tmp_v, tmp_s, params.o_indptr, o, lse,
                     params.paged_kv.batch_size, nullptr, num_qo_heads,
                     HEAD_DIM_CKV, stream));

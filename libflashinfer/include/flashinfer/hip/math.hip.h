@@ -4,15 +4,16 @@
 // SPDX - License - Identifier : Apache 2.0
 
 #pragma once
-#define HIP_ENABLE_WARP_SYNC_BUILTINS
-
 #ifndef FLASHINFER_MATH_CUH_
 #define FLASHINFER_MATH_CUH_
 
+#define HIP_ENABLE_WARP_SYNC_BUILTINS 1
+
 #include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+
 #include <hip/hip_fp16.h>
 
-#include "hip_platform.h"
 #include <cstdint>
 
 namespace flashinfer::math
@@ -110,4 +111,4 @@ template <> __forceinline__ __device__ __half2 tanh<__half2>(__half2 x)
 }
 
 } // namespace flashinfer::math
-#endif  // FLASHINFER_MATH_CUH_
+#endif // FLASHINFER_MATH_CUH_
