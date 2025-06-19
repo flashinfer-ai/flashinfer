@@ -161,7 +161,6 @@ def generate_ninja_build_for_op(
         )
 
     objects = []
-    cuda_objects = []
     for source in sources:
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
@@ -169,8 +168,6 @@ def generate_ninja_build_for_op(
         obj_name = source.with_suffix(object_suffix).name
         obj = f"$name/{obj_name}"
         objects.append(obj)
-        if is_cuda:
-            cuda_objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
 
     lines.append("")
