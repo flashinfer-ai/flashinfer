@@ -246,9 +246,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 rtol=1e-2,
                             ):
                                 test_passed = False
-                                print(f"Rank {rank} allreduce_out mismatch")
-                                print(f"moe_all_reduce_out: {moe_allreduce_out}")
-                                print(f"moe_all_reduce_ref: {moe_allreduce_ref}")
+                                print(f"Rank {rank} moe_allreduce_out mismatch")
+                                print(f"moe_allreduce_out: {moe_allreduce_out}")
+                                print(f"moe_allreduce_ref: {moe_allreduce_ref}")
                                 # Print max diff elements for allreduce_out
                                 max_diff = torch.max(
                                     torch.abs(
@@ -262,15 +262,17 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                         - moe_allreduce_ref
                                     )
                                 )
-                                print(f"Rank {rank} allreduce_out max diff: {max_diff}")
                                 print(
-                                    f"Rank {rank} allreduce_out max diff idx: {max_diff_idx}"
+                                    f"Rank {rank} moe_allreduce_out max diff: {max_diff}"
                                 )
                                 print(
-                                    f"Rank {rank} allreduce_out value at max diff: {moe_allreduce_out.view(-1)[max_diff_idx]}"
+                                    f"Rank {rank} moe_allreduce_out max diff idx: {max_diff_idx}"
                                 )
                                 print(
-                                    f"Rank {rank} allreduce_out ref value at max diff: {moe_allreduce_ref.view(-1)[max_diff_idx]}"
+                                    f"Rank {rank} moe_allreduce_out value at max diff: {moe_allreduce_out.view(-1)[max_diff_idx]}"
+                                )
+                                print(
+                                    f"Rank {rank} moe_allreduce_out ref value at max diff: {moe_allreduce_ref.view(-1)[max_diff_idx]}"
                                 )
 
                             torch.testing.assert_close(
