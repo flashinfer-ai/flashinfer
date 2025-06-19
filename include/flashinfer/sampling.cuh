@@ -56,6 +56,15 @@ using namespace cub;
     __VA_ARGS__                                                                \
   }
 
+#define DISPATCH_SOFTMAX_CACHE_INPUT(cache_input, CACHE_INPUT, ...) \
+  if (cache_input) {                                                \
+    constexpr bool CACHE_INPUT = true;                              \
+    __VA_ARGS__                                                     \
+  } else {                                                          \
+    constexpr bool CACHE_INPUT = false;                             \
+    __VA_ARGS__                                                     \
+  }
+
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
@@ -273,7 +282,7 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
   return temp_storage.max_val;
 }
 
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_INPUT>
 __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -281,7 +290,15 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
   extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
   auto& temp_storage = reinterpret_cast<TempStorage&>(smem);
 
+  DType* smem_vec_base = nullptr;
+  if constexpr (CACHE_INPUT) {
+    constexpr size_t vec_alignment = alignof(vec_t<DType, VEC_SIZE>);
+    size_t aligned_offset = round_up(sizeof(TempStorage), vec_alignment);
+    smem_vec_base = reinterpret_cast<DType*>(smem + aligned_offset);
+  }
+
   vec_t<DType, VEC_SIZE> logits_vec;
+
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float running_denominator = 0.0f;
 
@@ -291,6 +308,10 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+
+      if constexpr (CACHE_INPUT) {
+        logits_vec.store(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
     }
 
     float thread_max = -cuda::std::numeric_limits<float>::infinity();
@@ -344,8 +365,12 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
   // Pass 2: Normalize in place
   vec_t<DType, VEC_SIZE> prob_vec;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    if constexpr (CACHE_INPUT) {
+      logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    } else {
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
     }
 
 #pragma unroll
@@ -1014,6 +1039,13 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
                           cudaStream_t stream = 0) {
+  int device_id = 0;
+  cudaGetDevice(&device_id);
+  int smem_cap = 0;
+  // cache input into shared memory if d is small
+  cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device_id);
+  const bool cache_input = d * sizeof(DType) <= smem_cap;
+
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1021,13 +1053,20 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&logits, &output, &d};
-    const uint32_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>);
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      auto kernel = OnlineSoftmaxFusedKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(DType);
+
+      uint32_t smem_size =
+          sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>) + (cache_input ? smem_logits_bytes : 0);
+
+      DISPATCH_SOFTMAX_CACHE_INPUT(cache_input, CACHE_INPUT, {
+        auto kernel = OnlineSoftmaxFusedKernel<BLOCK_THREADS, VEC_SIZE, DType, CACHE_INPUT>;
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      });
     });
     return cudaSuccess;
   });
