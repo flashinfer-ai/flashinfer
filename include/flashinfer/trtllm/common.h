@@ -226,6 +226,29 @@ enum Data_type {
   DATA_TYPE_UNKNOWN
 };
 
+inline constexpr const char* toStr(Data_type dtype) {
+  switch (dtype) {
+    case DATA_TYPE_FP16:
+      return "FP16";
+    case DATA_TYPE_BF16:
+      return "BF16";
+    case DATA_TYPE_FP32:
+      return "FP32";
+    case DATA_TYPE_INT8:
+      return "INT8";
+    case DATA_TYPE_INT32:
+      return "INT32";
+    case DATA_TYPE_E4M3:
+      return "E4M3";
+    case DATA_TYPE_E5M2:
+      return "E5M2";
+    case DATA_TYPE_E2M1:
+      return "E2M1";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 // Type trait to map types to enum values
 template <typename T>
 struct TypeToDataType {
