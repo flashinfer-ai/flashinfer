@@ -66,14 +66,16 @@ SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
 
 
 def get_nvshmem_include_dir():
-    import nvidia.nvshmem
+    # import nvidia.nvshmem
 
-    path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "include"
-    return path
+    # path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "include"
+    # return path
+    return "/opt/nvshmem-3.2.5/include"
 
 
 def get_nvshmem_lib_dir():
-    import nvidia.nvshmem
+    # import nvidia.nvshmem
 
-    path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "lib"
-    return path
+    # path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "lib"
+    # return path
+    return "/opt/nvshmem-3.2.5/lib"
