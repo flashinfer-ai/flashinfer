@@ -662,7 +662,6 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams<T> {
   // Refer to kernel implementation on layout of those params
   // number of active experts on current device
 
-  // todo(review): why int* moe_reduction_device_num_experts = nullptr; in trt-llm?
   int moe_reduction_device_num_experts = 0;
   // per token per expert fp32 scale
   float* moe_reduction_scale_input = nullptr;
@@ -670,6 +669,9 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams<T> {
   void* moe_reduction_active_experts_token_input = nullptr;
   // per token input
   void* moe_reduction_token_input = nullptr;
+
+  // moe-allreduce output (non-fused)
+  void* moe_allreduce_out = nullptr;
 };
 
 template <typename T>
@@ -780,9 +782,10 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
 template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, typename T,
           uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
-                                         int access_id_in_token, AllReduceFusionParams<T>& params) {
+                                         int access_id_in_token,
+                                         MoeReductionAllReduceFusionParams<T>& params) {
   if constexpr (AllReduceOut) {
-    val.store(reinterpret_cast<T*>(params.allreduce_out) + access_id * VEC_SIZE);
+    val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> residual_val;
   residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
@@ -1172,8 +1175,8 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
   FLASHINFER_CHECK(params.hidden_dim * sizeof(T) % details::kBytesPerAccess == 0,
                    "hidden_dim * sizeof(T) must be a multiple of kBytesPerAccess");
   FLASHINFER_CHECK(
-      params.allreduce_out || params.residual_out || params.norm_out || params.quant_out,
-      "at least one of allreduce_out, residual_out, norm_out, quant_out must be set");
+      params.moe_allreduce_out || params.residual_out || params.norm_out || params.quant_out,
+      "at least one of moe_allreduce_out, residual_out, norm_out, quant_out must be set");
 
   // hidden_dim (d) = 7168 for dpsk moe, and hence 128 tokens as one-shot threshold
   // AR outputs are optional, since we always have fused options followed.
@@ -1194,8 +1197,8 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
   // [m, d] bf16 residual_out, [m, d] bf16 norm_out, [m, d] fp4 quant_out
 
   auto status = DISPATCH_MOEREDUCTION(
-      params.nranks, params.allreduce_out, params.residual_out, params.rms_gamma, params.quant_out,
-      N_RANKS, AR, RES, RMS, QUANT, [&]() -> cudaError_t {
+      params.nranks, params.moe_allreduce_out, params.residual_out, params.rms_gamma,
+      params.quant_out, N_RANKS, AR, RES, RMS, QUANT, [&]() -> cudaError_t {
         FLASHINFER_CUDA_CALL(
             (moereduction_allreduce_fusion_kernel_launcher<T, N_RANKS, AR, RES, RMS, QUANT>(
                 (params), (launch_with_pdl))));
