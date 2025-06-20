@@ -12,7 +12,7 @@ from flashinfer import MoE_Mapping
 
 
 RANDOM_SEED = 42
-NUM_REPEATS = 8
+NUM_REPEATS = 8 # To test input as a list 
 
 
 def _run_reduce_scatter_worker(rank, world_size, dtype):
@@ -25,24 +25,30 @@ def _run_reduce_scatter_worker(rank, world_size, dtype):
         gpus_per_node=world_size,
         tp_size=world_size,
     )
+    hidden_dim = 32
 
-    # Create input tensor with shape (world_size, world_size)
-    # Each rank will have a different slice of this tensor
-    shape = (world_size, world_size)
+    sizes = [world_size * (i + 1) for i in range(world_size)]
+    total_size = sum(sizes)
+    shape = (world_size, total_size, hidden_dim)
+
     input_tensors = [
         torch.randn(shape, dtype=dtype, device=device) for _ in range(NUM_REPEATS)
     ]
     expected_output = [i.sum(dim=0) for i in input_tensors]
+    input_rs = [i[rank,:,:] for i in input_tensors]
 
     output = comm.reduce_scatter(
-        [i[rank, :] for i in input_tensors],
+        input_rs,
         mapp,
-        dim=-1,
+        dim=0,
+        sizes=sizes,
     )
 
     for i in range(NUM_REPEATS):
+        start = sum(sizes[:rank])
+        end = start + sizes[rank]
         torch.testing.assert_close(
-            output[i][0], expected_output[i][rank], atol=1e-3, rtol=3e-2
+            output[i], expected_output[i][start:end,:], atol=1e-2, rtol=3e-2
         )
 
 
@@ -57,14 +63,20 @@ def _run_allgather_worker(world_size, rank, hidden_dim, dtype):
         gpus_per_node=world_size,
         tp_size=world_size,
     )
-    shape_ref = (world_size, world_size, hidden_dim)
+    sizes = [world_size * (i + 1) for i in range(world_size)]
+    total_size = sum(sizes)
+    shape_ref = (total_size, hidden_dim)
+        
     out_ref = torch.randn(shape_ref, dtype=dtype, device=device)
-    inp = out_ref[rank, :, :]
+    start = sum(sizes[:rank])
+    end = start + sizes[rank]
+    inp = out_ref[start:end, :]
     out = comm.all_gather(
         inp,
         mapp,
         dim=0,
-    ).reshape(shape_ref)
+        sizes=sizes,
+    )
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=3e-2)
 
 
