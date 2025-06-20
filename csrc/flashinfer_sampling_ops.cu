@@ -15,7 +15,7 @@
  */
 #include "pytorch_extension_utils.h"
 
-void softmax(at::Tensor logits, at::Tensor probs);
+void softmax(at::Tensor workspace_buffer, at::Tensor logits, at::Tensor probs);
 
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,

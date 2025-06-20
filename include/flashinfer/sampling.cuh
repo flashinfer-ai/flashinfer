@@ -28,6 +28,7 @@
 #include <numeric>
 #include <tuple>
 
+#include "allocator.h"
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -93,6 +94,17 @@ struct BoolDiffOp {
   }
 };
 
+struct Float2SoftmaxReduceOp {
+  __device__ __forceinline__ float2 operator()(const float2& a, const float2& b) const {
+    if (isinf(a.x)) return b;
+    if (isinf(b.x)) return a;
+
+    float new_max = max(a.x, b.x);
+    float new_denom = a.y * __expf(a.x - new_max) + b.y * __expf(b.x - new_max);
+    return make_float2(new_max, new_denom);
+  }
+};
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM>
 struct SamplingTempStorage {
@@ -120,12 +132,18 @@ template <uint32_t BLOCK_THREADS>
 struct OnlineSoftmaxTempStorage {
   union {
     typename cub::BlockReduce<float, BLOCK_THREADS>::TempStorage reduce;
+    typename cub::BlockReduce<float2, BLOCK_THREADS>::TempStorage reduce_pair;
   } block_prim;
 
   struct {
     float max_val;
     float denominator;
   } shared_state;
+};
+
+struct PartialSoftmaxResult {
+  float max_val;
+  float denominator;
 };
 
 /*!
@@ -371,6 +389,144 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
+    }
+
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
+      prob_vec[j] = static_cast<DType>(p);
+    }
+
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+  }
+}
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
+__global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* partial_results,
+                                       uint32_t d, uint32_t num_slices) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t by = blockIdx.y;  // slice index
+  const uint32_t tx = threadIdx.x;
+
+  const uint32_t slice_start = by * ceil_div(d, num_slices);
+  const uint32_t slice_size = min((by + 1) * ceil_div(d, num_slices), d) - slice_start;
+
+  if (slice_start >= d) return;
+
+  using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
+  extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<TempStorage&>(smem);
+
+  vec_t<DType, VEC_SIZE> logits_vec;
+  float running_max = -cuda::std::numeric_limits<float>::infinity();
+  float running_denominator = 0.0f;
+
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
+    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
+
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size) {
+      logits_vec.cast_load(logits + bx * d + slice_start + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+
+    float thread_max = -cuda::std::numeric_limits<float>::infinity();
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      thread_max = max(thread_max, logits_vec[j]);
+    }
+
+    float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                          .Reduce(thread_max, cub::Max());
+
+    if (tx == 0) {
+      temp_storage.shared_state.max_val = block_max;
+    }
+    __syncthreads();
+    block_max = temp_storage.shared_state.max_val;
+
+    float thread_sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      thread_sum += __expf(logits_vec[j] - block_max);
+    }
+
+    float block_sum =
+        cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
+
+    if (tx == 0) {
+      temp_storage.shared_state.denominator = block_sum;
+    }
+    __syncthreads();
+    block_sum = temp_storage.shared_state.denominator;
+
+    if (tx == 0) {
+      float new_max = max(running_max, block_max);
+      running_denominator = running_denominator * __expf(running_max - new_max) +
+                            block_sum * __expf(block_max - new_max);
+      running_max = new_max;
+
+      temp_storage.shared_state.max_val = running_max;
+      temp_storage.shared_state.denominator = running_denominator;
+    }
+    __syncthreads();
+
+    running_max = temp_storage.shared_state.max_val;
+    running_denominator = temp_storage.shared_state.denominator;
+  }
+
+  if (tx == 0) {
+    partial_results[bx * num_slices + by] = {running_max, running_denominator};
+  }
+}
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
+__global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
+                                          PartialSoftmaxResult* partial_results, uint32_t d,
+                                          uint32_t num_slices) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+
+  // Reduce slice results
+  using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
+  extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<TempStorage&>(smem);
+
+  const Float2SoftmaxReduceOp reduce_op;
+
+  float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
+
+  for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
+    PartialSoftmaxResult partial = partial_results[bx * num_slices + i];
+    float2 partial_pair = make_float2(partial.max_val, partial.denominator);
+    thread_aggregate = reduce_op(thread_aggregate, partial_pair);
+  }
+
+  float2 block_result = cub::BlockReduce<float2, BLOCK_THREADS>(temp_storage.block_prim.reduce_pair)
+                            .Reduce(thread_aggregate, reduce_op);
+
+  if (tx == 0) {
+    temp_storage.shared_state.max_val = block_result.x;
+    temp_storage.shared_state.denominator = block_result.y;
+  }
+  __syncthreads();
+
+  block_result =
+      make_float2(temp_storage.shared_state.max_val, temp_storage.shared_state.denominator);
+
+  const float final_max = temp_storage.shared_state.max_val;
+  const float inv_denominator = 1.0f / temp_storage.shared_state.denominator;
+
+  // Apply normalization
+  vec_t<DType, VEC_SIZE> logits_vec;
+  vec_t<DType, VEC_SIZE> prob_vec;
+
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
+
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
 #pragma unroll
@@ -1038,38 +1194,87 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
+                          void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
                           cudaStream_t stream = 0) {
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  int smem_cap = 0;
-  // cache input into shared memory if d is small
-  cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device_id);
-  const bool cache_input = d * sizeof(DType) <= smem_cap;
+  constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
+  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 8192;
+  constexpr uint32_t DEFAULT_SLICE_SIZE = 8192;
 
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
-
   auto compute_capacity = GetCudaComputeCapability();
-  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
-    dim3 nblks(batch_size);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &output, &d};
 
-    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(DType);
+  DISPATCH_COMPUTE_CAP_NUM_THREADS(
+      compute_capacity, BLOCK_THREADS, {DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+        if (batch_size <= SMALL_BATCH_THRESHOLD && d >= LARGE_VOCAB_THRESHOLD) {
+          // Path A: Vocab-Splitting Strategy for small-batch & large-vocab
+          uint32_t num_slices = ceil_div(d, DEFAULT_SLICE_SIZE);
 
-      uint32_t smem_size =
-          sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>) + (cache_input ? smem_logits_bytes : 0);
+          const size_t partial_buffer_size = batch_size * num_slices * sizeof(PartialSoftmaxResult);
+          if (workspace_buffer_size_in_bytes < partial_buffer_size) {
+            return cudaErrorInvalidValue;
+          }
 
-      DISPATCH_SOFTMAX_CACHE_INPUT(cache_input, CACHE_INPUT, {
-        auto kernel = OnlineSoftmaxFusedKernel<BLOCK_THREADS, VEC_SIZE, DType, CACHE_INPUT>;
-        FLASHINFER_CUDA_CALL(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-      });
-    });
-    return cudaSuccess;
-  });
+          AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
+          auto partial_results = allocator.aligned_alloc<PartialSoftmaxResult>(
+              partial_buffer_size, alignof(PartialSoftmaxResult), "softmax_workspace");
+
+          // Phase 1: Map-Reduce across vocab slices
+          dim3 phase1_nblks(batch_size, num_slices);
+          dim3 phase1_nthrs(BLOCK_THREADS);
+          size_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>);
+
+          auto phase1_kernel = OnlineSoftmaxMapKernel<BLOCK_THREADS, VEC_SIZE, DType>;
+          void* phase1_args[] = {&logits, &partial_results, &d, &num_slices};
+
+          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+              phase1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
+                                                phase1_args, smem_size, stream));
+
+          // Phase 2: Final reduction and apply normalization
+          dim3 phase2_nblks(batch_size);
+          dim3 phase2_nthrs(BLOCK_THREADS);
+
+          auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DType>;
+          void* phase2_args[] = {&logits, &output, &partial_results, &d, &num_slices};
+
+          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+              phase2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
+                                                phase2_args, smem_size, stream));
+
+        } else {
+          // Path B: Single-Block Strategy
+          // Switch input cache
+          uint32_t cache_threshold;
+          if (batch_size <= 16) {
+            cache_threshold = 4096;
+          } else if (batch_size <= 32) {
+            cache_threshold = 2048;
+          } else {
+            cache_threshold = 0;
+          }
+          const bool cache_input = d <= cache_threshold;
+
+          dim3 nblks(batch_size);
+          dim3 nthrs(BLOCK_THREADS);
+          void* args[] = {&logits, &output, &d};
+
+          const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(DType);
+
+          uint32_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>) +
+                               (cache_input ? smem_logits_bytes : 0);
+
+          DISPATCH_SOFTMAX_CACHE_INPUT(cache_input, CACHE_INPUT, {
+            auto kernel = OnlineSoftmaxFusedKernel<BLOCK_THREADS, VEC_SIZE, DType, CACHE_INPUT>;
+            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+          });
+        }
+      })});
+  return cudaSuccess;
 }
 
 template <typename T, typename IdType>

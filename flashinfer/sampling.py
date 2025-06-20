@@ -23,7 +23,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
-from .utils import register_custom_op, register_fake_op
+from .utils import _get_cache_buf, register_custom_op, register_fake_op
 
 
 def gen_sampling_module() -> JitSpec:
@@ -41,13 +41,15 @@ def gen_sampling_module() -> JitSpec:
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
-    @register_custom_op("flashinfer::softmax", mutates_args=())
+    @register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
     def softmax(
+        workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
         module.softmax.default(
+            workspace_buffer,
             logits,
             probs,
         )
@@ -55,9 +57,10 @@ def get_sampling_module():
 
     @register_fake_op("flashinfer::softmax")
     def _fake_softmax(
+        workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.empty_like(logits, device=logits.device)
+        return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
     # torch library for sampling_from_logits
     @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
@@ -482,7 +485,8 @@ def softmax(
             [0.2401, 0.1707, 0.2249, 0.1664, 0.1979],
             [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
     """
-    return get_sampling_module().softmax(logits)
+    workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
+    return get_sampling_module().softmax(workspace_buffer, logits)
 
 
 def sampling_from_logits(
