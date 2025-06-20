@@ -410,8 +410,10 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
 
-  const uint32_t slice_start = by * ceil_div(d, num_slices);
-  const uint32_t slice_size = min((by + 1) * ceil_div(d, num_slices), d) - slice_start;
+  const uint32_t vec_alignment_elems = alignof(vec_t<DType, VEC_SIZE>) / sizeof(DType);
+  const uint32_t slice_stride = round_up(ceil_div(d, num_slices), vec_alignment_elems);
+  const uint32_t slice_start = by * slice_stride;
+  const uint32_t slice_size = min((by + 1) * slice_stride, d) - slice_start;
 
   if (slice_start >= d) return;
 
@@ -1197,7 +1199,7 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
                           void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
                           cudaStream_t stream = 0) {
   constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
-  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 8192;
+  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 32768;
   constexpr uint32_t DEFAULT_SLICE_SIZE = 8192;
 
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
@@ -1242,7 +1244,6 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
               phase2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
           FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
                                                 phase2_args, smem_size, stream));
-
         } else {
           // Path B: Single-Block Strategy
           // Switch input cache
