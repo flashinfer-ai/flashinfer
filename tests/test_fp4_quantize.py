@@ -177,7 +177,7 @@ def test_fp4_quantization(
     seed: int,
     device: str,
 ) -> None:
-    if not is_sm100a_supported(torch.device("cuda")):
+    if not is_sm100a_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
