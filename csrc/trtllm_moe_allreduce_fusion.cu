@@ -80,6 +80,57 @@ void trtllm_moe_allreduce_fusion(
       });
 }
 
+void trtllm_moe_finalize_allreduce(
+    at::Tensor const& input, at::Tensor const& residual, at::Tensor const& norm_weight,
+    at::Tensor const& expanded_idx_to_permuted_idx, at::Tensor& norm_out, at::Tensor& residual_out,
+    bool launch_with_pdl, at::Tensor& workspace, int64_t const world_rank, int64_t const world_size,
+    double const eps, std::optional<at::Tensor> const& shared_expert_output,
+    std::optional<at::Tensor> const& expert_scale_factor) {
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(input.scalar_type(), c_type, [&] {
+    MoeFinalizeAllReduceFusionParams<c_type> params;
+
+    int hidden_dim = residual.size(-1);
+    int top_k = expanded_idx_to_permuted_idx.size(-1);
+
+    params.quant_out = nullptr;
+    params.scale_out = nullptr;
+
+    params.nranks = static_cast<int>(world_size);
+    params.rank = static_cast<int>(world_rank);
+    // size: num_token * hidden_dim
+    params.size = residual.numel();
+    params.hidden_dim = hidden_dim;
+
+    // workspace: AR scratch space
+    params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    params.rms_gamma = norm_weight.data_ptr();
+    params.rms_eps = static_cast<float>(eps);
+    params.residual_in = residual.data_ptr();
+    params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
+
+    // MOE Reduction specific params
+    params.top_k = top_k;
+    params.allreduce_in = input.data_ptr();
+    params.expert_scale_factor =
+        expert_scale_factor.has_value() ? expert_scale_factor.value().data_ptr() : nullptr;
+    TORCH_CHECK(expanded_idx_to_permuted_idx.scalar_type() == at::ScalarType::Int,
+                "expanded_idx_to_permuted_idx must be int32");
+    params.expanded_idx_to_permuted_idx =
+        static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    params.shared_expert_output =
+        shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
+
+    // output tensors
+    params.norm_out = norm_out.mutable_data_ptr();
+    params.residual_out = residual_out.mutable_data_ptr();
+
+    auto status = moefinalize_allreduce_fusion_op(params, launch_with_pdl);
+    TORCH_CHECK(status == cudaSuccess, "moefinalize_allreduce_fusion_op failed with error code ",
+                cudaGetErrorString(status));
+  });
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_moe_allreduce_fusion", &trtllm_moe_allreduce_fusion);
+  m.def("trtllm_moe_finalize_allreduce", &trtllm_moe_finalize_allreduce);
 }
