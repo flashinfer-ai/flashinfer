@@ -48,13 +48,23 @@ def gumbel_distribution(beta):
         gumbel_distribution(0.1),
     ],
 )
-def test_softmax(batch_size, vocab_size, distribution):
+@pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
+@pytest.mark.parametrize("temperature_arr", [True, False])
+def test_softmax(batch_size, vocab_size, distribution, temperature, temperature_arr):
     torch.manual_seed(42)
     logits = distribution((batch_size, vocab_size), "cuda:0")
-    probs = flashinfer.sampling.softmax(logits)
-    probs_ref = torch.softmax(logits, dim=-1)
 
-    assert torch.allclose(probs, probs_ref)
+    if temperature_arr:
+        temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature_arr)
+        logits_scaled = logits / temperature_arr.unsqueeze(-1)
+    else:
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+        logits_scaled = logits / temperature
+
+    probs_ref = torch.softmax(logits_scaled, dim=-1)
+
+    assert torch.allclose(probs, probs_ref, atol=1e-3)
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])

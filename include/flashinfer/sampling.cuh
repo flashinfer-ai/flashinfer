@@ -301,8 +301,11 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_INPUT>
-__global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t d) {
+__global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* temperature_arr,
+                                         DType temperature_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
   extern __shared__ __align__(alignof(TempStorage)) uint8_t smem[];
@@ -326,6 +329,11 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        logits_vec[j] *= inv_temp;
+      }
 
       if constexpr (CACHE_INPUT) {
         logits_vec.store(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
@@ -388,6 +396,11 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
     } else {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          logits_vec[j] *= inv_temp;
+        }
       }
     }
 
@@ -405,10 +418,13 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, uint32_t 
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
 __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* partial_results,
-                                       uint32_t d, uint32_t num_slices) {
+                                       DType* temperature_arr, float temperature_val, uint32_t d,
+                                       uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   const uint32_t vec_alignment_elems = alignof(vec_t<DType, VEC_SIZE>) / sizeof(DType);
   const uint32_t slice_stride = round_up(ceil_div(d, num_slices), vec_alignment_elems);
@@ -436,6 +452,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     float thread_max = -cuda::std::numeric_limits<float>::infinity();
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      logits_vec[j] *= inv_temp;
       thread_max = max(thread_max, logits_vec[j]);
     }
 
@@ -485,10 +502,13 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
 __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
-                                          PartialSoftmaxResult* partial_results, uint32_t d,
+                                          PartialSoftmaxResult* partial_results,
+                                          DType* temperature_arr, float temperature_val, uint32_t d,
                                           uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
+  float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
+  const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
   // Reduce slice results
   using TempStorage = OnlineSoftmaxTempStorage<BLOCK_THREADS>;
@@ -533,6 +553,7 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      logits_vec[j] *= inv_temp;
       float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
       prob_vec[j] = static_cast<DType>(p);
     }
@@ -1196,8 +1217,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
-                          void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                          cudaStream_t stream = 0) {
+                          DType* temperature_arr, DType temperature_val, void* workspace_buffer,
+                          size_t workspace_buffer_size_in_bytes, cudaStream_t stream = 0) {
   constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
   constexpr uint32_t LARGE_VOCAB_THRESHOLD = 32768;
   constexpr uint32_t DEFAULT_SLICE_SIZE = 8192;
@@ -1226,7 +1247,8 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           size_t smem_size = sizeof(OnlineSoftmaxTempStorage<BLOCK_THREADS>);
 
           auto phase1_kernel = OnlineSoftmaxMapKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase1_args[] = {&logits, &partial_results, &d, &num_slices};
+          void* phase1_args[] = {&logits, &partial_results, &temperature_arr, &temperature_val,
+                                 &d,      &num_slices};
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1238,7 +1260,8 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
           dim3 phase2_nthrs(BLOCK_THREADS);
 
           auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DType>;
-          void* phase2_args[] = {&logits, &output, &partial_results, &d, &num_slices};
+          void* phase2_args[] = {&logits,          &output, &partial_results, &temperature_arr,
+                                 &temperature_val, &d,      &num_slices};
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1259,7 +1282,7 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
           dim3 nblks(batch_size);
           dim3 nthrs(BLOCK_THREADS);
-          void* args[] = {&logits, &output, &d};
+          void* args[] = {&logits, &output, &temperature_arr, &temperature_val, &d};
 
           const size_t smem_logits_bytes = (round_up(d, VEC_SIZE) + VEC_SIZE) * sizeof(DType);
 

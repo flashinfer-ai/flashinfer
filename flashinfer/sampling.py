@@ -45,13 +45,20 @@ def get_sampling_module():
     def softmax(
         workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
+        maybe_temperature_arr = (
+            maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+        )
         module.softmax.default(
             workspace_buffer,
             logits,
             probs,
+            maybe_temperature_arr,
+            temperature_val,
         )
         return probs
 
@@ -59,6 +66,8 @@ def get_sampling_module():
     def _fake_softmax(
         workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -451,15 +460,19 @@ def _to_tensor_scalar_tuple(x):
 
 def softmax(
     logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
 ) -> torch.Tensor:
-    r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_.
+    r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
 
 
     Parameters
     ----------
     logits : torch.Tensor
         Input tensor of logits.
-
+    temperature: Optional[Union[torch.Tensor, float]]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
+        If a scalar, the same temperature is used for all requests.
+        If a tensor, each request has its own temperature.
     Returns
     -------
     probs : torch.Tensor
@@ -478,7 +491,7 @@ def softmax(
             [0.6009, 0.2566, 0.7936, 0.9408, 0.1332],
             [0.9346, 0.5936, 0.8694, 0.5677, 0.7411],
             [0.4294, 0.8854, 0.5739, 0.2666, 0.6274]], device='cuda:0')
-    >>> probs = flashinfer.sampling.softmax(logits)
+    >>> probs = flashinfer.sampling.softmax(logits, temperature=1.0)
     >>> probs
     tensor([[0.2309, 0.2385, 0.1401, 0.2493, 0.1412],
             [0.2019, 0.1431, 0.2448, 0.2837, 0.1265],
@@ -486,7 +499,11 @@ def softmax(
             [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
     """
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
-    return get_sampling_module().softmax(workspace_buffer, logits)
+    if temperature is None:
+        temperature = 1.0
+    return get_sampling_module().softmax(
+        workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature)
+    )
 
 
 def sampling_from_logits(
