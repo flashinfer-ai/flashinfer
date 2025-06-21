@@ -114,7 +114,8 @@ def split_device_green_ctx(
     Args:
         dev: The device to split.
         num_groups: The number of groups to split the device into.
-        min_count: Minimum number of SMs required for each group.
+        min_count: Minimum number of SMs required for each group, it will be adjusted to meet the
+            alignment and granularity requirements.
 
     Returns:
         streams: The list of torch.Streams objects corresponding to the green contexts.
@@ -138,6 +139,10 @@ def split_device_green_ctx(
     Note:
         The length of the returned streams and resources is ``num_groups + 1``,
         where the last one is the remaining SMs.
+
+    Raises:
+        RuntimeError: when requested SM allocation exceeds device capacity:
+        ``num_groups * round_up(min_count, 8) > num_sm``
     """
     cu_dev = get_cudevice(dev)
     resource = get_device_resource(cu_dev)
