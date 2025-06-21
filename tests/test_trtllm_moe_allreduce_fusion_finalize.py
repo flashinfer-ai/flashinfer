@@ -403,7 +403,7 @@ def multi_process_parallel(
 
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_trtllm_moe_allreduce_fusion(world_size, dtype):
+def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)

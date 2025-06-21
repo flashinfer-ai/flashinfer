@@ -577,6 +577,43 @@ def get_comm_module():
             scale_out,
         )
 
+    @register_custom_op(
+        "flashinfer::trtllm_moe_finalize_allreduce_fusion",
+        mutates_args=["residual_out", "norm_out"],
+    )
+    def trtllm_moe_finalize_allreduce_fusion(
+        allreduce_in: torch.Tensor,
+        residual_in: torch.Tensor,
+        norm_weight: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        top_k: int,
+        norm_out: torch.Tensor,
+        residual_out: torch.Tensor,
+        launch_with_pdl: bool,
+        workspace: torch.Tensor,
+        world_rank: int,
+        world_size: int,
+        eps: float,
+        shared_expert_output: Optional[torch.Tensor],
+        expert_scale_factor: Optional[torch.Tensor],
+    ) -> None:
+        module.trtllm_moe_finalize_allreduce_fusion(
+            allreduce_in,
+            residual_in,
+            norm_weight,
+            expanded_idx_to_permuted_idx,
+            top_k,
+            norm_out,
+            residual_out,
+            launch_with_pdl,
+            workspace,
+            world_rank,
+            world_size,
+            eps,
+            shared_expert_output,
+            expert_scale_factor,
+        )
+
     return SimpleNamespace(
         init_custom_ar=init_custom_ar,
         dispose=dispose,
@@ -590,6 +627,7 @@ def get_comm_module():
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
         trtllm_allreduce_fusion=trtllm_allreduce_fusion,
         trtllm_moe_allreduce_fusion=trtllm_moe_allreduce_fusion,
+        trtllm_moe_finalize_allreduce_fusion=trtllm_moe_finalize_allreduce_fusion,
     )
 
 
