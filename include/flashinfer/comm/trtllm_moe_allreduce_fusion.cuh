@@ -656,7 +656,7 @@ struct AllReduceFusionParams {
   cudaStream_t stream;
 
   // moe-allreduce output (non-fused)
-  // might be used in MoeReductionAllReduceFusionParams and MoeFinalizeAllReduceFusionParams
+  // might be used in MoeReductionAllReduceFusionParams
   void* moe_allreduce_out = nullptr;
 };
 
