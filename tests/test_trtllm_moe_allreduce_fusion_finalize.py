@@ -1,11 +1,12 @@
 import multiprocessing as mp
 import socket
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
+from torch import nn
 
 import flashinfer.comm as comm
 
@@ -22,7 +23,58 @@ SF_VEC_SIZE = 16
 SCALE_FACTOR_RANGE = (-1, 1)
 
 
+class RMSNorm(nn.Module):
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        eps: float,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+        has_weights: bool = True,
+    ):
+        super().__init__()
+        if has_weights:
+            self.weight = nn.Parameter(
+                torch.ones(hidden_size, dtype=dtype, device=device)
+            )
+        else:
+            self.register_buffer(
+                "weight",
+                torch.ones(hidden_size, dtype=dtype, device=device),
+                persistent=False,
+            )
+        self.variance_epsilon = eps
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        if isinstance(residual, torch.Tensor):
+            hidden_states = hidden_states + residual.to(torch.float32)
+            residual = hidden_states.to(input_dtype)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual
+
+
 def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
+
+    def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
+        y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        if weight is not None:
+            y = y * weight
+        return y
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
@@ -80,16 +132,29 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                     norm_weight = torch.randn(
                         (HIDDEN_SIZE,), dtype=dtype, device=device
                     )
+                    norm = RMSNorm(hidden_size=HIDDEN_SIZE, eps=eps, dtype=dtype).cuda()
+                    norm.weight.data.copy_(norm_weight)
 
                     norm_out = torch.empty_like(residual)
                     residual_out = torch.empty_like(residual)
 
                     # == Calculate reference output ==
-                    # todo
+                    expert_reduction = torch.sum(
+                        fc2_output[expanded_idx_to_permuted_idx] * scale.unsqueeze(-1),
+                        dim=1,
+                    )
+
+                    torch_before_residual = (
+                        expert_reduction + shared_expert_output
+                    ) * world_size
+                    torch_residual = torch_before_residual + residual
+                    torch_residual = torch_residual.to(torch.float32)
+                    torch_output_hidden_states = rms_norm(
+                        torch_residual, norm_weight, eps
+                    ).to(dtype)
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
-
                     comm.trtllm_moe_finalize_allreduce_fusion(
                         allreduce_in=fc2_output,
                         residual_in=residual,
@@ -105,14 +170,21 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                         norm_out=norm_out,
                         residual_out=residual_out,
                     )
-
                     torch.cuda.synchronize()
 
                     # == Check correctness ==
-                    tolerance = 8e-2 if dtype == torch.float16 else 8e-1
-                    # torch.testing.assert_close(all_reduce_out, all_reduce_out_ref, atol=tolerance, rtol=tolerance)
-                    # torch.testing.assert_close(residual_out, residual_out_ref, atol=tolerance, rtol=tolerance)
-                    # torch.testing.assert_close(norm_out, norm_out_ref, atol=tolerance, rtol=tolerance)
+                    torch.testing.assert_close(
+                        residual_out.to(torch.float32),
+                        torch_residual.to(torch.float32),
+                        rtol=0.2,
+                        atol=0.2,
+                    )
+                    torch.testing.assert_close(
+                        norm_out.to(torch.float32),
+                        torch_output_hidden_states.to(torch.float32),
+                        rtol=0.2,
+                        atol=0.2,
+                    )
 
                 dist.barrier(group=group)
                 if test_passed:
