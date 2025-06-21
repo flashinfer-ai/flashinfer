@@ -42,4 +42,4 @@ def test_green_ctx_kernel_execution(
             x = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
             y = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
             z = x @ y
-            print(z)
+            print(z.shape)
