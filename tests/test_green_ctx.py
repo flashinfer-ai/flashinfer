@@ -1,109 +1,45 @@
-from typing import List, Tuple, Union
-
-import cuda
-import cuda.bindings.driver as driver
-import cuda.bindings.runtime as runtime
-import cuda.cudart as cudart
-import cuda.nvrtc as nvrtc
+import pytest
 import torch
-from cuda.bindings.driver import CUdevice, CUdevResource
+
+import flashinfer.green_ctx as green_ctx
 
 
-def _cudaGetErrorEnum(error):
-    if isinstance(error, driver.CUresult):
-        err, name = driver.cuGetErrorName(error)
-        return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
-    elif isinstance(error, runtime.cudaError_t):
-        return cudart.cudaGetErrorName(error)[1]
-    elif isinstance(error, nvrtc.nvrtcResult):
-        return nvrtc.nvrtcGetErrorString(error)[1]
-    else:
-        raise RuntimeError(f"Unknown error type: {error}")
-
-
-def checkCudaErrors(result):
-    if result[0].value:
-        raise RuntimeError(
-            f"CUDA error code={result[0].value}({_cudaGetErrorEnum(result[0])})"
-        )
-    if len(result) == 1:
-        return None
-    elif len(result) == 2:
-        return result[1]
-    else:
-        return result[1:]
-
-
-def get_cudevice(dev: torch.device) -> CUdevice:
-    try:
-        cu_dev = checkCudaErrors(driver.cuDeviceGet(dev.index))
-    except RuntimeError as e:
-        runtime.cudaInitDevice(dev.index, 0, 0)
-        cu_dev = checkCudaErrors(driver.cuDeviceGet(dev.index))
-    return cu_dev
-
-
-def get_device_resource(cu_dev: CUdevice) -> CUdevResource:
-    return checkCudaErrors(
-        driver.cuDeviceGetDevResource(
-            cu_dev, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
-        )
-    )
-
-
-def split_resource(
-    resource: CUdevResource,
+@pytest.mark.parametrize("device", ["cuda:0"])
+@pytest.mark.parametrize("num_groups", [1, 2, 3])
+@pytest.mark.parametrize("min_count", [16, 32])
+def test_green_ctx_creation(
+    device: str,
+    num_groups: int,
     min_count: int,
-) -> Tuple[CUdevResource, CUdevResource]:
-    result, _, remaining = checkCudaErrors(
-        driver.cuDevSmResourceSplitByCount(
-            1,  # nbGroups
-            resource,
-            0,  # useFlags
-            min_count,
-        )
+):
+    streams, resources = green_ctx.split_device_green_ctx(
+        torch.device(device), num_groups, min_count
     )
-    return result[0], remaining
+
+    assert len(resources) == num_groups + 1
+    for resource in resources[:-1]:
+        sm_count = resource.sm.smCount
+        assert sm_count >= min_count
 
 
-def create_green_ctx_streams(
-    cu_dev: CUdevResource, resources: List[CUdevResource]
-) -> List[torch.Stream]:
-    streams = []
-    for split in resources:
-        desc = checkCudaErrors(driver.cuDevResourceGenerateDesc([split], 1))
-        green_ctx = checkCudaErrors(
-            driver.cuGreenCtxCreate(
-                desc, cu_dev, driver.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM
-            )
-        )
-        stream = checkCudaErrors(
-            driver.cuGreenCtxStreamCreate(
-                green_ctx,
-                driver.CUstream_flags.CU_STREAM_NON_BLOCKING,
-                0,  # priority
-            )
-        )
-        streams.append(torch.cuda.get_stream_from_external(stream))
+@pytest.mark.parametrize("device", ["cuda:0"])
+@pytest.mark.parametrize("num_groups", [1, 2, 3])
+@pytest.mark.parametrize("min_count", [16, 32])
+def test_green_ctx_kernel_execution(
+    device: str,
+    num_groups: int,
+    min_count: int,
+):
+    streams, resources = green_ctx.split_device_green_ctx(
+        torch.device(device), num_groups, min_count
+    )
+    num_partitions = num_groups + 1
+    assert len(streams) == num_partitions
+    assert len(resources) == num_partitions
 
-    return streams
-
-
-def split_device_green_ctx_streams(
-    dev: torch.device, min_counts: List[int]
-) -> Tuple[List[torch.Stream], List[CUdevResource]]:
-    cu_dev = get_cudevice(dev)
-    resource = get_device_resource(cu_dev)
-    remaining = resource
-    resources = []
-    for i in range(len(min_counts)):
-        resource, remaining = split_resource(remaining, min_counts[i])
-        resources.append(resource)
-
-    resources.append(remaining)
-    streams = create_green_ctx_streams(cu_dev, resources)
-    return streams, resources
-
-
-print(split_device_green_ctx_streams(torch.device("cuda:0"), [16]))
-# print(split_device_green_ctx_streams(torch.device("cuda:0"), [16, 16]))
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            x = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
+            y = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
+            z = x @ y
+            print(z)
