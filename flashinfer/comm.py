@@ -1127,3 +1127,37 @@ def trtllm_moe_allreduce_fusion(
         quant_out=quant_out,
         scale_out=scale_out,
     )
+
+
+def trtllm_moe_finalize_allreduce_fusion(
+    allreduce_in: torch.Tensor,
+    residual_in: torch.Tensor,
+    norm_weight: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    top_k: int,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    workspace_ptrs: torch.Tensor,
+    launch_with_pdl: bool,
+    world_rank: int,
+    world_size: int,
+    eps: float,
+    shared_expert_output: Optional[torch.Tensor],
+    expert_scale_factor: Optional[torch.Tensor],
+) -> None:
+    get_trtllm_comm_module().trtllm_moe_finalize_allreduce_fusion(
+        allreduce_in=allreduce_in,
+        residual_in=residual_in,
+        norm_weight=norm_weight,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        top_k=top_k,
+        norm_out=norm_out,
+        residual_out=residual_out,
+        workspace_ptrs=workspace_ptrs,
+        launch_with_pdl=launch_with_pdl,
+        world_rank=world_rank,
+        world_size=world_size,
+        eps=eps,
+        shared_expert_output=shared_expert_output,
+        expert_scale_factor=expert_scale_factor,
+    )

@@ -81,7 +81,7 @@ void trtllm_moe_allreduce_fusion(
       });
 }
 
-void trtllm_moe_finalize_allreduce(
+void trtllm_moe_finalize_allreduce_fusion(
     at::Tensor const& allreduce_in, at::Tensor const& residual_in, at::Tensor const& norm_weight,
     at::Tensor const& expanded_idx_to_permuted_idx, at::Tensor& norm_out, at::Tensor& residual_out,
     bool launch_with_pdl, at::Tensor& workspace, int64_t const world_rank, int64_t const world_size,
@@ -133,5 +133,5 @@ void trtllm_moe_finalize_allreduce(
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_moe_allreduce_fusion", &trtllm_moe_allreduce_fusion);
-  m.def("trtllm_moe_finalize_allreduce", &trtllm_moe_finalize_allreduce);
+  m.def("trtllm_moe_finalize_allreduce_fusion", &trtllm_moe_finalize_allreduce_fusion);
 }

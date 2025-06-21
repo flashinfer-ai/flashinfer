@@ -424,4 +424,4 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
 
 
 if __name__ == "__main__":
-    mod = comm.get_comm_module()
+    mod = comm.get_trtllm_comm_module()

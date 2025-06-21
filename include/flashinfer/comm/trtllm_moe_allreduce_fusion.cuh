@@ -654,6 +654,10 @@ struct AllReduceFusionParams {
   float scale_factor;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
+
+  // moe-allreduce output (non-fused)
+  // might be used in MoeReductionAllReduceFusionParams and MoeFinalizeAllReduceFusionParams
+  void* moe_allreduce_out = nullptr;
 };
 
 template <typename T>
@@ -669,9 +673,6 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams<T> {
   void* moe_reduction_active_experts_token_input = nullptr;
   // per token input
   void* moe_reduction_token_input = nullptr;
-
-  // moe-allreduce output (non-fused)
-  void* moe_allreduce_out = nullptr;
 };
 
 template <typename T>
@@ -782,8 +783,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
 template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, typename T,
           uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
-                                         int access_id_in_token,
-                                         MoeReductionAllReduceFusionParams<T>& params) {
+                                         int access_id_in_token, AllReduceFusionParams<T>& params) {
   if constexpr (AllReduceOut) {
     val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
