@@ -87,7 +87,7 @@ void trtllm_moe_finalize_allreduce(
     bool launch_with_pdl, at::Tensor& workspace, int64_t const world_rank, int64_t const world_size,
     double const eps, std::optional<at::Tensor> const& shared_expert_output,
     std::optional<at::Tensor> const& expert_scale_factor) {
-  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(input.scalar_type(), c_type, [&] {
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(residual_in.scalar_type(), c_type, [&] {
     MoeFinalizeAllReduceFusionParams<c_type> params;
 
     int hidden_dim = residual_in.size(-1);
