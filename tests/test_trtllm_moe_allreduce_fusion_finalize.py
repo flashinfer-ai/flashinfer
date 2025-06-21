@@ -67,7 +67,17 @@ class RMSNorm(nn.Module):
             return hidden_states, residual
 
 
-def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
+def _run_correctness_worker(
+    world_size,
+    rank,
+    dtype,
+    distributed_init_port,
+    shared_expert_output,
+    fc2_output,
+    scale,
+    expanded_idx_to_permuted_idx,
+    residual,
+):
 
     def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
         y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -114,21 +124,21 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                 torch.cuda.synchronize()
                 for _ in range(test_loop):
                     # == Generate input ==
-                    shared_expert_output = torch.randn(
-                        (seq_len, HIDDEN_SIZE), dtype=dtype, device=device
+                    # move to local device
+                    shared_expert_output = shared_expert_output.to(device)
+                    fc2_output = fc2_output.to(device)
+                    scale = scale.to(device)
+                    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.to(
+                        device
                     )
-                    fc2_output = torch.randn(
-                        (seq_len * top_k, HIDDEN_SIZE), dtype=dtype, device=device
+                    residual = residual.to(device)
+
+                    # make clone
+                    fc2_output_clone = fc2_output.clone()
+                    scale_clone = scale.clone()
+                    expanded_idx_to_permuted_idx_clone = (
+                        expanded_idx_to_permuted_idx.clone()
                     )
-                    scale = torch.randn((seq_len, top_k), dtype=dtype, device=device)
-                    expanded_idx_to_permuted_idx = torch.randint(
-                        0,
-                        seq_len * top_k,
-                        (seq_len, top_k),
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    residual = torch.randn_like(shared_expert_output, device=device)
                     norm_weight = torch.randn(
                         (HIDDEN_SIZE,), dtype=dtype, device=device
                     )
@@ -137,21 +147,6 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                     norm_out = torch.empty_like(residual)
                     residual_out = torch.empty_like(residual)
-
-                    # == Calculate reference output ==
-                    expert_reduction = torch.sum(
-                        fc2_output[expanded_idx_to_permuted_idx] * scale.unsqueeze(-1),
-                        dim=1,
-                    )
-
-                    torch_before_residual = (
-                        expert_reduction + shared_expert_output
-                    ) * world_size
-                    torch_residual = torch_before_residual + residual
-                    torch_residual = torch_residual.to(torch.float32)
-                    torch_output_hidden_states = rms_norm(
-                        torch_residual, norm_weight, eps
-                    ).to(dtype)
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
@@ -172,7 +167,71 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                     )
                     torch.cuda.synchronize()
 
+                    # == Calculate reference output ==
+                    expert_reduction = torch.sum(
+                        fc2_output_clone[expanded_idx_to_permuted_idx]
+                        * scale.unsqueeze(-1),
+                        dim=1,
+                    )
+
+                    torch_before_residual = (
+                        expert_reduction + shared_expert_output
+                    ) * world_size
+                    torch_residual = torch_before_residual + residual
+                    torch_residual = torch_residual.to(torch.float32)
+                    torch_output_hidden_states = rms_norm(
+                        torch_residual, norm_weight, eps
+                    ).to(dtype)
+
                     # == Check correctness ==
+                    if not torch.allclose(
+                        residual_out.to(torch.float32),
+                        torch_residual.to(torch.float32),
+                        rtol=0.2,
+                        atol=0.2,
+                    ):
+                        test_passed = False
+                        print(f"Rank {rank} residual_out mismatch")
+                        print(f"residual_out: {residual_out}")
+                        print(f"torch_residual: {torch_residual}")
+                        print(
+                            f"max diff: {torch.max(torch.abs(residual_out.to(torch.float32) - torch_residual.to(torch.float32)))}"
+                        )
+                        print(
+                            f"max diff idx: {torch.argmax(torch.abs(residual_out.to(torch.float32) - torch_residual.to(torch.float32)))}"
+                        )
+                        print(
+                            f"max diff value: {residual_out.to(torch.float32).view(-1)[torch.argmax(torch.abs(residual_out.to(torch.float32) - torch_residual.to(torch.float32)))]}"
+                        )
+                        print(
+                            f"max diff ref value: {torch_residual.to(torch.float32).view(-1)[torch.argmax(torch.abs(residual_out.to(torch.float32) - torch_residual.to(torch.float32)))]}"
+                        )
+
+                    if not torch.allclose(
+                        norm_out.to(torch.float32),
+                        torch_output_hidden_states.to(torch.float32),
+                        rtol=0.2,
+                        atol=0.2,
+                    ):
+                        test_passed = False
+                        print(f"Rank {rank} norm_out mismatch")
+                        print(f"norm_out: {norm_out}")
+                        print(
+                            f"torch_output_hidden_states: {torch_output_hidden_states}"
+                        )
+                        print(
+                            f"max diff: {torch.max(torch.abs(norm_out.to(torch.float32) - torch_output_hidden_states.to(torch.float32)))}"
+                        )
+                        print(
+                            f"max diff idx: {torch.argmax(torch.abs(norm_out.to(torch.float32) - torch_output_hidden_states.to(torch.float32)))}"
+                        )
+                        print(
+                            f"max diff value: {norm_out.to(torch.float32).view(-1)[torch.argmax(torch.abs(norm_out.to(torch.float32) - torch_output_hidden_states.to(torch.float32)))]}"
+                        )
+                        print(
+                            f"max diff ref value: {torch_output_hidden_states.to(torch.float32).view(-1)[torch.argmax(torch.abs(norm_out.to(torch.float32) - torch_output_hidden_states.to(torch.float32)))]}"
+                        )
+
                     torch.testing.assert_close(
                         residual_out.to(torch.float32),
                         torch_residual.to(torch.float32),
@@ -247,15 +306,29 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
         )
     print(f"Running test for world_size={world_size}")
 
+    # generate shared random input tensor across all ranks
+    seq_len = 16
+    hidden_size = 7168
+    top_k = 8
+
+    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
+    scale = torch.randn((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randint(
+        0, seq_len * top_k, (seq_len, top_k), dtype=torch.int32
+    )
+    residual = torch.randn_like(shared_expert_output)
+
     multi_process_parallel(
         world_size,
         dtype,
         _run_correctness_worker,
-        target_args=(),
+        target_args=(
+            shared_expert_output,
+            fc2_output,
+            scale,
+            expanded_idx_to_permuted_idx,
+            residual,
+        ),
     )
     print(f"moe finalize allreduce fusion tp = {world_size}: OK")
-
-
-if __name__ == "__main__":
-    mod = comm.get_trtllm_comm_module()
-    test_trtllm_moe_finalize_allreduce_fusion(world_size=2, dtype=torch.float16)
