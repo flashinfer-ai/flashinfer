@@ -643,6 +643,7 @@ struct AllReduceFusionParams {
   int size;
   int hidden_dim;
   void** workspace;
+  void* allreduce_in;
   void* allreduce_out;
   void* residual_in;
   void* residual_out;
@@ -655,6 +656,10 @@ struct AllReduceFusionParams {
   float scale_factor;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
+
+  // moe-allreduce output (non-fused)
+  // might be used in MoeReductionAllReduceFusionParams
+  void* moe_allreduce_out = nullptr;
 };
 
 template <typename T>
@@ -670,9 +675,20 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams<T> {
   void* moe_reduction_active_experts_token_input = nullptr;
   // per token input
   void* moe_reduction_token_input = nullptr;
+};
 
-  // moe-allreduce output (non-fused)
-  void* moe_allreduce_out = nullptr;
+template <typename T>
+struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams<T> {
+  // * moe reduction specific params
+  // Refer to kernel implementation on layout of those params
+  // number of active experts on current device
+  int top_k;
+  // [num_tokens, top_k]
+  void* expert_scale_factor = nullptr;
+  void* shared_expert_output = nullptr;
+  // [num_tokens, top_k]
+  int32_t* expanded_idx_to_permuted_idx = nullptr;
+  // allreduce_in [maxPermutedPaddedCount, hidden_dim]
 };
 
 template <int NRanks>
@@ -769,8 +785,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
 template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, typename T,
           uint32_t VEC_SIZE>
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
-                                         int access_id_in_token,
-                                         MoeReductionAllReduceFusionParams<T>& params) {
+                                         int access_id_in_token, AllReduceFusionParams<T>& params) {
   if constexpr (AllReduceOut) {
     val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
@@ -1189,6 +1204,265 @@ cudaError_t moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams<T
       params.quant_out, N_RANKS, AR, RES, RMS, QUANT, [&]() -> cudaError_t {
         FLASHINFER_CUDA_CALL(
             (moereduction_allreduce_fusion_kernel_launcher<T, N_RANKS, AR, RES, RMS, QUANT>(
+                (params), (launch_with_pdl))));
+      });
+  return status;
+}
+
+/////////////////////////////////////////////////////////////////
+//                  * MoE Finalize Allreduce Fusion *                   //
+/////////////////////////////////////////////////////////////////
+
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
+__global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
+    MoeFinalizeAllReduceFusionParams<T> params) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  cg::grid_group grid = cg::this_grid();
+
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+
+  // Each token is handled by one cluster
+  // which token is handled by current cluster
+  int token_id = grid.cluster_rank();
+  // total number of token
+  int num_token = params.size / params.hidden_dim;
+  // Each thread handle VEC_SIZE num elem in token. Total cluster.num_threads() to handle one
+  // token For current token, which VEC_SIZE is handled by current thread (in unit of
+  // VEC_SIZE)
+  int access_id_in_token = cluster.thread_rank();
+  // Across all token, which VEC_SIZE is handled by current thread (in unit of
+  // VEC_SIZE)
+  int access_id = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
+  // Persistent kernel
+  // stride to next token handled by current cta
+  int token_stride = grid.num_clusters();
+  // stride in unit of VEC_SIZE
+  int access_stride = token_stride * params.hidden_dim / VEC_SIZE;
+  // Total number of access in unit of VEC_SIZE to handle (token_num * hidden_dim)
+  // This is within one rank
+  int tot_access = params.size / VEC_SIZE;
+  vec_t<T, VEC_SIZE> clear_vec;
+  clear_vec.fill(neg_zero_v<T>);
+
+  cudaGridDependencySynchronize();
+  LamportComm<NRanks> comm(params.workspace, params.rank);
+  int clear_access = comm.clear_size / VEC_SIZE;
+
+  // * MoE related
+  int threadid_in_cluster = cluster.thread_rank();
+  // Start Offset within one token's hidden_size of element
+  // Current thread handle token[thread_offset_within_token : thread_offset_within_token +
+  // VEC_SIZE]
+  int thread_offset_within_token = threadid_in_cluster * VEC_SIZE;
+
+  int top_k = params.top_k;
+  bool use_scale_factor = params.expert_scale_factor != nullptr;
+
+  // Persistent Kernel
+  // Each cluster iterate through all token it need to handle
+  for (int token_id = grid.cluster_rank(); token_id < num_token; token_id += grid.num_clusters()) {
+    if (thread_offset_within_token >= params.hidden_dim) {
+      break;
+    }
+
+    // * MoE finalize
+    vec_t<T, VEC_SIZE> accumulator;
+    accumulator.fill(0.f);
+
+    for (int k = 0; k < top_k; k++) {
+      int const expanded_idx = token_id * top_k + k;
+      int32_t const permuted_idx = params.expanded_idx_to_permuted_idx[expanded_idx];
+
+      if (permuted_idx == -1) continue;
+
+      int thread_offset_across_token =
+          permuted_idx * params.hidden_dim + thread_offset_within_token;
+      float block_scale = 1.0;
+      if (use_scale_factor) {
+        block_scale =
+            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
+      }
+
+      vec_t<T, VEC_SIZE> permuted_data;
+      permuted_data.load(reinterpret_cast<T*>(params.allreduce_in) + thread_offset_across_token);
+
+      // * acc += scale(data)
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        // assume computation is done in ScaleType
+        accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
+      }
+    }
+
+    // * Add shared expert output
+    if (params.shared_expert_output) {
+      // * Load shared expert output
+      int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
+      vec_t<T, VEC_SIZE> shared_expert_output;
+      shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
+                                thread_offset_across_token);
+#pragma unroll
+      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
+    }
+
+    // * AR Store
+    int idx = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
+    remove_neg_zero<T, VEC_SIZE>(accumulator);
+
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+      // STG.128 to remote rank
+      int offset = (params.rank * tot_access + idx) * VEC_SIZE;
+      accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
+    }
+  }
+
+  // * Clear previous buffer
+  for (int idx = access_id; idx < clear_access; idx += access_stride) {
+    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+  }
+
+  // * AR Load + Fusion
+  for (int idx = access_id, tidx = token_id; idx < tot_access;
+       idx += access_stride, tidx += token_stride) {
+    // * AR Load
+    vec_t<T, VEC_SIZE> vals[NRanks];
+    bool done = false;
+    while (!done) {
+      done = true;
+#pragma unroll
+      for (int r = 0; r < NRanks; ++r) {
+        // LDG.128 from local rank
+        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) +
+                                     (r * tot_access + idx) * VEC_SIZE);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
+      }
+    }
+    vec_t<T, VEC_SIZE> sum_val = vals[0];
+#pragma unroll
+    for (int r = 1; r < NRanks; ++r) {
+      sum_val = vec_add<T, VEC_SIZE>(sum_val, vals[r]);
+    }
+
+    // * Fuse: AllReduceOut is always false in finalize_moe_allreduce
+    fused_op<false, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
+                                                                 access_id_in_token, params);
+  }
+  comm.update(params.size * NRanks);
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
+cudaError_t launch_oneshot_moefinalize_lamport(MoeFinalizeAllReduceFusionParams<T> const& params,
+                                               cudaLaunchConfig_t& cfg) {
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+      &cfg,
+      moefinalize_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut, QuantOut,
+                                                          ScaleType>,
+      params));
+  return cudaSuccess;
+}
+
+template <typename T, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut,
+          typename ScaleType = T>
+cudaError_t moefinalize_allreduce_fusion_kernel_launcher(
+    MoeFinalizeAllReduceFusionParams<T> const& params, bool launch_with_pdl) {
+  int token_num = params.size / params.hidden_dim;
+  bool oneshot = use_oneshot(token_num);
+  if (oneshot == false) {
+    FLASHINFER_LOG_WARN("expect one shot but got %d tokens, expect performance degradation",
+                        token_num);
+    oneshot = true;
+  }
+  // Only support one shot
+  // FLASHINFER_CHECK(oneshot, "only support one shot");
+  // Each token is handled by one cluster
+  int cluster_num = token_num;
+  // Total number of threads (within one cluster) that's need to handle one token
+  // given that each thread handle VEC_SIZE
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  int threads_per_token = params.hidden_dim / VEC_SIZE;
+  // Total number of warp (within one cluster) that's need to handle one token
+  // given that each thread handle VEC_SIZE
+  int warps_per_token = (threads_per_token + 31) / 32;
+  int cluster_size = 8;
+  while (warps_per_token % cluster_size != 0) {
+    cluster_size /= 2;
+  }
+  int block_size = warps_per_token / cluster_size * 32;
+  FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
+                   "block_size <= 1024 && cluster_size > 0");
+  int sm_count = get_sm_count();
+  int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+  cudaLaunchConfig_t cfg;
+  cudaLaunchAttribute attribute[2];
+  cfg.gridDim = grid_size;
+  cfg.blockDim = block_size;
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = params.stream;
+  attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
+  attribute[1].id = cudaLaunchAttributeClusterDimension;
+  attribute[1].val.clusterDim.x = cluster_size;
+  attribute[1].val.clusterDim.y = 1;
+  attribute[1].val.clusterDim.z = 1;
+  cfg.attrs = attribute;
+  cfg.numAttrs = 2;
+  if (oneshot) {
+    FLASHINFER_CUDA_CALL(
+        (launch_oneshot_moefinalize_lamport<T, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>(
+            params, cfg)));
+  }
+  return cudaSuccess;
+}
+
+#define _DISPATCH_MOEFINALIZEREDUCTION_CASE(n_ranks_val, N_RANKS_VAR, res, rms, quant, RES, RMS, \
+                                            QUANT, ...)                                          \
+  case n_ranks_val: {                                                                            \
+    constexpr int N_RANKS_VAR = n_ranks_val;                                                     \
+    return DISPATCH_BOOL_(res, RES, [&]() -> cudaError_t {                                       \
+      return DISPATCH_BOOL_(rms, RMS, [&]() -> cudaError_t {                                     \
+        return DISPATCH_BOOL_(quant, QUANT, [&]() -> cudaError_t { return __VA_ARGS__(); });     \
+      });                                                                                        \
+    });                                                                                          \
+  }
+
+#define DISPATCH_MOEFINALIZEREDUCTION(n_ranks, res, rms, quant, N_RANKS, RES, RMS, QUANT, ...) \
+  [&]() -> cudaError_t {                                                                       \
+    switch (n_ranks) {                                                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(2, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(4, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(8, N_RANKS, res, rms, quant, RES, RMS, QUANT,        \
+                                          __VA_ARGS__)                                         \
+      _DISPATCH_MOEFINALIZEREDUCTION_CASE(16, N_RANKS, res, rms, quant, RES, RMS, QUANT,       \
+                                          __VA_ARGS__)                                         \
+      default:                                                                                 \
+        FLASHINFER_CHECK(false, "Unsupported n_ranks");                                        \
+        return cudaErrorNotSupported;                                                          \
+    }                                                                                          \
+  }()
+
+template <typename T>
+cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> const& params,
+                                            bool launch_with_pdl) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  FLASHINFER_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k,
+                   "allreduce_in, expanded_idx_to_permuted_idx and top_k must be set");
+  FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
+  FLASHINFER_CHECK(params.hidden_dim % VEC_SIZE == 0, "hidden_dim must be a multiple of VEC_SIZE");
+
+  auto status = DISPATCH_MOEFINALIZEREDUCTION(
+      params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
+      QUANT, [&]() -> cudaError_t {
+        FLASHINFER_CUDA_CALL(
+            (moefinalize_allreduce_fusion_kernel_launcher<T, N_RANKS, RES, RMS, QUANT>(
                 (params), (launch_with_pdl))));
       });
   return status;
