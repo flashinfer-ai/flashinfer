@@ -51,7 +51,7 @@ def generate_build_meta(aot_build_meta: dict) -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["numpy", "torch", "ninja", "requests"]
+install_requires = ["numpy", "torch", "ninja", "requests", "pynvml"]
 generate_build_meta({})
 
 if enable_aot:
