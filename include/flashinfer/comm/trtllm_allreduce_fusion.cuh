@@ -15,6 +15,23 @@ namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
+enum class FP4QuantizationSFLayout {
+  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
+  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
+  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
+  // columns to the nearest multiple of 4.
+  //
+  // The scale factor block rows map to data block rows in an interleaved pattern:
+  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
+  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
+  //
+  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
+  SWIZZLED,
+  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
+  // kernels standard.
+  LINEAR
+};
+
 namespace details {
 
 static constexpr int kBytesPerAccess = 16;
@@ -76,6 +93,163 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+template <int SF_VEC_SIZE>
+inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
+                                                  std::optional<int> numRows, int numCols) {
+  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  // batched tensor
+  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+  int64_t innerMStride = 4 * innerKStride;  // 4
+
+  // M tile layout [32, 4] is column-major.
+  int32_t outerMIdx = (mIdx % 32);
+  int64_t outerMStride = 4 * innerMStride;  // 16
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = 32 * outerMStride;  // 512
+
+  // SF vector size 16. We round the "numCols" up to a multiple of 64.
+  int factor = SF_VEC_SIZE * 4;
+  int32_t numKTiles = (numCols + factor - 1) / factor;
+  int32_t mTileIdx = mIdx / (32 * 4);
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  // Each SF block has 128 rows so pad rows to the multiple of 128.
+  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+  int64_t bTileStride = numMTiles * mTileStride;
+
+  // Compute the global offset.
+  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
+                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
+                     innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF, int SF_VEC_SIZE>
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
+                                                       int colIdx, std::optional<int> numRows,
+                                                       int numCols, SFType* SFout,
+                                                       FP4QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2 ||
+                CVT_FP4_NUM_THREADS_PER_SF == 4);
+
+  // One pair of threads write one SF to global memory.
+  // TODO: stage through smem for packed STG.32
+  // is it better than STG.8 from 4 threads ?
+  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
+    if (layout == FP4QuantizationSFLayout::SWIZZLED) {
+      // SF vector index (16 elements share one SF in the K dimension).
+      // numRows and numCols are unpadded.
+      int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+      int32_t mIdx = rowIdx;
+
+      auto SFOffset =
+          utils::get_sf_out_offset_128x4<SF_VEC_SIZE>(batchIdx, mIdx, kIdx, numRows, numCols);
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else if (layout == FP4QuantizationSFLayout::LINEAR) {
+      // Linear row-major layout, no padding required.
+      int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+
+      int32_t numKTiles = numCols / SF_VEC_SIZE;
+      int64_t mTileStride = numKTiles;
+
+      int64_t BTileStride = numRows.value_or(0) * mTileStride;
+
+      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else {
+      return nullptr;
+    }
+  }
+#endif
+  return nullptr;
+}
+
+// Quantizes the provided PackedVec into the uint32_t output
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Get absolute maximum values among the local 8 values.
+  auto localMax = cuda_abs(vec.elts[0]);
+
+// Local maximum value.
+#pragma unroll
+  for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
+
+  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+  // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
+  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+  }
+  // Get the final absolute maximum values.
+  float vecMax = float(cuda_max(localMax.x, localMax.y));
+
+  // Get the SF (max value of the vector / max value of e2m1).
+  // maximum value of e2m1 = 6.0.
+  // TODO: use half as compute data type.
+  float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+  // 8 bits representation of the SF.
+  uint8_t fp8SFVal;
+  // Write the SF to global memory (STG.8).
+  if constexpr (UE8M0_SF) {
+    __nv_fp8_e8m0 tmp;
+    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    SFValue = static_cast<float>(tmp);
+    fp8SFVal = tmp.__x;
+  } else {
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+  }
+  // Get the output scale.
+  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+  float outputScale =
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                   : 0.0f;
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<Type, half>) {
+      fp2Vals[i] = __half22float2(vec.elts[i]);
+    } else {
+      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+    }
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+
+  // Convert to e2m1 values.
+  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
 }  // namespace utils
 
 template <typename T, uint32_t VEC_SIZE>
@@ -98,23 +272,6 @@ enum class AllReduceFusionPattern : int {
   // the result of the norm.
   kARResidualRMSNormOutFP8Quant = 4,
   kARResidualRMSNormOutFP4Quant = 5
-};
-
-enum class FP4QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
 };
 
 enum class QuantType : int {
@@ -363,28 +520,28 @@ class FusedOp {
         val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
-    // todo(yingyi): add quant support
-    //     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-    //       constexpr int SF_VEC_SIZE = 16;
-    //       using PackedVec = PackedVec<DType>;
-    //       PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
-    //       auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(
-    //           std::nullopt, token_id, m_access_id_in_token, std::nullopt, m_params.hidden_dim,
-    //           reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
-    //       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
-    //           cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
-    //     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-    //       using PackedQuantizedType = std::conditional_t<std::is_same_v<DType, float>, float,
-    //       float2>; PackedQuantizedType ret;
-    // #pragma unroll
-    //       for (int i = 0; i < kMathCount; ++i) {
-    //         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-    //             static_cast<float>(reinterpret_cast<DType*>(&val)[i]) * m_scale_factor);
-    //       }
-    //       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
-    //     } else {
-    //       static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
-    //     }
+
+    if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
+      constexpr int SF_VEC_SIZE = 16;
+      // using PackedVec = PackedVec<T>;
+      // PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+      auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(
+          std::nullopt, token_id, m_access_id_in_token, std::nullopt, m_params.hidden_dim,
+          reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+      // reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
+      //     cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
+            static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+    } else {
+      static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
+    }
   }
 
  protected:
