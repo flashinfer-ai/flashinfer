@@ -430,6 +430,7 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
+template <int SF_VEC_SIZE>
 inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
                                                   std::optional<int> numRows, int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
@@ -453,7 +454,7 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
   int64_t kTileStride = 32 * outerMStride;  // 512
 
   // SF vector size 16. We round the "numCols" up to a multiple of 64.
-  int factor = details::CVT_FP4_SF_VEC_SIZE * 4;
+  int factor = SF_VEC_SIZE * 4;
   int32_t numKTiles = (numCols + factor - 1) / factor;
   int32_t mTileIdx = mIdx / (32 * 4);
   int64_t mTileStride = numKTiles * kTileStride;
@@ -470,13 +471,14 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
   return SFOffset;
 }
 
-template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF, int SF_VEC_SIZE>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                        int colIdx, std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
                                                        FP4QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2 ||
+                CVT_FP4_NUM_THREADS_PER_SF == 4);
 
   // One pair of threads write one SF to global memory.
   // TODO: stage through smem for packed STG.32
@@ -488,13 +490,13 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
       int32_t mIdx = rowIdx;
 
-      auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+      auto SFOffset = get_sf_out_offset_128x4<SF_VEC_SIZE>(batchIdx, mIdx, kIdx, numRows, numCols);
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else if (layout == FP4QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
       int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
-      int32_t numKTiles = numCols / details::CVT_FP4_SF_VEC_SIZE;
+      int32_t numKTiles = numCols / SF_VEC_SIZE;
       int64_t mTileStride = numKTiles;
 
       int64_t BTileStride = numRows.value_or(0) * mTileStride;
@@ -787,7 +789,8 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
   if constexpr (QuantOut) {
-    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+    constexpr int SF_VEC_SIZE = 16;
+    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(
         std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
         params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
