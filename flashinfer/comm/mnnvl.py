@@ -24,6 +24,12 @@ import logging
 
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
+from .comm import (
+    get_moe_commworkspace_size_per_rank,
+    moe_comm,
+    moe_local_gather,
+    moe_comm_prepare_indices,
+)
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
@@ -348,9 +354,7 @@ class MnnvlMoe:
             return MnnvlMoe.moe_workspace_tensor
 
         MnnvlMoe.moe_mapping = mapping
-        workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
-            mapping.tp_size
-        )
+        workspace_size_per_rank = get_moe_commworkspace_size_per_rank(mapping.tp_size)
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
             torch.uint64
@@ -387,7 +391,7 @@ class MnnvlMoe:
             recv_rank_count_cumsum,
             recv_rank_local_indices,
             backward_recv_rank_local_indices,
-        ) = torch.ops.trtllm.moe_comm_prepare_indices(
+        ) = moe_comm_prepare_indices(
             gathered_target_rank_ids,
             real_rank_token_count_cumsum,
             max_token_count_per_rank,
@@ -412,7 +416,7 @@ class MnnvlMoe:
             device=torch.device("cuda"),
         )
 
-        torch.ops.trtllm.moe_local_gather(
+        moe_local_gather(
             recv_rank_count_cumsum,
             local_gather_indices,
             gathered_expert_ids,
@@ -452,7 +456,7 @@ class MnnvlMoe:
             dtype=x.dtype,
             device=torch.device("cuda"),
         )
-        torch.ops.trtllm.moe_comm(
+        moe_comm(
             x,
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.send_rank_local_indices,
@@ -479,7 +483,7 @@ class MnnvlMoe:
         output_tensor = torch.zeros(
             token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
         )
-        torch.ops.trtllm.moe_comm(
+        moe_comm(
             x,
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
