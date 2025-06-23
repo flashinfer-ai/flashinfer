@@ -31,7 +31,7 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
-from .utils import version_at_least
+from .utils import get_trtllm_utils_spec, version_at_least
 
 
 def gen_fa2(
@@ -537,38 +537,7 @@ def main():
         )
     ]
     if has_sm90:
-        jit_specs.append(
-            gen_jit_spec(
-                "trtllm_utils",
-                [
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "delayStream.cu",
-                ],
-                extra_include_paths=[
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "cutlass_extensions"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels",
-                ],
-            ),
-        )
+        jit_specs.append(get_trtllm_utils_spec())
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
