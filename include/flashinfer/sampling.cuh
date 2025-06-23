@@ -1288,7 +1288,9 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
             config.attrs = attribute;
             config.numAttrs = 1;
 
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, phase1_args));
+            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, logits, partial_results,
+                                                    temperature_arr, temperature_val, d,
+                                                    num_slices));
           } else {
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
                                                   phase1_args, smem_size, stream));
@@ -1318,7 +1320,9 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
             config.attrs = attribute;
             config.numAttrs = 1;
 
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, phase2_args));
+            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, logits, output,
+                                                    partial_results, temperature_arr,
+                                                    temperature_val, d, num_slices));
           } else {
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
                                                   phase2_args, smem_size, stream));
@@ -1363,7 +1367,8 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
               config.attrs = attribute;
               config.numAttrs = 1;
 
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, logits, output,
+                                                      temperature_arr, temperature_val, d));
             } else {
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
