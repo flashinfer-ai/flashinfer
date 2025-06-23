@@ -323,6 +323,10 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float running_denominator = 0.0f;
 
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
   // Pass 1: Compute running max and denominator
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -414,6 +418,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
       prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
@@ -440,6 +447,10 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
   vec_t<DType, VEC_SIZE> logits_vec;
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float running_denominator = 0.0f;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
 
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -498,6 +509,9 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
   if (tx == 0) {
     partial_results[bx * num_slices + by] = {running_max, running_denominator};
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
@@ -518,6 +532,10 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
   const Float2SoftmaxReduceOp reduce_op;
 
   float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
 
   for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
     PartialSoftmaxResult partial = partial_results[bx * num_slices + i];
@@ -562,6 +580,9 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
       prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -1218,7 +1239,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
                           DType* temperature_arr, DType temperature_val, void* workspace_buffer,
-                          size_t workspace_buffer_size_in_bytes, cudaStream_t stream = 0) {
+                          size_t workspace_buffer_size_in_bytes, bool enable_pdl,
+                          cudaStream_t stream = 0) {
   constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
   constexpr uint32_t LARGE_VOCAB_THRESHOLD = 32768;
   constexpr uint32_t DEFAULT_SLICE_SIZE = 8192;
@@ -1252,8 +1274,25 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
-                                                phase1_args, smem_size, stream));
+
+          if (enable_pdl) {
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+            cudaLaunchConfig_t config;
+            config.gridDim = phase1_nblks;
+            config.blockDim = phase1_nthrs;
+            config.dynamicSmemBytes = smem_size;
+            config.stream = stream;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+
+            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, phase1_args));
+          } else {
+            FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
+                                                  phase1_args, smem_size, stream));
+          }
 
           // Phase 2: Final reduction and apply normalization
           dim3 phase2_nblks(batch_size);
@@ -1265,8 +1304,25 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
               phase2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
-                                                phase2_args, smem_size, stream));
+
+          if (enable_pdl) {
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+            cudaLaunchConfig_t config;
+            config.gridDim = phase2_nblks;
+            config.blockDim = phase2_nthrs;
+            config.dynamicSmemBytes = smem_size;
+            config.stream = stream;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+
+            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, phase2_args));
+          } else {
+            FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
+                                                  phase2_args, smem_size, stream));
+          }
         } else {
           // Path B: Single-Block Strategy
           // Switch input cache
@@ -1293,8 +1349,25 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
             auto kernel = OnlineSoftmaxFusedKernel<BLOCK_THREADS, VEC_SIZE, DType, CACHE_INPUT>;
             FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-            FLASHINFER_CUDA_CALL(
-                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+            if (enable_pdl) {
+              cudaLaunchAttribute attribute[1];
+              attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+              attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+              cudaLaunchConfig_t config;
+              config.gridDim = nblks;
+              config.blockDim = nthrs;
+              config.dynamicSmemBytes = smem_size;
+              config.stream = stream;
+              config.attrs = attribute;
+              config.numAttrs = 1;
+
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, args));
+            } else {
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
           });
         }
       })});

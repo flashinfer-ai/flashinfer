@@ -26,7 +26,8 @@
 using namespace flashinfer;
 
 void softmax(at::Tensor workspace_buffer, at::Tensor logits, at::Tensor output,
-             std::optional<at::Tensor> maybe_temperature_arr, double temperature_val) {
+             std::optional<at::Tensor> maybe_temperature_arr, double temperature_val,
+             bool enable_pdl) {
   CHECK_INPUT(workspace_buffer);
   CHECK_INPUT(logits);
   CHECK_INPUT(output);
@@ -44,7 +45,7 @@ void softmax(at::Tensor workspace_buffer, at::Tensor logits, at::Tensor output,
       vocab_size,
       has_temperature_arr ? static_cast<float*>(maybe_temperature_arr->data_ptr()) : nullptr,
       temperature_val, workspace_buffer.data_ptr(),
-      workspace_buffer.element_size() * workspace_buffer.size(0), stream);
+      workspace_buffer.element_size() * workspace_buffer.size(0), enable_pdl, stream);
   TORCH_CHECK(status == cudaSuccess,
               "OnlineSoftmax failed with error code " + std::string(cudaGetErrorString(status)));
 }

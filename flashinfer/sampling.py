@@ -23,7 +23,12 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
-from .utils import _get_cache_buf, register_custom_op, register_fake_op
+from .utils import (
+    _get_cache_buf,
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 def gen_sampling_module() -> JitSpec:
@@ -47,6 +52,7 @@ def get_sampling_module():
         logits: torch.Tensor,
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
+        enable_pdl: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
@@ -59,6 +65,7 @@ def get_sampling_module():
             probs,
             maybe_temperature_arr,
             temperature_val,
+            enable_pdl,
         )
         return probs
 
@@ -68,6 +75,7 @@ def get_sampling_module():
         logits: torch.Tensor,
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
+        enable_pdl: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -461,6 +469,7 @@ def _to_tensor_scalar_tuple(x):
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
 
@@ -473,6 +482,9 @@ def softmax(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
         If a scalar, the same temperature is used for all requests.
         If a tensor, each request has its own temperature.
+    enable_pdl : Optional[bool]
+        Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
+        If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
     Returns
     -------
     probs : torch.Tensor
@@ -501,8 +513,13 @@ def softmax(
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
     if temperature is None:
         temperature = 1.0
+
+    # Auto-detect PDL support if not specified
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(logits.device)
+
     return get_sampling_module().softmax(
-        workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature)
+        workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature), enable_pdl
     )
 
 

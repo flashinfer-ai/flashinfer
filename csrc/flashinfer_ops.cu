@@ -174,7 +174,8 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
 //========== sampling ==========
 
 void softmax(at::Tensor workspace_buffer, at::Tensor logits, at::Tensor output,
-             std::optional<at::Tensor> maybe_temperature_arr, double temperature_val);
+             std::optional<at::Tensor> maybe_temperature_arr, double temperature_val,
+             bool enable_pdl);
 
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
