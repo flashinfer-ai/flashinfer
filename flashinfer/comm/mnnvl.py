@@ -13,23 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Code imported from TensorRT-LLM/tensorrt_llm/_mnnvl_utils.py
+import logging
 import platform
 import sys
 from dataclasses import dataclass
-from mpi4py import MPI
+
 import pynvml
 import torch
 from cuda import cuda
-import logging
+from mpi4py import MPI
 
-from .dlpack_utils import pack_strided_memory
-from .mapping import Mapping
 from .comm import (
     get_moe_commworkspace_size_per_rank,
     moe_comm,
-    moe_local_gather,
     moe_comm_prepare_indices,
+    moe_local_gather,
 )
+from .dlpack_utils import pack_strided_memory
+from .mapping import Mapping
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
