@@ -327,9 +327,9 @@ class MnnvlMemory:
         # But it is not equivalent to MNNVL support.
         # May need better support check.
         arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
-        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
-        return is_on_aarch64 and support_nvlink_and_all_up
+        if not "aarch64" in arch:
+            return False
+        return MnnvlMemory.support_nvlink(True)
 
 
 @dataclass
