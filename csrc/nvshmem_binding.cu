@@ -89,6 +89,14 @@ at::Tensor malloc_tensor(const std::vector<int64_t>& shape, c10::ScalarType dtyp
       at::TensorOptions().dtype(dtype).device(device));
 }
 
+int64_t multicast_ptr(at::Tensor tensor) {
+  void *mc_ptr = nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, (void *) tensor.data_ptr());
+  if (mc_ptr == nullptr) {
+    AT_ERROR("nvshmemx_mc_ptr failed.");
+  }
+  return reinterpret_cast<int64_t>(mc_ptr);
+}
+
 void barrier_all() { nvshmem_barrier_all(); }
 
 void barrier_all_on_current_stream() {
@@ -121,6 +129,7 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("nvshmem_alltoall(Tensor! dest, Tensor src) -> ()");
   m.impl("nvshmem_alltoall", c10::kCUDA, &alltoall);
   m.impl("nvshmem_alltoall", c10::kMeta, &fake_alltoall);
+  m.def("nvshmem_multicast_ptr", &multicast_ptr);
 };
 
 }  // namespace
