@@ -13,8 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
-from ctypes import (CFUNCTYPE, POINTER, c_int, c_int64, c_size_t, c_uint8,
-                    c_uint16, c_void_p, pointer)
+from ctypes import (
+    CFUNCTYPE,
+    POINTER,
+    c_int,
+    c_int64,
+    c_size_t,
+    c_uint8,
+    c_uint16,
+    c_void_p,
+    pointer,
+)
 
 import torch
 
