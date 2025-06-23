@@ -14,10 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ._build_meta import __version__ as __version__
+try:
+    from ._build_meta import __version__ as __version__
+except ModuleNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+
+from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
+from .attention import BatchAttention as BatchAttention
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
 )
@@ -40,6 +47,8 @@ from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .fp4_quantization import fp4_quantize
+from .fused_moe import cutlass_fused_moe
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper

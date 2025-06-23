@@ -9,7 +9,7 @@ Kernel Library for LLM Serving
 </h1>
 
 <p align="center">
-| <a href="https://flashinfer.ai"><b>Blog</b></a> | <a href="https://docs.flashinfer.ai"><b>Documentation</b></a> | <a href="https://join.slack.com/t/flashinfer/shared_invite/zt-2r93kj2aq-wZnC2n_Z2~mf73N5qnVGGA"><b>Slack</b></a>|  <a href="https://github.com/orgs/flashinfer-ai/discussions"><b>Discussion Forum</b></a> |
+| <a href="https://flashinfer.ai"><b>Blog</b></a> | <a href="https://docs.flashinfer.ai"><b>Documentation</b></a> | <a href="https://join.slack.com/t/flashinfer/shared_invite/zt-379wct3hc-D5jR~1ZKQcU00WHsXhgvtA"><b>Slack</b></a> |  <a href="https://github.com/orgs/flashinfer-ai/discussions"><b>Discussion Forum</b></a> |
 </p>
 
 [![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
@@ -72,13 +72,20 @@ Alternatively, build FlashInfer from source:
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
-pip install -e . -v
+python -m pip install -v .
 ```
 
-To pre-compile essential kernels, set the environment variable `FLASHINFER_ENABLE_AOT=1` before running the installation command:
+To pre-compile essential kernels ahead-of-time (AOT), run the following command:
 
 ```bash
-FLASHINFER_ENABLE_AOT=1 pip install -e . -v
+# Set target CUDA architectures
+export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+# Build AOT kernels. Will produce AOT kernels in aot-ops/
+python -m flashinfer.aot
+# Build AOT wheel
+python -m build --no-isolation --wheel
+# Install AOT wheel
+python -m pip install dist/flashinfer-*.whl
 ```
 
 For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).

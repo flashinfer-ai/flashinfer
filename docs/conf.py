@@ -17,13 +17,12 @@ os.environ["BUILD_DOC"] = "1"
 autodoc_mock_imports = [
     "torch",
     "triton",
-    "flashinfer.jit.aot_config",
     "flashinfer._build_meta",
 ]
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = f"2023-2024, {author}"
+copyright = f"2023-2025, {author}"
 
 package_version = (root / "version.txt").read_text().strip()
 version = package_version

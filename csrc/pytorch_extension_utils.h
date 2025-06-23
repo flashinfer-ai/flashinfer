@@ -67,6 +67,31 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 
 #endif
 
+#define _DISPATCH_CASE_I32(c_type, ...) \
+  case at::ScalarType::Int: {           \
+    using c_type = int32_t;             \
+    return __VA_ARGS__();               \
+  }
+
+#define _DISPATCH_CASE_I64(c_type, ...) \
+  case at::ScalarType::Long: {          \
+    using c_type = int64_t;             \
+    return __VA_ARGS__();               \
+  }
+
+#define DISPATCH_PYTORCH_IDTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                  \
+  [&]() -> bool {                                                                     \
+    switch (pytorch_dtype) {                                                          \
+      _DISPATCH_CASE_I32(c_type, __VA_ARGS__)                                         \
+      _DISPATCH_CASE_I64(c_type, __VA_ARGS__)                                         \
+      default:                                                                        \
+        std::ostringstream oss;                                                       \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch idtype " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                \
+        return false;                                                                 \
+    }                                                                                 \
+  }()
+
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -223,6 +248,8 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)
+#define CHECK_INPUT_TYPE(x, st) \
+  TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)

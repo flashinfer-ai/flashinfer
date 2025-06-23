@@ -16,12 +16,14 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import JitSpec
+from .jit import env as jit_env
+from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -31,218 +33,209 @@ from .utils import (
     register_fake_op,
 )
 
-_gemm_module = None
-_gemm_module_sm90 = None
+
+def gen_gemm_module() -> JitSpec:
+    return gen_jit_spec(
+        "gemm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+        ],
+        extra_ldflags=["-lcublas", "-lcublasLt"],
+    )
 
 
+@functools.cache
 def get_gemm_module():
-    global _gemm_module
-    if _gemm_module is None:
-        if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
+    module = gen_gemm_module().build_and_load()
 
-            module = _kernels
-        else:
-            module = load_cuda_ops(
-                "gemm",
-                [
-                    FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
-                ],
-                extra_ldflags=["-lcublas", "-lcublasLt"],
-            )
+    # torch library for bmm_fp8
 
-        # torch library for bmm_fp8
-
-        @register_custom_op(
-            "flashinfer::bmm_fp8", mutates_args=("workspace_buffer", "D")
+    @register_custom_op("flashinfer::bmm_fp8", mutates_args=("workspace_buffer", "D"))
+    def bmm_fp8(
+        workspace_buffer: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        D: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        cublas_handle = torch.cuda.current_blas_handle()
+        module.bmm_fp8.default(
+            A,
+            B,
+            D,
+            A_scale,
+            B_scale,
+            workspace_buffer,
+            cublas_handle,
         )
-        def bmm_fp8(
-            workspace_buffer: torch.Tensor,
-            A: torch.Tensor,
-            B: torch.Tensor,
-            D: torch.Tensor,
-            A_scale: torch.Tensor,
-            B_scale: torch.Tensor,
-        ) -> None:
-            cublas_handle = torch.cuda.current_blas_handle()
-            module.bmm_fp8.default(
-                A,
-                B,
-                D,
-                A_scale,
-                B_scale,
-                workspace_buffer,
-                cublas_handle,
-            )
 
-        @register_fake_op("flashinfer::bmm_fp8")
-        def _fake_bmm_fp8(
-            workspace_buffer: torch.Tensor,
-            A: torch.Tensor,
-            B: torch.Tensor,
-            D: torch.Tensor,
-            A_scale: torch.Tensor,
-            B_scale: torch.Tensor,
-        ) -> None:
-            pass
+    @register_fake_op("flashinfer::bmm_fp8")
+    def _fake_bmm_fp8(
+        workspace_buffer: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        D: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        pass
 
-        # torch library for cutlass_segment_gemm
+    # torch library for cutlass_segment_gemm
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=("y"))
-        def cutlass_segment_gemm(
-            workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_ld: torch.Tensor,
-            w_ld: torch.Tensor,
-            y_ld: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            module.cutlass_segment_gemm.default(
-                workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_ld,
-                w_ld,
-                y_ld,
-                empty_x_data,
-                weight_column_major,
-            )
-
-        @register_fake_op("flashinfer::cutlass_segment_gemm")
-        def _fake_cutlass_segment_gemm(
-            workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_ld: torch.Tensor,
-            w_ld: torch.Tensor,
-            y_ld: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            pass
-
-        # Register the module
-        _gemm_module = SimpleNamespace(
-            bmm_fp8=bmm_fp8,
-            cutlass_segment_gemm=cutlass_segment_gemm,
+    @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=("y"))
+    def cutlass_segment_gemm(
+        workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_ld: torch.Tensor,
+        w_ld: torch.Tensor,
+        y_ld: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        module.cutlass_segment_gemm.default(
+            workspace_buffer,
+            all_problems,
+            x_data,
+            w_data,
+            y_data,
+            x_ld,
+            w_ld,
+            y_ld,
+            empty_x_data,
+            weight_column_major,
         )
+
+    @register_fake_op("flashinfer::cutlass_segment_gemm")
+    def _fake_cutlass_segment_gemm(
+        workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_ld: torch.Tensor,
+        w_ld: torch.Tensor,
+        y_ld: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        pass
+
+    # Register the module
+    _gemm_module = SimpleNamespace(
+        bmm_fp8=bmm_fp8,
+        cutlass_segment_gemm=cutlass_segment_gemm,
+    )
 
     return _gemm_module
 
 
+def gen_gemm_sm100_module() -> JitSpec:
+    return gen_jit_spec(
+        "gemm_sm100",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_groupwise_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
+        ],
+        extra_cuda_cflags=sm100a_nvcc_flags,
+    )
+
+
 @functools.cache
 def get_gemm_sm100_module():
-    if has_prebuilt_ops:
-        _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
-        module = _kernels_sm100
-    else:
-        module = load_cuda_ops(
-            "gemm_sm100",
-            [
-                FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
-                FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
-            ],
-            extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
-        )
+    module = gen_gemm_sm100_module().build_and_load()
 
     return module
 
 
+def gen_gemm_sm90_module() -> JitSpec:
+    return gen_jit_spec(
+        "gemm_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags,
+    )
+
+
+@functools.cache
 def get_gemm_sm90_module():
-    global _gemm_module_sm90
-    if _gemm_module_sm90 is None:
-        if has_prebuilt_ops:
-            _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
+    module = gen_gemm_sm90_module().build_and_load()
 
-            module = _kernels_sm90
-        else:
-            module = load_cuda_ops(
-                "gemm_sm90",
-                [
-                    FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
-                ],
-                extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
-            )
+    # torch library for cutlass_segment_gemm_sm90
 
-        # torch library for cutlass_segment_gemm_sm90
-
-        @register_custom_op(
-            "flashinfer::cutlass_segment_gemm_sm90",
-            mutates_args=("workspace_buffer", "y"),
-        )
-        def cutlass_segment_gemm_sm90(
-            workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_stride: torch.Tensor,
-            w_stride: torch.Tensor,
-            y_stride: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            empty_y_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            module.cutlass_segment_gemm_sm90.default(
-                workspace_buffer,
-                int_workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_stride,
-                w_stride,
-                y_stride,
-                empty_x_data,
-                empty_y_data,
-                weight_column_major,
-            )
-
-        @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
-        def _fake_cutlass_segment_gemm_sm90(
-            workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            all_problems: torch.Tensor,
-            x_data: torch.Tensor,
-            w_data: torch.Tensor,
-            y_data: torch.Tensor,
-            x_stride: torch.Tensor,
-            w_stride: torch.Tensor,
-            y_stride: torch.Tensor,
-            y: torch.Tensor,
-            empty_x_data: torch.Tensor,
-            empty_y_data: torch.Tensor,
-            weight_column_major: bool,
-        ) -> None:
-            pass
-
-        # Register the module
-        _gemm_module_sm90 = SimpleNamespace(
-            cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
+    @register_custom_op(
+        "flashinfer::cutlass_segment_gemm_sm90",
+        mutates_args=("workspace_buffer", "y"),
+    )
+    def cutlass_segment_gemm_sm90(
+        workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_stride: torch.Tensor,
+        w_stride: torch.Tensor,
+        y_stride: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        empty_y_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        module.cutlass_segment_gemm_sm90.default(
+            workspace_buffer,
+            int_workspace_buffer,
+            all_problems,
+            x_data,
+            w_data,
+            y_data,
+            x_stride,
+            w_stride,
+            y_stride,
+            empty_x_data,
+            empty_y_data,
+            weight_column_major,
         )
 
-    return _gemm_module_sm90
+    @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
+    def _fake_cutlass_segment_gemm_sm90(
+        workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        all_problems: torch.Tensor,
+        x_data: torch.Tensor,
+        w_data: torch.Tensor,
+        y_data: torch.Tensor,
+        x_stride: torch.Tensor,
+        w_stride: torch.Tensor,
+        y_stride: torch.Tensor,
+        y: torch.Tensor,
+        empty_x_data: torch.Tensor,
+        empty_y_data: torch.Tensor,
+        weight_column_major: bool,
+    ) -> None:
+        pass
+
+    # Register the module
+    return SimpleNamespace(
+        cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
+    )
 
 
 def launch_compute_sm80_group_gemm_args(
@@ -700,6 +693,8 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -719,13 +714,24 @@ def gemm_fp8_nt_groupwise(
         Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape (ceil_div(k, k_granularity), ceil_div(m, m_granularity)).
+        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
+        or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape (ceil_div(k, k_granularity), ceil_div(n, n_granularity)).
+        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
+        or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    scale_major_mode: Literal["MN", "K"]
+        The layout mode of scale tensor, `MN` for MN-major scale with shape of
+        ``(k // block_size, *)`` and `K` for K-major scale with shape of
+        ``(*, k // block_size)``
+
+    mma_sm: int
+        How many SMs to use for the MMA operation, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
 
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
@@ -741,23 +747,13 @@ def gemm_fp8_nt_groupwise(
 
     Notes
     -----
-    If ``m`` is not a multiple of 4, we will pad ``m`` to the next multiple of 4 to accommodate the kernel's requirement.
+    The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
     )
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
-    m = a.shape[0]
-    m_padded = ((m + 3) // 4) * 4
-    need_padding = m_padded != m
-    if need_padding:
-        a_padded = F.pad(a, (0, 0, 0, m_padded - m))
-        # a_scale is (k // 128, m)
-        a_scale_padded = F.pad(a_scale, (0, m_padded - m))
-    else:
-        a_padded = a
-        a_scale_padded = a_scale
 
     if a.shape[1] != b.shape[1]:
         raise ValueError(
@@ -775,33 +771,25 @@ def gemm_fp8_nt_groupwise(
     # (True, False) -> use out tensor as out_padded
     # (True, True) -> create out_padded tensor explicitly
 
-    if need_padding or out is None:
-        out_padded = torch.empty(
-            m_padded,
+    if out is None:
+        out = torch.empty(
+            a.shape[0],
             b.shape[0],
             device=a.device,
             dtype=out_dtype,
         )
-    else:
-        out_padded = out
 
     get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
         workspace_buffer,
-        a_padded,
+        a,
         b,
-        a_scale_padded,
+        a_scale,
         b_scale,
-        out_padded,
+        out,
         *scale_granularity_mnk,
+        scale_major_mode,
+        mma_sm,
     )
-
-    # NOTE(Zihao): if out is specified and need_padding is True, we need to copy
-    # the result back to out
-
-    if out is not None and need_padding:
-        out.copy_(out_padded[:m])
-    else:
-        out = out_padded[:m]
 
     return out
 
@@ -811,6 +799,8 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    scale_major_mode: str = "MN",
+    mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -825,6 +815,130 @@ def gemm_fp8_nt_blockscaled(
         a_scale,
         b_scale,
         scale_granularity_mnk=(128, 128, 128),
+        scale_major_mode=scale_major_mode,
+        mma_sm=mma_sm,
         out=out,
         out_dtype=out_dtype,
     )
+
+
+def group_gemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (k // block_size, cum_m)
+    b_scale: torch.Tensor,  # (batch_size, k // block_size, n // block_size)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
+    Blackwell architecture.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor shape ``(cum_m, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+        ``cum_m`` is the cumulative sum of the segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor shape ``(batch_size, n, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape ``(cum_m, k // block_size)`` if scale_major_mode is ``K``
+        or shape ``(k // block_size, cum_m)`` if scale_major_mode is ``MN``
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape ``(batch_size, n // block_size, k // block_size)`` if scale_major_mode is ``K``
+        shape ``(batch_size, k // block_size, n // block_size)`` if scale_major_mode is ``MN``
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(batch_size + 1,)``.
+        Element element in ``m_indptr`` must be a multiple of 4.
+
+    scale_granularity_mnk: Tuple[int, int, int]
+        The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
+
+    scale_major_mode: Literal["MN", "K"]
+        The layout mode of scale tensor, `MN` for MN-major scale with shape of
+        ``(k // block_size, *)`` and `K` for K-major scale with shape of
+        ``(*, k // block_size)``
+
+    mma_sm: int
+        How many SMs to use for the MMA operation, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
+    to accommodate the kernel's requirement.
+    """
+    int_workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
+    )
+    float_workspace_buffer = _get_cache_buf(
+        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
+    )
+
+    batch_size = m_indptr.shape[0] - 1
+    assert b.shape[0] == batch_size
+    assert b_scale.shape[0] == batch_size
+    n = b.shape[1]
+    k = b.shape[2]
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
+
+    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        int_workspace_buffer,
+        float_workspace_buffer,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        m_indptr,
+        n,
+        k,
+        *scale_granularity_mnk,
+        scale_major_mode,
+        mma_sm,
+    )
+    return out
+
+
+def pad_indptr_to_multiple_of_4(
+    m_indptr: torch.Tensor,
+):
+    from .triton.gemm import compute_padding_mapping
+
+    batch_size = m_indptr.shape[0] - 1
+    m = m_indptr[1:] - m_indptr[:-1]
+    m = m + 3 - (m + 3) % 4
+    padded_m_indptr = torch.cat((torch.zeros((1,), device=m.device, dtype=m.dtype), m))
+    padded_m_indptr = padded_m_indptr.cumsum(dim=0, dtype=padded_m_indptr.dtype)
+
+    m_rank = torch.zeros((m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device)
+    padded_m_rank = torch.zeros(
+        (m_indptr[-1],), dtype=m_indptr.dtype, device=m_indptr.device
+    )
+
+    compute_padding_mapping[(batch_size,)](
+        m_indptr, padded_m_indptr, m_rank, padded_m_rank
+    )
+
+    return padded_m_indptr, padded_m_rank

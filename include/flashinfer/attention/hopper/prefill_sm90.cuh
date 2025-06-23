@@ -184,8 +184,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
           auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
-              std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
-          num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);
+              std::max(0, q_tile_idx * CTA_Q + kv_len - qo_len - max_item_len);
+          num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
         if constexpr (MULTIITEMSCORING) {
@@ -269,8 +269,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
         auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =
-            std::max(0, (q_tile_idx + 1) * CTA_Q + kv_len - qo_len - max_item_len);
-        num_kv_tiles_outside_items_window = cute::ceil_div(valid_items_window_len, CTA_KV);
+            std::max(0, q_tile_idx * CTA_Q + kv_len - qo_len - max_item_len);
+        num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
@@ -542,7 +542,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream) {
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                    cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -562,7 +563,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                   cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.

@@ -21,11 +21,7 @@ from typing import List
 import jinja2
 import torch
 
-from ..env import (
-    FLASHINFER_CSRC_DIR,
-    FLASHINFER_GEN_SRC_DIR,
-    FLASHINFER_TVM_BINDING_DIR,
-)
+from .. import env as jit_env
 from ..utils import (
     dtype_map,
     mask_mode_literal,
@@ -36,12 +32,12 @@ from .utils import generate_additional_params
 
 
 def gen_sampling_tvm_binding(uri: str):
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
     source_paths = []
     for filename in ["sampling.cu", "sampling_jit_tvm_binding.cu"]:
-        src_path = FLASHINFER_TVM_BINDING_DIR / filename
+        src_path = jit_env.FLASHINFER_TVM_BINDING_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -91,7 +87,7 @@ def gen_customize_batch_prefill_tvm_binding(
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
                 additional_tensor_names,
@@ -102,14 +98,18 @@ def gen_customize_batch_prefill_tvm_binding(
         )
 
         with open(
-            FLASHINFER_TVM_BINDING_DIR / "batch_prefill_customize_config.jinja"
+            jit_env.FLASHINFER_TVM_BINDING_DIR / "batch_prefill_customize_config.jinja"
         ) as f:
             config_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja"
+        ) as f:
             paged_kernel_inst_templ = jinja2.Template(f.read())
 
-        with open(FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja") as f:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja"
+        ) as f:
             ragged_kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
@@ -156,7 +156,7 @@ def gen_customize_batch_prefill_tvm_binding(
             "batch_prefill.cu",
             "batch_prefill_jit_tvm_binding.cu",
         ]:
-            src_path = FLASHINFER_TVM_BINDING_DIR / filename
+            src_path = jit_env.FLASHINFER_TVM_BINDING_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -167,7 +167,7 @@ def gen_customize_batch_prefill_tvm_binding(
         write_if_different(generated_config_path, generated_inc_str)
         return uri, source_paths
     elif backend == "fa3":
-        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
             generate_additional_params(
                 additional_tensor_names,
@@ -179,17 +179,18 @@ def gen_customize_batch_prefill_tvm_binding(
         )
 
         with open(
-            FLASHINFER_TVM_BINDING_DIR / "batch_prefill_sm90_customize_config.jinja"
+            jit_env.FLASHINFER_TVM_BINDING_DIR
+            / "batch_prefill_sm90_customize_config.jinja"
         ) as f:
             config_templ = jinja2.Template(f.read())
 
         with open(
-            FLASHINFER_CSRC_DIR / "batch_prefill_paged_sm90_kernel_inst.jinja"
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_paged_sm90_kernel_inst.jinja"
         ) as f:
             paged_kernel_inst_templ = jinja2.Template(f.read())
 
         with open(
-            FLASHINFER_CSRC_DIR / "batch_prefill_ragged_sm90_kernel_inst.jinja"
+            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_sm90_kernel_inst.jinja"
         ) as f:
             ragged_kernel_inst_templ = jinja2.Template(f.read())
 
@@ -232,7 +233,7 @@ def gen_customize_batch_prefill_tvm_binding(
             "batch_prefill_sm90.cu",
             "batch_prefill_sm90_jit_tvm_binding.cu",
         ]:
-            src_path = FLASHINFER_TVM_BINDING_DIR / filename
+            src_path = jit_env.FLASHINFER_TVM_BINDING_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
@@ -275,7 +276,7 @@ def gen_customize_batch_decode_tvm_binding(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
             additional_tensor_names,
@@ -285,10 +286,12 @@ def gen_customize_batch_decode_tvm_binding(
         )
     )
 
-    with open(FLASHINFER_TVM_BINDING_DIR / "batch_decode_customize_config.jinja") as f:
+    with open(
+        jit_env.FLASHINFER_TVM_BINDING_DIR / "batch_decode_customize_config.jinja"
+    ) as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs |= {
@@ -313,7 +316,7 @@ def gen_customize_batch_decode_tvm_binding(
         "batch_decode.cu",
         "batch_decode_jit_tvm_binding.cu",
     ]:
-        src_path = FLASHINFER_TVM_BINDING_DIR / filename
+        src_path = jit_env.FLASHINFER_TVM_BINDING_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:
@@ -334,10 +337,10 @@ def gen_batch_mla_tvm_binding(
     head_dim_ckv: int,
     head_dim_kpe: int,
 ):
-    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
-    with open(FLASHINFER_TVM_BINDING_DIR / "batch_mla_config.jinja") as f:
+    with open(jit_env.FLASHINFER_TVM_BINDING_DIR / "batch_mla_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
     generated_config_path = gen_directory / "batch_mla_config.inc"
     write_if_different(
@@ -358,7 +361,7 @@ def gen_batch_mla_tvm_binding(
         "batch_mla_run.cu",
         "batch_mla_jit_tvm_binding.cu",
     ]:
-        src_path = FLASHINFER_TVM_BINDING_DIR / filename
+        src_path = jit_env.FLASHINFER_TVM_BINDING_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)
         with open(src_path, "r") as f:

@@ -1,11 +1,6 @@
 // flashinfer: adapted from sglang + vllm code
 // refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cu
-#include <ATen/cuda/Exceptions.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-#include <torch/all.h>
-
-#include "flashinfer/distributed/custom_all_reduce.cuh"
+#include "flashinfer/comm/custom_all_reduce.cuh"
 #include "pytorch_extension_utils.h"
 
 // Fake pointer type, must match fptr_t type in ops.h.
@@ -13,8 +8,8 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data,
-                      int64_t rank, bool full_nvlink) {
+fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, at::Tensor& rank_data, int64_t rank,
+                      bool full_nvlink) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
   if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported for now");
@@ -44,7 +39,7 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& r
  * 5. A[None].expand(2, -1, -1, -1): Not OK
  * 6. A[:, 1:, 1:]: Not OK
  */
-bool _is_weak_contiguous(torch::Tensor& t) {
+bool _is_weak_contiguous(at::Tensor& t) {
   return t.is_contiguous() || (t.storage().nbytes() - t.storage_offset() * t.element_size() ==
                                t.numel() * t.element_size());
 }
@@ -56,10 +51,10 @@ bool _is_weak_contiguous(torch::Tensor& t) {
  * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
  * copied into _reg_buffer.
  */
-void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer,
+void all_reduce(fptr_t _fa, at::Tensor& inp, at::Tensor& out, fptr_t _reg_buffer,
                 int64_t reg_buffer_sz_bytes, int64_t num_ctas) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  const at::cuda::OptionalCUDAGuard device_guard(inp.device());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -70,8 +65,9 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
   if (reg_buffer) {
     TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
-    AT_CUDA_CHECK(
-        cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+    auto status =
+        cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream);
+    TORCH_CHECK(status == cudaSuccess);
   } else {
     reg_buffer = inp.data_ptr();
   }

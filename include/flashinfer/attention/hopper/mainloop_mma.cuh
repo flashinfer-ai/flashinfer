@@ -98,8 +98,12 @@ CUTLASS_DEVICE void mma_f16(
     const bool out_of_boundary =
         kv_idx > idx_in_original_seq || (kv_idx >= std::min(kv_len, col_limit_right(qo_idx)));
     const bool is_prefix = idx_in_original_seq < prefix_len;
-    uint16_t token_pos_in_items_regs =
-        __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+    uint16_t token_pos_in_items_regs = 0;
+    // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
+    // out-of-bounds memory access
+    if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
+      token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+    }
     if (out_of_boundary || is_prefix) {
       tSrS(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS(i);
     } else {
@@ -115,8 +119,13 @@ CUTLASS_DEVICE void mma_f16(
     if (is_prefix) {
       tSrS(i) = AttentionUpdater::fill_value;
     } else {
-      uint16_t token_pos_in_items_regs =
-          __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+      uint16_t token_pos_in_items_regs = 0;
+      // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
+      // out-of-bounds memory access
+      if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
+        token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+      }
+
       tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
                     ? tSrS(i)
                     : (AttentionUpdater::fill_value);
@@ -125,7 +134,7 @@ CUTLASS_DEVICE void mma_f16(
   auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
     int result = kv_tile_idx - 1;
     if constexpr (MULTIITEMSCORING) {
-      if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) &
+      if ((kv_tile_idx == num_kv_tiles_outside_items_window) &
           (kv_tile_idx >= num_kv_tiles_prefix)) {
         result = num_kv_tiles_prefix - 1;
       }
@@ -194,11 +203,7 @@ CUTLASS_DEVICE void mma_f16(
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
       if (MULTIITEMSCORING) {
-        if (masking_step == n_masking_steps - 1) {
-          mask_multi_item_scoring_assume_in_bound(tSrS, i, qo_idx, kv_idx);
-        } else {
-          mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
-        }
+        mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
       } else {
         if (kv_idx >= col_limit_right(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;

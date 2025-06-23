@@ -18,12 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import (
-    dtype_literal,
-    idtype_literal,
-    mask_mode_literal,
-    pos_encoding_mode_literal,
-)
+from .literal_map import dtype_literal, idtype_literal, mask_mode_literal
 
 
 def get_cu_file_str(
@@ -47,7 +42,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
      /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
      {attention_variant},
-     Params>(Params& params, cudaStream_t stream);
+     Params>(Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim_qk},
@@ -56,7 +51,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
      /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
      {attention_variant},
-     Params>(Params& params, cudaStream_t stream);
+     Params>(Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim_qk},
@@ -65,7 +60,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
      /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
      {attention_variant},
-     Params>(Params& params, cudaStream_t stream);
+     Params>(Params& params, bool enable_pdl, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim_qk},
@@ -74,7 +69,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
      /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
      {attention_variant},
-     Params>(Params& params, cudaStream_t stream);
+     Params>(Params& params, bool enable_pdl, cudaStream_t stream);
         """.format(
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,

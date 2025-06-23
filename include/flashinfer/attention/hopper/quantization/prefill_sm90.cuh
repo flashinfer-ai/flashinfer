@@ -351,10 +351,15 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
       });
 
   typename Scheduler::Arguments scheduler_args = {
-      params.work_indptr,     params.head_indices,
-      params.qo_tile_indices, params.qo_indptr,
-      params.kv_indptr,       params.qo_lens,
-      params.kv_lens,         cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      params.work_indptr,
+      params.head_indices,
+      params.qo_tile_indices,
+      params.qo_indptr,
+      params.kv_indptr,
+      params.qo_lens,
+      params.kv_lens,
+      params.batch_indices,
+      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
       params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
@@ -425,7 +430,8 @@ cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t s
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
-cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream) {
+cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                      cudaStream_t stream) {
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.

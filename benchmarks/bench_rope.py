@@ -6,8 +6,7 @@ $ pip install vllm
 $ python bench_rope.py
 """
 
-import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn

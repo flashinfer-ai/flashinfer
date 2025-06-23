@@ -342,7 +342,7 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
                 total_num_pages, page_size, self.qk_rope_head_dim
             )
 
-            workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(
+            workspace_buffer = torch.empty(64 * 1024 * 1024, dtype=torch.int8).to(
                 dev_id
             )
             wrapper = flashinfer.BatchDecodeMlaWithPagedKVCacheWrapper(
@@ -365,6 +365,17 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
                 data_type=q_kv_dtype,
                 q_data_type=q_kv_dtype,
             )
+
+            attn_output = wrapper.run(q_nope, q_pe, paged_ckv_cache, paged_kpe_cache)
+
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    o, lse = wrapper.run(
+                        q_nope, q_pe, paged_ckv_cache, paged_kpe_cache, return_lse=True
+                    )
+            torch.cuda.current_stream().wait_stream(s)
 
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):

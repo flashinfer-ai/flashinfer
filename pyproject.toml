@@ -15,15 +15,15 @@
 [project]
 name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
-requires-python = ">=3.8,<4.0"
+requires-python = ">=3.9,<4.0"
 authors = [{ name = "FlashInfer team" }]
-license = { text = "Apache License 2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
@@ -40,8 +40,10 @@ skip = [
 packages = [
     "flashinfer",
     "flashinfer.data",
+    "flashinfer.data.aot",
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
+    "flashinfer.data.spdlog",
     "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
     "flashinfer.jit",
@@ -53,8 +55,9 @@ include-package-data = false
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
+"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
-
+"flashinfer.data.spdlog" = "3rdparty/spdlog"
 [tool.setuptools.package-data]
 "flashinfer.data" = [
     "csrc/**",
@@ -62,9 +65,15 @@ include-package-data = false
     "tvm_binding/**",
     "version.txt"
 ]
+"flashinfer.data.aot" = [
+    "**"
+]
 "flashinfer.data.cutlass" = [
     "include/**",
     "tools/util/include/**"
+]
+"flashinfer.data.spdlog" = [
+    "include/**",
 ]
 
 [tool.mypy]

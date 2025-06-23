@@ -15,27 +15,16 @@ limitations under the License.
 """
 
 import functools
-import logging
 import math
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
-from .decode import get_batch_decode_module
-from .jit import (
-    gen_batch_decode_module,
-    gen_batch_prefill_module,
-    gen_customize_batch_prefill_module,
-    gen_pod_module,
-    gen_single_prefill_module,
-    get_pod_uri,
-    has_prebuilt_ops,
-    prebuilt_ops_uri,
-)
-from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
+from .jit import gen_pod_module
+from .page import get_seq_lens
 from .prefill import get_batch_prefill_module
-from .quantization import packbits, segment_packbits
+from .quantization import packbits
 from .utils import (
     MaskMode,
     PosEncodingMode,
@@ -48,30 +37,14 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
-    determine_attention_backend,
-    is_float8,
-    register_custom_op,
-    register_fake_op,
+    device_support_pdl,
 )
 
-_pod_modules = {}
 
-
+@functools.cache
 def get_pod_module(*args):
-    global _pod_modules
-    if args not in _pod_modules:
-        uri = get_pod_uri(*args)
-
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            _kernels = torch.ops.flashinfer_kernels
-            # torch library for pod_with_kv_cache
-            # No tensor deprecated due to poor performance. Just use tensor cores for both.
-            run_tensor = _kernels.pod_with_kv_cache_tensor.default
-        else:
-            run_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor.default
-        # Register the module
-        _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
-    return _pod_modules[args]
+    module = gen_pod_module(*args).build_and_load()
+    return SimpleNamespace(run_tensor=module.pod_with_kv_cache_tensor.default)
 
 
 class PODWithPagedKVCacheWrapper:
@@ -409,7 +382,8 @@ class PODWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            self._cached_module = get_batch_prefill_module("fa2")(
+            self._cached_module = get_batch_prefill_module(
+                "fa2",
                 q_data_type,
                 kv_data_type,
                 q_data_type,
@@ -483,9 +457,13 @@ class PODWithPagedKVCacheWrapper:
         v_scale: Optional[float] = None,
         return_lse_d: bool = False,
         use_fp16_qk_reduction: bool = False,
+        enable_pdl: Optional[bool] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute POD-attention for a batch of requests."""
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q_p.device)
+
         # Currently unsupported
         logits_soft_cap_p = None
         logits_soft_cap_d = None
@@ -619,6 +597,7 @@ class PODWithPagedKVCacheWrapper:
             sm_scale_d,
             1.0 / rope_scale_d,
             1.0 / rope_theta_d,
+            enable_pdl,
         )
 
         if v_scale is not None:

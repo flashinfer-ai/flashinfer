@@ -32,6 +32,7 @@ from .utils import (
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
+    device_support_pdl,
     is_float8,
 )
 
@@ -352,7 +353,7 @@ class BlockSparseAttentionWrapper:
         if (
             R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
-            and not q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]
+            and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
         ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
@@ -411,8 +412,8 @@ class BlockSparseAttentionWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            self._cached_module = get_batch_prefill_module(self._backend)(
-                *get_module_args
+            self._cached_module = get_batch_prefill_module(
+                self._backend, *get_module_args
             )
 
             kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
@@ -496,6 +497,7 @@ class BlockSparseAttentionWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
@@ -522,6 +524,9 @@ class BlockSparseAttentionWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the log-sum-exp of attention logits
+        enable_pdl : bool
+            Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
 
         Returns
         -------
@@ -532,6 +537,9 @@ class BlockSparseAttentionWrapper:
             * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(q.device)
+
         pos_encoding_mode = self._pos_encoding_mode
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
@@ -612,6 +620,8 @@ class BlockSparseAttentionWrapper:
                 self._mask_mode,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
+                enable_pdl,
+                # ADDITIONAL_FUNC_PARAMS
                 self._packed_mask_buf,
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
@@ -642,6 +652,8 @@ class BlockSparseAttentionWrapper:
                 lse,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
+                enable_pdl,
+                # ADDITIONAL_FUNC_PARAMS
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
                 logits_soft_cap,
                 sm_scale,

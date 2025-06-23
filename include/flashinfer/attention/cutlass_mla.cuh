@@ -22,8 +22,8 @@
 #include "cutlass/kernel_hardware_info.h"
 
 // From 3rdparty/cutlass/examples/77_blackwell_fmha
-#include "device/sm100_mla.hpp"
-#include "kernel/sm100_mla_tile_scheduler.hpp"
+#include "blackwell/device/sm100_mla.hpp"
+#include "blackwell/kernel/sm100_mla_tile_scheduler.hpp"
 
 namespace flashinfer {
 

@@ -33,12 +33,6 @@ FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH
 if [ -n "${FLASHINFER_GIT_SHA}" ]; then
     FLASHINFER_LOCAL_VERSION="${FLASHINFER_GIT_SHA}.${FLASHINFER_LOCAL_VERSION}"
 fi
-# wgmma work for cuda 12.3 and above
-if [ "$CUDA_MAJOR" -gt 12 ] || { [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 3 ]; }; then
-    FLASHINFER_ENABLE_SM90=1
-else
-    FLASHINFER_ENABLE_SM90=0
-fi
 
 echo "::group::Install PyTorch"
 pip install torch==${FLASHINFER_CI_TORCH_VERSION}.* --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
@@ -46,14 +40,18 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade setuptools wheel build
+pip install --upgrade setuptools packaging wheel build
 echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT"
-FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION=$FLASHINFER_LOCAL_VERSION FLASHINFER_ENABLE_SM90=$FLASHINFER_ENABLE_SM90 \
-    python -m build --no-isolation --wheel
+
 python -m build --no-isolation --sdist
+
+python -m flashinfer.aot
+FLASHINFER_LOCAL_VERSION=$FLASHINFER_LOCAL_VERSION \
+    python -m build --no-isolation --wheel
+
 ls -la dist/
 echo "::endgroup::"

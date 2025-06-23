@@ -245,7 +245,7 @@ struct SparseCollectiveMainloop {
     auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
       int result = kv_tile_idx - 1;
       if constexpr (MULTIITEMSCORING) {
-        if ((kv_tile_idx == num_kv_tiles_outside_items_window - 1) &
+        if ((kv_tile_idx == num_kv_tiles_outside_items_window) &
             (kv_tile_idx >= num_kv_tiles_prefix)) {
           result = num_kv_tiles_prefix - 1;
         }
