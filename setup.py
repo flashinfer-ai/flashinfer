@@ -51,11 +51,15 @@ def generate_build_meta(aot_build_meta: dict) -> None:
 
 ext_modules = []
 cmdclass = {}
-<<<<<<< HEAD
-install_requires = ["numpy", "torch", "ninja", "requests", "cuda-python", "pynvml"]
-=======
-install_requires = ["numpy", "torch", "ninja", "requests", "nvidia-nvshmem-cu12"]
->>>>>>> be734cb (upd)
+install_requires = [
+    "numpy",
+    "torch",
+    "ninja",
+    "requests",
+    "cuda-python",
+    "pynvml",
+    "nvidia-nvshmem-cu12",
+]
 generate_build_meta({})
 
 if enable_aot:
