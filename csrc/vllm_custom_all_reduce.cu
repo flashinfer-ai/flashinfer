@@ -1,6 +1,6 @@
 // flashinfer: adapted from sglang + vllm code
 // refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cu
-#include "flashinfer/comm/custom_all_reduce.cuh"
+#include "flashinfer/comm/vllm_custom_all_reduce.cuh"
 #include "pytorch_extension_utils.h"
 
 // Fake pointer type, must match fptr_t type in ops.h.
@@ -158,3 +158,13 @@ void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int
   customAllReduce(params, dtype, strat_type, strat_config, fusion_op, stream, num_ctas);
 }
 */
+
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
+  m.def("dispose", &dispose);
+  m.def("meta_size", &meta_size);
+  m.def("register_buffer", &register_buffer);
+  m.def("init_custom_ar", &init_custom_ar);
+  m.def("all_reduce", &all_reduce);
+}

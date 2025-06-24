@@ -25,6 +25,31 @@
 
 using namespace flashinfer;
 
+void softmax(at::Tensor workspace_buffer, at::Tensor logits, at::Tensor output,
+             std::optional<at::Tensor> maybe_temperature_arr, double temperature_val,
+             bool enable_pdl) {
+  CHECK_INPUT(workspace_buffer);
+  CHECK_INPUT(logits);
+  CHECK_INPUT(output);
+  auto device = logits.device();
+  CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  unsigned int batch_size = logits.size(0);
+  unsigned int vocab_size = logits.size(1);
+
+  bool has_temperature_arr = maybe_temperature_arr.has_value();
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t status = sampling::OnlineSoftmax<float>(
+      static_cast<float*>(logits.data_ptr()), static_cast<float*>(output.data_ptr()), batch_size,
+      vocab_size,
+      has_temperature_arr ? static_cast<float*>(maybe_temperature_arr->data_ptr()) : nullptr,
+      temperature_val, workspace_buffer.data_ptr(),
+      workspace_buffer.element_size() * workspace_buffer.size(0), enable_pdl, stream);
+  TORCH_CHECK(status == cudaSuccess,
+              "OnlineSoftmax failed with error code " + std::string(cudaGetErrorString(status)));
+}
+
 void sampling_from_logits(at::Tensor logits, at::Tensor output,
                           std::optional<at::Tensor> maybe_indices, bool deterministic,
                           std::optional<at::Generator> gen_) {

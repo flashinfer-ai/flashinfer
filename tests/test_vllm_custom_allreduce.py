@@ -33,13 +33,15 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
     try:
         device = torch.device(f"cuda:{rank}")
         max_size = 8192 * 1024
-        meta_ptrs = comm.create_shared_buffer(comm.meta_size() + max_size, group=group)
+        meta_ptrs = comm.create_shared_buffer(
+            comm.vllm_meta_size() + max_size, group=group
+        )
 
         rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=device)
         buffer_ptrs = comm.create_shared_buffer(max_size, group=group)
 
-        custom_ptr = comm.init_custom_ar(meta_ptrs, rank_data, rank, True)
-        comm.register_buffer(custom_ptr, buffer_ptrs)
+        custom_ptr = comm.vllm_init_custom_ar(meta_ptrs, rank_data, rank, True)
+        comm.vllm_register_buffer(custom_ptr, buffer_ptrs)
 
         test_sizes = [
             512,
@@ -67,7 +69,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
                         inp1_ref = inp1.clone()
                         out1 = torch.empty_like(inp1)
 
-                        comm.all_reduce(
+                        comm.vllm_all_reduce(
                             custom_ptr,
                             inp1,
                             out1,
@@ -82,7 +84,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
     finally:
         dist.barrier(group=group)
         if custom_ptr is not None:
-            comm.dispose(custom_ptr)
+            comm.vllm_dispose(custom_ptr)
         if buffer_ptrs:
             comm.free_shared_buffer(buffer_ptrs, group)
         if meta_ptrs:
