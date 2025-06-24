@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 import math
 import os
 from enum import Enum
@@ -24,9 +23,6 @@ import torch
 import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
-
-from .jit import env as jit_env
-from .jit import gen_jit_spec
 
 IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
@@ -469,49 +465,6 @@ log_level_map = {
 
 def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
-
-
-def get_trtllm_utils_spec():
-    return gen_jit_spec(
-        "trtllm_utils",
-        [
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/delayStream.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
-        ],
-        extra_include_paths=[
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "cutlass_extensions"
-            / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "internal_cutlass_kernels"
-            / "include",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "internal_cutlass_kernels",
-        ],
-    )
-
-
-@functools.cache
-def get_trtllm_utils_module():
-    return get_trtllm_utils_spec().build_and_load()
-
-
-def delay_kernel(stream_delay_micro_secs):
-    get_trtllm_utils_module().delay_kernel(stream_delay_micro_secs)
 
 
 def device_support_pdl(device: torch.device) -> bool:
