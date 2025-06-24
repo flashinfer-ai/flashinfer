@@ -18,6 +18,7 @@ from .trtllm_ar import FP4QuantizationSFLayout as FP4QuantizationSFLayout
 from .trtllm_ar import (
     compute_fp4_swizzled_layout_sf_size as compute_fp4_swizzled_layout_sf_size,
 )
+from .trtllm_ar import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .trtllm_ar import trtllm_allreduce_fusion as trtllm_allreduce_fusion
 from .trtllm_ar import (
     trtllm_create_ipc_workspace_for_all_reduce as trtllm_create_ipc_workspace_for_all_reduce,
@@ -40,6 +41,7 @@ from .trtllm_ar import (
 )
 from .vllm_ar import all_reduce as vllm_all_reduce
 from .vllm_ar import dispose as vllm_dispose
+from .vllm_ar import gen_vllm_comm_module as gen_vllm_comm_module
 from .vllm_ar import get_graph_buffer_ipc_meta as vllm_get_graph_buffer_ipc_meta
 from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
