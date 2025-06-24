@@ -13,31 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import socket
-import unittest
 
 import pynvml
 import pytest
 import torch
 
-import flashinfer.comm as comm
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo, mpi_comm
+from flashinfer.comm.mnnvl import MnnvlMemory, MpiComm
+from flashinfer.comm.trtllm_alltoall import MnnvlMoe, MoEAlltoallInfo
 
 pynvml.nvmlInit()
 
 
-@unittest.skipIf(
+@pytest.mark.skipif(
     not MnnvlMemory.supports_mnnvl(),
     reason="Mnnvl memory is not supported on this platform",
 )
-class TestMnnvlMemory(unittest.TestCase):
-
-    def setUp(self):
-        self.world_size = mpi_comm().Get_size()
-        self.rank = mpi_comm().Get_rank()
+class TestMnnvlMemory:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.world_size = MpiComm.Get_size()
+        self.rank = MpiComm.Get_rank()
         # get num of task per node
         hostname = socket.gethostname()
-        self.comm = mpi_comm()
+        self.comm = MpiComm()
         all_hostnames = self.comm.allgather(hostname)
         local_ntasks_per_node = all_hostnames.count(hostname)
         all_ntasks_per_node = self.comm.allgather(local_ntasks_per_node)
@@ -63,7 +62,7 @@ class TestMnnvlMemory(unittest.TestCase):
     @pytest.mark.skipif(
         not MnnvlMemory.supports_mnnvl(),
         reason="Mnnvl memory is not supported on this platform",
-    )  # Skip tests on unsupported platform
+    )
     def test_mnnvl_memory(self):
         # allocate un-aligned memory
         allocate0_size = 4 * 1024 * 1024 - 3 * 1024
@@ -76,7 +75,7 @@ class TestMnnvlMemory(unittest.TestCase):
         tensor0[(self.rank + 1) % self.world_size] = torch.arange(
             start=self.rank, end=self.rank + numel_per_rank, device="cuda"
         )
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
         for r in range(self.world_size):
             torch.equal(
                 tensor0[(r + 1) % self.world_size],
@@ -98,7 +97,7 @@ class TestMnnvlMemory(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
         for r in range(self.world_size):
             torch.equal(
                 tensor1[(r + 5) % self.world_size],
@@ -106,9 +105,9 @@ class TestMnnvlMemory(unittest.TestCase):
                     start=r, end=r + numel_per_rank, dtype=torch.float32, device="cuda"
                 ),
             )
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
         del tensor0, mnnvl_memory0
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
 
         large_allocation2_size = 768 * 1024 * 1024
         large_mnnvl_memory2 = MnnvlMemory(self.mapping, large_allocation2_size)
@@ -121,7 +120,7 @@ class TestMnnvlMemory(unittest.TestCase):
     @pytest.mark.skipif(
         not MnnvlMemory.supports_mnnvl(),
         reason="Mnnvl memory is not supported on this platform",
-    )  # Skip tests on unsupported platform
+    )
     def test_moe_alltoall_multi_rank_single_gpu(self):
         torch.cuda.set_device(self.rank)
         max_world_size = 8
@@ -254,7 +253,7 @@ class TestMnnvlMemory(unittest.TestCase):
 
         alltoall_workspace = MnnvlMoe.get_moe_workspaces(self.mapping)
 
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
 
         output = MnnvlMoe.mnnvl_moe_alltoallv(
             input_tensors_all_ranks[self.rank],
@@ -264,12 +263,8 @@ class TestMnnvlMemory(unittest.TestCase):
             self.world_size,
         )
 
-        mpi_comm().Barrier()
+        MpiComm.Barrier()
 
         torch.testing.assert_close(
             output, ref_output_tensors_all_ranks[self.rank], atol=1e-5, rtol=1e-5
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
