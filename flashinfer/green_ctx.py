@@ -18,35 +18,10 @@ from typing import List, Tuple
 
 import cuda.bindings.driver as driver
 import cuda.bindings.runtime as runtime
-import cuda.cudart as cudart
-import cuda.nvrtc as nvrtc
 import torch
 from cuda.bindings.driver import CUdevice, CUdevResource
 
-
-def _cudaGetErrorEnum(error):
-    if isinstance(error, driver.CUresult):
-        err, name = driver.cuGetErrorName(error)
-        return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
-    elif isinstance(error, runtime.cudaError_t):
-        return cudart.cudaGetErrorName(error)[1]
-    elif isinstance(error, nvrtc.nvrtcResult):
-        return nvrtc.nvrtcGetErrorString(error)[1]
-    else:
-        raise RuntimeError(f"Unknown error type: {error}")
-
-
-def checkCudaErrors(result):
-    if result[0].value:
-        raise RuntimeError(
-            f"CUDA error code={result[0].value}({_cudaGetErrorEnum(result[0])})"
-        )
-    if len(result) == 1:
-        return None
-    elif len(result) == 2:
-        return result[1]
-    else:
-        return result[1:]
+from .cuda_utils import checkCudaErrors
 
 
 def get_cudevice(dev: torch.device) -> CUdevice:
