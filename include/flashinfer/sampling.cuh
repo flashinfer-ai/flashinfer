@@ -1242,7 +1242,7 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
                           size_t workspace_buffer_size_in_bytes, bool enable_pdl,
                           cudaStream_t stream = 0) {
   constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
-  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 32768;
+  constexpr uint32_t LARGE_VOCAB_THRESHOLD = 24576;
   constexpr uint32_t DEFAULT_SLICE_SIZE = 8192;
 
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
