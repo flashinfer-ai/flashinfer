@@ -14,32 +14,6 @@
 #include <string>
 #include <vector>
 
-#define CUDACHECK(cmd)                                                                      \
-  do {                                                                                      \
-    cudaError_t e = cmd;                                                                    \
-    if (e != cudaSuccess) {                                                                 \
-      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-      exit(EXIT_FAILURE);                                                                   \
-    }                                                                                       \
-  } while (0)
-
-template <typename T>
-T* mallocZeroBuffer(size_t size) {
-  T* ptr;
-  CUDACHECK(cudaMalloc(&ptr, size * sizeof(T)));
-  cudaMemset(ptr, 0, size * sizeof(T));
-  return ptr;
-}
-
-inline int get_sm_count() {
-  int device;
-  CUDACHECK(cudaGetDevice(&device));
-  int numSMs;
-  CUDACHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, device));
-
-  return numSMs;
-}
-
 #define NVSHMEMCHECK(stmt)                                                                    \
   do {                                                                                        \
     int result = (stmt);                                                                      \
@@ -62,8 +36,9 @@ int64_t unique_id_size() { return sizeof(nvshmemx_uniqueid_t); }
 int64_t init(at::Tensor uid, int64_t rank, int64_t world_size) {
   TORCH_CHECK(uid.device().is_cpu(), "uid must be a CPU tensor");
   TORCH_CHECK(uid.scalar_type() == at::kByte, "uid must be a byte tensor");
-  TORCH_CHECK(uid.numel() == sizeof(nvshmemx_uniqueid_t), "Invalid unique id size (expected ",
-              sizeof(nvshmemx_uniqueid_t), ", got ", uid.numel(), ")");
+  TORCH_CHECK(uid.numel() == sizeof(nvshmemx_uniqueid_t),
+              "Invalid unique id size. Expected: ", sizeof(nvshmemx_uniqueid_t),
+              ", Got: ", uid.numel(), ")");
   nvshmemx_uniqueid_t id;
   std::memcpy(&id, uid.data_ptr(), sizeof(id));
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
