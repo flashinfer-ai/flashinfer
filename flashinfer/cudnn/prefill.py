@@ -23,7 +23,7 @@ def cudnn_batch_prefill_with_kv_cache(
     batch_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    use_cuda_graph: bool = False,
+    is_cuda_graph_compatible: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Performs batched prefill attention with paged KV cache using cuDNN.
 
@@ -36,17 +36,17 @@ def cudnn_batch_prefill_with_kv_cache(
         max_token_per_sequence: Maximum number of tokens per query sequence (s_qo_max)
         max_sequence_kv: Maximum number of tokens per key/value sequence (s_kv_max)
         actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device (cpu if cuda_graph is False)
-        actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU
+        actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU or device (cpu if cuda_graph is False)
         block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
         causal: Whether to apply causal masking (must be True)
         return_lse: Whether to return log-sum-exp values (must be True)
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
-        use_cuda_graph: Whether to use CUDA graph for the prefill operation
+        is_cuda_graph_compatible: Whether the prefill operation is compatible with CUDA graph
         batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
 
     Returns:
-        Output tensor of shape (batch_size, seq_len_q, num_heads_qo, head_dim)
+        Output tensor of shape (batch_size * seq_len_q, num_heads_qo, head_dim)
         If return_lse is True, also returns log-sum-exp tensor of shape (batch_size, seq_len_q, num_heads_qo)
 
     Note:
@@ -86,7 +86,7 @@ def cudnn_batch_prefill_with_kv_cache(
             )
 
     if out is None:
-        out_shape = (q.size(0), q.size(1), v_cache.size(3))
+        out_shape = (q.size(0), h_qo, v_cache.size(3))
         out = torch.empty(out_shape, device=q.device, dtype=q.dtype)
 
     if actual_seq_lens_q.is_cuda == False:
@@ -114,7 +114,7 @@ def cudnn_batch_prefill_with_kv_cache(
         out,
         lse,
         batch_offsets,
-        use_cuda_graph,
+        is_cuda_graph_compatible,
     )
 
     return out, lse

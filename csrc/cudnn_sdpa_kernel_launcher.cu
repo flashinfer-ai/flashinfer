@@ -381,7 +381,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
              at::Tensor actual_seq_lens_q, at::Tensor actual_seq_lens_kv,
              at::Tensor actual_seq_lens_q_gpu, at::Tensor actual_seq_lens_kv_gpu,
              at::Tensor block_tables, bool causal, bool return_lse, at::Tensor out, at::Tensor lse,
-             std::optional<at::Tensor> batch_offset_array, bool use_cuda_graph) {
+             std::optional<at::Tensor> batch_offset_array, bool is_cuda_graph_compatible) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr int64_t TILE_M_1 = 128;
   constexpr int64_t TILE_N_1 = 128;
@@ -455,7 +455,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   config.sharedMemBytes = SMEM_SIZE;
   config.hStream = stream;
 
-  if (use_cuda_graph == false) {
+  if (is_cuda_graph_compatible == false) {
     TORCH_CHECK(actual_seq_lens_q.is_cuda() == false,
                 "actual_seq_lens_q must be on the same device as q");
     TORCH_CHECK(actual_seq_lens_kv.is_cuda() == false,
@@ -522,7 +522,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   tma::cudaTmaDesc* tma_desc_v =
       reinterpret_cast<tma::cudaTmaDesc*>(workspace_start + sizeof(tma::cudaTmaDesc) * (2 * b + 1));
 
-  if (use_cuda_graph == false) {
+  if (is_cuda_graph_compatible == false) {
     // tma descriptors for k and v
     tma::cudaSetTmaTileDescriptor(
         tma_desc_k_host, k_cache.data_ptr(), DIMS_QKV, tensor_size_k.data(), tensor_stride_k.data(),
@@ -761,7 +761,7 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
 void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
             at::Tensor workspace_buffer, at::Tensor actual_seq_lens_kv,
             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, at::Tensor out,
-            std::optional<at::Tensor> batch_offset_array, bool use_cuda_graph) {
+            std::optional<at::Tensor> batch_offset_array, bool is_cuda_graph_compatible) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr size_t REDUCTION_MEM_SIZE = 128 * 1024;
   constexpr int64_t TILE_N_1 = 128;
@@ -880,7 +880,7 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   int8_t* lse_dev = batch_strides_dev + (b * sizeof(int64_t));
 
-  if (use_cuda_graph) {
+  if (is_cuda_graph_compatible) {
     dim3 grid(1, 1, 1);
     dim3 block(128, 1, 1);
     auto kid = get_kernel_id(h_qo / h_kv);

@@ -16,7 +16,7 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
 def test_cudnn_prefill(
     batch_size,
     s_qo,
@@ -27,7 +27,7 @@ def test_cudnn_prefill(
     head_dim,
     causal,
     return_lse,
-    use_cuda_graph,
+    is_cuda_graph_compatible,
 ):
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
@@ -105,7 +105,7 @@ def test_cudnn_prefill(
         block_tables=block_tables,
         causal=causal,
         return_lse=return_lse,
-        use_cuda_graph=use_cuda_graph,
+        is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
     torch.cuda.synchronize()
 
@@ -191,14 +191,14 @@ def test_cudnn_prefill(
 @pytest.mark.parametrize("s_kv", [8, 32])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
 def test_cudnn_prefill_deepseek(
     batch_size,
     s_qo,
     s_kv,
     num_kv_heads,
     num_qo_heads,
-    use_cuda_graph,
+    is_cuda_graph_compatible,
 ):
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
@@ -218,7 +218,7 @@ def test_cudnn_prefill_deepseek(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
     actual_seq_lens_kv = torch.randint(
-        s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
@@ -267,7 +267,7 @@ def test_cudnn_prefill_deepseek(
         actual_seq_lens_kv=actual_seq_lens_kv,
         causal=causal,
         return_lse=return_lse,
-        use_cuda_graph=use_cuda_graph,
+        is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
     torch.cuda.synchronize()
 

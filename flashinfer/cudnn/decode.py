@@ -18,14 +18,14 @@ def cudnn_batch_decode_with_kv_cache(
     actual_seq_lens_q: Optional[torch.Tensor] = None,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: torch.Tensor,
-    use_cuda_graph: bool = False,
+    is_cuda_graph_compatible: bool = False,
     batch_offsets: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Performs batched decode attention with paged KV cache using cuDNN.
 
     Args:
-        q: Query tensor of shape (batch_size, seq_len_q, num_heads_qo, head_dim), seq_len_q is the maximum sequence length of queries in the batch
+        q: Query tensor of shape (batch_size, num_heads_qo, head_dim), seq_len_q is the maximum sequence length of queries in the batch
         k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim)
         v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim)
         scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
@@ -35,13 +35,13 @@ def cudnn_batch_decode_with_kv_cache(
         actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device (cpu if cuda_graph is False)
         actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU
         block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
-        use_cuda_graph: Whether to use CUDA graph for the decode operation
+        is_cuda_graph_compatible: Whether the decode operation is compatible with CUDA graph
         batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
 
     Returns:
-        Output tensor of shape (batch_size, seq_len_q, num_heads_qo, head_dim)
+        Output tensor of shape (batch_size, num_heads_qo, head_dim)
 
     Note:
         Currently only supports causal attention (causal must be True)
@@ -71,7 +71,7 @@ def cudnn_batch_decode_with_kv_cache(
         block_tables,
         out,
         batch_offsets,
-        use_cuda_graph,
+        is_cuda_graph_compatible,
     )
 
     return out
