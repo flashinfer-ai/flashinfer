@@ -981,7 +981,7 @@ def top_k_top_p_sampling_from_logits(
     """
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(logits, top_k)
-        probs = torch.softmax(masked_logits, dim=-1)
+        probs = softmax(masked_logits)
         return top_p_sampling_from_probs(
             probs,
             top_p,
@@ -991,7 +991,7 @@ def top_k_top_p_sampling_from_logits(
             generator=generator,
         )
     elif filter_apply_order == "joint":
-        probs = torch.softmax(logits, dim=-1)
+        probs = softmax(logits)
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
