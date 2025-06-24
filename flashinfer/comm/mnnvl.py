@@ -99,7 +99,7 @@ class MnnvlMemory:
     def get_comm(mapping: Mapping):
         if MnnvlMemory.comm is not None:
             return MnnvlMemory.comm
-        comm = MpiComm.Split(
+        comm = MpiComm().Split(
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
         )
         MnnvlMemory.comm = comm

@@ -32,11 +32,11 @@ pynvml.nvmlInit()
 class TestMnnvlMemory:
     @pytest.fixture(autouse=True)
     def setup(self):
-        self.world_size = MpiComm.Get_size()
-        self.rank = MpiComm.Get_rank()
         # get num of task per node
         hostname = socket.gethostname()
         self.comm = MpiComm()
+        self.world_size = self.comm.Get_size()
+        self.rank = self.comm.Get_rank()
         all_hostnames = self.comm.allgather(hostname)
         local_ntasks_per_node = all_hostnames.count(hostname)
         all_ntasks_per_node = self.comm.allgather(local_ntasks_per_node)
@@ -75,7 +75,7 @@ class TestMnnvlMemory:
         tensor0[(self.rank + 1) % self.world_size] = torch.arange(
             start=self.rank, end=self.rank + numel_per_rank, device="cuda"
         )
-        MpiComm.Barrier()
+        self.comm.Barrier()
         for r in range(self.world_size):
             torch.equal(
                 tensor0[(r + 1) % self.world_size],
@@ -97,7 +97,7 @@ class TestMnnvlMemory:
             dtype=torch.float32,
             device="cuda",
         )
-        MpiComm.Barrier()
+        self.comm.Barrier()
         for r in range(self.world_size):
             torch.equal(
                 tensor1[(r + 5) % self.world_size],
@@ -105,9 +105,9 @@ class TestMnnvlMemory:
                     start=r, end=r + numel_per_rank, dtype=torch.float32, device="cuda"
                 ),
             )
-        MpiComm.Barrier()
+        self.comm.Barrier()
         del tensor0, mnnvl_memory0
-        MpiComm.Barrier()
+        self.comm.Barrier()
 
         large_allocation2_size = 768 * 1024 * 1024
         large_mnnvl_memory2 = MnnvlMemory(self.mapping, large_allocation2_size)
@@ -253,7 +253,7 @@ class TestMnnvlMemory:
 
         alltoall_workspace = MnnvlMoe.get_moe_workspaces(self.mapping)
 
-        MpiComm.Barrier()
+        self.comm.Barrier()
 
         output = MnnvlMoe.mnnvl_moe_alltoallv(
             input_tensors_all_ranks[self.rank],
@@ -263,7 +263,7 @@ class TestMnnvlMemory:
             self.world_size,
         )
 
-        MpiComm.Barrier()
+        self.comm.Barrier()
 
         torch.testing.assert_close(
             output, ref_output_tensors_all_ranks[self.rank], atol=1e-5, rtol=1e-5
