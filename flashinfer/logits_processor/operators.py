@@ -19,6 +19,7 @@ from typing import Any, Optional, Tuple, Union
 import torch
 
 from flashinfer.sampling import get_sampling_module
+from flashinfer.utils import _get_cache_buf, device_support_pdl
 
 from .op import Op, ParameterizedOp
 from .types import TaggedTensor, TensorType
@@ -41,8 +42,8 @@ class TemperatureOp(ParameterizedOp):
 
     Parameters
     ----------
-    temperature : float
-        Temperature value for scaling. Must be positive.
+    temperature : float or torch.Tensor
+        Temperature value for scaling.
     """
 
     IN = TensorType.LOGITS
@@ -51,22 +52,35 @@ class TemperatureOp(ParameterizedOp):
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_type = self._validate_input_type(tensor)
 
-        temperature = self._get_param("temperature", kwargs)
-        if temperature <= 0:
-            raise ValueError("Temperature must be positive")
+        temperature = self._get_param("temperature", kwargs, required=True)
+        maybe_temperature_arr, temperature_val = _to_tensor_scalar_tuple(temperature)
+        if maybe_temperature_arr is None and (
+            not isinstance(temperature_val, float) or temperature_val <= 0
+        ):
+            raise ValueError("Temperature must be positive float or a tensor array")
+
+        if maybe_temperature_arr is not None:
+            temperature = maybe_temperature_arr
+        else:
+            temperature = temperature_val
 
         scaled_logits = tensor.data / temperature
 
         return TaggedTensor(scaled_logits, output_type)
 
 
-class SoftmaxOp(Op):
+class SoftmaxOp(ParameterizedOp):
     """
     Softmax operator.
 
     Converts logits to probabilities using softmax function.
 
     :attr:`TensorType.LOGITS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    enable_pdl: bool, optional
+        Whether to enable PDL for the fused kernel.
     """
 
     IN = TensorType.LOGITS
@@ -75,7 +89,17 @@ class SoftmaxOp(Op):
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_type = self._validate_input_type(tensor)
 
-        probs = get_sampling_module().softmax(tensor.data)
+        enable_pdl = self.default_params.get("enable_pdl", None)
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(tensor.data.device)
+
+        workspace_buffer = _get_cache_buf(
+            "softmax_workspace", 1024 * 1024, tensor.data.device
+        )
+
+        probs = get_sampling_module().softmax(
+            workspace_buffer, tensor.data, None, 1.0, enable_pdl
+        )
         return TaggedTensor(probs, output_type)
 
 
@@ -320,6 +344,59 @@ class LogitsSampleOp(ParameterizedOp):
 
 
 # Fused operators
+class FusedTemperatureSoftmaxOp(ParameterizedOp):
+    """
+    Fused temperature scaling and softmax operator.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    enable_pdl: bool, optional
+        Whether to enable PDL for the fused kernel.
+    temperature : float or torch.Tensor
+        Temperature value for scaling.
+
+    See Also
+    --------
+    :meth:`~flashinfer.sampling.softmax`
+    """
+
+    IN = TensorType.LOGITS
+    OUT = TensorType.PROBS
+
+    def __init__(self, enable_pdl: Optional[bool] = None, **default_params: Any):
+        super().__init__(enable_pdl=enable_pdl, **default_params)
+
+    def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
+        output_type = self._validate_input_type(tensor)
+
+        temperature = self._get_param("temperature", kwargs, required=True)
+        maybe_temperature_arr, temperature_val = _to_tensor_scalar_tuple(temperature)
+        if maybe_temperature_arr is None and (
+            not isinstance(temperature_val, float) or temperature_val <= 0
+        ):
+            raise ValueError("Temperature must be positive float or a tensor array")
+
+        workspace_buffer = _get_cache_buf(
+            "softmax_workspace", 1024 * 1024, tensor.data.device
+        )
+
+        enable_pdl = self.default_params.get("enable_pdl", None)
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(tensor.data.device)
+
+        probs = get_sampling_module().softmax(
+            workspace_buffer,
+            tensor.data,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
+
+        return TaggedTensor(probs, output_type)
+
+
 class FusedProbsTopKSampleOp(ParameterizedOp):
     """
     Fused top-k filtering and sampling operator for probabilities.
