@@ -87,6 +87,26 @@ def malloc(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
+    """Allocates memory using NVSHMEM collective malloc operation.
+
+    This is a collective operation that requires participation by all PEs (Processing Elements).
+    All participants must call this function with the same parameters.
+
+    Note: This tensor should be explicitly deleted (del tensor) to ensure proper ordering
+    of nvshmem_free operations rather than relying on garbage collection.
+
+    Args:
+        shape: The shape of the tensor to allocate.
+        dtype: The data type of the tensor.
+        device: The device to allocate the tensor on.
+
+    Returns:
+        A tensor allocated using NVSHMEM collective malloc.
+
+    Reference:
+        https://docs.nvidia.com/nvshmem/api/gen/api/memory.html#nvshmem-malloc-nvshmem-free-nvshmem-align
+    """
+
     return get_nvshmem_module().nvshmem_malloc(shape, dtype, device)
 
 
