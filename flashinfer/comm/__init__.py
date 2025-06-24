@@ -1,15 +1,6 @@
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
-from .trtllm_alltoall import (
-    get_moe_commworkspace_size_per_rank as trtllm_get_moe_commworkspace_size_per_rank,
-)
-from .trtllm_alltoall import moe_comm as trtllm_moe_comm
-from .trtllm_alltoall import moe_comm_prepare_indices as trtllm_moe_comm_prepare_indices
-from .trtllm_alltoall import moe_local_gather as trtllm_moe_local_gather
-from .trtllm_alltoall import (
-    set_moe_max_usable_sm_count as trtllm_set_moe_max_usable_sm_count,
-)
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
 from .trtllm_ar import AllReduceFusionPattern as AllReduceFusionPattern
 from .trtllm_ar import AllReduceStrategyConfig as AllReduceStrategyConfig
