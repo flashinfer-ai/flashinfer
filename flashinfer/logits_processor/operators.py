@@ -75,8 +75,7 @@ class SoftmaxOp(Op):
     def __call__(self, tensor: TaggedTensor, **kwargs: Any) -> TaggedTensor:
         output_type = self._validate_input_type(tensor)
 
-        probs = torch.softmax(tensor.data, dim=-1)
-
+        probs = get_sampling_module().softmax(tensor.data)
         return TaggedTensor(probs, output_type)
 
 
