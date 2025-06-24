@@ -31,7 +31,8 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
-from .utils import get_trtllm_utils_spec, version_at_least
+from .tllm_utils import get_trtllm_utils_spec
+from .utils import version_at_least
 
 
 def gen_fa2(
