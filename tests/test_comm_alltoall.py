@@ -30,7 +30,7 @@ def setup_test_environment():
         # Set up SM count once for all tests
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
         max_sm_count = sm_count // 8  # Maximum world size is 8
-        comm.set_moe_max_usable_sm_count(max_sm_count)
+        comm.trtllm_set_moe_max_usable_sm_count(max_sm_count)
         has_setup_max_sm_count = True
 
     torch.manual_seed(0x1234)
@@ -131,12 +131,12 @@ def test_moe_alltoall_single_gpu(
     )
     ref_output_tensor[recv_indices] = input_tensor[send_indices]
 
-    workspace_size = comm.get_moe_commworkspace_size_per_rank(1)
+    workspace_size = comm.trtllm_get_moe_commworkspace_size_per_rank(1)
     all_workspaces = torch.zeros(
         1, workspace_size, dtype=torch.uint64, device=torch.device("cuda")
     )
 
-    comm.moe_comm(
+    comm.trtllm_moe_comm(
         input_tensor,
         send_cumsum,
         send_indices,
@@ -280,7 +280,7 @@ def test_moe_alltoall_multi_rank_single_gpu(
 
     cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
 
-    workspace_size = comm.get_moe_commworkspace_size_per_rank(world_size)
+    workspace_size = comm.trtllm_get_moe_commworkspace_size_per_rank(world_size)
     all_workspaces = torch.zeros(
         world_size, workspace_size, dtype=torch.uint64, device=torch.device("cuda")
     )
@@ -291,7 +291,7 @@ def test_moe_alltoall_multi_rank_single_gpu(
     # do alltoall in parallel
     for rank in range(world_size):
         with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            comm.moe_comm(
+            comm.trtllm_moe_comm(
                 input_tensors_all_ranks[rank],
                 send_cumsum_all_ranks[rank],
                 send_ids_all_ranks[rank],
@@ -390,7 +390,7 @@ def test_moe_alltoall_prepare_indices(
         recv_rank_count_cumsum,
         recv_rank_local_indices,
         backward_recv_rank_local_indices,
-    ) = comm.moe_comm_prepare_indices(
+    ) = comm.trtllm_moe_comm_prepare_indices(
         gathered_target_rank_ids,
         real_rank_token_count_cumsum,
         max_token_count_per_rank,
@@ -492,7 +492,7 @@ def test_moe_local_gather(
         device=torch.device("cuda"),
     )
 
-    comm.moe_local_gather(
+    comm.trtllm_moe_local_gather(
         rank_token_count_cumsum,
         local_gather_indices,
         gathered_expert_ids,
