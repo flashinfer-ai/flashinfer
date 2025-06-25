@@ -11,7 +11,7 @@ import torch
 
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
-from flashinfer.utils import delay_kernel
+from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
