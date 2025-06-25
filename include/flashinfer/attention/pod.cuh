@@ -120,7 +120,7 @@ __global__ __launch_bounds__(std::max(
   linear_bid = ((int*)smem)[0];
   op = ((int*)smem)[1];
   // Sync to force all threads to wait
-  __syncthreads();
+  // __syncthreads();
 
   if (op == PREFILL) {
     const uint32_t linear_tid = threadIdx.x;
@@ -209,24 +209,6 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   uint32_t cta_tile_q_p = 0;
   int64_t unpacked_qo_len =
       qo_len * group_size;  // TODO(@Wenxuan): Include batch size in calculation
-  // if (unpacked_qo_len > 64 && HEAD_DIM_VO < 256) {
-  //   cta_tile_q_p = 128;
-  // } else {
-  //   auto compute_capacity = GetCudaComputeCapability();
-  //   if (compute_capacity.first >= 8) {
-  //     // Ampere or newer
-  //     if (unpacked_qo_len > 16) {
-  //       // avg_packed_qo_len <= 64
-  //       cta_tile_q_p = 64;
-  //     } else {
-  //       // avg_packed_qo_len <= 16
-  //       cta_tile_q_p = 16;
-  //     }
-  //   } else {
-  //     // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-  //     cta_tile_q_p = 64;
-  //   }
-  // }
   cta_tile_q_p = FA2DetermineCtaTileQ(unpacked_qo_len, HEAD_DIM_VO);
 
   // Decode vars setup
@@ -413,7 +395,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             //  ************************************************ /
 
             static int* tbAssign = nullptr;
-            if (tbAssign == nullptr) cudaMalloc(&tbAssign, sizeof(int) * (num_sm + 2));
+            cudaMalloc(&tbAssign, sizeof(int) * (num_sm + 2));
             cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
 
             // Setup kernel arguments
