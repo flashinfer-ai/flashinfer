@@ -3,7 +3,7 @@ import functools
 import pytest
 import torch
 
-from flashinfer import fp4_quantize
+from flashinfer import fp4_quantize, fp4_swizzle_blockscale
 from flashinfer.utils import is_sm100a_supported
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -232,6 +232,52 @@ def test_scale_swizzling(
     assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
     assert_equal(recovered_unswizzled_scale, unswizzled_scale)
     assert_equal(ref_unswizzled_scale, unswizzled_scale)
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_fp4_swizzle_blockscale(
+    shape: tuple[int, int],
+    seed: int,
+    device: str,
+) -> None:
+    """Test the fp4_swizzle_blockscale function directly."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    m, n = shape
+    sf_vec_size = BLOCK_SIZE
+
+    # Create a test scale factors tensor with uint8 dtype
+    # The shape should be [m, n // sf_vec_size] for scale factors
+    scale_shape = (m, n // sf_vec_size)
+    unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
+
+    # Test the swizzling function
+    swizzled_sf = fp4_swizzle_blockscale(unswizzled_sf, m, n, sf_vec_size)
+
+    # Compare against the reference implementation
+    ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)
+
+    # Basic checks
+    assert swizzled_sf.dtype == torch.uint8, f"Expected uint8, got {swizzled_sf.dtype}"
+    assert swizzled_sf.device == unswizzled_sf.device, "Device mismatch"
+
+    # Check that the output has the expected padded shape
+    factor = sf_vec_size * 4
+    padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
+    padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
+    expected_shape = (padded_row, padded_col // sf_vec_size)
+
+    assert (
+        swizzled_sf.shape == expected_shape
+    ), f"Expected shape {expected_shape}, got {swizzled_sf.shape}"
+    assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
+    assert_equal(swizzled_sf, ref_swizzled_sf)
 
 
 if __name__ == "__main__":

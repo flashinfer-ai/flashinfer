@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,12 +105,28 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 
   return {valueE2M1, scaleFP8SF};
 }
+
+void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
+                            int64_t m, int64_t n, int64_t sf_vec_size) {
+  CHECK_TH_CUDA(unswizzled_sf);
+  CHECK_CONTIGUOUS(unswizzled_sf);
+  CHECK_TH_CUDA(swizzled_sf);
+  CHECK_CONTIGUOUS(swizzled_sf);
+  CHECK_INPUT_TYPE(unswizzled_sf, c10::ScalarType::Byte);
+  CHECK_INPUT_TYPE(swizzled_sf, c10::ScalarType::Byte);
+
+  TORCH_CHECK(unswizzled_sf.sizes() == swizzled_sf.sizes(),
+              "Input and output tensors must have the same shape");
+
+  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(
+      b, m, n, reinterpret_cast<uint8_t const*>(unswizzled_sf.data_ptr()),
+      reinterpret_cast<uint8_t*>(swizzled_sf.data_ptr()), mMultiProcessorCount,
+      at::cuda::getCurrentCUDAStream(unswizzled_sf.get_device()));
+}
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def(
-      "fp4_quantize(Tensor input, Tensor globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-      "swizzedLayout=True) "
-      "-> (Tensor, Tensor)",
-      &torch_ext::fp4_quantize);
+  m.def("fp4_quantize", &torch_ext::fp4_quantize);
+  m.def("fp4_swizzle_blockscale", &torch_ext::fp4_swizzle_blockscale);
 }
