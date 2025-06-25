@@ -22,9 +22,12 @@ from .operators import (
     FusedProbsTopKSampleOp,
     FusedProbsTopKTopPSampleOp,
     FusedProbsTopPSampleOp,
+    FusedTemperatureSoftmaxOp,
     MinPOp,
     ProbsSampleOp,
     ProbsTopKOp,
+    SoftmaxOp,
+    TemperatureOp,
     TopPOp,
 )
 
@@ -55,6 +58,12 @@ def joint_topk_topp_sampleprobs_guard(window: List[Op]) -> bool:
     return joint_topk_topp
 
 
+def build_temperature_softmax(window: List[Op]) -> Op:
+    softmax_op = window[1]
+    enable_pdl = getattr(softmax_op, "default_params", {}).get("enable_pdl", None)
+    return FusedTemperatureSoftmaxOp(enable_pdl=enable_pdl)
+
+
 def build_topk_sampling(window: List[Op]) -> Op:
     sampling_op = window[1]
     deterministic = getattr(sampling_op, "default_params", {}).get(
@@ -81,6 +90,12 @@ def build_minp_sampling(window: List[Op]) -> Op:
 
 def get_default_fusion_rules() -> List[FusionRule]:
     return [
+        FusionRule(
+            pattern=(TemperatureOp, SoftmaxOp),
+            guard=lambda window: True,
+            build=build_temperature_softmax,
+            prio=100,
+        ),
         FusionRule(
             pattern=(ProbsTopKOp, TopPOp, ProbsSampleOp),
             guard=joint_topk_topp_sampleprobs_guard,

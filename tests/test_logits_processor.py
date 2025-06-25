@@ -48,6 +48,31 @@ def get_generators():
 class TestLogitsPipeCompilation:
     """Test LogitsPipe with compile=True vs compile=False"""
 
+    @pytest.mark.parametrize("batch_size", [1, 99, 989])
+    @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+    @pytest.mark.parametrize(
+        "distribution",
+        [
+            normal_distribution(1),
+            normal_distribution(5),
+            gumbel_distribution(0.1),
+        ],
+    )
+    @pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
+    def test_temperature_softmax(
+        self, batch_size, vocab_size, distribution, temperature
+    ):
+        set_random_seed(42)
+        logits = distribution((batch_size, vocab_size), "cuda:0")
+
+        pipe_compiled = LogitsPipe([Temperature(), Softmax()], compile=True)
+        pipe_no_compile = LogitsPipe([Temperature(), Softmax()], compile=False)
+
+        probs_compiled = pipe_compiled(logits, temperature=temperature)
+        probs_no_compile = pipe_no_compile(logits, temperature=temperature)
+
+        assert torch.allclose(probs_compiled, probs_no_compile, atol=1e-5)
+
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(
         "distribution",
@@ -560,6 +585,29 @@ class TestLogitsPipeCompilation:
 
 class TestLogitsPipeVsSamplingOps:
     """Test LogitsPipe implementations against direct sampling operations"""
+
+    @pytest.mark.parametrize("batch_size", [1, 99, 989])
+    @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+    @pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
+    @pytest.mark.parametrize("temperature_arr", [True, False])
+    def test_temperature_softmax(
+        self, batch_size, vocab_size, temperature, temperature_arr
+    ):
+        set_random_seed(42)
+
+        logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+        if temperature_arr:
+            temperature = torch.rand(batch_size, device="cuda:0")
+
+        samples_direct = flashinfer.sampling.softmax(
+            logits=logits, temperature=temperature
+        )
+
+        pipe = LogitsPipe([Temperature(), Softmax()])
+        samples_pipe = pipe(logits, temperature=temperature)
+
+        assert torch.allclose(samples_pipe, samples_direct, atol=1e-5)
 
     @pytest.mark.parametrize("batch_size", [1, 99, 989])
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import Any, List, Optional
 
 from .types import TensorType
 
@@ -96,8 +96,8 @@ class Temperature(LogitsProcessor):
 
     Parameters
     ----------
-    temperature : float, Runtime
-        Temperature value for scaling. Must be positive.
+    temperature : float or torch.Tensor, Runtime
+        Temperature value for scaling. Must be positive. Can be a scalar or per-batch tensor.
 
     Examples
     --------
@@ -131,6 +131,62 @@ class Temperature(LogitsProcessor):
             )
 
         return [TemperatureOp(**self.params)]
+
+
+class Softmax(LogitsProcessor):
+    """
+    Softmax processor to convert logits to probabilities.
+
+    Applies the softmax function.
+
+    :attr:`TensorType.LOGITS` -> :attr:`TensorType.PROBS`
+
+    Parameters
+    ----------
+    enable_pdl : bool, optional, Compile-time
+        Whether to enable PDL for the kernel implementation.
+        Default is True.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.logits_processor import LogitsPipe, Softmax, Sample
+    >>> torch.manual_seed(42)
+    >>> pipe = LogitsPipe([Softmax()])
+    >>> logits = torch.randn(2, 2, device="cuda")
+    >>> logits
+    tensor([[ 0.1940,  2.1614], [ -0.1721,  0.8491]], device='cuda:0')
+    >>> probs = pipe(logits)
+    >>> probs
+    tensor([[0.1227, 0.8773], [0.2648, 0.7352]], device='cuda:0')
+
+    Notes
+    -----
+    Can only appear once in a pipeline.
+    """
+
+    def __init__(self, enable_pdl: Optional[bool] = None, **params: Any):
+        """
+        Constructor for Softmax processor.
+
+        Parameters
+        ----------
+        enable_pdl : bool, optional, Compile-time
+            Whether to enable PDL for the kernel implementation.
+            Default is None, which means the kernel will be automatically enabled if PDL is supported on the device.
+        """
+        super().__init__(enable_pdl=enable_pdl, **params)
+
+    def legalize(self, input_type: TensorType) -> List["Op"]:
+        """
+        Legalize the processor into a list of low-level operators.
+        """
+        from .operators import SoftmaxOp
+
+        if input_type != TensorType.LOGITS:
+            raise ValueError(f"Softmax can only be applied to LOGITS, got {input_type}")
+
+        return [SoftmaxOp(**self.params)]
 
 
 class TopK(LogitsProcessor):
@@ -308,44 +364,6 @@ class MinP(LogitsProcessor):
             raise ValueError(f"MinP can only be applied to PROBS, got {input_type}")
 
         return [MinPOp(**self.params)]
-
-
-class Softmax(LogitsProcessor):
-    """
-    Softmax processor to convert logits to probabilities.
-
-    Applies the softmax function.
-
-    :attr:`TensorType.LOGITS` -> :attr:`TensorType.PROBS`
-
-    Examples
-    --------
-    >>> import torch
-    >>> from flashinfer.logits_processor import LogitsPipe, Softmax, Sample
-    >>> torch.manual_seed(42)
-    >>> pipe = LogitsPipe([Softmax()])
-    >>> logits = torch.randn(2, 2, device="cuda")
-    >>> logits
-    tensor([[ 0.1940,  2.1614], [ -0.1721,  0.8491]], device='cuda:0')
-    >>> probs = pipe(logits)
-    >>> probs
-    tensor([[0.1227, 0.8773], [0.2648, 0.7352]], device='cuda:0')
-
-    Notes
-    -----
-    Can only appear once in a pipeline.
-    """
-
-    def legalize(self, input_type: TensorType) -> List["Op"]:
-        """
-        Legalize the processor into a list of low-level operators.
-        """
-        from .operators import SoftmaxOp
-
-        if input_type != TensorType.LOGITS:
-            raise ValueError(f"Softmax can only be applied to LOGITS, got {input_type}")
-
-        return [SoftmaxOp(**self.params)]
 
 
 class Sample(LogitsProcessor):
