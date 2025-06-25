@@ -107,7 +107,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 }
 
 void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
-                            int64_t m, int64_t n, int64_t sf_vec_size) {
+                            int64_t m, int64_t n) {
   CHECK_TH_CUDA(unswizzled_sf);
   CHECK_CONTIGUOUS(unswizzled_sf);
   CHECK_TH_CUDA(swizzled_sf);

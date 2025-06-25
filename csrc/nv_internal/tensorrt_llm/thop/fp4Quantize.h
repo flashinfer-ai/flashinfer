@@ -27,5 +27,5 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 bool sfUseUE8M0, bool isSfSwizzledLayout);
 
 void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
-                            int64_t m, int64_t n, int64_t sf_vec_size);
+                            int64_t m, int64_t n);
 }  // namespace torch_ext

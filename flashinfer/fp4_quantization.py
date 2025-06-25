@@ -129,7 +129,6 @@ def get_fp4_quantization_sm100_module():
         b: int,
         m: int,
         n: int,
-        sf_vec_size: int = 16,
     ) -> None:
         """Swizzle block scale tensor for FP4 format.
 
@@ -139,7 +138,6 @@ def get_fp4_quantization_sm100_module():
             b (int): Batch dimension.
             m (int): M dimension.
             n (int): N dimension.
-            sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
         """
         module.fp4_swizzle_blockscale(
             unswizzled_sf,
@@ -147,7 +145,6 @@ def get_fp4_quantization_sm100_module():
             b,
             m,
             n,
-            sf_vec_size,
         )
 
     @register_fake_op("flashinfer::fp4_swizzle_blockscale_sm100")
@@ -157,9 +154,7 @@ def get_fp4_quantization_sm100_module():
         b: int,
         m: int,
         n: int,
-        sf_vec_size: int = 16,
     ) -> None:
-        # Fake op just copies the input to output
         pass
 
     # Register the module
@@ -238,6 +233,7 @@ def fp4_swizzle_blockscale(
     assert (
         unswizzled_sf.dtype == torch.uint8
     ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert sf_vec_size == 16, f"Currently only support sf_vec_size 16!"
     padded_input_sf = _pad_scale_factors(unswizzled_sf, m, n, sf_vec_size)
     out = torch.empty_like(padded_input_sf)
     o_m, o_n = out.shape
@@ -247,6 +243,5 @@ def fp4_swizzle_blockscale(
         1,
         o_m,
         o_n,
-        sf_vec_size,
     )
     return out
