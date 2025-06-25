@@ -37,17 +37,19 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
     nvshmem_allreduce = NVSHMEMAllReduce(
         rank_id,
         num_ranks,
-        max_batch_size*hidden_dim,
+        max_batch_size * hidden_dim,
         tensor_dtype,
         device,
         group,
     )
-    
+
     try:
         for batch_size in batch_sizes:
             for _ in range(test_loop):
                 tensor_size = batch_size * hidden_dim
-                inp1 = torch.full([tensor_size], rank_id, dtype=tensor_dtype, device=device)
+                inp1 = torch.full(
+                    [tensor_size], rank_id, dtype=tensor_dtype, device=device
+                )
                 inp1_ref = inp1.clone()
                 out1 = torch.empty_like(inp1)
                 nvshmem_allreduce.all_reduce(inp1, out1)
