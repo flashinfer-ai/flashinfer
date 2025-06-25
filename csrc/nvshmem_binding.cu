@@ -97,51 +97,6 @@ void sum_reduce(at::Tensor dest, at::Tensor source, int64_t nelems) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   switch (dest.scalar_type()) {
-    // Signed integers
-    case at::kChar:  // int8
-      NVSHMEMCHECK(nvshmemx_int8_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (int8_t*)dest.data_ptr(),
-                                                      (int8_t*)source.data_ptr(),
-                                                      nelems_size_t,  // Use the converted value
-                                                      stream));
-      break;
-    case at::kShort:  // int16
-      NVSHMEMCHECK(nvshmemx_int16_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (int16_t*)dest.data_ptr(), (int16_t*)source.data_ptr(),
-          nelems_size_t,  // Use the converted value
-          stream));
-      break;
-    case at::kInt:  // int32
-      NVSHMEMCHECK(
-          nvshmemx_int32_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (int32_t*)dest.data_ptr(),
-                                              (int32_t*)source.data_ptr(), nelems_size_t, stream));
-      break;
-    case at::kLong:  // int64
-      NVSHMEMCHECK(
-          nvshmemx_int64_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (int64_t*)dest.data_ptr(),
-                                              (int64_t*)source.data_ptr(), nelems_size_t, stream));
-      break;
-    // Unsigned integers
-    case at::kByte:
-      NVSHMEMCHECK(
-          nvshmemx_uint8_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (uint8_t*)dest.data_ptr(),
-                                              (uint8_t*)source.data_ptr(), nelems_size_t, stream));
-      break;
-    case at::kUInt16:
-      NVSHMEMCHECK(nvshmemx_uint16_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (uint16_t*)dest.data_ptr(), (uint16_t*)source.data_ptr(),
-          nelems_size_t, stream));
-      break;
-    case at::kUInt32:
-      NVSHMEMCHECK(nvshmemx_uint32_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (uint32_t*)dest.data_ptr(), (uint32_t*)source.data_ptr(),
-          nelems_size_t, stream));
-      break;
-    case at::kUInt64:
-      NVSHMEMCHECK(nvshmemx_uint64_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (uint64_t*)dest.data_ptr(), (uint64_t*)source.data_ptr(),
-          nelems_size_t, stream));
-      break;
-    // Floating point types
     case at::kHalf:  // float16
       NVSHMEMCHECK(nvshmemx_half_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (__half*)dest.data_ptr(),
                                                       (__half*)source.data_ptr(), nelems_size_t,
@@ -151,11 +106,6 @@ void sum_reduce(at::Tensor dest, at::Tensor source, int64_t nelems) {
       NVSHMEMCHECK(nvshmemx_float_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (float*)dest.data_ptr(),
                                                        (float*)source.data_ptr(), nelems_size_t,
                                                        stream));
-      break;
-    case at::kDouble:  // float64
-      NVSHMEMCHECK(
-          nvshmemx_double_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, (double*)dest.data_ptr(),
-                                               (double*)source.data_ptr(), nelems_size_t, stream));
       break;
     case at::kBFloat16:  // bfloat16
       NVSHMEMCHECK(nvshmemx_bfloat16_sum_reduce_on_stream(
