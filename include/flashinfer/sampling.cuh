@@ -358,35 +358,31 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     __syncthreads();
     block_max = temp_storage.shared_state.max_val;
 
-    float thread_sum = 0.0f;
+    // if block_max is -inf, then this block contains all -inf values, so we can skip updating
     if (!isinf(block_max)) {
+      float thread_sum = 0.0f;
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         thread_sum += __expf(logits_vec[j] - block_max);
       }
+
+      float block_sum =
+          cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
+      __syncthreads();
+
+      if (tx == 0) {
+        float new_max = max(running_max, block_max);
+        running_denominator = running_denominator * __expf(running_max - new_max) +
+                              block_sum * __expf(block_max - new_max);
+        running_max = new_max;
+
+        temp_storage.shared_state.max_val = running_max;
+        temp_storage.shared_state.denominator = running_denominator;
+      }
+      __syncthreads();
+      running_max = temp_storage.shared_state.max_val;
+      running_denominator = temp_storage.shared_state.denominator;
     }
-
-    float block_sum =
-        cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
-    if (tx == 0) {
-      temp_storage.shared_state.denominator = block_sum;
-    }
-    __syncthreads();
-    block_sum = temp_storage.shared_state.denominator;
-
-    if (tx == 0 && !isinf(block_max)) {
-      float new_max = max(running_max, block_max);
-      running_denominator = running_denominator * __expf(running_max - new_max) +
-                            block_sum * __expf(block_max - new_max);
-      running_max = new_max;
-
-      temp_storage.shared_state.max_val = running_max;
-      temp_storage.shared_state.denominator = running_denominator;
-    }
-    __syncthreads();
-
-    running_max = temp_storage.shared_state.max_val;
-    running_denominator = temp_storage.shared_state.denominator;
   }
 
   const float final_max = running_max;
@@ -478,36 +474,31 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     __syncthreads();
     block_max = temp_storage.shared_state.max_val;
 
-    float thread_sum = 0.0f;
+    // if block_max is -inf, then this block contains all -inf values, so we can skip updating
     if (!isinf(block_max)) {
+      float thread_sum = 0.0f;
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         thread_sum += __expf(logits_vec[j] - block_max);
       }
+
+      float block_sum =
+          cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
+      __syncthreads();
+
+      if (tx == 0) {
+        float new_max = max(running_max, block_max);
+        running_denominator = running_denominator * __expf(running_max - new_max) +
+                              block_sum * __expf(block_max - new_max);
+        running_max = new_max;
+
+        temp_storage.shared_state.max_val = running_max;
+        temp_storage.shared_state.denominator = running_denominator;
+      }
+      __syncthreads();
+      running_max = temp_storage.shared_state.max_val;
+      running_denominator = temp_storage.shared_state.denominator;
     }
-
-    float block_sum =
-        cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
-
-    if (tx == 0) {
-      temp_storage.shared_state.denominator = block_sum;
-    }
-    __syncthreads();
-    block_sum = temp_storage.shared_state.denominator;
-
-    if (tx == 0 && !isinf(block_max)) {
-      float new_max = max(running_max, block_max);
-      running_denominator = running_denominator * __expf(running_max - new_max) +
-                            block_sum * __expf(block_max - new_max);
-      running_max = new_max;
-
-      temp_storage.shared_state.max_val = running_max;
-      temp_storage.shared_state.denominator = running_denominator;
-    }
-    __syncthreads();
-
-    running_max = temp_storage.shared_state.max_val;
-    running_denominator = temp_storage.shared_state.denominator;
   }
 
   if (tx == 0) {
