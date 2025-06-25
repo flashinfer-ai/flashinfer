@@ -359,9 +359,11 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     block_max = temp_storage.shared_state.max_val;
 
     float thread_sum = 0.0f;
+    if (!isinf(block_max)) {
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      thread_sum += __expf(logits_vec[j] - block_max);  // e^(-inf) is safe to add
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        thread_sum += __expf(logits_vec[j] - block_max);
+      }
     }
 
     float block_sum =
@@ -372,7 +374,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     __syncthreads();
     block_sum = temp_storage.shared_state.denominator;
 
-    if (tx == 0) {
+    if (tx == 0 && !isinf(block_max)) {
       float new_max = max(running_max, block_max);
       running_denominator = running_denominator * __expf(running_max - new_max) +
                             block_sum * __expf(block_max - new_max);
@@ -477,9 +479,11 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     block_max = temp_storage.shared_state.max_val;
 
     float thread_sum = 0.0f;
+    if (!isinf(block_max)) {
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      thread_sum += __expf(logits_vec[j] - block_max);
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        thread_sum += __expf(logits_vec[j] - block_max);
+      }
     }
 
     float block_sum =
@@ -491,7 +495,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     __syncthreads();
     block_sum = temp_storage.shared_state.denominator;
 
-    if (tx == 0) {
+    if (tx == 0 && !isinf(block_max)) {
       float new_max = max(running_max, block_max);
       running_denominator = running_denominator * __expf(running_max - new_max) +
                             block_sum * __expf(block_max - new_max);
