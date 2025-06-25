@@ -236,7 +236,7 @@ def test_variable_block_sparse_attention_wrapper(
 
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=device)
         wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
-            float_workspace_buffer, backend="fa3"
+            float_workspace_buffer, backend=backend
         )
 
         wrapper.plan(
