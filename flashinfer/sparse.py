@@ -17,6 +17,7 @@ limitations under the License.
 import math
 from typing import Optional, Tuple, Union
 
+import einops
 import torch
 
 from .decode import get_batch_decode_module
@@ -706,7 +707,7 @@ class VariableBlockSparseAttentionWrapper:
         float_workspace_buffer: torch.Tensor,
         backend: str = "auto",
     ) -> None:
-        r"""Constructs of :class:`BlockSparseAttentionWrapper`.
+        r"""Constructs of :class:`VariableBlockSparseAttentionWrapper`.
 
         Parameters
         ----------
@@ -1096,16 +1097,22 @@ class VariableBlockSparseAttentionWrapper:
             rope_theta = 1e4
 
         # reshape to pad num_kv_heads into seq_len
-        # input HND, underlying kernel layout is NHD -> [qo_len * num_kv_heads, gqa_group_size, head_dim]
-        q = (
-            q.reshape(self._num_kv_heads, self._gqa_group_size, *q.shape[-2:])
-            .transpose(1, 2)
-            .contiguous()
-        )
-        q = q.flatten(start_dim=0, end_dim=1)
+        # input [num_qo_heads, qo_len, head_dim]
+        # kernel layout is NHD -> [qo_len * num_kv_heads, gqa_group_size, head_dim]
+        q = einops.rearrange(
+            q,
+            "(num_kv_heads gqa_group_size) qo_len head_dim -> (num_kv_heads qo_len) gqa_group_size head_dim",
+            num_kv_heads=self._num_kv_heads,
+        ).contiguous()
         # HND -> [kv_len * num_kv_heads (num_pages), 1 (page_size), 1 (new_num_kv_heads), head_dim]
-        k = k.flatten(start_dim=0, end_dim=1).unsqueeze(1).unsqueeze(1)
-        v = v.flatten(start_dim=0, end_dim=1).unsqueeze(1).unsqueeze(1)
+        k = einops.rearrange(
+            k,
+            "num_kv_heads kv_len head_dim -> (num_kv_heads kv_len) 1 1 head_dim",
+        ).contiguous()
+        v = einops.rearrange(
+            v,
+            "num_kv_heads kv_len head_dim -> (num_kv_heads kv_len) 1 1 head_dim",
+        ).contiguous()
 
         stride_block = k.stride(0)
         stride_n = k.stride(1)
@@ -1176,12 +1183,18 @@ class VariableBlockSparseAttentionWrapper:
             0,  # token_pos_in_items_len
         )
 
-        # reshape back
         # [qo_len * num_kv_heads, gqa_group_size, head_dim] -> HND
-        out = out.reshape(self._num_kv_heads, -1, self._gqa_group_size, out.shape[-1])
-        out = out.transpose(1, 2).contiguous().flatten(start_dim=0, end_dim=1)
+        out = einops.rearrange(
+            out,
+            "(num_kv_heads qo_len) gqa_group_size head_dim -> (num_kv_heads gqa_group_size) qo_len head_dim",
+            num_kv_heads=self._num_kv_heads,
+        ).contiguous()
+
         if return_lse:
-            lse = lse.reshape(self._num_kv_heads, -1, self._gqa_group_size)
-            lse = lse.transpose(1, 2).contiguous().flatten(start_dim=0, end_dim=1)
+            lse = einops.rearrange(
+                lse,
+                "(num_kv_heads qo_len) gqa_group_size -> (num_kv_heads gqa_group_size) qo_len",
+                num_kv_heads=self._num_kv_heads,
+            ).contiguous()
 
         return (out, lse) if return_lse else out
