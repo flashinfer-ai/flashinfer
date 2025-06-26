@@ -49,7 +49,7 @@ def generate_build_meta(aot_build_meta: dict) -> None:
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 
-ext_modules = []
+ext_modules = []  # type: ignore
 cmdclass = {}
 install_requires = [
     "numpy",
