@@ -17,7 +17,6 @@ limitations under the License.
 import math
 from typing import Optional, Tuple, Union
 
-import einops
 import torch
 
 from .decode import get_batch_decode_module
@@ -538,6 +537,10 @@ class BlockSparseAttentionWrapper:
             * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
+
+        # NOTE(Zihao): defer import of einops
+        import einops
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
 
