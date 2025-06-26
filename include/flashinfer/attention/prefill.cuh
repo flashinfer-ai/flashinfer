@@ -1032,37 +1032,6 @@ __device__ __forceinline__ void compute_sfm_v(
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
-  using AttentionVariant = typename KTraits::AttentionVariant;
-  if constexpr (AttentionVariant::use_softmax) {
-    float d_rcp[KTraits::NUM_MMA_Q][2];
-    // compute reciprocal of d
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-      for (uint32_t j = 0; j < 2; ++j) {
-        d_rcp[mma_q][j] = (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf))
-                              ? math::ptx_rcp(d[mma_q][j])
-                              : 0.f;
-      }
-    }
-
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-#pragma unroll
-        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-          o_frag[mma_q][mma_d][reg_id] =
-              o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
-        }
-      }
-    }
-  }
-}
-
-template <typename KTraits>
 __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant variant,
                                            typename KTraits::DTypeQKAccum (*m)[2]) {
   if constexpr (variant.use_softmax) {
@@ -1073,6 +1042,39 @@ __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant va
         if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
           m[mma_q][j] *= variant.sm_scale_log2;
         }
+      }
+    }
+  }
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void transform_output(
+    const Params& params, typename KTraits::AttentionVariant variant,
+    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::DTypeQKAccum (*m)[2],
+    float (*d)[2], const uint32_t batch_idx, const uint32_t qo_packed_idx_base,
+    const uint32_t warp_idx, const uint32_t lane_idx, uint32_t kv_head_idx,
+    const uint_fastdiv group_size) {
+  uint32_t q[KTraits::NUM_MMA_Q][2], r[KTraits::NUM_MMA_Q][2];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
+                        r[mma_q][j]);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t qo_idx = q[mma_q][(reg_id % 4) / 2];
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
+        o_frag[mma_q][mma_d][reg_id] = variant.OutputTransform(
+            params, o_frag[mma_q][mma_d][reg_id], batch_idx, qo_idx, qo_head_idx,
+            m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2]);
       }
     }
   }
@@ -1530,8 +1532,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/0,
+                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      group_size);
 
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -1966,10 +1970,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
-
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      group_size);
 
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -2358,10 +2364,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
-
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      group_size);
 
     // write_back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
