@@ -20,7 +20,10 @@ def cudnn_batch_prefill_with_kv_cache(
     block_tables: Optional[torch.Tensor] = None,
     causal: bool,
     return_lse: bool,
-    batch_offsets: Optional[torch.Tensor] = None,
+    batch_offsets_q: Optional[torch.Tensor] = None,
+    batch_offsets_o: Optional[torch.Tensor] = None,
+    batch_offsets_k: Optional[torch.Tensor] = None,
+    batch_offsets_v: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     is_cuda_graph_compatible: bool = False,
@@ -43,7 +46,10 @@ def cudnn_batch_prefill_with_kv_cache(
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
         is_cuda_graph_compatible: Whether the prefill operation is compatible with CUDA graph
-        batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
+        batch_offsets_q: Optional batch offsets for query tensor of shape (batch_size,) on GPU
+        batch_offsets_o: Optional batch offsets for output tensor of shape (batch_size,) on GPU
+        batch_offsets_k: Optional batch offsets for key tensor of shape (batch_size,) on GPU
+        batch_offsets_v: Optional batch offsets for value tensor of shape (batch_size,) on GPU
 
     Returns:
         Output tensor of shape (batch_size * seq_len_q, num_heads_qo, head_dim)
@@ -118,7 +124,10 @@ def cudnn_batch_prefill_with_kv_cache(
         return_lse,
         out,
         lse,
-        batch_offsets,
+        batch_offsets_q,
+        batch_offsets_o,
+        batch_offsets_k,
+        batch_offsets_v,
         is_cuda_graph_compatible,
     )
 

@@ -353,7 +353,8 @@ typedef struct AttentionDescriptor {
   // s_q - max sequence length of q
   // s_kv - max sequence length of kv
   // d - hidden dim (head dim)
-  uint32_t b, q_h, k_h, v_h, s_q, s_kv, d, q_heads_per_kv;
+  // is_kv_ragged - whether kv is ragged
+  uint32_t b, q_h, k_h, v_h, s_q, s_kv, d, q_heads_per_kv, is_kv_ragged;
 } AttentionDescriptor_t;
 
 typedef struct FastDivisor {
