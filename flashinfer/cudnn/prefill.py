@@ -29,8 +29,8 @@ def cudnn_batch_prefill_with_kv_cache(
 
     Args:
         q: Query tensor of shape (Total number of tokens, num_heads_qo, head_dim)
-        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (batch_size, num_heads_kv, s_kv, d_qk)
-        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (batch_size, num_heads_kv, s_kv, d_vo)
+        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (Total sequence length of kv, num_heads_kv, d_qk)
+        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (Total sequence length of kv, num_heads_kv, d_vo)
         scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
         workspace_buffer: Workspace buffer for cuDNN operations. Scales with batch size. 128 MB should be sufficient for most cases
         max_token_per_sequence: Maximum number of tokens per query sequence (s_qo_max)
@@ -61,6 +61,11 @@ def cudnn_batch_prefill_with_kv_cache(
     h_qo = q.shape[1]
     num_sequences = actual_seq_lens_q.shape[0]
 
+    if v_cache.dim() == 3:
+        d_vo = v_cache.shape[2]
+    else:
+        d_vo = v_cache.shape[3]
+
     assert causal, "Currently only supports causal attention"
     assert return_lse, "Currently only supports return_lse = True"
 
@@ -86,7 +91,7 @@ def cudnn_batch_prefill_with_kv_cache(
             )
 
     if out is None:
-        out_shape = (q.size(0), h_qo, v_cache.size(3))
+        out_shape = (q.shape[0], h_qo, d_vo)
         out = torch.empty(out_shape, device=q.device, dtype=q.dtype)
 
     if actual_seq_lens_q.is_cuda == False:
