@@ -217,7 +217,9 @@ def test_cudnn_prefill_deepseek(
     actual_seq_lens_q = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
-    actual_seq_lens_kv = torch.full((batch_size,), s_kv, type=torch.int32)
+    actual_seq_lens_kv = torch.randint(
+        s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+    )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     q = torch.randn(
