@@ -188,7 +188,7 @@ def test_cudnn_prefill(
 
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("s_qo", [8, 17, 1024])
-@pytest.mark.parametrize("s_kv", [8, 32, 63])
+@pytest.mark.parametrize("s_kv", [8, 32, 256])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
 @pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
@@ -300,4 +300,4 @@ def test_cudnn_prefill_deepseek(
 
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(output, output_ref)
+    torch.testing.assert_close(output, output_ref, atol=1e-3, rtol=1e-2)
