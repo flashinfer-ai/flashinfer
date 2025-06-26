@@ -70,14 +70,14 @@ enum KernelType { PREFILL, PREFILL_DEEPSEEK, DECODE };
 
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin("fmha/cudnn/cudnn_sm100_fprop_sdpa_prefill_d128_bf16",
-                                "8617d182601becc8add280e38cc153cb699a658fb372793ca2af7ec316b69d67");
+                                "ff14e8dcfc04d9b3a912dd44056be37d9aa8a85976e0070494ca0cce0524f2a1");
 
   cubin_map[DECODE] = getCubin("fmha/cudnn/cudnn_sm100_fprop_sdpa_decode_d128_bf16",
-                               "f2a13f464330120e2eeaf6942ba16da804140ade1e83df6b52721d6b661948d2");
+                               "e7ce0408b4c3a36c42616498228534ee64cab785ef570af5741deaf9dd1b475c");
 
   cubin_map[PREFILL_DEEPSEEK] =
       getCubin("fmha/cudnn/cudnn_sm100_fprop_sdpa_prefill_d192_bf16",
-               "87c2c395572e643579b3afb22af7ed1ac1ea0a12af9f0d580be86d09c3e73fc5");
+               "2190967b8733e193cdcecc054eeb7c2907080a158a33fe7ba2004523a4aff6f9");
 }
 
 auto get_cudnn_cubin(KernelType kernel_type) -> std::string {
