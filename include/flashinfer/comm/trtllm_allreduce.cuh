@@ -74,6 +74,7 @@ enum class AllReduceFusionOp : int8_t {
   RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
   RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
   MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+  MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 9,
 };
 
 template <typename T>
@@ -183,6 +184,12 @@ template <>
 struct neg_zero<nv_bfloat16> {
   static constexpr unsigned short neg_zero_bits = 0x8000U;
   static constexpr __nv_bfloat16 value = __nv_bfloat16_raw{neg_zero_bits};
+};
+
+template <>
+struct neg_zero<float> {
+  static constexpr unsigned int neg_zero_bits = 0x80000000U;
+  static constexpr float value = -0.0f;
 };
 
 template <typename T>

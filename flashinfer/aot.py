@@ -10,7 +10,7 @@ from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
-from .comm import gen_comm_module
+from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
 from .fused_moe import gen_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
@@ -31,6 +31,7 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
+from .tllm_utils import get_trtllm_utils_spec
 from .utils import version_at_least
 
 
@@ -327,7 +328,8 @@ def gen_all_modules(
 
     jit_specs += [
         gen_cascade_module(),
-        gen_comm_module(),
+        gen_vllm_comm_module(),
+        gen_trtllm_comm_module(),
         gen_norm_module(),
         gen_page_module(),
         gen_quantization_module(),
@@ -536,38 +538,7 @@ def main():
         )
     ]
     if has_sm90:
-        jit_specs.append(
-            gen_jit_spec(
-                "trtllm_utils",
-                [
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "delayStream.cu",
-                ],
-                extra_include_paths=[
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "cutlass_extensions"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels",
-                ],
-            ),
-        )
+        jit_specs.append(get_trtllm_utils_spec())
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,

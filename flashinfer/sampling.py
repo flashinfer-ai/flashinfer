@@ -23,7 +23,12 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec
-from .utils import register_custom_op, register_fake_op
+from .utils import (
+    _get_cache_buf,
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 def gen_sampling_module() -> JitSpec:
@@ -40,6 +45,39 @@ def gen_sampling_module() -> JitSpec:
 @functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
+
+    @register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
+    def softmax(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        logits = logits.float()
+        probs = torch.empty_like(logits, device=logits.device)
+        maybe_temperature_arr = (
+            maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+        )
+        module.softmax.default(
+            workspace_buffer,
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
+        return probs
+
+    @register_fake_op("flashinfer::softmax")
+    def _fake_softmax(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
     # torch library for sampling_from_logits
     @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
@@ -407,6 +445,7 @@ def get_sampling_module():
 
     # Register the module
     return SimpleNamespace(
+        softmax=softmax,
         sampling_from_probs=sampling_from_probs,
         sampling_from_logits=sampling_from_logits,
         top_p_sampling_from_probs=top_p_sampling_from_probs,
@@ -425,6 +464,63 @@ def _to_tensor_scalar_tuple(x):
         return (x, 0)
     else:
         return (None, x)
+
+
+def softmax(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
+
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Input tensor of logits.
+    temperature: Optional[Union[torch.Tensor, float]]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
+        If a scalar, the same temperature is used for all requests.
+        If a tensor, each request has its own temperature.
+    enable_pdl : Optional[bool]
+        Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
+        If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
+    Returns
+    -------
+    probs : torch.Tensor
+        Tensor of the same shape as input containing the softmax probabilities.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> logits = torch.rand(batch_size, vocab_size).to(0)
+    >>> logits
+    tensor([[0.8823, 0.9150, 0.3829, 0.9593, 0.3904],
+            [0.6009, 0.2566, 0.7936, 0.9408, 0.1332],
+            [0.9346, 0.5936, 0.8694, 0.5677, 0.7411],
+            [0.4294, 0.8854, 0.5739, 0.2666, 0.6274]], device='cuda:0')
+    >>> probs = flashinfer.sampling.softmax(logits, temperature=1.0)
+    >>> probs
+    tensor([[0.2309, 0.2385, 0.1401, 0.2493, 0.1412],
+            [0.2019, 0.1431, 0.2448, 0.2837, 0.1265],
+            [0.2401, 0.1707, 0.2249, 0.1664, 0.1979],
+            [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
+    """
+    workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
+    if temperature is None:
+        temperature = 1.0
+
+    # Auto-detect PDL support if not specified
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(logits.device)
+
+    return get_sampling_module().softmax(
+        workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature), enable_pdl
+    )
 
 
 def sampling_from_logits(
