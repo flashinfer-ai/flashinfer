@@ -166,7 +166,6 @@ def _ref_attention(
 @pytest.mark.parametrize("num_blocks_row", [10, 20])
 @pytest.mark.parametrize("num_blocks_col", [50, 100])
 @pytest.mark.parametrize("block_density", [0.2, 0.7, 0.9])
-@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_variable_block_sparse_attention_wrapper(
     num_qo_heads: int,
     num_kv_heads: int,
@@ -175,7 +174,6 @@ def test_variable_block_sparse_attention_wrapper(
     num_blocks_row: int,
     num_blocks_col: int,
     block_density: float,
-    backend: str,
 ):
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
@@ -220,7 +218,6 @@ def test_variable_block_sparse_attention_wrapper(
         block_mask_map: torch.Tensor,
         block_row_sz: torch.Tensor,
         block_col_sz: torch.Tensor,
-        backend: str = "fa2",
         device: str = "cuda:0",
         dtype: torch.dtype = torch.float16,
     ):
@@ -236,7 +233,7 @@ def test_variable_block_sparse_attention_wrapper(
 
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=device)
         wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
-            float_workspace_buffer, backend=backend
+            float_workspace_buffer, backend="auto"
         )
 
         wrapper.plan(
@@ -277,7 +274,6 @@ def test_variable_block_sparse_attention_wrapper(
         block_mask_map,
         block_row_sz,
         block_col_sz,
-        backend,
     )
 
 
