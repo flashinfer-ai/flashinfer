@@ -104,12 +104,28 @@ def init_git(submodule = false) {
 
 def run_unittest_CPU_AOT_COMPILE(node_type) {
   echo "Running CPU AOT Compile Unittest"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-aot')) {
-      init_git(true)
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+
+  if (node_type.contains('SPOT')) {
+    // For SPOT: timeout only node allocation to prevent hanging
+    timeout(time: 10, unit: 'MINUTES') {
+      node(node_type) {
+        // Node successfully allocated, now run tests without time limit
+        ws(per_exec_ws('flashinfer-aot')) {
+          init_git(true)
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+        }
+      }
+    }
+  } else {
+    node(node_type) {
+      ws(per_exec_ws('flashinfer-aot')) {
+        init_git(true)
+        sh(script: "ls -alh", label: 'Show work directory')
+        sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+        sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+      }
     }
   }
 }
@@ -134,17 +150,21 @@ stage('Unittest') {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT')
       } catch (Throwable ex) {
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
-        } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
-          throw ex
-        }
+          def isLast = is_last_build()
+          echo "Exception during SPOT run: ${ex.toString()}"
+          echo "Current build: ${env.BUILD_NUMBER}, is_last_build(): ${isLast}"
+
+          if (isLast) {
+            // retry if we are currently at last build
+            // mark the current stage as success
+            // and try again via on demand node
+            echo 'Retrying with CPU-LARGE because this is the last build'
+            currentBuild.result = 'SUCCESS'
+            run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
+          } else {
+            echo 'Not retrying because this is not the last build'
+            throw ex
+          }
       }
     },
     'JIT-Unittest-1': {
