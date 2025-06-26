@@ -348,7 +348,7 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
         logits, k, p, filter_apply_order="top_k_first", generator=generator_logits
     )
     samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        torch.softmax(logits, dim=-1),
+        flashinfer.sampling.softmax(logits),
         k,
         p,
         filter_apply_order="top_k_first",
@@ -377,7 +377,7 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     )
 
     samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        torch.softmax(logits, dim=-1),
+        flashinfer.sampling.softmax(logits),
         k,
         p,
         filter_apply_order="joint",
