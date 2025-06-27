@@ -38,7 +38,7 @@ template <typename KTraits_P, typename KTraits_D, bool PartitionKV_P, typename P
           typename DecodeParams>
 __global__ __launch_bounds__(std::max(
     KTraits_P::NUM_THREADS,
-    KTraits_D::NUM_THREADS)) void PODWithKVCacheTensorKernel(const uint32_t xsize,
+    KTraits_D::NUM_THREADS)) void PODWithKVCacheTensorKernel(const uint32_t num_qo_tiles,
                                                              const __grid_constant__ PrefillParams
                                                                  prefill_params,
                                                              const __grid_constant__ DecodeParams
@@ -55,7 +55,7 @@ __global__ __launch_bounds__(std::max(
   const uint32_t num_kv_heads_d = decode_params.paged_kv.num_heads;
 
   // THREADBLOCKS
-  const uint32_t prefill_blocks = num_kv_heads_p * xsize * (PartitionKV_P ? num_chunks : 1);
+  const uint32_t prefill_blocks = num_kv_heads_p * num_qo_tiles * (PartitionKV_P ? num_chunks : 1);
   const uint32_t decode_blocks = padded_bsize * num_kv_heads_d;
 
   int op;
@@ -134,17 +134,17 @@ __global__ __launch_bounds__(std::max(
     //  BlockID exceeds limit
     if (linear_bid >= prefill_blocks) return;
 
-    const uint32_t bx = linear_bid % xsize;
+    const uint32_t bx = linear_bid % num_qo_tiles;
     auto& smem_storage = reinterpret_cast<typename KTraits_P::SharedStorage&>(smem);
     // Not partition_kv
     if constexpr (!PartitionKV_P) {
       const uint32_t chunk_idx = 0;
-      const uint32_t kv_head_idx = linear_bid / xsize;
+      const uint32_t kv_head_idx = linear_bid / num_qo_tiles;
       SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, chunk_idx,
                                                 kv_head_idx, 1, num_kv_heads_p);
     } else {
-      const uint32_t chunk_idx = (linear_bid / xsize) % num_chunks;
-      const uint32_t kv_head_idx = linear_bid / (xsize * num_chunks);
+      const uint32_t chunk_idx = (linear_bid / num_qo_tiles) % num_chunks;
+      const uint32_t kv_head_idx = linear_bid / (num_qo_tiles * num_chunks);
       SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, chunk_idx,
                                                 kv_head_idx, num_chunks, num_kv_heads_p);
     }
@@ -375,8 +375,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               decode_params.o = tmp_v;
               decode_params.lse = tmp_s;
             }
-            uint32_t xsize = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
-            int nblks_p(xsize * (prefill_params.partition_kv ? prefill_params.partition_kv : 1) *
+            uint32_t num_qo_tiles = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
+            int nblks_p(num_qo_tiles *
+                        (prefill_params.partition_kv ? prefill_params.partition_kv : 1) *
                         num_kv_heads);
             int nthrs_p(32 * NUM_WARPS_Q_P * NUM_WARPS_KV_P);
 
@@ -399,7 +400,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
 
             // Setup kernel arguments
-            void* args[] = {(void*)&xsize, (void*)&prefill_params, (void*)&decode_params,
+            void* args[] = {(void*)&num_qo_tiles, (void*)&prefill_params, (void*)&decode_params,
                             (void*)&tbAssign};
             FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -416,7 +417,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               config.blockDim = nthrs;
               config.dynamicSmemBytes = smem_size;
               config.stream = stream;
-              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, xsize, prefill_params,
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, num_qo_tiles, prefill_params,
                                                       decode_params, tbAssign));
             } else {
               FLASHINFER_CUDA_CALL(
