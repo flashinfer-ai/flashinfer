@@ -276,8 +276,10 @@ __global__ static void __launch_bounds__(128)
     std::array<uint64_t, DIMS_QKV - 1> packed_tensor_stride_o = {h_qo * d_vo * BYTES_PER_ELEMENT,
                                                                  d_vo * BYTES_PER_ELEMENT, 0};
 
-    uint16_t* per_batch_q_ptr = reinterpret_cast<uint16_t*>(q_ptr + batch_offset_q);
-    uint16_t* per_batch_out_ptr = reinterpret_cast<uint16_t*>(o_ptr + batch_offset_o);
+    uint16_t* per_batch_q_ptr =
+        reinterpret_cast<uint16_t*>(reinterpret_cast<std::byte*>(q_ptr) + batch_offset_q);
+    uint16_t* per_batch_out_ptr =
+        reinterpret_cast<uint16_t*>(reinterpret_cast<std::byte*>(o_ptr) + batch_offset_o);
 
     tma::cudaTmaDesc desc_q;
     tma::cudaTmaDesc desc_o;

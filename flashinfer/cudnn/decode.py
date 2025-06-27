@@ -19,7 +19,10 @@ def cudnn_batch_decode_with_kv_cache(
     actual_seq_lens_kv: torch.Tensor,
     block_tables: torch.Tensor,
     is_cuda_graph_compatible: bool = False,
-    batch_offsets: Optional[torch.Tensor] = None,
+    batch_offsets_q: Optional[torch.Tensor] = None,
+    batch_offsets_o: Optional[torch.Tensor] = None,
+    batch_offsets_k: Optional[torch.Tensor] = None,
+    batch_offsets_v: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Performs batched decode attention with paged KV cache using cuDNN.
@@ -39,6 +42,10 @@ def cudnn_batch_decode_with_kv_cache(
         batch_offsets: Optional batch offsets tensor of shape (batch_size,) on GPU
         out: Optional pre-allocated output tensor
         lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
+        batch_offsets_q: Optional batch offsets for query tensor of shape (batch_size,) on GPU
+        batch_offsets_o: Optional batch offsets for output tensor of shape (batch_size,) on GPU
+        batch_offsets_k: Optional batch offsets for key tensor of shape (batch_size,) on GPU
+        batch_offsets_v: Optional batch offsets for value tensor of shape (batch_size,) on GPU
 
     Returns:
         Output tensor of shape (batch_size, num_heads_qo, head_dim)
@@ -70,7 +77,7 @@ def cudnn_batch_decode_with_kv_cache(
         actual_seq_lens_kv_gpu,
         block_tables,
         out,
-        batch_offsets,
+        batch_offsets_q,
         is_cuda_graph_compatible,
     )
 
