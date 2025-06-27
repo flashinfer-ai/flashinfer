@@ -431,6 +431,21 @@ class TllmGenFmhaKernel {
         info);
   }
 
+  std::string getCubinsBasePath() const{
+    std::string cache_dir = std::getenv("FLASHINFER_CACHE_DIR");
+    std::string base_path = "";
+    if(cache_dir != ""){
+      if (cache_dir[cache_dir.length() - 1] != '/') {
+        cache_dir = cache_dir + "/";
+      }
+      base_path = cache_dir;
+    }
+    else base_path = "d7dd4ecf842cc03f11c83e8f08d6d437fefda9d1/fmha/trtllm-gen/";
+    IKL_LOG_DEBUG("[Debug] Loading cubins from: %s\n", base_path.c_str());
+    return base_path;
+  }
+
+
   // Load a single kernel (called by `run()` when needed).
   void loadKernel(uint64_t hashId, unsigned int metaIndex) const {
     auto const& kernelMeta = mKernelMeta[metaIndex];
@@ -447,9 +462,8 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path =
-          std::string("d7dd4ecf842cc03f11c83e8f08d6d437fefda9d1/fmha/trtllm-gen/") +
-          kernelMeta.mFuncName;
+      std::string cubin_path = getCubinsBasePath() + kernelMeta.mFuncName;
+      IKL_LOG_DEBUG("[Debug] cubin_path: %s\n", cubin_path.c_str());
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
