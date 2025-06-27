@@ -385,29 +385,46 @@ static void create_packed_tma_desc_qo_prefill(int b, int32_t* actual_seq_lens_q_
   }
 }
 
-void setup_prefill(CUfunction* hfunc, int64_t d_qk, int64_t d_vo) {
+void setup_prefill(CUfunction* hfunc, CUfunction* hfunc_deepseek) {
   // Use cu++filt to get the kernel name
-  std::string kernel_name =
-      d_qk == 192
-          ? "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
-            "128x128x192ILb1ELb0EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
-            "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE"
-          : "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
-            "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
-            "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
+  std::string kernel_name_deepseek =
 
-  std::string cubin = get_cudnn_cubin(d_qk == 192 ? PREFILL_DEEPSEEK : PREFILL);
+      "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
+      "128x128x192ILb1ELb0EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
+      "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
+
+  std::string kernel_name =
+      "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
+      "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
+      "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
+
+  std::string cubin = get_cudnn_cubin(PREFILL);
+  std::string cubin_deepseek = get_cudnn_cubin(PREFILL_DEEPSEEK);
+
   if (cubin.empty()) {
     throw std::runtime_error("Failed to load cubin for prefill");
   }
+  if (cubin_deepseek.empty()) {
+    throw std::runtime_error("Failed to load cubin for prefill_deepseek");
+  }
 
   CUmodule hmod{0};
+  CUmodule hmod_deepseek{0};
+  if (cuModuleLoadData(&hmod_deepseek, cubin_deepseek.data()) != CUDA_SUCCESS) {
+    throw std::runtime_error("Failed to cuModuleLoadData for prefill_deepseek");
+  }
+
   if (cuModuleLoadData(&hmod, cubin.data()) != CUDA_SUCCESS) {
     throw std::runtime_error("Failed to cuModuleLoadData for prefill");
   }
 
   if (cuModuleGetFunction(hfunc, hmod, kernel_name.c_str()) != CUDA_SUCCESS) {
     throw std::runtime_error("Failed to cuModuleGetFunction for prefill");
+  }
+
+  if (cuModuleGetFunction(hfunc_deepseek, hmod_deepseek, kernel_name_deepseek.c_str()) !=
+      CUDA_SUCCESS) {
+    throw std::runtime_error("Failed to cuModuleGetFunction for prefill_deepseek");
   }
 };
 
@@ -490,13 +507,14 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   // Step 1: Setup the kernel pointer
 
   static CUfunction hfunc{nullptr};
+  static CUfunction hfunc_deepseek{nullptr};
 
   int64_t d_qk = q.size(2);
 
   int64_t d_vo = v_cache.dim() == 3 ? v_cache.size(2) : v_cache.size(3);
 
-  if (hfunc == nullptr) {
-    setup_prefill(&hfunc, d_qk, d_vo);
+  if (hfunc == nullptr || hfunc_deepseek == nullptr) {
+    setup_prefill(&hfunc, &hfunc_deepseek);
 
     if (hfunc != nullptr) {
       cuErrCheck(
@@ -504,6 +522,14 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
       cuErrCheck(
           cuFuncSetAttribute(hfunc, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
       cuErrCheck(cuFuncSetAttribute(hfunc, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
+    }
+    if (hfunc_deepseek != nullptr) {
+      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                    SMEM_SIZE));
+      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek,
+                                    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
+      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek,
+                                    CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
     }
   }
 
@@ -710,7 +736,13 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   args[12] = &num_pages_per_seq32;
   args[13] = &page_size_div;
 
-  auto err_launch = cuLaunchKernelEx(&config, hfunc, (void**)args, nullptr);
+  auto err_launch = CUDA_SUCCESS;
+  if (d_qk == 192) {
+    err_launch = cuLaunchKernelEx(&config, hfunc_deepseek, (void**)args, nullptr);
+  } else {
+    err_launch = cuLaunchKernelEx(&config, hfunc, (void**)args, nullptr);
+  }
+
   if (err_launch != CUDA_SUCCESS) {
     const char* errstr = NULL;
     cuGetErrorString(err_launch, &errstr);

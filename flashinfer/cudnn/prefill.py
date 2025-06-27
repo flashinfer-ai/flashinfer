@@ -100,10 +100,6 @@ def cudnn_batch_prefill_with_kv_cache(
         out_shape = (q.shape[0], h_qo, d_vo)
         out = torch.empty(out_shape, device=q.device, dtype=q.dtype)
 
-    if is_cuda_graph_compatible is True:
-        assert actual_seq_lens_q.is_cuda == True
-        assert actual_seq_lens_kv.is_cuda == True
-
     if actual_seq_lens_q.is_cuda == False:
         actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
     if actual_seq_lens_kv.is_cuda == False:
