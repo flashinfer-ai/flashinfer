@@ -55,6 +55,12 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
 
   uint32_t num_k_heads = num_kv_heads;
   uint32_t num_v_heads = num_k_heads;
+  if (num_heads % num_k_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_heads must be a multiple of num_k_heads, got num_k_heads: " << num_k_heads
+            << "and num_heads: " << num_heads;
+    FLASHINFER_ERROR(err_msg.str());
+  }
   auto batch_size = num_seqs;
 
   int const beam_width = num_seqs / batch_size;  // always 1
@@ -91,8 +97,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   // num_kv_heads should be enough, but num_heads for safty at long seq len.
   size_t num_semaphores = batch_size * num_heads;
 
-  runner_params.multiCtasKvScratchPtr =
-      reinterpret_cast<void*>(workspace_buffer.data_ptr() + num_semaphores * sizeof(uint32_t));
+  runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
+      static_cast<char*>(workspace_buffer.data_ptr()) + num_semaphores * sizeof(uint32_t));
   runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer.data_ptr());
 
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
@@ -127,12 +133,22 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mHeadDimV = head_size;
   runner_params.mNumHeadsQ = num_heads;
   runner_params.mNumHeadsKv = num_k_heads;
-  runner_params.mNumHeadsQPerKv = 8;
+  runner_params.mNumHeadsQPerKv = num_heads / num_k_heads;
   runner_params.mBatchSize = batch_size;
   runner_params.mMaxSeqLenQ = 1;
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_size * runner_params.mMaxSeqLenQ);
   runner_params.mScaleQ = 1.0;
+  // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking
+  // if the kernel is supported.
+  runner_params.mChunkedAttentionSize = INT_MAX;
+  runner_params.mAttentionWindowSize = INT_MAX;
+  auto [foundKernels, kinfo] = fmha_runner.isSupportedWithInfo(runner_params);
+  if (!foundKernels) {
+    std::ostringstream err_msg;
+    err_msg << "Missing TRTLLM-GEN decode kernel:" << kinfo;
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
@@ -159,7 +175,7 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
     if (SRC_DTYPE == at::ScalarType::Half) {                                   \
       FN(half, Data_type::DATA_TYPE_FP16);                                     \
     } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                        \
-      FN(__nv_bfloat16, Data_type::DATA_TYPE_FP16);                            \
+      FN(__nv_bfloat16, Data_type::DATA_TYPE_BF16);                            \
     } else {                                                                   \
       TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
     }                                                                          \
