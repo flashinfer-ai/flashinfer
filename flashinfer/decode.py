@@ -21,7 +21,9 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .cudnn import cudnn_batch_decode_with_kv_cache
 from .jit import (
+    cudnn_fmha_gen_module,
     gen_batch_decode_mla_module,
     gen_batch_decode_module,
     gen_customize_batch_decode_module,

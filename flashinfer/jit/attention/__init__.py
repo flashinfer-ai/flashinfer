@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from . import pytorch, tvm
+from .pytorch import cudnn_fmha_gen_module as cudnn_fmha_gen_module
 from .pytorch import gen_batch_attention_module as gen_batch_attention_module
 from .pytorch import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .pytorch import gen_batch_decode_module as gen_batch_decode_module

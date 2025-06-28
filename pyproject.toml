@@ -50,6 +50,7 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
+    "flashinfer.cudnn"
 ]
 include-package-data = false
 
@@ -58,6 +59,8 @@ include-package-data = false
 "flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
+"flashinfer.cudnn" = "flashinfer/cudnn"
+
 [tool.setuptools.package-data]
 "flashinfer.data" = [
     "csrc/**",
@@ -74,6 +77,11 @@ include-package-data = false
 ]
 "flashinfer.data.spdlog" = [
     "include/**",
+]
+
+"flashinfer.cudnn" = [
+    "*.py",
+    "*.pyi"
 ]
 
 [tool.mypy]

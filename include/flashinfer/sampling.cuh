@@ -23,6 +23,8 @@
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+#include <cuda/functional>
+#include <cuda/std/functional>
 #include <cuda/std/limits>
 #include <limits>
 #include <numeric>

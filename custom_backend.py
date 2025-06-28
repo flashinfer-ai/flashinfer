@@ -37,6 +37,7 @@ def _create_data_dir():
     ln("csrc", "csrc")
     ln("include", "include")
     ln("tvm_binding", "tvm_binding")
+    ln("cudnn", "cudnn")
 
 
 def _prepare_for_wheel():

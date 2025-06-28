@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import functools
 import os
 
 # Re-export
@@ -22,6 +23,7 @@ from . import cubin_loader
 from . import env as env
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
+from .attention import cudnn_fmha_gen_module as cudnn_fmha_gen_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
@@ -67,6 +69,15 @@ from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .cubin_loader import setup_cubin_loader
+
+
+@functools.cache
+def get_cudnn_fmha_gen_module():
+    mod = cudnn_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
