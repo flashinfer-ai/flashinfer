@@ -66,7 +66,7 @@ def attention_varlen_ref(
 ) -> torch.Tensor:
     batch_size = qo_indptr.shape[0] - 1
     nnz_qo = qo_indptr[-1].item()
-    o = torch.empty(nnz_qo, *q.shape[1:], device=q.device, dtype=q.dtype)
+    o = torch.empty(nnz_qo, *q.shape[1:-1], v.shape[-1], device=q.device, dtype=q.dtype)
     lse = torch.empty(nnz_qo, q.shape[1], device=q.device, dtype=torch.float32)
 
     for i in range(batch_size):
@@ -188,14 +188,23 @@ def test_blackwell_cutlass_varlen(
     torch.manual_seed(42)
     qkv = torch.randn(
         indptr[-1],
-        (num_qo_heads + 2 * num_kv_heads),
-        head_dim_qk,
+        (
+            num_qo_heads * head_dim_qk
+            + num_kv_heads * head_dim_qk
+            + num_kv_heads * head_dim_vo
+        ),
         dtype=dtype,
         device="cuda",
     )
-    q = qkv[:, :num_qo_heads]
-    k = qkv[:, num_qo_heads : num_qo_heads + num_kv_heads]
-    v = qkv[:, num_qo_heads + num_kv_heads :]
+    q = qkv[:, : num_qo_heads * head_dim_qk].view(indptr[-1], num_qo_heads, head_dim_qk)
+    k = qkv[
+        :,
+        num_qo_heads * head_dim_qk : num_qo_heads * head_dim_qk
+        + num_kv_heads * head_dim_qk,
+    ].view(indptr[-1], num_kv_heads, head_dim_qk)
+    v = qkv[:, num_qo_heads * head_dim_qk + num_kv_heads * head_dim_qk :].view(
+        indptr[-1], num_kv_heads, head_dim_vo
+    )
     qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
     kv_indptr = qo_indptr
 
