@@ -236,17 +236,20 @@ def split_device_green_ctx_by_sm_count(
     resource = get_device_resource(cu_dev)
 
     # Round sm counts to meet the alignment and granularity requirements
-    for i in range(len(sm_counts)):
+    rounded_sm_counts = []
+    for sm_count in sm_counts:
         min_sm_count, sm_alignment = get_sm_count_constraint(CUDA_CAPABILITY)
-        if sm_counts[i] <= 0:
-            raise ValueError(f"SM count must be positive, got {sm_counts[i]}")
-        sm_counts[i] = max(
-            min_sm_count,
-            (sm_counts[i] + sm_alignment - 1) // sm_alignment * sm_alignment,
+        if sm_count <= 0:
+            raise ValueError(f"SM count must be positive, got {sm_count}")
+        rounded_sm_counts.append(
+            max(
+                min_sm_count,
+                (sm_count + sm_alignment - 1) // sm_alignment * sm_alignment,
+            )
         )
 
     # Split the device into multiple green contexts
-    results, remaining = split_resource_by_sm_count(cu_dev, resource, sm_counts)
+    results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
     resources = results + [remaining]
     streams = create_green_ctx_streams(cu_dev, resources)
     return streams, resources
