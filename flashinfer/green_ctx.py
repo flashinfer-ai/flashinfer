@@ -23,7 +23,6 @@ from cuda.bindings.driver import CUdevice, CUdevResource
 
 from .cuda_utils import checkCudaErrors
 
-
 is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
@@ -229,7 +228,7 @@ def split_device_green_ctx_by_sm_count(
         - Requested 10 SMs → Allocated 16 SMs (rounded up to multiple of 8)
         - Requested 16 SMs → Allocated 16 SMs (no rounding needed)
         - Requested 17 SMs → Allocated 24 SMs (rounded up to multiple of 8)
-        
+
         See `CUDA Green Contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_
         for more details.
     """
@@ -242,7 +241,8 @@ def split_device_green_ctx_by_sm_count(
         if sm_counts[i] <= 0:
             raise ValueError(f"SM count must be positive, got {sm_counts[i]}")
         sm_counts[i] = max(
-            min_sm_count, (sm_counts[i] + sm_alignment - 1) // sm_alignment * sm_alignment
+            min_sm_count,
+            (sm_counts[i] + sm_alignment - 1) // sm_alignment * sm_alignment,
         )
 
     # Split the device into multiple green contexts
