@@ -24,6 +24,24 @@ from cuda.bindings.driver import CUdevice, CUdevResource
 from .cuda_utils import checkCudaErrors
 
 
+is_cuda_available = torch.cuda.is_available()
+if is_cuda_available:
+    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+
+
+def get_sm_count_constraint(capability: Tuple[int, int]) -> Tuple[int, int]:
+    if capability[0] == 6:
+        return (1, 1)
+    elif capability[0] == 7:
+        return (2, 2)
+    elif capability[0] == 8:
+        return (4, 2)
+    elif capability[0] >= 9:
+        return (8, 8)
+    else:
+        raise ValueError(f"Unsupported CUDA capability: {capability}")
+
+
 def get_cudevice(dev: torch.device) -> CUdevice:
     try:
         cu_dev = checkCudaErrors(driver.cuDeviceGet(dev.index))
@@ -55,6 +73,29 @@ def split_resource(
         )
     )
     return results, remaining
+
+
+def split_resource_by_sm_count(
+    cu_dev: CUdevice, resource: CUdevResource, sm_counts: List[int]
+) -> Tuple[List[CUdevResource], CUdevResource]:
+    results = []
+    for sm_count in sm_counts:
+        result, remaining = split_resource(resource, 1, sm_count)
+        results.extend(result)
+        # Refresh the remaining resource for the next iteration
+        desc = checkCudaErrors(driver.cuDevResourceGenerateDesc([remaining], 1))
+        green_ctx = checkCudaErrors(
+            driver.cuGreenCtxCreate(
+                desc, cu_dev, driver.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM
+            )
+        )
+        resource = checkCudaErrors(
+            driver.cuGreenCtxGetDevResource(
+                green_ctx, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            )
+        )
+
+    return results, resource
 
 
 def create_green_ctx_streams(
@@ -119,11 +160,93 @@ def split_device_green_ctx(
 
     Raises:
         RuntimeError: when requested SM allocation exceeds device capacity:
-        ``num_groups * round_up(min_count, 8) > num_sm``
+        ``num_groups * rounded_min_count > total_device_sms``
     """
     cu_dev = get_cudevice(dev)
     resource = get_device_resource(cu_dev)
     results, remaining = split_resource(resource, num_groups, min_count)
+    resources = results + [remaining]
+    streams = create_green_ctx_streams(cu_dev, resources)
+    return streams, resources
+
+
+def split_device_green_ctx_by_sm_count(
+    dev: torch.device, sm_counts: List[int]
+) -> Tuple[List[torch.Stream], List[CUdevResource]]:
+    r"""
+    Split the device into multiple green contexts, each with a fixed number of SMs.
+
+    This function allows precise control over SM allocation by specifying exact SM counts
+    for each partition. The SM counts will be automatically adjusted to meet the alignment
+    and granularity requirements of the current compute capability.
+
+    Args:
+        dev: The device to split.
+        sm_counts: List of SM counts for each partition. Each count will be rounded up
+                   to meet the minimum and alignment requirements.
+
+    Returns:
+        streams: The list of torch.Streams objects corresponding to the green contexts.
+        resources: The list of CUdevResource objects corresponding to the green contexts.
+
+    Raises:
+        RuntimeError: If the requested SM allocation exceeds device capacity:
+            - When sum(rounded_sm_counts) > total_device_sms
+            - When CUDA operations fail due to invalid resource types
+            - When the device is not properly initialized
+        ValueError: If sm_counts is empty or contains invalid values (e.g., negative values).
+
+    Example:
+        >>> from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+        >>> import torch
+        >>> dev = torch.device("cuda:0")
+        >>>
+        >>> # Create three partitions with specific SM counts
+        >>> streams, resources = split_device_green_ctx_by_sm_count(dev, [8, 16, 24])
+        >>> print([r.sm.smCount for r in resources])
+        [8, 16, 24, 84]  # Last value is remaining SMs
+        >>>
+        >>> # Execute kernels on different partitions
+        >>> with torch.cuda.stream(streams[0]):
+        ...     x = torch.randn(4096, 4096, device=dev, dtype=torch.bfloat16)
+        ...     y = torch.randn(4096, 4096, device=dev, dtype=torch.bfloat16)
+        ...     z = x @ y
+        ...     print(f"Partition 0 result: {z.shape}")
+        ...
+        >>> with torch.cuda.stream(streams[1]):
+        ...     # Different computation on partition 1
+        ...     a = torch.randn(2048, 2048, device=dev, dtype=torch.bfloat16)
+        ...     b = torch.randn(2048, 2048, device=dev, dtype=torch.bfloat16)
+        ...     c = a @ b
+        ...     print(f"Partition 1 result: {c.shape}")
+
+    Note:
+        The length of the returned streams and resources is ``len(sm_counts) + 1``,
+        where the last one contains the remaining SMs that were not allocated.
+
+        SM count alignment examples for Compute Capability 9.0+:
+        - Requested 7 SMs → Allocated 8 SMs (rounded up to minimum)
+        - Requested 10 SMs → Allocated 16 SMs (rounded up to multiple of 8)
+        - Requested 16 SMs → Allocated 16 SMs (no rounding needed)
+        - Requested 17 SMs → Allocated 24 SMs (rounded up to multiple of 8)
+        
+        See `CUDA Green Contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_
+        for more details.
+    """
+    cu_dev = get_cudevice(dev)
+    resource = get_device_resource(cu_dev)
+
+    # Round sm counts to meet the alignment and granularity requirements
+    for i in range(len(sm_counts)):
+        min_sm_count, sm_alignment = get_sm_count_constraint(CUDA_CAPABILITY)
+        if sm_counts[i] <= 0:
+            raise ValueError(f"SM count must be positive, got {sm_counts[i]}")
+        sm_counts[i] = max(
+            min_sm_count, (sm_counts[i] + sm_alignment - 1) // sm_alignment * sm_alignment
+        )
+
+    # Split the device into multiple green contexts
+    results, remaining = split_resource_by_sm_count(cu_dev, resource, sm_counts)
     resources = results + [remaining]
     streams = create_green_ctx_streams(cu_dev, resources)
     return streams, resources
