@@ -122,7 +122,7 @@ def test_split_device_green_ctx_by_sm_count_alignment(
         assert sm_count > 0
 
         min_sm_count, sm_alignment = green_ctx.get_sm_count_constraint(
-            green_ctx.CUDA_CAPABILITY
+            *green_ctx.get_compute_capability(torch.device(device))
         )
         assert sm_count >= min_sm_count
         assert sm_count % sm_alignment == 0

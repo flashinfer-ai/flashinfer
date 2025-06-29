@@ -22,23 +22,20 @@ import torch
 from cuda.bindings.driver import CUdevice, CUdevResource
 
 from .cuda_utils import checkCudaErrors
-
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+from .utils import get_compute_capability, round_up
 
 
-def get_sm_count_constraint(capability: Tuple[int, int]) -> Tuple[int, int]:
-    if capability[0] == 6:
+def get_sm_count_constraint(major: int, minor: int) -> Tuple[int, int]:
+    if major == 6:
         return (1, 1)
-    elif capability[0] == 7:
+    elif major == 7:
         return (2, 2)
-    elif capability[0] == 8:
+    elif major == 8:
         return (4, 2)
-    elif capability[0] >= 9:
+    elif major >= 9:
         return (8, 8)
     else:
-        raise ValueError(f"Unsupported CUDA capability: {capability}")
+        raise ValueError(f"Unsupported CUDA capability: {major}.{minor}")
 
 
 def get_cudevice(dev: torch.device) -> CUdevice:
@@ -157,6 +154,12 @@ def split_device_green_ctx(
         The length of the returned streams and resources is ``num_groups + 1``,
         where the last one is the remaining SMs.
 
+        The following examples show how the SM count is rounded up to meet the alignment and granularity requirements:
+        - Requested 7 SMs → Allocated 8 SMs (rounded up to minimum)
+        - Requested 10 SMs → Allocated 16 SMs (rounded up to multiple of 8)
+        - Requested 16 SMs → Allocated 16 SMs (no rounding needed)
+        - Requested 17 SMs → Allocated 24 SMs (rounded up to multiple of 8)
+
     Raises:
         RuntimeError: when requested SM allocation exceeds device capacity:
         ``num_groups * rounded_min_count > total_device_sms``
@@ -173,11 +176,9 @@ def split_device_green_ctx_by_sm_count(
     dev: torch.device, sm_counts: List[int]
 ) -> Tuple[List[torch.Stream], List[CUdevResource]]:
     r"""
-    Split the device into multiple green contexts, each with a fixed number of SMs.
-
-    This function allows precise control over SM allocation by specifying exact SM counts
-    for each partition. The SM counts will be automatically adjusted to meet the alignment
-    and granularity requirements of the current compute capability.
+    Split the device into multiple green contexts, each with a fixed number of SMs,
+    return the corresponding streams and `CUdevResource` for each group and the remaining SMs.
+    Green contexts allow concurrent execution of multiple kernels on different SM partitions.
 
     Args:
         dev: The device to split.
@@ -229,6 +230,8 @@ def split_device_green_ctx_by_sm_count(
         - Requested 16 SMs → Allocated 16 SMs (no rounding needed)
         - Requested 17 SMs → Allocated 24 SMs (rounded up to multiple of 8)
 
+        The actual SM count can be obtained from the ``.sm.smCount`` field of the returned resources.
+
         See `CUDA Green Contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_
         for more details.
     """
@@ -238,15 +241,12 @@ def split_device_green_ctx_by_sm_count(
     # Round sm counts to meet the alignment and granularity requirements
     rounded_sm_counts = []
     for sm_count in sm_counts:
-        min_sm_count, sm_alignment = get_sm_count_constraint(CUDA_CAPABILITY)
+        min_sm_count, sm_alignment = get_sm_count_constraint(
+            *get_compute_capability(dev)
+        )
         if sm_count <= 0:
             raise ValueError(f"SM count must be positive, got {sm_count}")
-        rounded_sm_counts.append(
-            max(
-                min_sm_count,
-                (sm_count + sm_alignment - 1) // sm_alignment * sm_alignment,
-            )
-        )
+        rounded_sm_counts.append(round_up(sm_count, sm_alignment, min_sm_count))
 
     # Split the device into multiple green contexts
     results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
