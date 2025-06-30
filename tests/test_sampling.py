@@ -50,9 +50,17 @@ def gumbel_distribution(beta):
 )
 @pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
 @pytest.mark.parametrize("temperature_arr", [True, False])
-def test_softmax(batch_size, vocab_size, distribution, temperature, temperature_arr):
+@pytest.mark.parametrize("neg_inf_input", [True, False])
+def test_softmax(
+    batch_size, vocab_size, distribution, temperature, temperature_arr, neg_inf_input
+):
     torch.manual_seed(42)
     logits = distribution((batch_size, vocab_size), "cuda:0")
+    if neg_inf_input:
+        # assign random logits to -inf
+        num_inf = torch.randint(0, logits.numel() - 1, (), device=logits.device).item()
+        inf_idx = torch.randperm(logits.numel(), device=logits.device)[:num_inf]
+        logits.view(-1).index_fill_(0, inf_idx, float("-inf"))
 
     if temperature_arr:
         temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")
@@ -64,7 +72,7 @@ def test_softmax(batch_size, vocab_size, distribution, temperature, temperature_
 
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
-    assert torch.allclose(probs, probs_ref, atol=1e-3)
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
