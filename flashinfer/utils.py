@@ -472,6 +472,6 @@ def device_support_pdl(device: torch.device) -> bool:
     return major >= 9
 
 
-def round_up(x: int, y: int, min_value: int = 0) -> int:
-    """Round up x to the nearest multiple of y, with a minimum value of min_value."""
-    return (max(min_value, x) + y - 1) // y * y
+def round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y"""
+    return (x + y - 1) // y * y
