@@ -694,7 +694,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-  int num_blocks_per_sm = 3;
+  int num_blocks_per_sm = 2;
   int max_grid_size = num_blocks_per_sm * num_sm;
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
