@@ -325,11 +325,11 @@ def gen_all_modules(
         jit_specs.append(gen_fused_moe_sm100_module())
         jit_specs.append(gen_fp4_quantization_sm100_module())
         jit_specs.append(gen_gemm_sm100_module())
+        jit_specs.append(gen_trtllm_comm_module())
 
     jit_specs += [
         gen_cascade_module(),
         gen_vllm_comm_module(),
-        gen_trtllm_comm_module(),
         gen_norm_module(),
         gen_page_module(),
         gen_quantization_module(),
