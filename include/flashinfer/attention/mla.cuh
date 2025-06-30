@@ -1007,7 +1007,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -1030,7 +1031,8 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
     using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType, AttentionVariant>;
+                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,
+                                 AttentionVariant>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
     void* args[] = {(void*)&params};

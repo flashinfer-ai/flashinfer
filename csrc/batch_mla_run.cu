@@ -63,7 +63,8 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant,
+      Params, [&] {
         Params params;
 
         params.q_nope = static_cast<DTypeQ*>(q_nope.data_ptr());
@@ -117,10 +118,13 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
 
         params.sm_scale = sm_scale;
 
-        params.maybe_custom_mask = maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()): nullptr;
-        params.maybe_mask_indptr = maybe_mask_indptr ? static_cast<int32_t*>(maybe_mask_indptr->data_ptr()): nullptr;
+        params.maybe_custom_mask =
+            maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr;
+        params.maybe_mask_indptr =
+            maybe_mask_indptr ? static_cast<int32_t*>(maybe_mask_indptr->data_ptr()) : nullptr;
 
-        cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant, Params>(
+        cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE,
+                                                         AttentionVariant, Params>(
             params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 
         TORCH_CHECK(status == cudaSuccess,

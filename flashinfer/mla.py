@@ -16,12 +16,13 @@ limitations under the License.
 
 import functools
 from typing import Literal, Optional, Tuple, Union, overload
-from .prefill import _compute_mask_indptr, segment_packbits
+
 import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
+from .prefill import _compute_mask_indptr, segment_packbits
 from .utils import MaskMode, _check_shape_dtype_device, determine_mla_backend
 
 
@@ -300,7 +301,7 @@ class BatchMLAPagedAttentionWrapper:
         #         mask_mode = MaskMode.CAUSAL.value
         #     else:
         #         mask_mode = MaskMode.NON_CAUSAL.value
-        
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,

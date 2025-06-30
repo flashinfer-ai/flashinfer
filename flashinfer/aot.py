@@ -326,6 +326,7 @@ def gen_all_modules(
         jit_specs.append(gen_fp4_quantization_sm100_module())
         jit_specs.append(gen_gemm_sm100_module())
         from .comm import gen_trtllm_comm_module
+
         jit_specs.append(gen_trtllm_comm_module())
 
     jit_specs += [

@@ -142,7 +142,6 @@ def gen_batch_mla_module(
                 mask_mode=mask_mode,
                 head_dim_ckv=head_dim_ckv,
                 head_dim_kpe=head_dim_kpe,
-                
             ),
         )
 
