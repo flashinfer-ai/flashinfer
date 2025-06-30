@@ -163,18 +163,13 @@ if __name__ == "__main__":
     torch.random.manual_seed(42)
 
     # Irregular sequence lengths for prefill and decode
-    # d_q_len_configs = [[1] * 122, [1] * 128, [1] * 242, [1] * 256]
-    # d_kv_len_configs = [[600] * 122, [10000] * 128, [400] * 242, [8192] * 256]
-    # p_q_configs = [[17] * 1, [10000], [17] * 1, []]
-    # p_kv_configs = [[10000] * 1, [10000], [8192] * 1, []]
-
-    p_q_configs = []
-    p_kv_configs = []
-    d_q_len_configs = []
-    d_kv_len_configs = []
+    d_q_len_configs = [[1] * 122, [1] * 128, [1] * 242, [1] * 256]
+    d_kv_len_configs = [[600] * 122, [10000] * 128, [400] * 242, [8192] * 256]
+    p_q_configs = [[17] * 1, [10000], [17] * 1, []]
+    p_kv_configs = [[10000] * 1, [10000], [8192] * 1, []]
 
     # construct random length testcases
-    for _ in range(3):
+    for _ in range(1):
         bsz = 256
         stride = 16
         sparsity = 0.05
