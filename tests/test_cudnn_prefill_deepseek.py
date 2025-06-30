@@ -85,7 +85,6 @@ def test_cudnn_prefill_deepseek(
         return_lse=return_lse,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
-    torch.cuda.synchronize()
 
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -118,7 +117,5 @@ def test_cudnn_prefill_deepseek(
         q_data_type=torch.bfloat16,
     )
     output_ref, lse_ref = wrapper.run_return_lse(q, k_cache, v_cache)
-
-    torch.cuda.synchronize()
 
     torch.testing.assert_close(output, output_ref, atol=1e-3, rtol=1e-2)

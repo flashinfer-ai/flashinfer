@@ -107,7 +107,6 @@ def test_cudnn_prefill(
         return_lse=return_lse,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
-    torch.cuda.synchronize()
 
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -182,5 +181,4 @@ def test_cudnn_prefill(
 
     output_ref = wrapper.run(q, kv_cache)
 
-    torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)
