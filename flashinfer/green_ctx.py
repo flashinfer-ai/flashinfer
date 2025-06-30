@@ -246,7 +246,7 @@ def split_device_green_ctx_by_sm_count(
         )
         if sm_count <= 0:
             raise ValueError(f"SM count must be positive, got {sm_count}")
-        rounded_sm_counts.append(max(round_up(sm_count, sm_alignment), min_sm_count))
+        rounded_sm_counts.append(round_up(max(sm_count, min_sm_count), sm_alignment))
 
     # Split the device into multiple green contexts
     results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
