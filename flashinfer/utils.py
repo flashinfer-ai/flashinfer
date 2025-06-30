@@ -470,3 +470,8 @@ def set_log_level(lvl_str: str) -> None:
 def device_support_pdl(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major >= 9
+
+
+def round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y"""
+    return (x + y - 1) // y * y
