@@ -68,20 +68,23 @@ struct ProfilerEntry {
 
 #ifdef FLASHINFER_ENABLE_PROFILER
 #define PROFILER_CLOSURE_PARAMS_DECL \
+  ProfilerEntry entry;               \
   uint64_t* profiler_write_ptr;      \
   uint32_t profiler_write_stride;    \
   uint32_t profiler_entry_tag_base;  \
   bool profiler_write_thread_predicate;
 
+#define PROFILER_CLOSURE_FUNC_PARAMS , ProfilerClosure& profiler_closure
+
+#define PROFILER_FUNC_PARAMS , at::Tensor profiler_buffer
 #define PROFILER_PARAMS_DECL uint64_t* profiler_buffer;
 
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,                     \
                       write_thread_predicate)                                                   \
-  volatile ProfilerEntry entry;                                                                 \
   if (get_block_idx() == 0 && get_thread_idx() == 0) {                                          \
-    entry.nblocks = get_num_blocks();                                                           \
-    entry.ngroups = num_groups;                                                                 \
-    params.profiler_buffer[0] = entry.raw;                                                      \
+    closure.entry.nblocks = get_num_blocks();                                                   \
+    closure.entry.ngroups = num_groups;                                                         \
+    params.profiler_buffer[0] = closure.entry.raw;                                              \
   }                                                                                             \
   closure.profiler_write_ptr =                                                                  \
       params.profiler_buffer + 1 + get_block_idx() * num_groups + group_idx;                    \
@@ -91,10 +94,10 @@ struct ProfilerEntry {
 
 #define PROFILER_EVENT_START(closure, event)                                                  \
   if (closure.profiler_write_thread_predicate) {                                              \
-    entry.tag =                                                                               \
+    closure.entry.tag =                                                                       \
         closure.profiler_entry_tag_base | ((uint32_t)event << EVENT_IDX_SHIFT) | EVENT_BEGIN; \
-    entry.delta_time = get_timestamp();                                                       \
-    *closure.profiler_write_ptr = entry.raw;                                                  \
+    closure.entry.delta_time = get_timestamp();                                               \
+    *closure.profiler_write_ptr = closure.entry.raw;                                          \
     closure.profiler_write_ptr += closure.profiler_write_stride;                              \
   }                                                                                           \
   __threadfence_block();
@@ -102,26 +105,28 @@ struct ProfilerEntry {
 #define PROFILER_EVENT_END(closure, event)                                                  \
   __threadfence_block();                                                                    \
   if (closure.profiler_write_thread_predicate) {                                            \
-    entry.tag =                                                                             \
+    closure.entry.tag =                                                                     \
         closure.profiler_entry_tag_base | ((uint32_t)event << EVENT_IDX_SHIFT) | EVENT_END; \
-    entry.delta_time = get_timestamp();                                                     \
-    *closure.profiler_write_ptr = entry.raw;                                                \
+    closure.entry.delta_time = get_timestamp();                                             \
+    *closure.profiler_write_ptr = closure.entry.raw;                                        \
     closure.profiler_write_ptr += closure.profiler_write_stride;                            \
   }
 
 #define PROFILER_EVENT_INSTANT(closure, event)                                                  \
   __threadfence_block();                                                                        \
   if (closure.profiler_write_thread_predicate) {                                                \
-    entry.tag =                                                                                 \
+    closure.entry.tag =                                                                         \
         closure.profiler_entry_tag_base | ((uint32_t)event << EVENT_IDX_SHIFT) | EVENT_INSTANT; \
-    entry.delta_time = get_timestamp();                                                         \
-    *closure.profiler_write_ptr = entry.raw;                                                    \
+    closure.entry.delta_time = get_timestamp();                                                 \
+    *closure.profiler_write_ptr = closure.entry.raw;                                            \
   }                                                                                             \
   __threadfence_block();
 
 #else
 
 #define PROFILER_CLOSURE_PARAMS_DECL
+#define PROFILER_CLOSURE_FUNC_PARAMS
+#define PROFILER_FUNC_PARAMS
 #define PROFILER_PARAMS_DECL
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups, write_thread_predicate)
 #define PROFILER_EVENT_START(closure, event)

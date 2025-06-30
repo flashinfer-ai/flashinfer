@@ -395,6 +395,7 @@ def get_batch_attention_uri(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_profiler: bool,
 ) -> str:
     return (
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -403,7 +404,8 @@ def get_batch_attention_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
-        f"posenc_{pos_encoding_mode}"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_profiler_{str(use_profiler).lower()}"
     )
 
 
@@ -859,6 +861,7 @@ def gen_batch_attention_module(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_profiler: bool,
 ):
     uri = get_batch_attention_uri(
         dtype_q,
@@ -868,7 +871,9 @@ def gen_batch_attention_module(
         head_dim_qk,
         head_dim_vo,
         pos_encoding_mode,
+        use_profiler,
     )
+
     additional_tensor_names = []
     additional_tensor_dtypes = []
     additional_scalar_names = []
@@ -891,6 +896,7 @@ def gen_batch_attention_module(
         variant_name,
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
+        use_profiler=use_profiler,
     )
 
 
@@ -1501,6 +1507,7 @@ def gen_customize_batch_attention_module(
     variant_name: str,
     variant_decl: str,
     pos_encoding_mode: int = 0,
+    use_profiler: bool = False,
 ):
     kwargs = {
         "variant_decl": variant_decl,
@@ -1567,7 +1574,9 @@ def gen_customize_batch_attention_module(
 
     generated_config_path = gen_directory / "batch_attention_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
+
     return gen_jit_spec(
         uri,
         source_paths,
+        extra_cuda_cflags=["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [],
     )

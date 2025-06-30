@@ -68,7 +68,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
                             std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
-                            int64_t page_size, double sm_scale ADDITIONAL_FUNC_PARAMS) {
+                            int64_t page_size,
+                            double sm_scale ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -172,6 +173,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           params[i].sm_scale = sm_scale;
 
           ADDITIONAL_PARAMS_SETTER
+          PROFILER_PARAMS_SETTER
         }
 
         cudaError_t status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
