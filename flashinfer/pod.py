@@ -118,13 +118,10 @@ class PODWithPagedKVCacheWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
-        qo_indptr_buffer_p: Optional[torch.Tensor] = None,
-        paged_kv_indptr_buffer_p: Optional[torch.Tensor] = None,
-        paged_kv_indices_buffer_p: Optional[torch.Tensor] = None,
-        paged_kv_last_page_len_buffer_p: Optional[torch.Tensor] = None,
-        paged_kv_indptr_buffer_d: Optional[torch.Tensor] = None,
-        paged_kv_indices_buffer_d: Optional[torch.Tensor] = None,
-        paged_kv_last_page_len_buffer_d: Optional[torch.Tensor] = None,
+        qo_indptr_buffer: Optional[torch.Tensor] = None,
+        paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
+        paged_kv_indices_buffer: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         custom_mask_buf_p: Optional[torch.Tensor] = None,
         mask_indptr_buf_p: Optional[torch.Tensor] = None,
         jit_args: Optional[List[Any]] = None,
@@ -146,35 +143,26 @@ class PODWithPagedKVCacheWrapper:
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        qo_indptr_buffer_p: Optional[torch.Tensor]
+        qo_indptr_buffer: Optional[torch.Tensor]
             The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
-        paged_kv_indptr_buffer_p: Optional[torch.Tensor]
+        paged_kv_indptr_buffer: Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the prefill paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        paged_kv_indices_buffer_p: Optional[torch.Tensor]
+        paged_kv_indices_buffer: Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the prefill paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        paged_kv_last_page_len_buffer_p: Optional[torch.Tensor]
+        paged_kv_last_page_len_buffer: Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page for prefill, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
-
-        paged_kv_indptr_buffer_d: Optional[torch.Tensor]
-            Same as ``paged_kv_indptr_buffer_p`` but for decode.
-
-        paged_kv_indices_buffer_d: Optional[torch.Tensor]
-            Same as ``paged_kv_indices_buffer_p`` but for decode.
-
-        paged_kv_last_page_len_buffer_d: Optional[torch.Tensor]
-            Same as ``paged_kv_last_page_len_buffer_p`` but for decode.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -203,20 +191,11 @@ class PODWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        self._qo_indptr_buf_p = qo_indptr_buffer_p
-        self._int_workspace_buffer_p = torch.empty(
+        self._qo_indptr_buf = qo_indptr_buffer
+        self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        self._pin_memory_int_workspace_buffer_p = torch.empty(
-            (8 * 1024 * 1024,),
-            dtype=torch.uint8,
-            pin_memory=True,
-            device="cpu",
-        )
-        self._int_workspace_buffer_d = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-        )
-        self._pin_memory_int_workspace_buffer_d = torch.empty(
+        self._pin_memory_int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,),
             dtype=torch.uint8,
             pin_memory=True,
@@ -224,46 +203,43 @@ class PODWithPagedKVCacheWrapper:
         )
 
         if use_cuda_graph:
-            if not torch.is_tensor(qo_indptr_buffer_p):
+            if not torch.is_tensor(qo_indptr_buffer):
                 raise ValueError(
                     "qo_indptr_buffer_p should be a torch.Tensor in CUDA graph mode"
                 )
-            if not torch.is_tensor(paged_kv_indptr_buffer_p) or not torch.is_tensor(
-                paged_kv_indptr_buffer_d
+            if not torch.is_tensor(paged_kv_indptr_buffer) or not torch.is_tensor(
+                paged_kv_indptr_buffer
             ):
                 raise ValueError(
                     "paged_kv_indptr_buffer should be a torch.Tensor in cudagraph mode"
                 )
-            if not torch.is_tensor(paged_kv_indices_buffer_p) or not torch.is_tensor(
-                paged_kv_indices_buffer_d
+            if not torch.is_tensor(paged_kv_indices_buffer) or not torch.is_tensor(
+                paged_kv_indices_buffer
             ):
                 raise ValueError(
                     "paged_kv_indices_buffer should be a torch.Tensor in cudagraph mode"
                 )
             if not torch.is_tensor(
-                paged_kv_last_page_len_buffer_p
-            ) or not torch.is_tensor(paged_kv_last_page_len_buffer_d):
+                paged_kv_last_page_len_buffer
+            ) or not torch.is_tensor(paged_kv_last_page_len_buffer):
                 raise ValueError(
                     "paged_kv_last_page_len_buffer should be a torch.Tensor in cudagraph mode"
                 )
-            self._fixed_batch_size = len(paged_kv_last_page_len_buffer_p)
-            if len(paged_kv_indptr_buffer_p) != self._fixed_batch_size + 1:
+            self._fixed_batch_size = len(paged_kv_last_page_len_buffer)
+            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
                 raise ValueError(
                     "The length of paged_kv_indptr_buffer_p should be batch_size + 1"
                 )
-            if len(paged_kv_last_page_len_buffer_p) != self._fixed_batch_size:
+            if len(paged_kv_last_page_len_buffer) != self._fixed_batch_size:
                 raise ValueError(
                     "The length of paged_kv_last_page_len_buffer_p should be batch_size"
                 )
         else:
             self._fixed_batch_size = 0
 
-        self._paged_kv_indptr_buf_p = paged_kv_indptr_buffer_p
-        self._paged_kv_indices_buf_p = paged_kv_indices_buffer_p
-        self._paged_kv_last_page_len_buf_p = paged_kv_last_page_len_buffer_p
-        self._paged_kv_indptr_buf_d = paged_kv_indptr_buffer_d
-        self._paged_kv_indices_buf_d = paged_kv_indices_buffer_d
-        self._paged_kv_last_page_len_buf_d = paged_kv_last_page_len_buffer_d
+        self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+        self._paged_kv_indices_buf = paged_kv_indices_buffer
+        self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
         self._use_tensor_cores = use_tensor_cores
         self._use_cuda_graph = use_cuda_graph
 

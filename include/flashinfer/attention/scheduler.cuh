@@ -677,11 +677,191 @@ template <typename IdType>
 inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                                void* int_buffer, void* page_locked_int_buffer,
                                size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info,
-                               IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
+                               IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_t total_num_rows,
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o,
                                cudaStream_t stream) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
+            << num_kv_heads;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
+  // step 0: get the number of SMs
+  int num_sm = 0;
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  int num_blocks_per_sm = 3;
+  int max_grid_size = num_blocks_per_sm * num_sm;
+  uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
+
+  // step 2: determine kv_chunk_size
+  auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
+        qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
+      PrefillSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, total_num_rows, batch_size, num_qo_heads,
+                             num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
+                             enable_cuda_graph);
+
+  plan_info.cta_tile_q = cta_tile_q;
+  plan_info.total_num_rows = total_num_rows;
+  plan_info.enable_cuda_graph = enable_cuda_graph;
+  plan_info.padded_batch_size = padded_batch_size;
+  plan_info.split_kv = split_kv;
+
+  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_request_indices");
+  plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_qo_tile_indices");
+  plan_info.kv_tile_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_kv_tile_indices");
+  plan_info.o_indptr_offset = int_allocator.aligned_alloc_offset(sizeof(IdType) * (batch_size + 1),
+                                                                 16, "batch_prefill_o_indptr");
+  plan_info.kv_chunk_size_ptr_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_prefill_kv_chunk_size_ptr");
+
+  if (plan_info.enable_cuda_graph) {
+    plan_info.total_num_rows_offset =
+        int_allocator.aligned_alloc_offset(sizeof(uint32_t), 16, "batch_prefill_total_num_rows");
+    uint32_t* total_num_rows_h =
+        GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer, plan_info.total_num_rows_offset);
+    *total_num_rows_h = qo_indptr_h[batch_size];
+  }
+
+  IdType* request_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
+  IdType* qo_tile_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
+  IdType* kv_tile_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
+  IdType* o_indptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
+  IdType* kv_chunk_size_ptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
+  std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
+  std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
+  std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
+  std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
+  kv_chunk_size_ptr_h[0] = kv_chunk_size;
+
+  if (split_kv) {
+    AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+    plan_info.v_offset = float_allocator.aligned_alloc_offset(
+        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
+        "batch_prefill_tmp_v");
+    plan_info.s_offset = float_allocator.aligned_alloc_offset(
+        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
+    plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
+        sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
+    plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
+        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
+
+    IdType* merge_indptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+    bool* block_valid_mask_h =
+        GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+    std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
+    for (uint32_t i = 0; i < padded_batch_size; ++i) {
+      block_valid_mask_h[i] = i < new_batch_size;
+    }
+  }
+
+  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                       cudaMemcpyHostToDevice, stream));
+
+  return cudaSuccess;
+}
+
+struct PODPlanInfo {
+  int64_t padded_batch_size;
+  int64_t total_num_rows;
+  int64_t total_num_rows_offset;
+  int64_t cta_tile_q;
+  int64_t request_indices_offset;
+  int64_t qo_tile_indices_offset;
+  int64_t kv_tile_indices_offset;
+  int64_t merge_indptr_offset;
+  int64_t o_indptr_offset;
+  int64_t kv_chunk_size_ptr_offset;
+  int64_t v_offset;
+  int64_t s_offset;
+  int64_t block_valid_mask_offset;
+  bool enable_cuda_graph;
+  bool split_kv;
+
+  PODPlanInfo()
+      : padded_batch_size(0),
+        total_num_rows(0),
+        total_num_rows_offset(0),
+        cta_tile_q(0),
+        request_indices_offset(0),
+        qo_tile_indices_offset(0),
+        kv_tile_indices_offset(0),
+        merge_indptr_offset(0),
+        o_indptr_offset(0),
+        kv_chunk_size_ptr_offset(0),
+        v_offset(0),
+        s_offset(0),
+        block_valid_mask_offset(0),
+        enable_cuda_graph(false),
+        split_kv(false) {}
+
+  // convert PrefillPlanInfo to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {padded_batch_size,
+            total_num_rows,
+            total_num_rows_offset,
+            cta_tile_q,
+            request_indices_offset,
+            qo_tile_indices_offset,
+            kv_tile_indices_offset,
+            merge_indptr_offset,
+            o_indptr_offset,
+            kv_chunk_size_ptr_offset,
+            v_offset,
+            s_offset,
+            block_valid_mask_offset,
+            enable_cuda_graph,
+            split_kv};
+  }
+
+  // From std::vector<int64_t> to PodPlanInfo
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 15) {
+      std::ostringstream err_msg;
+      err_msg << "PodPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    padded_batch_size = vec[0];
+    total_num_rows = vec[1];
+    total_num_rows_offset = vec[2];
+    cta_tile_q = vec[3];
+    request_indices_offset = vec[4];
+    qo_tile_indices_offset = vec[5];
+    kv_tile_indices_offset = vec[6];
+    merge_indptr_offset = vec[7];
+    o_indptr_offset = vec[8];
+    kv_chunk_size_ptr_offset = vec[9];
+    v_offset = vec[10];
+    s_offset = vec[11];
+    block_valid_mask_offset = vec[12];
+    enable_cuda_graph = vec[13];
+    split_kv = vec[14];
+  }
+};
+
+template <typename IdType>
+inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                           void* int_buffer, void* page_locked_int_buffer,
+                           size_t int_workspace_size_in_bytes, PODPlanInfo& plan_info,
+                           IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
+                           uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                           uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+                           bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
