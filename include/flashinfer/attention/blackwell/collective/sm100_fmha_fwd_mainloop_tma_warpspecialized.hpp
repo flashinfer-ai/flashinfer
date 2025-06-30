@@ -1088,6 +1088,72 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_commit(pipeline_epi_producer_state);
     ++pipeline_epi_producer_state;
   }
+
+  template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class TensorStorageEpi,
+            class CollectiveEpilogue>
+  CUTLASS_DEVICE auto correction_empty(
+      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
+      ParamsProblemShape const& params_problem_shape, TensorStorageEpi& shared_storage_epi,
+      PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
+      CollectiveEpilogue& epilogue) {
+    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+
+    Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
+                            typename TensorStorageEpi::SmemLayoutO{});
+    Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
+    int thread_idx = threadIdx.x % (4 * NumThreadsPerWarp);
+
+    using ElementOut = typename CollectiveEpilogue::ElementOut;
+    auto tiled_copy = make_cotiled_copy(
+        Copy_Atom<UniversalCopy<uint32_t>, ElementOut>{},
+        make_ordered_layout(make_shape(_128{}, Int<sizeof(uint32_t) / sizeof(ElementOut)>{}),
+                            Step<_1, _0>{}),
+        sO.layout());
+
+    auto thr_copy = tiled_copy.get_slice(thread_idx);
+    auto tOgO = thr_copy.partition_D(sO);
+    auto tOrO = make_tensor<ElementOut>(shape(tOgO(_, _, _, _0{})));
+    clear(tOrO);
+
+    copy(tiled_copy, tOrO, tOgO(_, _, _, _0{}));
+
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx = thread_idx + get<0>(TileShape{}) * qo_tile_idx;
+
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, qo_head_idx) = -cuda::std::numeric_limits<float>::infinity();
+      }
+    }
+
+    pipeline_epi.producer_commit(pipeline_epi_producer_state);
+    ++pipeline_epi_producer_state;
+
+    copy(tiled_copy, tOrO, tOgO(_, _, _, _1{}));
+    cutlass::arch::fence_view_async_shared();
+    pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+
+    if (epilogue.params.ptr_LSE != nullptr) {
+      int qo_tile_idx = get<0>(blk_coord);
+      int qo_head_idx = get<2, 0>(blk_coord);
+      int batch_idx = get<2, 1>(blk_coord);
+      int qo_len = get<0>(problem_shape);
+      int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+      int row_idx = thread_idx + get<0>(TileShape{}) * qo_tile_idx + get<0>(TileShapeQK{});
+
+      if (row_idx < qo_len) {
+        gLSE(segment_offset + row_idx, qo_head_idx) = -cuda::std::numeric_limits<float>::infinity();
+      }
+    }
+
+    cutlass::arch::fence_view_async_shared();
+    pipeline_epi.producer_commit(pipeline_epi_producer_state);
+    ++pipeline_epi_producer_state;
+  }
 };
 
 }  // namespace cutlass::fmha::collective
