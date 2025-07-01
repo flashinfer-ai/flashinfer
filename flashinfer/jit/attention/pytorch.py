@@ -1580,3 +1580,11 @@ def gen_customize_batch_attention_module(
         source_paths,
         extra_cuda_cflags=["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [],
     )
+
+
+def cudnn_fmha_gen_module():
+    return gen_jit_spec(
+        "fmha_cudnn_gen",
+        [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
+        extra_ldflags=["-lcuda"],
+    )
