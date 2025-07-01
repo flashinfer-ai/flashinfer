@@ -31,6 +31,9 @@ def _build_seq_len_configs():
     torch.manual_seed(42)
 
     seq_len_configs = [
+        [(67, 1)],
+        [(182, 1)],
+        [(2011, 1)],
         [(2048, 1)] * 77,  # decode-only
         [(4099, 129)] * 2,  # prefill-only
         [(600, 1)] * 132 * 2 + [(5000, 3)] * 128,
