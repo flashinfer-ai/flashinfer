@@ -57,7 +57,7 @@ def export_to_perfetto_trace(
     tgen = TraceGenerator(file_name)
 
     tid_map = {}
-    track_map = {}
+    track_map = {}  # type: ignore
     for block_idx in range(num_blocks):
         pid = tgen.create_group(f"block_{block_idx}")
         for group_idx in range(num_groups):
