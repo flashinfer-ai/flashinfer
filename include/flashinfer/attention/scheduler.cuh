@@ -1133,14 +1133,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   plan_info.num_blks_y = num_clusters;
 
   auto f = [](int x) {
-    if (x <= 8) {
-      return 32;
-    } else if (x <= 16) {
-      return 64;
-    } else if (x <= 32) {
+    if (x <= 128) {
+      // This aligns with CTA_TILE_KV in persistent mainloop
+      // NOTE (Yilong): Optimize here for smaller batch/seqlen scenarios
       return 128;
-    } else if (x <= 64) {
-      return 192;
     }
     return ceil_div(x, 256) * 256;
   };

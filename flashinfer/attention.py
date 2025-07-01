@@ -39,6 +39,7 @@ class BatchAttention:
     def __init__(
         self,
         kv_layout: str = "NHD",
+        device: str = "cuda",
     ):
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -46,12 +47,12 @@ class BatchAttention:
         self.float_workspace_buffer = torch.empty(
             256 * 1024 * 1024,
             dtype=torch.uint8,
-            device=torch.device("cuda"),
+            device=torch.device(device),
         )
         self.int_workspace_buffer = torch.empty(
             8 * 1024 * 1024,
             dtype=torch.uint8,
-            device=torch.device("cuda"),
+            device=torch.device(device),
         )
         self.page_locked_int_workspace_buffer = torch.empty(
             8 * 1024 * 1024,
