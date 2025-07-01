@@ -59,3 +59,9 @@ repos:
     hooks:
       - id: cmake-format
         additional_dependencies: [pyyaml>=5.1]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.1
+    hooks:
+      - id: ruff-check
+      # - id: ruff-format

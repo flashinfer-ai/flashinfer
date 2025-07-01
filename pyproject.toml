@@ -84,6 +84,11 @@ follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
 
+[tool.ruff]
+extend-exclude = [
+    "3rdparty",
+    "tests",
+]
 
 [tool.ruff.lint]
 select = [
