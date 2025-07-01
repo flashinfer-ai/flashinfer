@@ -1120,7 +1120,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     int packed_qo_len = qo_len * gqa_group_size;
     int kv_len = kv_len_arr_h[i];
 
-    // TODO(Zihao): add more stages
     if (packed_qo_len > CTA_TILE_Q_SIZES[1]) {
       idx_qo_kv_len_vec[0].push_back({i, qo_len, kv_len});
     } else {
@@ -1153,15 +1152,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   const int max_total_num_works = 16384;
   const int max_packed_qo_lens =
       4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
-  ;  // max_partial_num_rows
 
-  // used for remapping the output offsets
-  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
-  int partial_o_nnz = 0;
-  std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
-  merge_indptr.push_back(partial_o_nnz);
+  // calculate kv_len_limit first, considering all workloads
+  int64_t total_kv_lens = 0;
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
-    int64_t total_kv_lens = 0;
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
     for (auto& [_, qo_len, kv_len] : idx_qo_kv_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
@@ -1174,7 +1168,23 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         total_kv_lens += effective_kv_len;
       }
     }
-    int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
+  }
+
+  // used for remapping the output offsets
+  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
+  int partial_o_nnz = 0;
+  std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
+  merge_indptr.push_back(partial_o_nnz);
+  for (uint32_t task = 0; task < NUM_TASKS; ++task) {
+    int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
+    int kv_len_limit = 0;
+    if (cluster_tile_q >= 64) {
+      // chunked-prefill workloads are much more expensive than decode
+      // so we use a smaller kv_len_limit for chunked-prefill workloads
+      kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
+    } else {
+      kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
+    }
 
     std::vector<std::vector<IdType>> cluster_q_indptr(num_clusters, std::vector<IdType>()),
         cluster_kv_indptr(num_clusters, std::vector<IdType>()),
@@ -1228,12 +1238,15 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
             break;
           }
         }
-        for (int row = 0; row < row_tile_size; ++row) {
-          merge_indptr.push_back(merge_indptr.back() + num_kv_tiles);
-          merge_o_indices.push_back(qo_indptr_h[i] +
-                                    (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+        if (split_kv) {
+          // non-split kv is directly written through
+          for (int row = 0; row < row_tile_size; ++row) {
+            merge_indptr.push_back(merge_indptr.back() + num_kv_tiles);
+            merge_o_indices.push_back(qo_indptr_h[i] +
+                                      (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+          }
+          partial_o_nnz += row_tile_size * num_kv_tiles;
         }
-        partial_o_nnz += row_tile_size * num_kv_tiles;
       }
     }
 

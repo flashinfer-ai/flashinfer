@@ -86,6 +86,7 @@ class BatchAttention:
             head_dim_qk,
             head_dim_vo,
             PosEncodingMode["NONE"].value,
+            use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
 
@@ -146,6 +147,9 @@ class BatchAttention:
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
 
+        # profiler_buffer is optional
+        profiler_args = (profiler_buffer,) if self._use_profiler else ()
+
         self.module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -162,6 +166,7 @@ class BatchAttention:
             self._num_kv_heads,
             self._page_size,
             self._sm_scale,
+            *profiler_args,
         )
 
         return out, lse

@@ -17,7 +17,7 @@ name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.9,<4.0"
 authors = [{ name = "FlashInfer team" }]
-license = "Apache-2.0"
+# license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
@@ -50,6 +50,8 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
+    "flashinfer.comm",
+    "flashinfer.cudnn",
 ]
 include-package-data = false
 
@@ -58,6 +60,7 @@ include-package-data = false
 "flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
+
 [tool.setuptools.package-data]
 "flashinfer.data" = [
     "csrc/**",

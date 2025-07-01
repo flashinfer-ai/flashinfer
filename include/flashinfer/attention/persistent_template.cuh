@@ -30,8 +30,11 @@ namespace cg = cooperative_groups;
 enum class PersistentProfileEventType {
   kRunner1 = 0U,
   kRunner2 = 1U,
-  kRunner3 = 2U,
-  kRunner4 = 3U,
+  kReduction = 2U,
+};
+
+struct ProfilerClosure {
+  PROFILER_CLOSURE_PARAMS_DECL
 };
 
 // Helper metafunction to find maximum threads among multiple BlockPersistentRunners
@@ -60,29 +63,37 @@ __global__ __launch_bounds__(
                                              typename BlockPersistentRunner2::Params params_2) {
   extern __shared__ uint8_t smem[];
 
+#ifdef FLASHINFER_ENABLE_PROFILER
+  ProfilerClosure
+      profiler_closure;  // no volatile as this is scope.CTA, and only threadIdx == 0 is modifying
   PROFILER_INIT(params_1, smem, profiler_closure, 0, 1, (threadIdx.x == 0));
+#endif
 
   auto& smem_storage_1 =
       reinterpret_cast<typename BlockPersistentRunner1::KTraits::SharedStorage&>(smem);
-
-  PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner1);
-  BlockPersistentRunner1::Run(params_1, &smem_storage_1);
-  PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner1);
-
   auto& smem_storage_2 =
       reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
-
-  PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kRunner2);
-  BlockPersistentRunner2::Run(params_2, &smem_storage_2);
-  PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kRunner2);
-
-  // NOTE(Yilong): optimize the barrier
   auto grid = cg::this_grid();
+
+#ifndef FLASHINFER_ENABLE_PROFILER
+  BlockPersistentRunner1::Run(params_1, &smem_storage_1);
+  BlockPersistentRunner2::Run(params_2, &smem_storage_2);
+
   grid.sync();
   BlockReductionRunner::Run(params_1.partial_o, params_1.final_o, params_1.partial_lse,
                             params_1.final_lse, *(params_1.num_packed_qo_len),
                             params_1.gqa_group_size, params_1.num_kv_heads, params_1.merge_indptr,
                             params_1.merge_o_indices, smem);
+#else
+  BlockPersistentRunner1::Run(params_1, &smem_storage_1, profiler_closure);
+  BlockPersistentRunner2::Run(params_2, &smem_storage_2, profiler_closure);
+
+  grid.sync();
+  BlockReductionRunner::Run(params_1.partial_o, params_1.final_o, params_1.partial_lse,
+                            params_1.final_lse, *(params_1.num_packed_qo_len),
+                            params_1.gqa_group_size, params_1.num_kv_heads, params_1.merge_indptr,
+                            params_1.merge_o_indices, smem, profiler_closure);
+#endif
 }
 }  // namespace flashinfer
 

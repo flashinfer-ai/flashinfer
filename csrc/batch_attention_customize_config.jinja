@@ -13,6 +13,13 @@ using namespace flashinfer;
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
+#ifdef FLASHINFER_ENABLE_PROFILER
+#define PROFILER_PARAMS_SETTER \
+  params[i].profiler_buffer = static_cast<uint64_t*>(profiler_buffer.data_ptr());
+#else
+#define PROFILER_PARAMS_SETTER
+#endif
+
 {{ variant_decl }}
 
 struct StandardAttention : AttentionVariantBase {
