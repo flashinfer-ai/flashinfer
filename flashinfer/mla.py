@@ -76,7 +76,6 @@ def get_batch_mla_module(backend, *args):
     return gen_batch_mla_module(backend, *args).build_and_load()
 
 
-# todo(yingyi): 这是什么？？
 def _compute_page_mask_indptr(
     qo_indptr: torch.Tensor,
     paged_kv_indptr: torch.Tensor,
