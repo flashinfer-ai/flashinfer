@@ -50,6 +50,7 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
+    "flashinfer.comm",
     "flashinfer.cudnn",
 ]
 include-package-data = false
