@@ -15,9 +15,8 @@ limitations under the License.
 """
 
 import functools
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist

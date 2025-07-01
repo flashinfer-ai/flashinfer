@@ -1,6 +1,5 @@
 import ctypes
 import functools
-import os
 from typing import Sequence
 
 import torch

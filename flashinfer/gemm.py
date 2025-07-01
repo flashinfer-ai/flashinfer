@@ -19,7 +19,6 @@ from types import SimpleNamespace
 from typing import Literal, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .jit import JitSpec
 from .jit import env as jit_env

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import functools
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 

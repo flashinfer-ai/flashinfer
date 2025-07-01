@@ -1,7 +1,6 @@
 import functools
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Tuple
+from typing import Tuple
 
 import torch
 
@@ -233,7 +232,7 @@ def fp4_swizzle_blockscale(
     assert (
         unswizzled_sf.dtype == torch.uint8
     ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    assert sf_vec_size == 16, f"Currently only support sf_vec_size 16!"
+    assert sf_vec_size == 16, "Currently only support sf_vec_size 16!"
     padded_input_sf = _pad_scale_factors(unswizzled_sf, m, n, sf_vec_size)
     out = torch.empty_like(padded_input_sf)
     o_m, o_n = out.shape
