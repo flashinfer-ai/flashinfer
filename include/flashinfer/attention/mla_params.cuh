@@ -71,6 +71,10 @@ struct MLAParams {
   uint32_t o_stride_h;
 
   float sm_scale;
+
+  // custom mask
+  uint8_t* maybe_custom_mask;
+  int32_t* maybe_mask_indptr;
 };
 
 };  // namespace flashinfer

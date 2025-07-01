@@ -799,6 +799,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
+  [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
 
   DTypeQ* q_nope = params.q_nope;
   DTypeQ* q_pe = params.q_pe;
@@ -896,8 +897,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
       // logits mask
-      logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag);
+      if (MASK_MODE == MaskMode::kCustom) {
+        // todo(yingyi): support custom mask
+      } else {
+        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
+                              kv_len, kv_end, num_heads, s_frag);
+      }
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -1007,16 +1012,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;
-  }
+
+  // todo(yingyi): support custom mask
+  // if (MASK_MODE == MaskMode::kCustom) {
+  //   return cudaErrorNotSupported;
+  // }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
 
   dim3 nblks(num_blks_x, num_blks_y);
@@ -1030,7 +1037,7 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
     using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType, AttentionVariant>;
+                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
     void* args[] = {(void*)&params};
