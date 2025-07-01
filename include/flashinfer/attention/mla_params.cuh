@@ -75,6 +75,14 @@ struct MLAParams {
   // custom mask
   uint8_t* maybe_custom_mask;
   int32_t* maybe_mask_indptr;
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return q_len[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return kv_len[batch_idx];
+  }
 };
 
 };  // namespace flashinfer

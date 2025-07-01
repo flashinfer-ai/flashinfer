@@ -61,11 +61,11 @@ struct SharedStorageQKVO {
   };
 };
 
-template <bool CAUSAL_, uint32_t NUM_STAGES_, bool QK_SHARD_, uint32_t HEAD_DIM_CKV_,
+template <MaskMode MASK_MODE_, uint32_t NUM_STAGES_, bool QK_SHARD_, uint32_t HEAD_DIM_CKV_,
           uint32_t HEAD_DIM_KPE_, uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename IdType_, typename AttentionVariant_>
 struct KernelTraits {
-  static constexpr bool CAUSAL = CAUSAL_;
+  static constexpr MaskMode MASK_MODE = MASK_MODE_;
   static constexpr uint32_t NUM_STAGES = NUM_STAGES_;
   // NOTE(Zihao): whether to shard Q*K computation across warpgroups
   // if true, each warpgroup will compute a subset of Q*K (sharded on the KV dimension)
@@ -104,7 +104,7 @@ struct KernelTraits {
 
   using SharedStorage = SharedStorageQKVO<NUM_STAGES, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_CKV,
                                           HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO>;
-  using AttentionVariant = StandardAttention;
+  // using AttentionVariant = StandardAttention;
 
   // static constexpr DTypeQKAccum MaskFillValue = -math::inf;
   static constexpr DTypeQKAccum MaskFillValue =
@@ -319,12 +319,12 @@ __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
   }
 }
 
-template <typename KTraits>
-__device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
-                                             const uint32_t kv_idx_base, const uint32_t qo_len,
-                                             const uint32_t kv_len, const uint32_t kv_end,
-                                             const uint_fastdiv num_heads,
-                                             typename KTraits::DTypeQKAccum (*s_frag)[8]) {
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void logits_mask_(
+    const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
+    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
+    const uint32_t kv_len, const uint32_t kv_end, const uint_fastdiv num_heads,
+    typename KTraits::DTypeQKAccum (*s_frag)[8]) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
@@ -339,12 +339,18 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const uint32_t q_idx = q[(reg_id % 4) / 2],
-                       kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
+        const uint32_t q_packed_idx =
+            qo_packed_idx_base + warp_idx_in_wg * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2);
+        const uint32_t q_idx = q[(reg_id % 4) / 2];
+        const uint32_t kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
                                 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t qo_head_idx = q_packed_idx % params.num_heads;
+        const uint32_t kv_head_idx = qo_head_idx / (params.num_heads / 1);
         const bool mask =
-            (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
-                               : kv_idx >= kv_end));
+            (!((KTraits::MASK_MODE == MaskMode::kCausal)
+                   ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
+                   : kv_idx >= kv_end)) &&
+            variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
     }
@@ -353,12 +359,18 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const uint32_t q_idx = q[(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
-                                                             2 * (lane_idx % 4) + 8 * (reg_id / 4) +
-                                                             reg_id % 2;
+        const uint32_t q_packed_idx =
+            qo_packed_idx_base + warp_idx_in_wg * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2);
+        const uint32_t q_idx = q[(reg_id % 4) / 2];
+        const uint32_t kv_idx =
+            kv_idx_base + mma_kv * 16 + 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t qo_head_idx = q_packed_idx % params.num_heads;
+        const uint32_t kv_head_idx = qo_head_idx / (params.num_heads / 1);
         const bool mask =
-            (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
-                               : kv_idx >= kv_end));
+            (!((KTraits::MASK_MODE == MaskMode::kCausal)
+                   ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
+                   : kv_idx >= kv_end)) &&
+            variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
     }
@@ -798,7 +810,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
-  [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
+  [[maybe_unused]] constexpr bool CAUSAL = KTraits::MASK_MODE == MaskMode::kCausal;
   [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
 
   DTypeQ* q_nope = params.q_nope;
@@ -897,12 +909,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
       // logits mask
-      if (MASK_MODE == MaskMode::kCustom) {
-        // todo(yingyi): support custom mask
-      } else {
-        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
-                              kv_len, kv_end, num_heads, s_frag);
-      }
+      logits_mask_<KTraits, Params>(params, variant, blockIdx.y, qo_packed_idx_base,
+                                    kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len, kv_end,
+                                    num_heads, s_frag);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -952,8 +961,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
-      logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag);
+      logits_mask_<KTraits, Params>(params, variant, blockIdx.y, qo_packed_idx_base,
+                                    kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len, kv_end,
+                                    num_heads, s_frag);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -1012,7 +1022,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -1036,8 +1047,9 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
-    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
-                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+    using KTraits = KernelTraits<MASK_MODE, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
+                                 /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType,
+                                 AttentionVariant>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
     void* args[] = {(void*)&params};
