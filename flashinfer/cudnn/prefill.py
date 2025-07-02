@@ -100,10 +100,9 @@ def cudnn_batch_prefill_with_kv_cache(
         out_shape = (q.shape[0], h_qo, d_vo)
         out = torch.empty(out_shape, device=q.device, dtype=q.dtype)
 
-    if actual_seq_lens_q.is_cuda == False:
-        actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device)
-    if actual_seq_lens_kv.is_cuda == False:
-        actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device)
+    actual_seq_lens_q_gpu = actual_seq_lens_q.to(q.device, non_blocking=True)
+
+    actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device, non_blocking=True)
 
     run_func = get_cudnn_fmha_gen_module().prefill
     run_func(
