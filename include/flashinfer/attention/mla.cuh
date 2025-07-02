@@ -341,8 +341,8 @@ __device__ __forceinline__ void logits_mask_(
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
         const uint32_t q_packed_idx =
             qo_packed_idx_base + warp_idx_in_wg * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2);
-        const uint32_t q_idx = q[(reg_id % 4) / 2];
-        const uint32_t kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
+        const uint32_t q_idx = q[(reg_id % 4) / 2],
+                       kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
                                 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = q_packed_idx % params.num_heads;
         const uint32_t kv_head_idx = qo_head_idx / (params.num_heads / 1);
@@ -361,9 +361,9 @@ __device__ __forceinline__ void logits_mask_(
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
         const uint32_t q_packed_idx =
             qo_packed_idx_base + warp_idx_in_wg * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2);
-        const uint32_t q_idx = q[(reg_id % 4) / 2];
-        const uint32_t kv_idx =
-            kv_idx_base + mma_kv * 16 + 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t q_idx = q[(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
+                                                             2 * (lane_idx % 4) + 8 * (reg_id / 4) +
+                                                             reg_id % 2;
         const uint32_t qo_head_idx = q_packed_idx % params.num_heads;
         const uint32_t kv_head_idx = qo_head_idx / (params.num_heads / 1);
         const bool mask =

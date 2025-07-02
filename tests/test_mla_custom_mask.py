@@ -634,6 +634,7 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+
 if __name__ == "__main__":
     # test_batch_mla_varlen_page_attention(
     #     1, 65, 65, 65, 1, 128, True, 64, "fa2", torch.half
