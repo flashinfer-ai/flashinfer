@@ -24,8 +24,8 @@ from einops import einsum, rearrange
 from flashinfer.gemm import (
     gemm_fp8_nt_blockscaled,
     gemm_fp8_nt_groupwise,
-    group_gemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
+    group_gemm_fp8_nt_groupwise,
 )
 
 
@@ -285,7 +285,7 @@ def test_fp8_groupwise_group_deepgemm(
     group_size,
     out_dtype,
 ):
-    from deep_gemm.utils.math import per_token_cast_to_fp8, per_block_cast_to_fp8
+    from deep_gemm.utils.math import per_block_cast_to_fp8, per_token_cast_to_fp8
 
     torch.random.manual_seed(0)
     m = m_per_group * group_size
