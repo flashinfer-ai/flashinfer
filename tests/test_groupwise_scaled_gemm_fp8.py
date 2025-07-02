@@ -25,6 +25,7 @@ from flashinfer.gemm import (
     gemm_fp8_nt_blockscaled,
     gemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
+    group_deepgemm_fp8_nt_groupwise,
 )
 
 
@@ -272,7 +273,53 @@ def test_fp8_groupwise_group_gemm(
         )
 
 
+@pytest.mark.parametrize("m_per_group", [128, 256])
+@pytest.mark.parametrize("n", [128, 512, 4096])
+@pytest.mark.parametrize("k", [128, 512, 4096])
+@pytest.mark.parametrize("group_size", [1, 4, 8])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+def test_fp8_groupwise_group_deepgemm(
+    m_per_group,
+    n,
+    k,
+    group_size,
+    out_dtype,
+):
+    from deep_gemm.utils.math import per_token_cast_to_fp8, per_block_cast_to_fp8
+
+    torch.random.manual_seed(0)
+    m = m_per_group * group_size
+    a = torch.rand((m, k), device="cuda", dtype=torch.float32)
+    b = torch.rand((group_size, n, k), device="cuda", dtype=torch.float32)
+    m_indptr = torch.empty((m,), device="cuda", dtype=torch.int32)
+    a_fp8, a_scale = per_token_cast_to_fp8(a)
+    b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
+    b_scale = torch.empty(
+        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    )
+    for i in range(group_size):
+        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
+
+    ref = torch.empty((m, n), device="cuda", dtype=out_dtype)
+
+    for i in range(group_size):
+        r = slice(i * m_per_group, (i + 1) * m_per_group)
+        m_indptr[r] = i
+        ref[r] = a[r] @ b[i].t()
+
+    out = group_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        m_indptr,
+        out_dtype=out_dtype,
+    )
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
 if __name__ == "__main__":
     test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
     test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
     test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
+    test_fp8_groupwise_group_deepgemm(256, 128, 128, 4, torch.bfloat16)

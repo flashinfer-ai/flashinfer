@@ -13,3 +13,7 @@
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "3rdparty/DeepGEMM"]
+	path = 3rdparty/DeepGEMM
+	url = https://github.com/RayWang96/DeepGEMM.git
+	branch = multi_arch_support

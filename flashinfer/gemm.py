@@ -942,3 +942,26 @@ def pad_indptr_to_multiple_of_4(
     )
 
     return padded_m_indptr, padded_m_rank
+
+
+def group_deepgemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (m, k // block_sizem)
+    b_scale: torch.Tensor,  # (batch_size, n // block_size, k // block_size)
+    m_indptr: torch.Tensor,  # (m, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,  # (m, n)
+    out_dtype: Optional[torch.dtype] = None,
+):
+    from deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
+
+    m_grouped_fp8_gemm_nt_contiguous(
+        (a, a_scale), (b, b_scale), out, m_indptr, scale_granularity_mnk
+    )
+
+    return out
