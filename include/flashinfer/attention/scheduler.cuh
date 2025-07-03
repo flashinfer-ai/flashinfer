@@ -561,9 +561,14 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
                                  std::vector<int64_t>& kv_len_arr, uint32_t batch_size,
                                  uint32_t cta_tile_q, uint32_t kv_chunk_size,
                                  uint32_t gqa_group_size,
+                                 std::vector<int64_t>& request_indices = nullptr,
                                  std::vector<int64_t>& merge_indptr = nullptr,
                                  std::vector<int64_t>& o_indptr = nullptr) {
-  std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices;
+  std::vector<IdType> qo_tile_indices, kv_tile_indices;
+  if (request_indices == nullptr) {
+    request_indices = std::vector<int64_t>();
+    request_indices.push_back(0);
+  }
   if (merge_indptr == nullptr) {
     merge_indptr = std::vector<int64_t>();
     merge_indptr.push_back(0);
@@ -868,13 +873,13 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                                      cta_tile_q_d, min_kv_chunk_size);
 
   // step 3: split qo_indptr and kv_indptr
-  auto [request_indices_p, qo_tile_indices_p, kv_tile_indices_p, merge_indptr, o_indptr,
+  auto [request_indices, qo_tile_indices_p, kv_tile_indices_p, merge_indptr, o_indptr,
         new_batch_size_p] = get_qkv_tile_indices(packed_qo_len_arr_p, kv_len_arr_p, batch_size_p,
                                                  cta_tile_q_p, kv_chunk_size_p, gqa_group_size);
-  auto [request_indices_d, qo_tile_indices_d, kv_tile_indices_d, merge_indptr_d, o_indptr_d,
-        new_batch_size_d] =
-      get_qkv_tile_indices(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d, cta_tile_q_d,
-                           kv_chunk_size_d, gqa_group_size, merge_indptr, o_indptr);
+  auto [request_indices, qo_tile_indices_d, kv_tile_indices_d, merge_indptr_d, o_indptr_d,
+        new_batch_size_d] = get_qkv_tile_indices(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d,
+                                                 cta_tile_q_d, kv_chunk_size_d, gqa_group_size,
+                                                 request_indices, merge_indptr, o_indptr);
 
   bool split_kv = split_kv_p || split_kv_d;
   uint32_t new_batch_size = new_batch_size_p + new_batch_size_d;
@@ -889,11 +894,11 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   kv_chunk_size_p *= page_size;
   kv_chunk_size_d *= page_size;
 
-  return std::make_tuple(
-      split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
-      cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, std::move(merge_indptr), std::move(o_indptr),
-      std::move(request_indices_p), std::move(qo_tile_indices_p), std::move(kv_tile_indices_p),
-      std::move(request_indices_d), std::move(qo_tile_indices_d), std::move(kv_tile_indices_d));
+  return std::make_tuple(split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d,
+                         cta_tile_q_p, cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d,
+                         std::move(merge_indptr), std::move(o_indptr), std::move(request_indices),
+                         std::move(qo_tile_indices_p), std::move(kv_tile_indices_p),
+                         std::move(qo_tile_indices_d), std::move(kv_tile_indices_d));
 }
 
 struct PODPlanInfo {
@@ -909,7 +914,8 @@ struct PODPlanInfo {
   int64_t kv_tile_indices_offset_d;
   int64_t merge_indptr_offset;
   int64_t o_indptr_offset;
-  int64_t kv_chunk_size_ptr_offset;
+  int64_t kv_chunk_size_ptr_offset_p;
+  int64_t kv_chunk_size_ptr_offset_d;
   int64_t v_offset_p;
   int64_t v_offset_d int64_t s_offset_p;
   int64_t s_offset_d;
@@ -931,13 +937,13 @@ struct PODPlanInfo {
         kv_tile_indices_offset_d(0),
         merge_indptr_offset(0),
         o_indptr_offset(0),
-        kv_chunk_size_ptr_offset(0),
+        kv_chunk_size_ptr_offset_p(0),
+        kv_chunk_size_ptr_offset_d(0),
         v_offset_p(0),
         v_offset_d(0),
         s_offset_p(0),
         s_offset_d(0),
-        block_valid_mask_offset_p(0),
-        block_valid_mask_offset_d(0),
+        block_valid_mask_offset(0),
         enable_cuda_graph(false),
         split_kv(false) {}
 
@@ -952,7 +958,8 @@ struct PODPlanInfo {
             kv_tile_indices_offset,
             merge_indptr_offset,
             o_indptr_offset,
-            kv_chunk_size_ptr_offset,
+            kv_chunk_size_ptr_offset_p,
+            kv_chunk_size_ptr_offset_d,
             v_offset,
             s_offset,
             block_valid_mask_offset,
@@ -979,13 +986,13 @@ struct PODPlanInfo {
     kv_tile_indices_offset_d = vec[9];
     merge_indptr_offset = vec[7];
     o_indptr_offset = vec[8];
-    kv_chunk_size_ptr_offset = vec[9];
-    v_offset_p = vec[10];
-    v_offset_d = vec[11];
-    s_offset_p = vec[12];
+    kv_chunk_size_ptr_offset_p = vec[9];
+    kv_chunk_size_ptr_offset_d = vec[10];
+    v_offset_p = vec[11];
+    v_offset_d = vec[12];
+    s_offset_p = vec[13];
     s_offset_d = vec[13];
-    block_valid_mask_offset_p = vec[14];
-    block_valid_mask_offset_d = vec[15];
+    block_valid_mask_offset = vec[14];
     enable_cuda_graph = vec[13];
     split_kv = vec[14];
   }
@@ -1020,8 +1027,8 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   // step 2: determine kv_chunk_size
   auto [split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
         cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, merge_indptr_vec, o_indptr_vec,
-        request_indices_vec_p, qo_tile_indices_vec_p, kv_tile_indices_vec_p, request_indices_vec_d,
-        qo_tile_indices_vec_d, kv_tile_indices_vec_d] =
+        request_indices_vec, qo_tile_indices_vec_p, kv_tile_indices_vec_p, qo_tile_indices_vec_d,
+        kv_tile_indices_vec_d] =
       PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, qo_indptr_d, kv_indptr_d, total_num_rows_p,
                          batch_size_p, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
                          head_dim_vo, page_size, max_batch_size_if_split, enable_cuda_graph);
@@ -1037,15 +1044,17 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_request_indices");
+      sizeof(IdType) * padded_batch_size, 16, "pod_prefill_request_indices");
   plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_qo_tile_indices");
+      sizeof(IdType) * padded_batch_size, 16, "pod_prefill_qo_tile_indices");
   plan_info.kv_tile_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * padded_batch_size, 16, "batch_prefill_kv_tile_indices");
-  plan_info.o_indptr_offset = int_allocator.aligned_alloc_offset(sizeof(IdType) * (batch_size + 1),
-                                                                 16, "batch_prefill_o_indptr");
-  plan_info.kv_chunk_size_ptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_prefill_kv_chunk_size_ptr");
+      sizeof(IdType) * padded_batch_size, 16, "pod_prefill_kv_tile_indices");
+  plan_info.o_indptr_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * (batch_size + 1), 16, "pod_o_indptr");
+  plan_info.kv_chunk_size_ptr_offset_p =
+      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "pod_prefill_kv_chunk_size_ptr");
+  plan_info.kv_chunk_size_ptr_offset_d =
+      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "pod_prefill_kv_chunk_size_ptr");
 
   if (plan_info.enable_cuda_graph) {
     plan_info.total_num_rows_offset =
@@ -1075,13 +1084,13 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
-        "batch_prefill_tmp_v");
+        "pod_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
+        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "pod_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
-        sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
+        sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "pod_merge_indptr");
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
-        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
+        sizeof(bool) * padded_batch_size, 16, "pod_block_valid_mask");
 
     IdType* merge_indptr_h =
         GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
