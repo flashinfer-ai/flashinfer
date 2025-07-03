@@ -1,19 +1,19 @@
 /*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
-* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
 namespace batchedGemm {
@@ -64,29 +64,29 @@ inline bool mmaKindIsBlockFmt(MmaKind mmaKind) {
 // For logging and error reporting
 inline std::string mmaKindToString(MmaKind mmaKind) {
   switch (mmaKind) {
-  case MmaKind::Auto:
-    return "Auto";
-  case MmaKind::Fp16:
-    return "Fp16";
-  case MmaKind::Fp8Fp6Fp4:
-    return "Fp8Fp6Fp4";
-  case MmaKind::Int8:
-    return "Int8";
-  case MmaKind::MxFp4NvFp4:
-    return "MxFp4NvFp4";
-  case MmaKind::MxFp8Fp6Fp4:
-    return "MxFp8Fp6Fp4";
-  case MmaKind::Tf32:
-    return "Tf32";
-  default:
-    assert(false);
-    return "Unsupported type";
+    case MmaKind::Auto:
+      return "Auto";
+    case MmaKind::Fp16:
+      return "Fp16";
+    case MmaKind::Fp8Fp6Fp4:
+      return "Fp8Fp6Fp4";
+    case MmaKind::Int8:
+      return "Int8";
+    case MmaKind::MxFp4NvFp4:
+      return "MxFp4NvFp4";
+    case MmaKind::MxFp8Fp6Fp4:
+      return "MxFp8Fp6Fp4";
+    case MmaKind::Tf32:
+      return "Tf32";
+    default:
+      assert(false);
+      return "Unsupported type";
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gen
-} // namespace trtllm
+}  // namespace gen
+}  // namespace trtllm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

@@ -1,19 +1,19 @@
 /*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
-* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
 #include <numeric>
@@ -24,7 +24,7 @@
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 #include "KernelMetaInfo.h"
-#endif // TLLM_GEN_EXPORT_INTERFACE
+#endif  // TLLM_GEN_EXPORT_INTERFACE
 
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
@@ -388,22 +388,17 @@ struct BatchedGemmData {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 class BatchedGemmInterface {
-public:
+ public:
   BatchedGemmInterface() {}
 
   // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
   // Provided config must be validated with isValidConfig before the call.
-  int32_t run(BatchedGemmConfig const& config,
-              void* workspace,
-              BatchedGemmData const& options,
-              void* cudaStream,
-              int32_t multiProcessorCount,
-              bool usePdl = true);
+  int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options,
+              void* cudaStream, int32_t multiProcessorCount, bool usePdl = true);
 
   // Initializes the buffers before the world sync. Must be called before run.
   int32_t runInitBeforeWorldSync(BatchedGemmConfig const& /* config */,
-                                 BatchedGemmData const& /* data */,
-                                 void* /* cudaStream */) const {
+                                 BatchedGemmData const& /* data */, void* /* cudaStream */) const {
     return 0;
   };
 
@@ -422,9 +417,10 @@ public:
   // Returns true if the configuration of the cubin can be executed for the given params.
   bool isValidConfig(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
-private:
+ private:
   // Aligns the pointer to the alignment
-  template <typename Dtype> inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
+  template <typename Dtype>
+  inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
   // Creates GemmOptions from kernel and data.
   BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config,
                                                  BatchedGemmData const& data) const;
@@ -436,7 +432,7 @@ private:
   // Returns the size padded to the alignment
   size_t getSizePaddedToAlignment(size_t size, size_t alignment) const;
 
-private:
+ private:
   // Number of the CTAs of the last launched kernel.
   int32_t mNumCtas{0};
 };
@@ -473,8 +469,7 @@ size_t BatchedGemmInterface::getNumBatchedGemmConfigs() const {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 BatchedGemmOptions BatchedGemmInterface::getOptionsFromConfigAndData(
-  BatchedGemmConfig const& config,
-  BatchedGemmData const& data) const {
+    BatchedGemmConfig const& config, BatchedGemmData const& data) const {
   // Create options from config and data.
   BatchedGemmOptions options;
   options = config.mOptions;
@@ -501,8 +496,7 @@ bool BatchedGemmInterface::isValidConfig(BatchedGemmConfig const& config,
   bool isBlackwell = config.mSm == gemm::SmVersion::Sm100a;
 
   // Check options without modifications.
-  return checkAndUpdateBatchedGemmOptions(options,
-                                          isBlackwell,
+  return checkAndUpdateBatchedGemmOptions(options, isBlackwell,
                                           /* updateOptions */ false);
 }
 
@@ -526,9 +520,7 @@ size_t BatchedGemmInterface::getWorkspaceSizeInBytes(BatchedGemmConfig const& co
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
-  BatchedGemmConfig const& config,
-  BatchedGemmData const& data) const {
-
+    BatchedGemmConfig const& config, BatchedGemmData const& data) const {
   std::vector<size_t> workspaceSizes;
 
   // Get options from config and data.
@@ -573,12 +565,9 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
-                                  void* workspace,
-                                  BatchedGemmData const& batchedGemmData,
-                                  void* cudaStream,
-                                  int32_t /* multiProcessorCount */,
-                                  bool usePdl) {
+int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
+                                  BatchedGemmData const& batchedGemmData, void* cudaStream,
+                                  int32_t /* multiProcessorCount */, bool usePdl) {
   // Might be used.
   (void)usePdl;
   // Get options from config and data.
@@ -596,10 +585,8 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
   if (useDeepSeekFp8 && options.mFusedAct) {
     dPtrRowMax = reinterpret_cast<float*>(alignPtr(reinterpret_cast<char*>(workspace), 1024));
     dPtrRowMaxBars = reinterpret_cast<uint32_t*>(
-      alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
-    auto err = cudaMemsetAsync((void*)dPtrRowMaxBars,
-                               0x00,
-                               workspaceSizes[1],
+        alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
+    auto err = cudaMemsetAsync((void*)dPtrRowMaxBars, 0x00, workspaceSizes[1],
                                reinterpret_cast<cudaStream_t>(cudaStream));
     if (err != cudaSuccess) {
       return 1;
@@ -629,30 +616,18 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
   auto const numCtaZ = options.mNumSlicesForSplitK;
   mNumCtas = numCtaX * numCtaY * numCtaZ;
 
-  auto kernelParams =
-    KernelParams::setKernelParams(options,
-                                  batchM,
-                                  batchedGemmData.mInputBuffers.mPtrA,
-                                  batchedGemmData.mInputBuffers.mPtrB,
-                                  batchedGemmData.mOutputBuffers.mPtrC,
-                                  batchedGemmData.mInputBuffers.mPtrSfA,
-                                  batchedGemmData.mInputBuffers.mPtrSfB,
-                                  batchedGemmData.mInputBuffers.mPtrPerTokenSfA,
-                                  batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
-                                  batchedGemmData.mInputBuffers.mPtrBias,
-                                  batchedGemmData.mOutputBuffers.mPtrSfC,
-                                  batchedGemmData.mInputBuffers.mPtrScaleC,
-                                  batchedGemmData.mInputBuffers.mPtrScaleGate,
-                                  batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
-                                  batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
-                                  batchedGemmData.mInputBuffers.mPtrRouteMap,
-                                  dPtrRowMax,
-                                  dPtrRowMaxBars,
-                                  batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
-                                  batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-                                  batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
-                                  batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-                                  maxNumCtasInBatchDim);
+  auto kernelParams = KernelParams::setKernelParams(
+      options, batchM, batchedGemmData.mInputBuffers.mPtrA, batchedGemmData.mInputBuffers.mPtrB,
+      batchedGemmData.mOutputBuffers.mPtrC, batchedGemmData.mInputBuffers.mPtrSfA,
+      batchedGemmData.mInputBuffers.mPtrSfB, batchedGemmData.mInputBuffers.mPtrPerTokenSfA,
+      batchedGemmData.mInputBuffers.mPtrPerTokenSfB, batchedGemmData.mInputBuffers.mPtrBias,
+      batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
+      batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
+      batchedGemmData.mInputBuffers.mPtrSwiGluBeta, batchedGemmData.mInputBuffers.mPtrRouteMap,
+      dPtrRowMax, dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+      batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
+      batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+      batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
 
   // The size of the grid.
   std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};
@@ -662,20 +637,19 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
   CUfunction cuFunction;
 #if 1
   const std::string sha256 = "";
-    std::string fname_cubin = config.mFunctionName;
+  std::string fname_cubin = config.mFunctionName;
   if (!fname_cubin.empty()) {
-        fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
+    fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
   }
   std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
-    cuModuleLoadData(&cuModule, cubin.c_str());
+  cuModuleLoadData(&cuModule, cubin.c_str());
 #else
-    cuModuleLoadData(&cuModule, config.mData);
+  cuModuleLoadData(&cuModule, config.mData);
 #endif
   cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
 
   // Prepare the grid/block.
-  dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA),
-              static_cast<uint32_t>(1),
+  dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1),
               static_cast<uint32_t>(1)};
   dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
              (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
@@ -686,16 +660,10 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
                 static_cast<uint32_t>(options.mClusterDimZ)};
 
   // Run the kernel.
-  auto result = trtllm::gen::launchKernel((void*)&kernelParams,
-                                          cudaStream,
-                                          config.mSharedMemSize,
-                                          cuFunction,
-                                          block3,
-                                          grid3,
-                                          cluster3,
-                                          usePdl && (config.mOptions.mGridWaitForPrimaryEarlyExit |
-                                                     config.mOptions.mGridWaitForPrimaryA |
-                                                     config.mOptions.mGridWaitForPrimaryB));
+  auto result = trtllm::gen::launchKernel(
+      (void*)&kernelParams, cudaStream, config.mSharedMemSize, cuFunction, block3, grid3, cluster3,
+      usePdl && (config.mOptions.mGridWaitForPrimaryEarlyExit |
+                 config.mOptions.mGridWaitForPrimaryA | config.mOptions.mGridWaitForPrimaryB));
   if (result != CUDA_SUCCESS) {
     return -1;
   }
@@ -708,8 +676,8 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace batchedGemm
+}  // namespace batchedGemm
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

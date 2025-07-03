@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,14 +22,15 @@
 // #include "tensorrt_llm/common/logger.h"
 // #include "tensorrt_llm/common/tllmException.h"
 
-#include <algorithm>
-#include <cassert>
-#include <cinttypes>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_types.h>
+
+#include <algorithm>
+#include <cassert>
+#include <cinttypes>
 #include <fstream>
 #include <iomanip>
 #include <memory>
@@ -42,12 +43,12 @@
 // #include <vector>
 // #ifdef _WIN32  // Windows
 // #include <windows.h>
-// #undef ERROR   // A Windows header file defines ERROR as 0, but it's used in our logger.h enum. Logging breaks without
+// #undef ERROR   // A Windows header file defines ERROR as 0, but it's used in our logger.h enum.
+// Logging breaks without
 //                // this undef.
 // #endif         // WIN32
 
-namespace tensorrt_llm::common
-{
+namespace tensorrt_llm::common {
 
 // // workspace for cublas gemm : 32MB
 // #define CUBLAS_WORKSPACE_SIZE 33554432
@@ -90,82 +91,68 @@ namespace tensorrt_llm::common
 
 /* **************************** debug tools ********************************* */
 
-inline std::optional<bool> isCudaLaunchBlocking()
-{
-    thread_local bool firstCall = true;
-    thread_local std::optional<bool> result = std::nullopt;
-    if (!firstCall)
-    {
-        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-        if (env != nullptr && std::string(env) == "1")
-        {
-            result = true;
-        }
-        else
-        {
-            result = false;
-        }
-        firstCall = false;
+inline std::optional<bool> isCudaLaunchBlocking() {
+  thread_local bool firstCall = true;
+  thread_local std::optional<bool> result = std::nullopt;
+  if (!firstCall) {
+    char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
+    if (env != nullptr && std::string(env) == "1") {
+      result = true;
+    } else {
+      result = false;
     }
-    return result;
+    firstCall = false;
+  }
+  return result;
 }
 
-inline std::optional<bool> isCapturing(cudaStream_t stream)
-{
-    cudaStreamCaptureStatus status;
-    TORCH_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess, "CUDA error in cudaStreamIsCapturing");
-    return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
+inline std::optional<bool> isCapturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus status;
+  TORCH_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess,
+              "CUDA error in cudaStreamIsCapturing");
+  return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
 }
 
-inline bool doCheckError(cudaStream_t stream)
-{
-    auto const cudaLaunchBlocking = isCudaLaunchBlocking();
-    if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
-    {
-        return !isCapturing(stream);
-    }
+inline bool doCheckError(cudaStream_t stream) {
+  auto const cudaLaunchBlocking = isCudaLaunchBlocking();
+  if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value()) {
+    return !isCapturing(stream);
+  }
 
 #ifndef NDEBUG
-    // Debug builds will sync when we're not capturing unless explicitly
-    // disabled.
-    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
+  // Debug builds will sync when we're not capturing unless explicitly
+  // disabled.
+  bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
 #else
-    bool const checkError = cudaLaunchBlocking.value_or(false);
+  bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
 
-    return checkError;
+  return checkError;
 }
 
-inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
-{
-    if (doCheckError(stream))
-    {
-        cudaStreamSynchronize(stream);
-        auto error = cudaGetLastError();
-        TORCH_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
-    }
+inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line) {
+  if (doCheckError(stream)) {
+    cudaStreamSynchronize(stream);
+    auto error = cudaGetLastError();
+    TORCH_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
+  }
 }
 
 #define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, __FILE__, __LINE__)
 
 template <typename T1, typename T2>
-inline size_t divUp(T1 const& a, T2 const& b)
-{
-    auto const tmp_a = static_cast<size_t>(a);
-    auto const tmp_b = static_cast<size_t>(b);
-    return (tmp_a + tmp_b - 1) / tmp_b;
+inline size_t divUp(T1 const& a, T2 const& b) {
+  auto const tmp_a = static_cast<size_t>(a);
+  auto const tmp_b = static_cast<size_t>(b);
+  return (tmp_a + tmp_b - 1) / tmp_b;
 }
 
-inline int roundUp(int a, int b)
-{
-    return divUp(a, b) * b;
-}
+inline int roundUp(int a, int b) { return divUp(a, b) * b; }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
-    typename = std::enable_if_t<std::is_integral<U>::value>>
-auto constexpr ceilDiv(T numerator, U denominator)
-{
-    return (numerator + denominator - 1) / denominator;
+          typename = std::enable_if_t<std::is_integral<U>::value>>
+auto constexpr ceilDiv(T numerator, U denominator) {
+  return (numerator + denominator - 1) / denominator;
 }
 
-} // namespace tensorrt_llm::common
+}  // namespace tensorrt_llm::common

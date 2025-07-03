@@ -1,25 +1,25 @@
 /*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
-* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
-#include <cstdint>
 #include <cassert>
-#include <vector>
+#include <cstdint>
 #include <string>
+#include <vector>
 #ifndef TLLM_GEN_EXPORT_INTERFACE
 #include "trtllm/gen/MmaDecl.h"
 #else
@@ -50,9 +50,9 @@ enum class Dtype : uint32_t {
 //         Bit 4: is it signed?  0x1 if true, 0x0 otherwise.
 // Byte 3: Is it a block format? 0x1 if true, 0x0 otherwise.
 
-#define TLLM_ENCODE_DTYPE(BlockFormatBit, SignedBit, IntegerBit, NumBits, Uid)                     \
-  uint32_t {                                                                                       \
-    (BlockFormatBit << 24) | (SignedBit << 20) | (IntegerBit << 16) | (NumBits << 8) | (Uid)       \
+#define TLLM_ENCODE_DTYPE(BlockFormatBit, SignedBit, IntegerBit, NumBits, Uid)               \
+  uint32_t {                                                                                 \
+    (BlockFormatBit << 24) | (SignedBit << 20) | (IntegerBit << 16) | (NumBits << 8) | (Uid) \
   }
 
   // clang-format off
@@ -109,9 +109,7 @@ inline bool dtypeIsFloat(Dtype dtype) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Is a given data type an 8-bit floating-point type?
-inline bool dtypeIsFp8(Dtype dtype) {
-  return dtype == Dtype::E4m3 || dtype == Dtype::E5m2;
-}
+inline bool dtypeIsFp8(Dtype dtype) { return dtype == Dtype::E4m3 || dtype == Dtype::E5m2; }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -134,51 +132,51 @@ inline bool dtypeIsSigned(Dtype dtype) {
 // For logging and error reporting
 inline std::string dtypeToString(Dtype dtype) {
   switch (dtype) {
-  case Dtype::Bfloat16:
-    return "Bfloat16";
-  case Dtype::Bool:
-    return "Bool";
-  case Dtype::E2m1:
-    return "E2m1";
-  case Dtype::E2m3:
-    return "E2m3";
-  case Dtype::E3m2:
-    return "E3m2";
-  case Dtype::E4m3:
-    return "E4m3";
-  case Dtype::E5m2:
-    return "E5m2";
-  case Dtype::Fp16:
-    return "Fp16";
-  case Dtype::Fp32:
-    return "Fp32";
-  case Dtype::Int8:
-    return "Int8";
-  case Dtype::Int32:
-    return "Int32";
-  case Dtype::Int64:
-    return "Int64";
-  case Dtype::MxE4m3:
-    return "MxE4m3";
-  case Dtype::MxE2m1:
-    return "MxE2m1";
-  case Dtype::UE8m0:
-    return "UE8m0";
-  case Dtype::UInt8:
-    return "UInt8";
-  case Dtype::UInt16:
-    return "UInt16";
-  case Dtype::UInt32:
-    return "UInt32";
-  case Dtype::UInt64:
-    return "UInt64";
-  case Dtype::UInt128:
-    return "UInt128";
-  case Dtype::Void:
-    return "Void";
-  default:
-    assert(false);
-    return "Unsupported type";
+    case Dtype::Bfloat16:
+      return "Bfloat16";
+    case Dtype::Bool:
+      return "Bool";
+    case Dtype::E2m1:
+      return "E2m1";
+    case Dtype::E2m3:
+      return "E2m3";
+    case Dtype::E3m2:
+      return "E3m2";
+    case Dtype::E4m3:
+      return "E4m3";
+    case Dtype::E5m2:
+      return "E5m2";
+    case Dtype::Fp16:
+      return "Fp16";
+    case Dtype::Fp32:
+      return "Fp32";
+    case Dtype::Int8:
+      return "Int8";
+    case Dtype::Int32:
+      return "Int32";
+    case Dtype::Int64:
+      return "Int64";
+    case Dtype::MxE4m3:
+      return "MxE4m3";
+    case Dtype::MxE2m1:
+      return "MxE2m1";
+    case Dtype::UE8m0:
+      return "UE8m0";
+    case Dtype::UInt8:
+      return "UInt8";
+    case Dtype::UInt16:
+      return "UInt16";
+    case Dtype::UInt32:
+      return "UInt32";
+    case Dtype::UInt64:
+      return "UInt64";
+    case Dtype::UInt128:
+      return "UInt128";
+    case Dtype::Void:
+      return "Void";
+    default:
+      assert(false);
+      return "Unsupported type";
   }
 }
 
@@ -186,12 +184,12 @@ inline std::string dtypeToString(Dtype dtype) {
 
 inline Dtype dtypeEltType(Dtype dtype) {
   switch (dtype) {
-  case Dtype::MxE2m1:
-    return Dtype::E2m1;
-  case Dtype::MxE4m3:
-    return Dtype::E4m3;
-  default:
-    return dtype;
+    case Dtype::MxE2m1:
+      return Dtype::E2m1;
+    case Dtype::MxE4m3:
+      return Dtype::E4m3;
+    default:
+      return dtype;
   }
 }
 
@@ -199,14 +197,14 @@ inline Dtype dtypeEltType(Dtype dtype) {
 
 inline int dtypeNumEltsPerSf(Dtype dtype) {
   switch (dtype) {
-  case Dtype::E2m1:
-    return 16;
-  case Dtype::MxE2m1:
-  case Dtype::MxE4m3:
-    return 32;
-  default:
-    assert(false);
-    return -1;
+    case Dtype::E2m1:
+      return 16;
+    case Dtype::MxE2m1:
+    case Dtype::MxE4m3:
+      return 32;
+    default:
+      assert(false);
+      return -1;
   }
 }
 
@@ -215,14 +213,14 @@ inline int dtypeNumEltsPerSf(Dtype dtype) {
 // Returns the dtype of scaling factors, if applicable.
 inline Dtype dtypeGetBlockSfType(Dtype dtype) {
   switch (dtype) {
-  case Dtype::E2m1:
-    return Dtype::E4m3;
-  case Dtype::MxE2m1:
-  case Dtype::MxE4m3:
-    return Dtype::UE8m0;
-  default:
-    assert(false);
-    return Dtype::Void;
+    case Dtype::E2m1:
+      return Dtype::E4m3;
+    case Dtype::MxE2m1:
+    case Dtype::MxE4m3:
+      return Dtype::UE8m0;
+    default:
+      assert(false);
+      return Dtype::Void;
   }
 }
 
@@ -267,7 +265,7 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gen
-} // namespace trtllm
+}  // namespace gen
+}  // namespace trtllm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

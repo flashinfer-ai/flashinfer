@@ -1,19 +1,19 @@
 /*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
-* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #pragma once
 
 #include <cstdint>
@@ -99,10 +99,8 @@ enum class TileScheduler {
 
 // Helper functions to check the SplitK type.
 
-#define SPLIT_K_FUNCTION(Mode)                                                                     \
-  inline bool doesSplitKUse##Mode(SplitK mode) {                                                   \
-    return (mode == SplitK::Mode);                                                                 \
-  }
+#define SPLIT_K_FUNCTION(Mode) \
+  inline bool doesSplitKUse##Mode(SplitK mode) { return (mode == SplitK::Mode); }
 
 SPLIT_K_FUNCTION(Gmem)
 SPLIT_K_FUNCTION(Dsmem)
@@ -113,10 +111,8 @@ SPLIT_K_FUNCTION(Dsmem)
 
 // Helper functions to check the Bias type.
 
-#define BIAS_TYPE_FUNCTION(Mode)                                                                   \
-  inline bool isBiasType##Mode(BiasType type) {                                                    \
-    return (type == BiasType::Mode);                                                               \
-  }
+#define BIAS_TYPE_FUNCTION(Mode) \
+  inline bool isBiasType##Mode(BiasType type) { return (type == BiasType::Mode); }
 
 BIAS_TYPE_FUNCTION(None)
 BIAS_TYPE_FUNCTION(N)
@@ -127,6 +123,6 @@ BIAS_TYPE_FUNCTION(Mn)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gemm
+}  // namespace gemm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm
