@@ -350,17 +350,17 @@ class PODWithPagedKVCacheWrapper:
         """
         # Logits soft cap is not supported currently
         logits_soft_cap = False
-        batch_size = len(last_page_len_d)
+        batch_size_d = len(last_page_len_d)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
-        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        qo_indptr_host = _get_range_buf(batch_size_d + 1, "cpu")
         if self.is_cuda_graph_enabled:
-            if batch_size != self._fixed_batch_size:
+            if batch_size_d != self._fixed_batch_size:
                 raise ValueError(
                     "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
                     " mismatches the batch size set during initialization {}".format(
-                        batch_size, self._fixed_batch_size
+                        batch_size_d, self._fixed_batch_size
                     )
                 )
             if len(indices_d) > len(self._paged_kv_indices_buf):
@@ -429,8 +429,8 @@ class PODWithPagedKVCacheWrapper:
             qo_indptr_host,
             indptr_host,
             kv_lens_arr_host,
-            batch_size,  # total_num_rows
-            batch_size,
+            batch_size_d,  # total_num_rows
+            batch_size_d,
             num_qo_heads,
             num_kv_heads,
             page_size,

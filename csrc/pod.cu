@@ -36,6 +36,36 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
 
 using namespace flashinfer;
 
+at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                              at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
+                              at::Tensor kv_indptr_p, at::Tensor kv_len_arr_p,
+                              at::Tensor kv_indptr_d, at::Tensor qo_indptr_d,
+                              int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
+                              int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
+                              int64_t head_dim_qk, int64_t head_dim_vo, bool causal) {
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+
+  PrefillPlanInfo plan_info;
+
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  cudaError_t status = PrefillPlan<IdType>(
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info, qo_indptr_p.data_ptr<IdType>(),
+      kv_indptr_p.data_ptr<IdType>(), qo_indptr_d.data_ptr<IdType>(),
+      kv_indptr_d.data_ptr<IdType>(), total_num_rows, batch_size, num_qo_heads, num_kv_heads,
+      head_dim_qk, head_dim_vo, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+
+  TORCH_CHECK(status == cudaSuccess,
+              "Failed to plan prefill with error: ", cudaGetErrorString(status));
+
+  return vec_to_tensor(plan_info.ToVector());
+}
+
 void pod_with_kv_cache_tensor(
     // Prefill params
     at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
@@ -200,30 +230,6 @@ void pod_with_kv_cache_tensor(
           params.q_stride_n = q_stride_n_d;
           params.q_stride_h = q_stride_h_d;
           params.window_left = window_left_d;
-
-          params.request_indices = nullptr;
-          params.qo_tile_indices = nullptr;
-          params.kv_tile_indices = nullptr;
-          params.merge_indptr = nullptr;
-          params.o_indptr = nullptr;
-          params.kv_chunk_size_ptr = nullptr;
-          params.block_valid_mask = nullptr;
-          params.total_num_rows = nullptr;
-          params.max_total_num_rows = 0;
-          params.padded_batch_size = 0;
-          params.partition_kv = false;
-
-          params.maybe_mask_indptr = maybe_mask_indptr_d
-                                         ? static_cast<int32_t*>(maybe_mask_indptr_d->data_ptr())
-                                         : nullptr;
-          params.maybe_alibi_slopes = maybe_alibi_slopes_d
-                                          ? static_cast<float*>(maybe_alibi_slopes_d->data_ptr())
-                                          : nullptr;
-          params.logits_soft_cap = logits_soft_cap_d;
-          params.sm_scale = sm_scale_d;
-          params.rope_rcp_scale = rope_rcp_scale_d;
-          params.rope_rcp_theta = rope_rcp_theta_d;
-
           params.request_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
           params.qo_tile_indices =
@@ -245,6 +251,19 @@ void pod_with_kv_cache_tensor(
           }
           params.padded_batch_size = plan_info.padded_batch_size;
           params.max_total_num_rows = plan_info.total_num_rows;
+
+          params.partition_kv = false;
+          params.maybe_mask_indptr = maybe_mask_indptr_d
+                                         ? static_cast<int32_t*>(maybe_mask_indptr_d->data_ptr())
+                                         : nullptr;
+          params.maybe_alibi_slopes = maybe_alibi_slopes_d
+                                          ? static_cast<float*>(maybe_alibi_slopes_d->data_ptr())
+                                          : nullptr;
+          params.logits_soft_cap = logits_soft_cap_d;
+          params.sm_scale = sm_scale_d;
+          params.rope_rcp_scale = rope_rcp_scale_d;
+          params.rope_rcp_theta = rope_rcp_theta_d;
+
           if (plan_info.enable_cuda_graph) {
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
