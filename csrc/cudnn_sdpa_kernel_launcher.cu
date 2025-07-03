@@ -582,7 +582,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
     config.gridDimX = actual_num_tiles_per_head;
 
   } else {
-    config.gridDimX = static_cast<int>(std::ceil(q.size(0) / (TILE_M_1 * 2.0f))) * b;
+    config.gridDimX = static_cast<int>(std::ceil(s_qo / (TILE_M_1 * 2.0f))) * b;
   }
 
   config.gridDimY = h_qo;
@@ -666,7 +666,15 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
     dim3 grid(1, 1, 1);
     dim3 block(128, 1, 1);
 
-    qkv_tma_setup_prefill<<<grid, block, 0, stream>>>(
+    at::cuda::CUDAStream cuda_stream = at::cuda::getCurrentCUDAStream(device.index());
+    cudaStream_t raw_stream = cuda_stream.stream();
+
+    cudaError_t err = cudaStreamQuery(raw_stream);
+    if (!(err == cudaSuccess || err == cudaErrorNotReady)) {
+      throw std::runtime_error("CUDA cudnn stream error" + std::string(cudaGetErrorString(err)));
+    }
+
+    qkv_tma_setup_prefill<<<grid, block, 0, raw_stream>>>(
         b, h_qo, h_kv, d_qk, d_vo, is_kv_ragged, page_size, total_num_pages,
         k_cache.strides().data()[2], k_cache.strides().data()[1], k_cache.strides().data()[0],
         v_cache.strides().data()[2], v_cache.strides().data()[1], v_cache.strides().data()[0],
