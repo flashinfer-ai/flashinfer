@@ -489,6 +489,9 @@ def cutlass_fused_moe(
     )
 
 
+# trtllmgen-moe-fp8
+
+
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "fused_moe_sm100",
@@ -1086,3 +1089,6 @@ def trtllm_fp8_block_scale_moe(
         tile_tokens_dim,
         routing_method_type,
     )
+
+
+# trtllmgen-moe-nvfp4
