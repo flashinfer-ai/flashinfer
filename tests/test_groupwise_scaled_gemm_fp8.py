@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from einops import einsum, rearrange, repeat, reduce
+from einops import einsum, rearrange, reduce, repeat
 
 from flashinfer.gemm import (
     gemm_fp8_nt_blockscaled,
@@ -87,47 +87,92 @@ def gemm_fp8_nt_groupwise_ref(
 
 
 def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
-    assert x.ndim == len(scale_shape) == len(tile_shape)
+    """
+    Quantizes a 2D or 3D tensor to FP8.
+
+    Args:
+        x (torch.Tensor): The 2D or 3D input tensor.
+        scale_shape (tuple): The shape of the scale tensor.
+        tile_shape (tuple): The shape of the tiles.
+        scale_major_mode (str): The tiling order, "K" for row-major like,
+                                or another value for column-major like.
+
+    Returns:
+        tuple: A tuple containing the quantized FP8 tensor and the
+               calculated float32 scales.
+    """
+    # 1. Assertions and Initial Setup
+    ndim = x.ndim
+    assert ndim in [2, 3], f"x.ndim must be 2 or 3, but got {ndim}"
+    assert ndim == len(scale_shape) == len(tile_shape)
+
     fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_amax = max(abs(fp8_info.max), abs(fp8_info.min))
-    x_fp32 = torch.empty(x.shape, dtype=torch.float32, device="cuda")
-    x_scale = torch.empty(scale_shape, dtype=torch.float32, device="cuda")
-    if x.ndim == 2:
-        for i in range(scale_shape[0]):
-            for j in range(scale_shape[1]):
-                if scale_major_mode == "K":
-                    index_select = (
-                        slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
-                        slice(j * tile_shape[1], (j + 1) * tile_shape[1]),
-                    )
-                else:
-                    index_select = (
-                        slice(j * tile_shape[0], (j + 1) * tile_shape[0]),
-                        slice(i * tile_shape[1], (i + 1) * tile_shape[1]),
-                    )
-                x_scale[i, j] = x[index_select].abs().max() / fp8_amax
-                x_fp32[index_select] = x[index_select] / (x_scale[i, j] + 1e-8)
-    elif x.ndim == 3:
-        for i in range(scale_shape[0]):
-            for j in range(scale_shape[1]):
-                for k in range(scale_shape[2]):
-                    if scale_major_mode == "K":
-                        index_select = (
-                            slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
-                            slice(j * tile_shape[1], (j + 1) * tile_shape[1]),
-                            slice(k * tile_shape[2], (k + 1) * tile_shape[2]),
-                        )
-                    else:
-                        index_select = (
-                            slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
-                            slice(k * tile_shape[1], (k + 1) * tile_shape[1]),
-                            slice(j * tile_shape[2], (j + 1) * tile_shape[2]),
-                        )
-                    x_scale[i, j, k] = x[index_select].abs().max() / fp8_amax
-                    x_fp32[index_select] = x[index_select] / (x_scale[i, j, k] + 1e-8)
-    else:
-        raise ValueError(f"x.ndim must be 2 or 3, but got {x.ndim}")
+    fp8_amax = torch.tensor(fp8_info.max, device=x.device, dtype=torch.float32)
+
+    # 2. Tiling and Scale Calculation
+    if ndim == 2:
+        s0, s1 = scale_shape
+        t0, t1 = tile_shape
+        if scale_major_mode == "K":
+            # Tile x and find the max absolute value in each tile
+            x_tiled = rearrange(x, "(s0 t0) (s1 t1) -> s0 s1 t0 t1", s0=s0, s1=s1)
+            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max")
+            x_scale = abs_max / fp8_amax
+
+            # Broadcast scales back to the original tensor shape
+            scales_repeated = repeat(x_scale, "s0 s1 -> (s0 t0) (s1 t1)", t0=t0, t1=t1)
+        else:
+            # Handle column-major tiling
+            x_tiled = rearrange(x, "(s1 t0) (s0 t1) -> s0 s1 t0 t1", s0=s0, s1=s1)
+            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max")
+            x_scale = abs_max / fp8_amax
+
+            # Permute scale axes before repeating to match layout
+            scales_permuted = rearrange(x_scale, "s0 s1 -> s1 s0")
+            scales_repeated = repeat(
+                scales_permuted, "s1 s0 -> (s1 t0) (s0 t1)", t0=t0, t1=t1
+            )
+
+    elif ndim == 3:
+        s0, s1, s2 = scale_shape
+        t0, t1, t2 = tile_shape
+        if scale_major_mode == "K":
+            # Tile x and find the max absolute value in each tile
+            x_tiled = rearrange(
+                x, "(s0 t0) (s1 t1) (s2 t2) -> s0 s1 s2 t0 t1 t2", s0=s0, s1=s1, s2=s2
+            )
+            abs_max = reduce(x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max")
+            x_scale = abs_max / fp8_amax
+
+            # Broadcast scales back to the original tensor shape
+            scales_repeated = repeat(
+                x_scale, "s0 s1 s2 -> (s0 t0) (s1 t1) (s2 t2)", t0=t0, t1=t1, t2=t2
+            )
+        else:
+            # Handle layout where the last two axes are swapped
+            x_tiled = rearrange(
+                x, "(s0 t0) (s2 t1) (s1 t2) -> s0 s1 s2 t0 t1 t2", s0=s0, s1=s1, s2=s2
+            )
+            abs_max = reduce(x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max")
+            x_scale = abs_max / fp8_amax
+
+            # Permute scale axes before repeating to match layout
+            scales_permuted = rearrange(x_scale, "s0 s1 s2 -> s0 s2 s1")
+            scales_repeated = repeat(
+                scales_permuted,
+                "s0 s2 s1 -> (s0 t0) (s2 t1) (s1 t2)",
+                t0=t0,
+                t1=t1,
+                t2=t2,
+            )
+
+    # 3. Final Quantization
+    # Divide the original tensor by the broadcasted scales
+    x_fp32 = x / (scales_repeated + 1e-8)
+
+    # Convert the result to the target FP8 format
     x_fp8 = x_fp32.to(torch.float8_e4m3fn)
+
     return x_fp8, x_scale
 
 
