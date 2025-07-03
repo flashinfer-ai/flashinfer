@@ -304,6 +304,7 @@ struct BatchedGemmConfig {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
   uint8_t const* mData{nullptr};
   uint32_t const mSize{0};
+  char const* mChecksum{nullptr};
   uint32_t const mSharedMemSize{0};
   char const* mFunctionName{nullptr};
   uint32_t const mNumThreadsPerCTA{0};
