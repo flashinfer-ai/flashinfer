@@ -118,6 +118,7 @@ class MemAllocatorHelper {
 
 int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind) {
   if (mmaKind == tg::MmaKind::Auto) {
+    std::cout << "mmaKind != tg::MmaKind::Auto" << std::endl;
     assert(false);
     return -1;
   }

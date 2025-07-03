@@ -243,8 +243,10 @@ struct BatchedGemmData {
     float const* mPtrScaleGate{nullptr};
 
     // The alpha and beta for SwiGlu.
-    // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
-    // Shape is [B]
+    // gatedActivation <- (x0 + beta) * activation(x1, alpha)
+    // Shape is [B].
+    // Alpha is 1.f if nullptr.
+    // Beta is 0.f if nullptr.
     float const* mPtrSwiGluAlpha{nullptr};
     float const* mPtrSwiGluBeta{nullptr};
 
