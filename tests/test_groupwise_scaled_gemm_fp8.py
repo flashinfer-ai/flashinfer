@@ -124,7 +124,7 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
                             slice(j * tile_shape[2], (j + 1) * tile_shape[2]),
                         )
                     x_scale[i, j, k] = x[index_select].abs().max() / fp8_amax
-                    x_fp32[index_select] = x[index_select] / x_scale[i, j, k]
+                    x_fp32[index_select] = x[index_select] / (x_scale[i, j, k] + 1e-8)
     else:
         raise ValueError(f"x.ndim must be 2 or 3, but got {x.ndim}")
     x_fp8 = x_fp32.to(torch.float8_e4m3fn)
