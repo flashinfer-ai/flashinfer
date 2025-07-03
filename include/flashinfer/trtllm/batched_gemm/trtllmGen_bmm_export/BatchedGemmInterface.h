@@ -636,7 +636,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
   CUmodule cuModule;
   CUfunction cuFunction;
 #if 1
-  const std::string sha256 = config.mChecksum ? config.mChecksum : ""; 
+  const std::string sha256 = config.mChecksum ? config.mChecksum : "";
   std::string fname_cubin = config.mFunctionName;
   if (!fname_cubin.empty()) {
     fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
