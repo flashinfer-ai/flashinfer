@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
+import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 from einops import einsum, rearrange
 
 from flashinfer.gemm import (
@@ -87,6 +86,51 @@ def gemm_fp8_nt_groupwise_ref(
     return einsum(A_f32_scale, B_f32_scale, "m k, n k -> m n").to(output_dtype)
 
 
+def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
+    assert x.ndim == len(scale_shape) == len(tile_shape)
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    fp8_amax = max(abs(fp8_info.max), abs(fp8_info.min))
+    x_fp32 = torch.empty(x.shape, dtype=torch.float32, device="cuda")
+    x_scale = torch.empty(scale_shape, dtype=torch.float32, device="cuda")
+    if x.ndim == 2:
+        for i in range(scale_shape[0]):
+            for j in range(scale_shape[1]):
+                if scale_major_mode == "K":
+                    index_select = (
+                        slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
+                        slice(j * tile_shape[1], (j + 1) * tile_shape[1]),
+                    )
+                else:
+                    index_select = (
+                        slice(j * tile_shape[0], (j + 1) * tile_shape[0]),
+                        slice(i * tile_shape[1], (i + 1) * tile_shape[1]),
+                    )
+                x_scale[i, j] = x[index_select].abs().max() / fp8_amax
+                x_fp32[index_select] = x[index_select] / x_scale[i, j]
+    elif x.ndim == 3:
+        for i in range(scale_shape[0]):
+            for j in range(scale_shape[1]):
+                for k in range(scale_shape[2]):
+                    if scale_major_mode == "K":
+                        index_select = (
+                            slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
+                            slice(j * tile_shape[1], (j + 1) * tile_shape[1]),
+                            slice(k * tile_shape[2], (k + 1) * tile_shape[2]),
+                        )
+                    else:
+                        index_select = (
+                            slice(i * tile_shape[0], (i + 1) * tile_shape[0]),
+                            slice(k * tile_shape[1], (k + 1) * tile_shape[1]),
+                            slice(j * tile_shape[2], (j + 1) * tile_shape[2]),
+                        )
+                    x_scale[i, j, k] = x[index_select].abs().max() / fp8_amax
+                    x_fp32[index_select] = x[index_select] / x_scale[i, j, k]
+    else:
+        raise ValueError(f"x.ndim must be 2 or 3, but got {x.ndim}")
+    x_fp8 = x_fp32.to(torch.float8_e4m3fn)
+    return x_fp8, x_scale
+
+
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
@@ -101,15 +145,9 @@ def test_fp8_blockscale_gemm(
 ):
     torch.random.manual_seed(0)
     tile_size = 128
-    factor_for_scale = 0.01
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-    a_fp32 = (torch.randn((m, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
-    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
-
-    b_fp32 = (torch.randn((n, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
-    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
 
     if scale_major_mode == "K":
         a_scale_shape = (m // tile_size, k // tile_size)
@@ -117,13 +155,11 @@ def test_fp8_blockscale_gemm(
     else:
         a_scale_shape = (k // tile_size, m // tile_size)
         b_scale_shape = (k // tile_size, n // tile_size)
+    a_tile_shape = (tile_size, tile_size)
+    b_tile_shape = (tile_size, tile_size)
 
-    a_scale = (
-        torch.ones(a_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
-    b_scale = (
-        torch.ones(b_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
     c = gemm_fp8_nt_blockscaled(
         a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
@@ -154,15 +190,9 @@ def test_fp8_groupwise_gemm(
 ):
     torch.random.manual_seed(0)
     tile_size = 128
-    factor_for_scale = 0.01
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-    a_fp32 = (torch.randn((m, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
-    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
-
-    b_fp32 = (torch.randn((n, k), device="cuda", dtype=torch.float)) * 2 * fp8_max
-    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
 
     if scale_major_mode == "K":
         a_scale_shape = (m, k // tile_size)
@@ -170,13 +200,11 @@ def test_fp8_groupwise_gemm(
     else:
         a_scale_shape = (k // tile_size, m)
         b_scale_shape = (k // tile_size, n // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (tile_size, tile_size)
 
-    a_scale = (
-        torch.rand(a_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
-    b_scale = (
-        torch.rand(b_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
     c = gemm_fp8_nt_groupwise(
         a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
@@ -209,23 +237,11 @@ def test_fp8_groupwise_group_gemm(
 ):
     torch.random.manual_seed(0)
     tile_size = 128
-    factor_for_scale = 0.01
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-    a_fp32 = (
-        (torch.randn((group_size * m, k), device="cuda", dtype=torch.float))
-        * 2
-        * fp8_max
-    )
-    a_fp8 = a_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
-
-    b_fp32 = (
-        (torch.randn((group_size, n, k), device="cuda", dtype=torch.float))
-        * 2
-        * fp8_max
-    )
-    b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    a_val = torch.randn((group_size * m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn(
+        (group_size, n, k), dtype=torch.float, device="cuda"
+    ) / math.sqrt(k)
 
     if scale_major_mode == "K":
         a_scale_shape = (group_size * m, k // tile_size)
@@ -233,13 +249,11 @@ def test_fp8_groupwise_group_gemm(
     else:
         a_scale_shape = (k // tile_size, m * group_size)
         b_scale_shape = (group_size, k // tile_size, n // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (1, tile_size, tile_size)
 
-    a_scale = (
-        torch.rand(a_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
-    b_scale = (
-        torch.rand(b_scale_shape, dtype=torch.float32, device="cuda") * factor_for_scale
-    )
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
     m_indptr = torch.arange(0, group_size + 1, dtype=torch.int32, device="cuda") * m
 
