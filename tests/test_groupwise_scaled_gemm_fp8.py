@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat, reduce
 
 from flashinfer.gemm import (
     gemm_fp8_nt_blockscaled,
