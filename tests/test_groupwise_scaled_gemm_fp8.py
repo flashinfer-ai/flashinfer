@@ -106,7 +106,7 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
                         slice(i * tile_shape[1], (i + 1) * tile_shape[1]),
                     )
                 x_scale[i, j] = x[index_select].abs().max() / fp8_amax
-                x_fp32[index_select] = x[index_select] / x_scale[i, j]
+                x_fp32[index_select] = x[index_select] / (x_scale[i, j] + 1e-8)
     elif x.ndim == 3:
         for i in range(scale_shape[0]):
             for j in range(scale_shape[1]):
