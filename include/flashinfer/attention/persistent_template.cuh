@@ -81,7 +81,7 @@ __global__ __launch_bounds__(
 
   grid.sync();
   BlockReductionRunner::Run(params_1.partial_o, params_1.final_o, params_1.partial_lse,
-                            params_1.final_lse, *(params_1.num_packed_qo_len),
+                            params_1.final_lse, *(params_1.num_to_merge_qo_len),
                             params_1.gqa_group_size, params_1.num_kv_heads, params_1.merge_indptr,
                             params_1.merge_o_indices, smem);
 #else
@@ -90,7 +90,7 @@ __global__ __launch_bounds__(
 
   grid.sync();
   BlockReductionRunner::Run(params_1.partial_o, params_1.final_o, params_1.partial_lse,
-                            params_1.final_lse, *(params_1.num_packed_qo_len),
+                            params_1.final_lse, *(params_1.num_to_merge_qo_len),
                             params_1.gqa_group_size, params_1.num_kv_heads, params_1.merge_indptr,
                             params_1.merge_o_indices, smem, profiler_closure);
 #endif

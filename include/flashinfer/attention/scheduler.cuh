@@ -1493,7 +1493,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   // used for remapping the output offsets
   // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
   int partial_o_nnz = 0;
-  std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
+  std::vector<IdType> merge_indptr, merge_o_indices, num_to_merge_qo_len_vec;
   merge_indptr.push_back(partial_o_nnz);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
@@ -1638,7 +1638,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   }
 
   // update num_qo_len_vec
-  num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
+  num_to_merge_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_packed_qo_lens, 16, "merge_indptr");
@@ -1650,7 +1650,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.merge_indptr_offset, merge_indptr);
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.merge_o_indices_offset, merge_o_indices);
   CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.num_qo_len_offset,
-                         num_expand_qo_len_vec);
+                         num_to_merge_qo_len_vec);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,

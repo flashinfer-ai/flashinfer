@@ -437,7 +437,7 @@ struct BlockBatchReductionPersistent {
   static __device__ __forceinline__ void Run(
       typename KTraits::DTypeIn* __restrict__ V, typename KTraits::DTypeO* __restrict__ v_merged,
       float* __restrict__ S, float* __restrict__ s_merged,
-      const typename KTraits::IdType num_packed_qo_len, const uint_fastdiv gqa_group_size,
+      const typename KTraits::IdType num_to_merge_qo_len, const uint_fastdiv gqa_group_size,
       const uint32_t num_kv_heads, const typename KTraits::IdType* indptr,
       const typename KTraits::IdType* o_indices, uint8_t* smem PROFILER_CLOSURE_FUNC_PARAMS) {
     using DTypeIn = typename KTraits::DTypeIn;
@@ -465,10 +465,10 @@ struct BlockBatchReductionPersistent {
     float* s_smem = (float*)(smem + num_warps * num_smem_stages * bdy * head_dim * sizeof(DTypeIn) +
                              warp_idx * 32 * sizeof(float));
 
-    // V: [num_packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
+    // V: [num_to_merge_qo_len x num_kv_tiles, num_kv_heads, head_dim]
     // v_merged: [qo_len, num_kv_heads, gqa_group_size, head_dim]
 #pragma unroll 1
-    for (uint32_t i = worker_id; i < num_packed_qo_len * num_kv_heads; i += num_workers) {
+    for (uint32_t i = worker_id; i < num_to_merge_qo_len * num_kv_heads; i += num_workers) {
       PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kReduction);
 
       // remap workload
