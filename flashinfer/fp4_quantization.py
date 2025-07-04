@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from functools import cache
 from types import SimpleNamespace
-from typing import Any, Tuple, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -158,7 +158,9 @@ def get_fp4_quantization_sm100_module():
     def _fake_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
-        return unswizzled_sf.new_empty([unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8)
+        return unswizzled_sf.new_empty(
+            [unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8
+        )
 
     @register_custom_op(
         "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
@@ -194,7 +196,7 @@ def get_fp4_quantization_sm100_module():
             global_scale_tensor.cpu(),
             sf_vec_size,
             ufp8_type,
-            is_sf_swizzled_layout
+            is_sf_swizzled_layout,
         )
 
     @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
@@ -206,7 +208,9 @@ def get_fp4_quantization_sm100_module():
         ufp8_type: int = 1,
         is_sf_swizzled_layout: bool = True,
     ) -> torch.Tensor:
-        return e2m1_tensor.new_empty([e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2], dtype=torch.float32)
+        return e2m1_tensor.new_empty(
+            [e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2], dtype=torch.float32
+        )
 
     # Register the module
     return SimpleNamespace(
@@ -261,9 +265,7 @@ def fp4_quantize(
     return x_q, sf
 
 
-def block_scale_interleave(
-    unswizzled_sf: torch.Tensor
-) -> torch.Tensor:
+def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
@@ -312,7 +314,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-    
+
     return get_fp4_quantization_sm100_module().e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor,
         ufp8_scale_tensor,

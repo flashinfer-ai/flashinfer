@@ -81,8 +81,8 @@ class FusedMoeCutlassRunner : public torch::CustomClassHolder {
   };
 
   FusedMoeCutlassRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
-                 c10::ScalarType output_dtype, bool use_fp8_block_scaling,
-                 bool use_w4a8_group_scaling) {
+                        c10::ScalarType output_dtype, bool use_fp8_block_scaling,
+                        bool use_w4a8_group_scaling) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mOutputDtype = output_dtype;

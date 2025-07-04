@@ -38,8 +38,9 @@ namespace torch_ext {
 // self_fp4, self_block_scale_factors self_fp4: [M, K / 2], FLOAT4_E2M1X2 self_block_scale_factors:
 // ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-                                                std::optional<at::Tensor> globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout) {
+                                                std::optional<at::Tensor> globalScale,
+                                                int64_t sfVecSize, bool sfUseUE8M0,
+                                                bool isSfSwizzledLayout) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   if (sfUseUE8M0) {
@@ -65,9 +66,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   at::Tensor valueE2M1 =
       at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
 
-  int64_t SFSize = isSfSwizzledLayout
-                       ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
-                       : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
+  int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
+                                      : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
   at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
@@ -79,9 +79,9 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 
   auto globalScalePtr = globalScale.has_value() ? globalScale.value().data_ptr<float>() : nullptr;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                              \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                                    \
-      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                  \
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
+  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       at::cuda::getCurrentCUDAStream(self.get_device()));
@@ -90,18 +90,18 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
     if (self.scalar_type() == at::ScalarType::Half) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 32)
     } else if (self.scalar_type() == at::ScalarType::BFloat16) {
-  #ifdef ENABLE_BF16
+#ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 32)
-  #else
+#else
       C10_THROW_ERROR(NotImplementedError,
                       "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
-  #endif
+#endif
     } else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn) {
-  #ifdef ENABLE_FP8
+#ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 32)
-  #else
+#else
       C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
-  #endif
+#endif
     } else {
       C10_THROW_ERROR(NotImplementedError,
                       "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
@@ -110,18 +110,18 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
     if (self.scalar_type() == at::ScalarType::Half) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
     } else if (self.scalar_type() == at::ScalarType::BFloat16) {
-  #ifdef ENABLE_BF16
+#ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
-  #else
+#else
       C10_THROW_ERROR(NotImplementedError,
                       "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
-  #endif
+#endif
     } else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn) {
-  #ifdef ENABLE_FP8
+#ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
-  #else
+#else
       C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
-  #endif
+#endif
     } else {
       C10_THROW_ERROR(NotImplementedError,
                       "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
@@ -134,82 +134,80 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 }
 
 at::Tensor block_scale_interleave(at::Tensor const& blockScale) {
-    CHECK_INPUT_TYPE(blockScale, c10::ScalarType::Byte);
-    auto blockScaleShape = blockScale.sizes();
-    TORCH_CHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3, "Block Scale should be 2D or 3D tensor.");
-    auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
-    auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
-    auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
+  CHECK_INPUT_TYPE(blockScale, c10::ScalarType::Byte);
+  auto blockScaleShape = blockScale.sizes();
+  TORCH_CHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3,
+              "Block Scale should be 2D or 3D tensor.");
+  auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
+  auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
+  auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
 
-    auto expert_out_size = tensorrt_llm::computeSwizzledLayoutSFSize(rows, cols);
-    auto rows_padded = PadUpFn(rows, 128);
-    auto cols_padded = PadUpFn(cols, 4);
-    TORCH_CHECK(
-        expert_out_size == rows_padded * cols_padded, "expert_out_size should be equal to rows_padded * cols_padded.");
-    at::Tensor interleavedBlockScale = at::empty(
-        {expert_out_size * num_experts}, at::dtype(c10::ScalarType::Byte).device(blockScale.device()).requires_grad(false));
+  auto expert_out_size = tensorrt_llm::computeSwizzledLayoutSFSize(rows, cols);
+  auto rows_padded = PadUpFn(rows, 128);
+  auto cols_padded = PadUpFn(cols, 4);
+  TORCH_CHECK(expert_out_size == rows_padded * cols_padded,
+              "expert_out_size should be equal to rows_padded * cols_padded.");
+  at::Tensor interleavedBlockScale =
+      at::empty({expert_out_size * num_experts},
+                at::dtype(c10::ScalarType::Byte).device(blockScale.device()).requires_grad(false));
 
-    const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
-    auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
-    tensorrt_llm::kernels::invokeBlockScaleInterleave(num_experts, rows, rows_padded, cols, cols_padded,
-        blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
+  const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
+  auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
+  tensorrt_llm::kernels::invokeBlockScaleInterleave(
+      num_experts, rows, rows_padded, cols, cols_padded, blockScale.data_ptr<uint8_t>(),
+      static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
 
-    return interleavedBlockScale;
+  return interleavedBlockScale;
 }
 
 static float const kE2M1ToFloatArray[] = {0, 0.5, 1, 1.5, 2, 3, 4, 6};
 
-float e2M1ToFloat(uint8_t value)
-{
-    bool signBit = value & 8;
-    auto absValue = value & 7;
-    float result = kE2M1ToFloatArray[absValue];
-    if (signBit)
-        result = -result;
-    return result;
+float e2M1ToFloat(uint8_t value) {
+  bool signBit = value & 8;
+  auto absValue = value & 7;
+  float result = kE2M1ToFloatArray[absValue];
+  if (signBit) result = -result;
+  return result;
 }
 
-int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensorrt_llm::QuantizationSFLayout layout)
-{
-    constexpr int kColumnGroup0Size = 4;
-    constexpr int kRowGroup0Size = 32;
-    constexpr int kRowGroup1Size = kRowGroup0Size * 4;
+int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
+                   tensorrt_llm::QuantizationSFLayout layout) {
+  constexpr int kColumnGroup0Size = 4;
+  constexpr int kRowGroup0Size = 32;
+  constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
-    // Swizzled layout is used as default layout.
-    if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED)
-    {
-        // int paddedRow = PadUpFn(totalRow, 128);
-        int paddedColumn = PadUpFn(totalColumn, 4);
+  // Swizzled layout is used as default layout.
+  if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED) {
+    // int paddedRow = PadUpFn(totalRow, 128);
+    int paddedColumn = PadUpFn(totalColumn, 4);
 
-        int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
-        int columnGroupIdx = colIdx / kColumnGroup0Size;
-        constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
+    int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
+    int columnGroupIdx = colIdx / kColumnGroup0Size;
+    constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
 
-        int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
-        int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
-        int rowGroupIdx = rowIdx / kRowGroup1Size;
-        constexpr int rowGroup1Stride = kColumnGroup0Size;
-        constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
-        int rowGroupStride = kRowGroup1Size * paddedColumn;
+    int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
+    int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
+    int rowGroupIdx = rowIdx / kRowGroup1Size;
+    constexpr int rowGroup1Stride = kColumnGroup0Size;
+    constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
+    int rowGroupStride = kRowGroup1Size * paddedColumn;
 
-        return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride
-            + rowIdxInGroup1 * rowGroup1Stride + rowGroupIdx * rowGroupStride;
-    }
-    // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
-    else if (layout == tensorrt_llm::QuantizationSFLayout::LINEAR)
-    {
-        // no padding needed. totalColumn is multiple of kVecSize.
-        return rowIdx * totalColumn + colIdx;
-    }
-    else
-    {
-        TORCH_CHECK(false, "Other layout not implemented yet.");
-    }
+    return columnIdxInGroup0 + columnGroupIdx * columnGroupStride +
+           rowIdxInGroup0 * rowGroup0Stride + rowIdxInGroup1 * rowGroup1Stride +
+           rowGroupIdx * rowGroupStride;
+  }
+  // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
+  else if (layout == tensorrt_llm::QuantizationSFLayout::LINEAR) {
+    // no padding needed. totalColumn is multiple of kVecSize.
+    return rowIdx * totalColumn + colIdx;
+  } else {
+    TORCH_CHECK(false, "Other layout not implemented yet.");
+  }
 }
 
-at::Tensor e2m1_and_ufp8sf_scale_to_float(at::Tensor valueE2M1, at::Tensor scaleFP8SF, std::optional<at::Tensor> globalScale,
-    int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout)
-{
+at::Tensor e2m1_and_ufp8sf_scale_to_float(at::Tensor valueE2M1, at::Tensor scaleFP8SF,
+                                          std::optional<at::Tensor> globalScale, int64_t sfVecSize,
+                                          int64_t sfType, bool isSfSwizzledLayout) {
   CHECK_CONTIGUOUS(valueE2M1);
   CHECK_CONTIGUOUS(scaleFP8SF);
   CHECK_INPUT_TYPE(valueE2M1, c10::ScalarType::Byte);
@@ -221,13 +219,13 @@ at::Tensor e2m1_and_ufp8sf_scale_to_float(at::Tensor valueE2M1, at::Tensor scale
   }
   TORCH_CHECK(valueE2M1.device().is_cpu(), "valueE2M1 must be CPU tensor");
   TORCH_CHECK(scaleFP8SF.device().is_cpu(), "scaleFP8SF must be CPU tensor");
-  
+
   auto packedShape = valueE2M1.sizes();
   auto scaleShape = scaleFP8SF.sizes();
   TORCH_CHECK(packedShape.size() == 2, "valueE2M1 should be 2D tensor.");
   TORCH_CHECK(scaleShape.size() == 1, "scaleFP8SF should be 1D tensor.");
-  at::Tensor floatTensor
-      = at::zeros({packedShape[0], packedShape[1] * 2}, at::dtype(at::ScalarType::Float).requires_grad(false));
+  at::Tensor floatTensor = at::zeros({packedShape[0], packedShape[1] * 2},
+                                     at::dtype(at::ScalarType::Float).requires_grad(false));
   float globalScaleVal = sfType == 1 ? globalScale.value().data_ptr<float>()[0] : 1.0f;
 
   int hiddenDim = packedShape[1] * 2;
@@ -235,35 +233,29 @@ at::Tensor e2m1_and_ufp8sf_scale_to_float(at::Tensor valueE2M1, at::Tensor scale
   int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
   auto layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
-                                    : tensorrt_llm::QuantizationSFLayout::LINEAR;
+                                   : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-  for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
-  {
-    for (int group = 0; group < groupsPerHiddenDim; ++group)
-    {
+  for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx) {
+    for (int group = 0; group < groupsPerHiddenDim; ++group) {
       float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
-      uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
+      uint8_t* packedFp4Ptr =
+          valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
       uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
-      
+
       int sf_index = computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim, layout);
       uint8_t fp8Scale = scaleFP8SFPtr[sf_index];
       float scaleFloat;
-      if (sfType == 0)
-      {
+      if (sfType == 0) {
         uint32_t tmp = uint32_t(fp8Scale) << 23;
         memcpy(&scaleFloat, &tmp, sizeof(scaleFloat));
-      }
-      else
-      {
+      } else {
         scaleFloat = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3&>(fp8Scale));
       }
-      
+
       scaleFloat *= globalScaleVal;
-      for (int i = 0; i < sfVecSize; ++i)
-      {
+      for (int i = 0; i < sfVecSize; ++i) {
         uint8_t packedFp4 = packedFp4Ptr[i / 2];
-        if (i % 2 == 1)
-        {
+        if (i % 2 == 1) {
           packedFp4 >>= 4;
         }
         packedFp4 &= 0xf;

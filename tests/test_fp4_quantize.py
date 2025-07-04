@@ -3,7 +3,11 @@ import functools
 import pytest
 import torch
 
-from flashinfer import fp4_quantize, block_scale_interleave, e2m1_and_ufp8sf_scale_to_float
+from flashinfer import (
+    block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+    fp4_quantize,
+)
 from flashinfer.utils import is_sm100a_supported
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -297,24 +301,24 @@ def test_e2m1_dequantization(
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
-    
+
     # Create a reasonable test tensor
     m, n = shape
     x = torch.randn((m, n), dtype=torch.float16)
-    
+
     # Calculate global scale as in the other tests
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    
+
     # Test with default common settings
     is_sf_swizzled_layout = True
     block_size = 32 if sf_use_ue8m0 else 16
-    
+
     # Step 1: Quantize with fp4_quantize
     quantized_tensor, scale_factors = fp4_quantize(
         x, global_scale, block_size, sf_use_ue8m0, is_sf_swizzled_layout
     )
-    
+
     # Step 2: Dequantize with e2m1_and_ufp8sf_scale_to_float
     ufp8_type = 0 if sf_use_ue8m0 else 1
     dequantized_tensor = e2m1_and_ufp8sf_scale_to_float(
@@ -325,25 +329,36 @@ def test_e2m1_dequantization(
         ufp8_type=ufp8_type,
         is_sf_swizzled_layout=is_sf_swizzled_layout,
     )
-    
+
     # Move back to device for comparison
     dequantized_tensor = dequantized_tensor.to(device)
     x_float32 = x.to(torch.float32)
-    
+
     # Step 3: Compare results
-    assert dequantized_tensor.shape == x.shape, f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
-    assert dequantized_tensor.dtype == torch.float32, f"Expected float32, got {dequantized_tensor.dtype}"
-    
+    assert (
+        dequantized_tensor.shape == x.shape
+    ), f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
+    assert (
+        dequantized_tensor.dtype == torch.float32
+    ), f"Expected float32, got {dequantized_tensor.dtype}"
+
     # Check for invalid values
-    assert not torch.isnan(dequantized_tensor).any(), "Dequantized tensor contains NaN values"
-    assert not torch.isinf(dequantized_tensor).any(), "Dequantized tensor contains Inf values"
-    
+    assert not torch.isnan(
+        dequantized_tensor
+    ).any(), "Dequantized tensor contains NaN values"
+    assert not torch.isinf(
+        dequantized_tensor
+    ).any(), "Dequantized tensor contains Inf values"
+
     # Compare with original - should be reasonably close since FP4 is designed to preserve important values
     torch.testing.assert_close(
-        dequantized_tensor, x_float32, 
-        rtol=0.3, atol=0.5,  # Reasonable tolerance for FP4 quantization
-        msg="Quantize -> dequantize roundtrip failed"
+        dequantized_tensor,
+        x_float32,
+        rtol=0.3,
+        atol=0.5,  # Reasonable tolerance for FP4 quantization
+        msg="Quantize -> dequantize roundtrip failed",
     )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

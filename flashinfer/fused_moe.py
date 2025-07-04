@@ -308,7 +308,9 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_fused_moe_sm100_module():
-    module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeCutlassRunner")
+    module = gen_fused_moe_sm100_module().build_and_load(
+        class_name="FusedMoeCutlassRunner"
+    )
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
