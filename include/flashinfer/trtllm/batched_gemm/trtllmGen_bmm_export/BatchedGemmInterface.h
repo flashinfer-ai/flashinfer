@@ -639,10 +639,13 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
   CUfunction cuFunction;
 #if 1
   const std::string sha256 = config.mChecksum ? config.mChecksum : "";
+  const std::string cubin_path = std::string("batched_gemm-") + TLLM_GEN_COMMIT + "-" +
+                                 TLLM_GEN_BATCHED_GEMM_CONFIG_HASH + "/";
   std::string fname_cubin = config.mFunctionName;
   if (!fname_cubin.empty()) {
     fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
   }
+  fname_cubin = cubin_path + fname_cubin;
   std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
   cuModuleLoadData(&cuModule, cubin.c_str());
 #else
