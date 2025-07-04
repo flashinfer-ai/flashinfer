@@ -26,13 +26,10 @@
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 #include "KernelMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h
 
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 }
-=======
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
 
 namespace batchedGemm {
 
@@ -395,22 +392,15 @@ struct BatchedGemmData {
 
 class BatchedGemmInterface {
  public:
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h
   using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
 
-=======
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
   BatchedGemmInterface() {}
 
   // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
   // Provided config must be validated with isValidConfig before the call.
   int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options,
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h
               void* cudaStream, int32_t multiProcessorCount, bool usePdl = true,
               std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
-=======
-              void* cudaStream, int32_t multiProcessorCount, bool usePdl = true);
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
 
   // Initializes the buffers before the world sync. Must be called before run.
   int32_t runInitBeforeWorldSync(BatchedGemmConfig const& /* config */,
@@ -580,17 +570,10 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
                                   BatchedGemmData const& batchedGemmData, void* cudaStream,
                                   int32_t /* multiProcessorCount */, bool usePdl,
                                   std::optional<std::reference_wrapper<ModuleCache>> moduleCache) {
-=======
-
-int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-                                  BatchedGemmData const& batchedGemmData, void* cudaStream,
-                                  int32_t /* multiProcessorCount */, bool usePdl) {
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
   // Might be used.
   (void)usePdl;
   (void)moduleCache;
