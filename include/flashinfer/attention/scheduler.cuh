@@ -877,7 +877,7 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   auto [request_indices, qo_tile_indices_p, kv_tile_indices_p, merge_indptr, o_indptr,
         new_batch_size_p] = get_qkv_tile_indices(packed_qo_len_arr_p, kv_len_arr_p, batch_size_p,
                                                  cta_tile_q_p, kv_chunk_size_p, gqa_group_size);
-  auto [request_indices, qo_tile_indices_d, kv_tile_indices_d, merge_indptr_d, o_indptr_d,
+  auto [request_indices, qo_tile_indices_d, kv_tile_indices_d, merge_indptr_d, o_indptr,
         new_batch_size_d] = get_qkv_tile_indices(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d,
                                                  cta_tile_q_d, kv_chunk_size_d, gqa_group_size,
                                                  request_indices, merge_indptr, o_indptr);
