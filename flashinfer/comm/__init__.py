@@ -30,6 +30,12 @@ from .trtllm_ar import trtllm_moe_allreduce_fusion as trtllm_moe_allreduce_fusio
 from .trtllm_ar import (
     trtllm_moe_finalize_allreduce_fusion as trtllm_moe_finalize_allreduce_fusion,
 )
+from .trtllm_mnnvl_ar import (
+    gen_trtllm_mnnvl_comm_module,
+    get_allreduce_mnnvl_workspace,
+    mpi_barrier,
+    trtllm_mnnvl_all_reduce,
+)
 from .vllm_ar import all_reduce as vllm_all_reduce
 from .vllm_ar import dispose as vllm_dispose
 from .vllm_ar import gen_vllm_comm_module as gen_vllm_comm_module
