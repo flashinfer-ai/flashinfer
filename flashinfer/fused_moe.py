@@ -123,7 +123,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_fused_moe_sm100_module():
-    module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeRunner")
+    module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeCutlassRunner")
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
@@ -167,7 +167,7 @@ def get_fused_moe_sm100_module():
 
             if instance_key not in MoERunner._runner_dict:
                 MoERunner._runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
+                    torch.classes.fused_moe_sm100.FusedMoeCutlassRunner(
                         x_dtype,
                         weight_dtype,
                         output_dtype,
@@ -228,10 +228,10 @@ def get_fused_moe_sm100_module():
             )
 
     @register_custom_op(
-        "flashinfer::cutlass_fused_moe_sm100",
+        "flashinfer::fused_moe_cutlass_sm100",
         mutates_args=(""),
     )
-    def cutlass_fused_moe_sm100(
+    def fused_moe_cutlass_sm100(
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -334,8 +334,8 @@ def get_fused_moe_sm100_module():
 
         return output if min_latency_mode else [output]
 
-    @register_fake_op("flashinfer::cutlass_fused_moe_sm100")
-    def _fake_cutlass_fused_moe_sm100(
+    @register_fake_op("flashinfer::fused_moe_cutlass_sm100")
+    def _fake_fused_moe_cutlass_sm100(
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -374,13 +374,13 @@ def get_fused_moe_sm100_module():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fused_moe_sm100=cutlass_fused_moe_sm100,
+        fused_moe_cutlass_sm100=fused_moe_cutlass_sm100,
     )
 
 
 # TODO(shuw): wrap into a FusedMoeModule once trtllm-gen is readly.
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe.py#L827
-def cutlass_fused_moe(
+def fused_moe_cutlass(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
@@ -467,7 +467,7 @@ def cutlass_fused_moe(
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
-    return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(
+    return get_fused_moe_sm100_module().fused_moe_cutlass_sm100(
         input,
         token_selected_experts,
         token_final_scales,
