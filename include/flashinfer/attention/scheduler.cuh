@@ -873,6 +873,7 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                                      cta_tile_q_d, min_kv_chunk_size);
 
   // step 3: split qo_indptr and kv_indptr
+  // use one merge_indptr and o_indptr to simply merging
   auto [request_indices, qo_tile_indices_p, kv_tile_indices_p, merge_indptr, o_indptr,
         new_batch_size_p] = get_qkv_tile_indices(packed_qo_len_arr_p, kv_len_arr_p, batch_size_p,
                                                  cta_tile_q_p, kv_chunk_size_p, gqa_group_size);
@@ -1054,7 +1055,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   plan_info.kv_chunk_size_ptr_offset_p =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "pod_prefill_kv_chunk_size_ptr");
   plan_info.kv_chunk_size_ptr_offset_d =
-      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "pod_prefill_kv_chunk_size_ptr");
+      int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "pod_decode_kv_chunk_size_ptr");
 
   if (plan_info.enable_cuda_graph) {
     plan_info.total_num_rows_offset =

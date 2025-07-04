@@ -16,7 +16,7 @@
 #include "pod_config.inc"
 #include "pytorch_extension_utils.h"
 
-void pod_with_kv_cache_tensor(
+void PODWithKVCacheTensorRun(
     // Prefill params
     at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
     std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
@@ -36,5 +36,5 @@ void pod_with_kv_cache_tensor(
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache operator
-  m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
+  m.def("PODWithKVCacheTensor", PODWithKVCacheTensorRun);
 }

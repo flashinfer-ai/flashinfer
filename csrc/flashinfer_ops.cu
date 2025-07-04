@@ -123,7 +123,7 @@ void BatchPrefillWithPagedKVCacheRun(
     int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS);
 
 //========== pod-attention =========
-void pod_with_kv_cache_tensor(
+void PODWithKVCacheTensorRun(
     // Prefill params
     at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
     std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
@@ -280,7 +280,7 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
 
   // pod-attention
   // Temporarily disabled because we don't generate the implementation yet.
-  // m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
+  // m.def("PODWithKVCacheTensor", PODWithKVCacheTensorRun);
 
   // quantization
   // GPU packbits operator

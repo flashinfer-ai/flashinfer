@@ -44,7 +44,7 @@ from .utils import (
 @functools.cache
 def get_pod_module(*args):
     module = gen_pod_module(*args).build_and_load()
-    return SimpleNamespace(run_tensor=module.pod_with_kv_cache_tensor.default)
+    return SimpleNamespace(run_tensor=module.PODWithKVCacheTensor.default)
 
 
 class PODWithPagedKVCacheWrapper:

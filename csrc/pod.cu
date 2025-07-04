@@ -66,7 +66,7 @@ at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_
   return vec_to_tensor(plan_info.ToVector());
 }
 
-void pod_with_kv_cache_tensor(
+void PODWithKVCacheTensorRun(
     // Prefill params
     at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
     std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
