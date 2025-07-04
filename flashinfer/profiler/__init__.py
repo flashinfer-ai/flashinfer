@@ -14,10 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import argparse
-import csv
-import json
-from collections import namedtuple
 from enum import Enum
 from typing import List
 

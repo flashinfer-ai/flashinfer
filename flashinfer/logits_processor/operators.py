@@ -21,12 +21,12 @@ import torch
 from flashinfer.sampling import get_sampling_module
 from flashinfer.utils import _get_cache_buf, device_support_pdl
 
-from .op import Op, ParameterizedOp
+from .op import ParameterizedOp
 from .types import TaggedTensor, TensorType
 
 
 def _to_tensor_scalar_tuple(
-    x: Union[torch.Tensor, float, int]
+    x: Union[torch.Tensor, float, int],
 ) -> Tuple[Optional[torch.Tensor], Union[float, int]]:
     if isinstance(x, torch.Tensor):
         return (x, 0 if x.dtype == torch.int32 else 0.0)

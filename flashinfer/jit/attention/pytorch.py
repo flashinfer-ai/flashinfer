@@ -878,8 +878,8 @@ def gen_batch_attention_module(
     additional_tensor_dtypes = []
     additional_scalar_names = []
     additional_scalar_dtypes = []
-    variant_name = f"StandardAttention"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    variant_name = "StandardAttention"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
         uri,

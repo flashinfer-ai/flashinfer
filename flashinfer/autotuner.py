@@ -320,7 +320,7 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
                 stats_str += f"    - Success rate: {success_rate:.1f}%\n"

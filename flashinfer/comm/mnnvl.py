@@ -16,7 +16,6 @@
 import logging
 import platform
 import sys
-from dataclasses import dataclass
 
 import pynvml
 import torch
@@ -305,6 +304,6 @@ class MnnvlMemory:
         # But it is not equivalent to MNNVL support.
         # May need better support check.
         arch = platform.machine().lower()
-        if not "aarch64" in arch:
+        if "aarch64" not in arch:
             return False
         return MnnvlMemory.support_nvlink(True)
