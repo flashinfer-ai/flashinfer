@@ -45,7 +45,7 @@ namespace common = tensorrt_llm::common;
 namespace kernels = tensorrt_llm::kernels;
 using profiler_backend = kernels::GemmProfilerBackend;
 
-class FusedMoeRunner : public torch::CustomClassHolder {
+class FusedMoeCutlassRunner : public torch::CustomClassHolder {
  public:
   template <typename Type, bool NeedQuant = false>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(
@@ -80,7 +80,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     }
   };
 
-  FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
+  FusedMoeCutlassRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
                  c10::ScalarType output_dtype, bool use_fp8_block_scaling,
                  bool use_w4a8_group_scaling) {
     mActivationDtype = activation_dtype;
@@ -171,16 +171,16 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     mAllProfiles = mKernelRunner->getTactics();
   }
 
-  ~FusedMoeRunner() {
+  ~FusedMoeCutlassRunner() {
     if (mProfileWorkspace != nullptr) {
       auto const cu_free_status = cudaFree(mProfileWorkspace);
       TORCH_CHECK(cu_free_status == cudaSuccess,
-                  "Can't free profile workspace during FusedMoeRunner destruction.");
+                  "Can't free profile workspace during FusedMoeCutlassRunner destruction.");
     }
   }
 
-  FusedMoeRunner(FusedMoeRunner const&) = delete;
-  void operator=(FusedMoeRunner const&) = delete;
+  FusedMoeCutlassRunner(FusedMoeCutlassRunner const&) = delete;
+  void operator=(FusedMoeCutlassRunner const&) = delete;
 
   at::Tensor runMoe(at::Tensor& output, at::Tensor const& input,
                     at::Tensor const& token_selected_experts,
@@ -663,10 +663,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
+  m.class_<torch_ext::FusedMoeCutlassRunner>("FusedMoeCutlassRunner")
       .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool>())
-      .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
-      .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
-      .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
-      .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
+      .def("run_gemm_profile", &torch_ext::FusedMoeCutlassRunner::runGemmProfile)
+      .def("get_tactic_num", &torch_ext::FusedMoeCutlassRunner::getTacticNum)
+      .def("run_moe", &torch_ext::FusedMoeCutlassRunner::runMoe)
+      .def("run_moe_min_latency", &torch_ext::FusedMoeCutlassRunner::runMoeMinLantency);
 }
