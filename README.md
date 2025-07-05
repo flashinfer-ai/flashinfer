@@ -75,7 +75,7 @@ cd flashinfer
 python -m pip install -v .
 
 # for development & contribution, install in editable mode
-pip install --no-build-isolation -e . -v
+python -m pip install --no-build-isolation -e . -v
 ```
 
 To pre-compile essential kernels ahead-of-time (AOT), run the following command:
