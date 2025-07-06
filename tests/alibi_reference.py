@@ -26,12 +26,12 @@ def get_slopes(n_heads: int):
 
     The slope for first head is
 
-    $$\frac{1}{2^{\frac{8}{n}}} = 2^{-\frac{8}{n}}$$
+    $$\\frac{1}{2^{\\frac{8}{n}}} = 2^{-\\frac{8}{n}}$$
 
     The slopes for the rest of the heads are in a geometric series with a ratio same as above.
 
     For instance when the number of heads is $8$ the slopes are
-    $$\frac{1}{2^1}, \frac{1}{2^2}, \dots, \frac{1}{2^8}$$
+    $$\\frac{1}{2^1}, \\frac{1}{2^2}, \\dots, \\frac{1}{2^8}$$
     """
 
     # Get the closest power of 2 to `n_heads`.
