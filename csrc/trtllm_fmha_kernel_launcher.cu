@@ -19,29 +19,25 @@
 #include <torch/all.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <flashinfer/semaphore_utils.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
 #include <iostream>
 
-__constant__ float out_scale = 1.0f;
-__constant__ float log2e_h64 = 0.18033688011112042;
-__constant__ float log2e_h128 = 0.12751743082459868;
-__constant__ float log2e_h192 = 0.10411754627697266;
-__constant__ float log2e_h256 = 0.09016844005556021;
-
 namespace flashinfer {
 template <typename T, Data_type CACHE_T>
 void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
                                      at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
-                                     int64_t num_heads_dummy, int64_t num_kv_heads, double scale,
+                                     int64_t num_q_heads, int64_t num_kv_heads, double scale,
                                      at::Tensor& block_tables, at::Tensor& seq_lens,
                                      int64_t block_size, int64_t max_seq_len,
                                      const std::string kv_cache_dtype, double k_scale,
                                      double v_scale) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
+  assert(num_heads == static_cast<int>(num_q_heads));
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(-1);
 
@@ -104,27 +100,11 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
 
-  float* log_scale_ptr;
-  float* output_scale_ptr;
-
-  if (head_size == 64) {
-    cudaGetSymbolAddress((void**)&log_scale_ptr, log2e_h64);
-  } else if (head_size == 128) {
-    cudaGetSymbolAddress((void**)&log_scale_ptr, log2e_h128);
-  } else if (head_size == 192) {
-    cudaGetSymbolAddress((void**)&log_scale_ptr, log2e_h192);
-  } else if (head_size == 256) {
-    cudaGetSymbolAddress((void**)&log_scale_ptr, log2e_h256);
-  } else {
+  if (head_size != 64 && head_size != 128 && head_size != 192 && head_size != 256) {
     std::ostringstream err_msg;
     err_msg << "head_size " << head_size << " is not supported!";
     FLASHINFER_ERROR(err_msg.str());
   }
-
-  cudaGetSymbolAddress((void**)&output_scale_ptr, out_scale);
-
-  runner_params.scaleSoftmaxLog2Ptr = log_scale_ptr;
-  runner_params.outputScalePtr = output_scale_ptr;
 
   runner_params.seqLensKvPtr = reinterpret_cast<int const*>(seq_lens.data_ptr<int>());
 
@@ -162,10 +142,10 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   fmha_runner.run(runner_params);
 }
 
-#define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                                         \
-  trtllm_paged_attention_launcher<T, CACHE_T_ENUM>(                                                \
-      out, query, key_value_cache, workspace_buffer, num_heads, num_kv_heads, scale, block_tables, \
-      seq_lens, block_size, max_seq_len, kv_cache_dtype, k_scale, v_scale);
+#define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                             \
+  trtllm_paged_attention_launcher<T, CACHE_T_ENUM>(                                    \
+      out, query, key_value_cache, workspace_buffer, num_q_heads, num_kv_heads, scale, \
+      block_tables, seq_lens, block_size, max_seq_len, kv_cache_dtype, k_scale, v_scale);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
@@ -194,7 +174,7 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   }
 
 void trtllm_paged_attention(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                            at::Tensor& workspace_buffer, int64_t num_heads, int64_t num_kv_heads,
+                            at::Tensor& workspace_buffer, int64_t num_q_heads, int64_t num_kv_heads,
                             double scale, at::Tensor& block_tables, at::Tensor& seq_lens,
                             int64_t block_size, int64_t max_seq_len,
                             const std::string kv_cache_dtype, double k_scale, double v_scale) {

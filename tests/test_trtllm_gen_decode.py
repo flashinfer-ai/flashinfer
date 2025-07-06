@@ -165,7 +165,7 @@ def test_trtllm_batch_decode(
     # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).to(dtype)
+    kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device).contiguous()
     k_scale = v_scale = 1.0
 
     if kv_cache_dtype.startswith("fp8"):
