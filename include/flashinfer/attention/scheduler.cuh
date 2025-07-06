@@ -562,12 +562,21 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
                                  uint32_t cta_tile_q, uint32_t kv_chunk_size,
                                  uint32_t gqa_group_size,
                                  std::vector<int64_t>& request_indices = nullptr,
+                                 std::vector<int64_t>& qo_tile_indices = nullptr,
+                                 std::vector<int64_t>& kv_tile_indices = nullptr,
                                  std::vector<int64_t>& merge_indptr = nullptr,
                                  std::vector<int64_t>& o_indptr = nullptr) {
-  std::vector<IdType> qo_tile_indices, kv_tile_indices;
   if (request_indices == nullptr) {
     request_indices = std::vector<int64_t>();
     request_indices.push_back(0);
+  }
+  if (qo_tile_indices == nullptr) {
+    qo_tile_indices = std::vector<int64_t>();
+    qo_tile_indices.push_back(0);
+  }
+  if (kv_tile_indices == nullptr) {
+    kv_tile_indices = std::vector<int64_t>();
+    kv_tile_indices.push_back(0);
   }
   if (merge_indptr == nullptr) {
     merge_indptr = std::vector<int64_t>();
@@ -828,8 +837,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
 }
 
 /*
-Modifed from PrefillSplitQOKVIndptr to support two tile sizes, and assign blocks proportional to the
-number of tiles.
+Modifed to support two tile sizes, and assign blocks proportional to
+the number of tiles.
 */
 template <typename IdType>
 inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_t total_num_rows_p,
@@ -873,14 +882,15 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                                      cta_tile_q_d, min_kv_chunk_size);
 
   // step 3: split qo_indptr and kv_indptr
-  // use one merge_indptr and o_indptr to simply merging
-  auto [request_indices, qo_tile_indices_p, kv_tile_indices_p, merge_indptr, o_indptr,
+  // Use one set of qkv indices, merge_indptr and o_indptr to simply merging.
+  auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
         new_batch_size_p] = get_qkv_tile_indices(packed_qo_len_arr_p, kv_len_arr_p, batch_size_p,
                                                  cta_tile_q_p, kv_chunk_size_p, gqa_group_size);
-  auto [request_indices, qo_tile_indices_d, kv_tile_indices_d, merge_indptr_d, o_indptr,
-        new_batch_size_d] = get_qkv_tile_indices(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d,
-                                                 cta_tile_q_d, kv_chunk_size_d, gqa_group_size,
-                                                 request_indices, merge_indptr, o_indptr);
+  auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
+        new_batch_size_d] =
+      get_qkv_tile_indices(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d, cta_tile_q_d,
+                           kv_chunk_size_d, gqa_group_size, request_indices, qo_tile_indices,
+                           kv_tile_indices, merge_indptr, o_indptr);
 
   bool split_kv = split_kv_p || split_kv_d;
   uint32_t new_batch_size = new_batch_size_p + new_batch_size_d;
@@ -897,9 +907,9 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
 
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d,
                          cta_tile_q_p, cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d,
-                         std::move(merge_indptr), std::move(o_indptr), std::move(request_indices),
-                         std::move(qo_tile_indices_p), std::move(kv_tile_indices_p),
-                         std::move(qo_tile_indices_d), std::move(kv_tile_indices_d));
+                         std::move(request_indices), std::move(qo_tile_indices),
+                         std::move(kv_tile_indices)) std::move(merge_indptr),
+         std::move(o_indptr);
 }
 
 struct PODPlanInfo {
@@ -1027,9 +1037,8 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 2: determine kv_chunk_size
   auto [split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
-        cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, merge_indptr_vec, o_indptr_vec,
-        request_indices_vec, qo_tile_indices_vec_p, kv_tile_indices_vec_p, qo_tile_indices_vec_d,
-        kv_tile_indices_vec_d] =
+        cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices, qo_tile_indices,
+        kv_tile_indices, merge_indptr, o_indptr] =
       PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, qo_indptr_d, kv_indptr_d, total_num_rows_p,
                          batch_size_p, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
                          head_dim_vo, page_size, max_batch_size_if_split, enable_cuda_graph);

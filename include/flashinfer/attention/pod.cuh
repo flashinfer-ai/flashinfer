@@ -114,7 +114,7 @@ __global__ __launch_bounds__(std::max(
     ((int*)smem)[0] = linear_bid;
     ((int*)smem)[1] = op;
   }
-  // Sync to wait for dynamic scheduler to finish
+  // Sync to wait for dynamic scheduler to write to smem
   __syncthreads();
   // Fetch from shared memory the assigned blockId and operation.
   linear_bid = ((int*)smem)[0];
