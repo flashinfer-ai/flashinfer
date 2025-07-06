@@ -73,6 +73,9 @@ Alternatively, build FlashInfer from source:
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
 python -m pip install -v .
+
+# for development & contribution, install in editable mode
+python -m pip install --no-build-isolation -e . -v
 ```
 
 To pre-compile essential kernels ahead-of-time (AOT), run the following command:
