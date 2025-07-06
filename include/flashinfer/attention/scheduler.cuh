@@ -568,15 +568,12 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
                                  std::vector<int64_t>& o_indptr = nullptr) {
   if (request_indices == nullptr) {
     request_indices = std::vector<int64_t>();
-    request_indices.push_back(0);
   }
   if (qo_tile_indices == nullptr) {
     qo_tile_indices = std::vector<int64_t>();
-    qo_tile_indices.push_back(0);
   }
   if (kv_tile_indices == nullptr) {
     kv_tile_indices = std::vector<int64_t>();
-    kv_tile_indices.push_back(0);
   }
   if (merge_indptr == nullptr) {
     merge_indptr = std::vector<int64_t>();
