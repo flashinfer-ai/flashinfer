@@ -40,6 +40,7 @@ namespace cutlass::fmha::collective {
 
 template <class Element, class ElementAcc, class TileShape>
 struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
+  using ElementOut = Element;
   using Pipeline = cutlass::PipelineAsync<2>;
   // using ShapeT = cute::Shape<int32_t, int32_t, cute::Shape<int32_t, int32_t>>;
   // using StrideO = cute::Shape<int32_t, _1, cute::Shape<int32_t, int32_t>>;
