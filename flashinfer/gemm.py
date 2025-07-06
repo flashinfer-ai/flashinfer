@@ -954,7 +954,8 @@ def group_deepgemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (m, n)
     out_dtype: Optional[torch.dtype] = None,
 ):
-    from deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+    # from deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+    from .deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
