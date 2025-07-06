@@ -251,7 +251,7 @@ def test_blackwell_cutlass_varlen(
 @pytest.mark.parametrize("head_dim_qk", [192, 128])
 @pytest.mark.parametrize("head_dim_vo", [128])
 @pytest.mark.parametrize("sm_scale", [1.0 / math.sqrt(128)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_blackwell_cutlass_qo_kv_varlen(
     qo_indptr_list,
     kv_indptr_list,
@@ -309,7 +309,6 @@ def test_blackwell_cutlass_qo_kv_varlen(
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    print(wrapper._plan_info)
     o, lse = wrapper.run(q, k, v, return_lse=True)
 
     gqa_group_ratio = num_qo_heads // num_kv_heads
@@ -329,29 +328,29 @@ def test_blackwell_cutlass_qo_kv_varlen(
 
 
 if __name__ == "__main__":
-    # test_blackwell_cutlass_fmha(
-    #     9,
-    #     377,
-    #     977,
-    #     1,
-    #     1,
-    #     192,
-    #     128,
-    #     1,
-    #     False,
-    #     torch.bfloat16,
-    # )
+    test_blackwell_cutlass_fmha(
+        9,
+        377,
+        977,
+        1,
+        1,
+        192,
+        128,
+        1,
+        False,
+        torch.bfloat16,
+    )
 
-    # test_blackwell_cutlass_varlen(
-    #     [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
-    #     32,
-    #     4,
-    #     128,
-    #     128,
-    #     1,
-    #     True,
-    #     torch.bfloat16,
-    # )
+    test_blackwell_cutlass_varlen(
+        [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
+        32,
+        4,
+        128,
+        128,
+        1,
+        True,
+        torch.bfloat16,
+    )
 
     test_blackwell_cutlass_qo_kv_varlen(
         [0, 10, 20, 30, 40, 50, 60, 100],

@@ -477,6 +477,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         }
 
         if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          work_idx++;
           continue;
         }
 
@@ -510,6 +511,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         epilogue.store(blk_coord, logical_problem_shape, params.epilogue, params.problem_shape,
                        shared_storage.epilogue, pipeline_corr_epi,
                        pipeline_corr_epi_consumer_state);
+
         work_idx++;
       }
 
