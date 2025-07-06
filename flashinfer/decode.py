@@ -33,6 +33,7 @@ from .jit import (
     get_single_decode_uri,
     setup_cubin_loader,
     trtllm_fmha_gen_module,
+    trtllm_mla_gen_module,
 )
 from .page import get_seq_lens
 from .prefill import (
@@ -298,6 +299,14 @@ def get_batch_decode_module(*args):
 @functools.cache
 def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
+
+@functools.cache
+def get_trtllm_mla_gen_module():
+    mod = trtllm_mla_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -1704,6 +1713,48 @@ def trtllm_batch_decode_with_kv_cache(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
+
+    if out is None:
+        out = torch.empty_like(query)
+    else:
+        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+
+    run_func(
+        out,
+        query,
+        kv_cache,
+        workspace_buffer,
+        num_heads,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+    return out
+
+
+def trtllm_batch_decode_with_kv_cache_mla(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
     if out is None:
         out = torch.empty_like(query)
