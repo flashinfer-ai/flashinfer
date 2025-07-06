@@ -948,7 +948,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                False,  # causal
             )
         else:
             if self._jit_module is not None:

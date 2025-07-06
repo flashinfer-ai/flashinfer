@@ -1576,7 +1576,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self.is_cuda_graph_enabled,
             head_dim_qk,
             head_dim_vo,
-            causal,
         )
 
         self._causal = causal
@@ -2350,7 +2349,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
                 head_dim_vo,
-                causal,
             )
 
         self._causal = causal

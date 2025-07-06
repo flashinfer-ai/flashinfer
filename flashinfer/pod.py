@@ -242,7 +242,6 @@ class PODWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
         self._use_tensor_cores = use_tensor_cores
         self._use_cuda_graph = use_cuda_graph
-
         if use_cuda_graph:
             # NOTE(Zihao): if once created, no need to update it in plan/run
             self._qo_indptr_buf = torch.arange(
@@ -437,7 +436,6 @@ class PODWithPagedKVCacheWrapper:
             self.is_cuda_graph_enabled,
             head_dim,
             head_dim,
-            False,  # causal
         )
 
         self._indptr_type = indptr_d.dtype

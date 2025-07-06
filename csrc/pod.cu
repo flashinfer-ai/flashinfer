@@ -39,26 +39,28 @@ using namespace flashinfer;
 at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                               at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
                               at::Tensor kv_indptr_p, at::Tensor kv_len_arr_p,
-                              at::Tensor kv_indptr_d, at::Tensor qo_indptr_d,
-                              int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
-                              int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
-                              int64_t head_dim_qk, int64_t head_dim_vo, bool causal) {
+                              uint32_t total_num_rows_p, uint32_t batch_size_p,
+                              at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
+                              uint32_t total_num_rows_d, uint32_t batch_size_d,
+                              uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim_qk,
+                              uint32_t head_dim_vo, uint32_t page_size, bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
-  PrefillPlanInfo plan_info;
+  PODPlanInfo plan_info;
 
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-  cudaError_t status = PrefillPlan<IdType>(
-      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-      int_workspace_size_in_bytes, plan_info, qo_indptr_p.data_ptr<IdType>(),
-      kv_indptr_p.data_ptr<IdType>(), qo_indptr_d.data_ptr<IdType>(),
-      kv_indptr_d.data_ptr<IdType>(), total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-      head_dim_qk, head_dim_vo, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+  cudaError_t status =
+      PODPlan<IdType>(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+                      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+                      int_workspace_size_in_bytes, plan_info, qo_indptr_p.data_ptr<IdType>(),
+                      kv_indptr_p.data_ptr<IdType>(), total_num_rows_p, batch_size_p,
+                      qo_indptr_d.data_ptr<IdType>(), kv_indptr_d.data_ptr<IdType>(),
+                      total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads, head_dim_qk,
+                      head_dim_vo, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan prefill with error: ", cudaGetErrorString(status));
@@ -118,7 +120,7 @@ void PODWithKVCacheTensorRun(
   auto kv_scalar_type = k_p.scalar_type();
 
   // Decode setup (Tensor decode = batched prefill)
-  PrefillPlanInfo plan_info;
+  PODPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout_d = static_cast<QKVLayout>(layout_d);
   auto device = q_d.device();
@@ -296,13 +298,13 @@ at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_
                               at::Tensor kv_indptr_p, at::Tensor kv_len_arr, int64_t total_num_rows,
                               int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
                               int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-                              int64_t head_dim_vo, bool causal) {
+                              int64_t head_dim_vo) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
-  PrefillPlanInfo plan_info;
+  PODPlanInfo plan_info;
 
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();

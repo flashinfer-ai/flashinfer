@@ -524,9 +524,9 @@ inline auto get_q_tiles(std::vector<int64_t>& packed_qo_len_arr, uint32_t batch_
     // When CUDA graphs are enabled, the lengths of sequences determined by
     // qo_indptr_h can vary. We assume that the dummy data based on which
     // the CUDA graph is created fixes the maximum number of tokens.
-    const uint64_t max_seq_len = total_num_rows - batch_size + 1;
-    uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
     if (tile_size == -1) {
+      const uint64_t max_seq_len = total_num_rows - batch_size + 1;
+      uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
       cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
     } else {
       cta_tile_q = tile_size;
@@ -538,12 +538,12 @@ inline auto get_q_tiles(std::vector<int64_t>& packed_qo_len_arr, uint32_t batch_
     // number of rows.
     total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
   } else {
-    int64_t sum_packed_qo_len = 0;
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      sum_packed_qo_len += packed_qo_len_arr[i];
-    }
-    const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
     if (tile_size == -1) {
+      int64_t sum_packed_qo_len = 0;
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        sum_packed_qo_len += packed_qo_len_arr[i];
+      }
+      const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
       cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
     } else {
       cta_tile_q = tile_size;
@@ -866,11 +866,11 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                   gqa_group_size, enable_cuda_graph, cta_tile_q_d);
 
   uint32_t total_num_tiles_q = num_tiles_q_p + num_tiles_q_d;
-  // Assign CTAs proportional to the number of query tiles
+  // Allocate CTAs proportional to the number of query tiles in prefill and decode
   // TODO(Wenxuan): explore a more balanced cost function considering kv len.
   // See discussion: https://github.com/flashinfer-ai/flashinfer/issues/1175
   uint32_t max_bs_p = max_batch_size_if_split * num_tiles_q_p / total_num_tiles_q;
-  uint32_t max_bs_d = max_batch_size_if_split * num_tiles_q_d / total_num_tiles_q;
+  uint32_t max_bs_d = max_batch_size_if_split - max_bs_p;
   auto [split_kv_p, kv_chunk_size_p] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_bs_p, packed_qo_len_arr_p, kv_len_arr_p,
                                      cta_tile_q_p, min_kv_chunk_size);
@@ -905,8 +905,7 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d,
                          cta_tile_q_p, cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d,
                          std::move(request_indices), std::move(qo_tile_indices),
-                         std::move(kv_tile_indices)) std::move(merge_indptr),
-         std::move(o_indptr);
+                         std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
 }
 
 struct PODPlanInfo {
@@ -914,21 +913,16 @@ struct PODPlanInfo {
   int64_t total_num_rows;
   int64_t total_num_rows_offset;
   int64_t cta_tile_q;
-  int64_t request_indices_offset_p;
-  int64_t request_indices_offset_d;
-  int64_t qo_tile_indices_offset_p;
-  int64_t qo_tile_indices_offset_d;
-  int64_t kv_tile_indices_offset_p;
-  int64_t kv_tile_indices_offset_d;
+  int64_t request_indices_offset;
+  int64_t qo_tile_indices_offset;
+  int64_t kv_tile_indices_offset;
   int64_t merge_indptr_offset;
   int64_t o_indptr_offset;
   int64_t kv_chunk_size_ptr_offset_p;
   int64_t kv_chunk_size_ptr_offset_d;
-  int64_t v_offset_p;
-  int64_t v_offset_d int64_t s_offset_p;
-  int64_t s_offset_d;
-  int64_t block_valid_mask_offset_p;
-  int64_t block_valid_mask_offset_d;
+  int64_t v_offset;
+  int64_t s_offset;
+  int64_t block_valid_mask_offset;
   bool enable_cuda_graph;
   bool split_kv;
 
@@ -937,20 +931,14 @@ struct PODPlanInfo {
         total_num_rows(0),
         total_num_rows_offset(0),
         cta_tile_q(0),
-        request_indices_offset_p(0),
-        request_indices_offset_d(0),
-        qo_tile_indices_offset_p(0),
-        qo_tile_indices_offset_d(0),
-        kv_tile_indices_offset_p(0),
-        kv_tile_indices_offset_d(0),
+        request_indices_offset(0),
+        qo_tile_indices_offset(0),
+        kv_tile_indices_offset(0),
         merge_indptr_offset(0),
         o_indptr_offset(0),
-        kv_chunk_size_ptr_offset_p(0),
-        kv_chunk_size_ptr_offset_d(0),
-        v_offset_p(0),
-        v_offset_d(0),
-        s_offset_p(0),
-        s_offset_d(0),
+        kv_chunk_size_ptr_offset(0),
+        v_offset(0),
+        s_offset(0),
         block_valid_mask_offset(0),
         enable_cuda_graph(false),
         split_kv(false) {}
@@ -1028,7 +1016,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-  int num_blocks_per_sm = 2;  // TODO(Wenxuan): increase this to reduce wave quantization?
+  int num_blocks_per_sm = 3;  // TODO(Wenxuan): increase this to reduce wave quantization?
   int max_grid_size = num_blocks_per_sm * num_sm;
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
