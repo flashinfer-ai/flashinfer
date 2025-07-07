@@ -62,12 +62,7 @@ def _prepare_for_editable():
     _aot_ops_package_dir.symlink_to(_aot_ops_dir)
 
 
-def get_requires_for_build_wheel(config_settings=None):
-    _prepare_for_wheel()
-    return _requires_for_aot
-
-
-def get_requires_for_build_sdist(config_settings=None):
+def _prepare_for_sdist():
     # Remove data directory
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
@@ -77,6 +72,14 @@ def get_requires_for_build_sdist(config_settings=None):
     _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
     _aot_ops_package_dir.mkdir(parents=True)
 
+
+def get_requires_for_build_wheel(config_settings=None):
+    _prepare_for_wheel()
+    return _requires_for_aot
+
+
+def get_requires_for_build_sdist(config_settings=None):
+    _prepare_for_sdist()
     return []
 
 
@@ -101,7 +104,7 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 
 def build_sdist(sdist_directory, config_settings=None):
-    get_requires_for_build_sdist(config_settings)
+    _prepare_for_sdist()
     return orig.build_sdist(sdist_directory, config_settings)
 
 
