@@ -224,6 +224,7 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         w31_weight,
         w2_weight,
         flash_output.dtype,
+        output=flash_output,
         quant_scales=None,
     )
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
@@ -294,7 +295,7 @@ def test_moe_fp8(
         hidden_states_scale,
     ]
 
-    flash_output = fused_moe.cutlass_fused_moe(
+    _ = fused_moe.cutlass_fused_moe(
         x_quant,
         selected_experts.to(torch.int),
         routing_weights,
@@ -302,8 +303,9 @@ def test_moe_fp8(
         w2_weight,
         otype,
         quant_scales=quant_scales,
+        output=flash_output,
     )
-    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -408,7 +410,7 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    flash_output = fused_moe.cutlass_fused_moe(
+    _ = fused_moe.cutlass_fused_moe(
         hidden_states,
         selected_experts.to(torch.int),
         routing_weights,
@@ -417,6 +419,7 @@ def test_moe_nvfp4(
         otype,
         quant_scales=quant_scales,
         input_sf=input_sf,
+        output=flash_output,
     )
 
     # Ref check
@@ -459,7 +462,7 @@ def test_moe_nvfp4(
     ref_output = torch_moe_nvfp4(
         a_in_dtype, w1_d, w2_d, top_k, routing_weights, selected_experts
     )
-    torch.testing.assert_close(ref_output, flash_output[0], rtol=2e-1, atol=2e-1)
+    torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -536,7 +539,7 @@ def test_moe_expert_parallel(
             expert_start:expert_end, :
         ]  # Get only the experts for this rank
 
-        out_hidden_states_local = fused_moe.cutlass_fused_moe(
+        _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
@@ -546,8 +549,9 @@ def test_moe_expert_parallel(
             ep_size=ep_size,
             ep_rank=ep_rank,
             quant_scales=None,
+            output=out_hidden_states_local,
         )
-        outputs.append(out_hidden_states_local[0])
+        outputs.append(out_hidden_states_local)
 
     # Reduce results from all GPUs
     for ep_rank in range(ep_size):
@@ -646,7 +650,7 @@ def test_moe_tensor_parallel(
         w2_end = w2_start + w2_shard_size
         w2_weight_local = w2_weight[:, :, w2_start:w2_end]
 
-        out_hidden_states_local = fused_moe.cutlass_fused_moe(
+        _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
@@ -656,8 +660,9 @@ def test_moe_tensor_parallel(
             tp_size=tp_size,
             tp_rank=tp_rank,
             quant_scales=None,
+            output=out_hidden_states_local,
         )
-        outputs.append(out_hidden_states_local[0])
+        outputs.append(out_hidden_states_local)
 
     # All-reduce to sum partial results from all GPUs
     flash_output = sum(outputs)
