@@ -102,7 +102,7 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 def build_sdist(sdist_directory, config_settings=None):
     get_requires_for_build_sdist(config_settings)
-    return orig.build_wheel(sdist_directory, config_settings)
+    return orig.build_sdist(sdist_directory, config_settings)
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
