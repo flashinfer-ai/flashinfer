@@ -1,3 +1,19 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -217,7 +233,7 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
     )
     flash_output = torch.empty_like(ref_output)
-    flash_output = fused_moe.cutlass_fused_moe(
+    flash_output = fused_moe.fused_moe_cutlass(
         x,
         selected_experts.to(torch.int),
         routing_weights,
@@ -294,7 +310,7 @@ def test_moe_fp8(
         hidden_states_scale,
     ]
 
-    flash_output = fused_moe.cutlass_fused_moe(
+    flash_output = fused_moe.fused_moe_cutlass(
         x_quant,
         selected_experts.to(torch.int),
         routing_weights,
@@ -408,7 +424,7 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    flash_output = fused_moe.cutlass_fused_moe(
+    flash_output = fused_moe.fused_moe_cutlass(
         hidden_states,
         selected_experts.to(torch.int),
         routing_weights,
@@ -536,7 +552,7 @@ def test_moe_expert_parallel(
             expert_start:expert_end, :
         ]  # Get only the experts for this rank
 
-        out_hidden_states_local = fused_moe.cutlass_fused_moe(
+        out_hidden_states_local = fused_moe.fused_moe_cutlass(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
@@ -646,7 +662,7 @@ def test_moe_tensor_parallel(
         w2_end = w2_start + w2_shard_size
         w2_weight_local = w2_weight[:, :, w2_start:w2_end]
 
-        out_hidden_states_local = fused_moe.cutlass_fused_moe(
+        out_hidden_states_local = fused_moe.fused_moe_cutlass(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
@@ -765,7 +781,7 @@ def test_moe_tensor_expert_parallel(
             w2_weight_local = w2_weight_ep[:, :, w2_start:w2_end]
 
             # Call flashinfer implementation with both parallelisms
-            out_hidden_states_local = fused_moe.cutlass_fused_moe(
+            out_hidden_states_local = fused_moe.fused_moe_cutlass(
                 x.contiguous(),
                 selected_experts.to(torch.int),
                 routing_weights,
@@ -991,7 +1007,7 @@ def test_moe_fp8_block_scaling(
         NotImplementedError,
         match="FP8 Block Scaling is not yet implemented for Blackwell",
     ):
-        _ = fused_moe.cutlass_fused_moe(
+        _ = fused_moe.fused_moe_cutlass(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
