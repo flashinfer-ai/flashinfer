@@ -7,23 +7,19 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [4, 8, 64])
-@pytest.mark.parametrize("s_qo", [1])
-@pytest.mark.parametrize("s_kv", [8, 64, 2048])
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("batch_size", [4, 8, 17, 64])
+@pytest.mark.parametrize("s_kv", [8, 40, 1024])
+@pytest.mark.parametrize("page_size", [1, 8])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
 def test_cudnn_decode(
     batch_size,
-    s_qo,
     s_kv,
     page_size,
     num_kv_heads,
     num_qo_heads,
-    head_dim,
-    use_cuda_graph,
+    is_cuda_graph_compatible,
 ):
 
     # test set up basics
@@ -31,7 +27,11 @@ def test_cudnn_decode(
     torch.manual_seed(seed)
     device = "cuda:0"
 
+    s_qo = 1
+    head_dim = 128
+
     # Initialize Q tensor
+    # Since the number of tokens is 1, batch size is the token count
     q = torch.randn(
         batch_size, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
     )
@@ -79,7 +79,7 @@ def test_cudnn_decode(
 
     # Actual sequence lengths (should be randomized across batches. )
     actual_seq_lens_kv = torch.randint(
-        s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        0, s_kv, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
     workspace_buffer_size = math.ceil(
@@ -102,26 +102,13 @@ def test_cudnn_decode(
         v_cache,
         scale,
         workspace_buffer,
-        actual_seq_lens_kv,
-        block_tables,
-        use_cuda_graph=use_cuda_graph,
+        max_sequence_kv=s_kv,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_tables=block_tables,
+        is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
-
-    torch.cuda.synchronize()
-
-    tokens_per_seq_device = torch.ones([batch_size], device=device)
 
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
-    qo_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(tokens_per_seq_device.view(-1), dim=0),
-            ]
-        )
-        .int()
-        .to(device)
-    )
 
     kv_indptr = (
         torch.cat(
@@ -177,7 +164,5 @@ def test_cudnn_decode(
     )
 
     output_ref = wrapper.run(q, kv_cache)
-
-    torch.cuda.synchronize()
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
