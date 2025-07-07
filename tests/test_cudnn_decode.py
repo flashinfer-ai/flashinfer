@@ -107,22 +107,7 @@ def test_cudnn_decode(
         is_cuda_graph_compatible=use_cuda_graph,
     )
 
-    torch.cuda.synchronize()
-
-    tokens_per_seq_device = torch.ones([batch_size], device=device)
-
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
-    qo_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(tokens_per_seq_device.view(-1), dim=0),
-            ]
-        )
-        .int()
-        .to(device)
-    )
-
     kv_indptr = (
         torch.cat(
             [
@@ -177,7 +162,5 @@ def test_cudnn_decode(
     )
 
     output_ref = wrapper.run(q, kv_cache)
-
-    torch.cuda.synchronize()
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
