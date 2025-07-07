@@ -713,14 +713,16 @@ def trtllm_allreduce_fusion(
 ) -> None:
     """
     Note:
-    use_oneshot should be only be enabled when
-    (1) prefer one-shot strategy than two-shot strategy
-    (2) in min-latency mode, sequence length < one-shot max token num (128 now)
-    Otherwise, use_oneshot should be disabled.
+    Regarding the `use_oneshot` parameter:
+
+    It should only be enabled when:
+    (1) Preferring the one-shot strategy over the two-shot strategy.
+    (2) In min-latency mode, the sequence length is less than the one-shot max token number (currently 128).
+
+    Otherwise, it should be disabled.
     """
     if not use_oneshot:
-        seq_len = allreduce_in.shape[0]
-        assert seq_len > world_size, "sequence length should be larger than tp_size"
+        assert token_num > world_size, "sequence length should be larger than tp_size"
 
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
