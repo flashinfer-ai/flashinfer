@@ -104,7 +104,7 @@ def test_cudnn_decode(
         workspace_buffer,
         actual_seq_lens_kv,
         block_tables,
-        use_cuda_graph=use_cuda_graph,
+        is_cuda_graph_compatible=use_cuda_graph,
     )
 
     torch.cuda.synchronize()
