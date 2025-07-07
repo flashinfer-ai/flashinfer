@@ -566,8 +566,11 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
                                  std::vector<int64_t>& kv_tile_indices = nullptr,
                                  std::vector<int64_t>& merge_indptr = nullptr,
                                  std::vector<int64_t>& o_indptr = nullptr) {
+  uint32_t start_req_idx = 0;  // for global q,k,v,o indexing in POD Attention
   if (request_indices == nullptr) {
     request_indices = std::vector<int64_t>();
+  } else {
+    start_req_idx = request_indices.back();
   }
   if (qo_tile_indices == nullptr) {
     qo_tile_indices = std::vector<int64_t>();
@@ -594,7 +597,7 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         real_batch_size += 1;
-        request_indices.push_back(request_idx);
+        request_indices.push_back(request_idx + start_req_idx);
         qo_tile_indices.push_back(q_tile_idx);
         kv_tile_indices.push_back(kv_tile_idx);
       }
