@@ -67,7 +67,7 @@ inline void CopyToPageLockedBuffer(void* page_locked_int_buffer, int64_t offset,
  * \param num_pages The number of pages per request in the batch
  * \param max_num_pages_per_batch_lb The pre-set lower bound of maximum number of
  *   pages per batch, default to 1
- * \return (max_num_pages_per_batch, new_batch_size) The number of pages per batch and
+ * \return (max_num_pages_per_batch, real_batch_size) The number of pages per batch and
  *   the new batch size after the partition.
  */
 template <typename IdType>
@@ -78,24 +78,24 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
   for (const IdType& elem : num_pages) {
     high = max(high, elem);
   }
-  uint32_t new_batch_size;
+  uint32_t real_batch_size;
   while (low < high) {
     uint32_t mid = (low + high) / 2;
-    new_batch_size = 0;
+    real_batch_size = 0;
     for (const IdType& elem : num_pages) {
-      new_batch_size += ceil_div(elem, mid);
+      real_batch_size += ceil_div(elem, mid);
     }
-    if (new_batch_size * gdy > max_grid_size) {
+    if (real_batch_size * gdy > max_grid_size) {
       low = mid + 1;
     } else {
       high = mid;
     }
   }
-  new_batch_size = 0;
+  real_batch_size = 0;
   for (const IdType& elem : num_pages) {
-    new_batch_size += ceil_div(std::max(elem, 1), low);
+    real_batch_size += ceil_div(std::max(elem, 1), low);
   }
-  return std::make_tuple(low, new_batch_size);
+  return std::make_tuple(low, real_batch_size);
 }
 
 inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
@@ -115,12 +115,12 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
   constexpr int64_t min_kv_len = 1;
   while (low < high) {
     const int64_t mid = (low + high) / 2;
-    int64_t new_batch_size = 0;
+    int64_t real_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
-      new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
-                        ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
+      real_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
+                         ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
-    if (new_batch_size > max_batch_size_if_split) {
+    if (real_batch_size > max_batch_size_if_split) {
       low = mid + 1;
     } else {
       high = mid;
@@ -138,7 +138,7 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
  * \param split_kv Whether to split the KV cache into multiple chunks
  * \param max_grid_size The maximum grid size that can be used in a partiton-kv kernel
  * \param max_num_pages_per_batch The maximum number of pages per batch
- * \param new_batch_size The new batch size after the partition
+ * \param real_batch_size The new batch size after the partition
  * \param paged_kv The paged kv cache data structure
  * \param num_qo_heads A integer indicates the number of heads of query and output
  * \param pos_encoding_mode The positional encoding mode
@@ -149,7 +149,7 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_M
           typename AttentionVariant, typename Params>
 inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
+    uint32_t& real_batch_size, uint32_t& gdy, uint32_t batch_size,
     typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
@@ -187,17 +187,17 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
         max_num_pages_per_batch = std::max<uint32_t>(
             max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
       }
-      new_batch_size = batch_size;
+      real_batch_size = batch_size;
     } else {
-      // compute max_num_pages_per_batch and new_batch_size
+      // compute max_num_pages_per_batch and real_batch_size
       std::vector<IdType> num_pages(batch_size);
       for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
-      std::tie(max_num_pages_per_batch, new_batch_size) =
+      std::tie(max_num_pages_per_batch, real_batch_size) =
           PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
                                                               std::max(128 / page_size, 1U));
-      if (new_batch_size == batch_size && !enable_cuda_graph) {
+      if (real_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
       } else {
@@ -212,7 +212,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
 inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
+    uint32_t& real_batch_size, uint32_t& gdy, uint32_t batch_size,
     typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
@@ -253,17 +253,17 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
         max_num_pages_per_batch = std::max<uint32_t>(
             max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
       }
-      new_batch_size = batch_size;
+      real_batch_size = batch_size;
     } else {
-      // compute max_num_pages_per_batch and new_batch_size
+      // compute max_num_pages_per_batch and real_batch_size
       std::vector<IdType> num_pages(batch_size);
       for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
-      std::tie(max_num_pages_per_batch, new_batch_size) =
+      std::tie(max_num_pages_per_batch, real_batch_size) =
           PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
                                                               std::max(128 / page_size, 1U));
-      if (new_batch_size == batch_size && !enable_cuda_graph) {
+      if (real_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
       } else {
@@ -280,7 +280,7 @@ template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, uint32_t QO_TILE_LEN,
           typename AttentionVariant, typename Params>
 inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, uint32_t& gdy_, uint32_t batch_size,
+    uint32_t& real_batch_size, uint32_t& gdy_, uint32_t batch_size,
     typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
@@ -313,17 +313,17 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM8
       max_num_pages_per_batch = std::max<uint32_t>(
           max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
     }
-    new_batch_size = batch_size;
+    real_batch_size = batch_size;
   } else {
-    // compute max_num_pages_per_batch and new_batch_size
+    // compute max_num_pages_per_batch and real_batch_size
     std::vector<IdType> num_pages(batch_size);
     for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
     }
-    std::tie(max_num_pages_per_batch, new_batch_size) =
+    std::tie(max_num_pages_per_batch, real_batch_size) =
         PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
                                                             std::max(128 / page_size, 1U));
-    if (new_batch_size == batch_size && !enable_cuda_graph) {
+    if (real_batch_size == batch_size && !enable_cuda_graph) {
       // do not use partition-kv kernel for short sequence, when not using CUDAGraph
       split_kv = false;
     } else {
@@ -432,16 +432,16 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   bool split_kv;
-  uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size, gdy;
+  uint32_t max_grid_size, kv_chunk_size_in_pages, real_batch_size, gdy;
 
   FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, kv_chunk_size_in_pages,
-                                            new_batch_size, gdy, batch_size, indptr_h, num_qo_heads,
-                                            page_size, enable_cuda_graph, stream));
+                                            real_batch_size, gdy, batch_size, indptr_h,
+                                            num_qo_heads, page_size, enable_cuda_graph, stream));
   size_t padded_batch_size;
   plan_info.enable_cuda_graph = enable_cuda_graph;
   plan_info.split_kv = split_kv;
   padded_batch_size =
-      (enable_cuda_graph) ? (split_kv ? max_grid_size / gdy : batch_size) : new_batch_size;
+      (enable_cuda_graph) ? (split_kv ? max_grid_size / gdy : batch_size) : real_batch_size;
   plan_info.padded_batch_size = padded_batch_size;
 
   auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
@@ -481,7 +481,7 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
     bool* block_valid_mask_h =
         GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
     for (uint32_t i = 0; i < padded_batch_size; ++i) {
-      block_valid_mask_h[i] = i < new_batch_size;
+      block_valid_mask_h[i] = i < real_batch_size;
     }
   }
 
@@ -584,7 +584,7 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
     o_indptr.push_back(0);
   }
 
-  uint32_t new_batch_size = 0;
+  uint32_t real_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     const int64_t packed_qo_len = packed_qo_len_arr[request_idx];
     const int64_t kv_len = std::max(int(kv_len_arr[request_idx]), 1);
@@ -593,7 +593,7 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
-        new_batch_size += 1;
+        real_batch_size += 1;
         request_indices.push_back(request_idx);
         qo_tile_indices.push_back(q_tile_idx);
         kv_tile_indices.push_back(kv_tile_idx);
@@ -607,7 +607,7 @@ inline auto get_qkv_tile_indices(std::vector<int64_t>& packed_qo_len_arr,
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
   return std::make_tuple(request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
-                         new_batch_size);
+                         real_batch_size);
 }
 
 template <typename IdType>
@@ -635,19 +635,19 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
                                      kv_len_arr, cta_tile_q, min_kv_chunk_size);
 
-  auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr, new_batch_size] =
-      get_qkv_tile_indices(packed_qo_len_arr, kv_len_arr, batch_size, cta_tile_q, kv_chunk_size,
-                           gqa_group_size);
+  auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
+        real_batch_size] = get_qkv_tile_indices(packed_qo_len_arr, kv_len_arr, batch_size,
+                                                cta_tile_q, kv_chunk_size, gqa_group_size);
 
   const size_t padded_batch_size =
-      enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
-  FLASHINFER_CHECK(new_batch_size <= padded_batch_size,
+      enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : real_batch_size;
+  FLASHINFER_CHECK(real_batch_size <= padded_batch_size,
                    "new batch size should not exceed padded batch size");
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
 
-  return std::make_tuple(split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
+  return std::make_tuple(split_kv, real_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
                          std::move(request_indices), std::move(qo_tile_indices),
                          std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
 }
@@ -756,11 +756,11 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
-  auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
-        qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
-      PrefillSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, total_num_rows, batch_size, num_qo_heads,
-                             num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph);
+  auto [split_kv, real_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
+        request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
+        o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, total_num_rows, batch_size,
+                                               num_qo_heads, num_kv_heads, head_dim_vo, page_size,
+                                               max_batch_size_if_split, enable_cuda_graph);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -822,7 +822,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
     std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
     for (uint32_t i = 0; i < padded_batch_size; ++i) {
-      block_valid_mask_h[i] = i < new_batch_size;
+      block_valid_mask_h[i] = i < real_batch_size;
     }
   }
 
@@ -890,19 +890,19 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                            kv_tile_indices, merge_indptr, o_indptr);
 
   bool split_kv = split_kv_p || split_kv_d;
-  uint32_t new_batch_size = new_batch_size_p + new_batch_size_d;
+  uint32_t real_batch_size = new_batch_size_p + new_batch_size_d;
   const size_t padded_batch_size_p =
       enable_cuda_graph ? std::max(max_bs_p, total_num_tiles_q_p) : new_batch_size_p;
   const size_t padded_batch_size_d =
       enable_cuda_graph ? std::max(max_bs_d, total_num_tiles_q_d) : new_batch_size_d;
-  FLASHINFER_CHECK(new_batch_size <= padded_batch_size_p + padded_batch_size_d,
+  FLASHINFER_CHECK(real_batch_size <= padded_batch_size_p + padded_batch_size_d,
                    "new batch size should not exceed padded batch size");
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size_p *= page_size;
   kv_chunk_size_d *= page_size;
 
-  return std::make_tuple(split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d,
+  return std::make_tuple(split_kv, real_batch_size, padded_batch_size_p, padded_batch_size_d,
                          cta_tile_q_p, cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d,
                          std::move(request_indices), std::move(qo_tile_indices),
                          std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
@@ -1021,7 +1021,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
-  auto [split_kv, new_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
+  auto [split_kv, real_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
         cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices, qo_tile_indices,
         kv_tile_indices, merge_indptr, o_indptr] =
       PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, qo_indptr_d, kv_indptr_d, total_num_rows_p,
@@ -1093,7 +1093,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
         GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
     std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
     for (uint32_t i = 0; i < padded_batch_size; ++i) {
-      block_valid_mask_h[i] = i < new_batch_size;
+      block_valid_mask_h[i] = i < real_batch_size;
     }
   }
 
