@@ -165,7 +165,7 @@ def test_trtllm_batch_decode(
     # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device).contiguous()
+    kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device)
     k_scale = v_scale = 1.0
 
     if kv_cache_dtype.startswith("fp8"):
@@ -174,7 +174,7 @@ def test_trtllm_batch_decode(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        q.contiguous(),
+        q,
         kv_cache,
         workspace_buffer,
         num_qo_heads,
@@ -191,7 +191,7 @@ def test_trtllm_batch_decode(
 
     if head_grp_size == 5:
         output_ref = reference_paged_attention(
-            q.contiguous(),
+            q,
             kv_cache,
             block_tables,
             seq_lens_tensor,
@@ -239,6 +239,6 @@ def test_trtllm_batch_decode(
             q_data_type=dtype,
         )
 
-        output_ref = wrapper.run(q.contiguous(), kv_cache)
+        output_ref = wrapper.run(q, kv_cache)
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)

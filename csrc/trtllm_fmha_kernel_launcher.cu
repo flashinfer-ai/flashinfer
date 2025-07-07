@@ -16,10 +16,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <flashinfer/exception.h>
 #include <nvrtc.h>
-#include <torch/all.h>
+// #include <torch/all.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <flashinfer/semaphore_utils.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
@@ -37,7 +36,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
                                      double v_scale) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
-  assert(num_heads == static_cast<int>(num_q_heads));
+  TORCH_CHECK(num_heads == static_cast<int>(num_q_heads),
+              "num_q_heads params and query shape does not match!");
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(-1);
 
