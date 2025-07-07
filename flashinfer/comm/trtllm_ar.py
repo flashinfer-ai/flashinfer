@@ -711,6 +711,17 @@ def trtllm_allreduce_fusion(
     scale_factor: Optional[float],
     layout_code: Optional[FP4QuantizationSFLayout],
 ) -> None:
+    """
+    Note:
+    use_oneshot should be only be enabled when
+    (1) prefer one-shot strategy than two-shot strategy
+    (2) in min-latency mode, sequence length < one-shot max token num (128 now)
+    Otherwise, use_oneshot should be disabled.
+    """
+    if not use_oneshot:
+        seq_len = allreduce_in.shape[0]
+        assert seq_len > world_size, "sequence length should be larger than tp_size"
+
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
         world_size=world_size,
