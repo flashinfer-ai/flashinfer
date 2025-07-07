@@ -216,6 +216,9 @@ struct TllmGenFmhaRunnerParams {
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;
 
+  // todo(Yingyi): check the output scaling
+  float mOutputScale;
+
   // The SF scale for Kv.
   float mScaleSfKv;
   // The cuda stream.

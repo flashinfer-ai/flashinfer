@@ -1696,6 +1696,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
+# todo(Yingyi): update the params list
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
