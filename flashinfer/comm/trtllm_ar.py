@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -541,7 +542,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         else tp_size * max_token_num * hidden_dim * 4
     )
     if lamport_comm_size > MAX_COMM_SIZE:
-        print(
+        logging.warning(
             f"warning: lamport_comm_size {lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}, set to MAX_COMM_SIZE"
         )
         lamport_comm_size = MAX_COMM_SIZE
