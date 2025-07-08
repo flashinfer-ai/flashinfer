@@ -2,7 +2,6 @@ import shutil
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from setuptools.build_meta import *  # noqa: F403
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
@@ -63,12 +62,7 @@ def _prepare_for_editable():
     _aot_ops_package_dir.symlink_to(_aot_ops_dir)
 
 
-def get_requires_for_build_wheel(config_settings=None):
-    _prepare_for_wheel()
-    return _requires_for_aot
-
-
-def get_requires_for_build_sdist(config_settings=None):
+def _prepare_for_sdist():
     # Remove data directory
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
@@ -78,6 +72,14 @@ def get_requires_for_build_sdist(config_settings=None):
     _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
     _aot_ops_package_dir.mkdir(parents=True)
 
+
+def get_requires_for_build_wheel(config_settings=None):
+    _prepare_for_wheel()
+    return _requires_for_aot
+
+
+def get_requires_for_build_sdist(config_settings=None):
+    _prepare_for_sdist()
     return []
 
 
@@ -94,3 +96,18 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
     _prepare_for_editable()
     return orig.prepare_metadata_for_build_editable(metadata_directory, config_settings)
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    _prepare_for_editable()
+    return orig.build_editable(wheel_directory, config_settings, metadata_directory)
+
+
+def build_sdist(sdist_directory, config_settings=None):
+    _prepare_for_sdist()
+    return orig.build_sdist(sdist_directory, config_settings)
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    _prepare_for_wheel()
+    return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
