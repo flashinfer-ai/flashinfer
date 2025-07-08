@@ -379,10 +379,12 @@ class PODWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf[:batch_size_p].copy_(
+            self._paged_kv_indptr_buf[: batch_size_p + 1].copy_(
                 kv_indptr_p, non_blocking=non_blocking
             )
-            self._paged_kv_indptr_buf[batch_size_p : batch_size_p + batch_size_d].copy_(
+            self._paged_kv_indptr_buf[
+                batch_size_p + 1 : batch_size_p + batch_size_d + 2
+            ].copy_(
                 kv_indptr_d,
                 non_blocking=(kv_indptr_d.device == self.device) and non_blocking,
             )
@@ -395,12 +397,12 @@ class PODWithPagedKVCacheWrapper:
                 last_page_len_d,
                 non_blocking=(last_page_len_d.device == self.device) and non_blocking,
             )
-            self._paged_kv_indices_buf[:batch_size_p].copy_(
+            self._paged_kv_indices_buf[: batch_size_p + 1].copy_(
                 kv_indices_d,
                 non_blocking=(kv_indices_d.device == self.device) and non_blocking,
             )
             self._paged_kv_indices_buf[
-                batch_size_p : batch_size_p + batch_size_d
+                batch_size_p + 1 : batch_size_p + batch_size_d + 2
             ].copy_(
                 kv_indices_d,
                 non_blocking=(kv_indices_d.device == self.device) and non_blocking,
@@ -651,7 +653,7 @@ class PODWithPagedKVCacheWrapper:
             q_d,
             k_cache_d,
             v_cache_d,
-            self._qo_indptr_buf_d,
+            self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,

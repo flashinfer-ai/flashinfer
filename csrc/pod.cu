@@ -292,31 +292,3 @@ void PODWithKVCacheTensorRun(
         //});
       });
 }
-
-at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                              at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
-                              at::Tensor kv_indptr_p, at::Tensor kv_len_arr, int64_t total_num_rows,
-                              int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
-                              int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-                              int64_t head_dim_vo) {
-  size_t float_workspace_size_in_bytes =
-      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
-  size_t int_workspace_size_in_bytes =
-      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
-
-  PODPlanInfo plan_info;
-
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-  cudaError_t status = PrefillPlan<IdType>(
-      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-      int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
-      kv_indptr.data_ptr<IdType>(), total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-      head_dim_qk, head_dim_vo, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
-
-  TORCH_CHECK(status == cudaSuccess,
-              "Failed to plan prefill with error: ", cudaGetErrorString(status));
-
-  return vec_to_tensor(plan_info.ToVector());
-}
