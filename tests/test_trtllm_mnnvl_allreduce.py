@@ -4,11 +4,9 @@ import sys
 
 import torch
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import flashinfer.comm as comm
 from flashinfer.comm.mapping import Mapping
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import traceback
 
 from mpi4py import MPI  # Added MPI import
@@ -43,13 +41,6 @@ def row_linear_residual_norm_fusion_forward(
         rank=tensor_parallel_rank,
     )
 
-    # Get workspace buffers using MPI rank
-    mcast_buffer_mnnvl, buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
-        comm.get_allreduce_mnnvl_workspace(mapping, dtype)
-    )
-
-    # Since all the modules here are provided by TRT-LLM,
-    # so it has to be fullgraph compatible
     def func(input, residual, norm_weight, eps, enable_fusion, buffer_mnnvl):
         # For both fused and unfused cases:
 
@@ -82,37 +73,47 @@ def row_linear_residual_norm_fusion_forward(
             )
             return (output.view(shape),)
 
-    output = func(x.clone(), residual.clone(), norm_weight, eps, fusion, buffer_mnnvl)
-
-    assert output[0].shape == reference_output[0].shape
-
-    if tensor_parallel_rank == 0:
-        print("output[0] (first 10 values):", output[0].flatten()[:10])
-        print(
-            "reference_output[0] (first 10 values):", reference_output[0].flatten()[:10]
-        )
-
-        if fusion:
-            print("output[1] (first 10 values):", output[1].flatten()[:10])
-            print(
-                "reference_output[1] (first 10 values):",
-                reference_output[1].flatten()[:10],
-            )
-
-    torch.testing.assert_close(
-        output[0],
-        reference_output[0],
-        rtol=0.05,
-        atol=0.15,
+    # Get workspace buffers using MPI rank
+    mcast_buffer_mnnvl, buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+        comm.get_allreduce_mnnvl_workspace(mapping, dtype)
     )
 
-    if fusion:
+    try:
+        output = func(x.clone(), residual.clone(), norm_weight, eps, fusion, buffer_mnnvl)
+
+        assert output[0].shape == reference_output[0].shape
+
+        if tensor_parallel_rank == 0:
+            print("output[0] (first 10 values):", output[0].flatten()[:10])
+            print(
+                "reference_output[0] (first 10 values):", reference_output[0].flatten()[:10]
+            )
+
+            if fusion:
+                print("output[1] (first 10 values):", output[1].flatten()[:10])
+                print(
+                    "reference_output[1] (first 10 values):",
+                    reference_output[1].flatten()[:10],
+                )
+
         torch.testing.assert_close(
-            output[1],
-            reference_output[1],
+            output[0],
+            reference_output[0],
             rtol=0.05,
             atol=0.15,
         )
+
+        if fusion:
+            torch.testing.assert_close(
+                output[1],
+                reference_output[1],
+                rtol=0.05,
+                atol=0.15,
+            )
+
+    finally:
+        # Ensure cleanup happens even if assertions fail
+        del mcast_buffer_mnnvl
 
 
 def test_mnnvl_allreduce_full(seq_len: int, fusion: bool):

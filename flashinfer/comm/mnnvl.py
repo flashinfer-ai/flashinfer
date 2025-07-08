@@ -480,14 +480,11 @@ class McastDeviceMemory:
         for i in range(self.group_size):
             self.signal_pads_dev[i] = self.uc_ptrs[i] + self.signal_pad_offset
             if i == self.group_rank:
-                try:
-                    checkCudaErrors(
+                checkCudaErrors(
                         cuda.cuMemsetD8(
                             self.signal_pads_dev[i], 0, self.SIGNAL_PAD_SIZE
                         )
                     )
-                except Exception as e:
-                    print(f"Error setting signal pad for rank {i}: {e}")
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
@@ -497,6 +494,11 @@ class McastDeviceMemory:
             return
 
         if not self.is_multi_node:
+            return
+
+        # Skip cleanup during Python finalization to avoid segfaults
+        # Especially cause the CUDA context could be destroyed at this point.
+        if sys.is_finalizing():
             return
 
         # Verify CUDA context is still valid
@@ -509,18 +511,23 @@ class McastDeviceMemory:
         # Unmap UC regions and release their handles
         if hasattr(self, "uc_handles") and self.uc_handles:
             for rank in range(self.group_size):
-                if rank == self.group_rank and self.uc_handles[rank] != 0:
+                if self.uc_handles[rank] != 0:
                     try:
-                        # Unmap first
+                        # Release the handle
+                        checkCudaErrors(cuda.cuMemRelease(self.uc_handles[rank]))
+                        # Unmap the vmem 
                         if rank < len(self.uc_ptrs) and self.uc_ptrs[rank]:
                             checkCudaErrors(
                                 cuda.cuMemUnmap(self.uc_ptrs[rank], self.allocation_size)
                             )
-                        checkCudaErrors(cuda.cuMemRelease(self.uc_handles[rank]))
                     except Exception as e:
                         print(
                             f"Destructor: Failed to release UC handle for rank {rank}: {e}"
                         )
+            
+            # Free the UC address space
+            if hasattr(self, "uc_base_ptr") and self.uc_base_ptr:
+                checkCudaErrors(cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size))
 
         # Release MC handle
         if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
@@ -693,9 +700,11 @@ class McastDeviceMemory:
 
         # Reserve address space for UC pointers
         total_uc_size = self.allocation_size * self.group_size
+        self.total_uc_size = total_uc_size
         uc_base_ptr = checkCudaErrors(
             cuda.cuMemAddressReserve(total_uc_size, mc_granularity, 0, 0)
         )
+        self.uc_base_ptr = uc_base_ptr  # Store for cleanup
 
         # Set up memory access descriptor
         access_desc = cuda.CUmemAccessDesc()
