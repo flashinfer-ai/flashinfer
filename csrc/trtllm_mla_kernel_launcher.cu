@@ -25,33 +25,30 @@
 #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
 #include <iostream>
 
-__constant__ float out_scale = 1.0f;
-__constant__ float log2e_h64 = 0.18033688011112042;
-__constant__ float log2e_h128 = 0.12751743082459868;
-__constant__ float log2e_h192 = 0.10411754627697266;
-__constant__ float log2e_h256 = 0.09016844005556021;
-__constant__ float log2e_h512 = 0.06375871541229934;
-
-// NOTE(Yingyi): dummy sliding window attention
+// NOTE(Yingyi):
+// dummy sliding window attention
+// quantization not supported
 namespace flashinfer {
 template <typename T, Data_type CACHE_T>
-void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
-                                         at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
-                                         double scale, at::Tensor& block_tables, double mScaleQ,
-                                         double mScaleKV, at::Tensor& seq_lens, int64_t block_size,
-                                         int64_t max_seq_len, const std::string kv_cache_dtype,
-                                         int64_t kv_lora_rank, int64_t qk_rope_head_dim,
-                                         bool fp8_generation_mla, std::optional<int64_t> acc_q_len,
-                                         std::optional<int64_t> max_attention_window_size,
-                                         std::optional<int64_t> cyclic_attention_window_size) {
+void trtllm_paged_attention_mla_launcher(
+    at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
+    double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
+    int64_t max_seq_len, const std::string kv_cache_dtype, int64_t qk_nope_head_dim,
+    int64_t kv_lora_rank, int64_t qk_rope_head_dim, bool fp8_generation_mla,
+    std::optional<int64_t> acc_q_len, std::optional<int64_t> max_attention_window_size,
+    std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
   int const num_q_heads = query.size(1);
   int const num_kv_heads = 1;
-  int head_size = query.size(
-      2);  // todo(Yingyi): add a check at python side that == kv_lora_rank + qk_rope_head_dim
-  int const beam_width = 1;  // NOTE: beam_width always 1
-  int const batch_beam = beam_width * batch_size;
+  int head_size = query.size(2);
+  FLASHINFER_CHECK(
+      head_size == kv_lora_rank + qk_rope_head_dim,
+      "head_size must be kv_lora_rank + qk_rope_head_dim for decode-only TRTLLM-GEN MLA");
+  // We only enable head_dim = 576 as decode-only MLA
+  FLASHINFER_CHECK(head_size == 576, "head_size must be 576 for decode-only TRTLLM-GEN MLA");
+  int const beam_width = 1;                        // NOTE: beam_width always 1
+  int const batch_beam = beam_width * batch_size;  // NOTE: batch_beam = batch_size
   int const max_num_blocks_per_seq = block_tables.size(-1);
 
   auto device = query.device();
@@ -63,7 +60,6 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
 
   bool use_multi_block = true;
   auto q_data_type = (kv_cache_dtype == "fp8_e4m3") ? DATA_TYPE_E4M3 : io_type;
-  auto output_dtype = io_type;
   static auto fmha_runner = TllmGenFmhaRunner(q_data_type, CACHE_T, io_type);
 
   TllmGenFmhaRunnerParams runner_params;
@@ -79,7 +75,7 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mMultiCtasKvMode = use_multi_block;
 
   // Q buffer.
-  // TODO(Yingyi): should we have an additional quantization input param?
+  // NOTE(Yingyi): no additional quantization input data field here
   runner_params.qPtr = query.data_ptr();
 
   // KV buffer
@@ -91,11 +87,11 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mNumTokensPerPage = tokens_per_page;
 
   // num_kv_heads should be enough, but num_heads for safty at long seq len.
-  size_t num_semaphores = batch_size * num_heads;
+  size_t num_semaphores = batch_size * num_q_heads;
 
   // The partial buffers' pointers when the multiCtasKv mode is enabled.
-  runner_params.multiCtasKvScratchPtr =
-      reinterpret_cast<void*>(workspace_buffer.data_ptr() + num_semaphores * sizeof(uint32_t));
+  runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
+      static_cast<char*>(workspace_buffer.data_ptr()) + num_semaphores * sizeof(uint32_t));
   runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer.data_ptr());
 
   // The sequence lengths for K/V.
@@ -106,7 +102,7 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.oSfPtr = nullptr;
 
   // MLA uses different head dimensions for Qk and V.
-  runner_params.mHeadDimQk = kv_lora_rank + qk_rope_head_dim;
+  runner_params.mHeadDimQk = num_q_heads;
   runner_params.mHeadDimV = kv_lora_rank;
 
   // NOTE: MLA use kv_heads = 1
@@ -131,16 +127,14 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
 
   // The attention window size.
   // NOTE(Yingyi): for sliding window attention, temp to the fixed INT_MAX
-  // runner_params.mAttentionWindowSize =
-  //     cyclic_attention_window_size.value_or(max_attention_window_size.value_or(max_seq_len));
   runner_params.mAttentionWindowSize = INT_MAX;
   // The chunked attention size.
   runner_params.mChunkedAttentionSize = INT_MAX;
 
   // The scaleQ that will be applied to the BMM1 output.
-  // todo(Yingyi): check the mQScaling: set to be a api param (mScaleQ and mScaleKV), default 1.0
-  runner_params.mScaleQ = 1.0 *
-                          sqrt((float)(mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)) /
+  // NOTE(Yingyi): set scale to be a api param, default 1.0
+  // Q_SCALE & KV_SCALE not supported for now
+  runner_params.mScaleQ = scale * sqrt((float)(qk_nope_head_dim + qk_rope_head_dim)) /
                           sqrtf((float)(kv_lora_rank + qk_rope_head_dim));
 
   // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds
@@ -153,56 +147,38 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
   // NOTE (Yingyi): quantization, not supported for now
   runner_params.mSfStartTokenIdx = 0;
 
-  // todo(Yingyi): check and complete the output scaling
-  // runner_params.mOutputScale = scaleO;
-
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
 
   fmha_runner.run(runner_params);
 }
 
-#define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                                   \
-  trtllm_paged_attention_mla_launcher<T, CACHE_T_ENUM>(                                      \
-      out, query, key_value_cache, workspace_buffer, scale, block_tables, q_scale, kv_scale, \
-      seq_lens, block_size, max_seq_len, kv_cache_dtype, kv_lora_rank, qk_rope_head_dim,     \
+#define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                                      \
+  trtllm_paged_attention_mla_launcher<T, CACHE_T_ENUM>(                                         \
+      out, query, key_value_cache, workspace_buffer, scale, block_tables, seq_lens, block_size, \
+      max_seq_len, kv_cache_dtype, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim,            \
       fp8_generation_mla, acc_q_len, max_attention_window_size, cyclic_attention_window_size);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
 // function with template<typename scalar_t, typename cache_t>
-#define DISPATCH_BY_KV_CACHE_ELEM_ENUM(SRC_DTYPE, KV_DTYPE, FN)                \
-  if (KV_DTYPE == "auto") {                                                    \
-    if (SRC_DTYPE == at::ScalarType::Half) {                                   \
-      FN(half, Data_type::DATA_TYPE_FP16);                                     \
-    } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                        \
-      FN(__nv_bfloat16, Data_type::DATA_TYPE_FP16);                            \
-    } else {                                                                   \
-      TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
-    }                                                                          \
-  } else {                                                                     \
-    if (KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") {                         \
-      if (SRC_DTYPE == at::ScalarType::Half) {                                 \
-        FN(half, Data_type::DATA_TYPE_E4M3);                                   \
-      } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                      \
-        FN(__nv_bfloat16, Data_type::DATA_TYPE_E4M3);                          \
-      } else {                                                                 \
-        TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
-      }                                                                        \
-    } else {                                                                   \
-      TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);     \
-    }                                                                          \
+#define DISPATCH_BY_Q_DTYPE(Q_DTYPE, FN)                                 \
+  if (Q_DTYPE == at::ScalarType::Float8E4M3FN) {                         \
+    FN(half, Data_type::DATA_TYPE_FP16);                                 \
+  } else if (Q_DTYPE == at::ScalarType::BFloat16) {                      \
+    FN(__nv_bfloat16, Data_type::DATA_TYPE_BF16);                        \
+  } else {                                                               \
+    TORCH_CHECK(false, "Unsupported input type of QKV type: ", Q_DTYPE); \
   }
 
 void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
                                 at::Tensor& workspace_buffer, double scale,
                                 at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
-                                int64_t max_seq_len, const std::string kv_cache_dtype,
-                                int64_t kv_lora_rank, int64_t qk_rope_head_dim,
-                                std::optional<int64_t> acc_q_len,
+                                int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank,
+                                int64_t qk_rope_head_dim, std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
-  DISPATCH_BY_KV_CACHE_ELEM_ENUM(query.dtype(), kv_cache_dtype, CALL_GEN_LAUNCHER);
+  DISPATCH_BY_Q_DTYPE(query.dtype(), CALL_GEN_LAUNCHER);
 }
 
 namespace trtllm_cubin_loader {
