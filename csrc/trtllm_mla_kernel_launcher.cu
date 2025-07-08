@@ -196,10 +196,9 @@ void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
 
 void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
                                 at::Tensor& workspace_buffer, double scale,
-                                at::Tensor& block_tables, double q_scale, double kv_scale,
-                                at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
-                                const std::string kv_cache_dtype, int64_t kv_lora_rank,
-                                int64_t qk_rope_head_dim, bool fp8_generation_mla,
+                                at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
+                                int64_t max_seq_len, const std::string kv_cache_dtype,
+                                int64_t kv_lora_rank, int64_t qk_rope_head_dim,
                                 std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
