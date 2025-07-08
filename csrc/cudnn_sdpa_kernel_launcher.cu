@@ -68,6 +68,14 @@ constexpr int32_t BYTES_PER_ELEMENT = 2;
 
 enum KernelType { PREFILL, PREFILL_DEEPSEEK, DECODE };
 
+enum PrefillType {
+  KERNEL_PREFILL,
+  KERNEL_PREFILL_DEEPSEEK,
+  KERNEL_PREFILL_CAUSAL,
+  KERNEL_PREFILL_DEEPSEEK_CAUSAL,
+  KERNEL_NUM_PREFILL_TYPES
+};
+
 void init_cudnn_cubin(std::map<KernelType, std::string>& cubin_map) {
   cubin_map[PREFILL] = getCubin(
       "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
@@ -389,17 +397,26 @@ static void create_packed_tma_desc_qo_prefill(int b, int32_t* actual_seq_lens_q_
   }
 }
 
-void setup_prefill(CUfunction* hfunc, CUfunction* hfunc_deepseek) {
+void setup_prefill(CUfunction* prefill_func) {
   // Use cu++filt to get the kernel name
-  std::string kernel_name_deepseek =
-
+  std::string kernel_name_deepseek_causal =
       "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
       "128x128x192ILb1ELb0EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
       "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
 
-  std::string kernel_name =
+  std::string kernel_name_causal =
       "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
       "128x128x128ILb1ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
+      "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
+
+  std::string kernel_name_deepseek =
+      "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
+      "128x128x192ILb0ELb0EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
+      "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
+
+  std::string kernel_name =
+      "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
+      "128x128x128ILb0ELb1EEvN4fmha19AttentionDescriptorEPKN3tma11cudaTmaDescES5_fPfNS0_"
       "7stridesES5_S5_PKjS9_S9_jjNS0_11FastDivisorE";
 
   std::string cubin = get_cudnn_cubin(PREFILL);
@@ -422,12 +439,23 @@ void setup_prefill(CUfunction* hfunc, CUfunction* hfunc_deepseek) {
     throw std::runtime_error("Failed to cuModuleLoadData for prefill");
   }
 
-  if (cuModuleGetFunction(hfunc, hmod, kernel_name.c_str()) != CUDA_SUCCESS) {
+  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL], hmod, kernel_name.c_str()) !=
+      CUDA_SUCCESS) {
     throw std::runtime_error("Failed to cuModuleGetFunction for prefill");
   }
 
-  if (cuModuleGetFunction(hfunc_deepseek, hmod_deepseek, kernel_name_deepseek.c_str()) !=
+  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_DEEPSEEK], hmod_deepseek,
+                          kernel_name_deepseek.c_str()) != CUDA_SUCCESS) {
+    throw std::runtime_error("Failed to cuModuleGetFunction for prefill_deepseek");
+  }
+
+  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_CAUSAL], hmod, kernel_name_causal.c_str()) !=
       CUDA_SUCCESS) {
+    throw std::runtime_error("Failed to cuModuleGetFunction for prefill");
+  }
+
+  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_DEEPSEEK_CAUSAL], hmod_deepseek,
+                          kernel_name_deepseek_causal.c_str()) != CUDA_SUCCESS) {
     throw std::runtime_error("Failed to cuModuleGetFunction for prefill_deepseek");
   }
 };
@@ -510,30 +538,24 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
 
   // Step 1: Setup the kernel pointer
 
-  static CUfunction hfunc{nullptr};
-  static CUfunction hfunc_deepseek{nullptr};
+  static CUfunction prefill_func[KERNEL_NUM_PREFILL_TYPES] = {nullptr, nullptr, nullptr, nullptr};
 
   int64_t d_qk = q.size(2);
 
   int64_t d_vo = v_cache.dim() == 3 ? v_cache.size(2) : v_cache.size(3);
 
-  if (hfunc == nullptr || hfunc_deepseek == nullptr) {
-    setup_prefill(&hfunc, &hfunc_deepseek);
+  if (prefill_func[0] == nullptr) {
+    setup_prefill(prefill_func);
 
-    if (hfunc != nullptr) {
-      cuErrCheck(
-          cuFuncSetAttribute(hfunc, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_SIZE));
-      cuErrCheck(
-          cuFuncSetAttribute(hfunc, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
-      cuErrCheck(cuFuncSetAttribute(hfunc, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
-    }
-    if (hfunc_deepseek != nullptr) {
-      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                    SMEM_SIZE));
-      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek,
-                                    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
-      cuErrCheck(cuFuncSetAttribute(hfunc_deepseek,
-                                    CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
+    for (int i = 0; i < KERNEL_NUM_PREFILL_TYPES; i++) {
+      if (prefill_func[i] != nullptr) {
+        cuErrCheck(cuFuncSetAttribute(prefill_func[i],
+                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_SIZE));
+        cuErrCheck(cuFuncSetAttribute(prefill_func[i],
+                                      CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
+        cuErrCheck(cuFuncSetAttribute(prefill_func[i],
+                                      CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
+      }
     }
   }
 
@@ -749,11 +771,15 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, at::Tensor q, at::Tensor
   args[13] = &page_size_div;
 
   auto err_launch = CUDA_SUCCESS;
-  if (d_qk == 192) {
-    err_launch = cuLaunchKernelEx(&config, hfunc_deepseek, (void**)args, nullptr);
+
+  auto choice = KERNEL_PREFILL;
+  if (causal) {
+    choice = d_qk == 192 ? KERNEL_PREFILL_DEEPSEEK_CAUSAL : KERNEL_PREFILL_CAUSAL;
   } else {
-    err_launch = cuLaunchKernelEx(&config, hfunc, (void**)args, nullptr);
+    choice = d_qk == 192 ? KERNEL_PREFILL_DEEPSEEK : KERNEL_PREFILL;
   }
+
+  err_launch = cuLaunchKernelEx(&config, prefill_func[choice], (void**)args, nullptr);
 
   if (err_launch != CUDA_SUCCESS) {
     const char* errstr = NULL;
