@@ -141,7 +141,13 @@ void trtllm_paged_attention_mla_launcher(
   // access.
   // todo(Yingyi): check the memory pool size, bounded current kv cache pool passed by params
   // kv_cache
-  runner_params.mNumPagesInMemPool = INT_MAX;
+  // runner_params.mNumPagesInMemPool = INT_MAX;
+  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
+  int max_head_dim_kv = head_size;
+  runner_params.mNumPagesInMemPool =
+      total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
+                      max_head_dim_kv * get_size_in_bytes(CACHE_T));
+
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   runner_params.stream = stream;
   // NOTE (Yingyi): quantization, not supported for now
