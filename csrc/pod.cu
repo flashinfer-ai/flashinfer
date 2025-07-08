@@ -196,7 +196,7 @@ void PODWithKVCacheTensorRun(
 
           params.window_left = window_left_p;
           params.partition_kv = false;
-
+          params.padded_batch_size = plan_info.padded_batch_size_p;
           params.maybe_custom_mask = maybe_custom_mask_p
                                          ? static_cast<uint8_t*>(maybe_custom_mask_p->data_ptr())
                                          : nullptr;
@@ -251,7 +251,7 @@ void PODWithKVCacheTensorRun(
                   GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
             }
           }
-          params.padded_batch_size = plan_info.padded_batch_size;
+          params.padded_batch_size = plan_info.padded_batch_size_d;
           params.max_total_num_rows = plan_info.total_num_rows;
 
           params.partition_kv = false;

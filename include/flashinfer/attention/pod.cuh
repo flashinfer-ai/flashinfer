@@ -375,13 +375,13 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               decode_params.o = tmp_v;
               decode_params.lse = tmp_s;
             }
-            uint32_t num_qo_tiles = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
-            int nblks_p(num_qo_tiles *
-                        (prefill_params.partition_kv ? prefill_params.partition_kv : 1) *
-                        num_kv_heads);
+            // uint32_t num_qo_tiles = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
+            uint32_t padded_batch_size_p = prefill_params.padded_batch_size;
+            uint32_t padded_batch_size_d = decode_params.padded_batch_size;
+            int nblks_p(padded_batch_size_p * num_kv_heads);
             int nthrs_p(32 * NUM_WARPS_Q_P * NUM_WARPS_KV_P);
 
-            int nblks_d(padded_batch_size_d * 1 * num_kv_heads);
+            int nblks_d(padded_batch_size_d * num_kv_heads);
             int nthrs_d(32 * NUM_WARPS_Q_D * NUM_WARPS_KV_D);
 
             // ******* Select final combined sizes here ******* /

@@ -58,7 +58,7 @@ inline void CopyToPageLockedBuffer(void* page_locked_int_buffer, int64_t offset,
 }
 
 /*!
- * \brief Compute the maximum number of pages per batch and the new batch size
+ * \brief Compute the maximum number of pages per batch and the new batch size (grid dim x)
  *   after we partition Paged KV-Cache into multiple chunks on KV sequence length
  *   dimension.
  * \tparam IdType A template type indicates the index data type
@@ -737,7 +737,7 @@ template <typename IdType>
 inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                                void* int_buffer, void* page_locked_int_buffer,
                                size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info,
-                               IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_t total_num_rows,
+                               IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o,
@@ -761,7 +761,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   // step 2: determine kv_chunk_size
   auto [split_kv, real_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
-        o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, total_num_rows, batch_size,
+        o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size,
                                                num_qo_heads, num_kv_heads, head_dim_vo, page_size,
                                                max_batch_size_if_split, enable_cuda_graph);
 
@@ -912,8 +912,11 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
 }
 
 struct PODPlanInfo {
-  int64_t padded_batch_size;
+  int64_t padded_batch_size_p;
+  int64_t padded_batch_size_d;
   int64_t total_num_rows;
+  int64_t total_num_rows_p;
+  int64_t total_num_rows_d;
   int64_t total_num_rows_offset;
   uint16_t cta_tile_q_p;
   uint16_t cta_tile_q_d;
@@ -931,8 +934,11 @@ struct PODPlanInfo {
   bool split_kv;
 
   PODPlanInfo()
-      : padded_batch_size(0),
+      : padded_batch_size_p(0),
+        padded_batch_size_d(0),
         total_num_rows(0),
+        total_num_rows_p(0),
+        total_num_rows_d(0),
         total_num_rows_offset(0),
         cta_tile_q_p(0),
         cta_tile_q_d(0),
@@ -941,7 +947,8 @@ struct PODPlanInfo {
         kv_tile_indices_offset(0),
         merge_indptr_offset(0),
         o_indptr_offset(0),
-        kv_chunk_size_ptr_offset(0),
+        kv_chunk_size_ptr_offset_p(0),
+        kv_chunk_size_ptr_offset_d(0),
         v_offset(0),
         s_offset(0),
         block_valid_mask_offset(0),
@@ -950,8 +957,11 @@ struct PODPlanInfo {
 
   // convert PrefillPlanInfo to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {padded_batch_size,
+    return {padded_batch_size_p,
+            padded_batch_size_d,
             total_num_rows,
+            total_num_rows_p,
+            total_num_rows_d,
             total_num_rows_offset,
             cta_tile_q_p,
             cta_tile_q_d,
@@ -971,28 +981,31 @@ struct PODPlanInfo {
 
   // From std::vector<int64_t> to PodPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 15) {
+    if (vec.size() != 19) {
       std::ostringstream err_msg;
-      err_msg << "PodPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
+      err_msg << "PodPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
-    padded_batch_size = vec[0];
-    total_num_rows = vec[1];
-    total_num_rows_offset = vec[2];
-    cta_tile_q_p = vec[3];
-    cta_tile_q_d = vec[4];
-    request_indices_offset = vec[5];
-    qo_tile_indices_offset = vec[6];
-    kv_tile_indices_offset = vec[7];
-    merge_indptr_offset = vec[8];
-    o_indptr_offset = vec[9];
-    kv_chunk_size_ptr_offset_p = vec[10];
-    kv_chunk_size_ptr_offset_d = vec[11];
-    v_offset = vec[12];
-    s_offset = vec[13];
-    block_valid_mask_offset = vec[14];
-    enable_cuda_graph = vec[15];
-    split_kv = vec[16];
+    padded_batch_size_p = vec[0];
+    padded_batch_size_d = vec[1];
+    total_num_rows = vec[2];
+    total_num_rows_p = vec[3];
+    total_num_rows_d = vec[4];
+    total_num_rows_offset = vec[4];
+    cta_tile_q_p = vec[5];
+    cta_tile_q_d = vec[6];
+    request_indices_offset = vec[7];
+    qo_tile_indices_offset = vec[8];
+    kv_tile_indices_offset = vec[9];
+    merge_indptr_offset = vec[10];
+    o_indptr_offset = vec[11];
+    kv_chunk_size_ptr_offset_p = vec[12];
+    kv_chunk_size_ptr_offset_d = vec[13];
+    v_offset = vec[14];
+    s_offset = vec[15];
+    block_valid_mask_offset = vec[16];
+    enable_cuda_graph = vec[17];
+    split_kv = vec[18];
   }
 };
 
@@ -1030,7 +1043,12 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
                          batch_size_p, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
                          head_dim_vo, page_size, max_batch_size_if_split, enable_cuda_graph);
   uint32_t padded_batch_size = padded_batch_size_p + padded_batch_size_d;
+  uint32_t batch_size = batch_size_p + batch_size_d;
+  uint32_t total_num_rows = total_num_rows_p + total_num_rows_d;
 
+  plan_info.padded_batch_size_p = padded_batch_size_p;
+  plan_info.padded_batch_size_d = padded_batch_size_d;
+  plan_info.total_num_rows = total_num_rows;
   plan_info.cta_tile_q_p = cta_tile_q_p;
   plan_info.cta_tile_q_d = cta_tile_q_d;
   plan_info.total_num_rows_p = total_num_rows_p;
@@ -1059,7 +1077,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
         int_allocator.aligned_alloc_offset(sizeof(uint32_t), 16, "batch_prefill_total_num_rows");
     uint32_t* total_num_rows_h =
         GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer, plan_info.total_num_rows_offset);
-    *total_num_rows_h = qo_indptr_h[batch_size];
+    *total_num_rows_h = total_num_rows_p + total_num_rows_d;
   }
 
   IdType* request_indices_h =
@@ -1082,6 +1100,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   kv_chunk_size_ptr_d[0] = kv_chunk_size_d;
 
   if (split_kv) {
+    // TODO(Wenxuan): write through for non-split-kv requests
     uint32_t num_outputs_p = num_qo_heads * padded_batch_size_p * cta_tile_q_p * head_dim_vo;
     uint32_t num_outputs_d = num_qo_heads * padded_batch_size_d * cta_tile_q_d * head_dim_vo;
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);

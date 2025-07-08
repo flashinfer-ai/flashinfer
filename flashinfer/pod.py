@@ -397,12 +397,12 @@ class PODWithPagedKVCacheWrapper:
                 last_page_len_d,
                 non_blocking=(last_page_len_d.device == self.device) and non_blocking,
             )
-            self._paged_kv_indices_buf[: batch_size_p + 1].copy_(
-                kv_indices_d,
-                non_blocking=(kv_indices_d.device == self.device) and non_blocking,
+            self._paged_kv_indices_buf[: len(kv_indices_p)].copy_(
+                kv_indices_p,
+                non_blocking=(kv_indices_p.device == self.device) and non_blocking,
             )
             self._paged_kv_indices_buf[
-                batch_size_p + 1 : batch_size_p + batch_size_d + 2
+                len(kv_indices_p) : len(kv_indices_p) + len(kv_indices_d)
             ].copy_(
                 kv_indices_d,
                 non_blocking=(kv_indices_d.device == self.device) and non_blocking,
@@ -471,12 +471,12 @@ class PODWithPagedKVCacheWrapper:
             kv_indptr_host_p,
             kv_lens_arr_host_p,
             batch_size_p,
-            batch_size_p,  # total_num_rows_p
+            qo_indptr_host_p[-1],  # total_num_rows_p
             qo_indptr_host_d,
             kv_indptr_host_d,
             kv_lens_arr_host_d,
             batch_size_d,
-            batch_size_d,  # total_num_rows_d
+            qo_indptr_host_d[-1],  # total_num_rows_d
             num_qo_heads,
             num_kv_heads,
             head_dim,
