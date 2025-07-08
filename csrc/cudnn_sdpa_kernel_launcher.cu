@@ -920,19 +920,20 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
                                 tma::cudaTmaDescSwizzle::SWIZZLE_128B);
 }
 
-void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
+void decode(int64_t max_s_kv, at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
             at::Tensor workspace_buffer, at::Tensor actual_seq_lens_kv,
             at::Tensor actual_seq_lens_kv_gpu, at::Tensor block_tables, at::Tensor out,
-            std::optional<at::Tensor> batch_offset_array, bool is_cuda_graph_compatible) {
+            std::optional<at::Tensor> batch_offset_q_array,
+            std::optional<at::Tensor> batch_offset_o_array, bool is_cuda_graph_compatible) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr size_t REDUCTION_MEM_SIZE = 128 * 1024;
   constexpr int64_t TILE_N_1 = 128;
 
   constexpr int32_t NUM_THREADS = 384;
 
-  int64_t* batch_offset_array_data = nullptr;
-  if (batch_offset_array.has_value()) {
-    batch_offset_array_data = batch_offset_array.value().data_ptr<int64_t>();
+  int64_t* batch_offset_q_array_data = nullptr;
+  if (batch_offset_q_array.has_value()) {
+    batch_offset_q_array_data = batch_offset_q_array.value().data_ptr<int64_t>();
   }
 
   auto device = q.device();
@@ -978,20 +979,21 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   int64_t b = q.size(0);
   int64_t h_qo = q.size(1);
-  int64_t h_kv = k_cache.size(1);
-  int64_t page_size = k_cache.size(2);
   int64_t d = q.size(2);
-  int64_t total_num_pages = k_cache.size(0);
 
-  int64_t max_skv = (k_cache.size(0) / b) * page_size;
+  int64_t h_kv = k_cache.size(1);
+
+  int64_t page_size = k_cache.dim() == 4 ? k_cache.size(2) : 1;
+
+  int64_t total_num_pages = k_cache.dim() == 4 ? k_cache.size(0) : 1;
+
+  int64_t s_kv = max_s_kv;
 
   int64_t s_qo = 1;
 
-  int32_t split_factor = compute_split_factor(b, h_kv, h_qo, max_skv, sm_count);
+  int32_t split_factor = compute_split_factor(b, h_kv, h_qo, s_kv, sm_count);
 
-  split_factor = 1;
-
-  // TORCH_CHECK(split_factor == 1, "Split factor > 1 not supported yet");
+  split_factor = 1;  // Fix split factor. Setting it to 1 for now
 
   // Set up TMA descriptors for Q, K, V, O
   auto qo_strides = q.strides();
@@ -1020,14 +1022,13 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
 
   config.hStream = stream;
   config.numAttrs = 1;
-  config.attrs = attrs;
 
   int8_t* workspace_start = workspace_buffer.data_ptr<int8_t>();
   int8_t* partial_o_dev = workspace_start;
   int8_t* tma_descriptor_start =
       partial_o_dev + (b * s_qo * h_qo * d * sizeof(float) * split_factor);
 
-  int8_t* batch_strides_dev = tma_descriptor_start + ((3 * b + 2) * sizeof(tma::cudaTmaDesc));
+  int8_t* batch_strides_dev = tma_descriptor_start + ((5 * b) * sizeof(tma::cudaTmaDesc));
 
   tma::cudaTmaDesc* packed_tma_desc_q_dev =
       reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start);
@@ -1037,8 +1038,8 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
       reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc) * 2);
   tma::cudaTmaDesc* tma_desc_k_dev =
       reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc) * 3);
-  tma::cudaTmaDesc* tma_desc_v_dev = reinterpret_cast<tma::cudaTmaDesc*>(
-      tma_descriptor_start + (sizeof(tma::cudaTmaDesc) * ((b * 3) + 1)));
+  tma::cudaTmaDesc* tma_desc_v_dev =
+      reinterpret_cast<tma::cudaTmaDesc*>(tma_descriptor_start + b * sizeof(tma::cudaTmaDesc) * 4);
 
   int8_t* lse_dev = batch_strides_dev + (b * sizeof(int64_t));
 
@@ -1072,15 +1073,15 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
         tma_desc_v_dev, packed_tma_desc_o_dev, packed_tma_desc_partial_o_dev,
         reinterpret_cast<int64_t*>(batch_strides_dev));
   } else {
-    std::unique_ptr<tma::cudaTmaDesc[]> tma_desc_host(new tma::cudaTmaDesc[(3 * b) + 2]);
+    std::unique_ptr<tma::cudaTmaDesc[]> tma_desc_host(new tma::cudaTmaDesc[5 * b]);
 
     tma::cudaTmaDesc* tma_desc_q = tma_desc_host.get();
     tma::cudaTmaDesc* tma_desc_o = tma_desc_host.get() + b;
     tma::cudaTmaDesc* tma_desc_partial_o = tma_desc_host.get() + b * 2;
     tma::cudaTmaDesc* tma_desc_k = tma_desc_host.get() + b * 3;
-    tma::cudaTmaDesc* tma_desc_v = tma_desc_host.get() + (b * 3) + 1;
+    tma::cudaTmaDesc* tma_desc_v = tma_desc_host.get() + b * 4;
 
-    setup_tma_desc_decode(b, max_skv, h_qo, h_kv, d, total_num_pages, q, out, k_cache, v_cache,
+    setup_tma_desc_decode(b, max_s_kv, h_qo, h_kv, d, total_num_pages, q, out, k_cache, v_cache,
                           split_factor, page_size, partial_o_dev, tma_desc_q, tma_desc_o,
                           tma_desc_partial_o, tma_desc_k, tma_desc_v);
 
@@ -1091,17 +1092,18 @@ void decode(at::Tensor q, at::Tensor k_cache, at::Tensor v_cache, double scale,
     cudaMemcpyAsync(batch_strides_dev, batch_strides.get(), sizeof(int64_t) * b,
                     cudaMemcpyHostToDevice, stream);
 
-    cudaMemcpyAsync(tma_descriptor_start, tma_desc_host.get(),
-                    sizeof(tma::cudaTmaDesc) * (3 * b + 2), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(tma_descriptor_start, tma_desc_host.get(), sizeof(tma::cudaTmaDesc) * (5 * b),
+                    cudaMemcpyHostToDevice, stream);
   }
 
-  cudnn_sdpa::AttentionDescriptor_t attnDesc{b, h_qo, h_kv, h_kv, s_qo, max_skv, d, h_qo / h_kv, 0};
+  cudnn_sdpa::AttentionDescriptor_t attnDesc{b,        h_qo, h_kv,        h_kv, s_qo,
+                                             max_s_kv, d,    h_qo / h_kv, 0};
 
   cudnn_sdpa::FastDivisor_t page_size_div;
   setFastDivisor(page_size_div, page_size);
 
   uint32_t page_size32 = static_cast<uint32_t>(page_size);
-  uint32_t num_pages_per_seq32 = static_cast<uint32_t>(max_skv / page_size);
+  uint32_t num_pages_per_seq32 = static_cast<uint32_t>(max_s_kv / page_size);
 
   void* args[15];
 
