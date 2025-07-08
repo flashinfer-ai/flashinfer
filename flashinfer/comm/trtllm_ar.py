@@ -26,7 +26,7 @@ from torch.distributed import ProcessGroup
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, sm100a_nvcc_flags
-from ..utils import register_custom_op
+from ..utils import register_custom_op, round_up
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
 
@@ -458,7 +458,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         lamport_buffer_size,
     ]:
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        aligned_size = round_up(size, 1 << 21)
         ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
@@ -495,7 +495,7 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
 
 BarrierFlagCount = 256
 
-MAX_COMM_SIZE = 2147483647  # MAX_INT32
+MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
@@ -555,7 +555,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        aligned_size = round_up(size, 1 << 21)
         ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
@@ -563,7 +563,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     # Initialize lamport buffer
-    aligned_lamport_buffer_size = ((lamport_buffer_size + (1 << 21) - 1) >> 21) << 21
+    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
     if use_fp32_lamport:
         trtllm_lamport_initialize(
             ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 4, torch.float32
