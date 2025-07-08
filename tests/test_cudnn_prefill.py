@@ -14,7 +14,7 @@ import flashinfer
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
 def test_cudnn_prefill(
@@ -175,7 +175,7 @@ def test_cudnn_prefill(
         head_dim,
         page_size,
         pos_encoding_mode="NONE",
-        causal=True,
+        causal=causal,
         q_data_type=torch.bfloat16,
     )
 
