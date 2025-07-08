@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,7 @@ from torch.distributed import ProcessGroup
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, sm100a_nvcc_flags
-from ..utils import register_custom_op
+from ..utils import register_custom_op, round_up
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
 
@@ -458,7 +459,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         lamport_buffer_size,
     ]:
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        aligned_size = round_up(size, 1 << 21)
         ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
@@ -495,6 +496,8 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
 
 BarrierFlagCount = 256
 
+MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
+
 
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_rank: int,
@@ -505,6 +508,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     group: Optional[ProcessGroup] = None,
 ) -> List[int]:
     """
+    Parameters:
+    - tp_rank: the rank of the current process.
+    - tp_size: the size of the process group.
+    - max_token_num: the maximum number of tokens in a sequence.
+    - hidden_dim: the dimension of the hidden states.
+    - use_fp32_lamport: if True, we will use fp32 datatype in allreduce fusion.
+    - group: the process group to use.
+
     Note:
     We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion.
     They are sized as follows:
@@ -530,6 +541,12 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         if not use_fp32_lamport
         else tp_size * max_token_num * hidden_dim * 4
     )
+    if lamport_comm_size > MAX_COMM_SIZE:
+        logging.warning(
+            f"warning: lamport_comm_size {lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}, set to MAX_COMM_SIZE"
+        )
+        lamport_comm_size = MAX_COMM_SIZE
+
     lamport_buffer_size = lamport_comm_size * 3
 
     # we should init 3 buffers for all reduce fusion:
@@ -539,7 +556,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = ((size + (1 << 21) - 1) >> 21) << 21
+        aligned_size = round_up(size, 1 << 21)
         ipc_handles.append(create_shared_buffer(aligned_size, group))
 
     print(
@@ -547,13 +564,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     # Initialize lamport buffer
+    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
     if use_fp32_lamport:
         trtllm_lamport_initialize(
-            ipc_handles[2][tp_rank], lamport_buffer_size // 4, torch.float32
+            ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 4, torch.float32
         )
     else:
         trtllm_lamport_initialize(
-            ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+            ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 2, torch.float16
         )
 
     # initialize workspace
@@ -711,6 +729,30 @@ def trtllm_allreduce_fusion(
     scale_factor: Optional[float],
     layout_code: Optional[FP4QuantizationSFLayout],
 ) -> None:
+    """
+    Note:
+    Regarding the `use_oneshot` parameter:
+
+    It should only be enabled when:
+    (1) Force to use the one-shot strategy based on your use case.
+    (2) In min-latency mode, the sequence length is less than the one-shot max token number (currently 128).
+
+    Otherwise, it should be disabled (as False).
+    """
+    if not use_oneshot:
+        assert token_num > world_size, "sequence length should be larger than tp_size"
+
+    required_lamport_comm_size = (
+        token_num * hidden_dim * 2 * world_size
+        if allreduce_in.dtype != torch.float32
+        else token_num * hidden_dim * 4 * world_size
+    )
+
+    if required_lamport_comm_size > MAX_COMM_SIZE and use_oneshot:
+        raise ValueError(
+            f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
+        )
+
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
         world_size=world_size,
@@ -758,6 +800,14 @@ def trtllm_moe_allreduce_fusion(
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
 ) -> None:
+    required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
+
+    # Note: only one-shot is supported for moe allreduce fusion.
+    if required_lamport_comm_size > MAX_COMM_SIZE:
+        raise ValueError(
+            f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
+        )
+
     get_trtllm_comm_module().trtllm_moe_allreduce_fusion(
         world_size=world_size,
         world_rank=world_rank,
@@ -797,6 +847,15 @@ def trtllm_moe_finalize_allreduce_fusion(
     shared_expert_output: Optional[torch.Tensor],
     expert_scale_factor: Optional[torch.Tensor],
 ) -> None:
+
+    required_lamport_comm_size = allreduce_in.numel() * 2 * world_size
+
+    # Note: only one-shot is supported for moe allreduce fusion.
+    if required_lamport_comm_size > MAX_COMM_SIZE:
+        raise ValueError(
+            f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
+        )
+
     get_trtllm_comm_module().trtllm_moe_finalize_allreduce_fusion(
         allreduce_in=allreduce_in,
         residual_in=residual_in,
