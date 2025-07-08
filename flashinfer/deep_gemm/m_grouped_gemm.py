@@ -16,89 +16,168 @@ limitations under the License.
 
 # Imported and adapted from DeepGEMM
 
+import ctypes
 import os
 import torch
 import cuda.bindings.driver as cbd
 import functools
-from typing import Any, Dict, Type, Tuple, Optional
+from typing import Any, Dict, Type, Tuple, Optional, List
 
-from deep_gemm.jit_kernels.runtime import (
+from .runtime import (
     make_tma_a_desc,
     make_tma_b_desc,
     make_tma_cd_desc,
     make_tma_sf_desc,
+    pytypes_to_ctypes,
+    Runtime,
 )
-from deep_gemm.jit_kernels.heuristics.sm100_heuristics import get_best_configs
-from deep_gemm.config import get_num_sms
-from deep_gemm.jit import Runtime
-from deep_gemm.utils.math import align, ceil_div
-from deep_gemm.utils.layout import GemmType, MajorTypeAB, MajorTypeCD
-from deep_gemm.jit_kernels.impls.sm100_fp8_gemm_1d1d import SM100FP8GemmRuntime
-from deep_gemm.jit.compiler import (
-    NVCCCompiler,
-    get_device_arch,
-    get_deep_gemm_version,
-    hash_to_hex,
-)
-from deep_gemm.jit.runtime import RuntimeCache
-from deep_gemm.utils.layout import (
+from .utils import (
+    align,
+    ceil_div,
+    GemmType,
     MajorTypeAB,
     MajorTypeCD,
     get_major_type_ab,
     get_major_type_cd,
     transform_sf_into_required_layout,
+    must_be_k_major,
+    get_default_recipe,
+    get_device_arch,
+    hash_to_hex,
+    get_best_configs,
 )
-from deep_gemm.dispatch import must_be_k_major, get_default_recipe
 
 
-runtime_cache = RuntimeCache()
+runtime_cache = {}
 
 
-class NVCCLoader(NVCCCompiler):
-    @classmethod
-    def build(
-        cls,
-        name: str,
-        code: str,
-        runtime_cls: Type[Runtime],
-        kwargs: Dict[str, Any] = None,
-    ) -> Runtime:
-        # Compiler flags
-        flags = cls.flags()
+def load(name: str, code: str, runtime_cls: Type[Runtime]) -> Runtime:
+    signature = f"{name}$${code}"
+    cubin_name = f"kernel.{name}.{hash_to_hex(signature)}"
+    print(name, cubin_name)
+    if cubin_name in runtime_cache:
+        return runtime_cache[cubin_name]
+    path = os.path.join(
+        "/home/devuser/.deep_gemm/cache/", cubin_name
+    )  # TODO: change dir to flashinfer cache dir
+    if os.path.exists(path) and Runtime.is_path_valid(path):
+        runtime_cache[cubin_name] = runtime_cls(path)
+        return runtime_cache[cubin_name]
+    raise ValueError("cubin not found")
 
-        # Build signature
-        # TODO: refactor post-process scripts if we have more in the future (or remove `< 12.9` support)
-        enable_sass_opt = (
-            cls.__version__() <= (12, 8)
-            and get_device_arch() == "90a"
-            and not int(os.getenv("DG_JIT_DISABLE_FFMA_INTERLEAVE", 0))
+
+class SM100FP8GemmRuntime(Runtime):
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+
+    @staticmethod
+    def generate(kwargs: Dict[str, Any]) -> str:
+        assert kwargs["CD_DTYPE_T"] in (torch.bfloat16, torch.float)
+        code = f"""
+#ifdef __CUDACC_RTC__
+#include <deep_gemm/nvrtc_std.cuh>
+#else
+#include <cuda.h>
+#include <string>
+#endif
+
+#include <deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_fp8_gemm_1d1d_impl<
+        {kwargs['MAJOR_A']},
+        {kwargs['MAJOR_B']},
+        {kwargs['M'] if 'm' in kwargs['COMPILED_DIMS'] else 0},
+        {kwargs['N'] if 'n' in kwargs['COMPILED_DIMS'] else 0},
+        {kwargs['K'] if 'k' in kwargs['COMPILED_DIMS'] else 0},
+        {kwargs['BLOCK_M']},
+        {kwargs['BLOCK_N']},
+        {kwargs['BLOCK_K']},
+        {kwargs['NUM_GROUPS']},
+        {kwargs['SWIZZLE_A_MODE']},
+        {kwargs['SWIZZLE_B_MODE']},
+        {kwargs['SWIZZLE_CD_MODE']},
+        {kwargs['NUM_STAGES']},
+        {kwargs['NUM_LAST_STAGES']},
+        {kwargs['NUM_NON_EPILOGUE_THREADS']},
+        {kwargs['NUM_EPILOGUE_THREADS']},
+        {kwargs['NUM_MULTICAST']},
+        {pytypes_to_ctypes[kwargs['IS_MULTICAST_ON_A']]},
+        {kwargs['GEMM_TYPE']},
+        {pytypes_to_ctypes[kwargs['WITH_ACCUMULATION']]},
+        {pytypes_to_ctypes[kwargs['CD_DTYPE_T']]}
+      >);
+}};
+"""
+        if int(os.getenv("DG_JIT_DEBUG", 0)):
+            print(f"Generated FP8 GEMM code:\n{code}")
+        return code
+
+    # noinspection PyMethodOverriding
+    @staticmethod
+    def launch(kernel: cbd.CUkernel, kwargs: Dict[str, Any]) -> cbd.CUresult:
+        result = cbd.cuKernelSetAttribute(
+            cbd.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            kwargs["SMEM_SIZE"],
+            kernel,
+            cbd.CUdevice(kwargs["DEVICE_INDEX"]),
+        )[0]
+        assert (
+            result == cbd.CUresult.CUDA_SUCCESS
+        ), f"Failed to set max dynamic shared memory size: {result}"
+
+        attr_val = cbd.CUlaunchAttributeValue()
+        attr_val.clusterDim.x = kwargs["NUM_MULTICAST"]
+        attr_val.clusterDim.y = 1
+        attr_val.clusterDim.z = 1
+        attr = cbd.CUlaunchAttribute()
+        attr.id = cbd.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        attr.value = attr_val
+
+        config = cbd.CUlaunchConfig()
+        config.numAttrs = 1
+        config.attrs = [attr]
+        config.gridDimX = kwargs["NUM_SMS"]
+        config.gridDimY = 1
+        config.gridDimZ = 1
+        config.blockDimX = (
+            kwargs["NUM_NON_EPILOGUE_THREADS"] + kwargs["NUM_EPILOGUE_THREADS"]
         )
-        signature = f"{name}$${get_deep_gemm_version()}$${cls.signature()}$${flags}$${enable_sass_opt}$${code}"
-        name = f"kernel.{name}.{hash_to_hex(signature)}"
-        path = os.path.join(
-            "/home/devuser/flashinfer_cache/", name
-        )  # TODO: change dir to flashinfer cache dir
+        config.blockDimY = 1
+        config.blockDimZ = 1
+        config.sharedMemBytes = kwargs["SMEM_SIZE"]
+        config.hStream = kwargs["STREAM"]
 
-        # Check runtime cache or file system hit
-        # NOTES: also try to use other users' cache
-        global runtime_cache
-        for possible_path in [path]:
-            cached_runtime = runtime_cache.get(possible_path, runtime_cls, name, kwargs)
-            if cached_runtime is not None:
-                if int(os.getenv("DG_JIT_DEBUG", 0)):
-                    print(f"Using cached JIT runtime {name} during build")
-                return cached_runtime
-        raise ValueError("cubin not found")
+        arg_values = (
+            kwargs["GROUPED_LAYOUT"].data_ptr(),
+            kwargs["M"],
+            kwargs["N"],
+            kwargs["K"],
+            kwargs["TENSOR_MAP_A"],
+            kwargs["TENSOR_MAP_B"],
+            kwargs["TENSOR_MAP_SFA"],
+            kwargs["TENSOR_MAP_SFB"],
+            kwargs["TENSOR_MAP_C"],
+            kwargs["TENSOR_MAP_D"],
+        )
+        arg_types = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
-def load(
-    name: str, code: str, runtime_cls: Type[Runtime], kwargs: Dict[str, Any] = None
-) -> Runtime:
-    compiler_cls = NVCCLoader
-    return compiler_cls.build(name, code, runtime_cls, kwargs)
-
-
-def m_grouped_fp8_gemm_nt_contiguous_impl(
+def m_grouped_fp8_gemm_nt_contiguous_sm100(
     a: torch.Tensor,
     sfa: torch.Tensor,
     b: torch.Tensor,
@@ -117,7 +196,7 @@ def m_grouped_fp8_gemm_nt_contiguous_impl(
     aligned_k = align(k, 128)
 
     # Auto-tuning with compilation
-    num_sms = get_num_sms()
+    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     num_sms, block_m, block_n, block_k, num_stages, multicast_config, smem_config = (
         get_best_configs(
             GemmType.GroupedContiguous,
@@ -230,7 +309,7 @@ def m_grouped_fp8_gemm_nt_contiguous_impl(
 
     # Generate, build and run the kernel
     code = SM100FP8GemmRuntime.generate(kwargs)
-    runtime = load("fp8_m_grouped_gemm", code, SM100FP8GemmRuntime, kwargs)
+    runtime = load("fp8_m_grouped_gemm", code, SM100FP8GemmRuntime)
     runtime(**kwargs)
 
 
@@ -284,7 +363,7 @@ def m_grouped_fp8_gemm_nt_contiguous(
 
     impl = {
         "100a": functools.partial(
-            m_grouped_fp8_gemm_nt_contiguous_impl,
+            m_grouped_fp8_gemm_nt_contiguous_sm100,
             major_a=major_a,
             major_b=major_b,
             compiled_dims=compiled_dims,
