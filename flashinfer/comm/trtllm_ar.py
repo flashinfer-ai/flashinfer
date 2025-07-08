@@ -749,9 +749,10 @@ def trtllm_allreduce_fusion(
     )
 
     if required_lamport_comm_size > MAX_COMM_SIZE and use_oneshot:
-        raise ValueError(
+        logging.warning(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
+        use_oneshot = False
 
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
