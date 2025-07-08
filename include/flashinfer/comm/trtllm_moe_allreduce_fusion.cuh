@@ -702,7 +702,7 @@ struct LamportComm {
     int clear_offset = (flag_value + 2) % 3;
     for (int r = 0; r < NRanks; ++r) {
       data_bufs[r] =
-          reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
+          reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + static_cast<int64_t>(data_offset) * comm_size;
     }
     clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
     __syncthreads();
