@@ -42,11 +42,6 @@ void trtllm_paged_attention_mla_launcher(
   int const num_q_heads = query.size(1);
   int const num_kv_heads = 1;
   int head_size = query.size(2);
-  FLASHINFER_CHECK(
-      head_size == kv_lora_rank + qk_rope_head_dim,
-      "head_size must be kv_lora_rank + qk_rope_head_dim for decode-only TRTLLM-GEN MLA");
-  // We only enable head_dim = 576 as decode-only MLA
-  FLASHINFER_CHECK(head_size == 576, "head_size must be 576 for decode-only TRTLLM-GEN MLA");
   int const beam_width = 1;                        // NOTE: beam_width always 1
   int const batch_beam = beam_width * batch_size;  // NOTE: batch_beam = batch_size
   int const max_num_blocks_per_seq = block_tables.size(-1);

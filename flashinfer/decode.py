@@ -1739,23 +1739,75 @@ def trtllm_batch_decode_with_kv_cache(
     return out
 
 
+def _check_trtllm_gen_mla_shape(
+    query, kv_cache, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, page_table
+):
+    if query.ndim != 3:
+        raise ValueError(f"Expected query.ndim == 3, got {query.ndim}")
+    if kv_cache.ndim != 3:
+        raise ValueError(f"Expected kv_cache.ndim == 3, got {kv_cache.ndim}")
+    if qk_nope_head_dim != 128:
+        raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
+    if kv_lora_rank != 512:
+        raise ValueError(f"Expected kv_lora_rank == 512, got {kv_lora_rank}")
+    if qk_rope_head_dim != 64:
+        raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
+
+    B_q, H, D_q = query.shape
+    D_ckv = kv_cache.shape[2]
+    if H != 128:
+        raise ValueError(f"Expected 128 heads for query, got {H}")
+    if D_q != D_ckv or D_q != 576:
+        raise ValueError(
+            f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"
+        )
+
+    B_block_table, block_num = page_table.shape
+    block_size = kv_cache.shape[1]
+    if B_q != B_block_table:
+        raise ValueError(
+            f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
+        )
+    if block_num % (128 / block_size) != 0:
+        raise ValueError(
+            f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
+        )
+
+
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    num_heads: int,
-    num_kv_heads: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Parameters:
+    query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
+    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    qk_nope_head_dim: qk_nope_head_dim, should be 128
+    kv_lora_rank: kv_lora_rank, should be 512
+    qk_rope_head_dim: qk_rope_head_dim, should be 64
+    scale: model scale of qk
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: query_len
+    block_size: page_size
+    max_seq_len: max sequence length
+    out: output tensor, if not provided, will be allocated internally
+    """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
+
+    _check_trtllm_gen_mla_shape(
+        query, kv_cache, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, block_tables
+    )
 
     if out is None:
         out = torch.empty_like(query)
@@ -1767,15 +1819,16 @@ def trtllm_batch_decode_with_kv_cache_mla(
         query,
         kv_cache,
         workspace_buffer,
-        num_heads,
-        num_kv_heads,
         scale,
         block_tables,
         seq_lens,
         block_size,
         max_seq_len,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        None,  # acc_q_len, speculative not supported for now
+        None,  # max_attention_window_size, sliding window not supported for now
+        None,  # cyclic_attention_window_size, cyclic window not supported for now
     )
     return out
