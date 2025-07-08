@@ -182,7 +182,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   FusedMoeRunner(FusedMoeRunner const&) = delete;
   void operator=(FusedMoeRunner const&) = delete;
 
-  at::Tensor runMoe(at::Tensor const& input, at::Tensor const& token_selected_experts,
+  at::Tensor runMoe(at::Tensor& output, at::Tensor const& input,
+                    at::Tensor const& token_selected_experts,
                     std::optional<at::Tensor> token_final_scales,
                     at::Tensor const& fc1_expert_weights, at::Tensor const& fc2_expert_weights,
                     std::optional<c10::ArrayRef<at::Tensor>> quant_scales,
@@ -241,9 +242,6 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    std::vector<int64_t> output_shape = {num_rows, hidden_size};
-    auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
-
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         activation_type, parallelism_config, min_latency_mode);
@@ -271,7 +269,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   }
 
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> runMoeMinLantency(
-      torch::Tensor const& input, torch::Tensor const& token_selected_experts,
+      torch::Tensor& output, torch::Tensor const& input,
+      torch::Tensor const& token_selected_experts,
       torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
       torch::Tensor const& fc2_expert_weights,
       torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
@@ -327,9 +326,6 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     setRunnerProfiles(profile_ids);
 
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-
-    std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, hidden_size};
-    auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
     auto num_active_experts_per_node =
         torch::empty({1}, input.options().dtype(at::ScalarType::Int));
