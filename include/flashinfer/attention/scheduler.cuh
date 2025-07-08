@@ -1070,13 +1070,16 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
   IdType* o_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
-  IdType* kv_chunk_size_ptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
+  IdType* kv_chunk_size_ptr_p =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset_p);
+  IdType* kv_chunk_size_ptr_d =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset_d);
   std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
   std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
   std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
   std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-  kv_chunk_size_ptr_h[0] = kv_chunk_size;
+  kv_chunk_size_ptr_p[0] = kv_chunk_size_p;
+  kv_chunk_size_ptr_d[0] = kv_chunk_size_d;
 
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);

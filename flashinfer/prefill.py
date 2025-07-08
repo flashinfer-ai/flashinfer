@@ -1428,9 +1428,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu", non_blocking=True)
+        paged_kv_last_page_len_host = paged_kv_last_page_len.to(
+            "cpu", non_blocking=True
+        )
         kv_lens_arr_host = get_seq_lens(
             paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
         )
@@ -1438,6 +1440,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             kv_lens_arr_host, non_blocking=non_blocking
         )
 
+        torch.cuda.synchronize()
         total_num_rows = qo_indptr_host[-1]
 
         if self.is_cuda_graph_enabled:
