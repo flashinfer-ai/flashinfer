@@ -249,8 +249,8 @@ struct TllmGenFmhaRunnerParams {
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;
 
-  // todo(Yingyi): check the output scaling
-  float mOutputScale;
+  // note(Yingyi): might take an output scale later
+  // float mOutputScale;
 
   // The SF scale for Kv.
   float mScaleSfKv;
