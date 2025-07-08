@@ -547,13 +547,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     # Initialize lamport buffer
+    aligned_lamport_buffer_size = ((lamport_buffer_size + (1 << 21) - 1) >> 21) << 21
     if use_fp32_lamport:
         trtllm_lamport_initialize(
-            ipc_handles[2][tp_rank], lamport_buffer_size // 4, torch.float32
+            ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 4, torch.float32
         )
     else:
         trtllm_lamport_initialize(
-            ipc_handles[2][tp_rank], lamport_buffer_size // 2, torch.float16
+            ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 2, torch.float16
         )
 
     # initialize workspace
