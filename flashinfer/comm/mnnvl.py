@@ -429,7 +429,6 @@ class McastDeviceMemory:
             []
         )  # std::vector<CUmemGenericAllocationHandle> mUcHandles
 
-
         # Signal pad constants
         self.SIGNAL_PAD_ALIGNMENT = 16
         self.SIGNAL_PAD_SIZE = SIGNAL_PAD_SIZE
@@ -481,10 +480,8 @@ class McastDeviceMemory:
             self.signal_pads_dev[i] = self.uc_ptrs[i] + self.signal_pad_offset
             if i == self.group_rank:
                 checkCudaErrors(
-                        cuda.cuMemsetD8(
-                            self.signal_pads_dev[i], 0, self.SIGNAL_PAD_SIZE
-                        )
-                    )
+                    cuda.cuMemsetD8(self.signal_pads_dev[i], 0, self.SIGNAL_PAD_SIZE)
+                )
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
@@ -515,25 +512,31 @@ class McastDeviceMemory:
                     try:
                         # Release the handle
                         checkCudaErrors(cuda.cuMemRelease(self.uc_handles[rank]))
-                        # Unmap the vmem 
+                        # Unmap the vmem
                         if rank < len(self.uc_ptrs) and self.uc_ptrs[rank]:
                             checkCudaErrors(
-                                cuda.cuMemUnmap(self.uc_ptrs[rank], self.allocation_size)
+                                cuda.cuMemUnmap(
+                                    self.uc_ptrs[rank], self.allocation_size
+                                )
                             )
                     except Exception as e:
                         print(
                             f"Destructor: Failed to release UC handle for rank {rank}: {e}"
                         )
-            
+
             # Free the UC address space
             if hasattr(self, "uc_base_ptr") and self.uc_base_ptr:
-                checkCudaErrors(cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size))
+                checkCudaErrors(
+                    cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
+                )
 
         # Release MC handle
         if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
             try:
                 checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
-                checkCudaErrors(cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size))
+                checkCudaErrors(
+                    cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size)
+                )
                 checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
             except Exception as e:
                 print(f"Destructor: Failed to release MC handle: {e}")
@@ -541,6 +544,7 @@ class McastDeviceMemory:
     def get_signal_pad_ptrs_dev(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
         return self.signal_pads_dev
+
     def get_buffer_ptrs_dev(self) -> List[int]:
         """Get the raw array of unicast pointers to all ranks (including self)"""
         return self.uc_ptrs

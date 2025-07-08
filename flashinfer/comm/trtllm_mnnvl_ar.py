@@ -3,9 +3,10 @@ MNNVL (Multi-Node NVLink) communication operations for FlashInfer.
 
 """
 
+import functools
 import math
 import os
-
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import torch
@@ -13,18 +14,12 @@ from mpi4py import MPI
 
 from flashinfer.comm.mapping import Mapping
 
-from ..utils import register_custom_op
-
-import atexit
-import functools
-from types import SimpleNamespace
-
-from .mnnvl import McastGPUBuffer
-
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, sm100a_nvcc_flags
 from ..utils import register_custom_op
+from .mnnvl import McastGPUBuffer
+
 
 def mpi_barrier():
     """MPI barrier - could potentially be replaced with dist.barrier()"""
@@ -100,9 +95,9 @@ def get_allreduce_mnnvl_workspace(
     # max_num_elements must be a multiple of 286720
     lcm_hidden_dim = 286720
     TARGET_WORKSPACE_SIZE_BYTES = 12_000_000
-    buffer_size_in_bytes = math.ceil(TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)) * (
-        lcm_hidden_dim * stride
-    )
+    buffer_size_in_bytes = math.ceil(
+        TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
+    ) * (lcm_hidden_dim * stride)
     max_num_elements = buffer_size_in_bytes // stride
 
     mcast_buffer = McastGPUBuffer(

@@ -1,17 +1,15 @@
 # Check torch version:
 import os
 import sys
+import traceback
 
 import torch
+from mpi4py import MPI  # Added MPI import
 
 import flashinfer.comm as comm
 from flashinfer.comm.mapping import Mapping
-
-import traceback
-
-from mpi4py import MPI  # Added MPI import
-
 from flashinfer.comm.mnnvl import McastDeviceMemory, McastGPUBuffer
+
 
 @torch.inference_mode()
 def row_linear_residual_norm_fusion_forward(
@@ -79,14 +77,17 @@ def row_linear_residual_norm_fusion_forward(
     )
 
     try:
-        output = func(x.clone(), residual.clone(), norm_weight, eps, fusion, buffer_mnnvl)
+        output = func(
+            x.clone(), residual.clone(), norm_weight, eps, fusion, buffer_mnnvl
+        )
 
         assert output[0].shape == reference_output[0].shape
 
         if tensor_parallel_rank == 0:
             print("output[0] (first 10 values):", output[0].flatten()[:10])
             print(
-                "reference_output[0] (first 10 values):", reference_output[0].flatten()[:10]
+                "reference_output[0] (first 10 values):",
+                reference_output[0].flatten()[:10],
             )
 
             if fusion:
