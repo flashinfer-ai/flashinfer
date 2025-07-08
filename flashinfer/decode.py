@@ -1781,11 +1781,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
+    scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -1796,11 +1796,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_nope_head_dim: qk_nope_head_dim, should be 128
     kv_lora_rank: kv_lora_rank, should be 512
     qk_rope_head_dim: qk_rope_head_dim, should be 64
-    scale: model scale of qk
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     block_size: page_size
     max_seq_len: max sequence length
+    scale: model scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
