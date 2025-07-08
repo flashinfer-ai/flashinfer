@@ -29,7 +29,7 @@
 // dummy sliding window attention
 // quantization not supported
 namespace flashinfer {
-template <typename T, Data_type CACHE_T>
+template <Data_type CACHE_T>
 void trtllm_paged_attention_mla_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
@@ -51,11 +51,9 @@ void trtllm_paged_attention_mla_launcher(
 
   uint32_t tokens_per_page = block_size;
 
-  auto io_type = TypeToDataType<T>::value;
-
+  // todo(Yingyi): use multi_block mode always true??
   bool use_multi_block = true;
-  auto q_data_type = (kv_cache_dtype == "fp8_e4m3") ? DATA_TYPE_E4M3 : io_type;
-  static auto fmha_runner = TllmGenFmhaRunner(q_data_type, CACHE_T, io_type);
+  static auto fmha_runner = TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
 
   TllmGenFmhaRunnerParams runner_params;
   memset(&runner_params, 0, sizeof(runner_params));
@@ -154,22 +152,24 @@ void trtllm_paged_attention_mla_launcher(
   fmha_runner.run(runner_params);
 }
 
-#define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                                      \
-  trtllm_paged_attention_mla_launcher<T, CACHE_T_ENUM>(                                         \
+#define CALL_GEN_LAUNCHER(CACHE_T_ENUM)                                                         \
+  trtllm_paged_attention_mla_launcher<CACHE_T_ENUM>(                                            \
       out, query, key_value_cache, workspace_buffer, scale, block_tables, seq_lens, block_size, \
-      max_seq_len, kv_cache_dtype, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim,            \
-      fp8_generation_mla, acc_q_len, max_attention_window_size, cyclic_attention_window_size);
+      max_seq_len, kv_cache_dtype, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, acc_q_len, \
+      max_attention_window_size, cyclic_attention_window_size);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
 // function with template<typename scalar_t, typename cache_t>
-#define DISPATCH_BY_Q_DTYPE(Q_DTYPE, FN)                                 \
-  if (Q_DTYPE == at::ScalarType::Float8E4M3FN) {                         \
-    FN(half, Data_type::DATA_TYPE_FP16);                                 \
-  } else if (Q_DTYPE == at::ScalarType::BFloat16) {                      \
-    FN(__nv_bfloat16, Data_type::DATA_TYPE_BF16);                        \
-  } else {                                                               \
-    TORCH_CHECK(false, "Unsupported input type of QKV type: ", Q_DTYPE); \
+#define DISPATCH_BY_QKV_DTYPE(Q_DTYPE, KV_DTYPE, FN)                                               \
+  FLASHINFER_CHECK(Q_DTYPE == KV_DTYPE,                                                            \
+                   "Q_DTYPE must be the same as KV_DTYPE. Hybrid type is not supported for now."); \
+  if (Q_DTYPE == at::ScalarType::Float8E4M3FN) {                                                   \
+    FN(Data_type::DATA_TYPE_E4M3);                                                                 \
+  } else if (Q_DTYPE == at::ScalarType::BFloat16) {                                                \
+    FN(Data_type::DATA_TYPE_BF16);                                                                 \
+  } else {                                                                                         \
+    TORCH_CHECK(false, "Unsupported input type of QKV type: ", Q_DTYPE);                           \
   }
 
 void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
@@ -179,7 +179,8 @@ void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& 
                                 int64_t qk_rope_head_dim, std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
-  DISPATCH_BY_Q_DTYPE(query.dtype(), CALL_GEN_LAUNCHER);
+  DISPATCH_BY_QKV_DTYPE(query.dtype(), key_value_cache.dtype(),
+                        CALL_GEN_LAUNCHER);  // hybrid attention is not supported for now
 }
 
 namespace trtllm_cubin_loader {
