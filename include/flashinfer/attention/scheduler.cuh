@@ -915,7 +915,8 @@ struct PODPlanInfo {
   int64_t padded_batch_size;
   int64_t total_num_rows;
   int64_t total_num_rows_offset;
-  int64_t cta_tile_q;
+  uint16_t cta_tile_q_p;
+  uint16_t cta_tile_q_d;
   int64_t request_indices_offset;
   int64_t qo_tile_indices_offset;
   int64_t kv_tile_indices_offset;
@@ -933,7 +934,8 @@ struct PODPlanInfo {
       : padded_batch_size(0),
         total_num_rows(0),
         total_num_rows_offset(0),
-        cta_tile_q(0),
+        cta_tile_q_p(0),
+        cta_tile_q_d(0),
         request_indices_offset(0),
         qo_tile_indices_offset(0),
         kv_tile_indices_offset(0),
@@ -951,7 +953,8 @@ struct PODPlanInfo {
     return {padded_batch_size,
             total_num_rows,
             total_num_rows_offset,
-            cta_tile_q,
+            cta_tile_q_p,
+            cta_tile_q_d,
             request_indices_offset,
             qo_tile_indices_offset,
             kv_tile_indices_offset,
@@ -976,24 +979,20 @@ struct PODPlanInfo {
     padded_batch_size = vec[0];
     total_num_rows = vec[1];
     total_num_rows_offset = vec[2];
-    cta_tile_q = vec[3];
-    request_indices_offset_p = vec[4];
-    request_indices_offset_d = vec[5];
-    qo_tile_indices_offset_p = vec[6];
-    qo_tile_indices_offset_d = vec[7];
-    kv_tile_indices_offset_p = vec[8];
-    kv_tile_indices_offset_d = vec[9];
-    merge_indptr_offset = vec[7];
-    o_indptr_offset = vec[8];
-    kv_chunk_size_ptr_offset_p = vec[9];
-    kv_chunk_size_ptr_offset_d = vec[10];
-    v_offset_p = vec[11];
-    v_offset_d = vec[12];
-    s_offset_p = vec[13];
-    s_offset_d = vec[13];
+    cta_tile_q_p = vec[3];
+    cta_tile_q_d = vec[4];
+    request_indices_offset = vec[5];
+    qo_tile_indices_offset = vec[6];
+    kv_tile_indices_offset = vec[7];
+    merge_indptr_offset = vec[8];
+    o_indptr_offset = vec[9];
+    kv_chunk_size_ptr_offset_p = vec[10];
+    kv_chunk_size_ptr_offset_d = vec[11];
+    v_offset = vec[12];
+    s_offset = vec[13];
     block_valid_mask_offset = vec[14];
-    enable_cuda_graph = vec[13];
-    split_kv = vec[14];
+    enable_cuda_graph = vec[15];
+    split_kv = vec[16];
   }
 };
 
@@ -1025,11 +1024,12 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 2: determine kv_chunk_size
   auto [split_kv, real_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
-        cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices, qo_tile_indices,
-        kv_tile_indices, merge_indptr, o_indptr] =
+        cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices_vec, qo_tile_indices_vec,
+        kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, qo_indptr_d, kv_indptr_d, total_num_rows_p,
                          batch_size_p, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
                          head_dim_vo, page_size, max_batch_size_if_split, enable_cuda_graph);
+  uint32_t padded_batch_size = padded_batch_size_p + padded_batch_size_d;
 
   plan_info.cta_tile_q_p = cta_tile_q_p;
   plan_info.cta_tile_q_d = cta_tile_q_d;
@@ -1082,12 +1082,13 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   kv_chunk_size_ptr_d[0] = kv_chunk_size_d;
 
   if (split_kv) {
+    uint32_t num_outputs_p = num_qo_heads * padded_batch_size_p * cta_tile_q_p * head_dim_vo;
+    uint32_t num_outputs_d = num_qo_heads * padded_batch_size_d * cta_tile_q_d * head_dim_vo;
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
-        "pod_tmp_v");
+        (num_outputs_p + num_outputs_d) * sizeof(float), 16, "pod_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "pod_tmp_s");
+        (num_outputs_p + num_outputs_d) * sizeof(float), 16, "pod_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "pod_merge_indptr");
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
