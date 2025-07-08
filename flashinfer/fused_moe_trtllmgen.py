@@ -25,7 +25,7 @@ from .autotuner import AutoTuner, TunableRunner, TuningConfig
 from .fp4_quantization import block_scale_interleave
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags
+from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from .utils import register_custom_op, register_fake_op
 
 
@@ -141,7 +141,9 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_fused_moe_sm100_module():
-    module = gen_fused_moe_sm100_module().build_and_load()
+    module = gen_fused_moe_sm100_module()
+    moe_op = module.build_and_load()
+    setup_cubin_loader(str(module.get_library_path()))
 
     @register_custom_op(
         "flashinfer::fused_moe_trtllmgen_sm100",
@@ -172,7 +174,7 @@ def get_fused_moe_sm100_module():
         do_finalize: bool,
     ) -> torch.Tensor:
 
-        output = module.fp4_block_scale_moe_runner(
+        output = moe_op.fp4_block_scale_moe_runner(
             routing_logits,
             routing_bias,
             hidden_states,

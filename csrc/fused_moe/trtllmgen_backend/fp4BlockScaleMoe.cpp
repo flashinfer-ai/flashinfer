@@ -313,6 +313,10 @@ std::vector<at::Tensor> fp4_block_scale_moe_runner(
 }
 }  // namespace torch_ext
 
+namespace flashinfer::trtllm_cubin_loader {
+#include <flashinfer/cubin_loader.h>
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def(
       "fp4_block_scale_moe_runner("
