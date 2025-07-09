@@ -1305,7 +1305,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.

@@ -69,22 +69,24 @@ at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_
 }
 
 void PODWithKVCacheTensorRun(
+    // Shared params
+    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
+    at::Tensor plan_info_vec, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
+    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     // Prefill params
-    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
+    at::Tensor q_p, at::Tensor paged_k_p, at::Tensor paged_v_p,
     std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
     int64_t window_left_p, std::optional<at::Tensor> maybe_custom_mask_p,
     std::optional<at::Tensor> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
     double rope_rcp_scale_p, double rope_rcp_theta_p,
     // Decode params
-    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
-    at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
-    at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
-    std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
-    std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    bool enable_pdl) {
+    at::Tensor q_d, at::Tensor paged_k_cache_d, at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d,
+    at::Tensor paged_kv_indptr_d, at::Tensor paged_kv_indices_d,
+    at::Tensor paged_kv_last_page_len_d, std::optional<at::Tensor> maybe_lse_d,
+    int64_t mask_mode_code_d, int64_t layout_d, int64_t window_left_d,
+    std::optional<at::Tensor> maybe_custom_mask_d, std::optional<at::Tensor> maybe_mask_indptr_d,
+    std::optional<at::Tensor> maybe_alibi_slopes_d, double logits_soft_cap_d, double sm_scale_d,
+    double rope_rcp_scale_d, double rope_rcp_theta_d, bool enable_pdl) {
   // Prefill setup
   unsigned int head_dim_qk = q_p.size(2);
   unsigned int kv_len_p, qo_len_p, num_kv_heads, num_qo_heads;
@@ -94,19 +96,19 @@ void PODWithKVCacheTensorRun(
   uint32_t q_stride_n_p = q_p.stride(0), q_stride_h_p = q_p.stride(1), k_stride_n_p, k_stride_h_p,
            v_stride_n_p, v_stride_h_p;
   if (kv_layout_p == QKVLayout::kNHD) {
-    kv_len_p = k_p.size(0);
-    num_kv_heads = k_p.size(1);
-    k_stride_n_p = k_p.stride(0);
-    k_stride_h_p = k_p.stride(1);
-    v_stride_n_p = v_p.stride(0);
-    v_stride_h_p = v_p.stride(1);
+    kv_len_p = paged_k_p.size(0);
+    num_kv_heads = paged_k_p.size(1);
+    k_stride_n_p = paged_k_p.stride(0);
+    k_stride_h_p = paged_k_p.stride(1);
+    v_stride_n_p = paged_v_p.stride(0);
+    v_stride_h_p = paged_v_p.stride(1);
   } else {
-    kv_len_p = k_p.size(1);
-    num_kv_heads = k_p.size(0);
-    k_stride_h_p = k_p.stride(0);
-    k_stride_n_p = k_p.stride(1);
-    v_stride_h_p = v_p.stride(0);
-    v_stride_n_p = v_p.stride(1);
+    kv_len_p = paged_k_p.size(1);
+    num_kv_heads = paged_k_p.size(0);
+    k_stride_h_p = paged_k_p.stride(0);
+    k_stride_n_p = paged_k_p.stride(1);
+    v_stride_h_p = paged_v_p.stride(0);
+    v_stride_n_p = paged_v_p.stride(1);
   }
   if (maybe_lse_p) {
     const auto& lse = *maybe_lse_p;
@@ -117,7 +119,7 @@ void PODWithKVCacheTensorRun(
   const MaskMode mask_mode_p = static_cast<MaskMode>(mask_mode_code_p);
 
   auto q_scalar_type = q_p.scalar_type();
-  auto kv_scalar_type = k_p.scalar_type();
+  auto kv_scalar_type = paged_k_p.scalar_type();
 
   // Decode setup (Tensor decode = batched prefill)
   PODPlanInfo plan_info;
@@ -178,8 +180,8 @@ void PODWithKVCacheTensorRun(
           // Make params a reference to prefill_params to set values
           PrefillParams& params = prefill_params;
           params.q = static_cast<DTypeQ*>(q_p.data_ptr());
-          params.k = static_cast<DTypeKV*>(k_p.data_ptr());
-          params.v = static_cast<DTypeKV*>(v_p.data_ptr());
+          params.k = static_cast<DTypeKV*>(paged_k_p.data_ptr());
+          params.v = static_cast<DTypeKV*>(paged_v_p.data_ptr());
           params.o = static_cast<DTypeO*>(o_p.data_ptr());
           params.lse = maybe_lse_p ? static_cast<float*>(maybe_lse_p->data_ptr()) : nullptr;
           params.num_qo_heads = num_qo_heads;

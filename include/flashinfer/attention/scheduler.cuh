@@ -516,37 +516,35 @@ inline auto get_qkv_len_arr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t b
 
 inline auto get_q_tiles(std::vector<int64_t>& packed_qo_len_arr, uint32_t batch_size,
                         uint32_t head_dim, uint32_t page_size, uint32_t total_num_rows,
-                        uint32_t gqa_group_size, bool enable_cuda_graph, uint32_t tile_size = -1) {
-  const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
+                        uint32_t gqa_group_size, bool enable_cuda_graph, bool is_decode = false) {
   uint32_t cta_tile_q;
   uint32_t total_num_tiles_q;
   if (enable_cuda_graph) {
     // When CUDA graphs are enabled, the lengths of sequences determined by
     // qo_indptr_h can vary. We assume that the dummy data based on which
     // the CUDA graph is created fixes the maximum number of tokens.
-    if (tile_size == -1) {
+    if (is_decode) {
+      cta_tile_q = 16;
+    } else {
       const uint64_t max_seq_len = total_num_rows - batch_size + 1;
       uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
       cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
-    } else {
-      cta_tile_q = tile_size;
     }
-
     // Find an upper bound for the number of tiles, derived from the total
     // number of rows and the batch size.  The sum of qo lengths rounded
     // up to cta_tile_q will not exceed this number derived from the total
     // number of rows.
     total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
   } else {
-    if (tile_size == -1) {
+    if (is_decode) {
+      cta_tile_q = 16;
+    } else {
       int64_t sum_packed_qo_len = 0;
       for (uint32_t i = 0; i < batch_size; ++i) {
         sum_packed_qo_len += packed_qo_len_arr[i];
       }
       const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
       cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
-    } else {
-      cta_tile_q = tile_size;
     }
 
     total_num_tiles_q = 0;
@@ -624,6 +622,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   o_indptr.push_back(0);
 
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
 
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   auto [packed_qo_len_arr, kv_len_arr] =
@@ -852,7 +851,7 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   o_indptr.push_back(0);
 
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
-
+  const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   auto [packed_qo_len_arr_p, kv_len_arr_p] =
       get_qkv_len_arr(qo_indptr_p, kv_indptr_p, batch_size_p, num_qo_heads, gqa_group_size);
@@ -863,10 +862,9 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   auto [cta_tile_q_p, num_tiles_q_p] =
       get_q_tiles(packed_qo_len_arr_p, batch_size_p, head_dim, page_size, total_num_rows_p,
                   gqa_group_size, enable_cuda_graph);
-  auto cta_tile_q_d = 16;  // minimum for tensor core decode
   auto [cta_tile_q_d, num_tiles_q_d] =
       get_q_tiles(packed_qo_len_arr_d, batch_size_d, head_dim, page_size, total_num_rows_d,
-                  gqa_group_size, enable_cuda_graph, cta_tile_q_d);
+                  gqa_group_size, enable_cuda_graph, /*is_decode=*/true);
 
   uint32_t total_num_tiles_q = num_tiles_q_p + num_tiles_q_d;
   // Allocate CTAs proportional to the number of query tiles in prefill and decode
@@ -895,9 +893,9 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   bool split_kv = split_kv_p || split_kv_d;
   uint32_t real_batch_size = new_batch_size_p + new_batch_size_d;
   const size_t padded_batch_size_p =
-      enable_cuda_graph ? std::max(max_bs_p, total_num_tiles_q_p) : new_batch_size_p;
+      enable_cuda_graph ? std::max(max_bs_p, num_tiles_q_p) : new_batch_size_p;
   const size_t padded_batch_size_d =
-      enable_cuda_graph ? std::max(max_bs_d, total_num_tiles_q_d) : new_batch_size_d;
+      enable_cuda_graph ? std::max(max_bs_d, num_tiles_q_d) : new_batch_size_d;
   FLASHINFER_CHECK(real_batch_size <= padded_batch_size_p + padded_batch_size_d,
                    "new batch size should not exceed padded batch size");
 
@@ -981,9 +979,9 @@ struct PODPlanInfo {
 
   // From std::vector<int64_t> to PodPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 19) {
+    if (vec.size() != 20) {
       std::ostringstream err_msg;
-      err_msg << "PodPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
+      err_msg << "PodPlanInfo::FromVector: vec.size() should be 20, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size_p = vec[0];
@@ -991,21 +989,21 @@ struct PODPlanInfo {
     total_num_rows = vec[2];
     total_num_rows_p = vec[3];
     total_num_rows_d = vec[4];
-    total_num_rows_offset = vec[4];
-    cta_tile_q_p = vec[5];
-    cta_tile_q_d = vec[6];
-    request_indices_offset = vec[7];
-    qo_tile_indices_offset = vec[8];
-    kv_tile_indices_offset = vec[9];
-    merge_indptr_offset = vec[10];
-    o_indptr_offset = vec[11];
-    kv_chunk_size_ptr_offset_p = vec[12];
-    kv_chunk_size_ptr_offset_d = vec[13];
-    v_offset = vec[14];
-    s_offset = vec[15];
-    block_valid_mask_offset = vec[16];
-    enable_cuda_graph = vec[17];
-    split_kv = vec[18];
+    total_num_rows_offset = vec[5];
+    cta_tile_q_p = vec[6];
+    cta_tile_q_d = vec[7];
+    request_indices_offset = vec[8];
+    qo_tile_indices_offset = vec[9];
+    kv_tile_indices_offset = vec[10];
+    merge_indptr_offset = vec[11];
+    o_indptr_offset = vec[12];
+    kv_chunk_size_ptr_offset_p = vec[13];
+    kv_chunk_size_ptr_offset_d = vec[14];
+    v_offset = vec[15];
+    s_offset = vec[16];
+    block_valid_mask_offset = vec[17];
+    enable_cuda_graph = vec[18];
+    split_kv = vec[19];
   }
 };
 
@@ -1054,8 +1052,6 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   plan_info.total_num_rows_p = total_num_rows_p;
   plan_info.total_num_rows_d = total_num_rows_d;
   plan_info.enable_cuda_graph = enable_cuda_graph;
-  plan_info.padded_batch_size_p = padded_batch_size_p;
-  plan_info.padded_batch_size_d = padded_batch_size_d;
   plan_info.split_kv = split_kv;
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);

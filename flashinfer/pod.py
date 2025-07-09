@@ -310,11 +310,14 @@ class PODWithPagedKVCacheWrapper:
         kv_indptr_p: torch.Tensor
             The indptr of the paged kv cache for prefill, shape: ``[batch_size + 1]``.
         kv_indices_p: torch.Tensor
-            The page indices of the paged kv cache for prefill, shape: ``[qo_indptr[-1]]``.
+            The page indices of the paged kv cache for prefill, shape: ``[kv_indptr[-1]]``.
+        last_page_len_p : torch.Tensor
+            The number of entries in the last page of each request in the kv
+            cache, shape: ``[batch_size]``
         kv_indptr_d : torch.Tensor
             The indptr of the paged kv cache for decode, shape: ``[batch_size + 1]``
         kv_indices_d : torch.Tensor
-            The page indices of the paged kv cache for decode, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache for decode, shape: ``[kv_indptr[-1]]``
         last_page_len_d : torch.Tensor
             The number of entries in the last page of each request in the kv
             cache, shape: ``[batch_size]``
@@ -542,7 +545,6 @@ class PODWithPagedKVCacheWrapper:
         # Prefill setup
         _check_pos_encoding_mode(pos_encoding_mode_p)
         _check_kv_layout(kv_layout_p)
-        tmp_p = _get_cache_buf("pod_with_kv_cache_tmp", 32 * 1024 * 1024, q_p.device)
         if logits_soft_cap_p is None:
             logits_soft_cap_p = 0.0
         if sm_scale_p is None:
@@ -570,8 +572,15 @@ class PODWithPagedKVCacheWrapper:
             lse_p = torch.empty(
                 (q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device
             )
-
-        out_p = torch.empty_like(q_p)
+        qo_len_p, num_qo_heads, head_dim = q_p.shape
+        qo_len_d, _, _ = q_d.shape
+        out = torch.empty(
+            qo_len_p + qo_len_d,
+            num_qo_heads,
+            head_dim,
+            device=q_p.device,
+            dtype=q_p.dtype,
+        )
 
         # Decode setup
         k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
@@ -606,7 +615,6 @@ class PODWithPagedKVCacheWrapper:
             lse_d = torch.empty(
                 (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
             )
-        out_d = torch.empty_like(q_d)
 
         module_getter = get_pod_module(
             # Prefill params
@@ -630,12 +638,19 @@ class PODWithPagedKVCacheWrapper:
             logits_soft_cap_d > 0,  # use_logits_soft_cap
         )
         module_getter.run_tensor(
+            # Shared params
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            self._qo_indptr_buf,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            out,
             # Prefill params
             q_p,
             k_p,
             v_p,
-            tmp_p,
-            out_p,
             lse_p,
             mask_mode_p,
             TensorLayout[kv_layout_p].value,
@@ -647,17 +662,9 @@ class PODWithPagedKVCacheWrapper:
             1.0 / rope_scale_p,
             1.0 / rope_theta_p,
             # Decode params
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._plan_info,
             q_d,
             k_cache_d,
             v_cache_d,
-            self._qo_indptr_buf,
-            self._paged_kv_indptr_buf,
-            self._paged_kv_indices_buf,
-            self._paged_kv_last_page_len_buf,
-            out_d,
             lse_d,
             MaskMode.NON_CAUSAL.value,
             TensorLayout[self._kv_layout].value,
@@ -673,9 +680,9 @@ class PODWithPagedKVCacheWrapper:
         )
 
         if v_scale is not None:
-            out_d *= v_scale
+            out *= v_scale
 
-        return (out_p, out_d)
+        return out[:qo_len_p], out[qo_len_p:]
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
