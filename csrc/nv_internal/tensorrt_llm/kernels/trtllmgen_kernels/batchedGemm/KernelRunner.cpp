@@ -29,6 +29,8 @@ namespace kernels {
 
 using namespace batchedGemm::batchedGemm;
 
+static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     TrtllmGenBatchedGemmRunnerOptions const& options_)
     : mOptions(options_) {
@@ -192,7 +194,7 @@ void TrtllmGenBatchedGemmRunner::run(
 
   auto const enablePdl = tensorrt_llm::common::getEnvEnablePDL();
   auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                           multiProcessorCount, enablePdl);
+                           multiProcessorCount, enablePdl, globalTrtllmGenBatchedGemmModuleCache);
 
   TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
