@@ -52,6 +52,7 @@ packages = [
     "flashinfer.triton.kernels",
     "flashinfer.comm",
     "flashinfer.cudnn",
+    "flashinfer.logits_processor",
 ]
 include-package-data = false
 

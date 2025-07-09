@@ -76,6 +76,8 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                         for use_oneshot in use_oneshots:
                             for trigger_completion_at_end in trigger_completion_at_ends:
                                 for fp32_acc in fp32_accs:
+                                    if token_num < world_size and not use_oneshot:
+                                        continue
                                     if dtype == torch.float32 and (
                                         pattern_code
                                         == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant

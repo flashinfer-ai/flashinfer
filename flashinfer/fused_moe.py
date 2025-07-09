@@ -24,7 +24,7 @@ from .autotuner import AutoTuner, TunableRunner, TuningConfig
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
-from .utils import register_custom_op, register_fake_op
+from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 
 
 def gen_fused_moe_sm100_module() -> JitSpec:
@@ -232,6 +232,7 @@ def get_fused_moe_sm100_module():
         mutates_args=(""),
     )
     def cutlass_fused_moe_sm100(
+        output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -314,7 +315,8 @@ def get_fused_moe_sm100_module():
             if min_latency_mode
             else moe_runner._fused_moe_runner.run_moe
         )
-        output = run_moe(
+        result = run_moe(
+            output,
             input,
             token_selected_experts,
             token_final_scales,
@@ -332,10 +334,11 @@ def get_fused_moe_sm100_module():
             [gemm_tactic_1, gemm_tactic_2],
         )
 
-        return output if min_latency_mode else [output]
+        return result if min_latency_mode else [result]
 
     @register_fake_op("flashinfer::cutlass_fused_moe_sm100")
     def _fake_cutlass_fused_moe_sm100(
+        output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -395,6 +398,7 @@ def cutlass_fused_moe(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
+    output: Optional[torch.Tensor] = None,
     use_fp8_block_scaling: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
@@ -436,6 +440,7 @@ def cutlass_fused_moe(
         ep_rank (int, optional): Expert parallelism rank. Defaults to 0.
         cluster_size (int, optional): Cluster size. Defaults to 1.
         cluster_rank (int, optional): Cluster rank. Defaults to 0.
+        output (torch.Tensor, optional): The output tensor, if not provided, will be allocated internally.
         use_fp8_block_scaling (bool, optional): Whether to use FP8 block scaling. Defaults to False.
         use_w4a8_group_scaling (bool, optional): Whether to use W4A8 group scaling. Defaults to False.
         min_latency_mode (bool, optional): Whether to use minimum latency mode. Defaults to False.
@@ -467,7 +472,21 @@ def cutlass_fused_moe(
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
+    num_rows = input.shape[0]
+    if min_latency_mode:
+        num_rows *= fc2_expert_weights.shape[0]
+    hidden_size = fc2_expert_weights.shape[1]
+    output_shape = (num_rows, hidden_size)
+
+    if output is None:
+        output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
+    else:
+        _check_shape_dtype_device(
+            output, output_shape, output_dtype, input.device, "output"
+        )
+
     return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(
+        output,
         input,
         token_selected_experts,
         token_final_scales,

@@ -12,6 +12,7 @@ import flashinfer
 @pytest.mark.parametrize("s_kv", [8, 32, 256])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
 def test_cudnn_prefill_deepseek(
     batch_size,
@@ -19,6 +20,7 @@ def test_cudnn_prefill_deepseek(
     s_kv,
     num_kv_heads,
     num_qo_heads,
+    causal,
     is_cuda_graph_compatible,
 ):
     if s_qo > s_kv:
@@ -27,7 +29,6 @@ def test_cudnn_prefill_deepseek(
     head_dim_qk = 192
     head_dim_vo = 128
 
-    causal = True
     return_lse = True
 
     # test set up basics
