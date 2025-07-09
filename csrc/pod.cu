@@ -133,9 +133,9 @@ void PODWithKVCacheTensorRun(
 
   // Decode setup (Tensor decode = batched prefill)
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  uint32_t num_qo_heads_d = q_d.size(1);
+  uint32_t num_qo_heads = q_d.size(1);
 
-  TORCH_CHECK(num_qo_heads_p == num_qo_heads_d,
+  TORCH_CHECK(num_qo_heads_p == num_qo_heads,
               "POD currently requires same # Query heads for prefill and decode");
 
   uint32_t num_kv_heads, page_size;
@@ -190,24 +190,33 @@ void PODWithKVCacheTensorRun(
           // Make params a reference to prefill_params to set values
           PrefillParams& params = prefill_params;
           params.q = static_cast<DTypeQ*>(q_p.data_ptr());
-          params.k = static_cast<DTypeKV*>(paged_k_p.data_ptr());
-          params.v = static_cast<DTypeKV*>(paged_v_p.data_ptr());
+          params.paged_kv = paged_kv;
+          params.q_indptr = static_cast<IdType*>(qo_indptr_p.data_ptr());
           params.o = static_cast<DTypeO*>(o_p.data_ptr());
           params.lse = maybe_lse_p ? static_cast<float*>(maybe_lse_p->data_ptr()) : nullptr;
-          params.num_qo_heads_p = num_qo_heads_p;
-          params.num_kv_heads = num_kv_heads;
-          params.group_size = uint_fastdiv(num_qo_heads_p / num_kv_heads);
-          params.qo_len = qo_len_p;
-          params.kv_len = kv_len_p;
+          params.num_qo_heads = num_qo_heads_p;
+          params.group_size = uint_fastdiv(num_qo_heads_p / paged_kv.num_heads);
           params.q_stride_n = q_stride_n_p;
           params.q_stride_h = q_stride_h_p;
-          params.k_stride_n = k_stride_n_p;
-          params.k_stride_h = k_stride_h_p;
-          params.v_stride_n = v_stride_n_p;
-          params.v_stride_h = v_stride_h_p;
-
           params.window_left = window_left_p;
-          params.partition_kv = false;
+
+          params.request_indices =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
+          params.qo_tile_indices =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+          params.kv_tile_indices =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
+          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
+          if (plan_info.split_kv) {
+            params.merge_indptr =
+                GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+            if (plan_info.enable_cuda_graph) {
+              params.block_valid_mask =
+                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
+            }
+          }
+          params.kv_chunk_size_ptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset_p);
           params.padded_batch_size = plan_info.padded_batch_size_p;
           params.maybe_custom_mask = maybe_custom_mask_p
                                          ? static_cast<uint8_t*>(maybe_custom_mask_p->data_ptr())
@@ -219,6 +228,11 @@ void PODWithKVCacheTensorRun(
           params.sm_scale = sm_scale_p;
           params.rope_rcp_scale = rope_rcp_scale_p;
           params.rope_rcp_theta = rope_rcp_theta_p;
+          params.max_total_num_rows = plan_info.total_num_rows;
+          if (plan_info.enable_cuda_graph) {
+            params.total_num_rows =
+                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+          }
         }
 
         DecodeParams decode_params;
@@ -232,28 +246,22 @@ void PODWithKVCacheTensorRun(
           params.o = static_cast<DTypeO*>(o_d.data_ptr());
 
           params.lse = maybe_lse_d ? static_cast<float*>(maybe_lse_d->data_ptr()) : nullptr;
-          params.num_qo_heads_p = num_qo_heads_p;
-          params.group_size = uint_fastdiv(num_qo_heads_p / paged_kv.num_heads);
+          params.num_qo_heads = num_qo_heads;
+          params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
           params.q_stride_n = q_stride_n_d;
           params.q_stride_h = q_stride_h_d;
           params.window_left = window_left_d;
-          params.request_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
-          params.qo_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
-          params.kv_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
-          params.kv_chunk_size_ptr =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+          params.request_indices = prefill_params.request_indices;
+          params.qo_tile_indices = prefill_params.qo_tile_indices;
+          params.kv_tile_indices = prefill_params.kv_tile_indices;
+          params.o_indptr = prefill_params.o_indptr;
+          params.kv_chunk_size_ptr = prefill_params.kv_chunk_size_ptr;
           if (plan_info.split_kv) {
-            params.merge_indptr =
-                GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
-            tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
-            tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
+            params.merge_indptr = prefill_params.merge_indptr;
+            tmp_v = prefill_params.v;
+            tmp_s = prefill_params.s;
             if (plan_info.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
+              params.block_valid_mask = prefill_params.block_valid_mask;
             }
           }
           params.padded_batch_size = plan_info.padded_batch_size_d;
@@ -272,8 +280,7 @@ void PODWithKVCacheTensorRun(
           params.rope_rcp_theta = rope_rcp_theta_d;
 
           if (plan_info.enable_cuda_graph) {
-            params.total_num_rows =
-                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+            params.total_num_rows = prefill_params.total_num_rows;
           }
         }
 
@@ -286,12 +293,13 @@ void PODWithKVCacheTensorRun(
             DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
                              USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
         // DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-        constexpr size_t CTA_TILE_Q = 16;
+        constexpr size_t CTA_TILE_Q_P = plan_info.cta_tile_q_p;
+        constexpr size_t CTA_TILE_Q_D = plan_info.cta_tile_q_d;
         cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
             HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
-            CTA_TILE_Q, MASK_MODE_D, PrefillAttentionVariant, DecodeAttentionVariant>(
-            prefill_params, static_cast<DTypeO*>(tmp_p.data_ptr()), decode_params, tmp_v, tmp_s,
-            enable_pdl, stream);
+            CTA_TILE_Q_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
+            DecodeAttentionVariant>(prefill_params, static_cast<DTypeO*>(tmp_p.data_ptr()),
+                                    decode_params, tmp_v, tmp_s, enable_pdl, stream);
         TORCH_CHECK(status == cudaSuccess, "PODWithKVCache kernel launch failed, error: " +
                                                std::string(cudaGetErrorString(status)));
         //});
