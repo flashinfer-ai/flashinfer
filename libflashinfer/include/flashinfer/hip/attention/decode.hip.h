@@ -848,11 +848,15 @@ hipError_t SingleDecodeWithKVCacheDispatched(Params params,
                         hipOccupancyMaxActiveBlocksPerMultiprocessor(
                             &num_blocks_per_sm, kernel, num_threads,
                             smem_size));
-                    // TODO: FIX MAX OCCUPANCY SETTING num_blocks_per_sm TO 0 -
-                    // This causes floating point exception due to division by 0
-                    // uint32_t max_grid_size = uint32_t(num_blocks_per_sm) *
-                    // uint32_t(num_sm);
-                    uint32_t max_grid_size = uint32_t(1) * uint32_t(num_sm);
+                    // FIXME: The hipOccupancyMaxActiveBlocksPerMultiprocessor
+                    // function does not return accurate results always causing
+                    // a potential of a division by zero error for certain
+                    // configurations. For now, instead of using the HIP
+                    // function to derive num_blocks_per_sm we are hard coding
+                    // it to eight based on limited tuning runs. A better
+                    // heuristics to derive the maximum number of blocks per
+                    // SM/CU is needed to not have to hardcode the value.
+                    uint32_t max_grid_size = uint32_t(8) * uint32_t(num_sm);
                     uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
                     uint32_t kv_chunk_size =
                         max(ceil_div(seq_len, max_num_kv_chunks), 256);

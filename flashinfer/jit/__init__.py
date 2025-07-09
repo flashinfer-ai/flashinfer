@@ -81,6 +81,10 @@ from .core import logger
 # Try and Except to break circular dependencies
 try:
     from ..__aot_prebuilt_uris__ import prebuilt_ops_uri
+except ImportError:
+    prebuilt_ops_uri = None
+
+try:
     from .. import __config__
 
     if __config__.get_info("aot_torch_exts_cuda"):
@@ -89,7 +93,7 @@ try:
 
             has_prebuilt_ops = True
             kernels_path = _get_extension_path("flashinfer.flashinfer_kernels")
-            
+
         except ImportError:
             logger.warning(
                 "CUDA kernels were enabled in build but couldn't be imported"
@@ -104,21 +108,20 @@ try:
                 kernels_sm90_path = _get_extension_path(
                     "flashinfer.flashinfer_kernels_sm90"
                 )
-                
+
             except ImportError:
                 logger.warning(
                     "SM90 kernels were enabled in build but couldn't be imported"
                 )
 
-    if __config__.get_info("aot_torch_exts_hip"):
+    if prebuilt_ops_uri is not None and __config__.get_info("aot_torch_exts_hip"):
         try:
             from .. import flashinfer_hip_kernels  # noqa: F401
+
             logger.info("Loading prebuilt HIP kernels")
             has_prebuilt_ops = True
 
-            kernels_hip_path = _get_extension_path(
-                "flashinfer.flashinfer_hip_kernels"
-            )
+            kernels_hip_path = _get_extension_path("flashinfer.flashinfer_hip_kernels")
 
         except ImportError as e:
             print(e)

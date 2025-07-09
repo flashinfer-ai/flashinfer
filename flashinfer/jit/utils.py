@@ -20,8 +20,6 @@ from typing import Any, Callable, List, Tuple
 
 import torch
 
-from .core import logger
-
 
 def write_if_different(path: pathlib.Path, content: str) -> None:
     if path.exists():
@@ -59,14 +57,25 @@ def parallel_load_modules(
             print(f"Exception occurred in {func.__name__}: {e}")
         raise RuntimeError("One or more exceptions occurred during module loading")
 
-    logger.info("Finished loading modules")
-
 
 dtype_map = {
     torch.float16: "half",
     torch.bfloat16: "nv_bfloat16",
     torch.float8_e4m3fn: "__nv_fp8_e4m3",
     torch.float8_e5m2: "__nv_fp8_e5m2",
+    torch.int8: "int8_t",
+    torch.uint8: "uint8_t",
+    torch.int32: "int32_t",
+    torch.uint32: "uint32_t",
+    torch.int64: "int64_t",
+    torch.uint64: "uint64_t",
+}
+
+dtype_map_hip = {
+    torch.float16: "half",
+    torch.bfloat16: "__hip_bfloat16",
+    torch.float8_e4m3fn: "__hip_fp8_e4m3_fnuz",
+    torch.float8_e5m2: "__hip_fp8_e5m2_fnuz",
     torch.int8: "int8_t",
     torch.uint8: "uint8_t",
     torch.int32: "int32_t",

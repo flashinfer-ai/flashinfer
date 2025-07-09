@@ -21,7 +21,13 @@ import ctypes
 import os
 import sys
 from pathlib import Path
-from .__aot_prebuilt_uris__ import prebuilt_ops_uri
+
+try:
+    from .__aot_prebuilt_uris__ import prebuilt_ops_uri
+except ImportError as e:
+    print(f"Failed to import __aot_prebuilt_uris__: {e}")
+    prebuilt_ops_uri = None
+
 try:
     from .__config__ import __version__, get_info, show
 
@@ -123,5 +129,5 @@ __all__ = [
     "get_info",
     "get_tvm_binding_dir",
     "show",
-    "prebuilt_ops_uri"
+    "prebuilt_ops_uri",
 ]

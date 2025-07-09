@@ -20,10 +20,18 @@ from typing import List
 import jinja2
 import torch
 
-from ..core import load_cuda_ops, logger, sm90a_nvcc_flags
+from ..core import (
+    JitSpec,
+    check_hip_availability,
+    gen_jit_spec,
+    load_cuda_ops,
+    logger,
+    sm90a_nvcc_flags,
+)
 from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
 from ..utils import (
     dtype_map,
+    dtype_map_hip,
     filename_safe_dtype_map,
     mask_mode_literal,
     pos_encoding_mode_literal,
@@ -421,7 +429,11 @@ def gen_single_decode_module(
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
-        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        (
+            f"#include<flashinfer/hip/attention/variants.hip.h>"
+            if check_hip_availability()
+            else f"#include<flashinfer/attention/variants.cuh>"
+        ),  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
@@ -698,7 +710,11 @@ def gen_batch_decode_module(
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
-        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        (
+            f"#include<flashinfer/hip/attention/variants.hip.h>"
+            if check_hip_availability()
+            else f"#include<flashinfer/attention/variants.cuh>"
+        ),  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
@@ -798,9 +814,8 @@ def gen_customize_single_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
-):
+) -> JitSpec:
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
-
     (
         additional_params_decl,
         additional_func_params,
@@ -812,10 +827,18 @@ def gen_customize_single_decode_module(
         additional_scalar_dtypes,
     )
 
-    with open(FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja") as f:
+    with open(
+        FLASHINFER_CSRC_DIR / "single_decode_customize_config_hip.jinja"
+        if check_hip_availability()
+        else FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja"
+    ) as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja") as f:
+    with open(
+        FLASHINFER_CSRC_DIR / "single_decode_kernel_inst_hip.jinja"
+        if check_hip_availability()
+        else FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja"
+    ) as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs = {
@@ -824,9 +847,15 @@ def gen_customize_single_decode_module(
         "additional_params_setter": additional_params_setter,
         "variant_decl": variant_decl,
         "variant_name": variant_name,
-        "dtype_q": dtype_map[dtype_q],
-        "dtype_kv": dtype_map[dtype_kv],
-        "dtype_o": dtype_map[dtype_o],
+        "dtype_q": (
+            dtype_map_hip[dtype_q] if check_hip_availability() else dtype_map[dtype_q]
+        ),
+        "dtype_kv": (
+            dtype_map_hip[dtype_kv] if check_hip_availability() else dtype_map[dtype_kv]
+        ),
+        "dtype_o": (
+            dtype_map_hip[dtype_o] if check_hip_availability() else dtype_map[dtype_o]
+        ),
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
@@ -848,10 +877,13 @@ def gen_customize_single_decode_module(
         **kwargs,
     )
     write_if_different(dest_path, source)
-
     for filename in [
-        "single_decode.cu",
-        "single_decode_jit_pybind.cu",
+        "single_decode_hip.cu" if check_hip_availability() else "single_decode.cu",
+        (
+            "single_decode_jit_pybind_hip.cu"
+            if check_hip_availability()
+            else "single_decode_jit_pybind.cu"
+        ),
     ]:
         src_path = FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -860,10 +892,14 @@ def gen_customize_single_decode_module(
             source = f.read()
         write_if_different(dest_path, source)
 
-    generated_config_path = gen_directory / "single_decode_config.inc"
+    generated_config_path = (
+        gen_directory / "single_decode_config_hip.inc"
+        if check_hip_availability()
+        else gen_directory / "single_decode_config.inc"
+    )
     write_if_different(generated_config_path, generated_inc_str)
 
-    return load_cuda_ops(uri, source_paths)
+    return gen_jit_spec(uri, source_paths)
 
 
 def gen_customize_single_prefill_module(
@@ -1053,10 +1089,18 @@ def gen_customize_batch_decode_module(
         "additional_params_setter": additional_params_setter,
         "variant_decl": variant_decl,
         "variant_name": variant_name,
-        "dtype_q": dtype_map[dtype_q],
-        "dtype_kv": dtype_map[dtype_kv],
-        "dtype_o": dtype_map[dtype_o],
-        "idtype": dtype_map[idtype],
+        "dtype_q": (
+            dtype_map_hip[dtype_q] if check_hip_availability() else dtype_map[dtype_q]
+        ),
+        "dtype_kv": (
+            dtype_map_hip[dtype_kv] if check_hip_availability() else dtype_map[dtype_kv]
+        ),
+        "dtype_o": (
+            dtype_map_hip[dtype_o] if check_hip_availability() else dtype_map[dtype_o]
+        ),
+        "idtype": (
+            dtype_map_hip[idtype] if check_hip_availability() else dtype_map[idtype]
+        ),
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
@@ -1064,10 +1108,18 @@ def gen_customize_batch_decode_module(
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
+    with open(
+        FLASHINFER_CSRC_DIR / "batch_decode_customize_config_hip.jinja"
+        if check_hip_availability()
+        else FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja"
+    ) as f:
         config_templ = jinja2.Template(f.read())
 
-    with open(FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
+    with open(
+        FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst_hip.jinja"
+        if check_hip_availability()
+        else FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja"
+    ) as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     generated_inc_str = config_templ.render(
@@ -1084,8 +1136,12 @@ def gen_customize_batch_decode_module(
     write_if_different(dest_path, source)
 
     for filename in [
-        "batch_decode.cu",
-        "batch_decode_jit_pybind.cu",
+        "batch_decode_hip.cu" if check_hip_availability() else "batch_decode.cu",
+        (
+            "batch_decode_jit_pybind_hip.cu"
+            if check_hip_availability()
+            else "batch_decode_jit_pybind.cu"
+        ),
     ]:
         src_path = FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1094,12 +1150,14 @@ def gen_customize_batch_decode_module(
             source = f.read()
         write_if_different(dest_path, source)
 
-    generated_config_path = gen_directory / "batch_decode_config.inc"
-    write_if_different(generated_config_path, generated_inc_str)
-    return load_cuda_ops(
-        uri,
-        source_paths,
+    generated_config_path = (
+        gen_directory / "batch_decode_config_hip.inc"
+        if check_hip_availability()
+        else gen_directory / "batch_decode_config.inc"
     )
+    write_if_different(generated_config_path, generated_inc_str)
+
+    return gen_jit_spec(uri, source_paths)
 
 
 def gen_customize_batch_prefill_module(

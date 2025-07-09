@@ -119,7 +119,10 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
                                     int64_t window_left ADDITIONAL_FUNC_PARAMS)
 {
     DecodePlanInfo plan_info;
-    plan_info.FromVector(tensor_to_vec(plan_info_vec));
+    const size_t size = plan_info_vec.numel();
+    const int64_t *first = plan_info_vec.data_ptr<int64_t>();
+    const int64_t *last = first + size;
+    plan_info.FromVector(std::vector<int64_t>(first, last));
     QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
     auto device = q.device();
     int64_t batch_size = q.size(0);

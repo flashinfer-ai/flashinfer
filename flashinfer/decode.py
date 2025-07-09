@@ -71,7 +71,8 @@ def get_single_decode_module(*args):
 
             run_func = _kernels.single_decode_with_kv_cache.default
         else:
-            run_func = gen_single_decode_module(*args).run.default
+            module = gen_single_decode_module(*args).build_and_load()
+            run_func = module.run.default
 
         # torch library for single_decode_with_kv_cache
 
@@ -218,7 +219,7 @@ def get_batch_decode_module(*args):
             plan_func = _kernels.batch_decode_with_paged_kv_cache_plan.default
             run_func = _kernels.batch_decode_with_paged_kv_cache_run.default
         else:
-            mod = gen_batch_decode_module(*args)
+            mod = gen_batch_decode_module(*args).build_and_load()
             plan_func = mod.plan.default
             run_func = mod.run.default
 
