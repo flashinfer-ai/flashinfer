@@ -94,7 +94,7 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.oSfPtr = nullptr;
 
   // MLA uses different head dimensions for Qk and V.
-  runner_params.mHeadDimQk = num_q_heads;
+  runner_params.mHeadDimQk = head_size;
   runner_params.mHeadDimV = kv_lora_rank;
 
   // NOTE: MLA use kv_heads = 1
