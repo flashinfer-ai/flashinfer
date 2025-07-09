@@ -519,7 +519,7 @@ class TllmGenFmhaKernel {
       // Load the module.
       const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
       std::string hash =
-          env_hash ? std::string(env_hash) : "4c623163877c8fef5751c9c7a59940cd2baae02e";
+          env_hash ? std::string(env_hash) : "da37be2ad519f48792ec05ca91207d600320b055";
       std::string cubin_path = hash + "/fmha/trtllm-gen/" + kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
