@@ -28,6 +28,8 @@ namespace kernels {
 
 using namespace batchedGemm::batchedGemm;
 
+static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     TrtllmGenBatchedGemmRunnerOptions const& options_)
     : mOptions(options_) {
@@ -177,8 +179,8 @@ void TrtllmGenBatchedGemmRunner::run(
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-  auto const err =
-      bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
+                           multiProcessorCount, true, globalTrtllmGenBatchedGemmModuleCache);
 
   TORCH_CHECK(err == 0, "Error occurred when running GEMM!");
 }
