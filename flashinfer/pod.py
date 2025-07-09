@@ -65,7 +65,7 @@ class PODWithPagedKVCacheWrapper:
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
     >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
-    >>> decode_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
+    >>> wrapper = flashinfer.PODWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
     >>> batch_size = 7
@@ -83,7 +83,7 @@ class PODWithPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> decode_wrapper.plan(
+    >>> wrapper.plan(
     ...     kv_page_indptr,
     ...     kv_page_indices,
     ...     kv_last_page_len,
@@ -510,7 +510,6 @@ class PODWithPagedKVCacheWrapper:
         custom_mask_p: Optional[torch.Tensor] = None,
         packed_custom_mask_p: Optional[torch.Tensor] = None,
         causal_p: bool = False,
-        kv_layout_p: str = "NHD",
         pos_encoding_mode_p: str = "NONE",
         sm_scale_p: Optional[float] = None,
         window_left_p: int = -1,
@@ -521,7 +520,6 @@ class PODWithPagedKVCacheWrapper:
         custom_mask_d: Optional[torch.Tensor] = None,
         packed_custom_mask_d: Optional[torch.Tensor] = None,
         causal_d: bool = False,
-        kv_layout_d: str = "NHD",
         pos_encoding_mode_d: str = "NONE",
         sm_scale_d: Optional[float] = None,
         window_left_d: int = -1,
@@ -544,7 +542,6 @@ class PODWithPagedKVCacheWrapper:
         logits_soft_cap_d = None
         # Prefill setup
         _check_pos_encoding_mode(pos_encoding_mode_p)
-        _check_kv_layout(kv_layout_p)
         if logits_soft_cap_p is None:
             logits_soft_cap_p = 0.0
         if sm_scale_p is None:
@@ -647,13 +644,13 @@ class PODWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             out,
+            TensorLayout[self._kv_layout].value,
             # Prefill params
             q_p,
             k_p,
             v_p,
             lse_p,
             mask_mode_p,
-            TensorLayout[kv_layout_p].value,
             window_left_p,
             packed_custom_mask_p,
             _get_cache_alibi_slopes_buf(q_p.shape[1], q_p.device),
@@ -667,7 +664,6 @@ class PODWithPagedKVCacheWrapper:
             v_cache_d,
             lse_d,
             MaskMode.NON_CAUSAL.value,
-            TensorLayout[self._kv_layout].value,
             window_left_d,
             None,  # packed_custom_mask
             None,  # mask_indptr_buf
