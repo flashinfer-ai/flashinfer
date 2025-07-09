@@ -103,7 +103,7 @@ def reference_paged_attention(
 @pytest.mark.parametrize("q_dtype", ["half", "bf16"])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-def test_trtllm_batch_decode(
+def test_trtllm_batch_decode_fmha(
     kv_layout,
     batch_size,
     page_size,
@@ -242,3 +242,100 @@ def test_trtllm_batch_decode(
         output_ref = wrapper.run(q, kv_cache)
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("batch_size", [4, 256])
+@pytest.mark.parametrize("scale", [1.0, 0.5])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_decode_mla(
+    batch_size: int,
+    scale: float,
+    dtype: torch.dtype,
+    page_size: int,
+):
+    torch.manual_seed(42)
+    device = "cuda:0"
+
+    # Fixed max sequence length
+    MAX_SEQ_LEN = 256
+
+    # Deepseek attention config (decode-MLA)
+    num_q_heads = 128
+    num_kv_heads = 1
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    scale = 1.0
+
+    # Initialize tensors
+    query = (
+        torch.randn(batch_size, num_q_heads, kv_lora_rank + qk_rope_head_dim)
+        .to(device)
+        .to(dtype)
+    )
+
+    num_tokens = MAX_SEQ_LEN * batch_size
+    num_blocks = (num_tokens + page_size - 1) // page_size
+
+    # Sequence lengths and block tables
+    seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
+    seq_lens[-1] = MAX_SEQ_LEN
+    max_seq_len = max(seq_lens)
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
+
+    blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
+    max_num_blocks_per_seq = max(blocks_per_seq)
+
+    # Generate random but unique block IDs for all sequences
+    total_blocks_needed = sum(blocks_per_seq)
+    all_block_ids = torch.randperm(
+        total_blocks_needed, device=device
+    )  # Random permutation
+
+    # Generate unique block IDs for all sequences
+    block_id = 0
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq), dtype=torch.int, device=device
+    )
+
+    # Populate block tables and track block assignments
+    block_id = 0
+    for i in range(batch_size):
+        num_blocks_needed = blocks_per_seq[i]
+        block_tables[i, :num_blocks_needed] = all_block_ids[
+            block_id : block_id + num_blocks_needed
+        ]
+        block_id += num_blocks_needed
+
+    # Create interleaved KV cache
+    # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
+    # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
+    kv_cache_shape = (num_blocks, page_size, kv_lora_rank + qk_rope_head_dim)
+    kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device)
+
+    # Allocate workspace buffer
+    # todo(Yingyi): calculate the actual size of workspace buffer
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    # Run decode-MLA
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens_tensor,
+        block_size=page_size,
+        max_seq_len=max_seq_len,
+        scale=scale,
+    )
+
+    # Run reference attention and align output
+    # todo
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_decode_mla(4, 1.0, torch.float8_e4m3fn, 16)

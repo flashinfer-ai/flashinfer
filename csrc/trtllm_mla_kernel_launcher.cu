@@ -33,8 +33,7 @@ template <Data_type CACHE_T>
 void trtllm_paged_attention_mla_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
-    int64_t max_seq_len, const std::string kv_cache_dtype, int64_t qk_nope_head_dim,
-    int64_t kv_lora_rank, int64_t qk_rope_head_dim, bool fp8_generation_mla,
+    int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
     std::optional<int64_t> acc_q_len, std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
@@ -155,7 +154,7 @@ void trtllm_paged_attention_mla_launcher(
 #define CALL_GEN_LAUNCHER(CACHE_T_ENUM)                                                         \
   trtllm_paged_attention_mla_launcher<CACHE_T_ENUM>(                                            \
       out, query, key_value_cache, workspace_buffer, scale, block_tables, seq_lens, block_size, \
-      max_seq_len, kv_cache_dtype, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, acc_q_len, \
+      max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, acc_q_len,                 \
       max_attention_window_size, cyclic_attention_window_size);
 
 // The following macro is used to dispatch the conversion function based on
@@ -164,7 +163,7 @@ void trtllm_paged_attention_mla_launcher(
 #define DISPATCH_BY_QKV_DTYPE(Q_DTYPE, KV_DTYPE, FN)                                               \
   FLASHINFER_CHECK(Q_DTYPE == KV_DTYPE,                                                            \
                    "Q_DTYPE must be the same as KV_DTYPE. Hybrid type is not supported for now."); \
-  if (Q_DTYPE == at::ScalarType::Float8E4M3FN) {                                                   \
+  if (Q_DTYPE == at::ScalarType::Float8_e4m3fn) {                                                  \
     FN(Data_type::DATA_TYPE_E4M3);                                                                 \
   } else if (Q_DTYPE == at::ScalarType::BFloat16) {                                                \
     FN(Data_type::DATA_TYPE_BF16);                                                                 \
@@ -187,7 +186,7 @@ namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, xm) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_paged_attention_mla", trtllm_paged_attention_mla);
 }
 

@@ -1755,8 +1755,9 @@ def _check_trtllm_gen_mla_shape(
 
     B_q, H, D_q = query.shape
     D_ckv = kv_cache.shape[2]
-    if H != 128:
-        raise ValueError(f"Expected 128 heads for query, got {H}")
+    # if H != 128:
+    #     raise ValueError(f"Expected 128 heads for query, got {H}")
+    # todo(Yingyi): should we check num_heads == 128? Is this deepseek only?
     if D_q != D_ckv or D_q != 576:
         raise ValueError(
             f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"
@@ -1793,9 +1794,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode
-    qk_nope_head_dim: qk_nope_head_dim, should be 128
-    kv_lora_rank: kv_lora_rank, should be 512
-    qk_rope_head_dim: qk_rope_head_dim, should be 64
+    qk_nope_head_dim: qk_nope_head_dim, must be 128
+    kv_lora_rank: kv_lora_rank, must be 512
+    qk_rope_head_dim: qk_rope_head_dim, must be 64
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     block_size: page_size
