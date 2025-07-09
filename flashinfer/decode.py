@@ -1788,6 +1788,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: int,
     scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
+    bmm1_scale: Optional[torch.Tensor] = None,
+    bmm2_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -1803,6 +1805,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length
     scale: model scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
+    bmm1_scale: scale for mla bmm1 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
+    bmm2_scale: scale for mla bmm2 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
@@ -1814,6 +1818,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out = torch.empty_like(query)
     else:
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+
+    if kv_cache.dtype == torch.float8_e4m3fn and (
+        bmm1_scale is None or bmm2_scale is None
+    ):
+        raise ValueError(
+            "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
+        )
 
     run_func(
         out,
@@ -1828,6 +1839,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         qk_nope_head_dim,
         kv_lora_rank,
         qk_rope_head_dim,
+        bmm1_scale,
+        bmm2_scale,
         None,  # acc_q_len, speculative not supported for now
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now

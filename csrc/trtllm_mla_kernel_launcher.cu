@@ -34,6 +34,7 @@ void trtllm_paged_attention_mla_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    std::optional<at::Tensor> bmm1_scale, std::optional<at::Tensor> bmm2_scale,
     std::optional<int64_t> acc_q_len, std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
@@ -145,6 +146,11 @@ void trtllm_paged_attention_mla_launcher(
   // NOTE (Yingyi): quantization, not supported for now
   runner_params.mSfStartTokenIdx = 0;
 
+  if (CACHE_T == Data_type::DATA_TYPE_E4M3) {
+    runner_params.outputScalePtr = reinterpret_cast<float const*>(bmm2_scale->data_ptr());
+    runner_params.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(bmm1_scale->data_ptr());
+  }
+
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
 
@@ -154,8 +160,8 @@ void trtllm_paged_attention_mla_launcher(
 #define CALL_GEN_LAUNCHER(CACHE_T_ENUM)                                                         \
   trtllm_paged_attention_mla_launcher<CACHE_T_ENUM>(                                            \
       out, query, key_value_cache, workspace_buffer, scale, block_tables, seq_lens, block_size, \
-      max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, acc_q_len,                 \
-      max_attention_window_size, cyclic_attention_window_size);
+      max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, bmm1_scale, bmm2_scale,    \
+      acc_q_len, max_attention_window_size, cyclic_attention_window_size);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
@@ -175,7 +181,9 @@ void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& 
                                 at::Tensor& workspace_buffer, double scale,
                                 at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
                                 int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank,
-                                int64_t qk_rope_head_dim, std::optional<int64_t> acc_q_len,
+                                int64_t qk_rope_head_dim, std::optional<at::Tensor> bmm1_scale,
+                                std::optional<at::Tensor> bmm2_scale,
+                                std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
   DISPATCH_BY_QKV_DTYPE(query.dtype(), key_value_cache.dtype(),
