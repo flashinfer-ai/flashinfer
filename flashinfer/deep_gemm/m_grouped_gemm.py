@@ -177,25 +177,18 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
-def m_grouped_fp8_gemm_nt_contiguous_sm100(
-    a: torch.Tensor,
-    sfa: torch.Tensor,
-    b: torch.Tensor,
-    sfb: torch.Tensor,
-    d: torch.Tensor,
-    m_indices: torch.Tensor,
+def m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(
+    m: int,
+    n: int,
+    k: int,
+    aligned_k: int,
+    num_groups: int,
     major_a: MajorTypeAB,
     major_b: MajorTypeAB,
+    major_d: MajorTypeCD,
     compiled_dims: str,
-) -> None:
-    m, k = a.shape
-    num_groups, n, _ = b.shape
-    major_d = MajorTypeCD.NMajor
-
-    # K must be aligned to 128
-    aligned_k = align(k, 128)
-
-    # Auto-tuning with compilation
+    output_dtype: torch.dtype,
+):
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     num_sms, block_m, block_n, block_k, num_stages, multicast_config, smem_config = (
         get_best_configs(
@@ -208,11 +201,84 @@ def m_grouped_fp8_gemm_nt_contiguous_sm100(
             major_b,
             major_d,
             torch.float8_e4m3fn,
-            d.dtype,
+            output_dtype,
             num_sms,
         )
     )
+    kwargs = {
+        # Templated or runtime arguments according to the `COMPILED_DIMS`
+        "COMPILED_DIMS": compiled_dims,
+        "M": m,
+        "N": n,
+        "K": aligned_k,
+        # Templated arguments
+        "GEMM_TYPE": GemmType.GroupedContiguous,
+        "NUM_NON_EPILOGUE_THREADS": 128,
+        "NUM_EPILOGUE_THREADS": 128,
+        "MAJOR_A": major_a,
+        "MAJOR_B": major_b,
+        "NUM_GROUPS": num_groups,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "NUM_STAGES": num_stages,
+        "NUM_LAST_STAGES": ceil_div(k, block_k) % num_stages,
+        "SWIZZLE_A_MODE": smem_config.swizzle_a_mode,
+        "SWIZZLE_B_MODE": smem_config.swizzle_b_mode,
+        "SWIZZLE_CD_MODE": smem_config.swizzle_cd_mode,
+        "NUM_MULTICAST": multicast_config.num_multicast,
+        "IS_MULTICAST_ON_A": multicast_config.is_multicast_on_a,
+        "WITH_ACCUMULATION": False,
+        "CD_DTYPE_T": output_dtype,
+    }
+    return (
+        num_sms,
+        block_m,
+        block_n,
+        block_k,
+        num_stages,
+        multicast_config,
+        smem_config,
+    ), kwargs
 
+
+def m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
+    a: torch.Tensor,
+    sfa: torch.Tensor,
+    b: torch.Tensor,
+    sfb: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    major_a: MajorTypeAB,
+    major_b: MajorTypeAB,
+    compiled_dims: str,
+):
+    m, k = a.shape
+    num_groups, n, _ = b.shape
+    major_d = MajorTypeCD.NMajor
+
+    # K must be aligned to 128
+    aligned_k = align(k, 128)
+    (
+        num_sms,
+        block_m,
+        block_n,
+        block_k,
+        num_stages,
+        multicast_config,
+        smem_config,
+    ), static_kwargs = m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(
+        m,
+        n,
+        k,
+        aligned_k,
+        num_groups,
+        major_a,
+        major_b,
+        major_d,
+        compiled_dims,
+        d.dtype,
+    )
     # NOTES: you cannot distinguish groups for A, SFA, and D
     tensor_map_a = make_tma_a_desc(
         major_a,
@@ -267,32 +333,8 @@ def m_grouped_fp8_gemm_nt_contiguous_sm100(
         num_groups=num_groups,
         swizzle_mode=smem_config.swizzle_sf_mode,
     )
-
-    kwargs = {
-        # Templated or runtime arguments according to the `COMPILED_DIMS`
-        "COMPILED_DIMS": compiled_dims,
-        "M": m,
-        "N": n,
-        "K": aligned_k,
-        # Templated arguments
-        "GEMM_TYPE": GemmType.GroupedContiguous,
-        "NUM_NON_EPILOGUE_THREADS": 128,
-        "NUM_EPILOGUE_THREADS": 128,
-        "MAJOR_A": major_a,
-        "MAJOR_B": major_b,
-        "NUM_GROUPS": num_groups,
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "NUM_STAGES": num_stages,
-        "NUM_LAST_STAGES": ceil_div(k, block_k) % num_stages,
-        "SWIZZLE_A_MODE": smem_config.swizzle_a_mode,
-        "SWIZZLE_B_MODE": smem_config.swizzle_b_mode,
-        "SWIZZLE_CD_MODE": smem_config.swizzle_cd_mode,
-        "NUM_MULTICAST": multicast_config.num_multicast,
-        "IS_MULTICAST_ON_A": multicast_config.is_multicast_on_a,
-        "WITH_ACCUMULATION": False,
-        "CD_DTYPE_T": d.dtype,
+    all_kwargs = {
+        **static_kwargs,
         # Runtime arguments
         "GROUPED_LAYOUT": m_indices,
         "NUM_SMS": num_sms,
@@ -306,11 +348,27 @@ def m_grouped_fp8_gemm_nt_contiguous_sm100(
         "STREAM": torch.cuda.current_stream().cuda_stream,
         "DEVICE_INDEX": d.device.index,
     }
+    return static_kwargs, all_kwargs
 
+
+def m_grouped_fp8_gemm_nt_contiguous_sm100(
+    a: torch.Tensor,
+    sfa: torch.Tensor,
+    b: torch.Tensor,
+    sfb: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    major_a: MajorTypeAB,
+    major_b: MajorTypeAB,
+    compiled_dims: str,
+) -> None:
+    static_kwargs, all_kwargs = m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
+        a, sfa, b, sfb, d, m_indices, major_a, major_b, compiled_dims
+    )
     # Generate, build and run the kernel
-    code = SM100FP8GemmRuntime.generate(kwargs)
+    code = SM100FP8GemmRuntime.generate(static_kwargs)
     runtime = load("fp8_m_grouped_gemm", code, SM100FP8GemmRuntime)
-    runtime(**kwargs)
+    runtime(**all_kwargs)
 
 
 def m_grouped_fp8_gemm_nt_contiguous(
