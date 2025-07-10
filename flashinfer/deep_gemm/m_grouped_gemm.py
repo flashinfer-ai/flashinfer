@@ -17,11 +17,10 @@ limitations under the License.
 # Imported and adapted from DeepGEMM
 
 import ctypes
-import os
 import torch
 import cuda.bindings.driver as cbd
 import functools
-from typing import Any, Dict, Type, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional
 from ..jit.env import FLASHINFER_CACHE_DIR
 from ..jit.cubin_loader import get_cubin
 
@@ -33,8 +32,6 @@ from .runtime import (
     pytypes_to_ctypes,
 )
 from .utils import (
-    align,
-    ceil_div,
     GemmType,
     MajorTypeAB,
     MajorTypeCD,
@@ -48,6 +45,7 @@ from .utils import (
     get_best_configs,
 )
 from ..cuda_utils import checkCudaErrors
+from ..utils import ceil_div, round_up
 
 runtime_cache = {}
 
@@ -291,7 +289,7 @@ def m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
     major_d = MajorTypeCD.NMajor
 
     # K must be aligned to 128
-    aligned_k = align(k, 128)
+    aligned_k = round_up(k, 128)
     (
         num_sms,
         block_m,

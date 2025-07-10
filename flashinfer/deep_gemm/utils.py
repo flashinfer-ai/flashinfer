@@ -7,24 +7,7 @@ import re
 from typing import Tuple, Optional
 from torch.utils.cpp_extension import CUDA_HOME
 import enum
-
-
-def ceil_div(x: int, y: int) -> int:
-    """
-    Perform ceiling division of two integers.
-
-    Args:
-        x: the dividend.
-        y: the divisor.
-
-    Returns:
-        The result of the ceiling division.
-    """
-    return (x + y - 1) // y
-
-
-def align(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
+from ..utils import ceil_div, round_up
 
 
 class GemmType(enum.Enum):
@@ -97,7 +80,7 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     tma_alignment_bytes = 16
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
-    return align(x, alignment)
+    return round_up(x, alignment)
 
 
 def get_col_major_tma_aligned_packed_tensor(x: torch.Tensor) -> torch.Tensor:
@@ -114,7 +97,7 @@ def get_col_major_tma_aligned_packed_tensor(x: torch.Tensor) -> torch.Tensor:
         x, remove_dim = x.unsqueeze(0), True
     b = x.shape[0]
     aligned_mn = get_tma_aligned_size(mn, 4)
-    aligned_k = align(k, 4)
+    aligned_k = round_up(k, 4)
     padded = torch.zeros((b, aligned_mn, aligned_k), device=x.device, dtype=torch.uint8)
     padded[:, :mn, :k] = ue8m0_tensor
     padded = padded.view(-1).view(dtype=torch.int).view(b, aligned_mn, aligned_k // 4)
@@ -328,8 +311,8 @@ def get_sf_aligned_block_sizes(block_m: int, block_n: int, ab_dtype: torch.dtype
     return {
         torch.bfloat16: (0, 0),
         torch.float8_e4m3fn: (
-            align(block_m, num_utccp_aligned_elems),
-            align(block_n, num_utccp_aligned_elems),
+            round_up(block_m, num_utccp_aligned_elems),
+            round_up(block_n, num_utccp_aligned_elems),
         ),
     }[ab_dtype]
 
@@ -542,29 +525,3 @@ def get_best_configs(
         best_multicast_config,
         best_smem_config,
     )
-
-
-@functools.lru_cache(maxsize=None)
-def get_nvcc_compiler() -> Tuple[str, str]:
-    paths = []
-    if os.getenv("DG_JIT_NVCC_COMPILER"):
-        paths.append(os.getenv("DG_JIT_NVCC_COMPILER"))
-    paths.append(os.path.join(CUDA_HOME, "bin", "nvcc"))
-
-    # Try to find the first available NVCC compiler
-    least_version_required = "12.3"
-    version_pattern = re.compile(r"release (\d+\.\d+)")
-    for path in paths:
-        if os.path.exists(path):
-            command = [path, "--version"]
-            result = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            match = version_pattern.search(result.stdout)
-            version = match.group(1)
-            assert match, f"Cannot get the version of NVCC compiler {path}"
-            assert (
-                version >= least_version_required
-            ), f"NVCC {path} version {version} is lower than {least_version_required}"
-            return path, version
-    raise RuntimeError("Cannot find any available NVCC compiler")

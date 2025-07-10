@@ -27,6 +27,7 @@ from flashinfer.gemm import (
     group_deepgemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
 )
+from flashinfer.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 
 
 def gemm_fp8_nt_blockscaled_ref(
@@ -285,8 +286,6 @@ def test_fp8_groupwise_group_deepgemm(
     group_size,
     out_dtype,
 ):
-    from deep_gemm.utils.math import per_block_cast_to_fp8, per_token_cast_to_fp8
-
     torch.random.manual_seed(0)
     m = m_per_group * group_size
     a = torch.rand((m, k), device="cuda", dtype=torch.float32)

@@ -1,11 +1,8 @@
-import os
-import subprocess
 import torch
 import cuda.bindings.driver as cbd
-from torch.utils.cpp_extension import CUDA_HOME
 from typing import Any, Dict, Tuple
 
-from .utils import ceil_div, get_tma_aligned_size, GemmType, MajorTypeAB, MajorTypeCD
+from .utils import ceil_div, get_tma_aligned_size, MajorTypeAB, MajorTypeCD
 from ..cuda_utils import checkCudaErrors
 
 
