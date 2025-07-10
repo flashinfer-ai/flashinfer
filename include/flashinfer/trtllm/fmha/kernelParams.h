@@ -719,9 +719,10 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     // todo(Yingyi): might take an output scale later
     // params.mOutputScale = options.mOutputScale;
-    params.mOutputScale = 1.f;
+    params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 =
-        (1.f / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
+        (options.scaleSoftmaxLog2 / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) *
+        M_LOG2E;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = nullptr;

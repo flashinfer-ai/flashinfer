@@ -1788,8 +1788,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: int,
     scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
-    bmm1_scale: Optional[torch.Tensor] = None,
-    bmm2_scale: Optional[torch.Tensor] = None,
+    bmm1_scale: float = 1.0,
+    bmm2_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -1815,16 +1815,18 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
 
     if out is None:
-        out = torch.empty_like(query)
+        out_shape = query.shape
+        out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
 
-    if kv_cache.dtype == torch.float8_e4m3fn and (
-        bmm1_scale is None or bmm2_scale is None
-    ):
-        raise ValueError(
-            "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
-        )
+    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
+    # if kv_cache.dtype == torch.float8_e4m3fn and (
+    #     bmm1_scale is None or bmm2_scale is None
+    # ):
+    #     raise ValueError(
+    #         "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
+    #     )
 
     run_func(
         out,

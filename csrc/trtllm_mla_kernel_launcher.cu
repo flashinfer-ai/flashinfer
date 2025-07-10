@@ -34,8 +34,8 @@ void trtllm_paged_attention_mla_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
-    std::optional<at::Tensor> bmm1_scale, std::optional<at::Tensor> bmm2_scale,
-    std::optional<int64_t> acc_q_len, std::optional<int64_t> max_attention_window_size,
+    double bmm1_scale, double bmm2_scale, std::optional<int64_t> acc_q_len,
+    std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
@@ -130,10 +130,6 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mScaleQ = scale * sqrt((float)(qk_nope_head_dim + qk_rope_head_dim)) /
                           sqrtf((float)(kv_lora_rank + qk_rope_head_dim));
 
-  // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds
-  // access.
-  // todo(Yingyi): check the memory pool size, bounded current kv cache pool passed by params
-  // kv_cache
   // runner_params.mNumPagesInMemPool = INT_MAX;
   auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
   int max_head_dim_kv = head_size;
@@ -147,8 +143,17 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mSfStartTokenIdx = 0;
 
   if (CACHE_T == Data_type::DATA_TYPE_E4M3) {
-    runner_params.outputScalePtr = reinterpret_cast<float const*>(bmm2_scale->data_ptr());
-    runner_params.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(bmm1_scale->data_ptr());
+    // NOTE(Yingyi): bmm1_scale and bmm2_scale are 1.0 could work already
+    runner_params.outputScale = bmm2_scale;
+    runner_params.scaleSoftmaxLog2 = bmm1_scale;
+
+    // NOTE(Yingyi): if loadsScalesFromGmem enabled, the scales will be loaded from gmem
+    // runner_params.outputScalePtr = bmm2_scale_tensor.has_value()
+    //                                    ? bmm2_scale_tensor.value().data_ptr<float>()
+    //                                    : nullptr;
+    // runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_tensor.has_value()
+    //                                         ? bmm1_scale_tensor.value().data_ptr<float>()
+    //                                         : nullptr;
   }
 
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
@@ -181,8 +186,7 @@ void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& 
                                 at::Tensor& workspace_buffer, double scale,
                                 at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
                                 int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank,
-                                int64_t qk_rope_head_dim, std::optional<at::Tensor> bmm1_scale,
-                                std::optional<at::Tensor> bmm2_scale,
+                                int64_t qk_rope_head_dim, double bmm1_scale, double bmm2_scale,
                                 std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
