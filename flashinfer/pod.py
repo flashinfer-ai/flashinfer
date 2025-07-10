@@ -515,7 +515,6 @@ class PODWithPagedKVCacheWrapper:
         window_left_p: int = -1,
         rope_scale_p: Optional[float] = None,
         rope_theta_p: Optional[float] = None,
-        return_lse_p: bool = False,
         # Decode options
         custom_mask_d: Optional[torch.Tensor] = None,
         packed_custom_mask_d: Optional[torch.Tensor] = None,
@@ -528,7 +527,7 @@ class PODWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-        return_lse_d: bool = False,
+        return_lse: bool = False,
         use_fp16_qk_reduction: bool = False,
         enable_pdl: Optional[bool] = None,
         *args,
@@ -564,10 +563,12 @@ class PODWithPagedKVCacheWrapper:
             else:
                 mask_mode_p = MaskMode.NON_CAUSAL.value
 
-        lse_p = None
-        if return_lse_p:
-            lse_p = torch.empty(
-                (q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device
+        lse = None
+        if return_lse:
+            lse = torch.empty(
+                (q_p.size(0) + q_d.size(0), q_p.size(1)),
+                dtype=torch.float32,
+                device=q_p.device,
             )
         qo_len_p, num_qo_heads, head_dim = q_p.shape
         qo_len_d, _, _ = q_d.shape
@@ -607,12 +608,6 @@ class PODWithPagedKVCacheWrapper:
         if rope_theta_d is None:
             rope_theta_d = 1e4
 
-        lse_d = None
-        if return_lse_d:
-            lse_d = torch.empty(
-                (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
-            )
-
         module_getter = get_pod_module(
             # Prefill params
             q_p.dtype,
@@ -644,12 +639,12 @@ class PODWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             out,
+            lse,
             TensorLayout[self._kv_layout].value,
             # Prefill params
             q_p,
             k_p,
             v_p,
-            lse_p,
             mask_mode_p,
             window_left_p,
             packed_custom_mask_p,
@@ -662,7 +657,6 @@ class PODWithPagedKVCacheWrapper:
             q_d,
             k_cache_d,
             v_cache_d,
-            lse_d,
             MaskMode.NON_CAUSAL.value,
             window_left_d,
             None,  # packed_custom_mask

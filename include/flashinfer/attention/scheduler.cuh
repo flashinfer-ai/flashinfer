@@ -1046,11 +1046,11 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   plan_info.padded_batch_size_p = padded_batch_size_p;
   plan_info.padded_batch_size_d = padded_batch_size_d;
+  plan_info.total_num_rows_p = total_num_rows_p;
+  plan_info.total_num_rows_d = total_num_rows_d;
   plan_info.total_num_rows = total_num_rows;
   plan_info.cta_tile_q_p = cta_tile_q_p;
   plan_info.cta_tile_q_d = cta_tile_q_d;
-  plan_info.total_num_rows_p = total_num_rows_p;
-  plan_info.total_num_rows_d = total_num_rows_d;
   plan_info.enable_cuda_graph = enable_cuda_graph;
   plan_info.split_kv = split_kv;
 
@@ -1097,11 +1097,11 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   if (split_kv) {
     // TODO(Wenxuan): write through for non-split-kv requests
-    uint32_t num_outputs_p = num_qo_heads * padded_batch_size_p * cta_tile_q_p * head_dim_vo;
-    uint32_t num_outputs_d = num_qo_heads * padded_batch_size_d * cta_tile_q_d * head_dim_vo;
+    uint32_t num_outputs_p = num_qo_heads * padded_batch_size_p * cta_tile_q_p;
+    uint32_t num_outputs_d = num_qo_heads * padded_batch_size_d * cta_tile_q_d;
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        (num_outputs_p + num_outputs_d) * sizeof(float), 16, "pod_tmp_v");
+        (num_outputs_p + num_outputs_d) * head_dim_vo * sizeof(float), 16, "pod_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         (num_outputs_p + num_outputs_d) * sizeof(float), 16, "pod_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(

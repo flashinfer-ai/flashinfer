@@ -173,9 +173,7 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODI
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_P,
           uint32_t CTA_TILE_Q_D, MaskMode MASK_MODE_D, typename PrefillAttentionVariant,
           typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp_p,
-                                           DecodeParams decode_params,
+cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeParams decode_params,
                                            typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
                                            bool enable_pdl, cudaStream_t stream) {
   static_assert(std::is_same<typename PrefillParams::DTypeQ, typename DecodeParams::DTypeQ>::value);
@@ -349,8 +347,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             // Setup new prefill params if (not) split
             auto o_p = prefill_params.o;
             auto lse_p = prefill_params.lse;
-            float* tmp_lse = (float*)(tmp_p + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
-            if (num_chunks <= 1 || tmp_p == nullptr) {
+            if (num_chunks <= 1 || tmp_v == nullptr) {
               // Enough parallelism, do not split-kv
               prefill_params.partition_kv = 0;
               kernel = PODWithKVCacheTensorKernel<KTraits_P, KTraits_D, false, PrefillParams,
@@ -358,8 +355,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             } else {
               // Use cooperative groups to increase occupancy
               prefill_params.partition_kv = num_chunks;
-              prefill_params.o = tmp_p;
-              prefill_params.lse = tmp_lse;
+              prefill_params.o = tmp_v;
+              prefill_params.lse = tmp_s;
               kernel = PODWithKVCacheTensorKernel<KTraits_P, KTraits_D, true, PrefillParams,
                                                   DecodeParams>;
             }
