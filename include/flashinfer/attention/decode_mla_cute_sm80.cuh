@@ -368,7 +368,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
   }
 
   // start rolling update
-  float row_max = -flashinfer::math::inf;
+  float row_max = flashinfer::math::neg_inf<float>();
   float row_denom = 1.0;
   for (uint32_t iter = 0; iter < ceil_div(cur_chunk_len, k_kv_tile_len); ++iter) {
     if (tx < k_warp_rows * 32) {
@@ -412,7 +412,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
       float row_max_prev = row_max;
 #pragma unroll
       for (int i = 0; i < k_kv_tile_len; ++i) {
-        if (i >= valid_kv_len) smem_att(tx, i) = -flashinfer::math::inf;
+        if (i >= valid_kv_len) smem_att(tx, i) = flashinfer::math::neg_inf<float>();
         row_max = max(row_max, smem_att(tx, i));
       }
 
