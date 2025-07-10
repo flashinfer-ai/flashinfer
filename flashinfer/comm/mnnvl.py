@@ -763,19 +763,20 @@ class McastDeviceMemory:
         """Get buffer pointers device as int64 (returning first UC pointer for now) (legacy compatibility)"""
         return self.uc_ptrs[0] if self.uc_ptrs else 0
 
-    def get_uc_buffer(
-        self, rank: int, shape: tuple, dtype: torch.dtype, offset: int = 0
-    ) -> torch.Tensor:
-        """Get UC buffer as torch tensor for a specific rank (helper method)"""
-        if rank >= len(self.uc_ptrs):
-            raise ValueError(f"Rank {rank} out of range (0-{len(self.uc_ptrs)-1})")
+    def lamport_initialize(self, rank: int):
+        bf16_neg_zero = 0x8000
 
-        ptr = self.uc_ptrs[rank] + offset
-        numel = 1
-        for dim in shape:
-            numel *= dim
+        # Calculate number of bf16 elements that fit in allocation_size
+        bf16_size = 2  # bf16 is 2 bytes
+        num_elements = self.allocation_size // bf16_size
 
-        raise NotImplementedError("Not implemented yet")
+        # Use cuMemsetD16 to directly set 16-bit values on GPU memory
+        # This is much more efficient than creating a host buffer and copying
+        checkCudaErrors(
+            cuda.cuMemsetD16(
+                int(self.uc_ptrs[self.group_rank]), bf16_neg_zero, num_elements
+            )
+        )
 
 
 class McastGPUBuffer:
@@ -810,40 +811,8 @@ class McastGPUBuffer:
         self.buf_size = buf_size
         self.local_device = device
 
-    def get_uc_buffer(
-        self, rank: int, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0
-    ) -> torch.Tensor:
-        # Calculate number of elements
-        numel = 1
-        for size in sizes:
-            numel *= size
-
-        # Get element size in bytes
-        element_size = torch.tensor([], dtype=dtype).element_size()
-
-        # Calculate required buffer size
-        reqSize = (numel + storage_offset) * element_size
-
-        # Buffer size check
-        if reqSize > self.buf_size:
-            raise RuntimeError(
-                f"Requested size ({reqSize} bytes) exceeds allocated buffer ({self.buf_size} bytes)"
-            )
-
-        # Get base pointer and adjust for offset
-        base_ptr = self.mcast_device_memory.get_unicast_ptr(rank)
-        data_ptr = base_ptr + storage_offset * element_size
-
-        # Test CUDA memory access
-        if MNNVL_DEBUG and not test_cuda_memory_access(
-            data_ptr, reqSize, self.local_device.index
-        ):
-            raise RuntimeError("CUDA memory access test failed")
-
-        # Create tensor from CUDA memory using DLPack
-        return create_tensor_from_cuda_memory(
-            data_ptr, sizes, dtype, self.local_device.index
-        )
+    def lamport_initialize(self, rank: int):
+        self.mcast_device_memory.lamport_initialize(rank)
 
     def get_mc_buffer(
         self, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0

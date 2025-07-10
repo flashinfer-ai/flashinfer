@@ -25,7 +25,7 @@ using namespace flashinfer::trtllm_mnnvl_allreduce;
   }()
 
 void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_buffer_ptr,
-                             int64_t buffer_ptrs_dev, at::Tensor& buffer_mnnvl,
+                             int64_t buffer_ptrs_dev, int64_t buffer_M,
                              at::Tensor& buffer_flags_mnnvl, int64_t nranks, int64_t rank,
                              bool wait_for_results, bool launch_with_pdl) {
   const c10::cuda::OptionalCUDAGuard device_guard(in.device());
@@ -44,7 +44,7 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
     AllReduceParams<c_type> params;
     params.nranks = nranks;
     params.rank = rank;
-    params.buffer_M = buffer_mnnvl.size(2);
+    params.buffer_M = buffer_M;
     params.num_tokens = num_tokens;
     params.token_dim = token_dim;
     params.buffer_ptrs_dev = reinterpret_cast<void**>(buffer_ptrs_dev);

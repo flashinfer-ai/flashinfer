@@ -108,11 +108,9 @@ def get_allreduce_mnnvl_workspace(
         mapping.is_multi_node() or force_mn,
     )
 
-    buffer = mcast_buffer.get_uc_buffer(
-        mapping.tp_rank, (3, 2, max_num_elements), dtype, 0
-    )
-    # Only initialize the buffer when we need to resize it
-    buffer.fill_(-0.0)
+    # Initialize the unicast buffer with -0.0
+    mcast_buffer.lamport_initialize(mapping.tp_rank)
+
     # CPU barrier since we assume this should not be called in cuda graph
     torch.cuda.synchronize()
     mpi_barrier()
@@ -128,7 +126,6 @@ def get_allreduce_mnnvl_workspace(
 
     return (
         mcast_buffer,
-        buffer,
         buffer_flags,
         max_num_elements,
     )
@@ -139,7 +136,7 @@ def trtllm_mnnvl_all_reduce(
     out: torch.Tensor,
     multicast_buffer_ptr: int,  # Pointer address as integer
     buffer_ptrs_dev: int,  # Pointer address as integer
-    buffer_mnnvl: torch.Tensor,
+    buffer_M: int,
     buffer_flags_mnnvl: torch.Tensor,
     nranks: int,
     rank: int,
@@ -153,7 +150,7 @@ def trtllm_mnnvl_all_reduce(
         out,
         multicast_buffer_ptr,
         buffer_ptrs_dev,
-        buffer_mnnvl,
+        buffer_M,
         buffer_flags_mnnvl,
         nranks,
         rank,

@@ -3,6 +3,7 @@ import os
 import sys
 import traceback
 
+import pytest
 import torch
 from mpi4py import MPI  # Added MPI import
 
@@ -31,7 +32,6 @@ def row_linear_residual_norm_fusion_forward(
     reference_output = tuple(t.cuda() for t in reference_output)
 
     MPI.COMM_WORLD.barrier()
-    os.environ["TRTLLM_MNNVL_AR_ENABLED"] = "1"
 
     mapping = Mapping(
         world_size=tensor_parallel_size,
@@ -39,19 +39,27 @@ def row_linear_residual_norm_fusion_forward(
         rank=tensor_parallel_rank,
     )
 
-    def func(input, residual, norm_weight, eps, enable_fusion, buffer_mnnvl):
+    def func(
+        input,
+        residual,
+        norm_weight,
+        eps,
+        enable_fusion,
+        multicast_ptr,
+        buffer_ptrs_dev,
+        max_num_elements_mnnvl,
+    ):
         # For both fused and unfused cases:
-
-        multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr_as_int64()
-        buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev_as_ctypes_ptr()
-
         shape = input.shape
 
-        assert buffer_mnnvl.shape[-1] % shape[-1] == 0
+        hidden_size = shape[-1]
+
+        assert max_num_elements_mnnvl % hidden_size == 0
 
         input = input.view(-1, shape[-1])
         output = torch.empty_like(input)
-        buffer_mnnvl = buffer_mnnvl.view(3, 2, -1, shape[-1])
+
+        buffer_M = max_num_elements_mnnvl // hidden_size
 
         if enable_fusion:
             raise NotImplementedError("Fusion not implemented")
@@ -62,7 +70,7 @@ def row_linear_residual_norm_fusion_forward(
                 output,
                 multicast_ptr,
                 buffer_ptrs_dev,  # Attempted to use this raw pointer
-                buffer_mnnvl,
+                buffer_M,
                 buffer_flags_mnnvl,
                 tensor_parallel_size,
                 tensor_parallel_rank,
@@ -72,13 +80,23 @@ def row_linear_residual_norm_fusion_forward(
             return (output.view(shape),)
 
     # Get workspace buffers using MPI rank
-    mcast_buffer_mnnvl, buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+    mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
         comm.get_allreduce_mnnvl_workspace(mapping, dtype)
     )
 
+    multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr_as_int64()
+    buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev_as_ctypes_ptr()
+
     try:
         output = func(
-            x.clone(), residual.clone(), norm_weight, eps, fusion, buffer_mnnvl
+            x.clone(),
+            residual.clone(),
+            norm_weight,
+            eps,
+            fusion,
+            multicast_ptr,
+            buffer_ptrs_dev,
+            max_num_elements_mnnvl,
         )
 
         assert output[0].shape == reference_output[0].shape
@@ -117,8 +135,13 @@ def row_linear_residual_norm_fusion_forward(
         del mcast_buffer_mnnvl
 
 
-def test_mnnvl_allreduce_full(seq_len: int, fusion: bool):
-    """Main test function that runs on each MPI rank"""
+"""Main test function that runs on each MPI rank"""
+
+
+@pytest.mark.parametrize("seq_len", [4])
+@pytest.mark.parametrize("fusion", [False])
+def test_mnnvl_allreduce_full(monkeypatch, seq_len: int, fusion: bool):
+    monkeypatch.setenv("TRTLLM_FORCE_MNNVL_AR", "1")  # force multi-node allreduce.
 
     # Get MPI info
     rank = MPI.COMM_WORLD.Get_rank()
@@ -197,7 +220,6 @@ def test_mnnvl_allreduce_full(seq_len: int, fusion: bool):
 
 
 if __name__ == "__main__":
-    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"  # force multi-node allreduce.
     # Test parameters
     # seq_lens = [1, 4, 32, 128]
     fusion_modes = [False]  # Only non-fused case for now
