@@ -23,9 +23,9 @@
 
 namespace flashinfer {
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q,
-          MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
-          typename PrefillParams, typename DecodeParams>
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_P,
+          uint32_t CTA_TILE_Q_D, MaskMode MASK_MODE_D, typename PrefillAttentionVariant,
+          typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
 cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                            typename PrefillParams::DTypeO* tmp,
                                            DecodeParams decode_params,
