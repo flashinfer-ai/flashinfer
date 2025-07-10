@@ -11,7 +11,12 @@
 #if defined(PLATFORM_CUDA_DEVICE)
 #include <cuda_runtime.h>
 #elif defined(PLATFORM_HIP_DEVICE)
+#include <hip/hip_bf16.h>
+#include <hip/hip_cooperative_groups.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #endif
 
 // Basic type mappings
@@ -34,6 +39,18 @@
 #define gpuLaunchKernel hipLaunchKernel
 #define gpuFuncSetAttribute hipFuncSetAttribute
 #define gpuDeviceGetAttribute hipDeviceGetAttribute
+#endif
+
+#if defined(PLATFORM_CUDA_DEVICE)
+#define gpuMemCpy cudaMemcpy
+#define gpuMemCpyAsync cudaMemcpyAsync
+#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#elif defined(PLATFORM_HIP_DEVICE)
+#define gpuMemCpy hipMemcpy
+#define gpuMemCpyAsync hipMemcpyAsync
+#define gpuMemcpyHostToDevice hipMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
 #endif
 
 // Function attribute enums (these have different names)
@@ -60,6 +77,8 @@
 #define gpuDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define gpuDevAttrMaxSharedMemoryPerMultiProcessor                             \
     hipDeviceAttributeMaxSharedMemPerMultiprocessor
+#define gpuOccupancyMaxActiveBlocksPerMultiprocessor                           \
+    hipOccupancyMaxActiveBlocksPerMultiprocessor
 #endif
 
 // Error handling (for FI_GPU_CALL)

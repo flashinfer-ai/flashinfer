@@ -7,9 +7,9 @@
 
 // Include platform-specific implementations
 #if defined(PLATFORM_CUDA_DEVICE)
-#include "backend/cuda/memory_ops.cuh"
+#include "backend/cuda/memory_ops_cuda.cuh"
 #elif defined(PLATFORM_HIP_DEVICE)
-#include "backend/hip/memory_ops.hip.h"
+#include "backend/hip/memory_ops_hip.hip.h"
 #endif
 
 namespace flashinfer
