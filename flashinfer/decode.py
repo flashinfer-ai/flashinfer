@@ -1740,12 +1740,18 @@ def trtllm_batch_decode_with_kv_cache(
 
 
 def _check_trtllm_gen_mla_shape(
-    query, kv_cache, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, page_table
+    query,
+    kv_cache,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    page_table,
+    page_size,
 ):
     if query.ndim != 3:
         raise ValueError(f"Expected query.ndim == 3, got {query.ndim}")
-    if kv_cache.ndim != 3:
-        raise ValueError(f"Expected kv_cache.ndim == 3, got {kv_cache.ndim}")
+    if kv_cache.ndim != 4:
+        raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
     if qk_nope_head_dim != 128:
         raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
     if kv_lora_rank != 512:
@@ -1754,7 +1760,7 @@ def _check_trtllm_gen_mla_shape(
         raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
 
     B_q, H, D_q = query.shape
-    D_ckv = kv_cache.shape[2]
+    D_ckv = kv_cache.shape[3]
     # if H != 128:
     #     raise ValueError(f"Expected 128 heads for query, got {H}")
     # todo(Yingyi): should we check num_heads == 128? Is this deepseek only?
@@ -1764,7 +1770,7 @@ def _check_trtllm_gen_mla_shape(
         )
 
     B_block_table, block_num = page_table.shape
-    block_size = kv_cache.shape[1]
+    block_size = page_size
     if B_q != B_block_table:
         raise ValueError(
             f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
@@ -1811,7 +1817,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
     _check_trtllm_gen_mla_shape(
-        query, kv_cache, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, block_tables
+        query,
+        kv_cache,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        block_size,
     )
 
     if out is None:
