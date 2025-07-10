@@ -258,15 +258,8 @@ def test_trtllm_batch_decode_mla(
     torch.manual_seed(42)
     device = "cuda:0"
 
-    free_memory, total_memory = torch.cuda.mem_get_info()
-    # Convert bytes to GB for readability
-    free_memory_gb = free_memory / (1024**3)
-    total_memory_gb = total_memory / (1024**3)
-    print(f"Total GPU Memory: {total_memory_gb:.2f} GB")
-    print(f"Free GPU Memory: {free_memory_gb:.2f} GB")
-
     # Fixed max sequence length
-    MAX_SEQ_LEN = 256
+    MAX_SEQ_LEN = 1024
 
     # Deepseek attention config (decode-MLA)
     num_q_heads = 128
@@ -303,8 +296,8 @@ def test_trtllm_batch_decode_mla(
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
-    blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
-    max_num_blocks_per_seq = max(blocks_per_seq)
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    max_num_blocks_per_seq = blocks_per_seq.max().item()
 
     # Generate random but unique block IDs for all sequences
     total_blocks_needed = sum(blocks_per_seq)
@@ -353,62 +346,68 @@ def test_trtllm_batch_decode_mla(
     )
 
     # Run reference attention and align output
-    # wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-    #     workspace_buffer, backend="fa2"
-    # )
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
+    workspace_buffer_ref = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace_buffer_ref,
+        backend="fa2",
+        use_cuda_graph=True,
+        qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
+        kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
+    )
 
-    # q_indptr = torch.arange(0, batch_size + 1, device=device).int()
-    # kv_indptr = torch.cat(
-    #     [
-    #         torch.tensor([0], device=device, dtype=torch.int),
-    #         torch.cumsum(
-    #             torch.tensor(blocks_per_seq, device=device, dtype=torch.int), dim=0
-    #         ),
-    #     ]
-    # )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * 1
+    )
+    kv_indptr = (
+        torch.cat(
+            [torch.tensor([0], device=device), torch.cumsum(blocks_per_seq, dim=0)]
+        )
+        .int()
+        .to(device)
+    )
+    kv_indices = all_block_ids.int()
 
-    # q_nope = query[:, :, :kv_lora_rank]
-    # q_pe = query[:, :, kv_lora_rank:]
-    # ckv_cache = kv_cache[:, :, :kv_lora_rank]
-    # kpe_cache = kv_cache[:, :, kv_lora_rank:]
-    # # for paged kv cache, the layout is [num_pages, page_size, head_dim]
-    # ckv_cache = ckv_cache.view(-1, page_size, kv_lora_rank)
-    # kpe_cache = kpe_cache.view(-1, page_size, qk_rope_head_dim)
-    # wrapper.plan(
-    #     q_indptr,
-    #     kv_indptr,
-    #     all_block_ids.int(),
-    #     seq_lens_tensor,
-    #     num_q_heads,
-    #     kv_lora_rank,
-    #     qk_rope_head_dim,
-    #     page_size,
-    #     False,  # causal
-    #     scale,
-    #     q_nope.dtype,
-    #     ckv_cache.dtype,
-    # )
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        seq_lens_tensor,
+        num_q_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        True,
+        sm_scale,
+        query.dtype,
+        kv_cache.dtype,
+    )
+    q_nope = query[:, :kv_lora_rank]
+    q_pe = query[:, kv_lora_rank:]
+    ckv = kv_cache[:num_blocks, :, :kv_lora_rank]
+    kpe = kv_cache[:num_blocks, :, kv_lora_rank:]
+    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    # output_ref = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False)
-
-    # torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=5e-2)
     torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
     # run all tests in the order of pytest
-    # test_trtllm_batch_decode_mla(256, 1.0, torch.bfloat16, 32)
+    test_trtllm_batch_decode_mla(256, 1.0, torch.bfloat16, 32)
 
     # Rewrite the pytest in the same test order here in a nested for loop
-    for page_size in [16, 32, 64]:
-        for dtype in [torch.float8_e4m3fn, torch.bfloat16]:
-            for scale in [0.5, 1.0]:
-                for batch_size in [4, 32, 64, 128, 256]:
-                    print(
-                        f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} started"
-                    )
-                    test_trtllm_batch_decode_mla(batch_size, scale, dtype, page_size)
-                    print(
-                        f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} passed"
-                    )
-                    torch.cuda.synchronize()
+    # for page_size in [16, 32, 64]:
+    #     for dtype in [torch.float8_e4m3fn, torch.bfloat16]:
+    #         for scale in [0.5, 1.0]:
+    #             for batch_size in [4, 32, 64, 128, 256]:
+    #                 print(
+    #                     f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} started"
+    #                 )
+    #                 test_trtllm_batch_decode_mla(batch_size, scale, dtype, page_size)
+    #                 print(
+    #                     f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} passed"
+    #                 )
+    #                 torch.cuda.synchronize()
