@@ -19,8 +19,8 @@
 #include "BatchedGemmEnums.h"
 #include "Enums.h"
 #include "TmaDescriptor.h"
-#include "trtllm/gen/SfLayoutDecl.h"
 #include "flashinfer/utils.cuh"
+#include "trtllm/gen/SfLayoutDecl.h"
 namespace batchedGemm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -623,7 +623,8 @@ struct KernelParams {
         }
 
         auto tileShapes = std::vector<uint32_t>{
-            256, 2, static_cast<uint32_t>(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4)),
+            256, 2,
+            static_cast<uint32_t>(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4)),
             static_cast<uint32_t>(flashinfer::ceil_div(numTokensPerTile, 128))};
 
         return std::make_tuple(shape, stride, tileShapes);
@@ -658,7 +659,8 @@ struct KernelParams {
         // Detect if the input hidden size K is a multiple of the repeats.
         if (flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4) % repeats != 0) {
           throw std::runtime_error(
-              "SF hiddenSize K (" + std::to_string(flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4)) +
+              "SF hiddenSize K (" +
+              std::to_string(flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4)) +
               ") must be a multiple of repeats (" + std::to_string(repeats) + ")");
         }
 
@@ -673,10 +675,11 @@ struct KernelParams {
           stride[i] = shape[i - 1] * stride[i - 1];
         }
 
-        auto tileShapes = std::vector<uint32_t>{
-            static_cast<uint32_t>(repeats * 32),
-            static_cast<uint32_t>(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4 * repeats)),
-            static_cast<uint32_t>(flashinfer::ceil_div(numTokensPerTile, 8))};
+        auto tileShapes =
+            std::vector<uint32_t>{static_cast<uint32_t>(repeats * 32),
+                                  static_cast<uint32_t>(flashinfer::ceil_div(
+                                      hiddenSizePerTile, numEltsPerSf * 4 * repeats)),
+                                  static_cast<uint32_t>(flashinfer::ceil_div(numTokensPerTile, 8))};
 
         return std::make_tuple(shape, stride, tileShapes);
       }

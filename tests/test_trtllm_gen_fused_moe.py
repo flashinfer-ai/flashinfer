@@ -5,10 +5,12 @@ from enum import IntEnum
 import pytest
 import torch
 from torch.nn import functional as F
+
 import flashinfer.fused_moe as fused_moe
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
+
 
 def is_16byte_aligned(tensor):
     return (tensor.data_ptr() % 16) == 0
@@ -353,21 +355,21 @@ def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     scale = scale.to(torch.float)
     if transpose_scale:
         scale = scale.t()
-    
+
     m, n = input.shape
     m_tile = 128 if block_m else 1
     n_tile = 128 if block_n else 1
-    
+
     assert m % m_tile == 0
     assert n % n_tile == 0
     assert scale.shape == (m // m_tile, n // n_tile)
-    
+
     # Expand scale to match input dimensions using tensor operations
     if m_tile > 1:
         scale = torch.repeat_interleave(scale, m_tile, dim=0)
     if n_tile > 1:
         scale = torch.repeat_interleave(scale, n_tile, dim=1)
-    
+
     # Element-wise multiplication (equivalent to the nested loop logic)
     output = input * scale
     return output
