@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import CUDA_HOME
 from typing import Any, Dict, Tuple
 
 from .utils import ceil_div, get_tma_aligned_size, GemmType, MajorTypeAB, MajorTypeCD
+from ..cuda_utils import checkCudaErrors
 
 
 tmap_type_map: Dict[Any, str] = {
@@ -47,22 +48,21 @@ def make_tma_xd_desc(
     assert len(smem_dims) == num_dims
 
     tensor_dtype = tmap_type_map[t.dtype]
-    res, tensor_map = cbd.cuTensorMapEncodeTiled(
-        tensor_dtype,
-        num_dims,
-        t.data_ptr(),
-        gmem_dims,
-        gmem_strides,
-        smem_dims,
-        (cbd.cuuint32_t(1),) * num_dims,
-        cbd.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        swizzle_type,
-        cbd.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        cbd.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    tensor_map = checkCudaErrors(
+        cbd.cuTensorMapEncodeTiled(
+            tensor_dtype,
+            num_dims,
+            t.data_ptr(),
+            gmem_dims,
+            gmem_strides,
+            smem_dims,
+            (cbd.cuuint32_t(1),) * num_dims,
+            cbd.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            swizzle_type,
+            cbd.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            cbd.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
     )
-
-    if res != cbd.CUresult.CUDA_SUCCESS:
-        raise Exception(f"Failed to encode tensor map: {res}")
     return tensor_map
 
 
@@ -229,10 +229,9 @@ class Runtime:
 
             # Load CUBIN
             path = bytes(os.path.join(self.path, "kernel.cubin"), "utf-8")
-            result, self.lib = cbd.cuLibraryLoadFromFile(path, [], [], 0, [], [], 0)
-            assert (
-                result == cbd.CUresult.CUDA_SUCCESS
-            ), f"Failed to load library: {result}"
+            self.lib = checkCudaErrors(
+                cbd.cuLibraryLoadFromFile(path, [], [], 0, [], [], 0)
+            )
 
             # Extract the kernel name
             # TODO: use `cuda-bindings` API to do this (requires at least 12.8)
@@ -258,18 +257,15 @@ class Runtime:
             ), f"Too many kernels in the library: {kernel_names}"
 
             # Load kernel from the library
-            result, self.kernel = cbd.cuLibraryGetKernel(
-                self.lib, bytes(kernel_names[0], encoding="utf-8")
+            self.kernel = checkCudaErrors(
+                cbd.cuLibraryGetKernel(
+                    self.lib, bytes(kernel_names[0], encoding="utf-8")
+                )
             )
-            assert (
-                result == cbd.CUresult.CUDA_SUCCESS
-            ), f"Failed to load kernel: {result}"
 
         # noinspection PyArgumentList
         return self.launch(self.kernel, kwargs)
 
     def __del__(self) -> None:
         if self.lib is not None:
-            res = cbd.cuLibraryUnload(self.lib)[0]
-            if res != cbd.CUresult.CUDA_SUCCESS:
-                raise Exception(f"Failed to unload library {self.path}: {res}")
+            checkCudaErrors(cbd.cuLibraryUnload(self.lib))

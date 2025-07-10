@@ -46,7 +46,7 @@ from .utils import (
     hash_to_hex,
     get_best_configs,
 )
-
+from ..cuda_utils import checkCudaErrors
 
 runtime_cache = {}
 
@@ -58,7 +58,7 @@ def load(name: str, code: str, runtime_cls: Type[Runtime]) -> Runtime:
     if cubin_name in runtime_cache:
         return runtime_cache[cubin_name]
     path = os.path.join(
-        "/home/devuser/.deep_gemm/cache/", cubin_name
+        "/home/devuser/.deep_gemm/output/", cubin_name
     )  # TODO: change dir to flashinfer cache dir
     if os.path.exists(path) and Runtime.is_path_valid(path):
         runtime_cache[cubin_name] = runtime_cls(path)
@@ -118,15 +118,14 @@ static void __instantiate_kernel() {{
     # noinspection PyMethodOverriding
     @staticmethod
     def launch(kernel: cbd.CUkernel, kwargs: Dict[str, Any]) -> cbd.CUresult:
-        result = cbd.cuKernelSetAttribute(
-            cbd.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            kwargs["SMEM_SIZE"],
-            kernel,
-            cbd.CUdevice(kwargs["DEVICE_INDEX"]),
-        )[0]
-        assert (
-            result == cbd.CUresult.CUDA_SUCCESS
-        ), f"Failed to set max dynamic shared memory size: {result}"
+        checkCudaErrors(
+            cbd.cuKernelSetAttribute(
+                cbd.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                kwargs["SMEM_SIZE"],
+                kernel,
+                cbd.CUdevice(kwargs["DEVICE_INDEX"]),
+            )
+        )
 
         attr_val = cbd.CUlaunchAttributeValue()
         attr_val.clusterDim.x = kwargs["NUM_MULTICAST"]
