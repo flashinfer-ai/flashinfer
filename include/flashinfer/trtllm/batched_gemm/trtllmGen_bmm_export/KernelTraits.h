@@ -19,8 +19,8 @@
 #include <cassert>
 
 #include "Enums.h"
-#include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/DtypeDecl.h"
+#include "flashinfer/utils.cuh"
 
 namespace batchedGemm {
 
@@ -445,8 +445,8 @@ class KernelTraits {
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA =
             useConstSfA
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileM, 64), 4)
-                : (useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0);
+              ? flashinfer::round_up((tileK / 64) * 2 * flashinfer::ceil_div(tileM, 64), 4)
+              : (useBlockScalingA ? ((tileK / 64) * 2 * flashinfer::ceil_div(tileM, 64)) * numStages : 0);
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfA = 4;
         // No need to reuse TMEM.
@@ -468,8 +468,8 @@ class KernelTraits {
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB =
             useConstSfB
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileN, 64), 4)
-                : (useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0);
+              ? flashinfer::round_up((tileK / 64) * 2 * flashinfer::ceil_div(tileN, 64), 4)
+              : (useBlockScalingB ? ((tileK / 64) * 2 * flashinfer::ceil_div(tileN, 64)) * numStages : 0);
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfB = 4;
         // No need to reuse TMEM.

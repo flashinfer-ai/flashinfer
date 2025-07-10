@@ -19,17 +19,11 @@
 #include "BatchedGemmEnums.h"
 #include "Enums.h"
 #include "TmaDescriptor.h"
-#include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/SfLayoutDecl.h"
+#include "flashinfer/utils.cuh"
 namespace batchedGemm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// TODO: Find a better header to put this in, that we can include from here.
-template <typename T>
-inline T ceilDiv(T m, T n) {
-  return (m + n - T(1)) / n;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -619,8 +613,8 @@ struct KernelParams {
         // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
 
         auto shape = std::vector<uint64_t>{
-            256, 2, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4)),
-            static_cast<uint64_t>(ceilDiv(numTokens, 128))};
+            256, 2, static_cast<uint64_t>(flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4)),
+            static_cast<uint64_t>(flashinfer::ceil_div(numTokens, 128))};
 
         std::vector<uint64_t> stride(shape.size());
         stride[0] = 1;
@@ -629,8 +623,8 @@ struct KernelParams {
         }
 
         auto tileShapes = std::vector<uint32_t>{
-            256, 2, static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4)),
-            static_cast<uint32_t>(ceilDiv(numTokensPerTile, 128))};
+            256, 2, static_cast<uint32_t>(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4)),
+            static_cast<uint32_t>(flashinfer::ceil_div(numTokensPerTile, 128))};
 
         return std::make_tuple(shape, stride, tileShapes);
       }
@@ -659,19 +653,19 @@ struct KernelParams {
         }
 
         // Sanitize number of repeats so it doesn't exceed the dimension.
-        int const repeats = std::min(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4), r);
+        int const repeats = std::min(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4), r);
 
         // Detect if the input hidden size K is a multiple of the repeats.
-        if (ceilDiv(hiddenSize, numEltsPerSf * 4) % repeats != 0) {
+        if (flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4) % repeats != 0) {
           throw std::runtime_error(
-              "SF hiddenSize K (" + std::to_string(ceilDiv(hiddenSize, numEltsPerSf * 4)) +
+              "SF hiddenSize K (" + std::to_string(flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4)) +
               ") must be a multiple of repeats (" + std::to_string(repeats) + ")");
         }
 
         auto shape = std::vector<uint64_t>{
             static_cast<uint64_t>(repeats * 32),
-            static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4 * repeats)),
-            static_cast<uint64_t>(ceilDiv(numTokens, 8))};
+            static_cast<uint64_t>(flashinfer::ceil_div(hiddenSize, numEltsPerSf * 4 * repeats)),
+            static_cast<uint64_t>(flashinfer::ceil_div(numTokens, 8))};
 
         std::vector<uint64_t> stride(shape.size());
         stride[0] = 1;
@@ -681,8 +675,8 @@ struct KernelParams {
 
         auto tileShapes = std::vector<uint32_t>{
             static_cast<uint32_t>(repeats * 32),
-            static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4 * repeats)),
-            static_cast<uint32_t>(ceilDiv(numTokensPerTile, 8))};
+            static_cast<uint32_t>(flashinfer::ceil_div(hiddenSizePerTile, numEltsPerSf * 4 * repeats)),
+            static_cast<uint32_t>(flashinfer::ceil_div(numTokensPerTile, 8))};
 
         return std::make_tuple(shape, stride, tileShapes);
       }
@@ -841,7 +835,7 @@ struct KernelParams {
           // Pad number of scaling factors to the nearest multiple of 16 because of the TMA 16B
           // alignment requirement.
           auto numSfsInK = options.mK / numEltsPerSf;
-          numSfsInK = ceilDiv(numSfsInK, 16) * 16;
+          numSfsInK = flashinfer::ceil_div(numSfsInK, 16) * 16;
 
           auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideAbc(
               options, options.mM, options.mNumTokens, numSfsInK, options.mTileM, 1 /* tileN */,

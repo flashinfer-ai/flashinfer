@@ -17,7 +17,10 @@
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
 #include <nvrtc.h>
-#include <torch/all.h>
+#include <torch/library.h>         
+#include <ATen/ATen.h>              
+#include <c10/core/ScalarType.h>    
+#include <c10/util/Exception.h>     
 
 #include <algorithm>
 #include <cmath>
