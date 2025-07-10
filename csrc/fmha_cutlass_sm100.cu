@@ -52,6 +52,11 @@
         using c_type_out = c_type_in;                                          \
         return __VA_ARGS__();                                                  \
       });                                                                      \
+    } else {                                                                   \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {    \
+        using c_type_out = nv_bfloat16;                                        \
+        return __VA_ARGS__();                                                  \
+      });                                                                      \
     }                                                                          \
     return false;                                                              \
   }()

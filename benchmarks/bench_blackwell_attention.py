@@ -28,15 +28,27 @@ def bench_fmha_blackwell(
     causal,
     dtype,
 ):
-    q = torch.randn(
-        batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
-    )
-    k = torch.randn(
-        batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
-    )
-    v = torch.randn(
-        batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
-    )
+    # if sizeof(dtype) == 1, create randn from half and then convert to dtype
+    if dtype.itemsize == 1:
+        q = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+        ).to(dtype)
+        k = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+        ).to(dtype)
+        v = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+        ).to(dtype)
+    else:
+        q = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        )
+        k = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        )
+        v = torch.randn(
+            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+        )
 
     qo_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
@@ -79,20 +91,38 @@ def bench_fmha_blackwell(
 
 
 if __name__ == "__main__":
-    bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
+    # bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
 
-    bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
+    # bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
+
+    bench_fmha_blackwell(128, 512, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(64, 1024, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(32, 2048, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(16, 4096, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(8, 8192, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(4, 16384, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(2, 32768, 32, 128, False, torch.float8_e4m3fn)
+    bench_fmha_blackwell(1, 65536, 32, 128, False, torch.float8_e4m3fn)
+
+    bench_fmha_blackwell(128, 512, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(64, 1024, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(32, 2048, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(16, 4096, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(8, 8192, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(4, 16384, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(2, 32768, 32, 128, True, torch.float8_e4m3fn)
+    bench_fmha_blackwell(1, 65536, 32, 128, True, torch.float8_e4m3fn)
