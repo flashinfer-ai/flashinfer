@@ -945,7 +945,7 @@ def pad_indptr_to_multiple_of_4(
 
 
 def gen_gemm_sm100_module() -> SimpleNamespace:
-    from flashinfer.deep_gemm.m_grouped_gemm import load_all
+    from flashinfer.deep_gemm import load_all
 
     load_all()
     return SimpleNamespace(
@@ -969,8 +969,6 @@ def group_deepgemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (m, n)
     out_dtype: Optional[torch.dtype] = None,
 ):
-    # from deep_gemm import m_grouped_fp8_gemm_nt_contiguous
-
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
     if out is None:
