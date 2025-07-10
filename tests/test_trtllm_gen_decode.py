@@ -330,7 +330,7 @@ def test_trtllm_batch_decode_mla(
     # Create interleaved KV cache
     # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
-    kv_cache_shape = (num_blocks, page_size, kv_lora_rank + qk_rope_head_dim)
+    kv_cache_shape = (num_blocks * 2, page_size, kv_lora_rank + qk_rope_head_dim)
     kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device)
 
     # Allocate workspace buffer
@@ -401,7 +401,7 @@ if __name__ == "__main__":
 
     # Rewrite the pytest in the same test order here in a nested for loop
     for page_size in [16, 32, 64]:
-        for dtype in [torch.float8_e4m3fn]:
+        for dtype in [torch.float8_e4m3fn, torch.bfloat16]:
             for scale in [0.5, 1.0]:
                 for batch_size in [4, 32, 64, 128, 256]:
                     print(
