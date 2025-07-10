@@ -30,6 +30,8 @@ from .jit import (
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
+    setup_cubin_loader,
+    trtllm_fmha_gen_module,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -364,8 +366,40 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        paged_kv_cache: Optional[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        block_tables: Optional[torch.Tensor],
+        kv_lens_buffer: Optional[torch.Tensor],
+        page_size: int,
+        max_kv_len: int,
+        batch_size: int,
+        sum_seq_q: int,
+        sum_seq_kv: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
     ) -> None:
-        if backend == "fa2":
+        if backend == "trtllm-gen":
+            assert maybe_lse is None
+            o = paged_run_func(
+                q.contiguous(),
+                paged_kv_cache,
+                int_workspace_buffer,
+                num_kv_heads,
+                sm_scale,
+                block_tables,
+                kv_lens_buffer,
+                page_size,
+                max_kv_len,
+                batch_size,
+                sum_seq_q,
+                sum_seq_kv,
+                cum_seq_lens_q,
+                cum_seq_lens_kv,
+                window_left,
+                out=o,
+            )
+        elif backend == "fa2":
             assert not is_float8(q)
             paged_run_func(
                 float_workspace_buffer,
@@ -476,6 +510,18 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        paged_kv_cache: Optional[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        block_tables: Optional[torch.Tensor],
+        kv_lens_buffer: Optional[torch.Tensor],
+        page_size: int,
+        max_kv_len: int,
+        batch_size: int,
+        sum_seq_q: int,
+        sum_seq_kv: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
     ) -> None:
         pass
 
@@ -1177,7 +1223,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        if backend in ["fa3", "auto"]:
+        self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
+        if backend in ["fa3", "auto", "trtllm-gen"]:
             # NOTE(Zihao): assume maximum accumulate kv length is 16M
             self._vector_sparse_indices_buffer = torch.empty(
                 (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
@@ -1295,6 +1342,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1407,6 +1456,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
 
         batch_size = len(qo_indptr) - 1
+        self._batch_size = batch_size
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
@@ -1431,12 +1483,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         paged_kv_indptr_host = paged_kv_indptr.to("cpu")
         paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-        kv_lens_arr_host = get_seq_lens(
-            paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
-        )
+        if seq_lens is None:
+            kv_lens_arr_host = get_seq_lens(
+                paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+            )
+        else:
+            kv_lens_arr_host = seq_lens.cpu()
         self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
             kv_lens_arr_host, non_blocking=non_blocking
         )
+        self._max_kv_len = max(kv_lens_arr_host).item()
 
         total_num_rows = qo_indptr_host[-1]
 
@@ -1545,7 +1601,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._backend, *get_module_args
             )
 
-        if self._backend == "fa3":
+        self._sum_seq_q=qo_indptr_host[-1]
+        if self._backend == "fa3" or self._backend == "trtllm-gen":
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
@@ -1560,6 +1617,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     : len(vector_sparse_indptr_host)
                 ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                 paged_kv_indptr_host = vector_sparse_indptr_host
+                self._sum_seq_kv=vector_sparse_indptr_host[-1]
+        else:
+            self._sum_seq_kv = torch.sum(kv_lens_arr_host).item()
+        
+        self._block_tables: Optional[torch.Tensor] = block_tables
+        if self._backend == "trtllm-gen":
+            assert self._kv_layout == "HND"
+            assert logits_soft_cap == 0.0
+            if self._block_tables is None:
+                blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in kv_lens_arr_host]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros((batch_size, max_num_blocks_per_seq), dtype=torch.int, device=self.device)
+                block_id = paged_kv_indptr_host[0]
+                for i in range(batch_size):
+                    num_blocks_needed = blocks_per_seq[i]
+                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[block_id:block_id + num_blocks_needed]
+                    block_id += num_blocks_needed
 
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
@@ -1794,7 +1868,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             window_left,
             enable_pdl,
         ]
-
         if self._jit_module is not None:
             run_args.extend(list(args))
         else:
@@ -1813,6 +1886,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 rope_scale,
                 rope_theta,
                 self._token_pos_in_items_len,
+                paged_kv_cache,
+                self._num_qo_heads,
+                self._num_kv_heads,
+                self._block_tables,
+                self._kv_lens_buffer,
+                page_size,
+                self._max_kv_len,
+                self._batch_size,
+                self._sum_seq_q,
+                self._sum_seq_kv,
+                self._qo_indptr_buf,
+                self._vector_sparse_indptr_buffer,
             ]
 
         self._cached_module.paged_run(*run_args)
@@ -2010,7 +2095,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``.
+            Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
@@ -2759,3 +2845,60 @@ def fmha_varlen(
     )
 
     return out, lse
+
+
+@functools.cache
+def get_trtllm_fmha_gen_module():
+    mod = trtllm_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
+def trtllm_batch_context_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    batch_size: int,
+    sum_seq_q: int,
+    sum_seq_kv: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    window_left: int = -1,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_context
+
+    if out is None:
+        out = torch.empty_like(query)
+    else:
+        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+
+    run_func(
+        out,
+        query,
+        kv_cache,
+        workspace_buffer,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        batch_size,
+        window_left,
+        k_scale,
+        v_scale,
+        sum_seq_q,
+        sum_seq_kv,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+    )
+    return out
