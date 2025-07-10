@@ -244,18 +244,26 @@ def test_trtllm_batch_decode_fmha(
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
 
 
-@pytest.mark.parametrize("batch_size", [4, 256])
+@pytest.mark.parametrize("batch_size", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("scale", [1.0, 0.5])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
     page_size: int,
+    kv_layout: str = "HND",  # trtllm-gen only support HND
 ):
     torch.manual_seed(42)
     device = "cuda:0"
+
+    free_memory, total_memory = torch.cuda.mem_get_info()
+    # Convert bytes to GB for readability
+    free_memory_gb = free_memory / (1024**3)
+    total_memory_gb = total_memory / (1024**3)
+    print(f"Total GPU Memory: {total_memory_gb:.2f} GB")
+    print(f"Free GPU Memory: {free_memory_gb:.2f} GB")
 
     # Fixed max sequence length
     MAX_SEQ_LEN = 256
@@ -274,6 +282,17 @@ def test_trtllm_batch_decode_mla(
         .to(device)
         .to(dtype)
     )
+    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
+    # bmm1_scale_tensor = (
+    #     torch.tensor([1.0], dtype=torch.float32, device=device)
+    #     if dtype == torch.float8_e4m3fn
+    #     else None
+    # )
+    # bmm2_scale_tensor = (
+    #     torch.tensor([1.0], dtype=torch.float32, device=device)
+    #     if dtype == torch.float8_e4m3fn
+    #     else None
+    # )
 
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
@@ -334,8 +353,62 @@ def test_trtllm_batch_decode_mla(
     )
 
     # Run reference attention and align output
-    # todo
+    # wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+    #     workspace_buffer, backend="fa2"
+    # )
+
+    # q_indptr = torch.arange(0, batch_size + 1, device=device).int()
+    # kv_indptr = torch.cat(
+    #     [
+    #         torch.tensor([0], device=device, dtype=torch.int),
+    #         torch.cumsum(
+    #             torch.tensor(blocks_per_seq, device=device, dtype=torch.int), dim=0
+    #         ),
+    #     ]
+    # )
+
+    # q_nope = query[:, :, :kv_lora_rank]
+    # q_pe = query[:, :, kv_lora_rank:]
+    # ckv_cache = kv_cache[:, :, :kv_lora_rank]
+    # kpe_cache = kv_cache[:, :, kv_lora_rank:]
+    # # for paged kv cache, the layout is [num_pages, page_size, head_dim]
+    # ckv_cache = ckv_cache.view(-1, page_size, kv_lora_rank)
+    # kpe_cache = kpe_cache.view(-1, page_size, qk_rope_head_dim)
+    # wrapper.plan(
+    #     q_indptr,
+    #     kv_indptr,
+    #     all_block_ids.int(),
+    #     seq_lens_tensor,
+    #     num_q_heads,
+    #     kv_lora_rank,
+    #     qk_rope_head_dim,
+    #     page_size,
+    #     False,  # causal
+    #     scale,
+    #     q_nope.dtype,
+    #     ckv_cache.dtype,
+    # )
+
+    # output_ref = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False)
+
+    # torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
-    test_trtllm_batch_decode_mla(4, 1.0, torch.float8_e4m3fn, 16)
+    # run all tests in the order of pytest
+    # test_trtllm_batch_decode_mla(256, 1.0, torch.bfloat16, 32)
+
+    # Rewrite the pytest in the same test order here in a nested for loop
+    for page_size in [16, 32, 64]:
+        for dtype in [torch.float8_e4m3fn]:
+            for scale in [0.5, 1.0]:
+                for batch_size in [4, 32, 64, 128, 256]:
+                    print(
+                        f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} started"
+                    )
+                    test_trtllm_batch_decode_mla(batch_size, scale, dtype, page_size)
+                    print(
+                        f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} passed"
+                    )
+                    torch.cuda.synchronize()
