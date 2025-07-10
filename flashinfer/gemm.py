@@ -944,6 +944,21 @@ def pad_indptr_to_multiple_of_4(
     return padded_m_indptr, padded_m_rank
 
 
+def gen_gemm_sm100_module() -> SimpleNamespace:
+    from flashinfer.deep_gemm.m_grouped_gemm import load_all
+
+    load_all()
+    return SimpleNamespace(
+        group_deepgemm_fp8_nt_groupwise=group_deepgemm_fp8_nt_groupwise,
+    )
+
+
+@functools.cache
+def get_deep_gemm_sm100_module():
+    module = gen_gemm_sm100_module()
+    return module
+
+
 def group_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (m, k)
     b: torch.Tensor,  # (batch_size, n, k)
