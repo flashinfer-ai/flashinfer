@@ -321,16 +321,14 @@ def test_trtllm_batch_decode_mla(
         block_id += num_blocks_needed
 
     # Create interleaved KV cache
-    # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
-    # kv_cache_shape = (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
-    kv_cache_shape = (num_blocks * 2, page_size, kv_lora_rank + qk_rope_head_dim)
-    # kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device)
-    kv_cache_c = torch.randn(size=kv_cache_shape).to(dtype).to(device)
-    kv_cache = kv_cache_c.as_strided(
-        size=(num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim),
-        stride=kv_cache_c.stride()[:1] + (0,) + kv_cache_c.stride()[1:],
+    kv_cache = (
+        torch.randn(size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim))
+        .to(dtype)
+        .to(device)
     )
+    # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
+    kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
@@ -339,7 +337,7 @@ def test_trtllm_batch_decode_mla(
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
-        kv_cache=kv_cache,
+        kv_cache=kv_cache_duplicate,  # kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
@@ -352,18 +350,20 @@ def test_trtllm_batch_decode_mla(
     )
 
     # Run reference attention and align output
-    sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
+    sm_scale = (
+        1.0  # 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
+    )
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
     )
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
         backend="fa2",
-        use_cuda_graph=True,
-        qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-        kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-        kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
-        kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
+        # use_cuda_graph=True,
+        # qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        # kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        # kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
+        # kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
     )
 
     q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * 1
@@ -390,15 +390,17 @@ def test_trtllm_batch_decode_mla(
         query.dtype,
         kv_cache.dtype,
     )
-    q_nope = query[:, :kv_lora_rank]
-    q_pe = query[:, kv_lora_rank:]
+    q_nope = query[..., :kv_lora_rank]
+    q_pe = query[..., kv_lora_rank:]
 
     # todo: fix kv_cache
+    ckv = kv_cache[..., :kv_lora_rank]
+    kpe = kv_cache[..., kv_lora_rank:]
 
-    # o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    print(output, o_ref)
 
     torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=5e-2)
-    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

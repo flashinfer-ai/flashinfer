@@ -1827,7 +1827,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
 
     if out is None:
-        out_shape = query.shape
+        out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
