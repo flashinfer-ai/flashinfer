@@ -41,7 +41,7 @@ def run_bench(
     )
 
     # Prefill params
-    num_pages_p = torch.ceil(
+    seq_lens_blocks_p = torch.ceil(
         torch.tensor(p_kv_lens, dtype=torch.int32) / page_size
     ).int()
     qo_indptr_p = torch.cat(
@@ -50,24 +50,24 @@ def run_bench(
     kv_indptr_p = torch.cat(
         [torch.tensor([0]), torch.cumsum(p_seq_lens, 0)], dim=0
     ).int()
+    num_pages_p = seq_lens_blocks_p[-1].item()
     kv_indices_p = torch.arange(num_pages_p, device=device, dtype=torch.int32)
-    kv_data_p = kv_data[:num_pages_p]
     last_page_len_p = (p_seq_lens - 1) % page_size + 1
 
     # Decode params
+
     qo_indptr_d = torch.cat(
         [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
     ).int()
     kv_indptr_d = torch.cat(
         [torch.tensor([0]), torch.cumsum(d_seq_lens, 0)], dim=0
     ).int()
-    kv_indices_d = torch.arange(num_pages_p, device=device, dtype=torch.int32)
-    kv_data_d = kv_data[num_pages_p:]
+    num_pages_d = kv_indptr_d[-1].item()
+    kv_indices_d = torch.arange(num_pages_d, device=device, dtype=torch.int32)
     last_page_len_d = (d_seq_lens - 1) % page_size + 1
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     kv_layout = "NHD"
-
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout=kv_layout,
@@ -75,9 +75,9 @@ def run_bench(
     )
     last_page_len = (seq_lens - 1) % page_size + 1
     wrapper_old.plan(
-        q_indptr.to(device),
+        qo_indptr.to(device),
         kv_indptr.to(device),
-        torch.arange(num_blocks, dtype=torch.int32, device=device),
+        torch.arange(num_pages, dtype=torch.int32, device=device),
         last_page_len,
         num_qo_heads,
         num_kv_heads,
@@ -92,13 +92,8 @@ def run_bench(
 
     if len(p_kv_lens) == 1:
         q_d = q[: qo_indptr_d[-1]]
-        kv_d = kv_data[: kv_indptr_d[-1]].unbind(1)
         q_p = q[qo_indptr_d[-1] :]
-        k_p, v_p = kv_data[kv_indptr_d[-1] :].unbind(1)
-        k_p, v_p = k_p.squeeze(1), v_p.squeeze(1)
-        kv_indices_d = torch.arange(
-            0, kv_indptr_d[-1], device=device, dtype=torch.int32
-        )
+        kv_indices_d = torch.arange(0, num_pages_d, device=device, dtype=torch.int32)
 
         last_page_len_d = (d_seq_lens - 1) % page_size + 1
         wrapper_pod = flashinfer.PODWithPagedKVCacheWrapper(
@@ -137,10 +132,8 @@ def run_bench(
         ms_pod = do_bench(
             lambda: wrapper_pod.run(
                 q_p,
-                k_p,
-                v_p,
                 q_d,
-                kv_d,
+                paged_kv_cache=kv_data,
                 causal_p=causal,
                 causal_d=causal,
             )
