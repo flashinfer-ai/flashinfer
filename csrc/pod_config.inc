@@ -30,7 +30,7 @@ using namespace flashinfer;
               return DISPATCH_BOOL(window_left_d > -1, USE_SLIDING_WINDOW_D, [&] {   \
                 return DISPATCH_BOOL(false, USE_LOGITS_SOFT_CAP, [&] {               \
                   using IdType = int32_t;                                            \
-                  using PrefillParams = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;\
+                  using PrefillParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO>;\
                   using DecodeParams = BatchPrefillPagedParams<DTypeQ,               \
                                               DTypeKV, DTypeO, IdType>;              \
                   __VA_ARGS__();                                                     \

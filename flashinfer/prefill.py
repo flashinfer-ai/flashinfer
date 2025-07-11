@@ -1305,7 +1305,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -1428,9 +1428,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu", non_blocking=True)
+        paged_kv_last_page_len_host = paged_kv_last_page_len.to(
+            "cpu", non_blocking=True
+        )
         kv_lens_arr_host = get_seq_lens(
             paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
         )
@@ -1438,6 +1440,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             kv_lens_arr_host, non_blocking=non_blocking
         )
 
+        torch.cuda.synchronize()
         total_num_rows = qo_indptr_host[-1]
 
         if self.is_cuda_graph_enabled:
@@ -1576,7 +1579,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self.is_cuda_graph_enabled,
             head_dim_qk,
             head_dim_vo,
-            causal,
         )
 
         self._causal = causal
@@ -2350,7 +2352,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
                 head_dim_vo,
-                causal,
             )
 
         self._causal = causal

@@ -80,7 +80,7 @@ struct PersistentParams {
   // for state reduction
   IdType* merge_indptr;
   IdType* merge_o_indices;
-  IdType* num_packed_qo_len;
+  IdType* num_to_merge_qo_len;
 
   uint32_t num_kv_heads;
   uint_fastdiv gqa_group_size;

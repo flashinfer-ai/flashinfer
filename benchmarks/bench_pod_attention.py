@@ -17,48 +17,67 @@ def run_bench(
     device=0,
     causal=True,
 ):
-    # POD Attention only supports page size = 1 due to use of single prefill kernel
-    page_block_size = 1
+    # if page size > 1, prefill kv len must be divisible by page size to ensure
+    # an identical workload as in BatchAttention
+    page_size = 1
     seq_lens = torch.tensor(d_kv_lens + p_kv_lens, dtype=torch.int32)
     q_lens = torch.tensor(d_qo_lens + p_qo_lens, dtype=torch.int32)
 
-    seq_lens_blocks = torch.ceil(seq_lens / page_block_size).int()
-    d_seq_lens_blocks = (
-        torch.tensor(d_kv_lens, dtype=torch.int32) / page_block_size
-    ).int()
+    seq_lens_blocks = torch.ceil(seq_lens / page_size).int()
+    p_seq_lens = torch.tensor(p_kv_lens, dtype=torch.int32) / page_size
+    d_seq_lens = (torch.tensor(d_kv_lens, dtype=torch.int32) / page_size).int()
 
-    q_indptr = torch.cat([torch.tensor([0]), torch.cumsum(q_lens, 0)], dim=0).int()
+    # General params
+    qo_indptr = torch.cat([torch.tensor([0]), torch.cumsum(q_lens, 0)], dim=0).int()
     kv_indptr = torch.cat(
         [torch.tensor([0]), torch.cumsum(seq_lens_blocks, 0)], dim=0
     ).int()
-    d_q_indptr = torch.cat(
+    num_pages = kv_indptr[-1].item()
+    q = torch.rand(qo_indptr[-1].item(), num_qo_heads, head_dim).to(
+        device, dtype=torch.bfloat16
+    )
+    kv_data = torch.randn(num_pages, 2, page_size, num_kv_heads, head_dim).to(
+        device, dtype=torch.bfloat16
+    )
+
+    # Prefill params
+    seq_lens_blocks_p = torch.ceil(
+        torch.tensor(p_kv_lens, dtype=torch.int32) / page_size
+    ).int()
+    qo_indptr_p = torch.cat(
+        [torch.tensor([0]), torch.cumsum(torch.tensor(p_qo_lens), 0)], dim=0
+    ).int()
+    kv_indptr_p = torch.cat(
+        [torch.tensor([0]), torch.cumsum(p_seq_lens, 0)], dim=0
+    ).int()
+    num_pages_p = seq_lens_blocks_p[-1].item()
+    kv_indices_p = torch.arange(num_pages_p, device=device, dtype=torch.int32)
+    last_page_len_p = (p_seq_lens - 1) % page_size + 1
+
+    # Decode params
+
+    qo_indptr_d = torch.cat(
         [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
     ).int()
-    d_kv_indptr = torch.cat(
-        [torch.tensor([0]), torch.cumsum(d_seq_lens_blocks, 0)], dim=0
+    kv_indptr_d = torch.cat(
+        [torch.tensor([0]), torch.cumsum(d_seq_lens, 0)], dim=0
     ).int()
-    num_blocks = kv_indptr[-1].item()
-
-    q = torch.rand(q_indptr[-1].item(), num_qo_heads, head_dim).to(
-        device, dtype=torch.bfloat16
-    )
-    kv_data = torch.randn(num_blocks, 2, page_block_size, num_kv_heads, head_dim).to(
-        device, dtype=torch.bfloat16
-    )
+    num_pages_d = kv_indptr_d[-1].item()
+    kv_indices_d = torch.arange(num_pages_d, device=device, dtype=torch.int32)
+    last_page_len_d = (d_seq_lens - 1) % page_size + 1
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     kv_layout = "NHD"
-
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout=kv_layout,
         backend="fa2",
     )
-    last_page_len = (seq_lens - 1) % page_block_size + 1
+    last_page_len = (seq_lens - 1) % page_size + 1
     wrapper_old.plan(
-        q_indptr.to(device),
+        qo_indptr.to(device),
         kv_indptr.to(device),
-        torch.arange(num_blocks).int().to(device),
+        torch.arange(num_pages, dtype=torch.int32, device=device),
         last_page_len,
         num_qo_heads,
         num_kv_heads,
@@ -72,28 +91,28 @@ def run_bench(
     ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
 
     if len(p_kv_lens) == 1:
-        q_d = q[: d_q_indptr[-1]]
-        kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
-        q_p = q[d_q_indptr[-1] :]
-        k_p, v_p = kv_data[d_kv_indptr[-1] :].unbind(1)
-        k_p, v_p = k_p.squeeze(1), v_p.squeeze(1)
-        kv_indices_d = torch.arange(
-            0, d_kv_indptr[-1], device=device, dtype=torch.int32
-        )
+        q_d = q[: qo_indptr_d[-1]]
+        q_p = q[qo_indptr_d[-1] :]
+        kv_indices_d = torch.arange(0, num_pages_d, device=device, dtype=torch.int32)
 
-        last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
+        last_page_len_d = (d_seq_lens - 1) % page_size + 1
         wrapper_pod = flashinfer.PODWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout=kv_layout,
         )
         wrapper_pod.plan(
-            d_kv_indptr.to(device),
+            qo_indptr_p.to(device),
+            kv_indptr_p.to(device),
+            kv_indices_p.to(device),
+            last_page_len_p,
+            qo_indptr_d.to(device),
+            kv_indptr_d.to(device),
             kv_indices_d.to(device),
-            last_page_len=last_page_len_d,
+            last_page_len_d,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            page_size=page_block_size,
+            page_size=page_size,
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
         )
@@ -113,29 +132,47 @@ def run_bench(
         ms_pod = do_bench(
             lambda: wrapper_pod.run(
                 q_p,
-                k_p,
-                v_p,
                 q_d,
-                kv_d,
+                paged_kv_cache=kv_data,
                 causal_p=causal,
                 causal_d=causal,
             )
         )
+    # Persistent attention
+    wrapper = flashinfer.BatchAttention(kv_layout="NHD")
+    wrapper.plan(
+        qo_indptr.to(device),
+        kv_indptr.to(device),
+        torch.arange(num_pages, dtype=torch.int32, device=device),
+        seq_lens.to(device),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        head_dim,
+        page_size,
+        causal=causal,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    ms_persistent = do_bench(lambda: wrapper.run(q, kv_data))
 
-    print(f"Elapsed time (Batched Prefill): {ms_old:.2f} ms")
-    if len(p_kv_lens) == 1:
-        print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     )
+    print(f"Elapsed time (Batched Prefill): {ms_old:.2f} ms")
+    if len(p_kv_lens) == 1:
+        print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
+    print(f"Elapsed time (Persistent Attention): {ms_persistent:.2f} ms")
+
     print(f"Loading memory size (MB): {total_bytes / (1024**2):.2f} MB")
 
     bandwidth_old_gb_s = total_bytes / (ms_old * 1e-3) / (1024**3)
-
+    bandwidth_new_gb_s = total_bytes / (ms_persistent * 1e-3) / (1024**3)
     print(f"Memory bandwidth (Batched Prefill): {bandwidth_old_gb_s:.2f} GB/s")
     if len(p_kv_lens) == 1:
         bandwidth_pod_gb_s = total_bytes / (ms_pod * 1e-3) / (1024**3)
         print(f"Memory bandwidth (POD Attention): {bandwidth_pod_gb_s:.2f} GB/s")
+    print(f"Memory bandwidth (Persistent Attention): {bandwidth_new_gb_s:.2f} GB/s")
 
 
 if __name__ == "__main__":

@@ -13,20 +13,25 @@
 
 #include "pod_config.inc"
 
-using namespace flashinfer;
-
 namespace flashinfer {
-constexpr auto use_custom_mask_p = {{ mask_mode_p }} == MaskMode::kCustom;
-constexpr auto use_custom_mask_d = {{ mask_mode_d }} == MaskMode::kCustom;
-// Not sure about the below declaration
+
+using PrefillParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
+using DecodeParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ idtype }}>;
+
 constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 
+constexpr auto use_custom_mask_p = {{ mask_mode_p }} == MaskMode::kCustom;
+constexpr auto use_custom_mask_d = {{ mask_mode_d }} == MaskMode::kCustom;
+
+using PrefillAttentionVariant = DefaultAttention<use_custom_mask_p, /*use_sliding_window=*/{{ use_sliding_window_p }}, /*use_logits_soft_cap=*/{{ use_logits_soft_cap_p }}, /*use_alibi_bias=*/false>;
+using DecodeAttentionVariant = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/{{ use_sliding_window_d }}, /*use_logits_soft_cap=*/{{ use_logits_soft_cap_d }}, /*use_alibi_bias=*/false>;
+
+{% for cta_tile_q_p in [16, 64, 128] %}
 template cudaError_t PODWithKVCacheTensorDispatched<
-    {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE,
-    {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, 16,
-    {{ mask_mode_d }}, {{ variant_name_p }},
-    {{ variant_name_d }}, PrefillParams, DecodeParams>(
-            PrefillParams prefill_params, {{ dtype_o }}* tmp,
-            DecodeParams decode_params, {{ dtype_o }}* tmp_v,
-            float *tmp_s, bool enable_pdl, cudaStream_t stream);
-};
+    {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE, {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, {{ cta_tile_q_p }}, 16, {{ mask_mode_d }},
+    PrefillAttentionVariant, DecodeAttentionVariant, PrefillParams, DecodeParams>(
+    PrefillParams prefill_params, DecodeParams decode_params,
+    {{ dtype_o }}* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+{% endfor %}
+
+};  // namespace flashinfer
