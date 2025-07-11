@@ -638,6 +638,8 @@ class PODWithPagedKVCacheWrapper:
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
+            k_cache_d,
+            v_cache_d,
             out,
             lse,
             TensorLayout[self._kv_layout].value,
@@ -655,8 +657,6 @@ class PODWithPagedKVCacheWrapper:
             1.0 / rope_theta_p,
             # Decode params
             q_d,
-            k_cache_d,
-            v_cache_d,
             MaskMode.NON_CAUSAL.value,
             window_left_d,
             None,  # packed_custom_mask

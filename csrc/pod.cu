@@ -26,9 +26,7 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODI
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_P,
           uint32_t CTA_TILE_Q_D, MaskMode MASK_MODE_D, typename PrefillAttentionVariant,
           typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp,
-                                           DecodeParams decode_params,
+cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeParams decode_params,
                                            typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
                                            bool enable_pdl, cudaStream_t stream);
 
@@ -71,17 +69,16 @@ at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_
 void PODWithKVCacheTensorRun(
     // Shared params
     at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    at::Tensor plan_info_vec, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
-    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, int64_t layout,
+    at::Tensor plan_info_vec, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
+    at::Tensor qo_indptr, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+    at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+    int64_t layout,
     // Prefill params
-    at::Tensor q_p, at::Tensor paged_k_p, at::Tensor paged_v_p,
-    std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t window_left_p,
+    at::Tensor q_p, int64_t mask_mode_code_p, int64_t window_left_p,
     std::optional<at::Tensor> maybe_custom_mask_p, std::optional<at::Tensor> maybe_alibi_slopes_p,
     double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
     // Decode params
-    at::Tensor q_d, at::Tensor paged_k_cache_d, at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d,
-    std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t window_left_d,
+    at::Tensor q_d, int64_t mask_mode_code_d, int64_t window_left_d,
     std::optional<at::Tensor> maybe_custom_mask_d, std::optional<at::Tensor> maybe_mask_indptr_d,
     std::optional<at::Tensor> maybe_alibi_slopes_d, double logits_soft_cap_d, double sm_scale_d,
     double rope_rcp_scale_d, double rope_rcp_theta_d, bool enable_pdl) {
@@ -100,27 +97,11 @@ void PODWithKVCacheTensorRun(
 
   // Prefill setup
   uint32_t head_dim_qk = q_p.size(2);
-  uint32_t kv_len_p, qo_len, num_kv_heads, num_qo_heads_p;
-  QKVLayout kv_layout_p = static_cast<QKVLayout>(layout_p);
+  uint32_t qo_len, num_qo_heads_p;
+  QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q_p.size(0) + q_d.size(0);
   num_qo_heads_p = q_p.size(1);
-  uint32_t q_stride_n_p = q_p.stride(0), q_stride_h_p = q_p.stride(1), k_stride_n_p, k_stride_h_p,
-           v_stride_n_p, v_stride_h_p;
-  if (kv_layout_p == QKVLayout::kNHD) {
-    kv_len_p = paged_k_p.size(0);
-    num_kv_heads = paged_k_p.size(1);
-    k_stride_n_p = paged_k_p.stride(0);
-    k_stride_h_p = paged_k_p.stride(1);
-    v_stride_n_p = paged_v_p.stride(0);
-    v_stride_h_p = paged_v_p.stride(1);
-  } else {
-    kv_len_p = paged_k_p.size(1);
-    num_kv_heads = paged_k_p.size(0);
-    k_stride_h_p = paged_k_p.stride(0);
-    k_stride_n_p = paged_k_p.stride(1);
-    v_stride_h_p = paged_v_p.stride(0);
-    v_stride_n_p = paged_v_p.stride(1);
-  }
+  uint32_t q_stride_n_p = q_p.stride(0), q_stride_h_p = q_p.stride(1);
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
     TORCH_CHECK(lse.size(0) == qo_len, lse.size(0), qo_len);
@@ -130,23 +111,21 @@ void PODWithKVCacheTensorRun(
   const MaskMode mask_mode_p = static_cast<MaskMode>(mask_mode_code_p);
 
   auto q_scalar_type = q_p.scalar_type();
-  auto kv_scalar_type = paged_k_p.scalar_type();
 
   // Decode setup (Tensor decode = batched prefill)
-  QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   uint32_t num_qo_heads = q_d.size(1);
-
   TORCH_CHECK(num_qo_heads_p == num_qo_heads,
               "POD currently requires same # Query heads for prefill and decode");
 
-  uint32_t num_kv_heads, page_size;
-  uint32_t head_dim_qk = q_d.size(2);
+  uint32_t num_kv_heads_d, num_kv_heads, page_size;
   if (kv_layout == QKVLayout::kHND) {
     num_kv_heads = paged_k_cache.size(1);
+    num_kv_heads_d = paged_k_cache.size(1);
     page_size = paged_k_cache.size(2);
   } else {
-    page_size = paged_k_cache.size(1);
     num_kv_heads = paged_k_cache.size(2);
+    num_kv_heads_d = paged_k_cache.size(2);
+    page_size = paged_k_cache.size(1);
   }
   TORCH_CHECK(num_kv_heads == num_kv_heads_d,
               "POD currently requires same # KV heads for prefill and decode; Prefill: ",
@@ -158,13 +137,6 @@ void PODWithKVCacheTensorRun(
   const auto q_stride_n_d = q_d.stride(0);
   const auto q_stride_h_d = q_d.stride(1);
 
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
-  auto k_strides = paged_k_cache_d.strides();
-  auto v_strides = paged_v_cache_d.strides();
-  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
-  kv_cache_strides = k_strides.data();
-
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer_d.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
@@ -173,25 +145,26 @@ void PODWithKVCacheTensorRun(
       USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, [&] {
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
-            static_cast<DTypeKV*>(paged_k_cache_d.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache_d.data_ptr()), kv_cache_strides,
-            static_cast<IdType*>(paged_kv_indices_d.data_ptr()),
-            static_cast<IdType*>(paged_kv_indptr_d.data_ptr()),
-            static_cast<IdType*>(paged_kv_last_page_len_d.data_ptr()));
+            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<IdType*>(paged_kv_indices.data_ptr()),
+            static_cast<IdType*>(paged_kv_indptr.data_ptr()),
+            static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
         PrefillParams prefill_params;
         {
           // Make params a reference to prefill_params to set values
           PrefillParams& params = prefill_params;
           params.q = static_cast<DTypeQ*>(q_p.data_ptr());
           params.paged_kv = paged_kv;
-          params.q_indptr = static_cast<IdType*>(qo_indptr_p.data_ptr());
-          params.o = static_cast<DTypeO*>(o_p.data_ptr());
+          params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+          params.o = static_cast<DTypeO*>(o.data_ptr());
           params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
-          params.num_qo_heads = num_qo_heads_p;
-          params.group_size = uint_fastdiv(num_qo_heads_p / paged_kv.num_heads);
+          params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
           params.q_stride_n = q_stride_n_p;
           params.q_stride_h = q_stride_h_p;
           params.window_left = window_left_p;
+          params.num_kv_heads = num_kv_heads;
+          params.num_qo_heads = num_qo_heads;
 
           params.request_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
@@ -226,6 +199,7 @@ void PODWithKVCacheTensorRun(
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
           }
+          params.partition_kv = plan_info.split_kv;
           if (plan_info.split_kv) {
             if (plan_info.enable_cuda_graph) {
               params.block_valid_mask =
@@ -241,21 +215,23 @@ void PODWithKVCacheTensorRun(
           DecodeParams& params = decode_params;
           params.q = static_cast<DTypeQ*>(q_d.data_ptr());
           params.paged_kv = paged_kv;
-          params.q_indptr = static_cast<IdType*>(qo_indptr_d.data_ptr());
-          params.o = static_cast<DTypeO*>(o_d.data_ptr());
-
+          params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+          params.o = static_cast<DTypeO*>(o.data_ptr());
           params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
-          params.num_qo_heads = num_qo_heads;
           params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
           params.q_stride_n = q_stride_n_d;
           params.q_stride_h = q_stride_h_d;
           params.window_left = window_left_d;
+          params.num_kv_heads = num_kv_heads;
+          params.num_qo_heads = num_qo_heads;
+
           params.request_indices = prefill_params.request_indices;
           params.qo_tile_indices = prefill_params.qo_tile_indices;
           params.kv_tile_indices = prefill_params.kv_tile_indices;
           params.o_indptr = prefill_params.o_indptr;
           params.kv_chunk_size_ptr = prefill_params.kv_chunk_size_ptr;
 
+          params.partition_kv = plan_info.split_kv;
           if (plan_info.split_kv) {
             params.merge_indptr = prefill_params.merge_indptr;
             // These should be assigned from plan info, not from prefill_params
@@ -268,7 +244,6 @@ void PODWithKVCacheTensorRun(
           params.padded_batch_size = plan_info.padded_batch_size_d;
           params.max_total_num_rows = plan_info.total_num_rows;
 
-          params.partition_kv = false;
           params.maybe_mask_indptr = maybe_mask_indptr_d
                                          ? static_cast<int32_t*>(maybe_mask_indptr_d->data_ptr())
                                          : nullptr;
