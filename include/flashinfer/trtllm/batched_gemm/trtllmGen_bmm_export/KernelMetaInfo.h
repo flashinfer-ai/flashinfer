@@ -27,7 +27,7 @@ namespace kernels {
 
 #define TLLM_GEN_COMMIT "a845b78"
 #define TLLM_GEN_EXPORT_VERSION "6.0.3.0.2.1"
-#define TLLM_GEN_BATCHED_GEMM_CONFIG_HASH "a29279d"
+#define TLLM_GEN_BATCHED_GEMM_CONFIG_HASH "ea4dc24"
 static constexpr size_t tllmGenBatchedGemmListLen = 216;
 
 #ifndef EXCLUDE_SM_100
