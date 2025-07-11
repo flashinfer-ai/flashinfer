@@ -271,6 +271,11 @@ struct TypeToDataType<uint8_t> {
   static constexpr Data_type value = Data_type::DATA_TYPE_E4M3;
 };
 
+template <>
+struct TypeToDataType<__nv_fp8_e4m3> {
+  static constexpr Data_type value = Data_type::DATA_TYPE_E4M3;
+};
+
 static inline size_t get_size_in_bytes(size_t n, Data_type dtype) {
   switch (dtype) {
     case DATA_TYPE_FP32:
