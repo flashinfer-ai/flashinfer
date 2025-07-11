@@ -20,6 +20,7 @@
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
+#include <cuda/std/type_traits>
 
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 
@@ -128,7 +129,11 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
         float constexpr E4m3MaxVal{448.f};
 
         // Compute the absolute max
+#if CUDA_VERSION >= 12090
         float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cuda::maximum<>{});
+#else
+        float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max{});
+#endif
         if (threadIdx.x == 0) {
           s_scaleOut = aMax / E4m3MaxVal;
           int const scaleOut_idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
@@ -502,7 +507,11 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
       float constexpr E4m3MaxVal{448.f};
 
       // Compute the absolute max
+#if CUDA_VERSION >= 12090
       float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cuda::maximum<>{});
+#else
+      float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cub::Max{});
+#endif
 
       if (threadIdx.x == 0) {
         if (params.outDqSfsPtr) {
