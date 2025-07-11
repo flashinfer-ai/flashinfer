@@ -39,6 +39,7 @@ def get_cu_file_str(
     idtype,
 ):
     cta_tile_q_choice = [128, 64, 16]
+    cta_tile_q_d = 16
 
     def get_insts(attention_variant_p, attention_variant_d, dtype_out):
         return "\n".join(
@@ -60,7 +61,6 @@ def get_cu_file_str(
                     dtype_out=dtype_out,
                 )
                 for cta_tile_q_p in cta_tile_q_choice
-                for cta_tile_q_d in cta_tile_q_choice
             ]
         )
 
@@ -71,43 +71,34 @@ def get_cu_file_str(
     dtype_out = dtype_literal[dtype_out]
     idtype = idtype_literal[idtype]
 
-    content = f"""#include <flashinfer/attention/default_prefill_params.cuh>
-#include <flashinfer/attention/default_decode_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-#include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/mask.cuh>
-#include <flashinfer/attention/pod.cuh>
-#include <flashinfer/pos_enc.cuh>
-#include <flashinfer/utils.cuh>
-#include <flashinfer/page.cuh>
+    content = f"""#include <flashinfer/attention/pod.cuh>
+#include "pod_config.inc"
 
-#include "pytorch_conversion_utils.h"
-#include "pytorch_extension_utils.h"
+namespace flashinfer {{
 
-using namespace flashinfer;
+constexpr auto use_custom_mask_p = MaskMode::kNone == MaskMode::kCustom;
+constexpr auto use_custom_mask_d = MaskMode::kNone == MaskMode::kCustom;
 
 using PrefillParams = BatchPrefillPagedParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 using DecodeParams = BatchPrefillPagedParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
 
-constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-
-using AttentionVariant1_P = DefaultAttention<{use_custom_mask_p}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
-using AttentionVariant1_D = DefaultAttention<{use_custom_mask_d}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
+using AttentionVariant1_P = DefaultAttention<use_custom_mask_p, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
+using AttentionVariant1_D = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant1_P", "AttentionVariant1_D", dtype_out)}
 
-using AttentionVariant2_P = DefaultAttention<{use_custom_mask_p}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
-using AttentionVariant2_D = DefaultAttention<{use_custom_mask_d}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
+using AttentionVariant2_P = DefaultAttention<use_custom_mask_p, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
+using AttentionVariant2_D = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant2_P", "AttentionVariant2_D", dtype_out)}
 
-using AttentionVariant3_P = DefaultAttention<{use_custom_mask_p}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
-using AttentionVariant3_D = DefaultAttention<{use_custom_mask_d}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
+using AttentionVariant3_P = DefaultAttention<use_custom_mask_p, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
+using AttentionVariant3_D = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant3_P", "AttentionVariant3_D", dtype_out)}
 
-using AttentionVariant4_P = DefaultAttention<{use_custom_mask_p}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
-using AttentionVariant4_D = DefaultAttention<{use_custom_mask_d}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
+using AttentionVariant4_P = DefaultAttention<use_custom_mask_p, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
+using AttentionVariant4_D = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant4_P", "AttentionVariant4_D", dtype_out)}
 
