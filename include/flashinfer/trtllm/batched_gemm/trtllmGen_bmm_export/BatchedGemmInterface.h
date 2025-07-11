@@ -645,7 +645,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "b5edd92aeb5bbeb861cbfd063d0b005dc7c778ec";
+    const std::string pipeline_hash = "505111546b5916d6bfd999caa2963983ea3469ca";
     const std::string cubin_path = pipeline_hash + "/" + std::string("batched_gemm-") +
                                    TLLM_GEN_COMMIT + "-" + TLLM_GEN_BATCHED_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
