@@ -24,6 +24,7 @@ from . import (
     generate_batch_paged_decode_inst,
     generate_batch_paged_prefill_inst,
     generate_batch_ragged_prefill_inst,
+    generate_pod_inst,
     generate_single_decode_inst,
     generate_single_prefill_inst,
 )
@@ -250,11 +251,69 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"f16qk_{bool(use_fp16_qk_reduction)}"
                         )
 
+    # POD files
+    pod_uris = []
+    for (
+        head_dim,
+        pos_encoding_mode,
+        use_fp16_qk_reduction,
+        mask_mode_p,
+        mask_mode_d,
+        idtype,
+    ) in product(
+        head_dims,
+        pos_encoding_modes,
+        use_fp16_qk_reductions,
+        mask_modes,
+        mask_modes,  # mask_mode_d can be different from mask_mode_p
+        idtypes,
+    ):
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
+            product(prefill_dtypes, fp8_dtypes)
+        ):
+            fname = f"pod_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_maskp_{mask_mode_p}_maskd_{mask_mode_d}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            content = generate_pod_inst.get_cu_file_str(
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                mask_mode_p,
+                mask_mode_d,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+                idtype,
+            )
+            write_if_different(path / fname, content)
+
+            for sliding_window_p in [True, False]:
+                for sliding_window_d in [True, False]:
+                    for logits_soft_cap_p in [True, False]:
+                        for logits_soft_cap_d in [True, False]:
+                            if (
+                                mask_mode_p == 0 and mask_mode_d == 0
+                            ):  # NOTE(Zihao): uri do not contain mask, avoid duplicate uris
+                                pod_uris.append(
+                                    f"pod_with_kv_cache_dtype_q_{dtype_q}_"
+                                    f"dtype_kv_{dtype_kv}_"
+                                    f"dtype_o_{dtype_q}_"
+                                    f"dtype_idx_{idtype}_"
+                                    f"head_dim_qk_{head_dim}_"
+                                    f"head_dim_vo_{head_dim}_"
+                                    f"posenc_{pos_encoding_mode}_"
+                                    f"use_swa_p_{sliding_window_p}_"
+                                    f"use_swa_d_{sliding_window_d}_"
+                                    f"use_logits_cap_p_{logits_soft_cap_p}_"
+                                    f"use_logits_cap_d_{logits_soft_cap_d}_"
+                                    f"f16qk_{bool(use_fp16_qk_reduction)}"
+                                )
+
     return (
         single_decode_uris
         + batch_decode_uris
         + single_prefill_uris
         + batch_prefill_uris
+        + pod_uris
     )
 
 

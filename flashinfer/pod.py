@@ -502,10 +502,8 @@ class PODWithPagedKVCacheWrapper:
         self,
         # Main params (prefill and decode)
         q_p: torch.Tensor,
-        k_p: torch.Tensor,
-        v_p: torch.Tensor,
         q_d: torch.Tensor,
-        paged_kv_cache_d: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         # Prefill options
         custom_mask_p: Optional[torch.Tensor] = None,
         packed_custom_mask_p: Optional[torch.Tensor] = None,
@@ -581,9 +579,9 @@ class PODWithPagedKVCacheWrapper:
         )
 
         # Decode setup
-        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
-            q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
+            q_d, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
         # TODO_AK: Where are these coming from?
         pos_encoding_mode_d = self._pos_encoding_mode
@@ -611,7 +609,7 @@ class PODWithPagedKVCacheWrapper:
         module_getter = get_pod_module(
             # Prefill params
             q_p.dtype,
-            k_p.dtype,
+            k_cache.dtype,
             q_p.dtype,
             q_p.shape[-1],
             PosEncodingMode[pos_encoding_mode_p].value,
@@ -634,19 +632,17 @@ class PODWithPagedKVCacheWrapper:
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
-            self._qo_indptr_buf,
+            k_cache,
+            v_cache,
+            self._qo_indptr_buf,  # contains both prefill and decode indptr
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
-            k_cache_d,
-            v_cache_d,
             out,
             lse,
             TensorLayout[self._kv_layout].value,
             # Prefill params
             q_p,
-            k_p,
-            v_p,
             mask_mode_p,
             window_left_p,
             packed_custom_mask_p,
