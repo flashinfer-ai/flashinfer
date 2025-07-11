@@ -246,7 +246,7 @@ def test_trtllm_batch_decode_fmha(
 
 @pytest.mark.parametrize("batch_size", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("scale", [1.0, 0.5])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])  # todo(Yingyi): add float8_e4m3fn
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
@@ -267,7 +267,6 @@ def test_trtllm_batch_decode_mla(
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     kv_lora_rank = 512
-    scale = 1.0
 
     # Initialize tensors
     query = (
@@ -328,7 +327,9 @@ def test_trtllm_batch_decode_mla(
         .to(device)
     )
     # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
+    # todo(Yingyi): do not duplicate kv_cache for the next generated cubins
     kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
+    # kv_cache_duplicate = torch.stack([kv_cache], dim=1)
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
@@ -346,13 +347,16 @@ def test_trtllm_batch_decode_mla(
         seq_lens=seq_lens_tensor,
         block_size=page_size,
         max_seq_len=max_seq_len,
-        scale=scale,
+        scale=scale
+        / ((512 + 64) ** 0.5)
+        * ((128 + 64) ** 0.5),  # todo(Yingyi): scale is not correct
     )
+    torch.cuda.synchronize()
 
     # Run reference attention and align output
     sm_scale = (
-        1.0  # 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
-    )
+        1.0 / scale / ((128 + 64) ** 0.5)
+    )  # use head dimension before matrix absorption
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
     )
@@ -365,6 +369,11 @@ def test_trtllm_batch_decode_mla(
         # kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
         # kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
     )
+
+    if dtype == torch.float8_e4m3fn:
+        # convert query and kv_cache to bfloat16
+        query = query.to(torch.bfloat16).to(device)
+        kv_cache = kv_cache.to(torch.bfloat16).to(device)
 
     q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * 1
     kv_indptr = (
@@ -398,25 +407,12 @@ def test_trtllm_batch_decode_mla(
     kpe = kv_cache[..., kv_lora_rank:]
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
-    print(output, o_ref)
+    # print("output", output)
+    # print("o_ref", o_ref)
 
-    torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
     # run all tests in the order of pytest
-    test_trtllm_batch_decode_mla(256, 1.0, torch.bfloat16, 32)
-
-    # Rewrite the pytest in the same test order here in a nested for loop
-    # for page_size in [16, 32, 64]:
-    #     for dtype in [torch.float8_e4m3fn, torch.bfloat16]:
-    #         for scale in [0.5, 1.0]:
-    #             for batch_size in [4, 32, 64, 128, 256]:
-    #                 print(
-    #                     f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} started"
-    #                 )
-    #                 test_trtllm_batch_decode_mla(batch_size, scale, dtype, page_size)
-    #                 print(
-    #                     f"test page_size={page_size}, dtype={dtype}, scale={scale}, batch_size={batch_size} passed"
-    #                 )
-    #                 torch.cuda.synchronize()
+    test_trtllm_batch_decode_mla(16, 1.0, torch.float8_e4m3fn, 16)
