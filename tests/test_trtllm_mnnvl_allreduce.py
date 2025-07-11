@@ -138,6 +138,7 @@ def row_linear_residual_norm_fusion_forward(
 """Main test function that runs on each MPI rank"""
 
 
+# seq_lens = [1, 4, 32, 128]
 @pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("fusion", [False])
 def test_mnnvl_allreduce_full(monkeypatch, seq_len: int, fusion: bool):
@@ -217,11 +218,3 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_len: int, fusion: bool):
 
     # Final synchronization and results
     comm.mpi_barrier()
-
-
-if __name__ == "__main__":
-    # Test parameters
-    # seq_lens = [1, 4, 32, 128]
-    fusion_modes = [False]  # Only non-fused case for now
-    for fusion in fusion_modes:
-        test_mnnvl_allreduce_full(4, fusion)

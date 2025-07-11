@@ -763,19 +763,23 @@ class McastDeviceMemory:
         """Get buffer pointers device as int64 (returning first UC pointer for now) (legacy compatibility)"""
         return self.uc_ptrs[0] if self.uc_ptrs else 0
 
-    def lamport_initialize(self, rank: int):
-        bf16_neg_zero = 0x8000
+    def lamport_initialize(self, rank: int, dtype: torch.dtype):
+        if dtype == torch.bfloat16:
+            neg_zero = 0x8000
+            dsize = 2
+            memset_func = cuda.cuMemsetD16
+        elif dtype == torch.float32:
+            neg_zero = 0x80000000
+            dsize = 4
+            memset_func = cuda.cuMemsetD32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
-        # Calculate number of bf16 elements that fit in allocation_size
-        bf16_size = 2  # bf16 is 2 bytes
-        num_elements = self.allocation_size // bf16_size
+        # Calculate number of elements that fit in allocation_size
+        num_elements = self.allocation_size // dsize
 
-        # Use cuMemsetD16 to directly set 16-bit values on GPU memory
-        # This is much more efficient than creating a host buffer and copying
         checkCudaErrors(
-            cuda.cuMemsetD16(
-                int(self.uc_ptrs[self.group_rank]), bf16_neg_zero, num_elements
-            )
+            memset_func(int(self.uc_ptrs[self.group_rank]), neg_zero, num_elements)
         )
 
 
