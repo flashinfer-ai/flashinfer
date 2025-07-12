@@ -23,6 +23,7 @@ import flashinfer
 def bench_groupwise_grouped_gemm_fp8_blackwell(
     batch_size, m, n, k, in_dtype, out_dtype
 ):
+    torch.random.manual_seed(0)
     a = torch.randn(batch_size * m, k, device="cuda:0").to(in_dtype)
     b = torch.randn(batch_size, n, k, device="cuda:0").to(in_dtype)
     out = torch.empty(batch_size * m, n, device="cuda:0", dtype=out_dtype)

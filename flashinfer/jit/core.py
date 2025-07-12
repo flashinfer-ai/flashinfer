@@ -60,7 +60,11 @@ def clear_cache_dir():
 
 
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"]
-sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"]
+sm100a_nvcc_flags = [
+    "-gencode=arch=compute_100a,code=sm_100a",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+    "-DFLASHINFER_ENABLE_FP4_E2M1",
+]
 
 
 @dataclasses.dataclass

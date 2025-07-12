@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/gemm/group_gemm_groupwise_sm100.cuh>
+#include <flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -74,18 +74,16 @@ using namespace flashinfer;
     return false;                                                    \
   }()
 
-void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
-                                          at::Tensor float_workspace_buffer, at::Tensor A,
-                                          at::Tensor B, at::Tensor SFA, at::Tensor SFB,
-                                          at::Tensor C, at::Tensor m_indptr, int64_t n, int64_t k,
-                                          int64_t scale_granularity_m, int64_t scale_granularity_n,
-                                          int64_t scale_granularity_k, std::string scale_major_mode,
-                                          int64_t mma_sm) {
+void CutlassGroupGemmFP8GroupwiseScaledSM100(
+    at::Tensor int_workspace_buffer, at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
+    at::Tensor SFA, at::Tensor SFB, at::Tensor D, at::Tensor m_indptr, int64_t n, int64_t k,
+    int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
+    std::string scale_major_mode, int64_t mma_sm) {
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  int batch_size = m_indptr.size(0) - 1;
+  int num_groups = m_indptr.size(0) - 1;
   int max_m = SFA.size(1);
-  DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(A.scalar_type(), C.scalar_type(), c_type_in, c_type_out, [&] {
+  DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(A.scalar_type(), D.scalar_type(), c_type_in, c_type_out, [&] {
     return DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
       return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
         return DISPATCH_SCALE_GRANULARITY(
@@ -93,7 +91,7 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
             SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
               using cutlass_t_in = cutlass_dtype_t<c_type_in>;
               using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-              auto status = flashinfer::gemm::CutlassGroupwiseScaledGroupGEMMSM100<
+              auto status = flashinfer::gemm::CutlassFP8GroupwiseScaledGroupGEMMSM100<
                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
                   MMA_SM>(static_cast<int*>(int_workspace_buffer.data_ptr()),
                           int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
@@ -102,9 +100,9 @@ void CutlassGroupGemmGroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                           static_cast<cutlass_t_in*>(A.data_ptr()),
                           static_cast<cutlass_t_in*>(B.data_ptr()),
                           static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
-                          static_cast<cutlass_t_out*>(C.data_ptr()),
-                          static_cast<int*>(m_indptr.data_ptr()), max_m, n, k, batch_size, stream);
-              return true;
+                          static_cast<cutlass_t_out*>(D.data_ptr()),
+                          static_cast<int*>(m_indptr.data_ptr()), max_m, n, k, num_groups, stream);
+              return status == cudaSuccess;
             });
       });
     });
