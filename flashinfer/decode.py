@@ -1827,6 +1827,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
+    if block_size != 32 and block_size != 64:
+        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
     _check_trtllm_gen_mla_shape(
         query,
         kv_cache,
