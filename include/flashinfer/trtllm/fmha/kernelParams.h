@@ -323,6 +323,8 @@ struct KernelParams {
     int32_t strideKeysVals{isK ? hiddenDimK : hiddenDimV};
     if (isPagedKv(options.mQkvLayout)) {
       strideKeysVals = maxHeadDimKv;
+      // printf("options.mNumTokensPerPage: %d, maxHeadDimKv: %d strideKeysVals: %d\n",
+      //        options.mNumTokensPerPage, maxHeadDimKv, strideKeysVals);
     } else if (isPackedQkv(options.mQkvLayout)) {
       strideKeysVals = hiddenDimQkv;
     } else if (isContiguousKv(options.mQkvLayout)) {
@@ -333,6 +335,8 @@ struct KernelParams {
     int32_t strideHeads{isK ? options.mHeadDimQk : options.mHeadDimV};
     if (isPagedKv(options.mQkvLayout)) {
       strideHeads = options.mNumTokensPerPage * maxHeadDimKv;
+      // printf("options.mNumTokensPerPage: %d, maxHeadDimKv: %d strideHeads: %d\n",
+      //        options.mNumTokensPerPage, maxHeadDimKv, strideHeads);
     } else if (isContiguousKv(options.mQkvLayout)) {
       strideHeads = options.mMaxSeqLenCacheKv * maxHeadDimKv;
     }
@@ -341,6 +345,8 @@ struct KernelParams {
     int32_t strideBatch{options.mMaxSeqLenKv * hiddenDimK};
     if (isPagedKv(options.mQkvLayout)) {
       strideBatch = options.mNumTokensPerPage * maxHiddenDimKv;
+      // printf("options.mNumTokensPerPage: %d, maxHiddenDimKv: %d strideBatch: %d\n",
+      //        options.mNumTokensPerPage, maxHiddenDimKv, strideBatch);
     } else if (isContiguousKv(options.mQkvLayout)) {
       strideBatch = 2 * options.mNumHeadsKv * options.mMaxSeqLenCacheKv * maxHeadDimKv;
     } else {
@@ -349,6 +355,7 @@ struct KernelParams {
     }
 
     // The 3 strides (the other ones are 1 and 0).
+    // todo(Yingyi): strideBatch is correct?
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
 
@@ -360,6 +367,11 @@ struct KernelParams {
     auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
     // The stride elements.
     auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
+
+    // printf(
+    //     "numKeys: %d, numHeadsQPerKv: %d, batchSize: %d, strideKeys: %d, strideHeads: %d, "
+    //     "strideBatch: %d\n",
+    //     numKeys, numHeadsQPerKv, batchSize, strideKeys, strideHeads, strideBatch);
 
     // The headDim.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -617,9 +629,11 @@ struct KernelParams {
                                         tileShapeKv, const_cast<void*>(kPtr),
                                         /*swizzled = */ !transformsKv);
     // Build tma descriptor for V.
+    // todo(Yingyi): strideV is correct?
     params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV,
                                         tileShapeKv, const_cast<void*>(vPtr),
                                         /*swizzled = */ !transformsKv);
+    // params.tmaV_ = params.tmaK_;
 
     // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
     if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1) {
@@ -717,9 +731,11 @@ struct KernelParams {
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
-    params.mOutputScale = 1.f;
+    // todo(Yingyi): might take a scalar tensor later
+    params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 =
-        (1.f / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
+        (options.scaleSoftmaxLog2 / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) *
+        M_LOG2E;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = nullptr;

@@ -62,6 +62,7 @@ from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import trtllm_fmha_gen_module as trtllm_fmha_gen_module
+from .attention import trtllm_mla_gen_module as trtllm_mla_gen_module
 from .core import JitSpec as JitSpec
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir

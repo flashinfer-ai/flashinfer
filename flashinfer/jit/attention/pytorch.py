@@ -1492,6 +1492,17 @@ def trtllm_fmha_gen_module():
     )
 
 
+def trtllm_mla_gen_module():
+    return gen_jit_spec(
+        "mla_gen",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mla_kernel_launcher.cu",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
 def gen_customize_batch_attention_module(
     uri: str,
     dtype_q: torch.dtype,

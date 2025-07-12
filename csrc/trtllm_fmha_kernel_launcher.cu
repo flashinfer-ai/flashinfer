@@ -138,6 +138,10 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
                       max_head_dim_kv * get_size_in_bytes(CACHE_T));
 
   runner_params.stream = stream;
+
+  runner_params.outputScale = 1.0;
+  runner_params.scaleSoftmaxLog2 = 1.0;
+
   fmha_runner.run(runner_params);
 }
 

@@ -46,6 +46,7 @@ from .pytorch import get_pod_uri as get_pod_uri
 from .pytorch import get_single_decode_uri as get_single_decode_uri
 from .pytorch import get_single_prefill_uri as get_single_prefill_uri
 from .pytorch import trtllm_fmha_gen_module as trtllm_fmha_gen_module
+from .pytorch import trtllm_mla_gen_module as trtllm_mla_gen_module
 from .tvm import gen_batch_mla_tvm_binding as gen_batch_mla_tvm_binding
 from .tvm import (
     gen_customize_batch_decode_tvm_binding as gen_customize_batch_decode_tvm_binding,
