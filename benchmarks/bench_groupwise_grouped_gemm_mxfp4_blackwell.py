@@ -25,6 +25,7 @@ import flashinfer
 def bench_groupwise_grouped_gemm_mxfp4_blackwell(
     group_size, m, n, k, in_dtype, out_dtype
 ):
+    torch.random.manual_seed(0)
     assert n % 8 == 0
     assert k % 128 == 0
     tile_size = 32
