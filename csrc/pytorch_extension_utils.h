@@ -27,8 +27,13 @@
 #include <cuda_fp16.h>
 #endif
 
-#if defined(FLASHINFER_ENABLE_FP8_E4M3) || defined(FLASHINFER_ENABLE_FP8_E5M2)
+#if defined(FLASHINFER_ENABLE_FP8_E4M3) || defined(FLASHINFER_ENABLE_FP8_E5M2) || \
+    defined(FLASHINFER_ENABLE_FP8_E8M0)
 #include <cuda_fp8.h>
+#endif
+
+#if defined(FLASHINFER_ENABLE_FP4_E2M1)
+#include <cuda_fp4.h>
 #endif
 
 #ifndef FLASHINFER_EXT_MODULE_INITED
@@ -92,6 +97,12 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     }                                                                                 \
   }()
 
+#define _DISPATCH_CASE_F32(c_type, ...) \
+  case at::ScalarType::Float: {         \
+    using c_type = float;               \
+    return __VA_ARGS__();               \
+  }
+
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -132,6 +143,28 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
 #endif
 
+// Should not be used together with _DISPATCH_SF_CASE_FP8_E8M0
+#ifdef FLASHINFER_ENABLE_FP4_E2M1
+#define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
+  case at::ScalarType::Byte: {               \
+    using c_type = __nv_fp4_e2m1;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP4_E2M1(c_type, ...)
+#endif
+
+// Should not be used together with _DISPATCH_CASE_FP4_E2M1
+#ifdef FLASHINFER_ENABLE_FP8_E8M0
+#define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...) \
+  case at::ScalarType::Byte: {                  \
+    using c_type = __nv_fp8_e8m0;               \
+    return __VA_ARGS__();                       \
+  }
+#else
+#define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)
+#endif
+
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -158,6 +191,20 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     }                                                                                        \
   }()
 
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_SF(pytorch_dtype, c_type, ...)                \
+  [&]() -> bool {                                                                     \
+    switch (pytorch_dtype) {                                                          \
+      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                         \
+      _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                                 \
+      default:                                                                        \
+        std::ostringstream oss;                                                       \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch scaling factor data type " \
+            << pytorch_dtype;                                                         \
+        TORCH_CHECK(false, oss.str());                                                \
+        return false;                                                                 \
+    }                                                                                 \
+  }()
+
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -165,6 +212,7 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
       _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
       _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
       _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP4_E2M1(c_type, __VA_ARGS__)                                       \
       default:                                                                           \
         std::ostringstream oss;                                                          \
         oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
