@@ -318,7 +318,7 @@ def test_fp8_groupwise_group_deepgemm(
 
 
 if __name__ == "__main__":
-    # test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
-    # test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
-    # test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
+    test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
+    test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
+    test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
     test_fp8_groupwise_group_deepgemm(256, 128, 128, 4, torch.bfloat16)
