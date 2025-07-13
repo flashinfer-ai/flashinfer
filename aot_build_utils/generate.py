@@ -313,7 +313,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
         + batch_decode_uris
         + single_prefill_uris
         + batch_prefill_uris
-        + pod_uris
+        # + pod_uris
     )
 
 

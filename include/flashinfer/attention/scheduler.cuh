@@ -1037,8 +1037,8 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   auto [split_kv, real_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
         cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices_vec, qo_tile_indices_vec,
         kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
-      PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, qo_indptr_d, kv_indptr_d, total_num_rows_p,
-                         batch_size_p, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
+      PODSplitQOKVIndptr(qo_indptr_p, kv_indptr_p, total_num_rows_p, batch_size_p, qo_indptr_d,
+                         kv_indptr_d, total_num_rows_d, batch_size_d, num_qo_heads, num_kv_heads,
                          head_dim_vo, page_size, max_batch_size_if_split, enable_cuda_graph);
   uint32_t padded_batch_size = padded_batch_size_p + padded_batch_size_d;
   uint32_t batch_size = batch_size_p + batch_size_d;
