@@ -755,6 +755,8 @@ class SM100FP8GemmRuntime:
         self.lib = None
         self.kernel = None
         self.symbol = symbol
+        # Store a reference to the cleanup function to avoid import issues during shutdown
+        self._cleanup_func = cbd.cuLibraryUnload
 
     def __call__(self, **kwargs) -> cbd.CUresult:
         # Load CUBIN
@@ -774,7 +776,11 @@ class SM100FP8GemmRuntime:
 
     def __del__(self) -> None:
         if self.lib is not None:
-            checkCudaErrors(cbd.cuLibraryUnload(self.lib))
+            try:
+                checkCudaErrors(self._cleanup_func(self.lib))
+            except:
+                # Ignore any errors during shutdown
+                pass
 
     @staticmethod
     def generate(kwargs: Dict[str, Any]) -> str:

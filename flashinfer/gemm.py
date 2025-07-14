@@ -944,7 +944,7 @@ def pad_indptr_to_multiple_of_4(
     return padded_m_indptr, padded_m_rank
 
 
-def gen_gemm_sm100_module() -> SimpleNamespace:
+def gen_deepgemm_sm100_module() -> SimpleNamespace:
     from flashinfer.deep_gemm import load_all
 
     load_all()
@@ -954,8 +954,8 @@ def gen_gemm_sm100_module() -> SimpleNamespace:
 
 
 @functools.cache
-def get_deep_gemm_sm100_module():
-    module = gen_gemm_sm100_module()
+def get_deepgemm_sm100_module():
+    module = gen_deepgemm_sm100_module()
     return module
 
 
