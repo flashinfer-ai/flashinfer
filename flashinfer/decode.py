@@ -1793,6 +1793,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_size: int,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
+    acc_q_len: Optional[int] = 1,
     q_scale: Optional[float] = 1.0,
     k_scale: Optional[float] = 1.0,
     v_scale: Optional[float] = 1.0,
@@ -1812,6 +1813,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_size: page_size
     max_seq_len: max sequence length
     out: output tensor, if not provided, will be allocated internally
+    acc_q_len: MTP query length. Should be num_draft_tokens + 1. todo(Yingyi): support MTP.
     q_scale: scale for mla q input. Quantization scale.
     k_scale: scale for mla k input. Quantization scale.
     v_scale: scale for mla v. Quantization scale.
@@ -1874,7 +1876,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        None,  # acc_q_len, speculative not supported for now
+        acc_q_len,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )
@@ -1892,6 +1894,7 @@ def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
+    acc_q_len: Optional[int] = 1,
     bmm1_scale: Optional[torch.Tensor] = None,
     bmm2_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
@@ -1908,6 +1911,7 @@ def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
     seq_lens: query_len
     block_size: page_size
     max_seq_len: max sequence length
+    acc_q_len: MTP query length. Should be num_draft_tokens + 1. todo(Yingyi): support MTP.
     bmm1_scale: per-tensor scale for mla bmm1 output. Shape is [1]
     bmm2_scale: per-tensor scale for mla bmm2 output. Shape is [1]
     out: output tensor, if not provided, will be allocated internally
@@ -1965,7 +1969,7 @@ def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        None,  # acc_q_len, speculative not supported for now
+        acc_q_len,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )

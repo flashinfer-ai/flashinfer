@@ -24,15 +24,12 @@
 // quantization not supported
 namespace flashinfer {
 template <Data_type CACHE_T>
-void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
-                                         at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
-                                         at::Tensor& block_tables, at::Tensor& seq_lens,
-                                         int64_t block_size, int64_t max_seq_len,
-                                         int64_t qk_nope_head_dim, int64_t kv_lora_rank,
-                                         int64_t qk_rope_head_dim, double bmm1_scale,
-                                         double bmm2_scale, std::optional<int64_t> acc_q_len,
-                                         std::optional<int64_t> max_attention_window_size,
-                                         std::optional<int64_t> cyclic_attention_window_size) {
+void trtllm_paged_attention_mla_launcher(
+    at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
+    at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
+    int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim, double bmm1_scale,
+    double bmm2_scale, int64_t acc_q_len, std::optional<int64_t> max_attention_window_size,
+    std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
   int const num_q_heads = query.size(1);
@@ -162,8 +159,7 @@ void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& 
                                 at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
                                 int64_t qk_nope_head_dim, int64_t kv_lora_rank,
                                 int64_t qk_rope_head_dim, double bmm1_scale, double bmm2_scale,
-                                std::optional<int64_t> acc_q_len,
-                                std::optional<int64_t> max_attention_window_size,
+                                int64_t acc_q_len, std::optional<int64_t> max_attention_window_size,
                                 std::optional<int64_t> cyclic_attention_window_size) {
   DISPATCH_BY_QKV_DTYPE(query.dtype(), key_value_cache.dtype(),
                         CALL_GEN_LAUNCHER);  // hybrid attention is not supported for now
@@ -174,8 +170,7 @@ void trtllm_paged_attention_mla_dynamic_scale_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
     int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim, double bmm1_scale,
-    double bmm2_scale, std::optional<int64_t> acc_q_len,
-    std::optional<int64_t> max_attention_window_size,
+    double bmm2_scale, int64_t acc_q_len, std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
@@ -291,7 +286,7 @@ void trtllm_paged_attention_mla_dynamic_scale(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
     int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
-    at::Tensor& bmm1_scale, at::Tensor& bmm2_scale, std::optional<int64_t> acc_q_len,
+    at::Tensor& bmm1_scale, at::Tensor& bmm2_scale, int64_t acc_q_len,
     std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   DISPATCH_BY_QKV_DTYPE(
