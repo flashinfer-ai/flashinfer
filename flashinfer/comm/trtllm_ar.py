@@ -26,7 +26,7 @@ from torch.distributed import ProcessGroup
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec
+from ..jit import gen_jit_spec, sm100a_nvcc_flags
 from ..utils import register_custom_op, round_up
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
@@ -96,6 +96,7 @@ class FP4QuantizationSFLayout:
 
 
 def gen_trtllm_comm_module() -> JitSpec:
+    major, minor = torch.cuda.get_device_capability()
     return gen_jit_spec(
         "trtllm_comm",
         [
@@ -103,6 +104,7 @@ def gen_trtllm_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
+        extra_cuda_cflags=sm100a_nvcc_flags if major >= 10 and minor >= 0 else [],
     )
 
 
