@@ -15,15 +15,19 @@ limitations under the License.
 """
 
 import functools
+import os
+from itertools import product
 from types import SimpleNamespace
 from typing import Literal, Optional, Tuple
 
+import jinja2
 import torch
 import torch.nn.functional as F
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -138,15 +142,76 @@ def get_gemm_module():
 
 
 def gen_gemm_sm100_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = []
+    for prefix in ["gemm_groupwise", "group_gemm_fp8_groupwise"]:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm100_kernel_inst.jinja"
+        ) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+        dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+        dtype_out_list = [torch.float16, torch.bfloat16]
+        scale_major_k_list = ["true", "false"]
+        mma_sm_list = [1, 2]
+        for dtype_in, dtype_out, scale_major_k, mma_sm in product(
+            dtype_in_list, dtype_out_list, scale_major_k_list, mma_sm_list
+        ):
+            name_dtype_in = filename_safe_dtype_map[dtype_in]
+            name_dtype_out = filename_safe_dtype_map[dtype_out]
+            dest_path = (
+                gen_directory
+                / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_sm100.cu"
+            )
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                dtype_in=dtype_cutlass_map[dtype_in],
+                dtype_out=dtype_cutlass_map[dtype_out],
+                scale_major_k=scale_major_k,
+                mma_sm=mma_sm,
+            )
+            write_if_different(dest_path, source)
+    prefix = "group_gemm_mxfp4_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm100_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    dtype_a_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+    dtype_d_list = [torch.float16, torch.bfloat16]
+    mma_sm_list = [1, 2]
+    swap_ab_list = ["true", "false"]
+    for dtype_a, dtype_d, mma_sm, swap_ab in product(
+        dtype_a_list, dtype_d_list, mma_sm_list, swap_ab_list
+    ):
+        name_dtype_a = filename_safe_dtype_map[dtype_a]
+        name_dtype_d = filename_safe_dtype_map[dtype_d]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_a}_{name_dtype_d}_mma{mma_sm}_swap{swap_ab}_sm100.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_a=dtype_cutlass_map[dtype_a],
+            dtype_b="cutlass::float_e2m1_t",
+            dtype_d=dtype_cutlass_map[dtype_d],
+            mma_sm=mma_sm,
+            swap_ab=swap_ab,
+        )
+        write_if_different(dest_path, source)
+    for filename in [
+        "gemm_groupwise_sm100.cu",
+        "group_gemm_fp8_groupwise_sm100.cu",
+        "group_gemm_mxfp4_groupwise_sm100.cu",
+        "gemm_sm100_pybind.cu",
+        "group_gemm_sm100_pybind.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
     return gen_jit_spec(
         "gemm_sm100",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_fp8_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp4_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
-        ],
+        source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
 
@@ -159,18 +224,43 @@ def get_gemm_sm100_module():
 
 
 def gen_gemm_sm90_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm90"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = []
+    with open(jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    for dtype_in, dtype_out in [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e5m2, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e5m2, torch.bfloat16),
+    ]:
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory / f"group_gemm_{name_dtype_in}_{name_dtype_out}_sm90.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+        )
+        write_if_different(dest_path, source)
+    for filename in [
+        "group_gemm_sm90.cu",
+        "flashinfer_gemm_sm90_ops.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
     return gen_jit_spec(
         "gemm_sm90",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
-        ],
+        source_paths,
         extra_cuda_cflags=sm90a_nvcc_flags,
     )
 
