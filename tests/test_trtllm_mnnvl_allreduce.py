@@ -65,7 +65,7 @@ def row_linear_residual_norm_fusion_forward(
             raise NotImplementedError("Fusion not implemented")
 
         else:
-            comm.trtllm_mnnvl_all_reduce(
+            comm.trtllm_mnnvl_ar.trtllm_mnnvl_all_reduce(
                 input,
                 output,
                 multicast_ptr,
@@ -81,7 +81,7 @@ def row_linear_residual_norm_fusion_forward(
 
     # Get workspace buffers using MPI rank
     mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
-        comm.get_allreduce_mnnvl_workspace(mapping, dtype)
+        comm.trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, dtype)
     )
 
     multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr_as_int64()
@@ -205,7 +205,7 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_len: int, fusion: bool):
         )
 
         # Synchronize before next test
-        comm.mpi_barrier()
+        comm.trtllm_mnnvl_ar.mpi_barrier()
 
         print(f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}")
 
@@ -214,7 +214,7 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_len: int, fusion: bool):
         if rank == 0:
             traceback.print_exc()
         # Don't exit immediately, let other tests run
-        comm.mpi_barrier()
+        comm.trtllm_mnnvl_ar.mpi_barrier()
 
     # Final synchronization and results
-    comm.mpi_barrier()
+    comm.trtllm_mnnvl_ar.mpi_barrier()
