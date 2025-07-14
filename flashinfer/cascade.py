@@ -21,7 +21,10 @@ import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
+from .prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    single_prefill_with_kv_cache,
+)
 from .utils import register_custom_op, register_fake_op
 
 _cascade_module = None
@@ -31,7 +34,7 @@ def get_cascade_module():
     global _cascade_module
     if _cascade_module is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
+            _kernels = torch.ops.flashinfer_hip_kernels
 
             _cascade_module = _kernels
         else:

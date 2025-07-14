@@ -15,7 +15,6 @@ from .cpp_ext import (
     generate_ninja_build_for_op,
     run_ninja,
 )
-from .env import FLASHINFER_AOT_DIR as FLASHINFER_AOT_DIR
 from .env import FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR
 from .env import FLASHINFER_GEN_SRC_DIR as FLASHINFER_GEN_SRC_DIR
 from .env import FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR
@@ -100,13 +99,7 @@ class JitSpec:
         return FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
     def get_library_path(self) -> Path:
-        if self.aot_path.exists():
-            return self.aot_path
         return self.jit_library_path
-
-    @property
-    def aot_path(self) -> Path:
-        return FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
@@ -127,13 +120,9 @@ class JitSpec:
             run_ninja(FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def build_and_load(self, class_name: str = None):
-        if self.aot_path.exists():
-            print("yy" * 100, self.aot_path)
-            so_path = self.aot_path
-        else:
-            so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose)
+        so_path = self.jit_library_path
+        verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+        self.build(verbose)
         load_class = class_name is not None
         loader = torch.classes if load_class else torch.ops
         loader.load_library(so_path)
@@ -222,8 +211,6 @@ def build_jit_specs(
 ) -> None:
     lines: List[str] = []
     for spec in specs:
-        if skip_prebuilt and spec.aot_path.exists():
-            continue
         lines.append(f"subninja {spec.ninja_path}")
     if not lines:
         return
