@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Code imported from TensorRT-LLM/tensorrt_llm/_mnnvl_utils.py
+import ctypes
 import logging
 import platform
 import sys
 from dataclasses import dataclass
+from typing import List
 
 import pynvml
 import torch
@@ -24,11 +26,88 @@ from cuda import cuda
 from mpi4py import MPI
 
 from ..cuda_utils import checkCudaErrors
-from .dlpack_utils import pack_strided_memory
+from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
 from .mapping import Mapping
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
+
+# Constants from C++ header
+SIGNAL_PAD_SIZE = 2048  # kSIGNAL_PAD_SIZE from header
+
+MNNVL_DEBUG = False
+
+
+def round_up(val: int, gran: int) -> int:
+    """Efficient implementation assuming gran is a power of 2"""
+    return (val + gran - 1) & ~(gran - 1)
+
+
+def create_tensor_from_cuda_memory(
+    ptr: int, shape: tuple, dtype: torch.dtype, device_id: int
+) -> torch.Tensor:
+    """
+    Create a PyTorch tensor from a CUDA memory pointer using DLPack.
+
+    Args:
+        ptr: CUDA memory pointer address as integer
+        shape: Desired tensor shape
+        dtype: PyTorch data type
+        device_id: CUDA device ID
+
+    Returns:
+        PyTorch tensor that wraps the CUDA memory
+    """
+    # Calculate total size in elements
+    numel = 1
+    for dim in shape:
+        numel *= dim
+
+    # Get element size in bytes
+    element_size = torch.tensor([], dtype=dtype).element_size()
+    total_size_bytes = numel * element_size
+
+    # Create DLPack capsule for contiguous memory (stride = element_size, num_segments = numel)
+    capsule_wrapper = create_dlpack_capsule(
+        ptr, element_size, element_size, numel, dtype, device_id
+    )
+
+    # Convert to tensor and reshape
+    tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
+    tensor._capsule_wrapper = capsule_wrapper  # Keep reference to prevent GC
+
+    # Reshape to desired shape
+    return tensor.view(shape)
+
+
+def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
+    """
+    Test if CUDA memory at ptr is accessible by trying to read/write a small amount.
+
+    Args:
+        ptr: CUDA memory pointer
+        size: Size of memory region
+        device_id: CUDA device ID
+
+    Returns:
+        True if memory is accessible, False otherwise
+    """
+    try:
+        # Test with a small 4-byte read/write
+        test_size = min(4, size)
+        host_data = bytearray(test_size)
+
+        # Try to copy from device to host
+        checkCudaErrors(cuda.cuMemcpyDtoH(host_data, ptr, test_size))
+
+        # Try to copy back from host to device
+        checkCudaErrors(cuda.cuMemcpyHtoD(ptr, host_data, test_size))
+
+        print(f"DEBUG: Memory access test PASSED for ptr=0x{ptr:x}")
+        return True
+    except Exception as e:
+        print(f"DEBUG: Memory access test FAILED for ptr=0x{ptr:x}: {e}")
+        return False
 
 
 class MpiComm:
@@ -308,3 +387,484 @@ class MnnvlMemory:
         if not "aarch64" in arch:
             return False
         return MnnvlMemory.support_nvlink(True)
+
+
+class McastDeviceMemory:
+    """Python port of McastDeviceMemory from TensorRT-LLM"""
+
+    def __init__(
+        self,
+        buf_size: int,
+        group_size: int,
+        group_rank: int,
+        device_idx: int,
+        is_multi_node: bool = True,
+    ):
+        cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
+
+        primary_ctx = checkCudaErrors(cuda.cuDevicePrimaryCtxRetain(cu_device))
+        checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
+
+        current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
+
+        # Set CUDA device
+        import cuda.cudart as cudart
+
+        checkCudaErrors(cudart.cudaSetDevice(device_idx))
+
+        self.is_multi_node = is_multi_node
+        self.device_idx = device_idx
+        self.group_size = group_size
+        self.group_rank = group_rank
+        self.buf_size = buf_size
+        self.signal_pad_offset = 0
+        self.allocation_size = 0
+
+        # CUDA memory handles and pointers
+        self.mc_ptr = 0  # CUdeviceptr mMcPtr
+        self.uc_ptrs: List[int] = []  # std::vector<CUdeviceptr> mUcPtrs
+        self.signal_pads_dev: List[int] = []  # std::vector<CUdeviceptr> mSignalPadsDev
+        self.mc_handle = 0  # CUmemGenericAllocationHandle mMcHandle
+        self.uc_handles: List[int] = (
+            []
+        )  # std::vector<CUmemGenericAllocationHandle> mUcHandles
+
+        # Signal pad constants
+        self.SIGNAL_PAD_ALIGNMENT = 16
+        self.SIGNAL_PAD_SIZE = SIGNAL_PAD_SIZE
+
+        # Check if device supports multicasting
+        multicast_supported = checkCudaErrors(
+            cuda.cuDeviceGetAttribute(
+                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
+                device_idx,
+            )
+        )
+        if multicast_supported == 0:
+            raise RuntimeError(
+                "[McastDeviceMemory] Device does not support multicasting."
+            )
+
+        # Calculate signal pad offset with alignment (matching C++ exactly)
+        self.signal_pad_offset = round_up(buf_size, self.SIGNAL_PAD_ALIGNMENT)
+
+        logging.info(
+            f"[McastDeviceMemory] Rank: {group_rank}, Group size: {group_size}, "
+            f"mnNvlink: {is_multi_node}, device_idx: {device_idx}, "
+            f"Signal pad offset: {self.signal_pad_offset}"
+        )
+
+        if self.is_multi_node:
+            # Check if fabric handle is supported
+            fabric_handle_supported = checkCudaErrors(
+                cuda.cuDeviceGetAttribute(
+                    cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                    device_idx,
+                )
+            )
+            if fabric_handle_supported == 0:
+                raise RuntimeError(
+                    "[McastDeviceMemory] Device does not support fabric handle."
+                )
+
+            current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
+
+            self._alloc_mn_mcast_mem(buf_size)
+        else:
+            # For single-node NVLS, would need to implement _alloc_nvls_mcast_mem
+            raise NotImplementedError("Single-node NVLS allocation not implemented yet")
+
+        # Initialize signal pads
+        self.signal_pads_dev = [0] * self.group_size
+        for i in range(self.group_size):
+            self.signal_pads_dev[i] = self.uc_ptrs[i] + self.signal_pad_offset
+            if i == self.group_rank:
+                checkCudaErrors(
+                    cuda.cuMemsetD8(self.signal_pads_dev[i], 0, self.SIGNAL_PAD_SIZE)
+                )
+
+    def __del__(self):
+        """Destructor - cleanup allocated memory"""
+
+        # Check if we're in a valid state for cleanup
+        if not hasattr(self, "is_multi_node"):
+            return
+
+        if not self.is_multi_node:
+            return
+
+        # Skip cleanup during Python finalization to avoid segfaults
+        # Especially cause the CUDA context could be destroyed at this point.
+        if sys.is_finalizing():
+            return
+
+        # Verify CUDA context is still valid
+        try:
+            cuda.cuCtxGetCurrent()
+        except Exception as e:
+            print(f"Destructor: CUDA context invalid, skipping cleanup: {e}")
+            return
+
+        # Unmap UC regions and release their handles
+        if hasattr(self, "uc_handles") and self.uc_handles:
+            for rank in range(self.group_size):
+                if self.uc_handles[rank] != 0:
+                    try:
+                        # Release the handle
+                        checkCudaErrors(cuda.cuMemRelease(self.uc_handles[rank]))
+                        # Unmap the vmem
+                        if rank < len(self.uc_ptrs) and self.uc_ptrs[rank]:
+                            checkCudaErrors(
+                                cuda.cuMemUnmap(
+                                    self.uc_ptrs[rank], self.allocation_size
+                                )
+                            )
+                    except Exception as e:
+                        print(
+                            f"Destructor: Failed to release UC handle for rank {rank}: {e}"
+                        )
+
+            # Free the UC address space
+            if hasattr(self, "uc_base_ptr") and self.uc_base_ptr:
+                checkCudaErrors(
+                    cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
+                )
+
+        # Release MC handle
+        if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
+            try:
+                checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+                checkCudaErrors(
+                    cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size)
+                )
+                checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
+            except Exception as e:
+                print(f"Destructor: Failed to release MC handle: {e}")
+
+    def get_signal_pad_ptrs_dev(self) -> List[int]:
+        """Get the raw array of signal pad pointers to all ranks (including self)"""
+        return self.signal_pads_dev
+
+    def get_buffer_ptrs_dev(self) -> List[int]:
+        """Get the raw array of unicast pointers to all ranks (including self)"""
+        return self.uc_ptrs
+
+    def get_unicast_ptr(self, rank: int) -> int:
+        """Get the raw unicast pointer to a given rank"""
+        if rank >= len(self.uc_ptrs):
+            raise ValueError(f"Rank {rank} out of range (0-{len(self.uc_ptrs)-1})")
+
+        data_ptr = self.uc_ptrs[rank]
+        # Note: In C++, this would call tensorrt_llm::common::registerMcastDevMemBuffer
+        # For Python port, we skip this registration for now
+        return data_ptr
+
+    def get_multicast_ptr(self) -> int:
+        """Get the raw multicast pointer"""
+        # Note: In C++, this would call tensorrt_llm::common::registerMcastDevMemBuffer
+        # For Python port, we skip this registration for now
+        return int(self.mc_ptr)
+
+    def get_rank(self) -> int:
+        """Get the rank of this device in the group"""
+        return self.group_rank
+
+    def get_world_size(self) -> int:
+        """Get the total number of devices in the group"""
+        return self.group_size
+
+    def _alloc_mn_mcast_mem(self, buf_size: int):
+        """Allocate multi-node multicast memory using MNNVL"""
+
+        # Verify CUDA context
+        try:
+            current_device = checkCudaErrors(cuda.cuCtxGetDevice())
+            current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
+
+            if int(current_device) != self.device_idx:
+                print(
+                    f"CUDA context device mismatch! Current: {current_device}, Expected: {self.device_idx}"
+                )
+        except Exception as e:
+            print(f"Error checking CUDA context: {e}")
+
+        # Get MPI communicator
+        comm = MpiComm()
+
+        # Set up allocation properties
+        handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+
+        allocation_prop = cuda.CUmemAllocationProp()
+        allocation_prop.requestedHandleTypes = handle_type
+        allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        allocation_prop.location = cuda.CUmemLocation()
+        allocation_prop.location.type = (
+            cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        )
+        allocation_prop.location.id = self.device_idx
+
+        allocation_prop.allocFlags.gpuDirectRDMACapable = 1
+
+        # Get allocation granularity
+        alloc_granularity = checkCudaErrors(
+            cuda.cuMemGetAllocationGranularity(
+                allocation_prop,
+                cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        )
+
+        # mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
+        self.allocation_size = round_up(
+            buf_size + self.SIGNAL_PAD_SIZE, alloc_granularity
+        )
+
+        # Set up multicast properties
+        mc_prop = cuda.CUmulticastObjectProp()
+        mc_prop.numDevices = self.group_size
+        mc_prop.size = self.allocation_size
+        mc_prop.handleTypes = handle_type
+
+        # Get multicast granularity
+        mc_granularity = checkCudaErrors(
+            cuda.cuMulticastGetGranularity(
+                mc_prop,
+                cuda.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
+            )
+        )
+
+        self.allocation_size = round_up(self.allocation_size, mc_granularity)
+
+        # Initialize UC handles list
+        self.uc_handles = [0] * self.group_size
+
+        # Allocate local GPU memory
+        self.uc_handles[self.group_rank] = checkCudaErrors(
+            cuda.cuMemCreate(self.allocation_size, allocation_prop, 0)
+        )
+
+        # Export local handle to fabric handle
+        my_fabric_handle = checkCudaErrors(
+            cuda.cuMemExportToShareableHandle(
+                self.uc_handles[self.group_rank],
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                0,
+            )
+        )
+
+        # All-gather fabric handles
+        all_fabric_handles = comm.allgather(my_fabric_handle.data)
+        cuda.cuCtxSynchronize()
+
+        # Import remote handles
+        for p in range(self.group_size):
+            if p != self.group_rank:
+                self.uc_handles[p] = checkCudaErrors(
+                    cuda.cuMemImportFromShareableHandle(
+                        all_fabric_handles[p],
+                        cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                    )
+                )
+
+        # Initialize multicasting
+        if self.group_rank == 0:
+            # Create multicast object
+            self.mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
+
+            # Export multicast handle
+            mc_fabric_handle = checkCudaErrors(
+                cuda.cuMemExportToShareableHandle(
+                    self.mc_handle,
+                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                    0,
+                )
+            )
+        else:
+            mc_fabric_handle = None
+
+        # Broadcast multicast handle
+        mc_fabric_handle_data = comm.bcast(
+            mc_fabric_handle.data if mc_fabric_handle else None, root=0
+        )
+        # Sync device to ensure broadcast is complete
+        cuda.cuCtxSynchronize()
+        # Import multicast handle for non-root ranks
+        if self.group_rank != 0:
+            self.mc_handle = checkCudaErrors(
+                cuda.cuMemImportFromShareableHandle(
+                    mc_fabric_handle_data,
+                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                )
+            )
+
+        # Add device to multicast
+        checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
+
+        # Bind memory addresses
+        self.uc_ptrs = [0] * self.group_size
+
+        # Reserve address space for UC pointers
+        total_uc_size = self.allocation_size * self.group_size
+        self.total_uc_size = total_uc_size
+        uc_base_ptr = checkCudaErrors(
+            cuda.cuMemAddressReserve(total_uc_size, mc_granularity, 0, 0)
+        )
+        self.uc_base_ptr = uc_base_ptr  # Store for cleanup
+
+        # Set up memory access descriptor
+        access_desc = cuda.CUmemAccessDesc()
+        access_desc.location = cuda.CUmemLocation()
+        access_desc.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        access_desc.location.id = self.device_idx
+        access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+
+        # Map UC memory
+        for i in range(self.group_size):
+            offset = self.allocation_size * i
+            self.uc_ptrs[i] = int(uc_base_ptr) + offset
+            checkCudaErrors(
+                cuda.cuMemMap(
+                    self.uc_ptrs[i], self.allocation_size, 0, self.uc_handles[i], 0
+                )
+            )
+
+        # Set memory access permissions
+        checkCudaErrors(
+            cuda.cuMemSetAccess(uc_base_ptr, total_uc_size, [access_desc], 1)
+        )
+
+        # Bind MC pointer
+        self.mc_ptr = checkCudaErrors(
+            cuda.cuMemAddressReserve(self.allocation_size, mc_granularity, 0, 0)
+        )
+        checkCudaErrors(
+            cuda.cuMemMap(self.mc_ptr, self.allocation_size, 0, self.mc_handle, 0)
+        )
+        checkCudaErrors(
+            cuda.cuMemSetAccess(self.mc_ptr, self.allocation_size, [access_desc], 1)
+        )
+
+        # Bind memory to multicast
+        checkCudaErrors(
+            cuda.cuMulticastBindMem(
+                self.mc_handle,
+                0,  # mcOffset
+                self.uc_handles[self.group_rank],
+                0,  # memOffset
+                self.allocation_size,
+                0,  # flags
+            )
+        )
+
+    def get_multicast_ptr_as_int64(self) -> int:
+        """Get multicast pointer as int64 (legacy compatibility)"""
+        return self.get_multicast_ptr()
+
+    def get_buffer_ptrs_dev_as_int64(self) -> int:
+        """Get buffer pointers device as int64 (returning first UC pointer for now) (legacy compatibility)"""
+        return self.uc_ptrs[0] if self.uc_ptrs else 0
+
+    def lamport_initialize(self, rank: int, dtype: torch.dtype):
+        if dtype == torch.bfloat16:
+            neg_zero = 0x8000
+            dsize = 2
+            memset_func = cuda.cuMemsetD16
+        elif dtype == torch.float32:
+            neg_zero = 0x80000000
+            dsize = 4
+            memset_func = cuda.cuMemsetD32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+
+        # Calculate number of elements that fit in allocation_size
+        num_elements = self.allocation_size // dsize
+
+        checkCudaErrors(
+            memset_func(int(self.uc_ptrs[self.group_rank]), neg_zero, num_elements)
+        )
+
+
+class McastGPUBuffer:
+    """
+    Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
+    It manages a buffer accessible via unicast or multicast for multi-node communication.
+
+    Python port of McastGPUBuffer from TensorRT-LLM
+    """
+
+    def __init__(
+        self,
+        buf_size: int,
+        group_size: int,
+        group_rank: int,
+        device: torch.device,
+        mn_nvlink: bool = True,
+    ):
+        """
+        Constructor for McastGpuBuffer.
+
+        Args:
+            buf_size: The total size of the buffer in bytes
+            group_size: The number of ranks in the communication group
+            group_rank: The rank of the local process within the group
+            device: The CUDA device for buffer allocation
+            mn_nvlink: Flag indicating if multi-node NVLink is used
+        """
+        self.mcast_device_memory = McastDeviceMemory(
+            buf_size, group_size, group_rank, device.index, mn_nvlink
+        )
+        self.buf_size = buf_size
+        self.local_device = device
+
+    def lamport_initialize(self, rank: int):
+        self.mcast_device_memory.lamport_initialize(rank)
+
+    def get_mc_buffer(
+        self, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0
+    ) -> torch.Tensor:
+        """
+        Returns a PyTorch tensor view of the multicast buffer portion.
+
+        Args:
+            sizes: The desired shape (dimensions) of the tensor
+            dtype: The data type of the tensor elements
+            storage_offset: The offset in elements from the start of the buffer
+
+        Returns:
+            A PyTorch tensor wrapping the multicast buffer section
+        """
+        raise NotImplementedError("Not implemented yet")
+
+    def get_multicast_ptr(self) -> int:
+        """Get the raw multicast pointer"""
+        return self.mcast_device_memory.get_multicast_ptr()
+
+    def get_multicast_ptr_as_int64(self) -> int:
+        """Get the multicast pointer as int64"""
+        return self.get_multicast_ptr()
+
+    def get_buffer_ptrs_dev(self) -> List[int]:
+        """Get the buffer pointers device array"""
+        return self.mcast_device_memory.get_buffer_ptrs_dev()
+
+    def get_buffer_ptrs_dev_as_int64(self) -> int:
+        """Get the buffer pointers device as int64 (returning first UC pointer)"""
+        ptrs = self.get_buffer_ptrs_dev()
+        assert ptrs is not None
+        return ptrs[0] if ptrs else 0
+
+    def get_buffer_ptrs_dev_as_ctypes_ptr(self) -> int:
+        """
+        Get buffer pointers as ctypes array pointer (equivalent to C++ void**).
+        Returns the address of a ctypes array that can be cast to int64_t and back to void**.
+
+        This matches the C++ pattern:
+        reinterpret_cast<int64_t>(reinterpret_cast<void**>(mUcPtrs.data()))
+        """
+        # Create ctypes array of void pointers
+        ArrayType = ctypes.c_void_p * len(self.mcast_device_memory.uc_ptrs)
+        self._buffer_ptrs_array = ArrayType(
+            *self.mcast_device_memory.uc_ptrs
+        )  # Keep reference to prevent GC
+
+        # Return the address of this array (equivalent to .data() in C++)
+        return ctypes.cast(self._buffer_ptrs_array, ctypes.c_void_p).value
