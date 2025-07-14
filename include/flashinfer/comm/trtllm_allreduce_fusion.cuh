@@ -1,6 +1,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 
 #include <cuda/std/optional>
 #include <tuple>
@@ -544,6 +545,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
   //         "f"(array[6]), "f"(array[7]));
   //   return val;
   // #else
+  uint32_t val;
   __nv_fp4x2_storage_t vals[4];
   for (int i = 0; i < 4; i++) {
     vals[i] = __nv_cvt_float2_to_fp4x2(*(((float2*)array) + i), __NV_E2M1, cudaRoundNearest);
@@ -576,6 +578,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   //         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   //   return val;
   // #else
+  uint32_t val;
   __nv_fp4x2_storage_t vals[4];
   for (int i = 0; i < 4; i++) {
     vals[i] = __nv_cvt_float2_to_fp4x2(array[i], __NV_E2M1, cudaRoundNearest);
