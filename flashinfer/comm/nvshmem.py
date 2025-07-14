@@ -1,6 +1,7 @@
 import ctypes
 import functools
 import os
+import shlex
 from typing import Sequence
 
 import torch
@@ -11,14 +12,18 @@ from ..jit import gen_jit_spec
 
 
 def gen_nvshmem_module() -> JitSpec:
+    lib_dirs = jit_env.get_nvshmem_lib_dirs()
+    ldflags = (
+        [f"-L{lib_dir}" for lib_dir in lib_dirs]
+        + ["-lnvshmem_device"]
+        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
+    )
+
     return gen_jit_spec(
         "nvshmem",
         [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
-        extra_include_paths=[jit_env.get_nvshmem_include_dir()],
-        extra_ldflags=[
-            f"-L{jit_env.get_nvshmem_lib_dir()}",
-            "-lnvshmem_device",
-        ],
+        extra_include_paths=[str(p) for p in jit_env.get_nvshmem_include_dirs()],
+        extra_ldflags=ldflags,
         needs_device_linking=True,
     )
 
@@ -27,18 +32,23 @@ def gen_nvshmem_module() -> JitSpec:
 def get_nvshmem_module():
     from pathlib import Path
 
-    import nvidia.nvshmem
-
     # Try to find libnvshmem_host.so first, fallback to libnvshmem_host.so.3
-    nvshmem_lib_path = Path(nvidia.nvshmem.__path__[0]) / "lib"
-    lib_path = nvshmem_lib_path / "libnvshmem_host.so"
+    lib_dirs = jit_env.get_nvshmem_lib_dirs()
+    lib_path = None
 
-    if not lib_path.exists():
-        lib_path = nvshmem_lib_path / "libnvshmem_host.so.3"
+    lib_names = ["libnvshmem_host.so", "libnvshmem_host.so.3"]
+    for lib_dir in lib_dirs:
+        for lib_name in lib_names:
+            candidate_path = lib_dir / lib_name
+            if candidate_path.exists():
+                lib_path = candidate_path
+                break
+        if lib_path is not None:
+            break
 
-    if not lib_path.exists():
+    if lib_path is None:
         raise FileNotFoundError(
-            f"Could not find libnvshmem_host.so or libnvshmem_host.so.3 in {nvshmem_lib_path}"
+            f"Could not find libnvshmem_host.so or libnvshmem_host.so.3 in {lib_dirs}"
         )
 
     ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
