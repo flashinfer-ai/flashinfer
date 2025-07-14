@@ -1850,7 +1850,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        batch_size, num_q_heads, _ = query.shape
+        _check_shape_dtype_device(
+            out,
+            [batch_size, num_q_heads, kv_lora_rank],
+            query.dtype,
+            query.device,
+            "out",
+        )
 
     bmm1_scale = (
         q_scale * k_scale * sm_scale / (qk_nope_head_dim + qk_rope_head_dim) ** 0.5
