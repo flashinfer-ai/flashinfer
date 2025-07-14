@@ -1821,11 +1821,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
-
-    For fp8 quantized output (NOTE: not supported for now),
-        bmm2_scale = v_scale * FP8_MAX_SCALE / o_scale,
-    otherwise,
-        bmm2_scale = v_scale, where o_scale should be 1.0.
+    bmm2_scale = v_scale * o_scale
 
     The two scale factors should be static constant for cuda graph capture.
 
@@ -1862,7 +1858,98 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale = (
         q_scale * k_scale * sm_scale / (qk_nope_head_dim + qk_rope_head_dim) ** 0.5
     )
-    bmm2_scale = v_scale / o_scale
+    bmm2_scale = v_scale * o_scale
+
+    run_func(
+        out,
+        query,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        bmm1_scale,
+        bmm2_scale,
+        None,  # acc_q_len, speculative not supported for now
+        None,  # max_attention_window_size, sliding window not supported for now
+        None,  # cyclic_attention_window_size, cyclic window not supported for now
+    )
+    return out
+
+
+def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    bmm1_scale: Optional[torch.Tensor] = None,
+    bmm2_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Parameters:
+    query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
+    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    qk_nope_head_dim: qk_nope_head_dim, must be 128
+    kv_lora_rank: kv_lora_rank, must be 512
+    qk_rope_head_dim: qk_rope_head_dim, must be 64
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: query_len
+    block_size: page_size
+    max_seq_len: max sequence length
+    bmm1_scale: per-tensor scale for mla bmm1 output. Shape is [1]
+    bmm2_scale: per-tensor scale for mla bmm2 output. Shape is [1]
+    out: output tensor, if not provided, will be allocated internally
+
+    Note:
+    In MLA, the BMM1 scales are applied at QK before softmax. The BMM2 scales are applied at V and O after softmax.
+    We expect the two scales are already fused.
+    ** Only use this api when (1) your scale is at device memory (2) you are using dynamic scale for mla output. Otherwise, use trtllm_batch_decode_with_kv_cache_mla **
+
+    """
+    run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla_dynamic_scale
+
+    if block_size != 32 and block_size != 64:
+        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+    _check_trtllm_gen_mla_shape(
+        query,
+        kv_cache,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        block_size,
+    )
+
+    if bmm1_scale.shape != (1,) or bmm2_scale.shape != (1,):
+        raise ValueError(
+            "bmm1_scale and bmm2_scale must be per-tensor scale. Shape must be [1]."
+        )
+
+    if out is None:
+        out_shape = query.shape[:-1] + (kv_lora_rank,)
+        out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
+    else:
+        batch_size, num_q_heads, _ = query.shape
+        _check_shape_dtype_device(
+            out,
+            [batch_size, num_q_heads, kv_lora_rank],
+            query.dtype,
+            query.device,
+            "out",
+        )
 
     run_func(
         out,

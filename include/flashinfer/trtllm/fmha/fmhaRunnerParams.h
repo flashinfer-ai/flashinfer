@@ -166,6 +166,8 @@ struct TllmGenFmhaRunnerParams {
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
+  // Whether to use gemm scale.
+  bool mUseGemmScale;
 
   // Input QKV buffers.
   void const* qPtr;
@@ -250,9 +252,6 @@ struct TllmGenFmhaRunnerParams {
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;
-
-  // note(Yingyi): might take an output scale later
-  // float mOutputScale;
 
   // The SF scale for Kv.
   float mScaleSfKv;
