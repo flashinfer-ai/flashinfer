@@ -103,7 +103,7 @@ def reference_paged_attention(
 @pytest.mark.parametrize("q_dtype", ["half", "bf16"])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-def test_trtllm_batch_decode(
+def test_trtllm_batch_decode_fmha(
     kv_layout,
     batch_size,
     page_size,
@@ -242,3 +242,194 @@ def test_trtllm_batch_decode(
         output_ref = wrapper.run(q, kv_cache)
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "batch_size", [16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+)
+@pytest.mark.parametrize("scale", [1.0, 0.5])
+@pytest.mark.parametrize(
+    "dtype", [torch.float8_e4m3fn, torch.bfloat16]
+)  # todo(Yingyi): add float8_e4m3fn
+@pytest.mark.parametrize("page_size", [32, 64])
+def test_trtllm_batch_decode_mla(
+    batch_size: int,
+    scale: float,
+    dtype: torch.dtype,
+    page_size: int,
+    kv_layout: str = "HND",  # trtllm-gen only support HND
+):
+    torch.manual_seed(42)
+    device = "cuda:0"
+
+    # Fixed max sequence length
+    MAX_SEQ_LEN = 1024
+
+    # Deepseek attention config (decode-MLA)
+    num_q_heads = 128
+    num_kv_heads = 1
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+
+    # Initialize tensors
+    query = (
+        torch.zeros(batch_size, num_q_heads, kv_lora_rank + qk_rope_head_dim)
+        .to(device)
+        .to(dtype)
+    )
+    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
+    # bmm1_scale_tensor = (
+    #     torch.tensor([1.0], dtype=torch.float32, device=device)
+    #     if dtype == torch.float8_e4m3fn
+    #     else None
+    # )
+    # bmm2_scale_tensor = (
+    #     torch.tensor([1.0], dtype=torch.float32, device=device)
+    #     if dtype == torch.float8_e4m3fn
+    #     else None
+    # )
+
+    num_tokens = MAX_SEQ_LEN * batch_size
+    num_blocks = (num_tokens + page_size - 1) // page_size
+
+    # Sequence lengths and block tables
+    seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
+    seq_lens[-1] = MAX_SEQ_LEN
+    max_seq_len = max(seq_lens)
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
+
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    max_num_blocks_per_seq = blocks_per_seq.max().item()
+
+    # Generate random but unique block IDs for all sequences
+    total_blocks_needed = sum(blocks_per_seq)
+    all_block_ids = torch.randperm(
+        total_blocks_needed, device=device
+    )  # Random permutation
+
+    # Generate unique block IDs for all sequences
+    block_id = 0
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq), dtype=torch.int, device=device
+    )
+
+    # Populate block tables and track block assignments
+    block_id = 0
+    for i in range(batch_size):
+        num_blocks_needed = blocks_per_seq[i]
+        block_tables[i, :num_blocks_needed] = all_block_ids[
+            block_id : block_id + num_blocks_needed
+        ]
+        block_id += num_blocks_needed
+
+    # Create interleaved KV cache
+    # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
+    kv_cache = (
+        torch.randn(size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim))
+        .to(dtype)
+        .to(device)
+    )
+    # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
+    # todo(Yingyi): do not duplicate kv_cache for the next generated cubins
+    kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
+    # kv_cache_duplicate = torch.stack([kv_cache], dim=1)
+
+    # Allocate workspace buffer
+    # todo(Yingyi): calculate the actual size of workspace buffer
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    # Run decode-MLA
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache_duplicate,  # kv_cache.unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens_tensor,
+        block_size=page_size,
+        max_seq_len=max_seq_len,
+        scale=scale / ((512 + 64) ** 0.5) * ((128 + 64) ** 0.5),
+    )
+    torch.cuda.synchronize()
+
+    # Run reference attention and align output
+    sm_scale = (
+        1.0 / scale / ((128 + 64) ** 0.5)
+    )  # use head dimension before matrix absorption
+    workspace_buffer_ref = torch.empty(
+        128 * 1024 * 1024, dtype=torch.int8, device=device
+    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace_buffer_ref,
+        backend="fa2",
+        # use_cuda_graph=True,
+        # qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        # kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        # kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
+        # kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
+    )
+
+    if dtype == torch.float8_e4m3fn:
+        # convert query and kv_cache to bfloat16
+        query = query.to(torch.bfloat16).to(device)
+        kv_cache = kv_cache.to(torch.bfloat16).to(device)
+
+    q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * 1
+    kv_indptr = (
+        torch.cat(
+            [torch.tensor([0], device=device), torch.cumsum(blocks_per_seq, dim=0)]
+        )
+        .int()
+        .to(device)
+    )
+    kv_indices = all_block_ids.int()
+
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        seq_lens_tensor,
+        num_q_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        True,
+        sm_scale,
+        query.dtype,
+        kv_cache.dtype,
+    )
+    q_nope = query[..., :kv_lora_rank]
+    q_pe = query[..., kv_lora_rank:]
+
+    # todo: fix kv_cache
+    ckv = kv_cache[..., :kv_lora_rank]
+    kpe = kv_cache[..., kv_lora_rank:]
+
+    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    # print("output", output)
+    # print("o_ref", o_ref)
+
+    if dtype == torch.float8_e4m3fn:
+        try:
+            torch.testing.assert_close(
+                output, o_ref, rtol=1e-1, atol=1e-1
+            )  # todo: do reference with normal attention?
+        except AssertionError as e:
+            print("output:", output)
+            print("o_ref:", o_ref)
+            raise e
+    else:
+        try:
+            torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=1e-2)
+        except AssertionError as e:
+            print("output:", output)
+            print("o_ref:", o_ref)
+            raise e
+
+
+if __name__ == "__main__":
+    # run all tests in the order of pytest
+    test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 16)

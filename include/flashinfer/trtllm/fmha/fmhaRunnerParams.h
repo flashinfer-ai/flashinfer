@@ -196,8 +196,10 @@ struct TllmGenFmhaRunnerParams {
   int const* kvPageIdxPtr;
   // The device output scale for FP8 quantization.
   float const* outputScalePtr;
+  float outputScale;
   // The device scaling factor for softmax (multiplied by log2 to use faster exp2)
   float const* scaleSoftmaxLog2Ptr;
+  float scaleSoftmaxLog2;
   // The device scale for KV scaling factor.
   float const* kvSfScalePtr;
   // The device scale for O scaling factor.
@@ -248,6 +250,9 @@ struct TllmGenFmhaRunnerParams {
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;
+
+  // note(Yingyi): might take an output scale later
+  // float mOutputScale;
 
   // The SF scale for Kv.
   float mScaleSfKv;
