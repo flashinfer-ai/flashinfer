@@ -274,21 +274,10 @@ def test_trtllm_batch_decode_mla(
 
     # Initialize tensors
     query = (
-        torch.zeros(batch_size, num_q_heads, kv_lora_rank + qk_rope_head_dim)
+        torch.randn(batch_size, num_q_heads, kv_lora_rank + qk_rope_head_dim)
         .to(device)
         .to(dtype)
     )
-    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
-    # bmm1_scale_tensor = (
-    #     torch.tensor([1.0], dtype=torch.float32, device=device)
-    #     if dtype == torch.float8_e4m3fn
-    #     else None
-    # )
-    # bmm2_scale_tensor = (
-    #     torch.tensor([1.0], dtype=torch.float32, device=device)
-    #     if dtype == torch.float8_e4m3fn
-    #     else None
-    # )
 
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
@@ -333,7 +322,6 @@ def test_trtllm_batch_decode_mla(
     # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
     # todo(Yingyi): do not duplicate kv_cache for the next generated cubins
     kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
-    # kv_cache_duplicate = torch.stack([kv_cache], dim=1)
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
@@ -342,7 +330,7 @@ def test_trtllm_batch_decode_mla(
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
-        kv_cache=kv_cache_duplicate,  # kv_cache.unsqueeze(1),
+        kv_cache=kv_cache_duplicate,
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
@@ -351,13 +339,17 @@ def test_trtllm_batch_decode_mla(
         seq_lens=seq_lens_tensor,
         block_size=page_size,
         max_seq_len=max_seq_len,
-        scale=scale / ((512 + 64) ** 0.5) * ((128 + 64) ** 0.5),
+        q_scale=1.0,
+        k_scale=1.0,
+        v_scale=1.0,
+        sm_scale=scale,
+        o_scale=1.0,
     )
     torch.cuda.synchronize()
 
     # Run reference attention and align output
-    sm_scale = (
-        1.0 / scale / ((128 + 64) ** 0.5)
+    sm_scale = scale / (
+        (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
@@ -409,8 +401,6 @@ def test_trtllm_batch_decode_mla(
     kpe = kv_cache[..., kv_lora_rank:]
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
-    # print("output", output)
-    # print("o_ref", o_ref)
 
     if dtype == torch.float8_e4m3fn:
         try:
@@ -428,8 +418,3 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
-
-
-if __name__ == "__main__":
-    # run all tests in the order of pytest
-    test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 16)

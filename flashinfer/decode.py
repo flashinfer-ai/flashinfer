@@ -1792,10 +1792,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
-    bmm1_scale: Optional[float] = 1.0,
-    bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
+    q_scale: Optional[float] = 1.0,
+    k_scale: Optional[float] = 1.0,
+    v_scale: Optional[float] = 1.0,
+    sm_scale: Optional[float] = 1.0,
+    o_scale: Optional[float] = 1.0,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -1809,19 +1811,23 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: query_len
     block_size: page_size
     max_seq_len: max sequence length
-    scale: model scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: scale for mla bmm1 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
-    bmm2_scale: scale for mla bmm2 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
+    q_scale: scale for mla q input. Quantization scale.
+    k_scale: scale for mla k input. Quantization scale.
+    v_scale: scale for mla v. Quantization scale.
+    sm_scale: scale for mla softmax output. Model-specific scale.
+    o_scale: scale for mla output. Quantization scale.
 
     Note:
-    For FP8 quantization, we could have those per-tensor scales:
-    - q_scale: dynamic scale for query, shape is [1]
-    - k_scale: loaded scale for kv_cache, shape is [1]
-    - v_scale: loaded scale for kv_cache, shape is [1]
-    We could calculate bmm1_scale and bmm2_scale as:
-    - bmm1_scale = q_scale * k_scale
-    - bmm2_scale = v_scale
+    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
+    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
+
+    For fp8 quantized output (NOTE: not supported for now),
+        bmm2_scale = v_scale * FP8_MAX_SCALE / o_scale,
+    otherwise,
+        bmm2_scale = v_scale, where o_scale should be 1.0.
+
+    The two scale factors should be static constant for cuda graph capture.
 
     TODO: We might support per-head / per-block / any finer-grained quantization in the future.
     """
@@ -1840,32 +1846,22 @@ def trtllm_batch_decode_with_kv_cache_mla(
         block_size,
     )
 
-    # todo(Yingyi): update to be tensor
-    # if bmm1_scale is None:
-    #     bmm1_scale = torch.tensor(1.0, device=query.device, dtype=query.dtype)
-    # if bmm2_scale is None:
-    #     bmm2_scale = torch.tensor(1.0, device=query.device, dtype=query.dtype)
-
     if out is None:
         out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
 
-    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
-    # if kv_cache.dtype == torch.float8_e4m3fn and (
-    #     bmm1_scale is None or bmm2_scale is None
-    # ):
-    #     raise ValueError(
-    #         "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
-    #     )
+    bmm1_scale = (
+        q_scale * k_scale * sm_scale / (qk_nope_head_dim + qk_rope_head_dim) ** 0.5
+    )
+    bmm2_scale = v_scale / o_scale
 
     run_func(
         out,
         query,
         kv_cache,
         workspace_buffer,
-        scale,
         block_tables,
         seq_lens,
         block_size,

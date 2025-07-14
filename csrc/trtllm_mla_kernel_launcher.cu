@@ -24,13 +24,15 @@
 // quantization not supported
 namespace flashinfer {
 template <Data_type CACHE_T>
-void trtllm_paged_attention_mla_launcher(
-    at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
-    double scale, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
-    int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
-    double bmm1_scale, double bmm2_scale, std::optional<int64_t> acc_q_len,
-    std::optional<int64_t> max_attention_window_size,
-    std::optional<int64_t> cyclic_attention_window_size) {
+void trtllm_paged_attention_mla_launcher(at::Tensor& out, at::Tensor& query,
+                                         at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
+                                         at::Tensor& block_tables, at::Tensor& seq_lens,
+                                         int64_t block_size, int64_t max_seq_len,
+                                         int64_t qk_nope_head_dim, int64_t kv_lora_rank,
+                                         int64_t qk_rope_head_dim, double bmm1_scale,
+                                         double bmm2_scale, std::optional<int64_t> acc_q_len,
+                                         std::optional<int64_t> max_attention_window_size,
+                                         std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
   int const num_q_heads = query.size(1);
@@ -117,41 +119,16 @@ void trtllm_paged_attention_mla_launcher(
   // The chunked attention size.
   runner_params.mChunkedAttentionSize = INT_MAX;
 
-  // The scaleQ that will be applied to the BMM1 output.
-  // NOTE(Yingyi): set scale to be a api param, default 1.0
-  // Q_SCALE & KV_SCALE not supported for now
-  // runner_params.mScaleQ = scale * sqrt((float)(qk_nope_head_dim + qk_rope_head_dim)) /
-  //                         sqrtf((float)(kv_lora_rank + qk_rope_head_dim));
-  runner_params.mScaleQ = scale;
+  runner_params.mScaleQ = 1.0;
 
-  // runner_params.mNumPagesInMemPool = INT_MAX;
-  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
-  int max_head_dim_kv = head_size;
-  // runner_params.mNumPagesInMemPool =
-  //     total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
-  //                     max_head_dim_kv * get_size_in_bytes(CACHE_T));
   runner_params.mNumPagesInMemPool = 0;
-
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   runner_params.stream = stream;
   // NOTE (Yingyi): quantization, not supported for now
   runner_params.mSfStartTokenIdx = 0;
 
   runner_params.outputScale = bmm2_scale;
-  runner_params.scaleSoftmaxLog2 = bmm1_scale;
-  // if (CACHE_T == Data_type::DATA_TYPE_E4M3) {
-  //   // NOTE(Yingyi): bmm1_scale and bmm2_scale are 1.0 could work already
-  //   runner_params.outputScale = bmm2_scale;
-  //   runner_params.scaleSoftmaxLog2 = bmm1_scale;
-
-  //   // NOTE(Yingyi): if loadsScalesFromGmem enabled, the scales will be loaded from gmem
-  //   // runner_params.outputScalePtr = bmm2_scale_tensor.has_value()
-  //   //                                    ? bmm2_scale_tensor.value().data_ptr<float>()
-  //   //                                    : nullptr;
-  //   // runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_tensor.has_value()
-  //   //                                         ? bmm1_scale_tensor.value().data_ptr<float>()
-  //   //                                         : nullptr;
-  // }
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * std::sqrt((float)(runner_params.mHeadDimQk));
 
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
@@ -159,10 +136,10 @@ void trtllm_paged_attention_mla_launcher(
   fmha_runner.run(runner_params);
 }
 
-#define CALL_GEN_LAUNCHER(CACHE_T_ENUM)                                                         \
-  trtllm_paged_attention_mla_launcher<CACHE_T_ENUM>(                                            \
-      out, query, key_value_cache, workspace_buffer, scale, block_tables, seq_lens, block_size, \
-      max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, bmm1_scale, bmm2_scale,    \
+#define CALL_GEN_LAUNCHER(CACHE_T_ENUM)                                                      \
+  trtllm_paged_attention_mla_launcher<CACHE_T_ENUM>(                                         \
+      out, query, key_value_cache, workspace_buffer, block_tables, seq_lens, block_size,     \
+      max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, bmm1_scale, bmm2_scale, \
       acc_q_len, max_attention_window_size, cyclic_attention_window_size);
 
 // The following macro is used to dispatch the conversion function based on
@@ -180,9 +157,9 @@ void trtllm_paged_attention_mla_launcher(
   }
 
 void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                                at::Tensor& workspace_buffer, double scale,
-                                at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
-                                int64_t max_seq_len, int64_t qk_nope_head_dim, int64_t kv_lora_rank,
+                                at::Tensor& workspace_buffer, at::Tensor& block_tables,
+                                at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
+                                int64_t qk_nope_head_dim, int64_t kv_lora_rank,
                                 int64_t qk_rope_head_dim, double bmm1_scale, double bmm2_scale,
                                 std::optional<int64_t> acc_q_len,
                                 std::optional<int64_t> max_attention_window_size,
