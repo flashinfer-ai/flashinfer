@@ -885,8 +885,9 @@ def load_all():
         if cubin_name in RUNTIME_CACHE:
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
-        get_cubin(cubin_name, sha256)
-        path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_name}.cubin"
+        cubin_prefix = f"0ffe2769c7eea90c44894abadf3eecf38801a143/deep-gemm/"
+        get_cubin(cubin_prefix + cubin_name, sha256)
+        path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
         assert path.exists()
         RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
 
@@ -899,9 +900,9 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
-    cubin_name = f"0ffe2769c7eea90c44894abadf3eecf38801a143/deep-gemm/{cubin_name}"
-    get_cubin(cubin_name, sha256)
-    path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_name}.cubin"
+    cubin_prefix = f"0ffe2769c7eea90c44894abadf3eecf38801a143/deep-gemm/"
+    get_cubin(cubin_prefix + cubin_name, sha256)
+    path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
     assert path.exists()
     RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
     return RUNTIME_CACHE[cubin_name]
