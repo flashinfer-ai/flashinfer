@@ -543,6 +543,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #else
   uint32_t val;
   __nv_fp4x2_storage_t vals[4];
+#pragma unroll
   for (int i = 0; i < 4; i++) {
     vals[i] = __nv_cvt_float2_to_fp4x2(*(((float2*)array) + i), __NV_E2M1, cudaRoundNearest);
   }
@@ -574,6 +575,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
 #else
   uint32_t val;
   __nv_fp4x2_storage_t vals[4];
+#pragma unroll
   for (int i = 0; i < 4; i++) {
     vals[i] = __nv_cvt_float2_to_fp4x2(array[i], __NV_E2M1, cudaRoundNearest);
   }
