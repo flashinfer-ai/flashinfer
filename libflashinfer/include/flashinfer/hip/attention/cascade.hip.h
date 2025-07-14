@@ -7,10 +7,12 @@
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
-#include "../cp_async.hip.h"
+// clang-format off
 #include "../math.hip.h"
-#include "../utils.hip.h"
 #include "state.hip.h"
+#include "../cp_async.hip.h"
+#include "../utils.hip.h"
+// clang-format on
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>

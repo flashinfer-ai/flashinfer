@@ -8,10 +8,12 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
+// clang-format off
+#include "vec_dtypes.hip.h"
 #include "fastdiv.hip.h"
 #include "layout.hip.h"
 #include "utils.hip.h"
-#include "vec_dtypes.hip.h"
+// clang-format on
 
 #include <hip/driver_types.h>
 #include <hip/hip_runtime.h>
@@ -363,17 +365,16 @@ __global__ void BlockSparseIndicesToVectorSparseOffsetsKernel(
 }
 
 template <typename IdType>
-hipError_t
-BlockSparseIndicesToVectorSparseOffset(IdType *block_sparse_indices,
-                                       IdType *block_sparse_indptr,
-                                       IdType *vector_sparse_offsets,
-                                       IdType *vector_sparse_indptr,
-                                       IdType *kv_lens,
-                                       const int64_t stride_block,
-                                       const int64_t stride_n,
-                                       const int64_t batch_size,
-                                       const uint32_t block_size,
-                                       hipStream_t stream = nullptr)
+hipError_t BlockSparseIndicesToVectorSparseOffset(IdType *block_sparse_indices,
+                                                  IdType *block_sparse_indptr,
+                                                  IdType *vector_sparse_offsets,
+                                                  IdType *vector_sparse_indptr,
+                                                  IdType *kv_lens,
+                                                  const int64_t stride_block,
+                                                  const int64_t stride_n,
+                                                  const int64_t batch_size,
+                                                  const uint32_t block_size,
+                                                  hipStream_t stream = nullptr)
 {
     int dev_id = 0;
     int num_sms = 0;
@@ -396,11 +397,14 @@ BlockSparseIndicesToVectorSparseOffset(IdType *block_sparse_indices,
                     (void *)&batch_size,
                     (void *)&block_size_fastdiv};
 
-    // FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, num_sms, num_threads,
+    // FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, num_sms,
+    // num_threads,
     //                                       args, 0, stream));
 
-    hipLaunchKernel((void*) kernel, dim3(num_sms), dim3(num_threads), args, 0, stream);
-    // BlockSparseIndicesToVectorSparseOffsetsKernel<IdType><<<num_sms, num_threads, 0, stream>>>(
+    hipLaunchKernel((void *)kernel, dim3(num_sms), dim3(num_threads), args, 0,
+                    stream);
+    // BlockSparseIndicesToVectorSparseOffsetsKernel<IdType><<<num_sms,
+    // num_threads, 0, stream>>>(
     //     block_sparse_indices, block_sparse_indptr, vector_sparse_offsets,
     //     vector_sparse_indptr, kv_lens, stride_block, stride_n, batch_size,
     //     block_size);
@@ -420,9 +424,9 @@ BlockSparseIndicesToVectorSparseOffset(IdType *block_sparse_indices,
  */
 template <typename DType, typename IdType>
 hipError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv,
-                                     DType *key,
-                                     DType *value,
-                                     hipStream_t stream = nullptr)
+                                    DType *key,
+                                    DType *value,
+                                    hipStream_t stream = nullptr)
 {
     uint32_t head_dim = paged_kv.head_dim;
     uint32_t batch_size = paged_kv.batch_size;
@@ -439,7 +443,7 @@ hipError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv,
             AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, DType, IdType>;
         void *args[] = {(void *)&paged_kv, (void *)&key, (void *)&value};
 
-        hipLaunchKernel((void*) kernel, nblks, nthrs, args, 0, stream);
+        hipLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream);
     });
     return hipSuccess;
 }
@@ -458,16 +462,16 @@ hipError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv,
  */
 template <typename DType, typename IdType>
 hipError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv,
-                               DType *append_key,
-                               DType *append_value,
-                               IdType *batch_indices,
-                               IdType *positions,
-                               uint32_t nnz,
-                               size_t append_k_stride_n,
-                               size_t append_k_stride_h,
-                               size_t append_v_stride_n,
-                               size_t append_v_stride_h,
-                               hipStream_t stream = nullptr)
+                              DType *append_key,
+                              DType *append_value,
+                              IdType *batch_indices,
+                              IdType *positions,
+                              uint32_t nnz,
+                              size_t append_k_stride_n,
+                              size_t append_k_stride_h,
+                              size_t append_v_stride_n,
+                              size_t append_v_stride_h,
+                              hipStream_t stream = nullptr)
 {
     uint32_t head_dim = paged_kv.head_dim;
     uint32_t num_heads = paged_kv.num_heads;
@@ -487,10 +491,10 @@ hipError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv,
         uint32_t smem_size = 0;
         auto kernel =
             AppendPagedKVCacheKernel<HEAD_DIM, vec_size, DType, IdType>;
-            assert(num_sms > 0);
+        assert(num_sms > 0);
         FLASHINFER_CUDA_CALL(hipOccupancyMaxActiveBlocksPerMultiprocessor(
             &num_blocks_per_sm, kernel, num_threads, smem_size));
-            
+
         num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
         dim3 nblks(num_blocks_per_sm * num_sms);
         dim3 nthrs(bdx, bdy);
@@ -502,7 +506,7 @@ hipError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv,
                         (void *)&append_v_stride_n, (void *)&append_v_stride_h};
         // FLASHINFER_CUDA_CALL(
         //     cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
-        hipLaunchKernel((void*) kernel, nblks, nthrs, args, 0, stream);
+        hipLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream);
     });
     return hipSuccess;
 }
@@ -738,14 +742,14 @@ AppendPagedKVMlaCacheKernel(paged_kv_mla_t<DType, IdType> paged_kv_mla,
 
 template <typename DType, typename IdType>
 hipError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv,
-                                  DType *append_ckv,
-                                  DType *append_kpe,
-                                  IdType *batch_indices,
-                                  IdType *positions,
-                                  uint32_t nnz,
-                                  size_t append_ckv_stride_n,
-                                  size_t append_kpe_stride_n,
-                                  hipStream_t stream = nullptr)
+                                 DType *append_ckv,
+                                 DType *append_kpe,
+                                 IdType *batch_indices,
+                                 IdType *positions,
+                                 uint32_t nnz,
+                                 size_t append_ckv_stride_n,
+                                 size_t append_kpe_stride_n,
+                                 hipStream_t stream = nullptr)
 {
     int dev_id = 0;
     int num_sms = 0;
@@ -778,9 +782,9 @@ hipError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv,
 
     // FLASHINFER_CUDA_CALL(
     //     cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
-    
-    AppendPagedKVMlaCacheKernel<HEAD_CKV_DIM, HEAD_KPE_DIM,
-                                              vec_size, DType, IdType><<<nblks, nthrs, smem_size, stream>>>(
+
+    AppendPagedKVMlaCacheKernel<HEAD_CKV_DIM, HEAD_KPE_DIM, vec_size, DType,
+                                IdType><<<nblks, nthrs, smem_size, stream>>>(
         paged_kv, append_ckv, append_kpe, batch_indices, positions, nnz,
         append_ckv_stride_n, append_kpe_stride_n);
 
