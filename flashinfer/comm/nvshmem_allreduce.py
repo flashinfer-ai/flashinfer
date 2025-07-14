@@ -21,7 +21,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .nvshmem import get_nvshmem_module
-
+import nvshmem.core as nvshmem
 
 class NVSHMEMAllReduce:
     """
@@ -60,15 +60,15 @@ class NVSHMEMAllReduce:
         self.device = device
         self.max_buffer_elements = max_buffer_elements
         self.group = group
-        self.nvshmem_module = get_nvshmem_module()
+        #self.nvshmem_module = get_nvshmem_module()
 
         self.should_init = should_init
         if self.should_init:
             self.init_nvshmem()
 
         # assert PE and world size match
-        my_pe = self.nvshmem_module.nvshmem_my_pe()
-        n_pes = self.nvshmem_module.nvshmem_n_pes()
+        my_pe = nvshmem.core.my_pe()
+        n_pes = nvshmem.core.n_pes()
         if my_pe != local_rank:
             print(
                 f"WARNING: Rank {local_rank}: PE mismatch! Expected PE {local_rank}, got PE {my_pe}",
@@ -81,54 +81,44 @@ class NVSHMEMAllReduce:
             )
 
         # allocate memory in nvshmem symm heap
-        self.symm_buffer_input = self.nvshmem_module.nvshmem_malloc(
-            [max_buffer_elements],
-            self.dtype,
-            self.device,
+        self.symm_buffer_input = nvshmem.core.tensor(
+            (max_buffer_elements,),
+            dtype=self.dtype,
         )
-        self.symm_buffer_output = self.nvshmem_module.nvshmem_malloc(
-            [max_buffer_elements],
-            self.dtype,
-            self.device,
+        self.symm_buffer_output = nvshmem.core.tensor(
+            (max_buffer_elements,),
+            dtype=self.dtype,
         )
-        torch.distributed.barrier(self.group)
 
     def init_nvshmem(self):
-        torch.zeros(
-            self.nvshmem_module.nvshmem_unique_id_size(),
-            dtype=torch.uint8,
-            device="cpu",
-        )
+        uniqueid = nvshmem.core.get_unique_id(empty=True)
         if self.local_rank == 0:
-            uid = self.nvshmem_module.nvshmem_get_unique_id()
-        else:
-            uid = torch.zeros(
-                self.nvshmem_module.nvshmem_unique_id_size(),
-                dtype=torch.uint8,
-                device="cpu",
-            )
-        torch.distributed.broadcast(uid, src=0)
+            # Rank 0 gets a real uniqueid
+            uniqueid = nvshmem.core.get_unique_id()
+        uid_data = uniqueid._data
+        torch.distributed.broadcast(uid_data, src=0, group=self.group)
         torch.distributed.barrier(self.group)
-        init_status = self.nvshmem_module.nvshmem_init(
-            uid, self.local_rank, self.world_size
+        if self.local_rank != 0:
+            uniqueid._data = uid_data
+        nvshmem.core.init(
+            device=self.device,
+            uid=uniqueid,
+            rank=self.local_rank,
+            nranks=self.world_size,
+            initializer_method="uid",
         )
-        torch.cuda.synchronize()
-        if init_status != 0:
-            raise RuntimeError("Failed to initialize nvshmem")
 
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
-        self.nvshmem_module.nvshmem_allreduce_on_stream_with_copy(
-            self.symm_buffer_output,
-            self.symm_buffer_input,
-            out,
-            inp,
-            inp.numel(),
-        )
+        stream = torch.cuda.current_stream()
+        numel = inp.numel()
+        input_buffer = self.symm_buffer_input.narrow(0, 0, numel)
+        output_buffer = self.symm_buffer_output.narrow(0, 0, numel)
+        input_buffer.copy_(inp)
+        nvshmem.core.reduce(nvshmem.core.Teams.TEAM_WORLD, output_buffer, input_buffer, "sum", stream=stream)
+        out.copy_(output_buffer)
 
     def shutdown(self):
-        del self.symm_buffer_input
-        del self.symm_buffer_output
-        torch.distributed.barrier(self.group)
-        torch.cuda.synchronize()
+        nvshmem.core.free_tensor(self.symm_buffer_input)
+        nvshmem.core.free_tensor(self.symm_buffer_output)
         if self.should_init:
-            self.nvshmem_module.nvshmem_finalize()
+            nvshmem.core.finalize()

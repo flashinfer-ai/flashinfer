@@ -60,6 +60,7 @@ install_requires = [
     "pynvml",
     "einops",
     "nvidia-nvshmem-cu12",
+    "nvshmem4py-cu12",
 ]
 generate_build_meta({})
 
