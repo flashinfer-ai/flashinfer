@@ -190,7 +190,6 @@ class MnnvlMemory:
         self.mapping = mapping
         self.segment_size = size
         # self._config = config or MnnvlConfig(comm_backend=LegacyMPIBackend())
-        print("zzzzzz"*10, self._config)
         self.ptr, self.rank_stride = MnnvlMemory.open_mnnvl_memory(self.mapping, size)
         
     def __del__(self):
@@ -210,7 +209,6 @@ class MnnvlMemory:
 
     @staticmethod
     def initialize():
-        print("entering initial"*10)
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device="cuda")
@@ -230,7 +228,6 @@ class MnnvlMemory:
         """Modified to work with configurable backends"""
         # If using legacy MPI path (original behavior)
         if isinstance(MnnvlMemory._config.comm_backend, LegacyMPIBackend):
-            print("run mpi"*10)
             if MnnvlMemory.comm is not None:
                 return MnnvlMemory.comm
             comm = MpiComm().Split(
@@ -241,7 +238,6 @@ class MnnvlMemory:
             return comm
         # New backend-aware path
         else:
-            print("run me"*10)
             print(MnnvlMemory._config)
             backend = MnnvlMemory._config.comm_backend
             return backend.Split(
@@ -308,10 +304,7 @@ class MnnvlMemory:
         comm = MnnvlMemory.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
-        print(f"rank:{comm_rank}, size:{comm_size}")
         all_rank_allocate_sizes = comm.allgather(size)
-        print(f"all_rank_allocate_sizes:{all_rank_allocate_sizes}")
-        print(f"dev:{dev_id}")
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(
             x == size for x in all_rank_allocate_sizes
@@ -333,7 +326,6 @@ class MnnvlMemory:
         allocated_mem_handle = checkCudaErrors(
             cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
         )
-        print("aaa"*100)
         exported_fabric_handle = checkCudaErrors(
             cuda.cuMemExportToShareableHandle(
                 allocated_mem_handle,
