@@ -133,6 +133,9 @@ class CommBackend(ABC):
     
     @abstractmethod
     def allgather(self, data: int) -> List[int]: ...
+
+    @abstractmethod
+    def allgather_bytes(self, data): ...
     
     @abstractmethod
     def Split(self, color: int, key: int) -> 'CommBackend': ...
@@ -148,6 +151,9 @@ class LegacyMPIBackend(CommBackend):
         return self._mpicomm.Get_size()
     
     def allgather(self, data: int) -> List[int]:
+        return self._mpicomm.allgather(data)
+    
+    def allgather_bytes(self, data):
         return self._mpicomm.allgather(data)
     
     def Split(self, color: int, key: int) -> CommBackend:
@@ -234,16 +240,16 @@ class MnnvlMemory:
                 mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
                 mapping.tp_rank
             )
-            MnnvlMemory.comm = comm
-            return comm
         # New backend-aware path
         else:
             print(MnnvlMemory._config)
             backend = MnnvlMemory._config.comm_backend
-            return backend.Split(
+            comm = backend.Split(
                 mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
                 mapping.tp_rank
             )
+        MnnvlMemory.comm = comm
+        return comm
 
 
     @staticmethod
@@ -333,7 +339,11 @@ class MnnvlMemory:
                 0,
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+        print(f"cccccccccccccccccc : {exported_fabric_handle.data}")
+        # all_handles_data = comm.allgather(exported_fabric_handle.data)
+        all_handles_data = comm.allgather_bytes(exported_fabric_handle.data)
+        print(f"passssss : {all_handles_data}")
+        # all_handles_data = comm.allgather(exported_fabric_handle.data)
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
