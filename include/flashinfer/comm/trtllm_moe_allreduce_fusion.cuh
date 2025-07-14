@@ -510,6 +510,15 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   return nullptr;
 }
 
+__forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3) {
+  uint32_t val0 = c0;
+  uint32_t val1 = c1;
+  uint32_t val2 = c2;
+  uint32_t val3 = c3;
+
+  return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
