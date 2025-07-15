@@ -888,7 +888,7 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
+          float o_scale = math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
@@ -899,14 +899,14 @@ __device__ __forceinline__ void update_mdo_states(
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            s_frag[mma_q][mma_kv][j * 2 + 0] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 1] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 5] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 0] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 0] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 1] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 1] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 4] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 5] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 5] - m[mma_q][j]) * sm_scale);
           }
         }
       }
