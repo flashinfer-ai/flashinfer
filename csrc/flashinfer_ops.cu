@@ -142,6 +142,15 @@ void PODWithKVCacheTensorRun(
     std::optional<at::Tensor> maybe_custom_mask_d, std::optional<at::Tensor> maybe_mask_indptr_d,
     std::optional<at::Tensor> maybe_alibi_slopes_d, double logits_soft_cap_d, double sm_scale_d,
     double rope_rcp_scale_d, double rope_rcp_theta_d, bool enable_pdl);
+
+at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                              at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
+                              at::Tensor kv_indptr_p, at::Tensor kv_len_arr_p,
+                              uint32_t total_num_rows_p, uint32_t batch_size_p,
+                              at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
+                              uint32_t total_num_rows_d, uint32_t batch_size_d,
+                              uint32_t num_qo_heads_p, uint32_t num_kv_heads, uint32_t head_dim_qk,
+                              uint32_t head_dim_vo, uint32_t page_size, bool enable_cuda_graph);
 //========== quantization ==========
 
 void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);
@@ -283,6 +292,8 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // pod-attention
   // Temporarily disabled because we don't generate the implementation yet.
   // m.def("PODWithKVCacheTensor", PODWithKVCacheTensorRun);
+  m.def("pod_with_kv_cache_plan", PODWithKVCachePlan);
+  m.def("pod_with_kv_cache_tensor_run", PODWithKVCacheTensorRun);
 
   // quantization
   // GPU packbits operator

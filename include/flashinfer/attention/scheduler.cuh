@@ -589,17 +589,17 @@ inline auto get_qkv_tile_indices(
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         real_batch_size += 1;
-        request_indices->push_back(request_idx + start_req_idx);
-        qo_tile_indices->push_back(q_tile_idx);
-        kv_tile_indices->push_back(kv_tile_idx);
+        out_req->push_back(request_idx + start_req_idx);
+        out_qo->push_back(q_tile_idx);
+        out_kv->push_back(kv_tile_idx);
       }
     }
 
     int64_t qo_len = packed_qo_len / gqa_group_size;
     for (uint32_t row = 0; row < qo_len; ++row) {
-      merge_indptr->push_back(merge_indptr->back() + num_tiles_kv);
+      out_merge->push_back(out_merge->back() + num_tiles_kv);
     }
-    o_indptr->push_back(o_indptr->back() + qo_len * num_tiles_kv);
+    out_o->push_back(out_o->back() + qo_len * num_tiles_kv);
   }
   return std::make_tuple(std::move(local_req), std::move(local_qo), std::move(local_kv),
                          std::move(local_merge), std::move(local_o), real_batch_size);

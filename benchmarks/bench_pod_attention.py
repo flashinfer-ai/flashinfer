@@ -56,9 +56,9 @@ def run_bench(
 
     # Decode params
 
-    qo_indptr_d = torch.cat(
-        [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
-    ).int()
+    # qo_indptr_d = torch.cat(
+    #     [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
+    # ).int()
     kv_indptr_d = torch.cat(
         [torch.tensor([0]), torch.cumsum(d_seq_lens, 0)], dim=0
     ).int()
@@ -105,7 +105,6 @@ def run_bench(
             kv_indptr_p.to(device),
             kv_indices_p.to(device),
             last_page_len_p,
-            qo_indptr_d.to(device),
             kv_indptr_d.to(device),
             kv_indices_d.to(device),
             last_page_len_d,

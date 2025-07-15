@@ -21,7 +21,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
-from .jit import gen_pod_module
+from .jit import gen_pod_module, get_pod_uri
 from .page import get_seq_lens
 from .prefill import get_batch_prefill_module
 from .quantization import packbits
@@ -38,13 +38,123 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     device_support_pdl,
+    register_custom_op,
+    register_fake_op,
 )
 
 
 @functools.cache
 def get_pod_module(*args):
+    """Get POD module with cached compilation."""
+    # Use the proper JIT compilation system like batch prefill
+    uri = get_pod_uri(*args)
     module = gen_pod_module(*args).build_and_load()
-    return SimpleNamespace(run_tensor=module.PODWithKVCacheTensor.default)
+    run_tensor_func = module.PODWithKVCacheTensor.default
+
+    # Register custom op for POD tensor run
+    @register_custom_op(
+        f"flashinfer::{uri}_pod_run",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "paged_k_cache",
+            "paged_v_cache",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def pod_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        layout: int,
+        # Prefill params
+        q_p: torch.Tensor,
+        mask_mode_code_p: int,
+        window_left_p: int,
+        maybe_custom_mask_p: Optional[torch.Tensor],
+        maybe_alibi_slopes_p: Optional[torch.Tensor],
+        logits_soft_cap_p: float,
+        sm_scale_p: float,
+        rope_rcp_scale_p: float,
+        rope_rcp_theta_p: float,
+        # Decode params
+        q_d: torch.Tensor,
+        mask_mode_code_d: int,
+        window_left_d: int,
+        maybe_custom_mask_d: Optional[torch.Tensor],
+        maybe_mask_indptr_d: Optional[torch.Tensor],
+        maybe_alibi_slopes_d: Optional[torch.Tensor],
+        logits_soft_cap_d: float,
+        sm_scale_d: float,
+        rope_rcp_scale_d: float,
+        rope_rcp_theta_d: float,
+        enable_pdl: bool,
+    ) -> None:
+        run_tensor_func(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            plan_info_vec,
+            paged_k_cache,
+            paged_v_cache,
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            o,
+            maybe_lse,
+            layout,
+            q_p,
+            mask_mode_code_p,
+            window_left_p,
+            maybe_custom_mask_p,
+            maybe_alibi_slopes_p,
+            logits_soft_cap_p,
+            sm_scale_p,
+            rope_rcp_scale_p,
+            rope_rcp_theta_p,
+            q_d,
+            mask_mode_code_d,
+            window_left_d,
+            maybe_custom_mask_d,
+            maybe_mask_indptr_d,
+            maybe_alibi_slopes_d,
+            logits_soft_cap_d,
+            sm_scale_d,
+            rope_rcp_scale_d,
+            rope_rcp_theta_d,
+            enable_pdl,
+        )
+
+    @register_fake_op(f"flashinfer::{uri}_pod_run")
+    def _fake_pod_run(*args) -> None:
+        pass
+
+    # Create a simple namespace that wraps the JIT module functions
+    class PODModule:
+        def __init__(self):
+            pass
+
+        def plan(self, *args):
+            """Call the POD plan function."""
+            # The plan function is not part of the JIT module, it's a regular function
+            import torch
+
+            return torch.ops.flashinfer.pod_with_kv_cache_plan(*args)
+
+        def run_tensor(self, *args):
+            """Call the POD tensor run function."""
+            return pod_run(*args)
+
+    return PODModule()
 
 
 class PODWithPagedKVCacheWrapper:
@@ -453,18 +563,21 @@ class PODWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            self._cached_module = get_batch_prefill_module(
-                "fa2",
+            self._cached_module = get_pod_module(
+                # Prefill params
                 q_data_type,
                 kv_data_type,
                 q_data_type,
-                kv_indptr_d.dtype,
                 head_dim,  # head_dim_qk
-                head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
+                # Decode params
+                self._indptr_type,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left != -1,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
             )
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
@@ -473,17 +586,16 @@ class PODWithPagedKVCacheWrapper:
             qo_indptr_host_p,
             kv_indptr_host_p,
             kv_lens_arr_host_p,
-            batch_size_p,
             qo_indptr_host_p[-1],  # total_num_rows_p
+            batch_size_p,
             qo_indptr_host_d,
             kv_indptr_host_d,
-            kv_lens_arr_host_d,
-            batch_size_d,
             qo_indptr_host_d[-1],  # total_num_rows_d
+            batch_size_d,
             num_qo_heads,
             num_kv_heads,
-            head_dim,
-            head_dim,
+            head_dim,  # head_dim_qk
+            head_dim,  # head_dim_vo
             page_size,
             self.is_cuda_graph_enabled,
         )
