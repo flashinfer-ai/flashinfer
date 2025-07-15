@@ -48,7 +48,7 @@
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #elif defined(PLATFORM_HIP_DEVICE)
 #define gpuMemCpy hipMemcpy
-#define gpuMemCpyAsync hipMemcpyAsync
+#define gpuMemcpyAsync hipMemcpyAsync
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
 #endif

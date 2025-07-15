@@ -5,10 +5,10 @@
 
 #pragma once
 
-#include <../exception.h>
+#include "flashinfer/exception.h"
 
-#include <page.hip.h>
-#include <pos_enc.hip.h>
+#include "flashinfer/attention/generic/page.cuh"
+#include "flashinfer/attention/generic/pos_enc.cuh"
 
 #include "utils_hip.h"
 

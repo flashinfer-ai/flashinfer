@@ -5,13 +5,6 @@
 #pragma once
 #include "platform.hpp"
 
-// Include platform-specific implementations
-#if defined(PLATFORM_CUDA_DEVICE)
-#include "backend/cuda/memory_ops_cuda.cuh"
-#elif defined(PLATFORM_HIP_DEVICE)
-#include "backend/hip/memory_ops_hip.hip.h"
-#endif
-
 namespace flashinfer
 {
 namespace gpu_iface
@@ -36,17 +29,20 @@ enum class PrefetchMode
     kNoPrefetch, // Do not fetch additional data from global memory to L2
     kPrefetch    // Fetch additional data from global memory to L2
 };
+
+// Include platform-specific implementations
+#if defined(PLATFORM_CUDA_DEVICE)
+#include "backend/cuda/memory_ops.cuh"
+namespace detail = flashinfer::gpu_iface::memory::detail::cuda;
+#elif defined(PLATFORM_HIP_DEVICE)
+#include "backend/hip/memory_ops_hip.h"
+namespace detail = flashinfer::gpu_iface::memory::detail::hip;
+#endif
+
 /**
  * @brief Commits pending asynchronous memory operations to a group
  */
-__device__ __forceinline__ void commit_group()
-{
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::commit_group();
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::commit_group();
-#endif
-}
+__device__ __forceinline__ void commit_group() { detail::commit_group(); }
 
 /**
  * @brief Waits until N most recent groups of async operations are complete
@@ -55,11 +51,7 @@ __device__ __forceinline__ void commit_group()
  */
 template <size_t N> __device__ __forceinline__ void wait_group()
 {
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::wait_group<N>();
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::wait_group<N>();
-#endif
+    detail::wait_group<N>();
 }
 
 /**
@@ -73,11 +65,7 @@ template <size_t N> __device__ __forceinline__ void wait_group()
 template <PrefetchMode PrefetchOpt, typename T>
 __device__ __forceinline__ void load_128b(T *smem_ptr, const T *gmem_ptr)
 {
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::load_128b<PrefetchOpt>(smem_ptr, gmem_ptr);
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::load_128b<PrefetchOpt>(smem_ptr, gmem_ptr);
-#endif
+    detail::load_128b<PrefetchOpt>(smem_ptr, gmem_ptr);
 }
 
 /**
@@ -94,13 +82,7 @@ template <PrefetchMode PrefetchOpt, SharedMemFillMode FillOpt, typename T>
 __device__ __forceinline__ void
 pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
 {
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::pred_load_128b<PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr,
-                                                       predicate);
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::pred_load_128b<PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr,
-                                                      predicate);
-#endif
+    detail::pred_load_128b<PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr, predicate);
 }
 
 /**
@@ -115,11 +97,7 @@ pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
 template <size_t NumBits, PrefetchMode PrefetchOpt, typename T>
 __device__ __forceinline__ void load(T *smem_ptr, const T *gmem_ptr)
 {
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::load<NumBits, PrefetchOpt>(smem_ptr, gmem_ptr);
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::load<NumBits, PrefetchOpt>(smem_ptr, gmem_ptr);
-#endif
+    detail::load<NumBits, PrefetchOpt>(smem_ptr, gmem_ptr);
 }
 
 /**
@@ -140,13 +118,8 @@ template <size_t NumBits,
 __device__ __forceinline__ void
 pred_load(T *smem_ptr, const T *gmem_ptr, bool predicate)
 {
-#if defined(PLATFORM_CUDA_DEVICE)
-    detail::cuda::pred_load<NumBits, PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr,
-                                                           predicate);
-#elif defined(PLATFORM_HIP_DEVICE)
-    detail::hip::pred_load<NumBits, PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr,
-                                                          predicate);
-#endif
+    detail::pred_load<NumBits, PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr,
+                                                     predicate);
 }
 
 } // namespace memory

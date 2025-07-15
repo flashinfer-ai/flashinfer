@@ -30,11 +30,10 @@ set(HIP_HIPCC_FLAGS
     "${HIP_HIPCC_FLAGS} -O3 --offload-arch=gfx942 -D__HIP_NO_HALF_OPERATORS__=0 -D__HIP_NO_HALF_CONVERSIONS__=0"
 )
 
-# clangformat off Add flashinfer directory here Example:
-# set(FLASHINFER_INCLUDE_DIRS
-# /root/flashinfer/libflashinfer/include/flashinfer/hip)
-set(FLASHINFER_INCLUDE_DIRS Enter Flashinfer Include Directory here)
-# clangformat on
+# clang-format off Add flashinfer directory here Example:
+# set(FLASHINFER_INCLUDE_DIRS /root/flashinfer/libflashinfer/include/)
+set(FLASHINFER_INCLUDE_DIRS Enter flashinfer include path here)
+# clang-format on
 
 include_directories(${HIP_INCLUDE_DIRS})
 include_directories("/opt/rocm/include") # Add this explicit include path
@@ -50,17 +49,22 @@ include_directories(${GTEST_INCLUDE_DIRS})
 # Add definition to use HIP API
 add_definitions(-D__HIP_PLATFORM_AMD__)
 
-add_library(math STATIC ${FLASHINFER_INCLUDE_DIRS}/math.hip.h)
-add_library(layout STATIC ${FLASHINFER_INCLUDE_DIRS}/layout.hip.h)
-add_library(pos_enc STATIC ${FLASHINFER_INCLUDE_DIRS}/pos_enc.hip.h)
-add_library(state STATIC ${FLASHINFER_INCLUDE_DIRS}/attention/state.hip.h)
-add_library(cascade STATIC ${FLASHINFER_INCLUDE_DIRS}/attention/cascade.hip.h)
-add_library(decode STATIC ${FLASHINFER_INCLUDE_DIRS}/attention/decode.hip.h)
-add_library(page STATIC ${FLASHINFER_INCLUDE_DIRS}/page.hip.h)
+add_library(math STATIC ${FLASHINFER_INCLUDE_DIRS}/gpu_iface/math_ops.hpp)
+add_library(layout STATIC ${FLASHINFER_INCLUDE_DIRS}/gpu_iface/layout.cuh)
+add_library(pos_enc STATIC
+            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/pos_enc.cuh)
+add_library(state STATIC
+            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/state.cuh)
+add_library(cascade STATIC
+            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/cascade.cuh)
+add_library(decode STATIC
+            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/decode.cuh)
+add_library(page STATIC
+            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/page.cuh)
 
 set(CMAKE_HIP_FLAGS
     "${CMAKE_HIP_FLAGS} -O3 -g -D__HIP_PLATFORM_AMD__ -D__HIP_NO_HALF_OPERATORS__=0 -D__HIP_NO_HALF_CONVERSIONS__=0"
-)
+    -DPLATFORM_HIP_DEVICE)
 
 set_target_properties(
   math

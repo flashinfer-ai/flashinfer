@@ -34,7 +34,7 @@ FLASHINFER_INLINE __hip_bfloat162 make_bfloat162(const __hip_bfloat16 x,
     return t;
 }
 
-namespace flashinfer
+namespace flashinfer::gpu_iface::vec_dtypes::detail::hip
 {
 
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED

@@ -3,7 +3,9 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "attention/decode.hip.h"
+#include "flashinfer/attention/generic/decode.cuh"
+#include "flashinfer/attention/generic/default_decode_params.cuh"
+#include "flashinfer/attention/generic/variants.cuh"
 
 #include "../../utils/cpu_reference_hip.h"
 #include "../../utils/flashinfer_batch_decode_test_ops.hip.h"

@@ -9,7 +9,7 @@
 #if defined(PLATFORM_CUDA_DEVICE)
 #include "backend/cuda/math.cuh"
 #elif defined(PLATFORM_HIP_DEVICE)
-#include "backend/hip/math.hip.h"
+#include "backend/hip/math_hip.h"
 #endif
 
 namespace flashinfer

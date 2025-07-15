@@ -3,11 +3,12 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "attention/default_decode_params.hip.h"
-#include "attention/mask.hip.h"
-#include "attention/scheduler.hip.h"
-#include "attention/variants.hip.h"
-#include "layout.hip.h"
+#include "flashinfer/attention/generic/default_decode_params.cuh"
+#include "flashinfer/attention/generic/scheduler.cuh"
+#include "flashinfer/attention/generic/variants.cuh"
+
+#include "gpu_iface/enums.hpp"
+#include "gpu_iface/layout.cuh"
 
 #include "utils_hip.h"
 

@@ -3,7 +3,9 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "attention/decode.hip.h"
+#include "flashinfer/attention/generic/decode.cuh"
+#include "flashinfer/attention/generic/default_decode_params.cuh"
+#include "flashinfer/attention/generic/variants.cuh"
 
 #include "../../utils/cpu_reference_hip.h"
 #include "../../utils/utils_hip.h"
@@ -17,7 +19,10 @@
 #include <type_traits>
 
 #include <gtest/gtest.h>
-namespace flashinfer::ops
+
+using namespace flashinfer;
+
+namespace test::ops
 {
 template <typename DTypeQ, typename DTypeKV, typename DTypeO>
 hipError_t SingleDecodeWithKVCache(
@@ -63,9 +68,7 @@ hipError_t SingleDecodeWithKVCache(
         })});
     return hipSuccess;
 }
-} // namespace flashinfer::ops
-
-using namespace flashinfer;
+} // namespace test::ops
 
 template <typename DTypeQO, typename DTypeKV>
 std::vector<DTypeQO> getCPUReference(const std::vector<DTypeQO> &Q_host,
@@ -165,7 +168,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads,
         QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode));
 
     hipError_t status =
-        flashinfer::ops::SingleDecodeWithKVCache<DTypeQO, DTypeKV, DTypeQO>(
+        test::ops::SingleDecodeWithKVCache<DTypeQO, DTypeKV, DTypeQO>(
             Q, K, V, O, tmp, num_qo_heads, num_kv_heads, seq_len, head_dim,
             kv_layout, pos_encoding_mode);
 
