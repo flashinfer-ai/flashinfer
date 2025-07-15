@@ -628,6 +628,150 @@ class SegmentGEMMWrapper:
     forward = run
 
 
+class UIDs(Enum):
+    """UIDs for CUDNN graph tensors"""
+
+    A_UID = 0
+    B_UID = 1
+    SCALE_UID = 2
+    O_UID = 3
+
+
+def _check_cudnn_availability():
+    """Check if cuDNN is available and raise exception if not."""
+    if not CUDNN_AVAILABLE:
+        raise RuntimeError(
+            "cuDNN is not available. Please install cuDNN to use FP8 GEMM functions. "
+        )
+
+
+def _validate_fp8_output_dtype(dtype: torch.dtype):
+    """Validate that the output dtype is either bf16 or fp16."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"Unsupported output dtype: {dtype}. "
+            f"Only torch.bfloat16 and torch.float16 are supported for FP8 GEMM operations."
+        )
+
+
+@functools.lru_cache(maxsize=128)
+def build_cudnn_gemm_with_per_tensor_q_graph(
+    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type
+):
+    """Build a cuDNN graph for GEMM with per-tensor quantization.
+
+    This function is cached to avoid rebuilding identical graphs.
+
+    Args:
+        a_shape: Shape of tensor A
+        a_stride: Stride of tensor A
+        b_shape: Shape of tensor B
+        b_stride: Stride of tensor B
+        a_type: Data type for input tensor A
+        b_type: Data type for input tensor B
+        o_type: Data type for output tensor
+
+    Returns:
+        cuDNN graph object
+    """
+    _check_cudnn_availability()
+
+    graph = cudnn.pygraph()
+
+    a_cudnn_tensor = graph.tensor(
+        name="a", dim=a_shape, stride=a_stride, data_type=a_type
+    )
+    b_cudnn_tensor = graph.tensor(
+        name="b", dim=b_shape, stride=b_stride, data_type=b_type
+    )
+    scale_cudnn_tensor = graph.tensor(
+        name="scale", dim=(1, 1, 1), stride=(1, 1, 1), data_type=cudnn.data_type.FLOAT
+    )
+    c_cudnn_tensor = graph.matmul(
+        name="matmul",
+        A=a_cudnn_tensor,
+        B=b_cudnn_tensor,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
+    c_final_cudnn_tensor = graph.mul(
+        name="scale_mul",
+        a=c_cudnn_tensor,
+        b=scale_cudnn_tensor,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+
+    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+    scale_cudnn_tensor.set_uid(UIDs.SCALE_UID.value)
+    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+
+    return graph
+
+
+def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, scale_tensor, c_final):
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.SCALE_UID.value: scale_tensor,
+        UIDs.O_UID.value: c_final,
+    }
+
+    workspace = torch.empty(
+        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+    )
+
+    graph.execute(variant_pack, workspace)
+
+
+def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
+    if dtype == torch.bfloat16:
+        return cudnn.data_type.BFLOAT16
+    elif dtype == torch.float16:
+        return cudnn.data_type.HALF
+    elif dtype == torch.float8_e4m3fn:
+        return cudnn.data_type.FP8_E4M3
+    elif dtype == torch.float8_e5m2:
+        return cudnn.data_type.FP8_E5M2
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _cudnn_gemm_f8f8_f32(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dq_scale: torch.Tensor,
+    out: Optional[torch.Tensor],
+    torch_out_dtype: torch.dtype,
+):
+    _check_cudnn_availability()
+
+    if out is None:
+        out = torch.empty(
+            a.shape[0], a.shape[1], b.shape[2], dtype=torch_out_dtype, device=a.device
+        )
+
+    graph = build_cudnn_gemm_with_per_tensor_q_graph(
+        a.shape,
+        a.stride(),
+        b.shape,
+        b.stride(),
+        _torch_data_type_to_cudnn_data_type(a.dtype),
+        _torch_data_type_to_cudnn_data_type(b.dtype),
+        _torch_data_type_to_cudnn_data_type(torch_out_dtype),
+    )
+
+    execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
+    return out
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -635,6 +779,7 @@ def bmm_fp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas"] = "cublas",
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -657,6 +802,9 @@ def bmm_fp8(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+
+    backend: Literal["cudnn", "cublas"]
+        The backend to use for the operation. Defaults to ``"cublas"``.
 
     Returns
     -------
@@ -687,14 +835,22 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
+    _validate_fp8_output_dtype(dtype)
+
     if out is None:
         out = torch.empty(
             (A.shape[0], A.shape[1], B.shape[2]),
             device=A.device,
             dtype=dtype,
         )
-    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-    get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
+
+    if backend == "cudnn":
+        return _cudnn_gemm_f8f8_f32(A, B, A_scale * B_scale, out, dtype)
+    elif backend == "cublas":
+        workspace_buffer = _get_cache_buf(
+            "bmm_fp8_workspace", 32 * 1024 * 1024, A.device
+        )
+        get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
 
 
@@ -774,6 +930,8 @@ def gemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
     else:
         out_dtype = out.dtype
+
+    _validate_fp8_output_dtype(out_dtype)
 
     # NOTE(Zihao): (out_specified, need_padding)
     # (False, False) -> create out_padded tensor explicitly
@@ -916,7 +1074,7 @@ def group_gemm_fp8_nt_groupwise(
     else:
         if out_dtype is None:
             out_dtype = out.dtype
-    assert out_dtype in [torch.bfloat16, torch.float16]
+    _validate_fp8_output_dtype(out_dtype)
 
     num_groups = m_indptr.shape[0] - 1
     assert b.shape[0] == num_groups
@@ -1248,175 +1406,4 @@ def group_deepgemm_fp8_nt_groupwise(
         (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
     )
 
-    return out
-
-
-class UIDs(Enum):
-    """UIDs for CUDNN graph tensors"""
-
-    A_UID = 0
-    B_UID = 1
-    SCALE_UID = 2
-    O_UID = 3
-
-
-def _check_cudnn_availability():
-    """Check if cuDNN is available and raise exception if not."""
-    if not CUDNN_AVAILABLE:
-        raise RuntimeError(
-            "cuDNN is not available. Please install cuDNN to use FP8 GEMM functions. "
-        )
-
-
-@functools.lru_cache(maxsize=128)
-def build_gemm_with_per_tensor_q_graph(
-    a_shape, a_stride, b_shape, b_stride, ab_type, o_type
-):
-    """Build a cuDNN graph for GEMM with per-tensor quantization.
-
-    This function is cached to avoid rebuilding identical graphs.
-
-    Args:
-        a_shape: Shape of tensor A
-        a_stride: Stride of tensor A
-        b_shape: Shape of tensor B
-        b_stride: Stride of tensor B
-        ab_type: Data type for input tensors A and B
-        o_type: Data type for output tensor
-
-    Returns:
-        cuDNN graph object
-    """
-    _check_cudnn_availability()
-
-    graph = cudnn.pygraph()
-
-    a_cudnn_tensor = graph.tensor(
-        name="a", dim=a_shape, stride=a_stride, data_type=ab_type
-    )
-    b_cudnn_tensor = graph.tensor(
-        name="b", dim=b_shape, stride=b_stride, data_type=ab_type
-    )
-    scale_cudnn_tensor = graph.tensor(
-        name="scale", dim=(1, 1, 1), stride=(1, 1, 1), data_type=cudnn.data_type.FLOAT
-    )
-    c_cudnn_tensor = graph.matmul(
-        name="matmul",
-        A=a_cudnn_tensor,
-        B=b_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
-    c_final_cudnn_tensor = graph.mul(
-        name="scale_mul",
-        a=c_cudnn_tensor,
-        b=scale_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
-
-    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
-    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    scale_cudnn_tensor.set_uid(UIDs.SCALE_UID.value)
-    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
-
-    graph.validate()
-    graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans()
-
-    return graph
-
-
-def execute_gemm_with_per_tensor_q_graph(graph, a, b, scale_tensor, c_final):
-    variant_pack = {
-        UIDs.A_UID.value: a,
-        UIDs.B_UID.value: b,
-        UIDs.SCALE_UID.value: scale_tensor,
-        UIDs.O_UID.value: c_final,
-    }
-
-    workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
-    )
-
-    graph.execute(variant_pack, workspace)
-
-
-def gemm_f8f8_f32_bf16(
-    a: torch.Tensor,  # (batch, m, k)
-    b: torch.Tensor,  # (batch, k, n)
-    dq_scale: torch.Tensor,  # (1, 1, 1)
-    out: Optional[torch.Tensor] = None,  # (batch, m, n)
-):
-    """Perform FP8 GEMM with per-tensor dequantization and BF16 output.
-
-    This function uses cached cuDNN graphs for optimal performance.
-
-    Args:
-        a: FP8 input tensor A with shape (batch, m, k)
-        b: FP8 input tensor B with shape (batch, k, n)
-        dq_scale: Dequantization scale tensor with shape (1, 1, 1)
-        out: Optional output tensor with shape (batch, m, n). If None, will be allocated.
-
-    Returns:
-        BF16 output tensor with shape (batch, m, n)
-    """
-    _check_cudnn_availability()
-
-    if out is None:
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[2], dtype=torch.bfloat16, device=a.device
-        )
-
-    graph = build_gemm_with_per_tensor_q_graph(
-        a.shape,
-        a.stride(),
-        b.shape,
-        b.stride(),
-        cudnn.data_type.FP8_E4M3,
-        cudnn.data_type.BFLOAT16,
-    )
-
-    execute_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
-    return out
-
-
-def gemm_f8f8_f32_fp16(
-    a: torch.Tensor,  # (batch, m, k)
-    b: torch.Tensor,  # (batch, k, n)
-    dq_scale: torch.Tensor,  # (1, 1, 1)
-    out: Optional[torch.Tensor] = None,  # (batch, m, n)
-):
-    """Perform FP8 GEMM with per-tensor dequantization and FP16 output.
-
-    This function uses cached cuDNN graphs for optimal performance.
-
-    Args:
-        a: FP8 input tensor A with shape (batch, m, k)
-        b: FP8 input tensor B with shape (batch, k, n)
-        dq_scale: Dequantization scale tensor with shape (1, 1, 1)
-        out: Optional output tensor with shape (batch, m, n). If None, will be allocated.
-
-    Returns:
-        FP16 output tensor with shape (batch, m, n)
-    """
-    _check_cudnn_availability()
-
-    if out is None:
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[2], dtype=torch.float16, device=a.device
-        )
-
-    graph = build_gemm_with_per_tensor_q_graph(
-        a.shape,
-        a.stride(),
-        b.shape,
-        b.stride(),
-        cudnn.data_type.FP8_E4M3,
-        cudnn.data_type.HALF,
-    )
-
-    execute_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
     return out
