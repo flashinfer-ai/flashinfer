@@ -127,7 +127,6 @@ class NVSHMEMAllReduce:
             "sum",
             stream=self.stream,
         )
-        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD, stream=self.stream)
         out.copy_(output_buffer)
 
     def shutdown(self):
