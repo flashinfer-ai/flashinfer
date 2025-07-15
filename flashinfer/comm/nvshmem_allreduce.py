@@ -19,9 +19,18 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-
+from nvshmem.core import Device
 from .nvshmem import get_nvshmem_module
-import nvshmem.core as nvshmem
+import nvshmem.core
+
+class PyTorchStreamWrapper:
+    def __init__(self, pt_stream):
+        self.pt_stream = pt_stream
+        self.handle = pt_stream.cuda_stream
+
+    def __cuda_stream__(self):
+        stream_id = self.pt_stream.cuda_stream
+        return (0, stream_id)  # Return format required by CUDA Python
 
 class NVSHMEMAllReduce:
     """
@@ -61,7 +70,10 @@ class NVSHMEMAllReduce:
         self.max_buffer_elements = max_buffer_elements
         self.group = group
         #self.nvshmem_module = get_nvshmem_module()
-
+        self.dev = Device(self.device.index)
+        self.dev.set_current()
+        self.pt_stream = torch.cuda.current_stream()
+        self.stream = PyTorchStreamWrapper(self.pt_stream)
         self.should_init = should_init
         if self.should_init:
             self.init_nvshmem()
@@ -95,26 +107,25 @@ class NVSHMEMAllReduce:
         if self.local_rank == 0:
             # Rank 0 gets a real uniqueid
             uniqueid = nvshmem.core.get_unique_id()
-        uid_data = uniqueid._data
-        torch.distributed.broadcast(uid_data, src=0, group=self.group)
+            broadcast_objects = [uniqueid]
+        else:
+            broadcast_objects = [None]
+        torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=self.group)
         torch.distributed.barrier(self.group)
-        if self.local_rank != 0:
-            uniqueid._data = uid_data
         nvshmem.core.init(
-            device=self.device,
-            uid=uniqueid,
+            device=self.dev,
+            uid=broadcast_objects[0],
             rank=self.local_rank,
             nranks=self.world_size,
             initializer_method="uid",
         )
 
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
-        stream = torch.cuda.current_stream()
         numel = inp.numel()
         input_buffer = self.symm_buffer_input.narrow(0, 0, numel)
         output_buffer = self.symm_buffer_output.narrow(0, 0, numel)
         input_buffer.copy_(inp)
-        nvshmem.core.reduce(nvshmem.core.Teams.TEAM_WORLD, output_buffer, input_buffer, "sum", stream=stream)
+        nvshmem.core.reduce(nvshmem.core.Teams.TEAM_WORLD, output_buffer, input_buffer, "sum", stream=self.stream)
         out.copy_(output_buffer)
 
     def shutdown(self):
