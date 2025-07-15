@@ -351,16 +351,16 @@ def test_trtllm_batch_decode_mla(
         seq_lens=seq_lens_tensor,
         block_size=page_size,
         max_seq_len=max_seq_len,
-        scale=scale * ((512 + 64) ** 0.5) / ((128 + 64) ** 0.5),
+        scale=scale / ((512 + 64) ** 0.5) * ((128 + 64) ** 0.5),
     )
     torch.cuda.synchronize()
     print("output shape", output.shape)
     print("output", output)
 
     # Run reference attention and align output
-    sm_scale = scale / (
-        (128 + 64) ** 0.5
-    )  # use head dimension before matrix absorption
+    sm_scale = (
+        1.0 / scale / ((128 + 64) ** 0.5)
+    ) # use head dimension before matrix absorption
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
     )
@@ -445,4 +445,4 @@ def test_trtllm_batch_decode_mla(
 if __name__ == "__main__":
     # run all tests in the order of pytest
     # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(1, 0.5, torch.bfloat16, 32, 2)
+    test_trtllm_batch_decode_mla(1, 1, torch.bfloat16, 32, 2)
