@@ -16,12 +16,14 @@ limitations under the License.
 
 from typing import Optional
 
+import nvshmem.core
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 from cuda.core.experimental import Device
-import nvshmem.core
+from torch.distributed import ProcessGroup
+
 from .nvshmem import PyTorchStreamWrapper
+
 
 class NVSHMEMAllReduce:
     """
@@ -60,7 +62,6 @@ class NVSHMEMAllReduce:
         self.device = device
         self.max_buffer_elements = max_buffer_elements
         self.group = group
-        #self.nvshmem_module = get_nvshmem_module()
         self.dev = Device(self.device.index)
         self.dev.set_current()
         self.pt_stream = torch.cuda.current_stream()
@@ -101,7 +102,9 @@ class NVSHMEMAllReduce:
             broadcast_objects = [uniqueid]
         else:
             broadcast_objects = [None]
-        torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=self.group)
+        torch.distributed.broadcast_object_list(
+            broadcast_objects, src=0, group=self.group
+        )
         torch.distributed.barrier(self.group)
         nvshmem.core.init(
             device=self.dev,
@@ -116,8 +119,15 @@ class NVSHMEMAllReduce:
         input_buffer = self.symm_buffer_input.narrow(0, 0, numel)
         output_buffer = self.symm_buffer_output.narrow(0, 0, numel)
         input_buffer.copy_(inp)
-        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD,stream=self.stream)
-        nvshmem.core.reduce(nvshmem.core.Teams.TEAM_WORLD, output_buffer, input_buffer, "sum", stream=self.stream)
+        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD, stream=self.stream)
+        nvshmem.core.reduce(
+            nvshmem.core.Teams.TEAM_WORLD,
+            output_buffer,
+            input_buffer,
+            "sum",
+            stream=self.stream,
+        )
+        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD, stream=self.stream)
         out.copy_(output_buffer)
 
     def shutdown(self):

@@ -9,6 +9,7 @@ from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec
 
+
 class PyTorchStreamWrapper:
     def __init__(self, pt_stream):
         self.pt_stream = pt_stream
