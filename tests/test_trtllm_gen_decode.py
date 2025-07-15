@@ -245,7 +245,7 @@ def test_trtllm_batch_decode_fmha(
 
 
 @pytest.mark.parametrize(
-    "batch_size", [16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+    "batch_size", [1, 2, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 )
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize(
