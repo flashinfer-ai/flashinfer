@@ -103,8 +103,7 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mMaxSeqLenCacheKv = max_attention_window_size_opt;
 
   // This should be set to numDraftTokens + 1.
-  auto const acc_q_len_opt = acc_q_len.value_or(batch_beam);
-  runner_params.mMaxSeqLenQ = acc_q_len_opt / batch_beam;  // should be 1 if acc_q_len not provided
+  runner_params.mMaxSeqLenQ = acc_q_len / batch_beam;  // should be 1 if acc_q_len not provided
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_beam * runner_params.mMaxSeqLenQ);
   // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
@@ -169,8 +168,9 @@ template <Data_type CACHE_T>
 void trtllm_paged_attention_mla_dynamic_scale_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
-    int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim, double bmm1_scale,
-    double bmm2_scale, int64_t acc_q_len, std::optional<int64_t> max_attention_window_size,
+    int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim,
+    at::Tensor& bmm1_scale, at::Tensor& bmm2_scale, int64_t acc_q_len,
+    std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
@@ -245,8 +245,7 @@ void trtllm_paged_attention_mla_dynamic_scale_launcher(
   runner_params.mMaxSeqLenCacheKv = max_attention_window_size_opt;
 
   // This should be set to numDraftTokens + 1.
-  auto const acc_q_len_opt = acc_q_len.value_or(batch_beam);
-  runner_params.mMaxSeqLenQ = acc_q_len_opt / batch_beam;  // should be 1 if acc_q_len not provided
+  runner_params.mMaxSeqLenQ = acc_q_len / batch_beam;  // should be 1 if acc_q_len not provided
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_beam * runner_params.mMaxSeqLenQ);
   // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
@@ -267,8 +266,8 @@ void trtllm_paged_attention_mla_dynamic_scale_launcher(
   runner_params.mSfStartTokenIdx = 0;
 
   runner_params.mUseGemmScale = true;
-  runner_params.outputScalePtr = bmm2_scale.data_ptr<float>();
-  runner_params.scaleSoftmaxLog2Ptr = bmm1_scale.data_ptr<float>();
+  runner_params.outputScalePtr = static_cast<float*>(bmm2_scale.data_ptr());
+  runner_params.scaleSoftmaxLog2Ptr = static_cast<float*>(bmm1_scale.data_ptr());
 
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
