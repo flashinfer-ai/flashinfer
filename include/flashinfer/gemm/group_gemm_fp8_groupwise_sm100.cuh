@@ -25,7 +25,7 @@
 
 namespace flashinfer {
 
-namespace gemm {
+namespace group_gemm {
 
 using namespace cute;
 
@@ -248,7 +248,7 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100(
   return cudaSuccess;
 }
 
-}  // namespace gemm
+}  // namespace group_gemm
 
 }  // namespace flashinfer
 

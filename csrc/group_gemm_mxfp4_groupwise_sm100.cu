@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/gemm/group_gemm_mxfp4_groupwise_sm100.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -115,6 +114,19 @@ constexpr bool is_valid_config() {
   return false;
 }
 
+namespace flashinfer {
+namespace group_gemm {
+
+template <int TileM, int TileN, int TileK, int MmaSM, bool SwapAB, typename DTypeInA,
+          typename DTypeInB, typename DTypeSFA, typename DTypeSFB, typename DTypeOut>
+cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100(
+    void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
+    size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
+    DTypeOut* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream);
+
+}  // namespace group_gemm
+}  // namespace flashinfer
+
 void CutlassGroupGemmMXFP4GroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                                                at::Tensor float_workspace_buffer, at::Tensor A,
                                                at::Tensor B, at::Tensor SFA, at::Tensor SFB,
@@ -139,8 +151,8 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                     using cutlass_t_sf_a = cutlass_dtype_t<c_type_sf_a>;
                     using cutlass_t_sf_b = cutlass_dtype_t<c_type_sf_b>;
                     using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-                    auto status = flashinfer::gemm::CutlassMXFP4GroupwiseScaledGroupGEMMSM100<
-                        MMA_SM, TILE_M, TILE_N, TILE_K, SWAP_AB>(
+                    auto status = flashinfer::group_gemm::CutlassMXFP4GroupwiseScaledGroupGEMMSM100<
+                        TILE_M, TILE_N, TILE_K, MMA_SM, SWAP_AB>(
                         static_cast<int*>(int_workspace_buffer.data_ptr()),
                         int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
                         static_cast<float*>(float_workspace_buffer.data_ptr()),

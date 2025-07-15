@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2025 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <flashinfer/gemm/group_gemm_mxfp4_groupwise_sm100.cuh>
+
+using namespace flashinfer;
+using namespace flashinfer::group_gemm;
+
+namespace flashinfer {
+namespace group_gemm {
+
+{% for tile_m in [128] %}
+{% for tile_n in [64, 128, 192, 256] %}
+{% for tile_k in [128, 256] %}
+{% for dtype_sfa in ["cutlass::float_ue8m0_t"] %}
+{% for dtype_sfb in ["cutlass::float_ue8m0_t"] %}
+template cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100<
+    {{ tile_m }},
+    {{ tile_n }},
+    {{ tile_k }},
+    {{ mma_sm }},
+    {{ swap_ab }},
+    {{ dtype_a }},
+    {{ dtype_b }},
+    {{ dtype_sfa }},
+    {{ dtype_sfb }},
+    {{ dtype_d }}>(
+        void* int_buffer, size_t int_buffer_size_in_bytes,
+        void* float_buffer, size_t float_buffer_size_in_bytes,
+        {{ dtype_a }}* A, {{ dtype_b }}* B, {{ dtype_sfa }}* SFA, {{ dtype_sfb }}* SFB,
+        {{ dtype_d }}* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream);
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+};  // namespace group_gemm
+};  // namespace flashinfer

@@ -1,0 +1,45 @@
+/*
+ * Copyright (c) 2025 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>
+
+using namespace flashinfer;
+using namespace flashinfer::group_gemm;
+
+namespace flashinfer {
+namespace group_gemm {
+
+{% for scale_granularity_m in [1, 128] %}
+{% for scale_granularity_n in [128] %}
+{% for scale_granularity_k in [128] %}
+template cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100<
+    {{ scale_granularity_m }},
+    {{ scale_granularity_n }},
+    {{ scale_granularity_k }},
+    {{ scale_major_k }},
+    {{ mma_sm }},
+    {{ dtype_in }},
+    {{ dtype_out }}>(
+        void* int_buffer, size_t int_buffer_size_in_bytes,
+        void* float_buffer, size_t float_buffer_size_in_bytes,
+        {{ dtype_in }}* A, {{ dtype_in }}* B, float* SFA, float* SFB,
+        {{ dtype_out }}* D, int* m_indptr, int max_m, int n, int k,
+        int num_groups, cudaStream_t stream);
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+};  // namespace group_gemm
+};  // namespace flashinfer
