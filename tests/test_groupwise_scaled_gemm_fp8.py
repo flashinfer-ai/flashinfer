@@ -21,6 +21,7 @@ import torch
 from einops import einsum, rearrange, reduce, repeat
 
 from flashinfer.gemm import (
+    batch_deepgemm_fp8_nt_groupwise,
     gemm_fp8_nt_blockscaled,
     gemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
@@ -376,8 +377,53 @@ def test_fp8_groupwise_group_deepgemm(
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("m", [128, 256, 512, 1024])
+@pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
+@pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+def test_fp8_groupwise_batch_deepgemm_masked(
+    m,
+    nk,
+    group_size,
+    out_dtype,
+):
+    torch.random.manual_seed(0)
+    n, k = nk
+    a = torch.rand((group_size, m, k), device="cuda", dtype=torch.float32)
+    b = torch.rand((group_size, n, k), device="cuda", dtype=torch.float32)
+    masked_m = torch.randint(0, m, (group_size,), device="cuda", dtype=torch.int32)
+    a_fp8 = torch.empty_like(a, device="cuda", dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((group_size, m, k // 128), device="cuda", dtype=torch.float32)
+    b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
+    b_scale = torch.empty(
+        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    )
+    for i in range(group_size):
+        a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
+        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
+
+    ref = torch.einsum("bmk,bnk->bmn", a, b).to(out_dtype)
+
+    expected_m = min(int(masked_m.float().mean()) + 1, m)
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=out_dtype,
+    )
+    for i in range(group_size):
+        torch.testing.assert_close(
+            out[i][: masked_m[i]], ref[i][: masked_m[i]], atol=3e-2, rtol=3e-2
+        )
+
+
 if __name__ == "__main__":
     test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
     test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
     test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
     test_fp8_groupwise_group_deepgemm(256, 128, 128, 4, torch.bfloat16)
+    test_fp8_groupwise_batch_deepgemm_masked(256, (128, 512), 8, torch.bfloat16)
