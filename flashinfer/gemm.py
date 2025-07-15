@@ -646,6 +646,13 @@ def _check_cudnn_availability():
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _get_cudnn_handle():
+    """Create and return a cached cuDNN handle."""
+    _check_cudnn_availability()
+    return cudnn.create_handle()
+
+
 def _validate_fp8_output_dtype(dtype: torch.dtype):
     """Validate that the output dtype is either bf16 or fp16."""
     if dtype not in (torch.bfloat16, torch.float16):
@@ -725,11 +732,13 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, scale_tensor, c_fina
         UIDs.O_UID.value: c_final,
     }
 
+    cudnn_handle = _get_cudnn_handle()
+
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
 
-    graph.execute(variant_pack, workspace)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
 
 
 def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
@@ -745,7 +754,7 @@ def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def _cudnn_gemm_f8f8_f32(
+def _cudnn_gemm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
     dq_scale: torch.Tensor,
@@ -846,7 +855,7 @@ def bmm_fp8(
         )
 
     if backend == "cudnn":
-        return _cudnn_gemm_f8f8_f32(A, B, A_scale * B_scale, out, dtype)
+        return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype)
     elif backend == "cublas":
         workspace_buffer = _get_cache_buf(
             "bmm_fp8_workspace", 32 * 1024 * 1024, A.device
