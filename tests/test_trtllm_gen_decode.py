@@ -251,7 +251,7 @@ def test_trtllm_batch_decode_fmha(
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize("acc_q_len", [1, 2])
+@pytest.mark.parametrize("acc_q_len", [1, 2, 3, 4])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
@@ -354,6 +354,8 @@ def test_trtllm_batch_decode_mla(
         scale=scale * ((512 + 64) ** 0.5) / ((128 + 64) ** 0.5),
     )
     torch.cuda.synchronize()
+    print("output shape", output.shape)
+    print("output", output)
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -401,21 +403,26 @@ def test_trtllm_batch_decode_mla(
         query.dtype,
         kv_cache.dtype,
     )
-    q_nope = query[..., :kv_lora_rank]
-    q_pe = query[..., kv_lora_rank:]
+    q_nope = query[..., :kv_lora_rank].view(
+        batch_size * acc_q_len, num_q_heads, kv_lora_rank
+    )
+    q_pe = query[..., kv_lora_rank:].view(
+        batch_size * acc_q_len, num_q_heads, qk_rope_head_dim
+    )
 
     # todo: fix kv_cache
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
-    # print("output", output)
-    # print("o_ref", o_ref)
+    torch.cuda.synchronize()
+    print("o_ref shape", o_ref.shape)
+    print("o_ref", o_ref)
 
     if dtype == torch.float8_e4m3fn:
         try:
             torch.testing.assert_close(
-                output, o_ref, rtol=1e-1, atol=1e-1
+                output, o_ref.view(batch_size, acc_q_len, num_q_heads, -1), rtol=1e-1, atol=1e-1
             )  # todo: do reference with normal attention?
         except AssertionError as e:
             print("output:", output)
@@ -423,7 +430,12 @@ def test_trtllm_batch_decode_mla(
             raise e
     else:
         try:
-            torch.testing.assert_close(output, o_ref, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(
+                output,
+                o_ref.view(batch_size, acc_q_len, num_q_heads, -1),
+                rtol=1e-2,
+                atol=1e-2,
+            )
         except AssertionError as e:
             print("output:", output)
             print("o_ref:", o_ref)
@@ -432,5 +444,5 @@ def test_trtllm_batch_decode_mla(
 
 if __name__ == "__main__":
     # run all tests in the order of pytest
-    test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 2)
+    # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
+    test_trtllm_batch_decode_mla(1, 0.5, torch.bfloat16, 32, 2)
