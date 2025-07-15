@@ -247,6 +247,12 @@ struct TllmGenFmhaRunnerParams {
   int mMultiProcessorCount;
   // Scaling factor for Q.
   float mScaleQ;
+  // Scaling factor for K.
+  float mScaleK;
+  // Scaling factor for V.
+  float mScaleV;
+  // Scaling factor for output.
+  float mScaleOutput;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;

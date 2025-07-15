@@ -1703,14 +1703,15 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
-    scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
     kv_cache_dtype: str,
+    q_scale: float,
     k_scale: float,
     v_scale: float,
+    o_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
@@ -1727,14 +1728,15 @@ def trtllm_batch_decode_with_kv_cache(
         workspace_buffer,
         num_heads,
         num_kv_heads,
-        scale,
         block_tables,
         seq_lens,
         block_size,
         max_seq_len,
         kv_cache_dtype,
+        q_scale,
         k_scale,
         v_scale,
+        o_scale,
     )
     return out
 
