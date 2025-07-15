@@ -24,10 +24,10 @@ using namespace flashinfer::trtllm_mnnvl_allreduce;
     }                                                                                            \
   }()
 
-void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_buffer_ptr,
-                             int64_t buffer_ptrs_dev, int64_t buffer_M,
-                             at::Tensor& buffer_flags_mnnvl, int64_t nranks, int64_t rank,
-                             bool wait_for_results, bool launch_with_pdl) {
+void trtllm_mnnvl_all_reduce(at::Tensor& in, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
+                             int64_t buffer_M, at::Tensor& buffer_flags_mnnvl, int64_t nranks,
+                             int64_t rank, bool wait_for_results, bool launch_with_pdl,
+                             std::optional<at::Tensor> out) {
   const c10::cuda::OptionalCUDAGuard device_guard(in.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -39,6 +39,8 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
     // Validate input parameters
     TORCH_CHECK(nranks >= 2 && nranks <= 64, "nranks must be between 2 and 64, got ", nranks);
     TORCH_CHECK(rank >= 0 && rank < nranks, "rank must be between 0 and nranks-1, got ", rank);
+    TORCH_CHECK(out.has_value() || !wait_for_results,
+                "out tensor must be provided if wait_for_results is true");
 
     // Create the parameters struct
     AllReduceParams<c_type> params;
@@ -53,7 +55,7 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
     params.wait_for_results = wait_for_results;
     params.launch_with_pdl = launch_with_pdl;
     params.input = in.data_ptr();
-    params.output = out.data_ptr();
+    params.output = out.has_value() ? out.value().data_ptr() : nullptr;
     params.stream = stream.stream();
 
     auto status = twoshot_allreduce_dispatch_world_size<c_type>(params);
