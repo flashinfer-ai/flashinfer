@@ -103,7 +103,7 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mMaxSeqLenCacheKv = max_attention_window_size_opt;
 
   // This should be set to numDraftTokens + 1.
-  runner_params.mMaxSeqLenQ = acc_q_len / batch_beam;  // should be 1 if acc_q_len not provided
+  runner_params.mMaxSeqLenQ = acc_q_len;
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_beam * runner_params.mMaxSeqLenQ);
   // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
