@@ -125,6 +125,7 @@ class NVSHMEMAllReduce:
         input_buffer = self.symm_buffer_input.narrow(0, 0, numel)
         output_buffer = self.symm_buffer_output.narrow(0, 0, numel)
         input_buffer.copy_(inp)
+        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD,stream=self.stream)
         nvshmem.core.reduce(nvshmem.core.Teams.TEAM_WORLD, output_buffer, input_buffer, "sum", stream=self.stream)
         out.copy_(output_buffer)
 
