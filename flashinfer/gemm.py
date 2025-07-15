@@ -642,6 +642,7 @@ def _check_cudnn_availability():
     if not CUDNN_AVAILABLE:
         raise RuntimeError(
             "cuDNN is not available. Please install cuDNN to use FP8 GEMM functions. "
+            "You can install it with: pip install nvidia-cudnn-cu12 nvidia-cudnn-frontend"
         )
 
 
