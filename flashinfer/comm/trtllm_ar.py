@@ -95,22 +95,34 @@ class FP4QuantizationSFLayout:
     LINEAR = 1
 
 
-def gen_trtllm_comm_module() -> JitSpec:
-    major, minor = torch.cuda.get_device_capability()
+def gen_trtllm_comm_module(sm100: bool = True) -> JitSpec:
+    """
+    Generate TensorRT-LLM communication module.
+    If sm100 is True, use SM100 flags and name 'trtllm_comm'.
+    If sm100 is False, use no extra flags and name 'trtllm_comm_legacy'.
+    """
     return gen_jit_spec(
-        "trtllm_comm",
+        "trtllm_comm" if sm100 else "trtllm_comm_legacy",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags if major >= 10 and minor >= 0 else [],
+        extra_cuda_cflags=sm100a_nvcc_flags if sm100 else [],
     )
 
 
 @functools.cache
 def get_trtllm_comm_module():
-    module = gen_trtllm_comm_module().build_and_load()
+    # Select the appropriate module based on device capability
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        use_sm100_module = major >= 10 and minor >= 0
+    except RuntimeError:
+        # If CUDA is not available (e.g., CPU-only mode), default to legacy module
+        use_sm100_module = False
+
+    module = gen_trtllm_comm_module(use_sm100_module).build_and_load()
 
     @register_custom_op(
         "flashinfer::trtllm_lamport_initialize", mutates_args=["buffer"]
