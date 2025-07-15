@@ -1748,8 +1748,8 @@ def _check_trtllm_gen_mla_shape(
     page_table,
     page_size,
 ):
-    if query.ndim != 3:
-        raise ValueError(f"Expected query.ndim == 3, got {query.ndim}")
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
     if kv_cache.ndim != 4:
         raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
     if qk_nope_head_dim != 128:
@@ -1759,7 +1759,7 @@ def _check_trtllm_gen_mla_shape(
     if qk_rope_head_dim != 64:
         raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
 
-    B_q, H, D_q = query.shape
+    B_q, Q_len, H, D_q = query.shape
     D_ckv = kv_cache.shape[3]
     # if H != 128:
     #     raise ValueError(f"Expected 128 heads for query, got {H}")
@@ -1799,7 +1799,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
 ) -> torch.Tensor:
     """
     Parameters:
-    query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
+    query: [batch_size, acc_q_len, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; acc_q_len = num_draft_tokens + 1 is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode
     qk_nope_head_dim: qk_nope_head_dim, must be 128
@@ -1850,7 +1850,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        batch_size, _, num_q_heads, _ = query.shape
+        _check_shape_dtype_device(
+            out,
+            [batch_size, num_q_heads, kv_lora_rank],
+            torch.bfloat16,
+            query.device,
+            "out",
+        )
 
     # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
     # if kv_cache.dtype == torch.float8_e4m3fn and (
@@ -1875,7 +1882,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        None,  # acc_q_len, speculative not supported for now
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )
