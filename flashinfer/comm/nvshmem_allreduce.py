@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from nvshmem.core import Device
+from cuda.core.experimental import Device
 from .nvshmem import get_nvshmem_module
 import nvshmem.core
 
