@@ -20,17 +20,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from cuda.core.experimental import Device
-from .nvshmem import get_nvshmem_module
 import nvshmem.core
-
-class PyTorchStreamWrapper:
-    def __init__(self, pt_stream):
-        self.pt_stream = pt_stream
-        self.handle = pt_stream.cuda_stream
-
-    def __cuda_stream__(self):
-        stream_id = self.pt_stream.cuda_stream
-        return (0, stream_id)  # Return format required by CUDA Python
+from .nvshmem import PyTorchStreamWrapper
 
 class NVSHMEMAllReduce:
     """
