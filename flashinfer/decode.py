@@ -1703,14 +1703,13 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
-    scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
+    bmm1_scale: float,
+    bmm2_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
@@ -1727,14 +1726,13 @@ def trtllm_batch_decode_with_kv_cache(
         workspace_buffer,
         num_heads,
         num_kv_heads,
-        scale,
         block_tables,
         seq_lens,
         block_size,
         max_seq_len,
         kv_cache_dtype,
-        k_scale,
-        v_scale,
+        bmm1_scale,
+        bmm2_scale,
     )
     return out
 
@@ -1792,7 +1790,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
@@ -1872,7 +1869,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         query,
         kv_cache,
         workspace_buffer,
-        scale,
         block_tables,
         seq_lens,
         block_size,

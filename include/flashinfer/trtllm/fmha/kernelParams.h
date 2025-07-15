@@ -733,9 +733,7 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     // todo(Yingyi): might take a scalar tensor later
     params.mOutputScale = options.outputScale;
-    params.mScaleSoftmaxLog2 =
-        (options.scaleSoftmaxLog2 / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) *
-        M_LOG2E;
+    params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = nullptr;

@@ -166,7 +166,6 @@ def test_trtllm_batch_decode_fmha(
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
     kv_cache = torch.randn(size=kv_cache_shape).to(dtype).to(device)
-    k_scale = v_scale = 1.0
 
     if kv_cache_dtype.startswith("fp8"):
         kv_cache, _ = to_float8(kv_cache)
@@ -179,14 +178,13 @@ def test_trtllm_batch_decode_fmha(
         workspace_buffer,
         num_qo_heads,
         num_kv_heads,
-        scale,
         block_tables,
         seq_lens_tensor,
         page_size,
         max_seq_len,
         kv_cache_dtype,
-        k_scale,
-        v_scale,
+        scale,  # bmm1_scale
+        1.0,  # bmm2_scale
     )
 
     if head_grp_size == 5:
@@ -376,15 +374,16 @@ def test_trtllm_batch_decode_mla(
         seq_lens=seq_lens_tensor,
         block_size=page_size,
         max_seq_len=max_seq_len,
-        scale=scale / ((512 + 64) ** 0.5) * ((128 + 64) ** 0.5),
+        bmm1_scale=scale / ((128 + 64) ** 0.5),
+        bmm2_scale=1.0,
     )
     torch.cuda.synchronize()
     print("output shape", output.shape)
     print("output", output)
 
     # Run reference attention and align output
-    sm_scale = (
-        1.0 / scale / ((128 + 64) ** 0.5)
+    sm_scale = scale / (
+        (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
     workspace_buffer_ref = torch.empty(
         128 * 1024 * 1024, dtype=torch.int8, device=device
