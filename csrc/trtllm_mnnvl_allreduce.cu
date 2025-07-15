@@ -63,6 +63,35 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
   });
 }
 
+void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, at::Tensor& prenorm_output,
+                          at::Tensor& normed_output, at::Tensor const& gamma, double epsilon,
+                          at::Tensor const& residual, at::Tensor& buffer_flags,
+                          bool launch_with_pdl) {
+  const c10::cuda::OptionalCUDAGuard device_guard(prenorm_output.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(prenorm_output.scalar_type(), c_type, [&] {
+    // Create the parameters struct
+    RMSNormParams<c_type> params;
+    params.residual_output = prenorm_output.data_ptr();
+    params.output = normed_output.data_ptr();
+    params.input = reinterpret_cast<void const*>(multicast_buffer_ptr);
+    params.gamma = gamma.data_ptr();
+    params.epsilon = epsilon;
+    params.residual = residual.data_ptr();
+    params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    params.batch = normed_output.size(0);
+    params.hidden_dim = normed_output.size(1);
+    params.stream = stream.stream();
+    params.launch_with_pdl = launch_with_pdl;
+    auto status = twoshot_rmsnorm_dispatch_hidden_dim<c_type>(params);
+    TORCH_CHECK(status == cudaSuccess,
+                "twoshot_rmsnorm_dispatch_hidden_dim failed with error code ",
+                cudaGetErrorString(status));
+  });
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_mnnvl_all_reduce", &trtllm_mnnvl_all_reduce);
+  m.def("trtllm_mnnvl_rmsnorm", &trtllm_mnnvl_rmsnorm);
 }
