@@ -118,8 +118,6 @@ def run_bench(
         )
         o_p, o_d = wrapper_pod.run(
             q_p,
-            k_p,
-            v_p,
             q_d,
             kv_data,
             causal_p=causal,
