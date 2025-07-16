@@ -244,20 +244,21 @@ def test_fp8_groupwise_group_gemm(
         )
 
 
-@pytest.mark.parametrize("m_per_group", [128, 256])
-@pytest.mark.parametrize("n", [128, 512, 4096])
-@pytest.mark.parametrize("k", [128, 512, 4096])
-@pytest.mark.parametrize("group_size", [1, 4, 8])
+@pytest.mark.parametrize("m", [128, 256, 512, 1024])
+@pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
+@pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_groupwise_group_deepgemm(
-    m_per_group,
-    n,
-    k,
+    m,
+    nk,
     group_size,
     out_dtype,
 ):
     torch.random.manual_seed(0)
-    m = m_per_group * group_size
+    m_per_group = m // group_size
+    if m_per_group < 128:
+        return
+    n, k = nk
     a = torch.randn((m, k), device="cuda", dtype=torch.float32)
     b = torch.randn((group_size, n, k), device="cuda", dtype=torch.float32)
     m_indptr = torch.empty((m,), device="cuda", dtype=torch.int32)
