@@ -100,7 +100,7 @@ def reference_paged_attention(
 @pytest.mark.parametrize("batch_size", [4, 256])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("q_dtype", ["half", "bf16"])
+@pytest.mark.parametrize("q_dtype", ["half", "bf16", "fp8"])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 def test_trtllm_batch_decode_fmha(
@@ -114,6 +114,9 @@ def test_trtllm_batch_decode_fmha(
 ):
     if head_grp_size == 5 and kv_cache_dtype == "fp8":
         pytest.skip("No reference provided for head_grp_size=5 and fp8 kv_cache")
+    if kv_cache_dtype == "auto" and q_dtype == "fp8":
+        pytest.skip("duplicated test to fp8 kvcache type.")
+
     # Set up test parameters
     seed = 0
     torch.manual_seed(seed)
@@ -126,10 +129,17 @@ def test_trtllm_batch_decode_fmha(
     # Initialize tensors
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
-    dtype = torch.float16 if q_dtype == "half" else torch.bfloat16
 
-    scale = float(1.0 / (head_dim**0.5))
-    q = torch.randn(batch_size, num_qo_heads, head_dim, device=device).to(dtype)
+    dtype_map = {
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp8": torch.float8_e4m3fn,
+    }
+
+    sm_scale = float(1.0 / (head_dim**0.5))
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device=device).to(
+        dtype_map[q_dtype]
+    )
 
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
@@ -165,9 +175,14 @@ def test_trtllm_batch_decode_fmha(
     # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape, device=device).to(dtype)
+    q_scale = k_scale = v_scale = 1.0
+    kv_cache = torch.randn(size=kv_cache_shape, device=device).to(dtype_map[q_dtype])
 
-    if kv_cache_dtype.startswith("fp8"):
+    # Output type is fp8 when q is fp8, set scale for it.
+    o_scale = (
+        1.0 if q_dtype != "fp8" else torch.rand(1).item() * 0.5 + 0.5
+    )  # Scale range: 0.5 ~ 1.0
+    if kv_cache_dtype.startswith("fp8") and q_dtype != "fp8":
         kv_cache, _ = to_float8(kv_cache)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
@@ -183,13 +198,16 @@ def test_trtllm_batch_decode_fmha(
         page_size,
         max_seq_len,
         kv_cache_dtype,
-        scale,  # bmm1_scale
-        1.0,  # bmm2_scale
+        q_scale * k_scale * sm_scale,  # bmm1_scale
+        v_scale / o_scale,  # bmm2_scale
     )
 
+    # Reference implementation have functional issue or low precision with fp8, use half instead.
+    ref_q = q.half() if q_dtype == "fp8" else q
     if head_grp_size == 5:
+        scale = float(1.0 / (head_dim**0.5))
         output_ref = reference_paged_attention(
-            q,
+            ref_q,
             kv_cache,
             block_tables,
             seq_lens_tensor,
@@ -215,7 +233,7 @@ def test_trtllm_batch_decode_fmha(
         kv_last_page_len[kv_last_page_len == 0] = page_size
 
         if kv_cache_dtype == "auto":
-            kv_compute_dtype = dtype
+            kv_compute_dtype = dtype_map[q_dtype]
         elif kv_cache_dtype == "fp8":
             kv_compute_dtype = torch.float8_e4m3fn
 
@@ -229,12 +247,17 @@ def test_trtllm_batch_decode_fmha(
             page_size,
             pos_encoding_mode="NONE",
             data_type=kv_compute_dtype,
-            q_data_type=dtype,
+            q_data_type=ref_q.dtype,
         )
 
-        output_ref = wrapper.run(q, kv_cache)
+        output_ref = wrapper.run(ref_q, kv_cache)
 
-    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=5e-2)
+    rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (5e-2, 7e-2)
+
+    # convert to float32 for fp8 is not supported by assert_close
+    torch.testing.assert_close(
+        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+    )
 
 
 @pytest.mark.parametrize(

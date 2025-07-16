@@ -115,6 +115,7 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_size * runner_params.mMaxSeqLenQ);
   runner_params.mScaleQ = 1.0;
+
   // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking
   // if the kernel is supported.
   runner_params.mChunkedAttentionSize = INT_MAX;
@@ -156,6 +157,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
       FN(half, Data_type::DATA_TYPE_FP16);                                     \
     } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                        \
       FN(__nv_bfloat16, Data_type::DATA_TYPE_BF16);                            \
+    } else if (SRC_DTYPE == at::ScalarType::Float8_e4m3fn) {                   \
+      FN(__nv_fp8_e4m3, Data_type::DATA_TYPE_E4M3);                            \
     } else {                                                                   \
       TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
     }                                                                          \
@@ -165,6 +168,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
         FN(half, Data_type::DATA_TYPE_E4M3);                                   \
       } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                      \
         FN(__nv_bfloat16, Data_type::DATA_TYPE_E4M3);                          \
+      } else if (SRC_DTYPE == at::ScalarType::Float8_e4m3fn) {                 \
+        FN(__nv_fp8_e4m3, Data_type::DATA_TYPE_E4M3);                          \
       } else {                                                                 \
         TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
       }                                                                        \
