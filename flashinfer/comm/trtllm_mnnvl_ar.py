@@ -7,7 +7,7 @@ import functools
 import math
 import os
 from types import SimpleNamespace
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from mpi4py import MPI
@@ -43,7 +43,6 @@ def get_trtllm_mnnvl_comm_module():
         "flashinfer::trtllm_mnnvl_all_reduce",
         mutates_args=[
             "inp",
-            "out",
             "multicast_buffer_ptr",
             "buffer_ptrs_dev",
             "buffer_mnnvl",
@@ -52,11 +51,11 @@ def get_trtllm_mnnvl_comm_module():
             "rank",
             "wait_for_results",
             "launch_with_pdl",
+            "out",
         ],
     )
     def trtllm_mnnvl_all_reduce(
         inp: torch.Tensor,
-        out: torch.Tensor,
         multicast_buffer_ptr: int,  # Pointer address as integer
         buffer_ptrs_dev: int,  # Pointer address as integer
         buffer_mnnvl: torch.Tensor,
@@ -65,10 +64,10 @@ def get_trtllm_mnnvl_comm_module():
         rank: int,
         wait_for_results: bool,
         launch_with_pdl: bool,
+        out: Optional[torch.Tensor],
     ) -> None:
         module.trtllm_mnnvl_all_reduce(
             inp,
-            out,
             multicast_buffer_ptr,
             buffer_ptrs_dev,
             buffer_mnnvl,
@@ -77,10 +76,58 @@ def get_trtllm_mnnvl_comm_module():
             rank,
             wait_for_results,
             launch_with_pdl,
+            out,
+        )
+
+    @register_custom_op(
+        "flashinfer::trtllm_mnnvl_rmsnorm",
+        mutates_args=[
+            "mcast_buffer_input",
+            "prenorm_output",
+            "normed_output",
+            "gamma",
+            "epsilon",
+            "residual",
+            "buffer_flags",
+            "launch_with_pdl",
+        ],
+    )
+    def trtllm_mnnvl_rmsnorm(
+        mcast_buffer_input: int,
+        prenorm_output: torch.Tensor,
+        normed_output: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+        residual: torch.Tensor,
+        buffer_flags: torch.Tensor,
+        launch_with_pdl: bool,
+    ) -> None:
+        """Performs MNNVL TwoShot RMSNorm on the communication buffer.
+
+        Args:
+            prenorm_output: Output tensor for prenorm results
+            normed_output: Output tensor for normalized results
+            mcast_buffer_input: Input tensor
+            gamma: The gamma parameter for RMSNorm
+            epsilon: The epsilon parameter for RMSNorm
+            residual: The residual tensor to add
+            buffer_flags: Buffer flags for synchronization
+            launch_with_pdl: Whether to launch with PDL
+        """
+        return module.trtllm_mnnvl_rmsnorm(
+            mcast_buffer_input,
+            prenorm_output,
+            normed_output,
+            gamma,
+            epsilon,
+            residual,
+            buffer_flags,
+            launch_with_pdl,
         )
 
     return SimpleNamespace(
         trtllm_mnnvl_all_reduce=trtllm_mnnvl_all_reduce,
+        trtllm_mnnvl_rmsnorm=trtllm_mnnvl_rmsnorm,
     )
 
 
@@ -153,7 +200,6 @@ def get_allreduce_mnnvl_workspace(
 
 def trtllm_mnnvl_all_reduce(
     inp: torch.Tensor,
-    out: torch.Tensor,
     multicast_buffer_ptr: int,  # Pointer address as integer
     buffer_ptrs_dev: int,  # Pointer address as integer
     buffer_M: int,
@@ -162,6 +208,7 @@ def trtllm_mnnvl_all_reduce(
     rank: int,
     wait_for_results: bool,
     launch_with_pdl: bool,
+    out: Optional[torch.Tensor] = None,
 ) -> None:
     """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
@@ -175,7 +222,6 @@ def trtllm_mnnvl_all_reduce(
 
     Args:
         inp: Local Input Shard
-        out: Output tensor to store the result
         multicast_buffer_ptr: Pointer to the multicast buffer as an integer
         buffer_ptrs_dev: Pointer to device buffer pointers as an integer
         buffer_M: Maximum number of elements // hidden_dim
@@ -184,11 +230,12 @@ def trtllm_mnnvl_all_reduce(
         rank: Current process rank
         wait_for_results: If True, store the result to out
         launch_with_pdl: If True, launch using Programmatic Dependent Launch
+        [Optional] out: Output tensor to store the result (required if wait_for_results is True)
+
     """
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_all_reduce(
         inp,
-        out,
         multicast_buffer_ptr,
         buffer_ptrs_dev,
         buffer_M,
@@ -196,5 +243,74 @@ def trtllm_mnnvl_all_reduce(
         nranks,
         rank,
         wait_for_results,
+        launch_with_pdl,
+        out,
+    )
+
+
+def trtllm_mnnvl_fused_allreduce_rmsnorm(
+    prenorm_output: torch.Tensor,
+    normed_output: torch.Tensor,
+    shard_input: torch.Tensor,
+    multicast_buffer_ptr: int,  # Pointer address as integer
+    buffer_ptrs_dev: int,  # Pointer address as integer
+    unicast_ptr: int,  # Local unicast buffer pointer
+    buffer_M: int,
+    buffer_flags_mnnvl: torch.Tensor,
+    nranks: int,
+    rank: int,
+    gamma: torch.Tensor,
+    epsilon: float,
+    residual: torch.Tensor,
+    launch_with_pdl: bool,
+) -> None:
+    """Performs MNNVL TwoShot Allreduce + RMSNorm.
+
+    This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
+    After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
+    Note: multicast buffer is the same as the unicast buffer for the current rank.
+
+    Args:
+        prenorm_output: Output tensor for prenorm results
+        normed_output: Output tensor for normalized results
+        shard_input: Input tensor shard
+        multicast_buffer_ptr: Pointer address as integer for multicast buffer
+        buffer_ptrs_dev: Pointer address as integer for device buffer pointers
+        unicast_ptr: Pointer address as integer for unicast buffer
+        buffer_M: Maximum number of elements // hidden_dim
+        buffer_flags_mnnvl: Buffer flags for synchronization
+        nranks: Number of ranks in the tensor parallel group
+        rank: Current rank in the tensor parallel group
+        gamma: The gamma (norm weight) parameter for RMSNorm
+        epsilon: The epsilon parameter for RMSNorm
+        residual: The residual tensor to add
+        launch_with_pdl: Whether to launch with PDL
+
+    """
+    # allreduce_result = Σ(shard_input across all ranks)
+    trtllm_mnnvl_all_reduce(
+        shard_input,
+        multicast_buffer_ptr,
+        buffer_ptrs_dev,
+        buffer_M,
+        buffer_flags_mnnvl,
+        nranks,
+        rank,
+        False,  # No need to wait to write AR results here as we are not writing them
+        launch_with_pdl,
+        None,  # out parameter - None since wait_for_results=False
+    )
+
+    # prenorm_output = AllReduce(shard_input) + residual
+    # rms = sqrt(mean(prenorm_output²) + epsilon)
+    # normed_output = (prenorm_output / rms) * gamma
+    get_trtllm_mnnvl_comm_module().trtllm_mnnvl_rmsnorm(
+        unicast_ptr,
+        prenorm_output,
+        normed_output,
+        gamma,
+        epsilon,
+        residual,
+        buffer_flags_mnnvl,
         launch_with_pdl,
     )

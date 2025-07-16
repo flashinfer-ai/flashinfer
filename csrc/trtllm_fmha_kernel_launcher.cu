@@ -31,8 +31,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
                                      int64_t num_q_heads, int64_t num_kv_heads,
                                      at::Tensor& block_tables, at::Tensor& seq_lens,
                                      int64_t block_size, int64_t max_seq_len,
-                                     const std::string kv_cache_dtype, double q_scale,
-                                     double k_scale, double v_scale, double o_scale) {
+                                     const std::string kv_cache_dtype, double bmm1_scale,
+                                     double bmm2_scale) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   TORCH_CHECK(num_heads == static_cast<int>(num_q_heads),
@@ -42,9 +42,6 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
 
   auto device = query.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
-
-  TORCH_CHECK(q_scale == 1 && k_scale == 1 && v_scale == 1,
-              "only 1.0 is supported as the scale for q, k, and v for now.");
 
   uint32_t tokens_per_page = block_size;
 
@@ -117,10 +114,6 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mMaxSeqLenQ = 1;
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_size * runner_params.mMaxSeqLenQ);
-  runner_params.mScaleQ = q_scale;
-  runner_params.mScaleK = k_scale;
-  runner_params.mScaleV = v_scale;
-  runner_params.mScaleOutput = o_scale;
 
   // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking
   // if the kernel is supported.
@@ -143,13 +136,16 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
 
   runner_params.stream = stream;
 
+  runner_params.outputScale = bmm2_scale;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+
   fmha_runner.run(runner_params);
 }
 
 #define CALL_GEN_LAUNCHER(T, CACHE_T_ENUM)                                                    \
   trtllm_paged_attention_launcher<T, CACHE_T_ENUM>(                                           \
       out, query, key_value_cache, workspace_buffer, num_q_heads, num_kv_heads, block_tables, \
-      seq_lens, block_size, max_seq_len, kv_cache_dtype, q_scale, k_scale, v_scale, o_scale);
+      seq_lens, block_size, max_seq_len, kv_cache_dtype, bmm1_scale, bmm2_scale);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
@@ -184,8 +180,8 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
 void trtllm_paged_attention(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
                             at::Tensor& workspace_buffer, int64_t num_q_heads, int64_t num_kv_heads,
                             at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
-                            int64_t max_seq_len, const std::string kv_cache_dtype, double q_scale,
-                            double k_scale, double v_scale, double o_scale) {
+                            int64_t max_seq_len, const std::string kv_cache_dtype,
+                            double bmm1_scale, double bmm2_scale) {
   DISPATCH_BY_KV_CACHE_ELEM_ENUM(query.dtype(), kv_cache_dtype, CALL_GEN_LAUNCHER);
 }
 

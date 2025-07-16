@@ -194,6 +194,7 @@ struct TllmGenFmhaRunnerParams {
   int const* cumSeqLensKvPtr;
   // The kv page idx
   int const* kvPageIdxPtr;
+  bool useGmemScale;
   // The device output scale for FP8 quantization.
   float const* outputScalePtr;
   // The device scaling factor for softmax (multiplied by log2 to use faster exp2)

@@ -15,15 +15,28 @@ limitations under the License.
 """
 
 import functools
+import os
+from enum import Enum
+from itertools import product
 from types import SimpleNamespace
 from typing import Literal, Optional, Tuple
 
+import jinja2
 import torch
 import torch.nn.functional as F
+
+try:
+    import cudnn
+
+    CUDNN_AVAILABLE = True
+except ImportError:
+    cudnn = None
+    CUDNN_AVAILABLE = False
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -138,15 +151,76 @@ def get_gemm_module():
 
 
 def gen_gemm_sm100_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = []
+    for prefix in ["gemm_groupwise", "group_gemm_fp8_groupwise"]:
+        with open(
+            jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm100_kernel_inst.jinja"
+        ) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+        dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+        dtype_out_list = [torch.float16, torch.bfloat16]
+        scale_major_k_list = ["true", "false"]
+        mma_sm_list = [1, 2]
+        for dtype_in, dtype_out, scale_major_k, mma_sm in product(
+            dtype_in_list, dtype_out_list, scale_major_k_list, mma_sm_list
+        ):
+            name_dtype_in = filename_safe_dtype_map[dtype_in]
+            name_dtype_out = filename_safe_dtype_map[dtype_out]
+            dest_path = (
+                gen_directory
+                / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_sm100.cu"
+            )
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                dtype_in=dtype_cutlass_map[dtype_in],
+                dtype_out=dtype_cutlass_map[dtype_out],
+                scale_major_k=scale_major_k,
+                mma_sm=mma_sm,
+            )
+            write_if_different(dest_path, source)
+    prefix = "group_gemm_mxfp4_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm100_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    dtype_a_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+    dtype_d_list = [torch.float16, torch.bfloat16]
+    mma_sm_list = [1, 2]
+    swap_ab_list = ["true", "false"]
+    for dtype_a, dtype_d, mma_sm, swap_ab in product(
+        dtype_a_list, dtype_d_list, mma_sm_list, swap_ab_list
+    ):
+        name_dtype_a = filename_safe_dtype_map[dtype_a]
+        name_dtype_d = filename_safe_dtype_map[dtype_d]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_a}_{name_dtype_d}_mma{mma_sm}_swap{swap_ab}_sm100.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_a=dtype_cutlass_map[dtype_a],
+            dtype_b="cutlass::float_e2m1_t",
+            dtype_d=dtype_cutlass_map[dtype_d],
+            mma_sm=mma_sm,
+            swap_ab=swap_ab,
+        )
+        write_if_different(dest_path, source)
+    for filename in [
+        "gemm_groupwise_sm100.cu",
+        "group_gemm_fp8_groupwise_sm100.cu",
+        "group_gemm_mxfp4_groupwise_sm100.cu",
+        "gemm_sm100_pybind.cu",
+        "group_gemm_sm100_pybind.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
     return gen_jit_spec(
         "gemm_sm100",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "gemm_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_fp8_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp4_groupwise_sm100.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "gemm_sm100_pybind.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm100_pybind.cu",
-        ],
+        source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,
     )
 
@@ -159,18 +233,43 @@ def get_gemm_sm100_module():
 
 
 def gen_gemm_sm90_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm90"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = []
+    with open(jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    for dtype_in, dtype_out in [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e5m2, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e5m2, torch.bfloat16),
+    ]:
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory / f"group_gemm_{name_dtype_in}_{name_dtype_out}_sm90.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+        )
+        write_if_different(dest_path, source)
+    for filename in [
+        "group_gemm_sm90.cu",
+        "flashinfer_gemm_sm90_ops.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
     return gen_jit_spec(
         "gemm_sm90",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_f16_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_bf16_bf16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_f16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e4m3_bf16_sm90.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "group_gemm_e5m2_bf16_sm90.cu",
-        ],
+        source_paths,
         extra_cuda_cflags=sm90a_nvcc_flags,
     )
 
@@ -619,6 +718,160 @@ class SegmentGEMMWrapper:
     forward = run
 
 
+class UIDs(Enum):
+    """UIDs for CUDNN graph tensors"""
+
+    A_UID = 0
+    B_UID = 1
+    SCALE_UID = 2
+    O_UID = 3
+
+
+def _check_cudnn_availability():
+    """Check if cuDNN is available and raise exception if not."""
+    if not CUDNN_AVAILABLE:
+        raise RuntimeError(
+            "cuDNN is not available. Please install cuDNN to use FP8 GEMM functions. "
+            "You can install it with: pip install nvidia-cudnn-cu12 nvidia-cudnn-frontend"
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_cudnn_handle():
+    """Create and return a cached cuDNN handle."""
+    _check_cudnn_availability()
+    return cudnn.create_handle()
+
+
+def _validate_fp8_output_dtype(dtype: torch.dtype):
+    """Validate that the output dtype is either bf16 or fp16."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"Unsupported output dtype: {dtype}. "
+            f"Only torch.bfloat16 and torch.float16 are supported for FP8 GEMM operations."
+        )
+
+
+@functools.lru_cache(maxsize=128)
+def build_cudnn_gemm_with_per_tensor_q_graph(
+    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type
+):
+    """Build a cuDNN graph for GEMM with per-tensor quantization.
+
+    This function is cached to avoid rebuilding identical graphs.
+
+    Args:
+        a_shape: Shape of tensor A
+        a_stride: Stride of tensor A
+        b_shape: Shape of tensor B
+        b_stride: Stride of tensor B
+        a_type: Data type for input tensor A
+        b_type: Data type for input tensor B
+        o_type: Data type for output tensor
+
+    Returns:
+        cuDNN graph object
+    """
+    _check_cudnn_availability()
+
+    graph = cudnn.pygraph()
+
+    a_cudnn_tensor = graph.tensor(
+        name="a", dim=a_shape, stride=a_stride, data_type=a_type
+    )
+    b_cudnn_tensor = graph.tensor(
+        name="b", dim=b_shape, stride=b_stride, data_type=b_type
+    )
+    scale_cudnn_tensor = graph.tensor(
+        name="scale", dim=(1, 1, 1), stride=(1, 1, 1), data_type=cudnn.data_type.FLOAT
+    )
+    c_cudnn_tensor = graph.matmul(
+        name="matmul",
+        A=a_cudnn_tensor,
+        B=b_cudnn_tensor,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
+    c_final_cudnn_tensor = graph.mul(
+        name="scale_mul",
+        a=c_cudnn_tensor,
+        b=scale_cudnn_tensor,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+
+    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+    scale_cudnn_tensor.set_uid(UIDs.SCALE_UID.value)
+    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+
+    return graph
+
+
+def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, scale_tensor, c_final):
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.SCALE_UID.value: scale_tensor,
+        UIDs.O_UID.value: c_final,
+    }
+
+    cudnn_handle = _get_cudnn_handle()
+
+    workspace = torch.empty(
+        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+    )
+
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+
+
+def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
+    if dtype == torch.bfloat16:
+        return cudnn.data_type.BFLOAT16
+    elif dtype == torch.float16:
+        return cudnn.data_type.HALF
+    elif dtype == torch.float8_e4m3fn:
+        return cudnn.data_type.FP8_E4M3
+    elif dtype == torch.float8_e5m2:
+        return cudnn.data_type.FP8_E5M2
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _cudnn_gemm_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dq_scale: torch.Tensor,
+    out: Optional[torch.Tensor],
+    torch_out_dtype: torch.dtype,
+):
+    _check_cudnn_availability()
+
+    if out is None:
+        out = torch.empty(
+            a.shape[0], a.shape[1], b.shape[2], dtype=torch_out_dtype, device=a.device
+        )
+
+    graph = build_cudnn_gemm_with_per_tensor_q_graph(
+        a.shape,
+        a.stride(),
+        b.shape,
+        b.stride(),
+        _torch_data_type_to_cudnn_data_type(a.dtype),
+        _torch_data_type_to_cudnn_data_type(b.dtype),
+        _torch_data_type_to_cudnn_data_type(torch_out_dtype),
+    )
+
+    execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
+    return out
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -626,6 +879,7 @@ def bmm_fp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas"] = "cublas",
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -648,6 +902,9 @@ def bmm_fp8(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+
+    backend: Literal["cudnn", "cublas"]
+        The backend to use for the operation. Defaults to ``"cublas"``.
 
     Returns
     -------
@@ -678,14 +935,22 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
+    _validate_fp8_output_dtype(dtype)
+
     if out is None:
         out = torch.empty(
             (A.shape[0], A.shape[1], B.shape[2]),
             device=A.device,
             dtype=dtype,
         )
-    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-    get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
+
+    if backend == "cudnn":
+        return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype)
+    elif backend == "cublas":
+        workspace_buffer = _get_cache_buf(
+            "bmm_fp8_workspace", 32 * 1024 * 1024, A.device
+        )
+        get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
 
 
@@ -765,6 +1030,8 @@ def gemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
     else:
         out_dtype = out.dtype
+
+    _validate_fp8_output_dtype(out_dtype)
 
     # NOTE(Zihao): (out_specified, need_padding)
     # (False, False) -> create out_padded tensor explicitly
@@ -907,7 +1174,7 @@ def group_gemm_fp8_nt_groupwise(
     else:
         if out_dtype is None:
             out_dtype = out.dtype
-    assert out_dtype in [torch.bfloat16, torch.float16]
+    _validate_fp8_output_dtype(out_dtype)
 
     num_groups = m_indptr.shape[0] - 1
     assert b.shape[0] == num_groups
@@ -1099,3 +1366,144 @@ def pad_indptr_to_multiple_of_4(
     )
 
     return padded_m_indptr, padded_m_rank
+
+
+def gen_deepgemm_sm100_module() -> SimpleNamespace:
+    from flashinfer.deep_gemm import load_all
+
+    load_all()
+    return SimpleNamespace(
+        group_deepgemm_fp8_nt_groupwise=group_deepgemm_fp8_nt_groupwise,
+    )
+
+
+@functools.cache
+def get_deepgemm_sm100_module():
+    module = gen_deepgemm_sm100_module()
+    return module
+
+
+def group_deepgemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (m, k // block_size)
+    b_scale: torch.Tensor,  # (batch_size, n // block_size, k // block_size)
+    m_indices: torch.Tensor,  # (m, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,  # (m, n)
+    out_dtype: Optional[torch.dtype] = None,
+):
+    r"""Perform grouped matrix multiplication with FP8 data types using DeepGEMM backend.
+
+    This function performs a grouped GEMM operation where each group in tensor `b` is multiplied
+    with the corresponding rows in tensor `a`. The grouping is determined by the `m_indices` tensor,
+    which specifies which group each row belongs to. This is particularly useful for scenarios
+    like mixture of experts (MoE) where different tokens are routed to different experts.
+
+    The operation can be conceptualized as:
+    ```
+    for i in range(num_groups):
+        row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+        output[row_slice] = a[row_slice] @ b[i].T
+    ```
+
+    Currently only supported on NVIDIA Blackwell (SM100) architecture.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor A of shape ``(m, k)`` with FP8 data type (``torch.float8_e4m3fn``).
+        This tensor contains all rows that will be multiplied with different groups in `b`.
+
+    b : torch.Tensor
+        Input tensor B of shape ``(batch_size, n, k)`` with FP8 data type (``torch.float8_e4m3fn``).
+        Each slice ``b[i]`` represents a different group/expert that will be multiplied with
+        the corresponding rows in `a`.
+
+    a_scale : torch.Tensor
+        Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
+        These are typically generated from per-token quantization of the original float32 tensor.
+
+    b_scale : torch.Tensor
+        Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
+        with ``torch.float32`` dtype. These are typically generated from per-block quantization
+        of the original float32 tensor for each group.
+
+    m_indices : torch.Tensor
+        Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
+        specifies which group (index into `b`) the corresponding row in `a` belongs to.
+        For example, if ``m_indices[i] = j``, then row ``i`` in `a` will be multiplied with
+        group ``j`` in `b`.
+
+    scale_granularity_mnk : Tuple[int, int, int], optional
+        The granularity of the scaling factors as ``(m_granularity, n_granularity, k_granularity)``.
+        Default is ``(1, 128, 128)`` which means per-token scaling for `a` and 128x128 block
+        scaling for `b`.
+
+    out : Optional[torch.Tensor], optional
+        Pre-allocated output tensor of shape ``(m, n)``. If not provided, a new tensor will be
+        created.
+
+    out_dtype : Optional[torch.dtype], optional
+        Data type of the output tensor. If `out` is provided, this parameter is ignored.
+        Default is ``torch.bfloat16``.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(m, n)`` containing the results of the grouped matrix multiplication.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
+    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>>
+    >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
+    >>> m_per_group, n, k = 128, 2048, 4096
+    >>> group_size = 2
+    >>> m = m_per_group * group_size
+    >>>
+    >>> # Create float32 inputs
+    >>> a_f32 = torch.randn(m, k, device="cuda", dtype=torch.float32)
+    >>> b_f32 = torch.randn(group_size, n, k, device="cuda", dtype=torch.float32)
+    >>>
+    >>> # Quantize to FP8 with appropriate scaling
+    >>> a_fp8, a_scale = per_token_cast_to_fp8(a_f32)
+    >>> b_fp8 = torch.empty_like(b_f32, dtype=torch.float8_e4m3fn)
+    >>> b_scale = torch.empty((group_size, n // 128, k // 128), device="cuda", dtype=torch.float32)
+    >>> for i in range(group_size):
+    ...     b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b_f32[i])
+    >>>
+    >>> # Create group assignment
+    >>> m_indices = torch.empty(m, device="cuda", dtype=torch.int32)
+    >>> for i in range(group_size):
+    ...     row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+    ...     m_indices[row_slice] = i
+    >>>
+    >>> # Perform grouped GEMM
+    >>> result = group_deepgemm_fp8_nt_groupwise(
+    ...     a_fp8, b_fp8, a_scale, b_scale, m_indices, out_dtype=torch.bfloat16
+    ... )
+    >>> print(result.shape)  # torch.Size([256, 2048])
+
+    Notes
+    -----
+    - This function requires NVIDIA Blackwell (SM100) architecture
+    - The scaling factors should be generated using appropriate quantization functions
+      like ``per_token_cast_to_fp8`` for `a` and ``per_block_cast_to_fp8`` for `b`
+    - The function internally uses the DeepGEMM backend for optimized FP8 computation
+    - All input tensors must be on the same CUDA device
+    - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
+    """
+    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
+
+    m_grouped_fp8_gemm_nt_contiguous(
+        (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
+    )
+
+    return out

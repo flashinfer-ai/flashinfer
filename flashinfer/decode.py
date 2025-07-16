@@ -1708,10 +1708,8 @@ def trtllm_batch_decode_with_kv_cache(
     block_size: int,
     max_seq_len: int,
     kv_cache_dtype: str,
-    q_scale: float,
-    k_scale: float,
-    v_scale: float,
-    o_scale: float,
+    bmm1_scale: float,
+    bmm2_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
@@ -1733,10 +1731,8 @@ def trtllm_batch_decode_with_kv_cache(
         block_size,
         max_seq_len,
         kv_cache_dtype,
-        q_scale,
-        k_scale,
-        v_scale,
-        o_scale,
+        bmm1_scale,
+        bmm2_scale,
     )
     return out
 
@@ -1750,8 +1746,8 @@ def _check_trtllm_gen_mla_shape(
     page_table,
     page_size,
 ):
-    if query.ndim != 3:
-        raise ValueError(f"Expected query.ndim == 3, got {query.ndim}")
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
     if kv_cache.ndim != 4:
         raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
     if qk_nope_head_dim != 128:
@@ -1761,7 +1757,7 @@ def _check_trtllm_gen_mla_shape(
     if qk_rope_head_dim != 64:
         raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
 
-    B_q, H, D_q = query.shape
+    B_q, Q_len, H, D_q = query.shape
     D_ckv = kv_cache.shape[3]
     # if H != 128:
     #     raise ValueError(f"Expected 128 heads for query, got {H}")
@@ -1794,14 +1790,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    scale: Optional[float] = 1.0,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
+    bmm1_scale_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters:
-    query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
+    query: [batch_size, acc_q_len, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; acc_q_len = num_draft_tokens + 1 is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode
     qk_nope_head_dim: qk_nope_head_dim, must be 128
@@ -1813,19 +1810,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length
     scale: model scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: scale for mla bmm1 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
-    bmm2_scale: scale for mla bmm2 output, only for fp8 quantization. Per-tensor scale now, so shape is [1].
+    bmm1_scale: fused scale for mla bmm1 input.
+    bmm2_scale: fused scale for mla bmm2 input.
+    bmm1_scale_tensor: On-device fused scale tensor for mla bmm1 input.
+    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
 
     Note:
-    For FP8 quantization, we could have those per-tensor scales:
-    - q_scale: dynamic scale for query, shape is [1]
-    - k_scale: loaded scale for kv_cache, shape is [1]
-    - v_scale: loaded scale for kv_cache, shape is [1]
-    We could calculate bmm1_scale and bmm2_scale as:
-    - bmm1_scale = q_scale * k_scale
-    - bmm2_scale = v_scale
-
-    TODO: We might support per-head / per-block / any finer-grained quantization in the future.
+    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
+    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
+    bmm2_scale = v_scale * o_scale
+    For bmm2_scale_tensor, please fuse * M_LOG2E to use faster exp2.
+    The two scale factors should be static constant for cuda graph capture.
+    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_tensor, bmm2_scale_tensor) should be provided.
+    For static constant scale factors, the scale factors should be provided as float.
+        - (bmm1_scale, bmm2_scale)
+    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
+        - (bmm1_scale_tensor, bmm2_scale_tensor)
+        - Currently, only fp8 tensor core operation supports this mode.
+    When both are provided, the dynamic scale factor tensors will be used.
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
@@ -1842,32 +1844,31 @@ def trtllm_batch_decode_with_kv_cache_mla(
         block_size,
     )
 
-    # todo(Yingyi): update to be tensor
-    # if bmm1_scale is None:
-    #     bmm1_scale = torch.tensor(1.0, device=query.device, dtype=query.dtype)
-    # if bmm2_scale is None:
-    #     bmm2_scale = torch.tensor(1.0, device=query.device, dtype=query.dtype)
-
     if out is None:
         out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        batch_size, _, num_q_heads, _ = query.shape
+        _check_shape_dtype_device(
+            out,
+            [batch_size, num_q_heads, kv_lora_rank],
+            torch.bfloat16,
+            query.device,
+            "out",
+        )
 
-    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
-    # if kv_cache.dtype == torch.float8_e4m3fn and (
-    #     bmm1_scale is None or bmm2_scale is None
-    # ):
-    #     raise ValueError(
-    #         "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
-    #     )
+    if bmm1_scale_tensor is not None and bmm2_scale_tensor is not None:
+        # dynamic scale factors
+        if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
+            )
 
     run_func(
         out,
         query,
         kv_cache,
         workspace_buffer,
-        scale,
         block_tables,
         seq_lens,
         block_size,
@@ -1877,7 +1878,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        None,  # acc_q_len, speculative not supported for now
+        bmm1_scale_tensor,
+        bmm2_scale_tensor,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )

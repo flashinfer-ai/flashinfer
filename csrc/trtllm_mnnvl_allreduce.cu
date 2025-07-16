@@ -24,10 +24,10 @@ using namespace flashinfer::trtllm_mnnvl_allreduce;
     }                                                                                            \
   }()
 
-void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_buffer_ptr,
-                             int64_t buffer_ptrs_dev, int64_t buffer_M,
-                             at::Tensor& buffer_flags_mnnvl, int64_t nranks, int64_t rank,
-                             bool wait_for_results, bool launch_with_pdl) {
+void trtllm_mnnvl_all_reduce(at::Tensor& in, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
+                             int64_t buffer_M, at::Tensor& buffer_flags_mnnvl, int64_t nranks,
+                             int64_t rank, bool wait_for_results, bool launch_with_pdl,
+                             std::optional<at::Tensor> out) {
   const c10::cuda::OptionalCUDAGuard device_guard(in.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -39,6 +39,8 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
     // Validate input parameters
     TORCH_CHECK(nranks >= 2 && nranks <= 64, "nranks must be between 2 and 64, got ", nranks);
     TORCH_CHECK(rank >= 0 && rank < nranks, "rank must be between 0 and nranks-1, got ", rank);
+    TORCH_CHECK(out.has_value() || !wait_for_results,
+                "out tensor must be provided if wait_for_results is true");
 
     // Create the parameters struct
     AllReduceParams<c_type> params;
@@ -53,7 +55,7 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
     params.wait_for_results = wait_for_results;
     params.launch_with_pdl = launch_with_pdl;
     params.input = in.data_ptr();
-    params.output = out.data_ptr();
+    params.output = out.has_value() ? out.value().data_ptr() : nullptr;
     params.stream = stream.stream();
 
     auto status = twoshot_allreduce_dispatch_world_size<c_type>(params);
@@ -63,6 +65,35 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, at::Tensor& out, int64_t multicast_
   });
 }
 
+void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, at::Tensor& prenorm_output,
+                          at::Tensor& normed_output, at::Tensor const& gamma, double epsilon,
+                          at::Tensor const& residual, at::Tensor& buffer_flags,
+                          bool launch_with_pdl) {
+  const c10::cuda::OptionalCUDAGuard device_guard(prenorm_output.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(prenorm_output.scalar_type(), c_type, [&] {
+    // Create the parameters struct
+    RMSNormParams<c_type> params;
+    params.residual_output = prenorm_output.data_ptr();
+    params.output = normed_output.data_ptr();
+    params.input = reinterpret_cast<void const*>(multicast_buffer_ptr);
+    params.gamma = gamma.data_ptr();
+    params.epsilon = epsilon;
+    params.residual = residual.data_ptr();
+    params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    params.batch = normed_output.size(0);
+    params.hidden_dim = normed_output.size(1);
+    params.stream = stream.stream();
+    params.launch_with_pdl = launch_with_pdl;
+    auto status = twoshot_rmsnorm_dispatch_hidden_dim<c_type>(params);
+    TORCH_CHECK(status == cudaSuccess,
+                "twoshot_rmsnorm_dispatch_hidden_dim failed with error code ",
+                cudaGetErrorString(status));
+  });
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_mnnvl_all_reduce", &trtllm_mnnvl_all_reduce);
+  m.def("trtllm_mnnvl_rmsnorm", &trtllm_mnnvl_rmsnorm);
 }

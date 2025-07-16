@@ -815,8 +815,8 @@ class McastGPUBuffer:
         self.buf_size = buf_size
         self.local_device = device
 
-    def lamport_initialize(self, rank: int):
-        self.mcast_device_memory.lamport_initialize(rank)
+    def lamport_initialize(self, rank: int, dtype: torch.dtype):
+        self.mcast_device_memory.lamport_initialize(rank, dtype)
 
     def get_mc_buffer(
         self, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0

@@ -23,9 +23,13 @@
 
 namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-                                                at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout);
+                                                std::optional<at::Tensor> globalScale,
+                                                int64_t sfVecSize, bool sfUseUE8M0,
+                                                bool isSfSwizzledLayout);
 
-void fp4_swizzle_blockscale(at::Tensor const& unswizzled_sf, at::Tensor& swizzled_sf, int64_t b,
-                            int64_t m, int64_t n);
+at::Tensor block_scale_interleave(at::Tensor const& unswizzled_sf);
+
+at::Tensor e2m1_and_ufp8sf_scale_to_float(at::Tensor valueE2M1, at::Tensor scaleFP8SF,
+                                          std::optional<at::Tensor> globalScale, int64_t sfVecSize,
+                                          int64_t sfType, bool isSfSwizzledLayout);
 }  // namespace torch_ext

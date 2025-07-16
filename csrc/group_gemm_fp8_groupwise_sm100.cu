@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -74,6 +73,19 @@ using namespace flashinfer;
     return false;                                                    \
   }()
 
+namespace flashinfer {
+namespace group_gemm {
+
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
+          int MmaSM, typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100(
+    void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
+    size_t float_buffer_size_in_bytes, DTypeIn* A, DTypeIn* B, float* SFA, float* SFB, DTypeOut* D,
+    int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream);
+
+}  // namespace group_gemm
+}  // namespace flashinfer
+
 void CutlassGroupGemmFP8GroupwiseScaledSM100(
     at::Tensor int_workspace_buffer, at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
     at::Tensor SFA, at::Tensor SFB, at::Tensor D, at::Tensor m_indptr, int64_t n, int64_t k,
@@ -91,7 +103,7 @@ void CutlassGroupGemmFP8GroupwiseScaledSM100(
             SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
               using cutlass_t_in = cutlass_dtype_t<c_type_in>;
               using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-              auto status = flashinfer::gemm::CutlassFP8GroupwiseScaledGroupGEMMSM100<
+              auto status = flashinfer::group_gemm::CutlassFP8GroupwiseScaledGroupGEMMSM100<
                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
                   MMA_SM>(static_cast<int*>(int_workspace_buffer.data_ptr()),
                           int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
