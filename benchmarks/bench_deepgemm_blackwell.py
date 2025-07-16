@@ -17,12 +17,11 @@ limitations under the License.
 import torch
 from triton.testing import do_bench
 
-import flashinfer
 from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
 )
-from flashinfer.utils import quantize_fp8
+from flashinfer.testing.utils import quantize_fp8
 
 
 def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):

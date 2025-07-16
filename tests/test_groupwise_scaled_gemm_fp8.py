@@ -27,7 +27,7 @@ from flashinfer.gemm import (
     group_deepgemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
 )
-from flashinfer.utils import dequantize_fp8, quantize_fp8
+from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 
 
 def gemm_fp8_nt_blockscaled_ref(
