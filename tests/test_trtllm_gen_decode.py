@@ -337,31 +337,6 @@ def test_trtllm_batch_decode_mla(
     # todo(Yingyi): calculate the actual size of workspace buffer
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    # Calculate the mean of all v tensors by the given kv_cache and block tables
-    # v tensor is the first kv_lora_rank dimensions in the last axis of kv_cache
-    # We need to gather all valid blocks for all sequences, then select [:, :kv_lora_rank]
-    # block_tables: (batch_size, max_num_blocks_per_seq), kv_cache: (num_blocks, page_size, kv_lora_rank + qk_rope_head_dim)
-    # blocks_per_seq: (batch_size,)
-    # v tensors are of shape [1, kv_lora_rank]. mean each of the dimensions
-    # For each block in block_tables, gather the v part (first kv_lora_rank dims), flatten, and compute mean over all tokens
-    v_blocks = []
-    for i in range(batch_size):
-        num_blocks_i = blocks_per_seq[i]
-        block_ids = block_tables[i, :num_blocks_i]
-        # Gather all blocks for this sequence
-        blocks = kv_cache[
-            block_ids
-        ]  # (num_blocks_i, page_size, kv_lora_rank + qk_rope_head_dim)
-        v_part = blocks[..., :kv_lora_rank]  # (num_blocks_i, page_size, kv_lora_rank)
-        v_blocks.append(
-            v_part.reshape(-1, kv_lora_rank)
-        )  # flatten all tokens for this sequence
-    all_v = torch.cat(v_blocks, dim=0)  # (total_tokens, kv_lora_rank)
-    print("all_v shape:", all_v.shape)
-    v_mean = all_v.mean(dim=0)  # (kv_lora_rank,)
-    print("v_mean shape:", v_mean.shape)
-    print("Mean of all v tensors:", v_mean)
-
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
