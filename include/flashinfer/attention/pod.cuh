@@ -438,8 +438,6 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
-            FLASHINFER_CUDA_CALL(
-                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 
             // Post-kernel stuff for split-kv prefill
             if (!(num_chunks <= 1 || tmp_p == nullptr)) {
