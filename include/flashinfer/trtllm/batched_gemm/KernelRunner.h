@@ -38,6 +38,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
+  bool useShuffledMatrixA{false};
 };
 
 class TrtllmGenBatchedGemmRunner {

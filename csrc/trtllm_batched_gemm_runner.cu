@@ -49,7 +49,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize &&
-        options.mUseShffledMatrixA == mOptions.useShuffledMatrixA) {
+        options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA) {
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
@@ -280,7 +280,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
               << "mTileM=" << config.mTileM << ", "
               << "mTileN=" << config.mTileN << ", "
               << "mTileK=" << config.mTileK << ", "
-              << "mUseShffledMatrixA=" << (config.mUseShffledMatrixA ? "true" : "false")
+              << "mUseShuffledMatrixA=" << (config.mUseShuffledMatrixA ? "true" : "false")
               << std::endl;
   }
 

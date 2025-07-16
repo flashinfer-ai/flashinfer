@@ -222,7 +222,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   // Create the MoE runner to get BMM workspace sizes
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_matrix_a);
+      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
   auto [bmm1WorkspaceSize, bmm2WorkspaceSize] = moe_runner.getWorkspaceSizeInBytes(args);
 
   // BMM workspaces

@@ -904,6 +904,7 @@ def get_trtllm_moe_sm100_module():
         routed_scaling: float,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        use_shuffled_matrix_a: bool = False,
     ) -> None:
         # Calculate workspace size
         seq_len = hidden_states.shape[0]
@@ -937,6 +938,7 @@ def get_trtllm_moe_sm100_module():
             routed_scaling,
             tile_tokens_dim,
             routing_method_type,
+            use_shuffled_matrix_a,
         )
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
@@ -960,6 +962,7 @@ def get_trtllm_moe_sm100_module():
         routed_scaling: float,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        use_shuffled_matrix_a: bool = False,
     ):
         # No-op for fake op since output is provided
         pass
@@ -1063,6 +1066,7 @@ def trtllm_fp8_block_scale_moe(
     routed_scaling: float,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
+    use_shuffled_matrix_a: bool = True,
 ) -> None:
     """FP8 block scale MoE operation.
 
@@ -1107,6 +1111,7 @@ def trtllm_fp8_block_scale_moe(
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
+        use_shuffled_matrix_a,
     )
 
 
