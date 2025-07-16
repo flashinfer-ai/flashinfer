@@ -559,7 +559,8 @@ at::Tensor trtllm_fp8_block_scale_moe(
     bool mUseDeepSeekFp8{true};                  // Always true for BlockScaleMoe
 
     // Properly initialize the runner using make_unique like in the original code
-    auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim);
+    auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
+                                                use_shuffled_weight);
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
     auto const num_tokens = hidden_states.sizes()[0];
@@ -572,8 +573,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group,
         topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, tile_tokens_dim, routing_method_type, use_shuffled_weight, *mRunner,
-        moeConfigIndex);
+        routed_scaling_factor, tile_tokens_dim, routing_method_type, *mRunner, moeConfigIndex);
   } else {
     TORCH_CHECK(false, "Unsupported input type: ", dtype);
   }
