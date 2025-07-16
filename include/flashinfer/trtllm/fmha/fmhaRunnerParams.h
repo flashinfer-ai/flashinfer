@@ -197,8 +197,10 @@ struct TllmGenFmhaRunnerParams {
   bool useGmemScale;
   // The device output scale for FP8 quantization.
   float const* outputScalePtr;
+  float outputScale;
   // The device scaling factor for softmax (multiplied by log2 to use faster exp2)
   float const* scaleSoftmaxLog2Ptr;
+  float scaleSoftmaxLog2;
   // The device scale for KV scaling factor.
   float const* kvSfScalePtr;
   // The device scale for O scaling factor.
@@ -244,12 +246,6 @@ struct TllmGenFmhaRunnerParams {
   int mNumPagesInMemPool;
   // The number of multiProcessor for the GPU.
   int mMultiProcessorCount;
-  // Scaling factor for Q.
-  float mScaleQ;
-  // Scaling factor for K.
-  float mScaleK;
-  // Scaling factor for V.
-  float mScaleV;
   // Scaling factor for output.
   float mScaleOutput;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase

@@ -176,7 +176,7 @@ def test_trtllm_batch_decode_fmha(
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
     q_scale = k_scale = v_scale = 1.0
-    kv_cache = torch.randn(size=kv_cache_shape, device=device)
+    kv_cache = torch.randn(size=kv_cache_shape, device=device, dtype=dtype_map[q_dtype])
 
     # Output type is fp8 when q is fp8, set scale for it.
     o_scale = (
