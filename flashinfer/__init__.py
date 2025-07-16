@@ -55,7 +55,7 @@ from .fp4_quantization import (
 )
 from .fused_moe import (
     RoutingMethodType,
-    fused_moe_cutlass,
+    cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,

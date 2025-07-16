@@ -233,7 +233,7 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
     )
     flash_output = torch.empty_like(ref_output)
-    flash_output = fused_moe.fused_moe_cutlass(
+    flash_output = fused_moe.cutlass_fused_moe(
         x,
         selected_experts.to(torch.int),
         routing_weights,
@@ -311,7 +311,7 @@ def test_moe_fp8(
         hidden_states_scale,
     ]
 
-    flash_output = fused_moe.fused_moe_cutlass(
+    _ = fused_moe.cutlass_fused_moe(
         x_quant,
         selected_experts.to(torch.int),
         routing_weights,
@@ -786,7 +786,7 @@ def test_moe_tensor_expert_parallel(
             w2_weight_local = w2_weight_ep[:, :, w2_start:w2_end]
 
             # Call flashinfer implementation with both parallelisms
-            out_hidden_states_local = fused_moe.fused_moe_cutlass(
+            out_hidden_states_local = fused_moe.cutlass_fused_moe(
                 x.contiguous(),
                 selected_experts.to(torch.int),
                 routing_weights,
@@ -1012,7 +1012,7 @@ def test_moe_fp8_block_scaling(
         NotImplementedError,
         match="FP8 Block Scaling is not yet implemented for Blackwell",
     ):
-        _ = fused_moe.fused_moe_cutlass(
+        _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,

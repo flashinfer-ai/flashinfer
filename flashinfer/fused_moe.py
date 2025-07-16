@@ -307,9 +307,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_fused_moe_sm100_module():
-    module = gen_fused_moe_sm100_module().build_and_load(
-        class_name="FusedMoeCutlassRunner"
-    )
+    module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeRunner")
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
@@ -353,7 +351,7 @@ def get_fused_moe_sm100_module():
 
             if instance_key not in MoERunner._runner_dict:
                 MoERunner._runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeCutlassRunner(
+                    torch.classes.fused_moe_sm100.FusedMoeRunner(
                         x_dtype,
                         weight_dtype,
                         output_dtype,
@@ -414,10 +412,11 @@ def get_fused_moe_sm100_module():
             )
 
     @register_custom_op(
-        "flashinfer::fused_moe_cutlass_sm100",
+        "flashinfer::cutlass_fused_moe_sm100",
         mutates_args=(""),
     )
-    def fused_moe_cutlass_sm100(
+    def cutlass_fused_moe_sm100(
+        output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
@@ -562,13 +561,13 @@ def get_fused_moe_sm100_module():
 
     # Register the module
     return SimpleNamespace(
-        fused_moe_cutlass_sm100=fused_moe_cutlass_sm100,
+        cutlass_fused_moe_sm100=cutlass_fused_moe_sm100,
     )
 
 
 # TODO(shuw): wrap into a FusedMoeModule once trtllm-gen is readly.
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe.py#L827
-def fused_moe_cutlass(
+def cutlass_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
