@@ -19,11 +19,7 @@
 #include <cassert>
 
 #include "Enums.h"
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/KernelTraits.h
 #include "flashinfer/utils.cuh"
-=======
-#include "trtllm/gen/CommonUtils.h"
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/KernelTraits.h
 #include "trtllm/gen/DtypeDecl.h"
 
 namespace batchedGemm {
@@ -449,15 +445,10 @@ class KernelTraits {
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA =
             useConstSfA
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/KernelTraits.h
                 ? flashinfer::round_up((tileK / 64) * 2 * flashinfer::ceil_div(tileM, 64), 4)
                 : (useBlockScalingA
                        ? ((tileK / 64) * 2 * flashinfer::ceil_div(tileM, 64)) * numStages
                        : 0);
-=======
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileM, 64), 4)
-                : (useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0);
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/KernelTraits.h
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfA = 4;
         // No need to reuse TMEM.
@@ -479,15 +470,10 @@ class KernelTraits {
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB =
             useConstSfB
-<<<<<<< HEAD:include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/KernelTraits.h
                 ? flashinfer::round_up((tileK / 64) * 2 * flashinfer::ceil_div(tileN, 64), 4)
                 : (useBlockScalingB
                        ? ((tileK / 64) * 2 * flashinfer::ceil_div(tileN, 64)) * numStages
                        : 0);
-=======
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileN, 64), 4)
-                : (useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0);
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/batchedGemm/trtllmGen_bmm_export/KernelTraits.h
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfB = 4;
         // No need to reuse TMEM.

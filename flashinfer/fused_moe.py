@@ -21,8 +21,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .fp4_quantization import block_scale_interleave
 from .autotuner import AutoTuner, TunableRunner, TuningConfig
+from .fp4_quantization import block_scale_interleave
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
@@ -33,15 +33,15 @@ from .utils import _check_shape_dtype_device, register_custom_op, register_fake_
 # Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
-    Default = 0,
+    Default = (0,)
     # Renormalize: TopK -> Softmax
-    Renormalize = 1,
+    Renormalize = (1,)
     # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
-    DeepSeekV3 = 2,
+    DeepSeekV3 = (2,)
     # Llama4: Top1 -> Sigmoid
-    Llama4 = 3,
+    Llama4 = (3,)
     # Qwen3: Softmax -> TopK -> Renormalize
-    RenormalizeNaive = 4,
+    RenormalizeNaive = (4,)
     # Unspecified
     Unspecified = 5
 
@@ -61,8 +61,8 @@ def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
 
     # We split into top half and bottom half, but if M is odd,
     # the bottom half is one row larger.
-    top = row_indices[:(M + 1) // 2]  # round up
-    bot = row_indices[(M + 1) // 2:]  # remainder
+    top = row_indices[: (M + 1) // 2]  # round up
+    bot = row_indices[(M + 1) // 2 :]  # remainder
 
     # Create the output
     permuted_row_indices = torch.empty_like(row_indices)
@@ -117,25 +117,28 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
     return shuffle_block_size
 
 
-def get_shuffle_matrix_a_row_indices(input_tensor: torch.Tensor,
-                                     epilogue_tile_m: int) -> torch.Tensor:
+def get_shuffle_matrix_a_row_indices(
+    input_tensor: torch.Tensor, epilogue_tile_m: int
+) -> torch.Tensor:
     """
     Higher-level PyTorch approach to reorder the rows in blocks of size 16 or 32.
     - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
     - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
     """
-    assert input_tensor.dim(
-    ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
 
     # M, K from the input
     M, K = input_tensor.shape
 
     # Choose block size 16 or 32
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
-    row_map = (srcToDstBlk16RowMap
-               if shuffle_block_size == 16 else srcToDstBlk32RowMap)
+    row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert M % shuffle_block_size == 0, f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
+    assert (
+        M % shuffle_block_size == 0
+    ), f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -154,35 +157,32 @@ def get_shuffle_matrix_a_row_indices(input_tensor: torch.Tensor,
     return row_indices
 
 
-def shuffle_matrix_a(input_tensor: torch.Tensor,
-                     epilogue_tile_m: int) -> torch.Tensor:
+def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     """
     PyTorch equivalent of trtllm-gen `shuffleMatrixA`
     """
-    row_indices = get_shuffle_matrix_a_row_indices(input_tensor,
-                                                   epilogue_tile_m)
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return input_tensor[row_indices.to(input_tensor.device)]
 
 
 def get_shuffle_matrix_sf_a_row_indices(
-        input_tensor: torch.Tensor,
-        epilogue_tile_m: int,
-        num_elts_per_sf: int = 16) -> torch.Tensor:
+    input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
+) -> torch.Tensor:
 
     assert input_tensor.dtype == torch.uint8
     assert num_elts_per_sf == 16
 
-    assert input_tensor.dim(
-    ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
 
     # M, K from the input
     M, K = input_tensor.shape
     assert M % 128 == 0
     assert K % 4 == 0
 
-    row_indices = get_shuffle_matrix_a_row_indices(input_tensor,
-                                                   epilogue_tile_m)
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
 
@@ -203,8 +203,7 @@ def shuffle_matrix_sf_a(
     This function doesn't add padding.
     """
 
-    row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor,
-                                                      epilogue_tile_m)
+    row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor, epilogue_tile_m)
 
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
@@ -775,7 +774,6 @@ def get_trtllm_moe_sm100_module():
         )
         return output
 
-
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
         routing_logits: torch.Tensor,
@@ -816,12 +814,17 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        num_experts: int, top_k: int, n_group: int,
-        topk_group: int, intermediate_size: int,
-        local_expert_offset: int, local_num_experts: int,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
         routed_scaling_factor: float,
         tile_tokens_dim: int,
-        routing_method_type: int) -> torch.Tensor:
+        routing_method_type: int,
+    ) -> torch.Tensor:
 
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
@@ -846,7 +849,7 @@ def get_trtllm_moe_sm100_module():
         )
 
         return output
-    
+
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
         routing_logits: torch.Tensor,
@@ -889,14 +892,18 @@ def get_trtllm_moe_sm100_module():
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
-        num_experts: int, top_k: int,
+        num_experts: int,
+        top_k: int,
         n_group: Optional[int],
         topk_group: Optional[int],
-        intermediate_size: int, local_expert_offset: int,
+        intermediate_size: int,
+        local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int, routing_method_type: int,
-        do_finalize: bool) -> List[torch.Tensor]:
+        tile_tokens_dim: int,
+        routing_method_type: int,
+        do_finalize: bool,
+    ) -> List[torch.Tensor]:
 
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp4_block_scale_moe(
@@ -919,13 +926,13 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset,
             local_num_experts,
             routed_scaling_factor,
-            tile_tokens_dim,    
+            tile_tokens_dim,
             routing_method_type,
             do_finalize,
         )
 
         return output
-    
+
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
         routing_logits: torch.Tensor,
@@ -939,14 +946,17 @@ def get_trtllm_moe_sm100_module():
         output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor,
-        num_experts: int, top_k: int,
+        num_experts: int,
+        top_k: int,
         n_group: Optional[int],
         topk_group: Optional[int],
-        intermediate_size: int, local_expert_offset: int,
+        intermediate_size: int,
+        local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int, routing_method_type: int,
-        do_finalize: bool
+        tile_tokens_dim: int,
+        routing_method_type: int,
+        do_finalize: bool,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1120,7 +1130,7 @@ def trtllm_fp4_block_scale_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = False,
-    ) -> List[torch.Tensor]:
+) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
     Args:
@@ -1146,7 +1156,7 @@ def trtllm_fp4_block_scale_moe(
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
-            - 1: Renormalize (TopK -> Softmax) 
+            - 1: Renormalize (TopK -> Softmax)
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)

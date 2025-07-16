@@ -22,12 +22,7 @@
 #include <cute/config.hpp>
 #include <stdexcept>
 
-<<<<<<< HEAD:include/flashinfer/trtllm/fused_moe/IntFastDiv.h
-namespace moe::dev
-{
-=======
-namespace trtllm::dev {
->>>>>>> 70da651 (precommit):csrc/nv_internal/tensorrt_llm/kernels/trtllmgen_kernels/blockScaleMoe/IntFastDiv.h
+namespace moe::dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
@@ -151,4 +146,4 @@ int operator%(int const dividend, IntFastDiv const& divisor) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace trtllm::dev
+}  // namespace moe::dev

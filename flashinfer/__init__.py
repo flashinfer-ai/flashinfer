@@ -48,25 +48,21 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-<<<<<<< HEAD
-from .fp4_quantization import fp4_quantize, block_scale_interleave, e2m1_and_ufp8sf_scale_to_float
-from .fused_moe import trtllm_fp4_block_scale_moe, trtllm_fp8_block_scale_moe, trtllm_fp8_per_tensor_scale_moe, fused_moe_cutlass
-from .fused_moe import RoutingMethodType, reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a
-=======
 from .fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
 )
-from .fused_moe import fused_moe_cutlass
-from .fused_moe_trtllmgen import (
+from .fused_moe import (
     RoutingMethodType,
-    fused_moe_trtllmgen,
+    fused_moe_cutlass,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
 )
->>>>>>> 70da651 (precommit)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper

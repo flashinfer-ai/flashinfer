@@ -20,12 +20,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-<<<<<<< HEAD:tests/test_trtllm_gen_fused_moe_fp4.py
-from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
-from flashinfer import fp4_quantize, e2m1_and_ufp8sf_scale_to_float, RoutingMethodType, reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a
-=======
-import flashinfer
-import flashinfer.fused_moe_trtllmgen as fused_moe_trtllmgen
 from flashinfer import (
     RoutingMethodType,
     e2m1_and_ufp8sf_scale_to_float,
@@ -34,8 +28,8 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
->>>>>>> 70da651 (precommit):tests/test_trtllm_trtllm_gen_fused_moe.py
 
 class moe_args:
 
@@ -846,23 +840,11 @@ def compute_moe_actual_with_routing(
         )
     )
     hidden_states_fp4 = hidden_states_fp4_bytes.reshape(num_tokens, hidden_size // 2)
-<<<<<<< HEAD:tests/test_trtllm_gen_fused_moe_fp4.py
-    hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(torch.float8_e4m3fn).reshape(-1)
-            
-    output = trtllm_fp4_block_scale_moe(
-        expert_logits, routing_bias, hidden_states_fp4,
-        hidden_states_scale_linear_fp4, 
-        static_data['gemm1_weights_fp4_shuffled'], static_data['gemm1_scales_fp4_shuffled'], 
-        static_data['gemm2_weights_fp4_shuffled'], static_data['gemm2_scales_fp4_shuffled'],
-        static_data['scale_c_fc1'], static_data['scale_gate_fc1'], static_data['scale_c_fc2'],
-        num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-        num_experts, routed_scaling, tile_tokens_dim, routing_method_type, do_finalize=True)
-=======
     hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
         torch.float8_e4m3fn
     ).reshape(-1)
 
-    output = fused_moe_trtllmgen(
+    output = trtllm_fp4_block_scale_moe(
         expert_logits,
         routing_bias,
         hidden_states_fp4,
@@ -884,9 +866,8 @@ def compute_moe_actual_with_routing(
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
-        do_finalize,
+        do_finalize=True,
     )
->>>>>>> 70da651 (precommit):tests/test_trtllm_trtllm_gen_fused_moe.py
 
     output_dequant_actual = output[0].to(torch.float)
 
