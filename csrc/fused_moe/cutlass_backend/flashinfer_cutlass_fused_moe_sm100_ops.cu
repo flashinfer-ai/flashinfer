@@ -1,5 +1,5 @@
-/*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+\/*
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ namespace common = tensorrt_llm::common;
 namespace kernels = tensorrt_llm::kernels;
 using profiler_backend = kernels::GemmProfilerBackend;
 
-class FusedMoeCutlassRunner : public torch::CustomClassHolder {
+class FusedMoeRunner : public torch::CustomClassHolder {
  public:
   template <typename Type, bool NeedQuant = false>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(
@@ -80,9 +80,9 @@ class FusedMoeCutlassRunner : public torch::CustomClassHolder {
     }
   };
 
-  FusedMoeCutlassRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
-                        c10::ScalarType output_dtype, bool use_fp8_block_scaling,
-                        bool use_w4a8_group_scaling) {
+  FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
+                 c10::ScalarType output_dtype, bool use_fp8_block_scaling,
+                 bool use_w4a8_group_scaling) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mOutputDtype = output_dtype;
@@ -171,16 +171,16 @@ class FusedMoeCutlassRunner : public torch::CustomClassHolder {
     mAllProfiles = mKernelRunner->getTactics();
   }
 
-  ~FusedMoeCutlassRunner() {
+  ~FusedMoeRunner() {
     if (mProfileWorkspace != nullptr) {
       auto const cu_free_status = cudaFree(mProfileWorkspace);
       TORCH_CHECK(cu_free_status == cudaSuccess,
-                  "Can't free profile workspace during FusedMoeCutlassRunner destruction.");
+                  "Can't free profile workspace during FusedMoeRunner destruction.");
     }
   }
 
-  FusedMoeCutlassRunner(FusedMoeCutlassRunner const&) = delete;
-  void operator=(FusedMoeCutlassRunner const&) = delete;
+  FusedMoeRunner(FusedMoeRunner const&) = delete;
+  void operator=(FusedMoeRunner const&) = delete;
 
   at::Tensor runMoe(at::Tensor& output, at::Tensor const& input,
                     at::Tensor const& token_selected_experts,
@@ -663,10 +663,10 @@ class FusedMoeCutlassRunner : public torch::CustomClassHolder {
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.class_<torch_ext::FusedMoeCutlassRunner>("FusedMoeCutlassRunner")
+  m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
       .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool>())
-      .def("run_gemm_profile", &torch_ext::FusedMoeCutlassRunner::runGemmProfile)
-      .def("get_tactic_num", &torch_ext::FusedMoeCutlassRunner::getTacticNum)
-      .def("run_moe", &torch_ext::FusedMoeCutlassRunner::runMoe)
-      .def("run_moe_min_latency", &torch_ext::FusedMoeCutlassRunner::runMoeMinLantency);
+      .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
+      .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
+      .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
+      .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
 }
