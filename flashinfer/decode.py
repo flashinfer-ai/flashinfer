@@ -1792,7 +1792,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
-    bmm2_scale: Optional[float] = 1.0,
+    bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
     bmm1_scale_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1818,21 +1818,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
-
     For bmm2_scale_tensor, please fuse * M_LOG2E to use faster exp2.
-
     The two scale factors should be static constant for cuda graph capture.
     Either (bmm1_scale, bmm2_scale) or (bmm1_scale_tensor, bmm2_scale_tensor) should be provided.
-
     For static constant scale factors, the scale factors should be provided as float.
         - (bmm1_scale, bmm2_scale)
     For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
         - (bmm1_scale_tensor, bmm2_scale_tensor)
         - Currently, only fp8 tensor core operation supports this mode.
-
     When both are provided, the dynamic scale factor tensors will be used.
-
-    TODO: We might support per-head / per-block / any finer-grained quantization in the future.
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
 
@@ -1864,13 +1858,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     if bmm1_scale_tensor is not None and bmm2_scale_tensor is not None:
         # dynamic scale factors
-        if query.dtype != torch.float8_e4m3fn:
+        if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
             raise ValueError(
-                "bmm1_scale_tensor is only supported for fp8 tensor core operation"
-            )
-        if kv_cache.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                "bmm2_scale_tensor is only supported for fp8 tensor core operation"
+                "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
             )
 
     run_func(

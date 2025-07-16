@@ -3,7 +3,11 @@ import functools
 import pytest
 import torch
 
-from flashinfer import fp4_quantize, fp4_swizzle_blockscale
+from flashinfer import (
+    block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+    fp4_quantize,
+)
 from flashinfer.utils import is_sm100a_supported
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -238,12 +242,12 @@ def test_scale_swizzling(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_fp4_swizzle_blockscale(
+def test_block_scale_interleave(
     shape: tuple[int, int],
     seed: int,
     device: str,
 ) -> None:
-    """Test the fp4_swizzle_blockscale function directly."""
+    """Test the block_scale_interleave function directly."""
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
@@ -258,7 +262,7 @@ def test_fp4_swizzle_blockscale(
     unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
 
     # Test the swizzling function
-    swizzled_sf = fp4_swizzle_blockscale(unswizzled_sf, m, n, sf_vec_size)
+    swizzled_sf = block_scale_interleave(unswizzled_sf)
 
     # Compare against the reference implementation
     ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)
@@ -272,12 +276,88 @@ def test_fp4_swizzle_blockscale(
     padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
     padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
     expected_shape = (padded_row, padded_col // sf_vec_size)
+    expected_size = expected_shape[0] * expected_shape[1]
 
     assert (
-        swizzled_sf.shape == expected_shape
-    ), f"Expected shape {expected_shape}, got {swizzled_sf.shape}"
+        expected_size == swizzled_sf.shape[0]
+    ), f"Expected size {expected_size}, got {swizzled_sf.shape[0]}"
     assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
-    assert_equal(swizzled_sf, ref_swizzled_sf)
+    assert_equal(swizzled_sf.reshape(expected_shape), ref_swizzled_sf)
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("sf_use_ue8m0", [True, False])
+@torch.inference_mode()
+def test_e2m1_dequantization(
+    shape: tuple[int, int],
+    seed: int,
+    device: str,
+    sf_use_ue8m0: bool,
+) -> None:
+    """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    # Create a reasonable test tensor
+    m, n = shape
+    x = torch.randn((m, n), dtype=torch.float16)
+
+    # Calculate global scale as in the other tests
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Test with default common settings
+    is_sf_swizzled_layout = True
+    block_size = 32 if sf_use_ue8m0 else 16
+
+    # Step 1: Quantize with fp4_quantize
+    quantized_tensor, scale_factors = fp4_quantize(
+        x, global_scale, block_size, sf_use_ue8m0, is_sf_swizzled_layout
+    )
+
+    # Step 2: Dequantize with e2m1_and_ufp8sf_scale_to_float
+    ufp8_type = 0 if sf_use_ue8m0 else 1
+    dequantized_tensor = e2m1_and_ufp8sf_scale_to_float(
+        quantized_tensor,
+        scale_factors,
+        1 / global_scale,
+        sf_vec_size=block_size,
+        ufp8_type=ufp8_type,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+    )
+
+    # Move back to device for comparison
+    dequantized_tensor = dequantized_tensor.to(device)
+    x_float32 = x.to(torch.float32)
+
+    # Step 3: Compare results
+    assert (
+        dequantized_tensor.shape == x.shape
+    ), f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
+    assert (
+        dequantized_tensor.dtype == torch.float32
+    ), f"Expected float32, got {dequantized_tensor.dtype}"
+
+    # Check for invalid values
+    assert not torch.isnan(
+        dequantized_tensor
+    ).any(), "Dequantized tensor contains NaN values"
+    assert not torch.isinf(
+        dequantized_tensor
+    ).any(), "Dequantized tensor contains Inf values"
+
+    # Compare with original - should be reasonably close since FP4 is designed to preserve important values
+    torch.testing.assert_close(
+        dequantized_tensor,
+        x_float32,
+        rtol=0.3,
+        atol=0.5,  # Reasonable tolerance for FP4 quantization
+        msg="Quantize -> dequantize roundtrip failed",
+    )
 
 
 if __name__ == "__main__":

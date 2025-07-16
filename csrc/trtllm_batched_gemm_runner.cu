@@ -21,14 +21,63 @@
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 // #include "tensorrt_llm/common/assert.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/common.h"
 
 namespace tensorrt_llm {
 namespace kernels {
 
 using namespace batchedGemm::batchedGemm;
+using namespace batchedGemm::gemm;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+std::vector<int64_t> prioritizePredefinedConfigs(
+    int m, int n, int k, std::vector<int64_t> const& sortedIndices,
+    batchedGemm::batchedGemm::BatchedGemmConfig const* configs) {
+  // Function to bubble up the pre-determined config.
+  auto bubbleUpConfig = [&configs](std::vector<int64_t> const& sortedIndices,
+                                   auto&& pred) -> std::vector<int64_t> {
+    std::vector<int64_t> prioritizedIndices_;
+    // Copy matching configs to new vector
+    std::copy_if(sortedIndices.begin(), sortedIndices.end(),
+                 std::back_inserter(prioritizedIndices_), [&configs, &pred](int idx) {
+                   BatchedGemmConfig const& config = configs[idx];
+                   return (pred(config));
+                 });
+    // Copy the rest of the configs to new vector, if not already copied
+    std::copy_if(sortedIndices.begin(), sortedIndices.end(),
+                 std::back_inserter(prioritizedIndices_), [&prioritizedIndices_](int idx) {
+                   return std::find(prioritizedIndices_.begin(), prioritizedIndices_.end(), idx) ==
+                          prioritizedIndices_.end();
+                 });
+    return prioritizedIndices_;
+  };
+
+  // Init empty vector
+  std::vector<int64_t> prioritizedIndices;
+
+  //
+  // Dummy
+  //
+  if (n /* out_dim */ == 0 && k /* in_dim */ == 0) {
+    auto pred = [](BatchedGemmConfig const& config) {
+      BatchedGemmOptions const& options = config.mOptions;
+      return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 256 &&
+             options.mTileScheduler == TileScheduler::Persistent;
+    };
+    prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+  }
+  //
+  // Fall back
+  //
+  else {
+    prioritizedIndices = sortedIndices;
+  }
+
+  return prioritizedIndices;
+}
 
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     TrtllmGenBatchedGemmRunnerOptions const& options_)
@@ -60,7 +109,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
-    int32_t numBatches, int32_t maxNumCtasInBatchDim, std::optional<int32_t> configIndex) {
+    int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
   BatchedGemmData gemmData;
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -80,13 +129,8 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  if (!configIndex.has_value()) {
-    mSelectedConfigIndex = getDefaultValidConfigIndex(m, n, k, batchedTokens, numTokens, numBatches,
-                                                      maxNumCtasInBatchDim);
-    configIndex = mSelectedConfigIndex;
-  }
+  auto const& config = configs[configIndex];
 
-  auto const& config = configs[configIndex.value()];
   return bmm.getWorkspaceSizeInBytes(config, gemmData);
 }
 
@@ -97,21 +141,14 @@ void TrtllmGenBatchedGemmRunner::run(
     float const* scaleGateC, void* c, void* outSfC, int32_t const* routeMap,
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-    CUstream stream, int device, std::optional<int32_t> configIndex) {
+    CUstream stream, int device, int32_t configIndex) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData;
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  if (!configIndex.has_value()) {
-    TORCH_CHECK(mSelectedConfigIndex.has_value(),
-                "Tried to use default config index but none was set");
-
-    configIndex = mSelectedConfigIndex;
-  }
-
-  auto const& config = configs[configIndex.value()];
+  auto const& config = configs[configIndex];
 
   TORCH_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -189,7 +226,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
                                      std::vector<int32_t> const& batchedTokens, void const* a,
                                      void const* sfA, void const* b, void const* sfB, void* c,
                                      void* outSfC, void* workspace, CUstream stream, int device,
-                                     std::optional<int32_t> configIndex) {
+                                     int32_t configIndex) {
   // Dispatch with block scaling factors and with static batching.
   run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0,
       a, sfA, b, sfB,
@@ -204,7 +241,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
                                      std::vector<int32_t> const& batchedTokens, void const* a,
                                      void const* b, float const* scaleC, float const* scaleGateC,
                                      void* c, void* workspace, CUstream stream, int device,
-                                     std::optional<int32_t> configIndex) {
+                                     int32_t configIndex) {
   // Dispatch with block scaling factors and with static batching.
   run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0,
       a,
@@ -236,32 +273,76 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
-  // Sort configs by options
-  std::vector<int32_t> sortedIndices = mPassingConfigIndices;
-  std::sort(sortedIndices.begin(), sortedIndices.end(), [&configs](int32_t idx0, int32_t idx1) {
+
+  // Tier 0: K < tileK, prefer higher efficiency.
+  auto cmpTier0 = [&configs, &gemmData](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
     auto const& optionsB = configs[idx1].mOptions;
-
-    // Sort by tileK sizes first
-    if (optionsA.mTileK != optionsB.mTileK) {
+    int32_t sizeK = gemmData.mProblemDimensions.mK;
+    // Both waste computation, prefer higher efficiency.
+    if (sizeK <= optionsA.mTileK && sizeK <= optionsB.mTileK) {
+      double eff_a = (double)sizeK / optionsA.mTileK;
+      double eff_b = (double)sizeK / optionsB.mTileK;
+      return eff_a > eff_b;
+    }
+    // If either can be utilized, sort by tileK.
+    else {
       return optionsA.mTileK > optionsB.mTileK;
     }
-
-    // Then by unroll loop 2x for mma
-    if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma) {
+  };
+  // Tier 1: When tileK is the same, prefer unroll loop 2x for mma.
+  auto cmpTier1 = [&configs](int64_t idx0, int64_t idx1) {
+    auto const& optionsA = configs[idx0].mOptions;
+    auto const& optionsB = configs[idx1].mOptions;
+    if (optionsA.mTileK == optionsB.mTileK) {
       return optionsA.mUseUnrollLoop2xForMma;
     }
-
-    // Then by tile scheduler (persistent scheduler is better for FC2 in MoE)
-    if (doesRouteImplUseNoRoute(optionsA.mRouteImpl)) {
-      return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+    return false;
+  };
+  // Tier 2+: When previous comparators are the same, prefer higher tileM.
+  auto cmpTier2 = [&configs](int64_t idx0, int64_t idx1) {
+    auto const& optionsA = configs[idx0].mOptions;
+    auto const& optionsB = configs[idx1].mOptions;
+    if (optionsA.mTileK == optionsB.mTileK &&
+        optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma) {
+      return optionsA.mTileM > optionsB.mTileM;
     }
+    return false;
+  };
+  // Tier 2+: When previous comparators are the same, and when number of estimated CTAs is on the
+  // larger side, prefer persistent tile scheduler. The threshold is hardcoded as >148 CTAs at the
+  // moment.
+  auto cmpTier3 = [&configs, &gemmData](int64_t idx0, int64_t idx1) {
+    int32_t sizeM = gemmData.mProblemDimensions.mM;
+    int32_t sizeN = gemmData.mProblemDimensions.mN;
+    auto const& optionsA = configs[idx0].mOptions;
+    auto const& optionsB = configs[idx1].mOptions;
+    if (optionsA.mTileK == optionsB.mTileK &&
+        optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma &&
+        optionsA.mTileM == optionsB.mTileM) {
+      int64_t numTilesM = batchedGemm::gemm::divUp(sizeM, optionsA.mTileM);
+      int64_t numTilesN = batchedGemm::gemm::divUp(sizeN, optionsA.mTileN);
+      if (numTilesM * numTilesN > 148) {
+        return optionsA.mTileScheduler == TileScheduler::Persistent;
+      }
+    }
+    return false;
+  };
 
-    return optionsA.mTileM > optionsB.mTileM;
-  });
+  // Sort configs by options.
+  std::vector<int64_t> sortedIndices = mPassingConfigIndices;
+  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier0);
+  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier1);
+  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier2);
+  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier3);
 
+  // Special rules for corner cases, if applicable.
+  std::vector<int64_t> prioritizedIndices =
+      prioritizePredefinedConfigs(m, n, k, sortedIndices, configs);
+
+  // Filter out invalid configs.
   std::vector<int64_t> validConfigIndices;
-  for (auto const& configIndex : sortedIndices) {
+  for (auto const& configIndex : prioritizedIndices) {
     auto const& config = configs[configIndex];
     auto isValidConfig = bmm.isValidConfig(config, gemmData);
     if (isValidConfig) {
@@ -281,6 +362,35 @@ int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(
       getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
 
   return validConfigIndices[0];
+}
+
+bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n,
+                                                    int32_t k,
+                                                    std::vector<int32_t> const& batchedTokens,
+                                                    int32_t numTokens, int32_t numBatches,
+                                                    int32_t maxNumCtasInBatchDim) const {
+  auto const bmm = BatchedGemmInterface();
+  auto const configs = bmm.getBatchedGemmConfigs();
+
+  BatchedGemmData gemmData;
+  // Dims
+  gemmData.mProblemDimensions.mNumBatches = numBatches;
+  gemmData.mProblemDimensions.mNumTokens = numTokens;
+  gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
+  gemmData.mProblemDimensions.mBatchedM =
+      mOptions.transposeMmaOutput ? std::vector<int32_t>{} : batchedTokens;
+  gemmData.mProblemDimensions.mBatchedN =
+      mOptions.transposeMmaOutput ? batchedTokens : std::vector<int32_t>{};
+  gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
+  gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
+  gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mRank = 0;
+  gemmData.mProblemDimensions.mWorldSize = 1;
+  gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+
+  auto const& config = configs[configIndex];
+
+  return bmm.isValidConfig(config, gemmData);
 }
 
 }  // namespace kernels

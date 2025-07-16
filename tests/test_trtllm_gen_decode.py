@@ -245,7 +245,7 @@ def test_trtllm_batch_decode_fmha(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("acc_q_len", [1, 2])
-@pytest.mark.parametrize("dynamic_scale", [True, False])
+@pytest.mark.parametrize("dynamic_scale", [False, True])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
@@ -254,6 +254,9 @@ def test_trtllm_batch_decode_mla(
     acc_q_len: int,
     dynamic_scale: bool,
 ):
+    if dynamic_scale and dtype != torch.float8_e4m3fn:
+        pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
+
     torch.manual_seed(42)
     device = "cuda:0"
 
@@ -275,17 +278,6 @@ def test_trtllm_batch_decode_mla(
         kv_lora_rank + qk_rope_head_dim,
         device=device,
     ).to(dtype)
-    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
-    # bmm1_scale_tensor = (
-    #     torch.tensor([1.0], dtype=torch.float32, device=device)
-    #     if dtype == torch.float8_e4m3fn
-    #     else None
-    # )
-    # bmm2_scale_tensor = (
-    #     torch.tensor([1.0], dtype=torch.float32, device=device)
-    #     if dtype == torch.float8_e4m3fn
-    #     else None
-    # )
 
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
@@ -335,7 +327,7 @@ def test_trtllm_batch_decode_mla(
 
     bmm1_scale_tensor = (
         torch.tensor(
-            [scale / ((128 + 64) ** 0.5) * math.log2(math.e)],
+            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
             dtype=torch.float32,
             device=device,
         )
@@ -461,4 +453,4 @@ def test_trtllm_batch_decode_mla(
 if __name__ == "__main__":
     # run all tests in the order of pytest
     # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(1280, 1.0, torch.float8_e4m3fn, 32, 2, False)
+    test_trtllm_batch_decode_mla(1024, 1.0, torch.float8_e4m3fn, 32, 2, False)

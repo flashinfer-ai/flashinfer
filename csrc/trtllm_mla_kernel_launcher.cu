@@ -117,8 +117,19 @@ void trtllm_paged_attention_mla_launcher(
   // The chunked attention size.
   runner_params.mChunkedAttentionSize = INT_MAX;
 
+  // The scaleQ that will be applied to the BMM1 output.
+  // NOTE(Yingyi): set scale to be a api param, default 1.0
+  // Q_SCALE & KV_SCALE not supported for now
+  // runner_params.mScaleQ = scale * sqrt((float)(qk_nope_head_dim + qk_rope_head_dim)) /
+  //                         sqrtf((float)(kv_lora_rank + qk_rope_head_dim));
   runner_params.mScaleQ = 1.0;
 
+  // runner_params.mNumPagesInMemPool = INT_MAX;
+  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
+  int max_head_dim_kv = head_size;
+  // runner_params.mNumPagesInMemPool =
+  //     total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
+  //                     max_head_dim_kv * get_size_in_bytes(CACHE_T));
   runner_params.mNumPagesInMemPool = 0;
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   runner_params.stream = stream;
@@ -128,12 +139,11 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mUseGemmScale = bmm1_scale_tensor.has_value() && bmm2_scale_tensor.has_value();
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
-
+  runner_params.useGmemScale = bmm1_scale_tensor.has_value() && bmm2_scale_tensor.has_value();
   runner_params.scaleSoftmaxLog2Ptr =
-      runner_params.mUseGemmScale ? bmm1_scale_tensor.value().data_ptr<float>() : nullptr;
-
+      runner_params.useGmemScale ? bmm1_scale_tensor.value().data_ptr<float>() : nullptr;
   runner_params.outputScalePtr =
-      runner_params.mUseGemmScale ? bmm2_scale_tensor.value().data_ptr<float>() : nullptr;
+      runner_params.useGmemScale ? bmm2_scale_tensor.value().data_ptr<float>() : nullptr;
 
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
