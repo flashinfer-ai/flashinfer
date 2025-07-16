@@ -49,6 +49,7 @@ def get_pod_module(*args):
     # Use the proper JIT compilation system like batch prefill
     uri = get_pod_uri(*args)
     module = gen_pod_module(*args).build_and_load()
+    plan_func = module.PODWithKVCachePlan.default
     run_tensor_func = module.PODWithKVCacheTensor.default
 
     # Register custom op for POD tensor run
@@ -145,10 +146,7 @@ def get_pod_module(*args):
 
         def plan(self, *args):
             """Call the POD plan function."""
-            # The plan function is not part of the JIT module, it's a regular function
-            import torch
-
-            return torch.ops.flashinfer.pod_with_kv_cache_plan(*args)
+            return plan_func(*args)
 
         def run_tensor(self, *args):
             """Call the POD tensor run function."""

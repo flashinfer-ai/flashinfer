@@ -27,7 +27,7 @@ using PrefillAttentionVariant = DefaultAttention<use_custom_mask_p, /*use_slidin
 using DecodeAttentionVariant = DefaultAttention<use_custom_mask_d, /*use_sliding_window=*/{{ use_sliding_window_d }}, /*use_logits_soft_cap=*/{{ use_logits_soft_cap_d }}, /*use_alibi_bias=*/false>;
 
 template cudaError_t PODWithKVCacheTensorDispatched<
-    {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE, {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, {{ 128 }}, 16, {{ mask_mode_d }},
+    {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE, {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, 128, 16, {{ mask_mode_d }},
     PrefillAttentionVariant, DecodeAttentionVariant, PrefillParams, DecodeParams>(
     PrefillParams prefill_params, DecodeParams decode_params,
     {{ dtype_o }}* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);

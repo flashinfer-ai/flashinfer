@@ -37,11 +37,11 @@ using namespace flashinfer;
 at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                               at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
                               at::Tensor kv_indptr_p, at::Tensor kv_len_arr_p,
-                              uint32_t total_num_rows_p, uint32_t batch_size_p,
+                              int64_t total_num_rows_p, int64_t batch_size_p,
                               at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
-                              uint32_t total_num_rows_d, uint32_t batch_size_d,
-                              uint32_t num_qo_heads_p, uint32_t num_kv_heads, uint32_t head_dim_qk,
-                              uint32_t head_dim_vo, uint32_t page_size, bool enable_cuda_graph) {
+                              int64_t total_num_rows_d, int64_t batch_size_d,
+                              int64_t num_qo_heads_p, int64_t num_kv_heads, int64_t head_dim_qk,
+                              int64_t head_dim_vo, int64_t page_size, bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -268,9 +268,10 @@ void PODWithKVCacheTensorRun(
         using DecodeAttentionVariant =
             DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
                              USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-        // DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-        constexpr size_t CTA_TILE_Q_P = plan_info.cta_tile_q_p;
-        constexpr size_t CTA_TILE_Q_D = plan_info.cta_tile_q_d;
+        //DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q_p, CTA_TILE_Q_P, {
+        assert(plan_info.cta_tile_q_d == 16 && "Decode tile size should be 16 for POD. Check planner.");
+        constexpr size_t CTA_TILE_Q_P = 128;
+        constexpr size_t CTA_TILE_Q_D = 16;
         cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
             HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
             CTA_TILE_Q_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
