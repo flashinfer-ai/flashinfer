@@ -7,23 +7,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
-
-
-# The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
-class RoutingMethodType(IntEnum):
-    # Default: Softmax -> TopK
-    Default = (0,)
-    # Renormalize: TopK -> Softmax
-    Renormalize = (1,)
-    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
-    DeepSeekV3 = (2,)
-    # Llama4: Top1 -> Sigmoid
-    Llama4 = (3,)
-    # Qwen3: Softmax -> TopK -> Renormalize
-    RenormalizeNaive = (4,)
-    # Unspecified
-    Unspecified = 5.0
+from flashinfer import RoutingMethodType, shuffle_matrix_sf_a
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -583,7 +567,10 @@ def quant_dequant_per_tensor_fp8(a):
 )
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
+@pytest.mark.parametrize("use_shuffled_weight", [False, True])
+def test_moe_fp8(
+    num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
+):
 
     torch.random.manual_seed(0)
 
@@ -660,15 +647,86 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         False,
     )
 
+    # Prepare weights and scales for the kernel call
+    kernel_gemm1_weights = gemm1_weights
+    kernel_gemm1_scales = gemm1_scales
+    kernel_gemm2_weights = gemm2_weights
+    kernel_gemm2_scales = gemm2_scales
+
+    # If using shuffled weights, apply shuffling to both weights and scales
+    if use_shuffled_weight:
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 128
+
+        # Reorder rows of W1 for fused gated activation
+        gemm1_weights_fp8_interleaved = []
+        gemm1_scales_fp8_interleaved = []
+        for i in range(num_experts):
+            gemm1_weights_fp8_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_weights[i].clone())
+            )
+            gemm1_scales_fp8_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_scales[i].clone())
+            )
+
+        # Stack weights and scales for all experts
+        gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved)
+        gemm1_scales_fp8_interleaved = torch.stack(gemm1_scales_fp8_interleaved)
+
+        # Shuffle weights and scaling factors for transposed mma output
+        gemm1_weights_fp8_shuffled = []
+        gemm1_scales_fp8_shuffled = []
+        gemm2_weights_fp8_shuffled = []
+        gemm2_scales_fp8_shuffled = []
+        for i in range(num_experts):
+            gemm1_weights_fp8_shuffled.append(
+                shuffle_matrix_a(
+                    gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+            gemm1_scales_fp8_shuffled.append(
+                shuffle_matrix_sf_a(
+                    gemm1_scales_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+
+            gemm2_weights_fp8_shuffled.append(
+                shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+            )
+            gemm2_scales_fp8_shuffled.append(
+                shuffle_matrix_sf_a(gemm2_scales[i].view(torch.uint8), epilogue_tile_m)
+            )
+
+        # Stack weights for all experts and convert back to proper dtypes
+        kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
+            torch.float8_e4m3fn
+        )
+        kernel_gemm1_scales = (
+            torch.stack(gemm1_scales_fp8_shuffled)
+            .view(torch.float8_e4m3fn)
+            .to(torch.float)
+            .reshape(num_experts, 2 * intermediate_size // 128, hidden_size // 128)
+        )
+
+        kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
+            torch.float8_e4m3fn
+        )
+        kernel_gemm2_scales = (
+            torch.stack(gemm2_scales_fp8_shuffled)
+            .view(torch.float8_e4m3fn)
+            .to(torch.float)
+            .reshape(num_experts, hidden_size // 128, intermediate_size // 128)
+        )
+
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
         routing_bias,
         hidden_states,
         hidden_states_scale,
-        gemm1_weights,
-        gemm1_scales,
-        gemm2_weights,
-        gemm2_scales,
+        kernel_gemm1_weights,
+        kernel_gemm1_scales,
+        kernel_gemm2_weights,
+        kernel_gemm2_scales,
         num_experts,
         top_k,
         n_groups,
@@ -679,7 +737,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
-        use_shuffled_weight=False,
+        use_shuffled_weight=use_shuffled_weight,
     )
 
     output_dequant_actual = output.to(torch.float)
