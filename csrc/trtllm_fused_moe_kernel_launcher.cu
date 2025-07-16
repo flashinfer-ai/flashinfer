@@ -262,7 +262,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   args.output_scale = nullptr;
 
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /*useShuffledMatrixA*/ true);
 
   auto const moeConfigIndex =
       moe_runner.getDefaultValidConfigIndex(args.top_k, args.hidden_size, args.intermediate_size,
