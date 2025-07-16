@@ -886,12 +886,15 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
+_artifact_hash = "3e5c4fb4cedaa757da61afcf5e3b94ebec33c08f"
+
+
 def load_all():
     for cubin_name in KERNEL_MAP:
         if cubin_name in RUNTIME_CACHE:
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
-        cubin_prefix = f"0ffe2769c7eea90c44894abadf3eecf38801a143/deep-gemm/"
+        cubin_prefix = f"{_artifact_hash}/deep-gemm/"
         get_cubin(cubin_prefix + cubin_name, sha256)
         path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
         assert path.exists()
@@ -906,7 +909,7 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
-    cubin_prefix = f"0ffe2769c7eea90c44894abadf3eecf38801a143/deep-gemm/"
+    cubin_prefix = f"{_artifact_hash}/deep-gemm/"
     get_cubin(cubin_prefix + cubin_name, sha256)
     path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
     assert path.exists()
