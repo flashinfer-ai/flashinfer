@@ -902,7 +902,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
   bool mUseDeepSeekFp8{false};  // FP4 doesn't use DeepSeek FP8
 
   // Properly initialize the runner using make_unique like in the original code
-  auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim);
+  auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
+                                              /*useShuffledMatrixA*/ true);
 
   auto const num_tokens = hidden_states.sizes()[0];
 
