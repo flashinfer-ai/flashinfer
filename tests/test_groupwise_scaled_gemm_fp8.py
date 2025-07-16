@@ -119,16 +119,18 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
         if scale_major_mode == "K":
             # Tile x and find the max absolute value in each tile
             x_tiled = rearrange(x, "(s0 t0) (s1 t1) -> s0 s1 t0 t1", s0=s0, s1=s1)
-            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max")
+            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max").clamp(1e-4)
             x_scale = abs_max / fp8_amax
+            x_scale = torch.pow(2.0, torch.ceil(torch.log2(x_scale.abs())))
 
             # Broadcast scales back to the original tensor shape
             scales_repeated = repeat(x_scale, "s0 s1 -> (s0 t0) (s1 t1)", t0=t0, t1=t1)
         else:
             # Handle column-major tiling
             x_tiled = rearrange(x, "(s1 t0) (s0 t1) -> s0 s1 t0 t1", s0=s0, s1=s1)
-            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max")
+            abs_max = reduce(x_tiled.abs(), "s0 s1 t0 t1 -> s0 s1", "max").clamp(1e-4)
             x_scale = abs_max / fp8_amax
+            x_scale = torch.pow(2.0, torch.ceil(torch.log2(x_scale.abs())))
 
             # Permute scale axes before repeating to match layout
             scales_permuted = rearrange(x_scale, "s0 s1 -> s1 s0")
@@ -144,8 +146,11 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
             x_tiled = rearrange(
                 x, "(s0 t0) (s1 t1) (s2 t2) -> s0 s1 s2 t0 t1 t2", s0=s0, s1=s1, s2=s2
             )
-            abs_max = reduce(x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max")
+            abs_max = reduce(
+                x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max"
+            ).clamp(1e-4)
             x_scale = abs_max / fp8_amax
+            x_scale = torch.pow(2.0, torch.ceil(torch.log2(x_scale.abs())))
 
             # Broadcast scales back to the original tensor shape
             scales_repeated = repeat(
@@ -156,8 +161,11 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
             x_tiled = rearrange(
                 x, "(s0 t0) (s2 t1) (s1 t2) -> s0 s1 s2 t0 t1 t2", s0=s0, s1=s1, s2=s2
             )
-            abs_max = reduce(x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max")
+            abs_max = reduce(
+                x_tiled.abs(), "s0 s1 s2 t0 t1 t2 -> s0 s1 s2", "max"
+            ).clamp(1e-4)
             x_scale = abs_max / fp8_amax
+            x_scale = torch.pow(2.0, torch.ceil(torch.log2(x_scale.abs())))
 
             # Permute scale axes before repeating to match layout
             scales_permuted = rearrange(x_scale, "s0 s1 s2 -> s0 s2 s1")
@@ -177,6 +185,59 @@ def quantize_fp8(x, scale_shape, tile_shape, scale_major_mode):
     x_fp8 = x_fp32.to(torch.float8_e4m3fn)
 
     return x_fp8, x_scale
+
+
+def dequantize_fp8(x, x_scale, scale_major_mode):
+    """
+    Quantizes a 2D or 3D tensor to FP8.
+
+    Args:
+        x (torch.Tensor): The 2D or 3D input tensor.
+        scale_shape (tuple): The shape of the scale tensor.
+        tile_shape (tuple): The shape of the tiles.
+        scale_major_mode (str): The tiling order, "K" for row-major like,
+                                or another value for column-major like.
+
+    Returns:
+        tuple: A tuple containing the quantized FP8 tensor and the
+               calculated float32 scales.
+    """
+    # 1. Assertions and Initial Setup
+    ndim = x.ndim
+    assert ndim in [2, 3], f"x.ndim must be 2 or 3, but got {ndim}"
+    assert ndim == len(x_scale.shape)
+
+    # 2. Tiling and Scale Calculation
+    if ndim == 2:
+        # x0, x1 = x.shape
+        s0, s1 = x_scale.shape
+        # t0, t1 = x0 // s0, x1 // s1
+        x = rearrange(
+            x.to(torch.float32), "(s0 t0) (s1 t1) -> s0 s1 t0 t1", s0=s0, s1=s1
+        )
+        if scale_major_mode == "K":
+            x_scale = rearrange(x_scale, "s0 s1 -> s0 s1 1 1")
+        else:
+            x_scale = rearrange(x_scale, "s0 s1 -> s1 s0 1 1")
+        out = rearrange(x * x_scale, "s0 s1 t0 t1 -> (s0 t0) (s1 t1)")
+
+    elif ndim == 3:
+        # x0, x1, x2 = x.shape
+        s0, s1, s2 = x_scale.shape
+        # t0, t1, t2 = x0 // s0, x1 // s1, x2 // s2
+        x = rearrange(
+            x.to(torch.float32),
+            "(s0 t0) (s1 t1) (s2 t2)-> s0 s1 s2 t0 t1 t2",
+            s0=s0,
+            s1=s1,
+            s2=s2,
+        )
+        if scale_major_mode == "K":
+            x_scale = rearrange(x_scale, "s0 s1 s2 -> s0 s1 s2 1 1 1")
+        else:
+            x_scale = rearrange(x_scale, "s0 s1 s2 -> s0 s2 s1 1 1 1")
+        out = rearrange(x * x_scale, "s0 s1 s2 t0 t1 t2 -> (s0 t0) (s1 t1) (s2 t2)")
+    return out
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
@@ -348,23 +409,22 @@ def test_fp8_groupwise_group_deepgemm(
 ):
     torch.random.manual_seed(0)
     m = m_per_group * group_size
-    a = torch.rand((m, k), device="cuda", dtype=torch.float32)
-    b = torch.rand((group_size, n, k), device="cuda", dtype=torch.float32)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float32)
+    b = torch.randn((group_size, n, k), device="cuda", dtype=torch.float32)
     m_indptr = torch.empty((m,), device="cuda", dtype=torch.int32)
-    a_fp8, a_scale = per_token_cast_to_fp8(a)
-    b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
-    b_scale = torch.empty(
-        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    a_fp8, a_scale = quantize_fp8(a, (m, k // 128), (1, 128), "K")
+    b_fp8, b_scale = quantize_fp8(
+        b, (group_size, n // 128, k // 128), (1, 128, 128), "K"
     )
-    for i in range(group_size):
-        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
+    a_dequant = dequantize_fp8(a_fp8, a_scale, "K")
+    b_dequant = dequantize_fp8(b_fp8, b_scale, "K")
 
     ref = torch.empty((m, n), device="cuda", dtype=out_dtype)
 
     for i in range(group_size):
         r = slice(i * m_per_group, (i + 1) * m_per_group)
         m_indptr[r] = i
-        ref[r] = a[r] @ b[i].t()
+        ref[r] = a_dequant[r] @ b_dequant[i].t()
 
     out = group_deepgemm_fp8_nt_groupwise(
         a_fp8,
@@ -389,20 +449,18 @@ def test_fp8_groupwise_batch_deepgemm_masked(
 ):
     torch.random.manual_seed(0)
     n, k = nk
-    a = torch.rand((group_size, m, k), device="cuda", dtype=torch.float32)
-    b = torch.rand((group_size, n, k), device="cuda", dtype=torch.float32)
+    a = torch.randn((group_size, m, k), device="cuda", dtype=torch.float32)
+    b = torch.randn((group_size, n, k), device="cuda", dtype=torch.float32)
     masked_m = torch.randint(0, m, (group_size,), device="cuda", dtype=torch.int32)
-    a_fp8 = torch.empty_like(a, device="cuda", dtype=torch.float8_e4m3fn)
-    a_scale = torch.empty((group_size, m, k // 128), device="cuda", dtype=torch.float32)
-    b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
-    b_scale = torch.empty(
-        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
-    )
-    for i in range(group_size):
-        a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
-        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
 
-    ref = torch.einsum("bmk,bnk->bmn", a, b).to(out_dtype)
+    a_fp8, a_scale = quantize_fp8(a, (group_size, m, k // 128), (1, 1, 128), "K")
+    b_fp8, b_scale = quantize_fp8(
+        b, (group_size, n // 128, k // 128), (1, 128, 128), "K"
+    )
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, "K")
+    b_dequant = dequantize_fp8(b_fp8, b_scale, "K")
+    ref = torch.einsum("bmk,bnk->bmn", a_dequant, b_dequant).to(out_dtype)
 
     expected_m = min(int(masked_m.float().mean()) + 1, m)
 

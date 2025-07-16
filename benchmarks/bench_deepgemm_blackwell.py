@@ -83,8 +83,8 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
 def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):
     """Benchmark DeepGEMM-based batch GEMM with FP8 quantization."""
 
-    a = torch.rand((batch_size, m, k), device="cuda", dtype=torch.float32)
-    b = torch.rand((batch_size, n, k), device="cuda", dtype=torch.float32)
+    a = torch.randn((batch_size, m, k), device="cuda", dtype=torch.float32)
+    b = torch.randn((batch_size, n, k), device="cuda", dtype=torch.float32)
     masked_m = torch.randint(0, m, (batch_size,), device="cuda", dtype=torch.int32)
     a_fp8 = torch.empty_like(a, device="cuda", dtype=torch.float8_e4m3fn)
     a_scale = torch.empty((batch_size, m, k // 128), device="cuda", dtype=torch.float32)
@@ -98,7 +98,7 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
 
     expected_m = min(int(masked_m.float().mean()) + 1, m)
 
-    out = torch.rand((batch_size, m, n), device="cuda", dtype=out_dtype)
+    out = torch.empty((batch_size, m, n), device="cuda", dtype=out_dtype)
 
     # Benchmark the DeepGEMM function
     ms = do_bench(
