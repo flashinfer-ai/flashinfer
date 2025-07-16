@@ -185,6 +185,10 @@ void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& 
                         CALL_GEN_LAUNCHER);  // hybrid attention is not supported for now
 }
 
+namespace trtllm_cubin_loader {
+#include <flashinfer/cubin_loader.h>
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_paged_attention_mla", trtllm_paged_attention_mla);
 }
