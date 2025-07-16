@@ -560,6 +560,13 @@ class PODWithPagedKVCacheWrapper:
         kv_lens_arr_host_d = get_seq_lens(
             kv_indptr_host_d, last_page_len_host_d, page_size
         )
+        self._indptr_type = kv_indptr_d.dtype
+        self._pos_encoding_mode = pos_encoding_mode
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -599,14 +606,6 @@ class PODWithPagedKVCacheWrapper:
             page_size,
             self.is_cuda_graph_enabled,
         )
-
-        self._indptr_type = kv_indptr_d.dtype
-        self._pos_encoding_mode = pos_encoding_mode
-        self._window_left = window_left
-        self._logits_soft_cap = logits_soft_cap
-        self._sm_scale = sm_scale
-        self._rope_scale = rope_scale
-        self._rope_theta = rope_theta
 
     begin_forward = plan
 

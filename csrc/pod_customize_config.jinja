@@ -30,7 +30,7 @@ constexpr auto USE_SLIDING_WINDOW_D = {{ use_sliding_window_d }};
 constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 constexpr bool USE_LOGITS_SOFT_CAP = false;
 
-using PrefillParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO>;
+using PrefillParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 using DecodeParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 #define DISPATCH_context(MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK,    \

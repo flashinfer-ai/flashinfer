@@ -246,7 +246,10 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
       (2 * NUM_WARPS_KV_P);
 
   // control NUM_MMA_KV for maximum warp occupancy
-  DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
+  uint32_t max_num_mma_kv_p = std::min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p);
+  uint32_t max_num_mma_kv_d = std::min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d);
+
+  DISPATCH_NUM_MMA_KV(max_num_mma_kv_p, NUM_MMA_KV_P, {
     using KTraits_P = KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P,
                                    NUM_MMA_D_QK, NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P,
                                    POS_ENCODING_MODE, DTypeQ_P, DTypeKV_P, DTypeO_P, DTypeQKAccum_P,
@@ -265,7 +268,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
     } else {
       // Decode stuff
       // TODO: Is there a way to avoid this nested dispatch?
-      DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
+      DISPATCH_NUM_MMA_KV(max_num_mma_kv_d, NUM_MMA_KV_D, {
         using KTraits_D =
             KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK,
                          NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
@@ -329,9 +332,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
           int nthrs_d(32 * NUM_WARPS_Q_D * NUM_WARPS_KV_D);
 
           // ******* Select final combined sizes here ******* /
-          size_t smem_size = max(smem_size_p, smem_size_d);
+          size_t smem_size = std::max(smem_size_p, smem_size_d);
           int nblks = nblks_p + nblks_d;
-          int nthrs = max(nthrs_p, nthrs_d);
+          int nthrs = std::max(nthrs_p, nthrs_d);
 
           // printf("Smem: prefill %zu, decode %zu, total %zu\n", smem_size_p, smem_size_d,
           // smem_size); printf("Blocks: prefill %d, decode %d, total %d\n", nblks_p, nblks_d,
