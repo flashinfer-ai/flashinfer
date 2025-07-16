@@ -114,6 +114,7 @@ void trtllm_paged_attention_launcher(at::Tensor& out, at::Tensor& query,
   runner_params.mMaxSeqLenQ = 1;
   runner_params.mMaxSeqLenKv = max_seq_len;
   runner_params.mSumOfSeqLensQ = int(batch_size * runner_params.mMaxSeqLenQ);
+  runner_params.mScaleQ = 1.0;
 
   // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking
   // if the kernel is supported.

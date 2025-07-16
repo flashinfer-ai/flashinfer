@@ -246,6 +246,8 @@ struct TllmGenFmhaRunnerParams {
   int mNumPagesInMemPool;
   // The number of multiProcessor for the GPU.
   int mMultiProcessorCount;
+  // Scaling factor for Q.
+  float mScaleQ;
   // Scaling factor for output.
   float mScaleOutput;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
