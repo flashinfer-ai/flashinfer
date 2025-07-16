@@ -43,7 +43,7 @@ __global__ __launch_bounds__(std::max(
                                                                  decode_params,
                                                              int* tbAssign) {
   extern __shared__ uint8_t smem[];
-  const uint32_t num_kv_heads = prefill_params.num_kv_heads;
+  const uint32_t num_kv_heads = prefill_params.paged_kv.num_heads;
   // PREFILL VARS
   const uint32_t padded_bsize_p = prefill_params.padded_batch_size;
 
@@ -166,14 +166,14 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
   static_assert(std::is_same<typename PrefillParams::DTypeO, typename DecodeParams::DTypeO>::value);
   // Ensure heads match
-  assert(prefill_params.num_kv_heads == decode_params.paged_kv.num_heads);
+  assert(prefill_params.paged_kv.num_heads == decode_params.paged_kv.num_heads);
   assert(prefill_params.num_qo_heads == decode_params.num_qo_heads);
   // Prefill variable setup
   using DTypeQ_P = typename PrefillParams::DTypeQ;
   using DTypeKV_P = typename PrefillParams::DTypeKV;
   using DTypeO_P = typename PrefillParams::DTypeO;
   const uint32_t num_qo_heads = prefill_params.num_qo_heads;
-  const uint32_t num_kv_heads = prefill_params.num_kv_heads;
+  const uint32_t num_kv_heads = prefill_params.paged_kv.num_heads;
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;

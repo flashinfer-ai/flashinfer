@@ -15,7 +15,7 @@
 
 namespace flashinfer {
 
-using PrefillParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
+using PrefillParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ idtype }}>;
 using DecodeParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ idtype }}>;
 
 constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;

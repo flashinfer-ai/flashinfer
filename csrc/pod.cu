@@ -163,7 +163,7 @@ void PODWithKVCacheTensorRun(
           params.q_stride_n = q_stride_n_p;
           params.q_stride_h = q_stride_h_p;
           params.window_left = window_left_p;
-          params.num_kv_heads = num_kv_heads;
+          params.paged_kv.num_heads = num_kv_heads;
           params.num_qo_heads = num_qo_heads;
 
           params.request_indices =
@@ -222,7 +222,7 @@ void PODWithKVCacheTensorRun(
           params.q_stride_n = q_stride_n_d;
           params.q_stride_h = q_stride_h_d;
           params.window_left = window_left_d;
-          params.num_kv_heads = num_kv_heads;
+          params.paged_kv.num_heads = num_kv_heads;
           params.num_qo_heads = num_qo_heads;
 
           params.request_indices = prefill_params.request_indices;
