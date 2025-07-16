@@ -57,6 +57,7 @@ struct KernelParams {
   void* ptrO;
   // The output SF pointer (used for FP4 output).
   void* ptrSfO;
+  float const* _placeholder{nullptr};
 
   // The cumulative sequence lengths for Q.
   int32_t const* ptrCumSeqLensQ;
