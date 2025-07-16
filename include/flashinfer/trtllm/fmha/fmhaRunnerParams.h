@@ -194,6 +194,7 @@ struct TllmGenFmhaRunnerParams {
   int const* cumSeqLensKvPtr;
   // The kv page idx
   int const* kvPageIdxPtr;
+  bool useGmemScale;
   // The device output scale for FP8 quantization.
   float const* outputScalePtr;
   float outputScale;
@@ -247,13 +248,11 @@ struct TllmGenFmhaRunnerParams {
   int mMultiProcessorCount;
   // Scaling factor for Q.
   float mScaleQ;
+  // Scaling factor for output.
+  float mScaleOutput;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled.
   int mSfStartTokenIdx;
-
-  // note(Yingyi): might take an output scale later
-  // float mOutputScale;
-
   // The SF scale for Kv.
   float mScaleSfKv;
   // The cuda stream.

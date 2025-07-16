@@ -57,8 +57,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
                  bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
-    moe::dev::routing::Data routingData;
-    // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+    TORCH_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+    TORCH_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
+    moe::dev::routing::routingDeepSeek::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
 
@@ -67,24 +68,17 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrNumTokensPerExpert = numTokensPerExpert;
     routingData.mPtrExpertWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
-    routingData.mAllToAllRouteAct = false;
 
     // input:
-    // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not
-    // using gemm)
     routingData.mPtrRoutingBias = routingBias;
     routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
-    // routingData.mPtrIn = args.mInputActs;
     routingData.mNumTokens = numTokens;
-    // routingData.mHiddenDim = args.mHiddenDim;
     routingData.mNumExperts = numExperts;
     routingData.mNumExpertGroups = nGroup;
     routingData.mNumLimitedGroups = topkGroup;
@@ -95,10 +89,14 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
     routingData.mUseRoutingSoftmax = false;
-    moe::dev::routing::run(routingData, stream);
+    moe::dev::routing::routingDeepSeek::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Llama4) {
-    moe::dev::routingLlama4::Data routingData;
-    // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+    TORCH_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
+    if (nGroup > 0 || topkGroup > 0) {
+      TORCH_WARN("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup,
+                 topkGroup);
+    }
+    moe::dev::routing::routingLlama4::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
 
@@ -107,44 +105,31 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
-    // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
     routingData.mPtrExpertWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
-    // routingData.mAllToAllRouteAct = false;
 
-    // input:
-    // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not
-    // using gemm) routingData.mPtrRoutingBias = routingBias;
     routingData.mPtrScores = routingLogits;
-    // routingData.mPtrIn = args.mInputActs;
     routingData.mNumTokens = numTokens;
-    // routingData.mHiddenDim = args.mHiddenDim;
     routingData.mNumExperts = numExperts;
-    // routingData.mNumExpertGroups = n_group;
-    // routingData.mNumLimitedGroups = topk_group;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
-    // routingData.mRouteScale = routed_scaling_factor;
-    // routingData.mUseRoutingSoftmax = false;
-    moe::dev::routingLlama4::run(routingData, stream);
+    moe::dev::routing::routingLlama4::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Renormalize /* default */
              || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */) {
-    moe::dev::routingQwen3::Data routingData;
+    moe::dev::routing::routingRenormalize::Data routingData;
 
     //
     // Config
     //
 
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-    // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
     routingData.mUsePdl = true;
     routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
@@ -179,7 +164,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
 
-    moe::dev::routingQwen3::run(routingData, stream);
+    moe::dev::routing::routingRenormalize::run(routingData, stream);
   } else {
     TORCH_CHECK(false, "Unimplemented routing method %s of enum %d",
                 serializeMoeRoutingMethodType(routingMethodType).c_str(), (int)routingMethodType);
@@ -220,7 +205,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-                 int device, cudaStream_t stream) {
+                 int device, cudaStream_t stream, int32_t configIndex) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
@@ -228,15 +213,42 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
               expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
               output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
               ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace,
-              stream, device);
+              stream, device, configIndex);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                                       int32_t numExperts, int32_t numTokens) {
+                                       int32_t numExperts, int32_t numTokens,
+                                       int32_t configIndex) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   return mRunner.getWorkspaceSizeInBytes(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens,
-                                         numExperts, maxNumCtasInBatchDim);
+                                         numExperts, maxNumCtasInBatchDim, configIndex);
+}
+
+int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                           int32_t intermediateSize, int32_t numExperts,
+                                           int32_t numTokens) const {
+  auto maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  return mRunner.getDefaultValidConfigIndex(numTokens, 2 * intermediateSize, hiddenSize, {},
+                                            numTokens, numExperts, maxNumCtasInBatchDim);
+}
+
+bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                int32_t intermediateSize, int32_t numExperts,
+                                int32_t numTokens) const {
+  auto maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+
+  auto const isValid =
+      mRunner.isValidConfigIndex(configIndex, numTokens, 2 * intermediateSize, hiddenSize, {},
+                                 numTokens, numExperts, maxNumCtasInBatchDim);
+
+  return isValid;
+}
+
+std::vector<int64_t> Runner::getPassingConfigIndices() const {
+  return mRunner.getPassingConfigIndices();
 }
 }  // namespace PermuteGemm1
 
@@ -273,7 +285,7 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
                  int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-                 int device, cudaStream_t stream) {
+                 int device, cudaStream_t stream, int32_t configIndex) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts,
@@ -282,15 +294,43 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
               /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr,
               output, outputScale,
               /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
-              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device);
+              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device,
+              configIndex);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                                       int32_t numExperts, int32_t numTokens) {
+                                       int32_t numExperts, int32_t numTokens,
+                                       int32_t configIndex) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   return mRunner.getWorkspaceSizeInBytes(numTokens, hiddenSize, intermediateSize, {}, numTokens,
-                                         numExperts, maxNumCtasInBatchDim);
+                                         numExperts, maxNumCtasInBatchDim, configIndex);
+}
+
+int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                           int32_t intermediateSize, int32_t numExperts,
+                                           int32_t numTokens) const {
+  auto maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  return mRunner.getDefaultValidConfigIndex(numTokens, hiddenSize, intermediateSize, {}, numTokens,
+                                            numExperts, maxNumCtasInBatchDim);
+}
+
+bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                int32_t intermediateSize, int32_t numExperts,
+                                int32_t numTokens) const {
+  auto const maxNumCtasInBatchDim =
+      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+
+  auto const isValid =
+      mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {},
+                                 numTokens, numExperts, maxNumCtasInBatchDim);
+
+  return isValid;
+}
+
+std::vector<int64_t> Runner::getPassingConfigIndices() const {
+  return mRunner.getPassingConfigIndices();
 }
 }  // namespace Gemm2
 
@@ -300,7 +340,21 @@ Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
     : mPermuteGemm1(
           PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8, tileTokensDim, useShuffledMatrixA)),
       mGemm2(Gemm2::Runner(dtypeElt, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim,
-                           useShuffledMatrixA)) {}
+                           useShuffledMatrixA)) {
+  auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
+  auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
+
+  auto const totalPassingIndices = gemm1PassingIndices.size() * gemm2PassingIndices.size();
+  mPassingConfigs.reserve(totalPassingIndices);
+
+  for (auto const& indexGemm1 : gemm1PassingIndices) {
+    for (auto const& indexGemm2 : gemm2PassingIndices) {
+      mPassingConfigs.push_back(MoEConfig{indexGemm1, indexGemm2});
+    }
+  }
+  TORCH_CHECK(!mPassingConfigs.empty(),
+              "No compatible configs found for the fp8 block scale MoE runner.");
+}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,
@@ -331,39 +385,82 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 
   // Setup finalize data
-  finalizeData.mDtypeElt = args.mDtypeOut;
-  finalizeData.mDtypeExpW = args.mDtypeExpW;
-  finalizeData.mUsePdl = true;
-  finalizeData.mUseDeepSeekFp8 = false;
-  finalizeData.inPtr = workspace.gemm2_output;
-  finalizeData.outPtr = args.output;
-  finalizeData.inDqSfsPtr = workspace.gemm2_output_scale;
-  finalizeData.outDqSfsPtr = args.output_scale;
-  if (args.mUseRoutingScalesOnInput) {
-    finalizeData.expertWeightsPtr = nullptr;
-  } else {
-    finalizeData.expertWeightsPtr = workspace.expert_weights;
+  if (args.do_finalize) {
+    // Setup finalize data
+    finalizeData.mDtypeElt = args.mDtypeOut;
+    finalizeData.mDtypeExpW = args.mDtypeExpW;
+    finalizeData.mUsePdl = true;
+    finalizeData.mUseDeepSeekFp8 = false;
+    finalizeData.inPtr = workspace.gemm2_output;
+    finalizeData.outPtr = args.output;
+    finalizeData.inDqSfsPtr = workspace.gemm2_output_scale;
+    finalizeData.outDqSfsPtr = args.output_scale;
+    if (args.mUseRoutingScalesOnInput) {
+      finalizeData.expertWeightsPtr = nullptr;
+    } else {
+      finalizeData.expertWeightsPtr = workspace.expert_weights;
+    }
+    finalizeData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
+    finalizeData.numTokens = args.num_tokens;
+    finalizeData.numExperts = args.num_experts;
+    finalizeData.topK = args.top_k;
+    finalizeData.hiddenDim = args.hidden_size;
+    finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }
-  finalizeData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
-  finalizeData.numTokens = args.num_tokens;
-  finalizeData.numExperts = args.num_experts;
-  finalizeData.topK = args.top_k;
-  finalizeData.hiddenDim = args.hidden_size;
-  finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 }
 
-std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args) {
-  auto workspace_size_fc1 = static_cast<int32_t>(
-      mPermuteGemm1.getWorkspaceSizeInBytes(args.top_k, args.hidden_size, args.intermediate_size,
-                                            args.local_num_experts, args.num_tokens));
+std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args,
+                                                             int64_t configIndex) const {
+  auto const& config = mPassingConfigs[configIndex];
+
+  auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(
+      args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
+      config.gemm1Config));
   auto workspace_size_fc2 = static_cast<int32_t>(
       mGemm2.getWorkspaceSizeInBytes(args.top_k, args.hidden_size, args.intermediate_size,
-                                     args.local_num_experts, args.num_tokens));
+                                     args.local_num_experts, args.num_tokens, config.gemm2Config));
   return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
+std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize,
+                                                   int32_t intermediateSize,
+                                                   int32_t numLocalExperts,
+                                                   int32_t numTokens) const {
+  std::vector<int64_t> validIndices;
+
+  for (int i = 0; i < mPassingConfigs.size(); ++i) {
+    auto const& config = mPassingConfigs[i];
+
+    if (mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, hiddenSize, intermediateSize,
+                                         numLocalExperts, numTokens) &&
+        mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSize, intermediateSize,
+                                  numLocalExperts, numTokens)) {
+      validIndices.push_back(i);
+    }
+  }
+
+  return validIndices;
+}
+
+int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                           int32_t intermediateSize, int32_t numLocalExperts,
+                                           int32_t numTokens) const {
+  int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
+                                                                numLocalExperts, numTokens);
+  int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
+                                                         numLocalExperts, numTokens);
+
+  auto it = std::find_if(mPassingConfigs.begin(), mPassingConfigs.end(),
+                         [indexGemm1, indexGemm2](MoEConfig cfg) {
+                           return (cfg.gemm1Config == indexGemm1 && cfg.gemm2Config == indexGemm2);
+                         });
+  TORCH_CHECK(it != mPassingConfigs.end(),
+              "No compatible configs found for the block scale MoE runner.");
+  return std::distance(mPassingConfigs.begin(), it);
+}
+
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, int64_t configIndex) {
   // Setup all operation data
   moe::dev::activation::Data activationData;
   moe::dev::finalize::Data finalizeData;
@@ -373,6 +470,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   void* hidden_states_scale_linear{args.hidden_states_scale};
 
+  auto const& config = mPassingConfigs[configIndex];
+
   mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights,
                     args.gemm1_weights_scale, workspace.expert_weights, args.output1_scales_scalar,
                     args.output1_scales_gate_scalar, workspace.gemm1_output,
@@ -381,7 +480,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                     workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
                     workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
                     workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-                    args.mUseRoutingScalesOnInput, device, stream);
+                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -400,11 +499,14 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts,
              args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
-             workspace.bmm2_workspace, device, stream);
+             workspace.bmm2_workspace, device, stream, config.gemm2Config);
 
   // Run finalize
-  moe::dev::finalize::run(finalizeData, stream);
-  sync_check_cuda_error(stream);
+  if (args.do_finalize) {
+    // Run finalize
+    moe::dev::finalize::run(finalizeData, stream);
+    sync_check_cuda_error(stream);
+  }
 }
 }  // namespace MoE
 
