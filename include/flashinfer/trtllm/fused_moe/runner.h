@@ -123,7 +123,17 @@ class Runner {
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                                 int32_t numExperts, int32_t numTokens);
+                                 int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
+
+  [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                                   int32_t intermediateSize, int32_t numExperts,
+                                                   int32_t numTokens) const;
+
+  [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numExperts,
+                                        int32_t numTokens) const;
+
+  [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
@@ -132,7 +142,7 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream);
+           int device, cudaStream_t stream, int32_t configIndex);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeElt;
@@ -149,14 +159,24 @@ class Runner {
                   int tileTokensDim);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                                 int32_t numExperts, int32_t numTokens);
+                                 int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
+
+  [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                                   int32_t intermediateSize, int32_t numExperts,
+                                                   int32_t numTokens) const;
+
+  [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numExperts,
+                                        int32_t numTokens) const;
+
+  [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, float* outputScalesScalar, void* output, void* outputScale,
            int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
            int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-           int device, cudaStream_t stream);
+           int device, cudaStream_t stream, int32_t configIndex);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeElt;
@@ -211,6 +231,9 @@ struct MoERunnerArgs {
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;
+
+  // finalize
+  bool do_finalize{true};
 };
 
 struct MoEWorkspace {
@@ -259,15 +282,32 @@ struct MoEWorkspace {
   void* bmm2_workspace = nullptr;
 };
 
+// Config indices to be used with Batched GEMM runners
+struct MoEConfig {
+  int64_t gemm1Config;
+  int64_t gemm2Config;
+};
+
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
-           cudaStream_t stream);
+           cudaStream_t stream, int64_t configIndex);
 
-  std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(MoERunnerArgs const& args);
+  [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(MoERunnerArgs const& args,
+                                                                     int64_t configIndex) const;
+
+  [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
+                                                           int32_t intermediateSize,
+                                                           int32_t numLocalExperts,
+                                                           int32_t numTokens) const;
+
+  [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
+                                                   int32_t intermediateSize,
+                                                   int32_t numLocalExperts,
+                                                   int32_t numTokens) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
@@ -278,6 +318,11 @@ class Runner {
  private:
   PermuteGemm1::Runner mPermuteGemm1;
   Gemm2::Runner mGemm2;
+
+  // This will be the cartesian product of the passing configs for gemm1 and gemm2
+  // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2
+  // separately
+  std::vector<MoEConfig> mPassingConfigs;
 };
 }  // namespace MoE
 
