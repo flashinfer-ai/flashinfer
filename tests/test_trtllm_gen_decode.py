@@ -245,12 +245,14 @@ def test_trtllm_batch_decode_fmha(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("acc_q_len", [1, 2])
+@pytest.mark.parametrize("dynamic_scale", [True, False])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
     page_size: int,
     acc_q_len: int,
+    dynamic_scale: bool,
 ):
     torch.manual_seed(42)
     device = "cuda:0"
@@ -331,6 +333,21 @@ def test_trtllm_batch_decode_mla(
     # todo(Yingyi): calculate the actual size of workspace buffer
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
+    bmm1_scale_tensor = (
+        torch.tensor(
+            [scale / ((128 + 64) ** 0.5) * math.log2(math.e)],
+            dtype=torch.float32,
+            device=device,
+        )
+        if dynamic_scale
+        else None
+    )
+    bmm2_scale_tensor = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if dynamic_scale
+        else None
+    )
+
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
@@ -345,6 +362,8 @@ def test_trtllm_batch_decode_mla(
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
+        bmm1_scale_tensor=bmm1_scale_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
     )
     torch.cuda.synchronize()
     print("output shape", output.shape)
@@ -442,4 +461,4 @@ def test_trtllm_batch_decode_mla(
 if __name__ == "__main__":
     # run all tests in the order of pytest
     # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(1280, 1.0, torch.float8_e4m3fn, 32, 2)
+    test_trtllm_batch_decode_mla(1280, 1.0, torch.float8_e4m3fn, 32, 2, False)

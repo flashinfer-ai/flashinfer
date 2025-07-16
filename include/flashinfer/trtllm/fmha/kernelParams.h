@@ -584,9 +584,11 @@ struct KernelParams {
 
     // Set the number of pages in the memory pool for paged K/V cache.
     if (isPagedKv(options.mQkvLayout)) {
-      params.mNumPagesInMemPool = options.mNumPagesInMemPool == 0
-                                      ? options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize
-                                      : options.mNumPagesInMemPool;
+      params.mNumPagesInMemPool =
+          options.mNumPagesInMemPool == 0
+              ? (options.mHeadDimQk != 576 ? options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize
+                                           : options.mMaxNumPagesPerSeqKv * 1 * options.mBatchSize)
+              : options.mNumPagesInMemPool;
     }
 
     // The number of elements in 128B for Q.
