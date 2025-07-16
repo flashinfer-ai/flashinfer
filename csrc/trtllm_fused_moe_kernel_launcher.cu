@@ -222,7 +222,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   // Create the MoE runner to get BMM workspace sizes
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_matrix_a);
   auto [bmm1WorkspaceSize, bmm2WorkspaceSize] = moe_runner.getWorkspaceSizeInBytes(args);
 
   // BMM workspaces
@@ -336,7 +336,7 @@ void trtllm_fp8_block_scale_moe_launcher(at::Tensor routing_logits, at::Tensor r
                                          int64_t topk_group, int64_t intermediate_size,
                                          int64_t local_expert_offset, int64_t local_num_experts,
                                          double routed_scaling_factor, int64_t tile_tokens_dim,
-                                         int64_t routing_method_type) {
+                                         int64_t routing_method_type, bool use_shuffled_matrix_a) {
   auto device = hidden_states.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
@@ -504,7 +504,7 @@ void trtllm_fp8_block_scale_moe_launcher(at::Tensor routing_logits, at::Tensor r
 
   // Create the MoE runner to get BMM workspace sizes
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_matrix_a);
   auto [bmm1WorkspaceSize, bmm2WorkspaceSize] = moe_runner.getWorkspaceSizeInBytes(args);
 
   // BMM workspaces
@@ -592,7 +592,8 @@ void trtllm_fp8_block_scale_moe(at::Tensor routing_logits, at::Tensor routing_bi
                                 int64_t top_k, int64_t n_group, int64_t topk_group,
                                 int64_t intermediate_size, int64_t local_expert_offset,
                                 int64_t local_num_experts, double routed_scaling_factor,
-                                int64_t tile_tokens_dim, int64_t routing_method_type) {
+                                int64_t tile_tokens_dim, int64_t routing_method_type,
+                                bool use_shuffled_matrix_a) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -600,7 +601,8 @@ void trtllm_fp8_block_scale_moe(at::Tensor routing_logits, at::Tensor routing_bi
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output, workspace_buffer,
         num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
-        local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type);
+        local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type,
+        use_shuffled_matrix_a);
   } else {
     TORCH_CHECK(false, "Unsupported input type: ", dtype);
   }

@@ -48,7 +48,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize) {
+        tileSize == mOptions.tileSize &&
+        options.mUseShffledMatrixA == mOptions.useShuffledMatrixA) {
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
@@ -267,6 +268,20 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     if (isValidConfig) {
       validConfigIndices.push_back(configIndex);
     }
+  }
+
+  for (auto const& configIndex : validConfigIndices) {
+    auto const& config = configs[configIndex].mOptions;
+    std::cout << "Valid config: "
+              << "configIndex=" << configIndex << ", "
+              << "mFunctionName="
+              << (configs[configIndex].mFunctionName ? configs[configIndex].mFunctionName : "")
+              << ",\n"
+              << "mTileM=" << config.mTileM << ", "
+              << "mTileN=" << config.mTileN << ", "
+              << "mTileK=" << config.mTileK << ", "
+              << "mUseShffledMatrixA=" << (config.mUseShffledMatrixA ? "true" : "false")
+              << std::endl;
   }
 
   TORCH_CHECK(!validConfigIndices.empty(), "No valid config found for the given problem shape");

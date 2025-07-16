@@ -191,7 +191,8 @@ namespace PermuteGemm1 {
 
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeElt,
                                                                     int32_t tileTokensDim,
-                                                                    bool useDeepSeekFp8) {
+                                                                    bool useDeepSeekFp8,
+                                                                    bool useShuffledMatrixA) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       .eltType = dtypeElt,
       .outputType = dtypeElt,
@@ -201,15 +202,16 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
       .staticBatch = false,
       .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
-      .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+      .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+      .useShuffledMatrixA = useShuffledMatrixA};
   return options;
 }
 
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrixA)
     : mDtypeElt(dtypeElt),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8))) {}
+          getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8, useShuffledMatrixA))) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
                  void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
@@ -242,7 +244,8 @@ namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeElt,
                                                                     btg::Dtype dtypeOut,
                                                                     int32_t tileTokensDim,
-                                                                    bool useDeepSeekFp8) {
+                                                                    bool useDeepSeekFp8,
+                                                                    bool useShuffledMatrixA) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       .eltType = dtypeElt,
       .outputType = dtypeOut,
@@ -252,16 +255,18 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
       .staticBatch = false,
       .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
-      .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+      .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+      .useShuffledMatrixA = useShuffledMatrixA};
   return options;
 }
 
-Runner::Runner(btg::Dtype dtypeElt, btg::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim)
+Runner::Runner(btg::Dtype dtypeElt, btg::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim,
+               bool useShuffledMatrixA)
     : mDtypeElt(dtypeElt),
       mOutputDtype(outputDtype),
       mTileTokensDim(tileTokensDim),
-      mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeElt, mOutputDtype, mTileTokensDim, useDeepSeekFp8))) {}
+      mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(
+          mDtypeElt, mOutputDtype, mTileTokensDim, useDeepSeekFp8, useShuffledMatrixA))) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, float* outputScalesScalar, void* output, void* outputScale,
@@ -290,9 +295,12 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 }  // namespace Gemm2
 
 namespace MoE {
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8, tileTokensDim)),
-      mGemm2(Gemm2::Runner(dtypeElt, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim)) {}
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
+               bool useShuffledMatrixA)
+    : mPermuteGemm1(
+          PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8, tileTokensDim, useShuffledMatrixA)),
+      mGemm2(Gemm2::Runner(dtypeElt, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim,
+                           useShuffledMatrixA)) {}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,
