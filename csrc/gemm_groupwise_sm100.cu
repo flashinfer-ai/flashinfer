@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/gemm/gemm_groupwise_sm100.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -73,6 +72,19 @@ using namespace flashinfer;
     TORCH_CHECK(false, "Unsupported Scale Major Mode");              \
     return false;                                                    \
   }()
+
+namespace flashinfer {
+namespace gemm {
+
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
+          int MmaSM, typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                            float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
+                                            int l, cudaStream_t stream);
+
+}  // namespace gemm
+}  // namespace flashinfer
 
 void CutlassGemmGroupwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
                                      at::Tensor SFA, at::Tensor SFB, at::Tensor C,

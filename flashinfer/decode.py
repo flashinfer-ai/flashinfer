@@ -1703,14 +1703,13 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
-    scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
+    bmm1_scale: float,
+    bmm2_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
@@ -1727,14 +1726,13 @@ def trtllm_batch_decode_with_kv_cache(
         workspace_buffer,
         num_heads,
         num_kv_heads,
-        scale,
         block_tables,
         seq_lens,
         block_size,
         max_seq_len,
         kv_cache_dtype,
-        k_scale,
-        v_scale,
+        bmm1_scale,
+        bmm2_scale,
     )
     return out
 
@@ -1748,8 +1746,8 @@ def _check_trtllm_gen_mla_shape(
     page_table,
     page_size,
 ):
-    if query.ndim != 3:
-        raise ValueError(f"Expected query.ndim == 3, got {query.ndim}")
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
     if kv_cache.ndim != 4:
         raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
     if qk_nope_head_dim != 128:
@@ -1759,7 +1757,7 @@ def _check_trtllm_gen_mla_shape(
     if qk_rope_head_dim != 64:
         raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
 
-    B_q, H, D_q = query.shape
+    B_q, Q_len, H, D_q = query.shape
     D_ckv = kv_cache.shape[3]
     # if H != 128:
     #     raise ValueError(f"Expected 128 heads for query, got {H}")
@@ -1793,16 +1791,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_size: int,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
-    acc_q_len: Optional[int] = 1,
-    q_scale: Optional[float] = 1.0,
-    k_scale: Optional[float] = 1.0,
-    v_scale: Optional[float] = 1.0,
-    sm_scale: Optional[float] = 1.0,
-    o_scale: Optional[float] = 1.0,
+    bmm1_scale: Optional[float] = 1.0,
+    bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
 ) -> torch.Tensor:
     """
     Parameters:
-    query: [batch_size, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope
+    query: [batch_size, acc_q_len, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; acc_q_len = num_draft_tokens + 1 is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode
     qk_nope_head_dim: qk_nope_head_dim, must be 128
@@ -1848,19 +1842,22 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out_shape = query.shape[:-1] + (kv_lora_rank,)
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
-        batch_size, num_q_heads, _ = query.shape
+        batch_size, _, num_q_heads, _ = query.shape
         _check_shape_dtype_device(
             out,
             [batch_size, num_q_heads, kv_lora_rank],
-            query.dtype,
+            torch.bfloat16,
             query.device,
             "out",
         )
 
-    bmm1_scale = (
-        q_scale * k_scale * sm_scale / (qk_nope_head_dim + qk_rope_head_dim) ** 0.5
-    )
-    bmm2_scale = v_scale * o_scale
+    # NOTE(Yingyi): enable scale factor tensor for finer-grained fp8 quantization in the future
+    # if kv_cache.dtype == torch.float8_e4m3fn and (
+    #     bmm1_scale is None or bmm2_scale is None
+    # ):
+    #     raise ValueError(
+    #         "bmm1_scale and bmm2_scale must be provided for fp8 quantization"
+    #     )
 
     run_func(
         out,
@@ -1876,7 +1873,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        acc_q_len,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )
@@ -1894,7 +1890,6 @@ def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
     seq_lens: torch.Tensor,
     block_size: int,
     max_seq_len: int,
-    acc_q_len: Optional[int] = 1,
     bmm1_scale: Optional[torch.Tensor] = None,
     bmm2_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
@@ -1969,7 +1964,6 @@ def trtllm_batch_decode_with_kv_cache_mla_dynamic_scale(
         qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        acc_q_len,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
     )
