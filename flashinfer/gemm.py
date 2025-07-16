@@ -1438,7 +1438,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     >>> result = batch_deepgemm_fp8_nt_groupwise(
     ...     a_fp8, b_fp8, a_scale, b_scale, masked_m, expected_m, out_dtype=torch.bfloat16
     ... )
-    >>> print(result.shape)  # torch.Size([2, 256, 2048])
+    >>> print(result.shape)  # torch.Size([2, 128, 2048])
 
     Notes
     -----
