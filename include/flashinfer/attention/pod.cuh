@@ -332,9 +332,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
           int nthrs_d(32 * NUM_WARPS_Q_D * NUM_WARPS_KV_D);
 
           // ******* Select final combined sizes here ******* /
-          size_t smem_size = std::max(smem_size_p, smem_size_d);
+          size_t smem_size = max(smem_size_p, smem_size_d);
           int nblks = nblks_p + nblks_d;
-          int nthrs = std::max(nthrs_p, nthrs_d);
+          int nthrs = max(nthrs_p, nthrs_d);
 
           // printf("Smem: prefill %zu, decode %zu, total %zu\n", smem_size_p, smem_size_d,
           // smem_size); printf("Blocks: prefill %d, decode %d, total %d\n", nblks_p, nblks_d,
@@ -347,7 +347,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
           cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
 
           // Setup kernel arguments
-          void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
+
           FLASHINFER_CUDA_CALL(
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -366,6 +366,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, tbAssign));
           } else {
+            void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
           }
@@ -376,11 +377,11 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
               FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
                   tmp_v, tmp_s, decode_params.merge_indptr, o, lse,
                   decode_params.max_total_num_rows, decode_params.total_num_rows, num_qo_heads,
-                  HEAD_DIM_VO, stream));
+                  HEAD_DIM_VO, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                   tmp_v, decode_params.merge_indptr, o, decode_params.max_total_num_rows,
-                  decode_params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+                  decode_params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
             }
           }
         }
