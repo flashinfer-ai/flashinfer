@@ -19,8 +19,8 @@ from triton.testing import do_bench
 
 import flashinfer
 from flashinfer.gemm import (
-    group_deepgemm_fp8_nt_groupwise,
     batch_deepgemm_fp8_nt_groupwise,
+    group_deepgemm_fp8_nt_groupwise,
 )
 from flashinfer.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 
