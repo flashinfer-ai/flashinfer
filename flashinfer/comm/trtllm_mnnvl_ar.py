@@ -208,7 +208,7 @@ def trtllm_mnnvl_all_reduce(
     rank: int,
     wait_for_results: bool,
     launch_with_pdl: bool,
-    out: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
 ) -> None:
     """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
@@ -263,11 +263,11 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
     epsilon: float,
     residual: torch.Tensor,
     launch_with_pdl: bool,
-) -> List[torch.Tensor]:
+) -> None:
     """Performs MNNVL TwoShot Allreduce + RMSNorm.
 
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
-    After this, it performs RMSNorm on the all-reduced result, reading it directly from the mutlicast buffer.
+    After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
     Note: multicast buffer is the same as the unicast buffer for the current rank.
 
     Args:
