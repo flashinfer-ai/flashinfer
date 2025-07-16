@@ -16,12 +16,12 @@ limitations under the License.
 
 import math
 import os
-from einops import rearrange, reduce, repeat
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
+from einops import rearrange, reduce, repeat
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
