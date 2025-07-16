@@ -60,6 +60,8 @@ install_requires = [
     "pynvml",
     "einops",
     "nvidia-nvshmem-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cudnn-frontend",
 ]
 generate_build_meta({})
 
