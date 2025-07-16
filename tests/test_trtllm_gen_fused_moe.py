@@ -679,7 +679,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
-        use_shuffled_matrix_a=False,
+        use_shuffled_weight=False,
     )
 
     output_dequant_actual = output.to(torch.float)
