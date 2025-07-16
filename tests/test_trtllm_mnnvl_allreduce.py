@@ -62,7 +62,6 @@ def row_linear_residual_norm_fusion_forward(
         assert max_num_elements_mnnvl % hidden_size == 0
 
         input = input.view(-1, shape[-1])
-        output = torch.empty_like(input)
 
         buffer_M = max_num_elements_mnnvl // hidden_size
 
@@ -75,7 +74,6 @@ def row_linear_residual_norm_fusion_forward(
             trtllm_mnnvl_ar.mpi_barrier()
 
             trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_rmsnorm(
-                output,  # TODO: can we remove the output argument if we don't use it?
                 prenorm_output,
                 normed_output,
                 input,
@@ -95,17 +93,19 @@ def row_linear_residual_norm_fusion_forward(
             return normed_output.view(shape), prenorm_output.view(shape)
 
         else:
+            output = torch.empty_like(input)
+
             trtllm_mnnvl_ar.trtllm_mnnvl_all_reduce(
                 input,
-                output,
                 multicast_ptr,
-                buffer_ptrs_dev,  # Attempted to use this raw pointer
+                buffer_ptrs_dev,
                 buffer_M,
                 buffer_flags_mnnvl,
                 tensor_parallel_size,
                 tensor_parallel_rank,
                 True,  # wait_for_results
                 False,  # launch_with_pdl
+                output,  # Need to provide output tensor since we are writing them out.
             )
             return (output.view(shape),)
 

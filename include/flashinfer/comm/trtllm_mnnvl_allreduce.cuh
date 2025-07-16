@@ -185,13 +185,6 @@ cudaError_t twoshot_allreduce_dispatch(AllReduceParams<T>& params) {
 
   dim3 grid(params.num_tokens, num_blocks);
 
-  FLASHINFER_LOG_DEBUG(
-      "[MNNVL TwoShot AllReduce] twoshot allreduce on rank %d, world_size: %d, buffer_M: %d, "
-      "num_tokens: %d, token_dim: "
-      "%d, wait_for_results: %d, launch_with_pdl: %d",
-      params.rank, params.nranks, params.buffer_M, params.num_tokens, params.token_dim,
-      params.wait_for_results, params.launch_with_pdl);
-
   cudaLaunchConfig_t config;
   cudaLaunchAttribute attrs[1];
   config.dynamicSmemBytes = 0;
@@ -563,9 +556,6 @@ cudaError_t twoshot_rmsnorm_dispatch(RMSNormParams<T>& params) {
   constexpr int iters = H_DIM / CGA_THREADS;
 
   dim3 grid(1, params.batch, 1);
-
-  FLASHINFER_LOG_DEBUG("[MNNVL TwoShot RMSNorm] batch: %d, hidden_dim: %d, epsilon: %f",
-                       params.batch, params.hidden_dim, params.epsilon);
 
   cudaLaunchConfig_t config;
   cudaLaunchAttribute attrs[1];
