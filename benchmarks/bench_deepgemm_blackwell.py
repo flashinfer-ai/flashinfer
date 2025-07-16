@@ -22,7 +22,7 @@ from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
 )
-from flashinfer.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
+from flashinfer.utils import quantize_fp8, dequantize_fp8
 
 
 def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):
@@ -33,15 +33,12 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
     b_f32 = torch.randn(batch_size, n, k, device="cuda", dtype=torch.float32)
 
     # Quantize tensor A using per-token quantization
-    a_fp8, a_scale = per_token_cast_to_fp8(a_f32)
+    a_fp8, a_scale = quantize_fp8(a_f32, (batch_size * m, k // 128), (1, 128), "K")
 
     # Quantize tensor B using per-block quantization
-    b_fp8 = torch.empty_like(b_f32, device="cuda", dtype=torch.float8_e4m3fn)
-    b_scale = torch.empty(
-        (batch_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    b_fp8, b_scale = quantize_fp8(
+        b_f32, (batch_size, n // 128, k // 128), (1, 128, 128), "K"
     )
-    for i in range(batch_size):
-        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b_f32[i])
 
     # Create group assignment indices
     m_indices = torch.arange(
@@ -86,16 +83,10 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
     a = torch.randn((batch_size, m, k), device="cuda", dtype=torch.float32)
     b = torch.randn((batch_size, n, k), device="cuda", dtype=torch.float32)
     masked_m = torch.randint(0, m, (batch_size,), device="cuda", dtype=torch.int32)
-    a_fp8 = torch.empty_like(a, device="cuda", dtype=torch.float8_e4m3fn)
-    a_scale = torch.empty((batch_size, m, k // 128), device="cuda", dtype=torch.float32)
-    b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
-    b_scale = torch.empty(
-        (batch_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    a_fp8, a_scale = quantize_fp8(a, (batch_size, m, k // 128), (1, 1, 128), "K")
+    b_fp8, b_scale = quantize_fp8(
+        b, (batch_size, n // 128, k // 128), (1, 128, 128), "K"
     )
-    for i in range(batch_size):
-        a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
-        b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
-
     expected_m = min(int(masked_m.float().mean()) + 1, m)
 
     out = torch.empty((batch_size, m, n), device="cuda", dtype=out_dtype)
