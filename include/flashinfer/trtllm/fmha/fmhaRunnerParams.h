@@ -166,8 +166,6 @@ struct TllmGenFmhaRunnerParams {
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
-  // Whether to use gemm scale.
-  bool mUseGemmScale;
 
   // Input QKV buffers.
   void const* qPtr;

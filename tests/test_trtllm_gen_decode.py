@@ -318,7 +318,7 @@ def test_trtllm_batch_decode_mla(
         size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim), device=device
     ).to(dtype)
     # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
-    # todo(Yingyi): do not duplicate kv_cache for the next generated cubins
+    # todo(Zihao): do not duplicate kv_cache for the next generated cubins
     kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
 
     # Allocate workspace buffer
@@ -411,7 +411,6 @@ def test_trtllm_batch_decode_mla(
         batch_size * acc_q_len, num_q_heads, qk_rope_head_dim
     )
 
-    # todo: fix kv_cache
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 

@@ -622,3 +622,15 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type d
   return nullptr;
 #endif  // EXCLUDE_SM_100
 }
+inline TllmGenFmhaKernel const* getTllmFmhaKernelsGmemScale(Data_type dtypeQ, Data_type dtypeKv,
+                                                            Data_type dtypeOut, unsigned int sm) {
+#ifndef EXCLUDE_SM_100
+  return TllmFmhaKernelFactory::Get().getKernels(
+      sTllmGenFmhaKernelMetaInfosGmemScale,
+      sizeof(sTllmGenFmhaKernelMetaInfosGmemScale) /
+          sizeof(sTllmGenFmhaKernelMetaInfosGmemScale[0]),
+      dtypeQ, dtypeKv, dtypeOut, sm);
+#else
+  return nullptr;
+#endif  // EXCLUDE_SM_100
+}

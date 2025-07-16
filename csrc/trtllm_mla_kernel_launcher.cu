@@ -48,7 +48,6 @@ void trtllm_paged_attention_mla_launcher(
 
   // todo(Yingyi): use multi_block mode always true??
   bool use_multi_block = true;
-  static auto fmha_runner = TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
 
   TllmGenFmhaRunnerParams runner_params;
   memset(&runner_params, 0, sizeof(runner_params));
@@ -136,7 +135,6 @@ void trtllm_paged_attention_mla_launcher(
   // NOTE (Yingyi): quantization, not supported for now
   runner_params.mSfStartTokenIdx = 0;
 
-  runner_params.mUseGemmScale = bmm1_scale_tensor.has_value() && bmm2_scale_tensor.has_value();
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
   runner_params.useGmemScale = bmm1_scale_tensor.has_value() && bmm2_scale_tensor.has_value();
@@ -148,6 +146,9 @@ void trtllm_paged_attention_mla_launcher(
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
 
+  static auto fmha_runner = runner_params.useGmemScale
+                                ? TllmGenFmhaRunnerGmemScale(CACHE_T, CACHE_T, DATA_TYPE_BF16)
+                                : TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
   fmha_runner.run(runner_params);
 }
 

@@ -46,3 +46,29 @@ class TllmGenFmhaRunner {
   // The class that stores all the kernels.
   TllmGenFmhaKernel const* mKernel;
 };
+
+class TllmGenFmhaRunnerGmemScale {
+ public:
+  // Constructor.
+  explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
+
+  TllmGenFmhaRunnerGmemScale() = default;
+
+  // Check if fmha is supported.
+  bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) const;
+
+  // Check if fmha is supported with additional info.
+  std::pair<bool, std::string> isSupportedWithInfo(
+      TllmGenFmhaRunnerParams const& runnerParams) const;
+
+  // Run the fmha kernel.
+  void run(TllmGenFmhaRunnerParams const&);
+
+ private:
+  // The input/output datatype.
+  Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+  // The SM version.
+  int mSM;
+  // The class that stores all the kernels.
+  TllmGenFmhaKernel const* mKernel;
+};

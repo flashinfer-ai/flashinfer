@@ -587,7 +587,7 @@ struct KernelParams {
       params.mNumPagesInMemPool =
           options.mNumPagesInMemPool == 0
               ? (options.mHeadDimQk != 576 ? options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize
-                                           : options.mMaxNumPagesPerSeqKv * 1 * options.mBatchSize)
+                                           : options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize)
               : options.mNumPagesInMemPool;
     }
 
