@@ -25,7 +25,7 @@
 
 namespace flashinfer {
 
-namespace gemm {
+namespace group_gemm {
 
 using namespace cute;
 
@@ -93,7 +93,7 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   }
 }
 
-template <int MmaSM, int TileM, int TileN, int TileK, bool SwapAB, typename DTypeInA,
+template <int TileM, int TileN, int TileK, int MmaSM, bool SwapAB, typename DTypeInA,
           typename DTypeInB, typename DTypeSFA, typename DTypeSFB, typename DTypeOut>
 cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
@@ -284,7 +284,7 @@ cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100(
   return cudaSuccess;
 }
 
-}  // namespace gemm
+}  // namespace group_gemm
 
 }  // namespace flashinfer
 
