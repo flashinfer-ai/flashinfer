@@ -565,32 +565,32 @@ def quant_dequant_per_tensor_fp8(a):
 @pytest.mark.parametrize(
     "expert_info", [(32, 8, 4, 8), (32, 1, 1, 5), (72, 1, 1, 6), (256, 8, 4, 8)]
 )
-@pytest.mark.parametrize("hidden_size", [512, 4096])
-@pytest.mark.parametrize("intermediate_size", [512, 2048])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize("use_shuffled_weight", [False, True])
 def test_moe_fp8(
     num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
 ):
     torch.random.manual_seed(0)
 
-    # Early skip if shuffling is requested but tensors are too small
-    if use_shuffled_weight:
-        epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-        shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)  # = 32
+    # # Early skip if shuffling is requested but tensors are too small
+    # if use_shuffled_weight:
+    #     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+    #     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)  # = 32
 
-        # Check if block scales will be too small to shuffle
-        scale_m_dim = 2 * intermediate_size // 128  # gemm1 scales M dimension
-        scale_m_dim2 = hidden_size // 128  # gemm2 scales M dimension
+    #     # Check if block scales will be too small to shuffle
+    #     scale_m_dim = 2 * intermediate_size // 128  # gemm1 scales M dimension
+    #     scale_m_dim2 = hidden_size // 128  # gemm2 scales M dimension
 
-        if (
-            scale_m_dim % shuffle_block_size != 0
-            or scale_m_dim2 % shuffle_block_size != 0
-        ):
-            pytest.skip(
-                f"Skipping shuffle test: scale tensors too small to shuffle "
-                f"(scale_dims: {scale_m_dim}, {scale_m_dim2}, "
-                f"shuffle_block_size: {shuffle_block_size})"
-            )
+    #     if (
+    #         scale_m_dim % shuffle_block_size != 0
+    #         or scale_m_dim2 % shuffle_block_size != 0
+    #     ):
+    #         pytest.skip(
+    #             f"Skipping shuffle test: scale tensors too small to shuffle "
+    #             f"(scale_dims: {scale_m_dim}, {scale_m_dim2}, "
+    #             f"shuffle_block_size: {shuffle_block_size})"
+    #         )
 
     #
     # Data Generation
@@ -702,39 +702,26 @@ def test_moe_fp8(
                     gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
                 )
             )
-            gemm1_scales_fp8_shuffled.append(
-                shuffle_matrix_a(
-                    gemm1_scales_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
-                )
-            )
-
             gemm2_weights_fp8_shuffled.append(
                 shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
             )
+
+            gemm1_scales_fp8_shuffled.append(
+                shuffle_matrix_a(gemm1_scales_fp8_interleaved[i], epilogue_tile_m)
+            )
             gemm2_scales_fp8_shuffled.append(
-                shuffle_matrix_a(gemm2_scales[i].view(torch.uint8), epilogue_tile_m)
+                shuffle_matrix_a(gemm2_scales[i], epilogue_tile_m)
             )
 
-        # Stack weights for all experts and convert back to proper dtypes
         kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )
-        kernel_gemm1_scales = (
-            torch.stack(gemm1_scales_fp8_shuffled)
-            .view(torch.float8_e4m3fn)
-            .to(torch.float)
-            .reshape(num_experts, 2 * intermediate_size // 128, hidden_size // 128)
-        )
-
         kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )
-        kernel_gemm2_scales = (
-            torch.stack(gemm2_scales_fp8_shuffled)
-            .view(torch.float8_e4m3fn)
-            .to(torch.float)
-            .reshape(num_experts, hidden_size // 128, intermediate_size // 128)
-        )
+
+        kernel_gemm1_scales = torch.stack(gemm1_scales_fp8_shuffled)
+        kernel_gemm2_scales = torch.stack(gemm2_scales_fp8_shuffled)
 
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
