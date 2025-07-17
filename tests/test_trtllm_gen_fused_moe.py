@@ -685,7 +685,7 @@ def test_moe_fp8(
                 )
             )
             gemm1_scales_fp8_shuffled.append(
-                shuffle_matrix_sf_a(
+                shuffle_matrix_a(
                     gemm1_scales_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
                 )
             )
@@ -694,7 +694,7 @@ def test_moe_fp8(
                 shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
             )
             gemm2_scales_fp8_shuffled.append(
-                shuffle_matrix_sf_a(gemm2_scales[i].view(torch.uint8), epilogue_tile_m)
+                shuffle_matrix_a(gemm2_scales[i].view(torch.uint8), epilogue_tile_m)
             )
 
         # Stack weights for all experts and convert back to proper dtypes
