@@ -887,6 +887,9 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
+_artifact_hash = "d25901733420c7cddc1adf799b0d4639ed1e162f"
+
+
 def load_all():
     for cubin_name in KERNEL_MAP:
         if cubin_name in RUNTIME_CACHE:
