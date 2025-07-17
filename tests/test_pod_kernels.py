@@ -70,7 +70,7 @@ def warmup_jit():
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("batch_size_d", [1, 17, 127])
 @pytest.mark.parametrize("kv_len_d", [127, 12288])
-@pytest.mark.parametrize("page_size_d", [1, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("kv_layout_d", ["NHD"])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("num_qo_heads", [8, 32])
@@ -87,7 +87,7 @@ def test_pod_with_paged_kv_cache(
     # Decode params
     batch_size_d,
     kv_len_d,
-    page_size_d,
+    page_size,
     kv_layout_d,
     # Shared params
     num_kv_heads,
@@ -98,20 +98,54 @@ def test_pod_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    device = "cuda:0"
     if causal and qo_len_p > kv_len_p:
         pytest.skip("Causal prefill with qo_len_p > kv_len_p is not supported")
     return_lse = False
     # Prefill inputs
-    kv_layout_p = "NHD"
+    kv_layout_p = kv_layout_d
+    kv_len_p_padded = (kv_len_p + page_size - 1) // page_size * page_size
     q_p = torch.randn(
-        qo_len_p, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+        qo_len_p, num_qo_heads, head_dim, device=device, dtype=torch.float16
     )
     k_p = torch.randn(
-        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+        kv_len_p_padded, num_kv_heads, head_dim, device=device, dtype=torch.float16
     )
     v_p = torch.randn(
-        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+        kv_len_p_padded, num_kv_heads, head_dim, device=device, dtype=torch.float16
     )
+    # Generate paged prefill inputs for POD
+    qo_indptr_p = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(torch.tensor([qo_len_p], device=device), 0),
+        ],
+        dim=0,
+    ).int()
+    kv_indptr_p = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(torch.tensor([kv_len_p], device=device), 0),
+        ],
+        dim=0,
+    ).int()
+    kv_indices_p = torch.arange(0, kv_len_p, device=device, dtype=torch.int32)
+    last_page_len_p = torch.tensor(
+        [(kv_len_p - 1) % page_size + 1], device=device, dtype=torch.int32
+    )
+    total_num_pages_p = (kv_len_p_padded + page_size - 1) // page_size
+    if kv_layout_p == "NHD":
+        k_p = k_p.reshape(total_num_pages_p, 1, page_size, num_kv_heads, head_dim)
+        v_p = v_p.reshape(total_num_pages_p, 1, page_size, num_kv_heads, head_dim)
+    else:
+        k_p = k_p.reshape(
+            total_num_pages_p, 1, page_size, num_kv_heads, head_dim
+        ).transpose(2, 3)
+        v_p = v_p.reshape(
+            total_num_pages_p, 1, page_size, num_kv_heads, head_dim
+        ).transpose(2, 3)
+    kv_data_p = torch.cat([k_p, v_p], dim=1)
+
     # Generate prefill reference output
     o_ref_p = flashinfer.prefill.single_prefill_with_kv_cache(
         q_p,
@@ -122,14 +156,14 @@ def test_pod_with_paged_kv_cache(
     )
     # Decode inputs
     q_d = torch.randn(
-        batch_size_d, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+        batch_size_d, num_qo_heads, head_dim, device=device, dtype=torch.float16
     )
-    num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
+    num_pages_per_seq = (kv_len_d + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size_d
-    if kv_layout_d == "HND":
-        kv_shape = [total_num_pages, 2, num_kv_heads, page_size_d, head_dim]
+    if kv_layout_d == "NHD":
+        kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
     else:
-        kv_shape = [total_num_pages, 2, page_size_d, num_kv_heads, head_dim]
+        kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
     if not contiguous_kv:
         tmp = [kv_shape[0]]
         for v_d in kv_shape[1:]:
@@ -137,32 +171,32 @@ def test_pod_with_paged_kv_cache(
             tmp.append(v_d)
         kv_shape = tmp
         kv_data_fp32 = torch.randn(*kv_shape, device="cuda:0", dtype=torch.float32)
-        kv_data = kv_data_fp32.to(kv_dtype)
-        kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
+        kv_data_d = kv_data_fp32.to(kv_dtype)
+        kv_data_d = kv_data_d[:, 1, :, 1, :, 1, :, 1, :]
         kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
         # actual data is stored in non-contiguous memory
         assert (
-            kv_data.stride(-4)
-            != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
+            kv_data_d.stride(-4)
+            != kv_data_d.shape[-3] * kv_data_d.shape[-2] * kv_data_d.shape[-1]
         )
     else:
         kv_data_fp32 = torch.randn(*kv_shape, device="cuda:0", dtype=torch.float32)
-        kv_data = kv_data_fp32.to(kv_dtype)
+        kv_data_d = kv_data_fp32.to(kv_dtype)
     kv_indptr_d = (
-        torch.arange(0, batch_size_d + 1, device="cuda:0", dtype=torch.int32)
+        torch.arange(0, batch_size_d + 1, device=device, dtype=torch.int32)
         * num_pages_per_seq
     )
-    kv_indices_d = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
-    kv_last_page_len = torch.full(
+    kv_indices_d = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
+    last_page_len_d = torch.full(
         (batch_size_d,),
-        (kv_len_d - 1) % page_size_d + 1,
-        device="cuda:0",
+        (kv_len_d - 1) % page_size + 1,
+        device=device,
         dtype=torch.int32,
     )
 
     # Generate decode reference output
     decode_workspace_buffer = torch.empty(
-        32 * 1024 * 1024, device="cuda:0", dtype=torch.int8
+        32 * 1024 * 1024, device=device, dtype=torch.int8
     )
     decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         decode_workspace_buffer, kv_layout_d
@@ -170,30 +204,35 @@ def test_pod_with_paged_kv_cache(
     decode_wrapper.plan(
         kv_indptr_d,
         kv_indices_d,
-        kv_last_page_len,
+        last_page_len_d,
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        page_size_d,
+        page_size,
         pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    o_ref_d = decode_wrapper.run(q_d, kv_data)
+    o_ref_d = decode_wrapper.run(q_d, kv_data_d)
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, device="cuda:0", dtype=torch.int8)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, device=device, dtype=torch.int8)
     pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout_d,
     )
+    kv_data = torch.cat([kv_data_p, kv_data_d])
     pod_wrapper.plan(
+        qo_indptr_p,
+        kv_indptr_p,
+        kv_indices_p,
+        last_page_len_p,
         kv_indptr_d,
         kv_indices_d,
-        kv_last_page_len,
+        last_page_len_d,
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        page_size_d,
+        page_size,
         pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
@@ -201,8 +240,6 @@ def test_pod_with_paged_kv_cache(
 
     o_p, o_d = pod_wrapper.run(
         q_p,
-        k_p,
-        v_p,
         q_d,
         kv_data,
         pos_encoding_mode_p=pos_encoding_mode,
