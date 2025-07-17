@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import sys
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple
@@ -375,7 +376,7 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
     return qo, kv
 
 
-def main():
+def main(args: list[str]):
     parser = argparse.ArgumentParser(
         description="Ahead-of-Time (AOT) build all modules"
     )
@@ -426,7 +427,7 @@ def main():
         type=parse_bool,
         help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(args)
 
     # Default values
     project_root = Path(__file__).resolve().parents[1]
@@ -561,4 +562,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

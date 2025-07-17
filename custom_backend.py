@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -109,5 +110,10 @@ def build_sdist(sdist_directory, config_settings=None):
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    if os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1":
+        from flashinfer.aot import main as aot_main
+
+        aot_main([])
+
     _prepare_for_wheel()
     return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
