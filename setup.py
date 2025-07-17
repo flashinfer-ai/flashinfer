@@ -25,7 +25,7 @@ from setuptools.dist import Distribution
 
 root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
-enable_aot = bool(os.listdir(aot_ops_package_dir))
+enable_aot = aot_ops_package_dir.is_dir() and any(aot_ops_package_dir.iterdir())
 
 
 def write_if_different(path: Path, content: str) -> None:
@@ -94,8 +94,8 @@ if enable_aot:
     generate_build_meta(aot_build_meta)
 
 
-class is_aot_wheel(Distribution):
-    def has_ext_modules(_):
+class AotDistribution(Distribution):
+    def has_ext_modules(self) -> bool:
         return enable_aot
 
 
@@ -105,5 +105,5 @@ setuptools.setup(
     cmdclass=cmdclass,
     install_requires=install_requires,
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
-    distclass=is_aot_wheel,
+    distclass=AotDistribution,
 )
