@@ -18,13 +18,10 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     seq_lens_blocks = torch.ceil(seq_lens / page_size).int()
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda:0")
     kv_indptr[1:] = torch.cumsum(seq_lens_blocks, dim=0)
-    last_page_len = seq_lens - (seq_lens_blocks - 1) * page_size
-    last_page_len = last_page_len.int()
+    last_page_len = (seq_lens - (seq_lens_blocks - 1) * page_size).int()
+    last_page_len[last_page_len == 0] = page_size
     num_blocks = kv_indptr[-1].item()
-    max_num_blocks_per_seq = (seq_len + page_size - 1) // page_size
-    block_tables = torch.arange(
-        batch_size * max_num_blocks_per_seq, dtype=torch.int32, device="cuda:0"
-    ).view(batch_size, max_num_blocks_per_seq)
+    kv_indices = torch.arange(num_blocks, dtype=torch.int32, device="cuda:0")
 
     q = torch.rand(batch_size, num_qo_heads, head_dim, device="cuda:0").to(
         torch.bfloat16
@@ -32,38 +29,28 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     kv_data = torch.randn(
         num_blocks, 2, num_kv_heads, page_size, head_dim, device="cuda:0"
     ).to(torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.float16)
-    # add one warmup here
-    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        q,
-        kv_data,
-        workspace_buffer,
-        num_kv_heads,
-        block_tables,
-        seq_lens,
-        page_size,
-        seq_len,
-        1.0 / (head_dim**0.5),
-        1.0,
-        batch_size,
-        batch_size * seq_len,
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "HND", backend="trtllm-gen"
     )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=q.dtype,
+        kv_data_type=kv_data.dtype,
+    )
+    # add one warmup here
+    wrapper.run(q, kv_data)
     torch.cuda.synchronize()
 
     ms = triton.testing.do_bench_cudagraph(
-        lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            q,
-            kv_data,
-            workspace_buffer,
-            num_kv_heads,
-            block_tables,
-            seq_lens,
-            page_size,
-            seq_len,
-            1.0 / (head_dim**0.5),
-            1.0,
-            batch_size,
-            batch_size * seq_len,
-        ),
+        lambda: wrapper.run(q, kv_data),
         rep=4,
     )
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
