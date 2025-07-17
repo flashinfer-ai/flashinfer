@@ -57,7 +57,6 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
             q,
             kv_data,
             workspace_buffer,
-            num_qo_heads,
             num_kv_heads,
             block_tables,
             seq_lens,
