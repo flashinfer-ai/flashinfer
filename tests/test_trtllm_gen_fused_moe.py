@@ -565,14 +565,32 @@ def quant_dequant_per_tensor_fp8(a):
 @pytest.mark.parametrize(
     "expert_info", [(32, 8, 4, 8), (32, 1, 1, 5), (72, 1, 1, 6), (256, 8, 4, 8)]
 )
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("hidden_size", [512, 4096])
+@pytest.mark.parametrize("intermediate_size", [512, 2048])
 @pytest.mark.parametrize("use_shuffled_weight", [False, True])
 def test_moe_fp8(
     num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
 ):
-
     torch.random.manual_seed(0)
+
+    # Early skip if shuffling is requested but tensors are too small
+    if use_shuffled_weight:
+        epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+        shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)  # = 32
+
+        # Check if block scales will be too small to shuffle
+        scale_m_dim = 2 * intermediate_size // 128  # gemm1 scales M dimension
+        scale_m_dim2 = hidden_size // 128  # gemm2 scales M dimension
+
+        if (
+            scale_m_dim % shuffle_block_size != 0
+            or scale_m_dim2 % shuffle_block_size != 0
+        ):
+            pytest.skip(
+                f"Skipping shuffle test: scale tensors too small to shuffle "
+                f"(scale_dims: {scale_m_dim}, {scale_m_dim2}, "
+                f"shuffle_block_size: {shuffle_block_size})"
+            )
 
     #
     # Data Generation
