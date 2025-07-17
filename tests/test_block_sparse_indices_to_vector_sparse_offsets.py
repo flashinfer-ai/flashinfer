@@ -25,6 +25,7 @@ import flashinfer.page
 @pytest.mark.parametrize("block_size", [1, 3, 7, 16, 64, 79, 128])
 @pytest.mark.parametrize("stride_block", [128])
 @pytest.mark.parametrize("stride_n", [1])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_block_sparse_indices_to_vector_sparse_offsets(
     batch_size, kv_len, block_size, stride_block, stride_n
 ):

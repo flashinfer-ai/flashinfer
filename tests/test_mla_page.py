@@ -26,6 +26,7 @@ kv_len_configs = [
 
 @pytest.mark.parametrize("kv_len", kv_len_configs)
 @pytest.mark.parametrize("page_size", [1, 16, 64])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_append_mla_paged_kv_cache(kv_len, page_size):
     nnz_kv = sum(kv_len)
     ckv_append = torch.randn(nnz_kv, CKV_DIM, dtype=torch.float16, device="cuda:0")

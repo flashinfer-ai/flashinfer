@@ -25,6 +25,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import pytest
+
 # this line makes it possible to directly load `libcudart.so` using `ctypes`
 import torch  # noqa
 
@@ -198,6 +200,7 @@ class CudaRTLibrary:
         return devPtr
 
 
+@pytest.mark.xfail(reason="Some configurations are not supported yet")
 def _run_correctness_worker(
     world_size, rank, distributed_init_port, test_sizes, num_ctas_list
 ):

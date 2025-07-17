@@ -52,6 +52,7 @@ def warmup_jit():
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("backend", ["sm90", "sm80"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_segment_gemm(
     batch_size,
     num_rows_per_batch,

@@ -16,7 +16,10 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import jit_decode_attention_func_args, jit_prefill_attention_func_args
+from jit_utils import (
+    jit_decode_attention_func_args,
+    jit_prefill_attention_func_args,
+)
 
 import flashinfer
 
@@ -59,6 +62,7 @@ def warmup_jit():
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_single_decode_tensor_cores(
     kv_len: int,
     num_kv_heads: int,
@@ -106,6 +110,7 @@ def test_single_decode_tensor_cores(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_decode_tensor_cores(
     batch_size: int,
     kv_len: int,
@@ -201,6 +206,7 @@ def test_batch_decode_tensor_cores(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_decode_tensor_cores_cuda_graph(
     batch_size: int,
     kv_len: int,

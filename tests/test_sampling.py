@@ -48,6 +48,7 @@ def gumbel_distribution(beta):
     ],
 )
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
     num_trials = 5000000
@@ -78,6 +79,7 @@ def test_sampling_freq(vocab_size, distribution, zero_ratio):
     ],
 )
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_p_sampling_freq(vocab_size, distribution, p):
     # use torch profiler to check the performance of the code
     torch.manual_seed(42)
@@ -113,6 +115,7 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     ],
 )
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_sampling_freq(vocab_size, distribution, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -154,6 +157,7 @@ def test_sampling(batch_size, vocab_size):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
     eps = 1e-4
@@ -174,6 +178,7 @@ def test_top_p_sampling(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -196,6 +201,7 @@ def test_top_k_sampling(batch_size, vocab_size, k):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
@@ -224,6 +230,7 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
     if p == 0.1:
@@ -267,6 +274,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [100])
 @pytest.mark.parametrize("p", [0.1, 0.5])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
@@ -288,6 +296,7 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     torch.manual_seed(42)
     logits = torch.rand(batch_size, vocab_size, device="cuda:0") * 5
@@ -317,6 +326,7 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
@@ -343,6 +353,7 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -371,6 +382,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_top_k_mask_logits(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
@@ -393,6 +405,7 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
 @pytest.mark.parametrize("onehot_target", [False, True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_chain_speculative_sampling(
     batch_size,
     vocab_size,

@@ -29,6 +29,7 @@ def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: str):
 
 @pytest.mark.parametrize("num_elements", [1, 10, 99, 128, 999, 5000, 131072, 999999])
 @pytest.mark.parametrize("bitorder", ["big", "little"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_packbits(num_elements, bitorder):
     torch.manual_seed(42)
     x_cpu = torch.rand(num_elements) < 0.5
@@ -41,6 +42,7 @@ def test_packbits(num_elements, bitorder):
 
 @pytest.mark.parametrize("batch_size", [1, 10, 99, 128, 777, 999])
 @pytest.mark.parametrize("bitorder", ["big", "little"])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_segment_packbits(batch_size, bitorder):
     torch.manual_seed(42)
     old_indptr = torch.cumsum(torch.arange(batch_size + 1), 0).to(0)

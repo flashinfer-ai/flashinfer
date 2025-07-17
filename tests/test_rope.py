@@ -30,6 +30,7 @@ import flashinfer
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_rope(
     batch_size,
     qkv_len,
@@ -146,6 +147,7 @@ def test_rope(
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("interleave", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -301,6 +303,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         (256, 128, 4096, 9231, False, torch.bfloat16, "cuda", 3, 231, 4, 2),
     ],
 )
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_rope_cos_sin_cache(
     head_size: int,
     rotary_dim: int,

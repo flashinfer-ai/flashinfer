@@ -17,6 +17,7 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")

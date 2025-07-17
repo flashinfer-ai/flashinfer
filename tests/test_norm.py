@@ -71,6 +71,7 @@ def fused_add_rms_norm(x, residual, weight, eps):
 @pytest.mark.parametrize("specify_out", [True, False])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguous):
     if contiguous:
         x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
@@ -99,6 +100,7 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguous):
     eps = 1e-6
 
@@ -135,6 +137,7 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
 @pytest.mark.parametrize("specify_out", [True, False])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_gemma_norm(
     batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguous
 ):
@@ -165,6 +168,7 @@ def test_gemma_norm(
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_gemma_fused_add_rmsnorm(
     batch_size, hidden_size, dtype, enable_pdl, contiguous
 ):

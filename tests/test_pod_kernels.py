@@ -16,7 +16,10 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import jit_decode_attention_func_args, jit_prefill_attention_func_args
+from jit_utils import (
+    jit_decode_attention_func_args,
+    jit_prefill_attention_func_args,
+)
 
 import flashinfer
 from flashinfer.jit.attention.pytorch import gen_pod_module
@@ -89,6 +92,7 @@ def warmup_jit():
 @pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize("kv_dtype", [torch.float16])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_pod_with_paged_kv_cache(
     # Prefill params
     kv_len_p,

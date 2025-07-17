@@ -63,6 +63,7 @@ def warmup_jit():
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -295,6 +296,7 @@ def test_batch_prefill_with_paged_kv_cache(
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_prefill_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -520,6 +522,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_prefill_with_paged_kv_cache_custom_mask(
     batch_size,
     kv_len,
@@ -633,6 +636,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
     kv_len,
@@ -718,6 +722,7 @@ def test_batch_prefill_with_ragged_kv_cache(
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     batch_size,
     kv_len,

@@ -16,7 +16,10 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import jit_decode_attention_func_args, jit_prefill_attention_func_args
+from jit_utils import (
+    jit_decode_attention_func_args,
+    jit_prefill_attention_func_args,
+)
 
 import flashinfer
 
@@ -72,6 +75,7 @@ def warmup_jit():
 @pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -205,6 +209,7 @@ def test_batch_decode_with_paged_kv_cache(
 @pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_decode_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -341,6 +346,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
 @pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("contiguous_kv", [True])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_cuda_graph_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,

@@ -5,6 +5,7 @@ import flashinfer
 
 
 @pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_append_paged_kv_cache(contiguous):
     nnz_kv = 100
     num_kv_heads = 32

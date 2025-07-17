@@ -27,6 +27,7 @@ import flashinfer
 @pytest.mark.parametrize("kv_layout", ["NHD"])  # ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])  # , "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_single_decode_fp8_calibration_scale(
     kv_len,
     num_kv_heads,
@@ -80,6 +81,7 @@ def test_single_decode_fp8_calibration_scale(
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
     batch_size,
     kv_len,

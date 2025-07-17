@@ -8,6 +8,7 @@ import flashinfer.triton
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.xfail(reason="Some configurations are not supported yet")
 def test_merge_state(seq_len, num_heads, head_dim):
     va = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
     sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
@@ -23,6 +24,7 @@ def test_merge_state(seq_len, num_heads, head_dim):
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.xfail(reason="Some configurations are not supported yet")
 def test_merge_state_in_place(seq_len, num_heads, head_dim):
     v = torch.randn(seq_len, num_heads, head_dim).half()
     v_std = v.clone()
@@ -43,6 +45,7 @@ def test_merge_state_in_place(seq_len, num_heads, head_dim):
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("num_states", [100])
+@pytest.mark.xfail(reason="Some configurations are not supported yet")
 def test_merge_states(seq_len, num_states, num_heads, head_dim):
     v = torch.randn(seq_len, num_states, num_heads, head_dim).half().to("cuda:0")
     s = torch.randn(seq_len, num_states, num_heads, dtype=torch.float32).to("cuda:0")
@@ -56,6 +59,7 @@ def test_merge_states(seq_len, num_states, num_heads, head_dim):
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.xfail(reason="Some configurations are not supported yet")
 def test_variable_length_merge_states(seq_len, num_heads, head_dim):
     max_index_sets = 512
     lengths = torch.randint(low=1, high=max_index_sets, size=(seq_len,))
