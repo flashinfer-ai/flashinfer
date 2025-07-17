@@ -1,4 +1,4 @@
-from .cuda_ipc import create_shared_buffer, free_shared_buffer
+from .cuda_ipc import create_shared_buffer, free_shared_buffer, CudaRTLibrary
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
