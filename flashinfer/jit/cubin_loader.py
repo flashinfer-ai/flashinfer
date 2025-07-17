@@ -137,7 +137,7 @@ def load_cubin(cubin_path, sha256):
     return ""
 
 
-def get_cubin(name, sha256):
+def get_cubin(name, sha256, file_extension=".cubin"):
     """
     Load a cubin from the local cache directory with {name} and
     ensure that the sha256 signature matches.
@@ -147,7 +147,7 @@ def get_cubin(name, sha256):
     Returns:
     None on failure.
     """
-    cubin_fname = name + ".cubin"
+    cubin_fname = name + file_extension
     cubin_path = FLASHINFER_CACHE_DIR / "cubins" / cubin_fname
     cubin = load_cubin(cubin_path, sha256)
     if cubin:
