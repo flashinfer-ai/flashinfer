@@ -887,7 +887,7 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
-_artifact_hash = "3e5c4fb4cedaa757da61afcf5e3b94ebec33c08f"
+_artifact_hash = "d25901733420c7cddc1adf799b0d4639ed1e162f"
 
 
 def load_all():
@@ -1457,5 +1457,5 @@ class KernelMap:
 
 
 KERNEL_MAP = KernelMap(
-    "7eb1458f2e6b495aa8b7551ed086c3345cdf0f0853bbd2a3b5b3fb0760bc69b8"
+    "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
 )
