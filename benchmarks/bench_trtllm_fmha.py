@@ -9,9 +9,6 @@ num_kv_heads = 4
 num_qo_heads = 32
 head_dim = 128
 
-scale = float(1.0 / (head_dim**0.5))
-k_scale = v_scale = 1.0
-
 workspace_buffer = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 
 
@@ -40,15 +37,15 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
         q,
         kv_data,
         workspace_buffer,
-        num_qo_heads,
         num_kv_heads,
         block_tables,
         seq_lens,
         page_size,
         seq_len,
-        kv_cache_dtype,
         1.0 / (head_dim**0.5),
         1.0,
+        batch_size,
+        batch_size * seq_len,
     )
     torch.cuda.synchronize()
 
@@ -62,9 +59,10 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
             seq_lens,
             page_size,
             seq_len,
-            kv_cache_dtype,
             1.0 / (head_dim**0.5),
             1.0,
+            batch_size,
+            batch_size * seq_len,
         ),
         rep=4,
     )
