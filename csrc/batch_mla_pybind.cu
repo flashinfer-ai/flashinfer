@@ -27,7 +27,8 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
                                at::Tensor ckv_cache, at::Tensor kpe_cache, at::Tensor kv_indices,
                                at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
-                               double sm_scale);
+                               double sm_scale, std::optional<at::Tensor> maybe_custom_mask,
+                               std::optional<at::Tensor> maybe_mask_indptr);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchMLAPagedAttentionPlan);
