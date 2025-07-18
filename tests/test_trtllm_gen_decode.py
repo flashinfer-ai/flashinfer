@@ -140,7 +140,6 @@ def test_trtllm_batch_decode_fmha_wrapper(
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = MAX_SEQ_LEN
-    max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
     blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
@@ -171,14 +170,8 @@ def test_trtllm_batch_decode_fmha_wrapper(
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
     # Compute kv_indptr as cumulative sum of blocks per sequence
-    kv_indptr = (
-        torch.cat(
-            [torch.tensor([0], device=device), torch.cumsum(blocks_per_seq, dim=0)]
-        )
-        .int()
-        .to(device)
-    )
-
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
     kv_indices = all_block_ids.int()
     # print(f"kv_indices:{kv_indices}")
 
@@ -518,11 +511,6 @@ def test_trtllm_batch_decode_mla(
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
         backend="fa2",
-        # use_cuda_graph=True,
-        # qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-        # kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-        # kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
-        # kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
     )
 
     if dtype == torch.float8_e4m3fn:
