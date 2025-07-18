@@ -33,9 +33,10 @@ template <typename DTypeQ, typename DTypeKV, typename DTypeO>
 void trtllm_paged_attention_decode_launcher(
     DTypeO* out, DTypeQ* query, DTypeKV* key_value_cache, void* workspace_buffer,
     KVCachePageIndex* block_tables, int* seq_lens, int64_t batch_size, int64_t max_seq_len,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, int64_t page_size,
-    int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale, int64_t window_left,
-    int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count, cudaStream_t stream) {
+    int64_t num_pages, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
+    int64_t window_left, int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count,
+    cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -119,10 +120,7 @@ void trtllm_paged_attention_decode_launcher(
 
   runner_params.mMultiProcessorCount = sm_count;
   int max_head_dim_kv = head_dim;
-  // Fix: key_value_cache is a pointer, not a tensor, so cannot call .size(0)
-  // runner_params.mNumPagesInMemPool = key_value_cache.size(0) * 2;
-  // Instead, set to 0 or a reasonable default if not available
-  runner_params.mNumPagesInMemPool = 0;
+  runner_params.mNumPagesInMemPool = num_pages * 2;
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
@@ -154,7 +152,7 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
         out.data_ptr<DTypeO>(), query.data_ptr<DTypeQ>(), key_value_cache.data_ptr<DTypeKV>(),
         workspace_buffer.data_ptr<void>(),
         reinterpret_cast<KVCachePageIndex*>(block_tables.data_ptr()), seq_lens.data_ptr<int>(),
-        batch_size, max_seq_len, num_qo_heads, num_kv_heads, head_dim, page_size,
+        batch_size, max_seq_len, num_pages, num_qo_heads, num_kv_heads, head_dim, page_size,
         max_num_blocks_per_seq, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
         sm_count, stream);
     // Remove return true; as the function is void
@@ -165,10 +163,10 @@ template <typename DTypeQ, typename DTypeKV, typename DTypeO>
 void trtllm_paged_attention_context_launcher(
     DTypeO* out, DTypeQ* query, DTypeKV* key_value_cache, void* workspace_buffer,
     KVCachePageIndex* block_tables, int* seq_lens, int64_t batch_size, int64_t max_seq_len,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, int64_t page_size,
-    int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale, int64_t window_left,
-    int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count, cudaStream_t stream,
-    int* cum_seq_lens_q = nullptr, int* cum_seq_lens_kv = nullptr) {
+    int64_t num_pages, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
+    int64_t window_left, int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count,
+    cudaStream_t stream, int* cum_seq_lens_q = nullptr, int* cum_seq_lens_kv = nullptr) {
   auto q_data_type = TypeToDataType<DTypeQ>::value;
   auto kv_data_type = TypeToDataType<DTypeKV>::value;
   auto o_data_type = TypeToDataType<DTypeO>::value;
@@ -227,14 +225,10 @@ void trtllm_paged_attention_context_launcher(
   }
   int max_head_dim_kv = head_dim;
 
-  // Fix: key_value_cache is a pointer, not a tensor, so cannot call .size(0)
-  // runner_params.mNumPagesInMemPool = key_value_cache.size(0) * 2;
-  runner_params.mNumPagesInMemPool = 0;
-
+  runner_params.mNumPagesInMemPool = num_pages * 2;
+  runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
-
-  runner_params.stream = stream;
   fmha_runner.run(runner_params);
 }
 
@@ -264,7 +258,7 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
         out.data_ptr<DTypeO>(), query.data_ptr<DTypeQ>(), key_value_cache.data_ptr<DTypeKV>(),
         workspace_buffer.data_ptr<void>(),
         reinterpret_cast<KVCachePageIndex*>(block_tables.data_ptr()), seq_lens.data_ptr<int>(),
-        batch_size_, max_seq_len, num_qo_heads, num_kv_heads, head_dim, page_size,
+        batch_size_, max_seq_len, num_pages, num_qo_heads, num_kv_heads, head_dim, page_size,
         max_num_blocks_per_seq, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
         sm_count, stream, cum_seq_lens_q.defined() ? cum_seq_lens_q.data_ptr<int>() : nullptr,
         cum_seq_lens_kv.defined() ? cum_seq_lens_kv.data_ptr<int>() : nullptr);
