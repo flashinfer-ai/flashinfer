@@ -1441,6 +1441,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        block_tables: Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
 
         Note
         ----
