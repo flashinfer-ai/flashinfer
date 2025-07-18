@@ -100,9 +100,9 @@ def reference_paged_attention(
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("q_dtype", ["half", "bf16"])  # "fp8"
-@pytest.mark.parametrize("head_grp_size", [1, 8])  # 5
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])  # "fp8"
+@pytest.mark.parametrize("q_dtype", ["half", "fp8", "bf16"])
+@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("window_left", [-1, 127])
 def test_trtllm_batch_decode_fmha_wrapper(
     kv_layout,
@@ -114,8 +114,6 @@ def test_trtllm_batch_decode_fmha_wrapper(
     kv_cache_dtype,
     window_left,
 ):
-    if head_grp_size == 5 and kv_cache_dtype == "fp8":
-        pytest.skip("No reference provided for head_grp_size=5 and fp8 kv_cache")
     seed = 0
     torch.manual_seed(seed)
     device = "cuda:0"
@@ -167,7 +165,9 @@ def test_trtllm_batch_decode_fmha_wrapper(
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, use_tensor_cores=True
+    )
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
     # Compute kv_indptr as cumulative sum of blocks per sequence
