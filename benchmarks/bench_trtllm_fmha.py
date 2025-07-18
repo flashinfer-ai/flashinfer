@@ -162,7 +162,7 @@ def bench_trtllm_fmha_wrapper(
 
     ms = triton.testing.do_bench_cudagraph(
         lambda: wrapper.run(q, kv_cache),
-        rep=4,
+        rep=1000,
     )
     io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
     print(
