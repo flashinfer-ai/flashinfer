@@ -61,8 +61,8 @@ install_requires = [
     "pynvml",
     "einops",
     "nvidia-nvshmem-cu12",
-    "nvidia-cudnn-cu12",
-    'nvidia-cudnn-frontend; platform_machine == "x86_64" or platform_machine == "AMD64"',
+    "nvidia-cudnn-cu12>=9.11.0",
+    'nvidia-cudnn-frontend>=1.13.0; platform_machine == "x86_64" or platform_machine == "AMD64"',
 ]
 generate_build_meta({})
 
