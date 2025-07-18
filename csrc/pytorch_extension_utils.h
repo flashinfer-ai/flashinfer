@@ -169,7 +169,10 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
   }
 #else
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...) \
-  static_assert(false, "FP8 E8M0 support requires CUDA 12.8 or newer.");
+  case at::ScalarType::Byte: { \
+    static_assert(false, "FP8 E8M0 support requires CUDA 12.8 or newer."); \
+    break; \
+  }
 #endif
 #else
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)
