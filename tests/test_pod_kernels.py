@@ -122,18 +122,13 @@ def test_pod_with_paged_kv_cache(
         ],
         dim=0,
     ).int()
-    kv_indptr_p = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            torch.cumsum(torch.tensor([kv_len_p], device=device), 0),
-        ],
-        dim=0,
-    ).int()
-    kv_indices_p = torch.arange(0, kv_len_p_padded, device=device, dtype=torch.int32)
+    total_num_pages_p = kv_len_p_padded // page_size
+    kv_indptr_p = torch.tensor([0, total_num_pages_p], device=device, dtype=torch.int32)
+    kv_indices_p = torch.arange(0, total_num_pages_p, device=device, dtype=torch.int32)
     last_page_len_p = torch.tensor(
         [(kv_len_p_padded - 1) % page_size + 1], device=device, dtype=torch.int32
     )
-    total_num_pages_p = (kv_len_p_padded + page_size - 1) // page_size
+
     if kv_layout_p == "NHD":
         k_p = k_p.reshape(total_num_pages_p, 1, page_size, num_kv_heads, head_dim)
         v_p = v_p.reshape(total_num_pages_p, 1, page_size, num_kv_heads, head_dim)
@@ -237,7 +232,6 @@ def test_pod_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-
     o_p, o_d = pod_wrapper.run(
         q_p,
         q_d,

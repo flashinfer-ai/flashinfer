@@ -505,6 +505,7 @@ inline auto get_qkv_len_arr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t b
       FLASHINFER_ERROR(err_msg.str());
     }
     kv_len_arr[i] = uint32_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
+    printf("Debug: request %d qo_len: %d, kv_len: %d\n", i, packed_qo_len_arr[i], kv_len_arr[i]);
     if (kv_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "kv_indptr[" << i + 1 << "]" << kv_indptr_h[i + 1] << " - kv_indptr[" << i << "]"

@@ -2095,6 +2095,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
+
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
     const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
@@ -2210,6 +2211,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                          chunk_start))
                : chunk_size),
           CTA_TILE_KV);
+      if (tid.x == 0 && tid.y == 0 && tid.z == 0) {
+        printf("Debug: block_idx: %d, num_iterations: %d, qo_len: %d, kv_len: %d\n", bx,
+               num_iterations, qo_len, kv_len);
+      }
     } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
       num_iterations_prefix = ceil_div(
           min(min(chunk_size,
