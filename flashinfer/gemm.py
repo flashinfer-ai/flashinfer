@@ -744,6 +744,14 @@ def _check_cudnn_availability():
         )
 
 
+def _get_native_fp4_dtype():
+    """get native fp4 datatype if supported in the torch, otherwise return uint8."""
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    else:
+        return torch.uint8
+
+
 @functools.lru_cache(maxsize=1)
 def _get_cudnn_handle():
     """Create and return a cached cuDNN handle."""
@@ -854,8 +862,8 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
 def execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, c_final):
     variant_pack = {
-        UIDs.A_UID.value: a.view(torch.float4_e2m1fn_x2),
-        UIDs.B_UID.value: b.view(torch.float4_e2m1fn_x2),
+        UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
+        UIDs.B_UID.value: b.view(_get_native_fp4_dtype()),
         UIDs.BLOCK_DESCALE_A_UID.value: a_descale.view(torch.float8_e4m3fn),
         UIDs.BLOCK_DESCALE_B_UID.value: b_descale.view(torch.float8_e4m3fn),
         UIDs.ALPHA_UID.value: alpha.view(torch.float),
@@ -1051,8 +1059,9 @@ def mm_fp4(
     a_descale: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: torch.Tensor,
-    dtype: torch.dtype,
+    out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -1073,11 +1082,14 @@ def mm_fp4(
     alpha: torch.Tensor
         Global scale tensor, float scalar.
 
-    dtype: torch.dtype
+    out_dtype: torch.dtype
         Output dtype, bf16 or fp16.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
+
+    block_size: int
+        Block size for FP4 quantization, only 16 is supported.
 
     Returns
     -------
@@ -1105,9 +1117,9 @@ def mm_fp4(
         raise ValueError(
             f"K dimension mismatch in mm_fp4. got a.shape[1] = {a.shape[1]}, b.shape[0] = {b.shape[0]}"
         )
-    if a.dtype not in {torch.uint8, torch.float4_e2m1fn_x2} or b.dtype not in {
+    if a.dtype not in {torch.uint8, _get_native_fp4_dtype()} or b.dtype not in {
         torch.uint8,
-        torch.float4_e2m1fn_x2,
+        _get_native_fp4_dtype(),
     }:
         raise ValueError(
             f"a and b must have float4_e2m1fn_x2 packed into uint8. "
@@ -1126,18 +1138,20 @@ def mm_fp4(
     if alpha.numel() != 1:
         raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
 
-    if dtype not in (torch.bfloat16, torch.float16):
+    if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
-            f"Unsupported output dtype: {dtype}. "
+            f"Unsupported output dtype: {out_dtype}. "
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
+    if block_size != 16:
+        raise ValueError(f"Only block_size = 16 is supported for FP4 GEMM operations.")
 
     # allocate the output tensor if not provided
     if out is None:
         out = torch.empty(
             (a.shape[0], b.shape[1]),
             device=a.device,
-            dtype=dtype,
+            dtype=out_dtype,
         )
 
     # the fp4 cudnn graph will be shared for both mm and bmm, so here we need to get the 3d shape and stride including the batch dimension for both input and block scale tensors.
@@ -1152,7 +1166,6 @@ def mm_fp4(
     )
 
     # build the fp4 cudnn graph
-    FP4_BLOCK_SIZE = 16
     graph = build_cudnn_gemm_block_scale_dequantize_graph(
         real_a_shape,
         real_a_stride,
@@ -1162,10 +1175,10 @@ def mm_fp4(
         expanded_a_descale_stride,
         expanded_b_descale_shape,
         expanded_b_descale_stride,
-        torch.float4_e2m1fn_x2,
+        _get_native_fp4_dtype(),
         torch.float8_e4m3fn,
-        _torch_data_type_to_cudnn_data_type(dtype),
-        FP4_BLOCK_SIZE,
+        _torch_data_type_to_cudnn_data_type(out_dtype),
+        block_size,
     )
 
     # execute the fp4 cudnn graph
