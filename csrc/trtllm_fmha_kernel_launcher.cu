@@ -82,7 +82,6 @@ void trtllm_paged_attention_launcher(
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
-  runner_params.mScaleQ = 1.0;
   runner_params.mChunkedAttentionSize = INT_MAX;
   runner_params.mAttentionWindowSize = window_left == -1 ? INT_MAX : window_left + 1;
   runner_params.mMaxSeqLenQ = max_q_len;

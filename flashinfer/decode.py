@@ -2081,7 +2081,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
-    For bmm2_scale_tensor, please fuse * M_LOG2E to use faster exp2.
+    ** For bmm2_scale_tensor, please fuse * M_LOG2E to use faster exp2. **
     The two scale factors should be static constant for cuda graph capture.
     Either (bmm1_scale, bmm2_scale) or (bmm1_scale_tensor, bmm2_scale_tensor) should be provided.
     For static constant scale factors, the scale factors should be provided as float.
