@@ -175,7 +175,10 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
 
     # 2. Tiling and Scale Calculation
     if ndim == 2:
-        s0, s1 = x_scale.shape
+        if scale_major_mode == "K":
+            s0, s1 = x_scale.shape
+        else:
+            s1, s0 = x_scale.shape
         x = rearrange(
             x.to(torch.float32), "(s0 t0) (s1 t1) -> s0 s1 t0 t1", s0=s0, s1=s1
         )
@@ -186,7 +189,10 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
         out = rearrange(x * x_scale, "s0 s1 t0 t1 -> (s0 t0) (s1 t1)")
 
     elif ndim == 3:
-        s0, s1, s2 = x_scale.shape
+        if scale_major_mode == "K":
+            s0, s1, s2 = x_scale.shape
+        else:
+            s0, s2, s1 = x_scale.shape
         x = rearrange(
             x.to(torch.float32),
             "(s0 t0) (s1 t1) (s2 t2)-> s0 s1 s2 t0 t1 t2",
