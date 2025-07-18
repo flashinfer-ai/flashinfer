@@ -90,7 +90,8 @@ void trtllm_paged_attention_decode_launcher(
   // runner_params.cumSeqLensKvPtr = cum_seq_lens_kv.data_ptr<int>();
 
   // num_kv_heads should be enough, but num_heads for safty at long seq len.
-  size_t num_semaphores = batch_size * num_heads;
+  // num_semaphores should be multiple of 8 to avoid misalignment issue
+  size_t num_semaphores = (batch_size * num_heads + 7) / 8 * 8;
 
   runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
       static_cast<char*>(workspace_buffer.data_ptr()) + num_semaphores * sizeof(uint32_t));
