@@ -22,7 +22,7 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
     if _cudnn_handle is None:
         _cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
+    # cudnn.set_stream(_cudnn_handle, stream.cuda_stream) # TODO: Will fix this in future
     return _cudnn_handle
 
 
@@ -88,6 +88,10 @@ def _build_decode_graph(
     batch_offsets_o: Optional[torch.Tensor] = None,
 ):
     handle = _create_cudnn_handle(torch.cuda.current_stream())
+
+    # WAR: override batch offsets for now, as it leads to a poor performance
+    batch_offsets_q = None
+    batch_offsets_o = None
 
     with cudnn.graph(handle) as (g, _):
 
