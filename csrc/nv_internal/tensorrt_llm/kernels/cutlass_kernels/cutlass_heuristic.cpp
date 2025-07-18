@@ -332,7 +332,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
 
 std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
-#ifdef FAST_BUILD
+#ifdef False //FAST_BUILD
   // Fast build disables all configs except this one for SM100
   return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B,
                             MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,

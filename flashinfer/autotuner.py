@@ -382,6 +382,9 @@ class AutoTuner:
             cache_key = r.get_cache_key(custom_op, input_shapes, tuning_config)
 
             if cache_key in self.profiling_cache:
+                # print(f"self.profiling_cache:{len(self.profiling_cache)}")
+                # # print("cache hit", cache_key)
+                # print(tuning_config)
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
@@ -452,9 +455,13 @@ class AutoTuner:
         )
         # Record the total configs to try
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
+        # print("xxx"*20)
+        # print(f"profiles:{len(profiles)}")
 
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
+            # [print(i.shape) for i in tensors]
+            # [print(i.dtype) for i in tensors]
             is_cache_hit, runner, tactic, _ = self.search_cache(
                 custom_op, runners, p.get_opt_shapes(), tuning_config
             )
@@ -464,17 +471,20 @@ class AutoTuner:
                 runner, tactic = None, None
                 for runner_id, r in enumerate(runners):
                     # TODO: use FakeTensor here.
+                    # [print(t.shape) for t in tensors]
                     valid_tactics = r.get_valid_tactics(tensors)
                     runner_arg_names = {
                         p.name for p in inspect.signature(r.forward).parameters.values()
                     }
                     if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
                         r(tensors, tactic=-1, do_preparation=True, **kwargs)
+                    # print(f"valid_tactics: {len(valid_tactics)}")
                     for tac in valid_tactics:
                         try:
                             time_measured = self._profile_single_kernel(
                                 r, tensors, tac, **kwargs
                             )
+                            # print(f"time_measured: {time_measured}, {tac}")
                         except Exception as e:
                             logger.error(
                                 f"[Autotuner]: Failed when profiling {r} {tac}, shapes={[t.size() for t in tensors]}. Error occurred: {e}"
@@ -508,13 +518,16 @@ class AutoTuner:
                     logger.debug(
                         f"[Autotuner]: profiling chosen runner: {runner} {tactic} for {cache_key}"
                     )
+                    # print(f"[Autotuner]: profiling chosen runner: {runner} {tactic} for {cache_key}")
+
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
+        # print("search cache")
         _, runner_id, tactic, _ = self.search_cache(
             custom_op, runners, input_shapes, tuning_config
         )
-
+        # print(f"returning tactic: {tactic} for {runners[runner_id]}")
         return runners[runner_id], tactic
 
     def _profile_single_kernel(
