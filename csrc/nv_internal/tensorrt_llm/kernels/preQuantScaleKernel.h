@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,20 +28,14 @@
 #include <type_traits>
 #include <vector>
 
-namespace tensorrt_llm {
-namespace kernels {
+namespace tensorrt_llm
+{
+namespace kernels
+{
 
 template <typename T_in, typename T_out = T_in>
-void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* act,
-                                             T_in const* per_channel_scale, int rows, int cols,
-                                             cudaStream_t stream = 0);
+void apply_per_channel_scale_kernel_launcher(
+    T_out* smoothed_act, T_in const* act, T_in const* per_channel_scale, int rows, int cols, int64_t const* num_valid_tokens_ptr = nullptr, cudaStream_t stream = 0);
 
-template <typename T_in, typename T_out = T_in>
-void apply_per_expert_scale_kernel_launcher(T_out* smoothed_act, T_in const* act,
-                                            T_in const* per_expert_scale,
-                                            int const* permuted_token_selected_experts,
-                                            int64_t const* num_valid_tokens_ptr, int rows, int cols,
-                                            cudaStream_t stream = 0);
-
-}  // namespace kernels
-}  // namespace tensorrt_llm
+} // namespace kernels
+} // namespace tensorrt_llm
