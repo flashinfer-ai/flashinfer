@@ -48,7 +48,6 @@ void trtllm_paged_attention_mla_launcher(
 
   // todo(Yingyi): use multi_block mode always true??
   bool use_multi_block = true;
-  static auto fmha_runner = TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
 
   TllmGenFmhaRunnerParams runner_params;
   memset(&runner_params, 0, sizeof(runner_params));
@@ -131,7 +130,6 @@ void trtllm_paged_attention_mla_launcher(
   //     total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
   //                     max_head_dim_kv * get_size_in_bytes(CACHE_T));
   runner_params.mNumPagesInMemPool = 0;
-
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   runner_params.stream = stream;
   // NOTE (Yingyi): quantization, not supported for now
@@ -148,6 +146,9 @@ void trtllm_paged_attention_mla_launcher(
   zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
                                /*enable_pdl=*/true, stream);
 
+  static auto fmha_runner = runner_params.useGmemScale
+                                ? TllmGenFmhaRunnerGmemScale(CACHE_T, CACHE_T, DATA_TYPE_BF16)
+                                : TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
   fmha_runner.run(runner_params);
 }
 
