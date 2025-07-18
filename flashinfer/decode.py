@@ -2029,8 +2029,8 @@ def _check_trtllm_gen_mla_shape(
 ):
     if query.ndim != 4:
         raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
-    if kv_cache.ndim != 4:
-        raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
+    if kv_cache.ndim != 3:
+        raise ValueError(f"Expected kv_cache.ndim == 3, got {kv_cache.ndim}")
     if qk_nope_head_dim != 128:
         raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
     if kv_lora_rank != 512:
@@ -2039,10 +2039,14 @@ def _check_trtllm_gen_mla_shape(
         raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
 
     B_q, Q_len, H, D_q = query.shape
-    D_ckv = kv_cache.shape[3]
+    _, cache_page_size, D_ckv = kv_cache.shape
     # if H != 128:
     #     raise ValueError(f"Expected 128 heads for query, got {H}")
     # todo(Yingyi): should we check num_heads == 128? Is this deepseek only?
+    if cache_page_size != page_size:
+        raise ValueError(
+            f"Expected kvcache page size == page_size, got {cache_page_size}"
+        )
     if D_q != D_ckv or D_q != 576:
         raise ValueError(
             f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"

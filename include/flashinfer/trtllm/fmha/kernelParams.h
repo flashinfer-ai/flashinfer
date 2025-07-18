@@ -575,10 +575,13 @@ struct KernelParams {
     int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
 
     // Set the number of pages in the memory pool for paged K/V cache.
+    // todo(Zihao): update to be single kvcache for mla?
     if (isPagedKv(options.mQkvLayout)) {
-      params.mNumPagesInMemPool = options.mNumPagesInMemPool == 0
-                                      ? options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize
-                                      : options.mNumPagesInMemPool;
+      params.mNumPagesInMemPool =
+          options.mNumPagesInMemPool == 0
+              ? (options.mHeadDimQk == 576 ? options.mMaxNumPagesPerSeqKv * 1 * options.mBatchSize
+                                           : options.mMaxNumPagesPerSeqKv * 2 * options.mBatchSize)
+              : options.mNumPagesInMemPool;
     }
 
     // The number of elements in 128B for Q.
@@ -616,6 +619,7 @@ struct KernelParams {
     std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
     tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
     tileShapeKv[1] = numKeysPerTile;
+    // todo(Zihao): update stride and shape for kv cache
     // Build tma descriptor for K.
     params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK,
                                         tileShapeKv, const_cast<void*>(kPtr),

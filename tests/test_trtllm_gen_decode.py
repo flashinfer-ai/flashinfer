@@ -312,10 +312,6 @@ def test_trtllm_batch_decode_mla(
     kv_cache = torch.randn(
         size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim), device=device
     ).to(dtype)
-    # (num_blocks, 2, page_size, kv_lora_rank + qk_rope_head_dim)
-    # todo(Yingyi): do not duplicate kv_cache for the next generated cubins
-    kv_cache_duplicate = torch.stack([kv_cache, kv_cache], dim=1)
-    # kv_cache_duplicate = torch.stack([kv_cache], dim=1)
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
@@ -339,7 +335,7 @@ def test_trtllm_batch_decode_mla(
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
-        kv_cache=kv_cache_duplicate,  # kv_cache.unsqueeze(1),
+        kv_cache=kv_cache,
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
