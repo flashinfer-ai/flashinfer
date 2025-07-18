@@ -129,9 +129,9 @@ def test_pod_with_paged_kv_cache(
         ],
         dim=0,
     ).int()
-    kv_indices_p = torch.arange(0, kv_len_p, device=device, dtype=torch.int32)
+    kv_indices_p = torch.arange(0, kv_len_p_padded, device=device, dtype=torch.int32)
     last_page_len_p = torch.tensor(
-        [(kv_len_p - 1) % page_size + 1], device=device, dtype=torch.int32
+        [(kv_len_p_padded - 1) % page_size + 1], device=device, dtype=torch.int32
     )
     total_num_pages_p = (kv_len_p_padded + page_size - 1) // page_size
     if kv_layout_p == "NHD":
@@ -245,7 +245,10 @@ def test_pod_with_paged_kv_cache(
         pos_encoding_mode_p=pos_encoding_mode,
         causal_p=causal,
     )
+
     # Prefill is run with batch size 1
+    torch.cuda.synchronize()
+    breakpoint()
     torch.testing.assert_close(
         o_p, o_ref_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch"
     )

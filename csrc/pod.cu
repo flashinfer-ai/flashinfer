@@ -268,17 +268,17 @@ void PODWithKVCacheTensorRun(
         using DecodeAttentionVariant =
             DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
                              USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-        //DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q_p, CTA_TILE_Q_P, {
-        assert(plan_info.cta_tile_q_d == 16 && "Decode tile size should be 16 for POD. Check planner.");
-        constexpr size_t CTA_TILE_Q_P = 128;
-        constexpr size_t CTA_TILE_Q_D = 16;
-        cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
-            HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
-            CTA_TILE_Q_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
-            DecodeAttentionVariant>(prefill_params, decode_params, tmp_v, tmp_s, enable_pdl,
-                                    stream);
-        TORCH_CHECK(status == cudaSuccess, "PODWithKVCache kernel launch failed, error: " +
-                                               std::string(cudaGetErrorString(status)));
-        //});
+        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q_p, CTA_TILE_Q_P, {
+          assert(plan_info.cta_tile_q_d == 16 &&
+                 "Decode tile size should be 16 for POD. Check planner.");
+          constexpr size_t CTA_TILE_Q_D = 16;
+          cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
+              HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
+              CTA_TILE_Q_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
+              DecodeAttentionVariant>(prefill_params, decode_params, tmp_v, tmp_s, enable_pdl,
+                                      stream);
+          TORCH_CHECK(status == cudaSuccess, "PODWithKVCache kernel launch failed, error: " +
+                                                 std::string(cudaGetErrorString(status)));
+        });
       });
 }
