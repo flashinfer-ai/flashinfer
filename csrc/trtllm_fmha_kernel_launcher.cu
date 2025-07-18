@@ -22,6 +22,7 @@
 #include <flashinfer/semaphore_utils.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
+#include <flashinfer/utils.cuh>
 #include <iostream>
 #include <optional>
 
@@ -90,7 +91,9 @@ void trtllm_paged_attention_decode_launcher(
   // runner_params.cumSeqLensKvPtr = cum_seq_lens_kv.data_ptr<int>();
 
   // num_kv_heads should be enough, but num_heads for safty at long seq len.
-  size_t num_semaphores = batch_size * num_heads;
+  // Round up num_semaphores to a multiple of 8 to satisfy the 16B alignment requirement for
+  // multiCtasKvScratchPtr.
+  size_t num_semaphores = round_up(batch_size * num_heads, 8);
 
   runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
       static_cast<char*>(workspace_buffer.data_ptr()) + num_semaphores * sizeof(uint32_t));
