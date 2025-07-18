@@ -14,6 +14,8 @@
 # limitations under the License.
 # Code imported from TensorRT-LLM/tensorrt_llm/_mnnvl_utils.py
 import ctypes
+from typing import Optional, Dict, Tuple, List
+from abc import ABC, abstractmethod
 import logging
 import platform
 import sys
@@ -23,7 +25,7 @@ from typing import List
 import pynvml
 import torch
 from cuda import cuda
-from mpi4py import MPI
+# from mpi4py import MPI
 
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
@@ -111,6 +113,7 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
 
 
 class MpiComm:
+    from mpi4py import MPI
     _comm: MPI.Intracomm = MPI.COMM_WORLD
 
     @classmethod
@@ -120,8 +123,55 @@ class MpiComm:
     def __getattr__(self, name):
         return getattr(self._comm, name)
 
+class CommBackend(ABC):
+    """Abstract communication backend interface"""
+    @abstractmethod
+    def Get_rank(self) -> int: ...
+    
+    @abstractmethod
+    def Get_size(self) -> int: ...
+    
+    @abstractmethod
+    def allgather(self, data: int) -> List[int]: ...
+
+    @abstractmethod
+    def allgather_bytes(self, data): ...
+    
+    @abstractmethod
+    def Split(self, color: int, key: int) -> 'CommBackend': ...
+class LegacyMPIBackend(CommBackend):
+    """Adapter for the original MpiComm singleton pattern"""
+    def __init__(self):
+        self._mpicomm = MpiComm()
+    
+    def Get_rank(self) -> int:
+        return self._mpicomm.Get_rank()
+    
+    def Get_size(self) -> int:
+        return self._mpicomm.Get_size()
+    
+    def allgather(self, data: int) -> List[int]:
+        return self._mpicomm.allgather(data)
+    
+    def allgather_bytes(self, data):
+        return self._mpicomm.allgather(data)
+    
+    def Split(self, color: int, key: int) -> CommBackend:
+        # Original split logic
+        new_comm = self._mpicomm.Split(color, key)
+        return LegacyMPIBackend()  # Returns new adapter
+
+@dataclass
+class MnnvlConfig:
+    """Configuration for MNNVL memory management"""
+    comm_backend: Optional[CommBackend] = None
+    allocation_granularity: int = 0
+    fabric_page_size: int = 1 << 29  # 512MB
+
 
 class MnnvlMemory:
+    _config: MnnvlConfig = MnnvlConfig(comm_backend=LegacyMPIBackend())  # Default to legacy MPI
+
     initialized: bool = False
 
     current_mem_offset: int = 0
@@ -145,8 +195,9 @@ class MnnvlMemory:
     def __init__(self, mapping: Mapping, size: int):
         self.mapping = mapping
         self.segment_size = size
+        # self._config = config or MnnvlConfig(comm_backend=LegacyMPIBackend())
         self.ptr, self.rank_stride = MnnvlMemory.open_mnnvl_memory(self.mapping, size)
-
+        
     def __del__(self):
         if not sys.is_finalizing():
             MnnvlMemory.close_mnnvl_memory(self.ptr)
@@ -175,14 +226,31 @@ class MnnvlMemory:
             MnnvlMemory.initialized = True
 
     @staticmethod
+    def set_comm(config: MnnvlConfig = None):
+        MnnvlMemory._config = config or MnnvlConfig(comm_backend=LegacyMPIBackend()) 
+
+    @staticmethod
     def get_comm(mapping: Mapping):
-        if MnnvlMemory.comm is not None:
-            return MnnvlMemory.comm
-        comm = MpiComm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
-        )
+        """Modified to work with configurable backends"""
+        # If using legacy MPI path (original behavior)
+        if isinstance(MnnvlMemory._config.comm_backend, LegacyMPIBackend):
+            if MnnvlMemory.comm is not None:
+                return MnnvlMemory.comm
+            comm = MpiComm().Split(
+                mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+                mapping.tp_rank
+            )
+        # New backend-aware path
+        else:
+            print(MnnvlMemory._config)
+            backend = MnnvlMemory._config.comm_backend
+            comm = backend.Split(
+                mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+                mapping.tp_rank
+            )
         MnnvlMemory.comm = comm
         return comm
+
 
     @staticmethod
     def get_allocation_prop(dev_id: int):
@@ -249,7 +317,6 @@ class MnnvlMemory:
         ), "Not all rank allocating same size."
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
-
         if (
             MnnvlMemory.current_mem_offset + aligned_size
             > MnnvlMemory.current_rank_stride
@@ -272,7 +339,11 @@ class MnnvlMemory:
                 0,
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+        print(f"cccccccccccccccccc : {exported_fabric_handle.data}")
+        # all_handles_data = comm.allgather(exported_fabric_handle.data)
+        all_handles_data = comm.allgather_bytes(exported_fabric_handle.data)
+        print(f"passssss : {all_handles_data}")
+        # all_handles_data = comm.allgather(exported_fabric_handle.data)
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 

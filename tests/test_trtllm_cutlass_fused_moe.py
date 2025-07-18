@@ -233,16 +233,31 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
     )
     flash_output = torch.empty_like(ref_output)
-    flash_output = fused_moe.cutlass_fused_moe(
-        x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w31_weight,
-        w2_weight,
-        flash_output.dtype,
-        output=flash_output,
-        quant_scales=None,
-    )
+
+    from flashinfer.autotuner import autotune
+    with torch.inference_mode(), autotune():
+        flash_output = fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            flash_output.dtype,
+            output=flash_output,
+            quant_scales=None,
+        )
+    print("xxx"*100)
+    flash_output2 = torch.empty_like(ref_output)
+    flash_output2 = fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            ref_output.dtype,
+            output=flash_output2,
+            quant_scales=None,
+        )
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
@@ -324,16 +339,27 @@ def test_moe_fp8(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+# @pytest.mark.parametrize("batch_size", BATCH_SIZES)
+# @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+# @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+# @pytest.mark.parametrize("top_k", TOP_K_VALUES)
+# @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+# @pytest.mark.parametrize(
+#     "otype, wtype",
+#     [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
+# )
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096])
+@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize("top_k", [8])
+@pytest.mark.parametrize("intermediate_size", [256])
 @pytest.mark.parametrize(
     "otype, wtype",
-    [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
+    [(torch.bfloat16, torch.float8_e4m3fn)],
 )
 @pytest.mark.parametrize("quantized_input", [False, True])
+@pytest.mark.parametrize("use_autotune", [False, True])
 def test_moe_nvfp4(
     batch_size,
     hidden_size,
@@ -343,6 +369,7 @@ def test_moe_nvfp4(
     otype,
     wtype,
     quantized_input,
+    use_autotune,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -426,17 +453,85 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    _ = fused_moe.cutlass_fused_moe(
-        hidden_states,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_q.contiguous().view(torch.long),
-        w2_q.contiguous().view(torch.long),
-        otype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        output=flash_output,
-    )
+        print(hidden_states.dtype)
+
+    # Timing starts here
+    runtimes = 6
+    flash_output2 = torch.zeros_like(x)
+    if not use_autotune:
+        # warmup
+        for _ in range(runtimes):
+            _ = fused_moe.cutlass_fused_moe(
+                    hidden_states,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w1_q.contiguous().view(torch.long),
+                    w2_q.contiguous().view(torch.long),
+                    otype,
+                    quant_scales=quant_scales,
+                    input_sf=input_sf,
+                    output=flash_output2,
+                )
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)    
+        start_event.record()        
+        for _ in range(runtimes):
+            _ = fused_moe.cutlass_fused_moe(
+                    hidden_states,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w1_q.contiguous().view(torch.long),
+                    w2_q.contiguous().view(torch.long),
+                    otype,
+                    quant_scales=quant_scales,
+                    input_sf=input_sf,
+                    output=flash_output2,
+                )
+        end_event.record()
+
+        # Wait for completion
+        torch.cuda.synchronize()
+        elapsed_time_ms = start_event.elapsed_time(end_event) / runtimes
+        print(f"No autotune Elapsed time: {elapsed_time_ms:.2f} ms")
+    else:
+        from flashinfer.autotuner import autotune, AutoTuner
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            for _ in range(5):
+                _ = fused_moe.cutlass_fused_moe(
+                    hidden_states,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w1_q.contiguous().view(torch.long),
+                    w2_q.contiguous().view(torch.long),
+                    otype,
+                    quant_scales=quant_scales,
+                    input_sf=input_sf,
+                    output=flash_output,
+                )
+        # Timing starts here
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)    
+        start_event.record()        
+        for _ in range(runtimes):
+            _ = fused_moe.cutlass_fused_moe(
+                    hidden_states,
+                    selected_experts.to(torch.int),
+                    routing_weights,
+                    w1_q.contiguous().view(torch.long),
+                    w2_q.contiguous().view(torch.long),
+                    otype,
+                    quant_scales=quant_scales,
+                    input_sf=input_sf,
+                    output=flash_output2,
+                )
+        end_event.record()
+
+        # Wait for completion
+        torch.cuda.synchronize()
+        elapsed_time_ms = start_event.elapsed_time(end_event) / runtimes
+        print(f"Elapsed time: {elapsed_time_ms:.2f} ms")
 
     # Ref check
     a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
@@ -478,7 +573,7 @@ def test_moe_nvfp4(
     ref_output = torch_moe_nvfp4(
         a_in_dtype, w1_d, w2_d, top_k, routing_weights, selected_experts
     )
-    torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
+    # torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)

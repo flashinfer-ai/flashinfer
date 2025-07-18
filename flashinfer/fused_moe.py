@@ -279,7 +279,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
             "-DCOMPILE_HOPPER_TMA_GEMMS",
         ],
         extra_cflags=[
-            "-DFAST_BUILD",
+            # "-DFAST_BUILD",
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
@@ -379,7 +379,6 @@ def get_fused_moe_sm100_module():
             invalid = (m > 128 and min_latency_mode) or (
                 m <= 128 and min_latency_mode and (not self._is_nvfp4)
             )
-
             return (
                 [] if invalid else list(range(self._fused_moe_runner.get_tactic_num()))
             )
@@ -394,6 +393,10 @@ def get_fused_moe_sm100_module():
             x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
             min_latency_mode = min_latency_mode_tensor.size(0) == 1
             # determine if we should use min latency mode according to the profiled seq len
+            # print("uuuu"*10)
+            # import traceback
+            # traceback.print_stack()
+            # print(f"do_preparation: {do_preparation}, gemm_idx: {gemm_idx}, tactic: {tactic}")
             self._fused_moe_runner.run_gemm_profile(
                 x,
                 fc1_expert_weights,
@@ -493,7 +496,10 @@ def get_fused_moe_sm100_module():
             [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
             gemm_idx=2,
         )
-
+        # print(f"input:{input.shape}")
+        # print(f"fc1_expert_weights:{fc1_expert_weights.shape}")
+        # print(f"fc2_expert_weights:{fc2_expert_weights.shape}")
+        print(gemm_tactic_1, gemm_tactic_2)
         run_moe = (
             moe_runner._fused_moe_runner.run_moe_min_latency
             if min_latency_mode
