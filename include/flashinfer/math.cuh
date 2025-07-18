@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 
 namespace flashinfer {
 namespace math {
@@ -29,7 +30,17 @@ constexpr float log2e = 1.44269504088896340736f;
 
 constexpr float loge2 = 0.693147180559945309417f;
 
+// only for bf16 or fp16
 constexpr float inf = 5e4;
+
+template <typename DT>
+__forceinline__ __device__ DT neg_inf() {
+  if constexpr (std::is_same<DT, float>::value) {
+    return std::numeric_limits<DT>::lowest();
+  } else {
+    return -inf;
+  }
+}
 
 __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&x; }
 
