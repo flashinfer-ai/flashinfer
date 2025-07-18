@@ -670,6 +670,8 @@ def test_moe_fp8(
         False,
     )
 
+    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+
     # Prepare weights and scales for the kernel call
     kernel_gemm1_weights = gemm1_weights
     kernel_gemm2_weights = gemm2_weights
@@ -729,14 +731,7 @@ def test_moe_fp8(
     )
 
     output_dequant_actual = output.to(torch.float)
-    #
-    # Run the reference implementations
-    #
-    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
 
-    #
-    # Check the results
-    #
     def check_accuracy(a, b, atol, rtol, percent):
         if torch.any(torch.isnan(a)):
             raise Exception("NaN in a")
