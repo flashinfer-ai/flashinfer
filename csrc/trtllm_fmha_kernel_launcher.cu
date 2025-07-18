@@ -204,8 +204,8 @@ void trtllm_paged_attention_context_launcher(
   runner_params.mNumHeadsKv = num_kv_heads;
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
-  runner_params.mMaxSeqLenQ =
-      batch_size;  // Fix: should be batch_size, not query.size(0) (query is pointer)
+  // NOTE(Zihao): need more discussions on the value of these two
+  runner_params.mMaxSeqLenQ = sum_seq_q;
   runner_params.mMaxSeqLenKv = max_seq_len;
 
   runner_params.mSumOfSeqLensQ = sum_seq_q;
@@ -250,7 +250,6 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
     using DTypeKV = DTypeQ;
     using DTypeO = DTypeQ;
 
-    int batch_size_ = query.size(0);
     int num_qo_heads = query.size(1);
     int head_dim = query.size(2);
     int page_size = block_size;
@@ -264,7 +263,7 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
         static_cast<DTypeO*>(out.data_ptr()), static_cast<DTypeQ*>(query.data_ptr()),
         static_cast<DTypeKV*>(key_value_cache.data_ptr()), workspace_buffer.data_ptr(),
         static_cast<KVCachePageIndex*>(block_tables.data_ptr()),
-        static_cast<int*>(seq_lens.data_ptr()), batch_size_, max_seq_len, num_pages, num_qo_heads,
+        static_cast<int*>(seq_lens.data_ptr()), batch_size, max_seq_len, num_pages, num_qo_heads,
         num_kv_heads, head_dim, page_size, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
         window_left, sum_seq_q, sum_seq_kv, sm_count, stream,
         cum_seq_lens_q.defined() ? cum_seq_lens_q.data_ptr<int>() : nullptr,
