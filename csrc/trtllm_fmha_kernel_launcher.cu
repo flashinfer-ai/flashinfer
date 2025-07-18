@@ -35,7 +35,7 @@ void trtllm_paged_attention_decode_launcher(
     int64_t num_kv_heads, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, double bmm1_scale, double bmm2_scale, int64_t window_left,
     int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count) {
-  int num_seqs = query.size(0);
+  int batch_size = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(-1);
@@ -53,9 +53,6 @@ void trtllm_paged_attention_decode_launcher(
             << "and num_heads: " << num_heads;
     FLASHINFER_ERROR(err_msg.str());
   }
-  auto batch_size = num_seqs;
-
-  int const beam_width = num_seqs / batch_size;  // always 1
 
   auto q_heads = reinterpret_cast<T*>(query.data_ptr());
   auto output_ptr = reinterpret_cast<T*>(out.data_ptr());
@@ -201,7 +198,6 @@ void trtllm_paged_attention_context_launcher(
     int64_t max_seq_len, double bmm1_scale, double bmm2_scale, int64_t batch_size,
     int64_t window_left, int64_t sum_seq_q, int64_t sum_seq_kv, at::Tensor& cum_seq_lens_q,
     at::Tensor& cum_seq_lens_kv, int64_t sm_count) {
-  int num_seqs = query.size(0) / batch_size;
   int num_heads = query.size(1);
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(-1);

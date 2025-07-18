@@ -33,14 +33,11 @@ void trtllm_paged_attention_mla_launcher(
     double bmm2_scale, std::optional<at::Tensor> bmm1_scale_tensor,
     std::optional<at::Tensor> bmm2_scale_tensor, std::optional<int64_t> max_attention_window_size,
     std::optional<int64_t> cyclic_attention_window_size, int64_t sm_count) {
-  int const num_seqs = query.size(0);
-  int const batch_size = num_seqs;
-  int const acc_q_len = query.size(1);
+  int const batch_size = query.size(0);
+  int const q_len_per_request = query.size(1);
   int const num_q_heads = query.size(2);
   int const num_kv_heads = 1;
   int head_size = query.size(3);
-  int const beam_width = 1;                        // NOTE: beam_width always 1
-  int const batch_beam = beam_width * batch_size;  // NOTE: batch_beam = batch_size
   int const max_num_blocks_per_seq = block_tables.size(-1);
 
   auto device = query.device();
@@ -98,7 +95,6 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mNumHeadsKv = num_kv_heads;
   runner_params.mNumHeadsQPerKv = num_q_heads / num_kv_heads;
 
-  // NOTE: beam_width = 1
   runner_params.mBatchSize = batch_size;
 
   // It is used to construct contiguous kv cache TMA descriptors.
@@ -106,11 +102,11 @@ void trtllm_paged_attention_mla_launcher(
   runner_params.mMaxSeqLenCacheKv = max_attention_window_size_opt;
 
   // This should be set to numDraftTokens + 1.
-  runner_params.mMaxSeqLenQ = acc_q_len;  // should be draft_tokens + 1
+  runner_params.mMaxSeqLenQ = q_len_per_request;  // should be draft_tokens + 1
   runner_params.mMaxSeqLenKv = max_seq_len;
-  runner_params.mSumOfSeqLensQ = int(batch_beam * runner_params.mMaxSeqLenQ);
+  runner_params.mSumOfSeqLensQ = int(batch_size * runner_params.mMaxSeqLenQ);
   // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
-  runner_params.mSumOfSeqLensKv = int(batch_beam * runner_params.mMaxSeqLenKv);
+  runner_params.mSumOfSeqLensKv = int(batch_size * runner_params.mMaxSeqLenKv);
 
   // The attention window size.
   // NOTE(Yingyi): for sliding window attention, temp to the fixed INT_MAX
