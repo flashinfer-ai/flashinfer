@@ -248,7 +248,6 @@ def test_pod_with_paged_kv_cache(
 
     # Prefill is run with batch size 1
     torch.cuda.synchronize()
-    breakpoint()
     torch.testing.assert_close(
         o_p, o_ref_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch"
     )
