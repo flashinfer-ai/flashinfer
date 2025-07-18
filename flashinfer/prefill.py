@@ -49,6 +49,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_device_sm_count,
     is_float8,
     is_sm100a_supported,
     register_custom_op,
@@ -2904,6 +2905,7 @@ def trtllm_batch_context_with_kv_cache(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_context
+    sm_count = get_device_sm_count(query.device)
 
     if out is None:
         out = torch.empty_like(query)
@@ -2928,5 +2930,6 @@ def trtllm_batch_context_with_kv_cache(
         sum_seq_kv,
         cum_seq_lens_q,
         cum_seq_lens_kv,
+        sm_count,
     )
     return out

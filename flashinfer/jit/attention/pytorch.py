@@ -20,6 +20,7 @@ from typing import List, Optional
 import jinja2
 import torch
 
+from ...utils import get_device_sm_count
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -767,6 +768,7 @@ class TrtllmGenPrefillModule:
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
         self._op.trtllm_paged_attention_context(
@@ -787,6 +789,7 @@ class TrtllmGenPrefillModule:
             sum_seq_kv,
             cum_seq_lens_q,
             cum_seq_lens_kv,
+            sm_count,
         )
         return out
 

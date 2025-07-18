@@ -26,13 +26,15 @@
 #include <iostream>
 #include <optional>
 
+#include "pytorch_extension_utils.h"
+
 namespace flashinfer {
 template <typename T, Data_type CACHE_T>
 void trtllm_paged_attention_decode_launcher(
     at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
     int64_t num_kv_heads, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, double bmm1_scale, double bmm2_scale, int64_t window_left,
-    int64_t sum_seq_q, int64_t sum_seq_kv) {
+    int64_t sum_seq_q, int64_t sum_seq_kv, int64_t sm_count) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -135,16 +137,10 @@ void trtllm_paged_attention_decode_launcher(
   //   std::cout << "Found TRTLLM-GEN decode kernel" << kinfo << std::endl;
   // }
 
-  runner_params.mMultiProcessorCount = getMultiProcessorCount();
-  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
+  runner_params.mMultiProcessorCount = sm_count;
   int max_head_dim_kv = head_size;
-
-  runner_params.mNumPagesInMemPool =
-      total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
-                      max_head_dim_kv * get_size_in_bytes(CACHE_T));
-
+  runner_params.mNumPagesInMemPool = key_value_cache.size(0) * 2;
   runner_params.stream = stream;
-
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
 
@@ -156,36 +152,42 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
                                    at::Tensor& block_tables, at::Tensor& seq_lens,
                                    int64_t block_size, int64_t max_seq_len, double bmm1_scale,
                                    double bmm2_scale, int64_t window_left, int64_t sum_seq_q,
-                                   int64_t sum_seq_kv) {
+                                   int64_t sum_seq_kv, int64_t sm_count) {
   if (query.dtype() == at::ScalarType::Half && key_value_cache.dtype() == at::ScalarType::Half) {
     trtllm_paged_attention_decode_launcher<half, Data_type::DATA_TYPE_FP16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::Half) {
     trtllm_paged_attention_decode_launcher<__nv_bfloat16, Data_type::DATA_TYPE_FP16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else if (query.dtype() == at::ScalarType::Half &&
              key_value_cache.dtype() == at::ScalarType::BFloat16) {
     trtllm_paged_attention_decode_launcher<half, Data_type::DATA_TYPE_BF16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::BFloat16) {
     trtllm_paged_attention_decode_launcher<__nv_bfloat16, Data_type::DATA_TYPE_BF16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else if (query.dtype() == at::ScalarType::Half &&
              key_value_cache.dtype() == at::ScalarType::Float8_e4m3fn) {
     trtllm_paged_attention_decode_launcher<half, Data_type::DATA_TYPE_E4M3>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::Float8_e4m3fn) {
     trtllm_paged_attention_decode_launcher<__nv_bfloat16, Data_type::DATA_TYPE_E4M3>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
-        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv);
+        block_size, max_seq_len, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
+        sm_count);
   } else {
     TORCH_CHECK(false, "Unsupported data type combination of query and kv cache: ", query.dtype(),
                 " and ", key_value_cache.dtype());
@@ -198,7 +200,7 @@ void trtllm_paged_attention_context_launcher(
     int64_t num_kv_heads, at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, double bmm1_scale, double bmm2_scale, int64_t batch_size,
     int64_t window_left, int64_t sum_seq_q, int64_t sum_seq_kv, at::Tensor& cum_seq_lens_q,
-    at::Tensor& cum_seq_lens_kv) {
+    at::Tensor& cum_seq_lens_kv, int64_t sm_count) {
   int num_seqs = query.size(0) / batch_size;
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -266,8 +268,7 @@ void trtllm_paged_attention_context_launcher(
   runner_params.mChunkedAttentionSize = INT_MAX;
   runner_params.mAttentionWindowSize = window_left == -1 ? INT_MAX : window_left + 1;
 
-  runner_params.mMultiProcessorCount = getMultiProcessorCount();
-  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
+  runner_params.mMultiProcessorCount = sm_count;
   auto [foundKernels, kinfo] = fmha_runner.isSupportedWithInfo(runner_params);
   if (!foundKernels) {
     std::ostringstream err_msg;
@@ -277,9 +278,7 @@ void trtllm_paged_attention_context_launcher(
   }
   int max_head_dim_kv = head_size;
 
-  runner_params.mNumPagesInMemPool =
-      total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
-                      max_head_dim_kv * get_size_in_bytes(CACHE_T));
+  runner_params.mNumPagesInMemPool = key_value_cache.size(0) * 2;
 
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
@@ -294,42 +293,43 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
                                     int64_t block_size, int64_t max_seq_len, double bmm1_scale,
                                     double bmm2_scale, int64_t batch_size, int64_t window_left,
                                     int64_t sum_seq_q, int64_t sum_seq_kv,
-                                    at::Tensor& cum_seq_lens_q, at::Tensor& cum_seq_lens_kv) {
+                                    at::Tensor& cum_seq_lens_q, at::Tensor& cum_seq_lens_kv,
+                                    int64_t sm_count) {
   if (query.dtype() == at::ScalarType::Half && key_value_cache.dtype() == at::ScalarType::Half) {
     trtllm_paged_attention_context_launcher<half, Data_type::DATA_TYPE_FP16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::Half) {
     trtllm_paged_attention_context_launcher<__nv_bfloat16, Data_type::DATA_TYPE_FP16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else if (query.dtype() == at::ScalarType::Half &&
              key_value_cache.dtype() == at::ScalarType::BFloat16) {
     trtllm_paged_attention_context_launcher<half, Data_type::DATA_TYPE_BF16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::BFloat16) {
     trtllm_paged_attention_context_launcher<__nv_bfloat16, Data_type::DATA_TYPE_BF16>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else if (query.dtype() == at::ScalarType::Half &&
              key_value_cache.dtype() == at::ScalarType::Float8_e4m3fn) {
     trtllm_paged_attention_context_launcher<half, Data_type::DATA_TYPE_E4M3>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else if (query.dtype() == at::ScalarType::BFloat16 &&
              key_value_cache.dtype() == at::ScalarType::Float8_e4m3fn) {
     trtllm_paged_attention_context_launcher<__nv_bfloat16, Data_type::DATA_TYPE_E4M3>(
         out, query, key_value_cache, workspace_buffer, num_kv_heads, block_tables, seq_lens,
         block_size, max_seq_len, bmm1_scale, bmm2_scale, batch_size, window_left, sum_seq_q,
-        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv);
+        sum_seq_kv, cum_seq_lens_q, cum_seq_lens_kv, sm_count);
   } else {
     TORCH_CHECK(false, "Unsupported data type combination of query and kv cache: ", query.dtype(),
                 " and ", key_value_cache.dtype());

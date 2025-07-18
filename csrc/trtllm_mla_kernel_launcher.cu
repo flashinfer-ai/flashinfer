@@ -19,6 +19,8 @@
 #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
 #include <iostream>
 
+#include "pytorch_extension_utils.h"
+
 // NOTE(Yingyi):
 // dummy sliding window attention
 // quantization not supported
@@ -30,7 +32,7 @@ void trtllm_paged_attention_mla_launcher(
     int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim, double bmm1_scale,
     double bmm2_scale, std::optional<at::Tensor> bmm1_scale_tensor,
     std::optional<at::Tensor> bmm2_scale_tensor, std::optional<int64_t> max_attention_window_size,
-    std::optional<int64_t> cyclic_attention_window_size) {
+    std::optional<int64_t> cyclic_attention_window_size, int64_t sm_count) {
   int const num_seqs = query.size(0);
   int const batch_size = num_seqs;
   int const acc_q_len = query.size(1);
@@ -123,15 +125,10 @@ void trtllm_paged_attention_mla_launcher(
   //                         sqrtf((float)(kv_lora_rank + qk_rope_head_dim));
   runner_params.mScaleQ = 1.0;
 
-  // runner_params.mNumPagesInMemPool = INT_MAX;
-  auto const [free_memory, total_memory] = getDeviceMemoryInfo(false);
   int max_head_dim_kv = head_size;
-  // runner_params.mNumPagesInMemPool =
-  //     total_memory / (runner_params.mNumHeadsKv * runner_params.mNumTokensPerPage *
-  //                     max_head_dim_kv * get_size_in_bytes(CACHE_T));
-  runner_params.mNumPagesInMemPool = 0;
+  runner_params.mNumPagesInMemPool = key_value_cache.size(0) * 2;
 
-  runner_params.mMultiProcessorCount = getMultiProcessorCount();
+  runner_params.mMultiProcessorCount = sm_count;
   runner_params.stream = stream;
   // NOTE (Yingyi): quantization, not supported for now
   runner_params.mSfStartTokenIdx = 0;
@@ -155,7 +152,7 @@ void trtllm_paged_attention_mla_launcher(
       out, query, key_value_cache, workspace_buffer, block_tables, seq_lens, block_size,     \
       max_seq_len, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, bmm1_scale, bmm2_scale, \
       bmm1_scale_tensor, bmm2_scale_tensor, max_attention_window_size,                       \
-      cyclic_attention_window_size);
+      cyclic_attention_window_size, sm_count);
 
 // The following macro is used to dispatch the conversion function based on
 // the data type of the key and value cache. The FN is a macro that calls a
@@ -171,15 +168,13 @@ void trtllm_paged_attention_mla_launcher(
     TORCH_CHECK(false, "Unsupported input type of QKV type: ", Q_DTYPE);                           \
   }
 
-void trtllm_paged_attention_mla(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                                at::Tensor& workspace_buffer, at::Tensor& block_tables,
-                                at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
-                                int64_t qk_nope_head_dim, int64_t kv_lora_rank,
-                                int64_t qk_rope_head_dim, double bmm1_scale, double bmm2_scale,
-                                std::optional<at::Tensor> bmm1_scale_tensor,
-                                std::optional<at::Tensor> bmm2_scale_tensor,
-                                std::optional<int64_t> max_attention_window_size,
-                                std::optional<int64_t> cyclic_attention_window_size) {
+void trtllm_paged_attention_mla(
+    at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache, at::Tensor& workspace_buffer,
+    at::Tensor& block_tables, at::Tensor& seq_lens, int64_t block_size, int64_t max_seq_len,
+    int64_t qk_nope_head_dim, int64_t kv_lora_rank, int64_t qk_rope_head_dim, double bmm1_scale,
+    double bmm2_scale, std::optional<at::Tensor> bmm1_scale_tensor,
+    std::optional<at::Tensor> bmm2_scale_tensor, std::optional<int64_t> max_attention_window_size,
+    std::optional<int64_t> cyclic_attention_window_size, int64_t sm_count) {
   DISPATCH_BY_QKV_DTYPE(query.dtype(), key_value_cache.dtype(),
                         CALL_GEN_LAUNCHER);  // hybrid attention is not supported for now
 }

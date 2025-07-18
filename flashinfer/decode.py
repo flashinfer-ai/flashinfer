@@ -56,6 +56,7 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     device_support_pdl,
+    get_device_sm_count,
     register_custom_op,
     register_fake_op,
 )
@@ -1809,11 +1810,13 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         sum_seq_q: int,
         sum_seq_kv: int,
+        sm_count: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
+        sm_count = get_device_sm_count(query.device)
         self._op.trtllm_paged_attention_decode(
             out,
             query,
@@ -1829,6 +1832,7 @@ class TrtllmGenDecodeModule:
             window_left,
             sum_seq_q,
             sum_seq_kv,
+            sm_count,
         )
         return out
 
@@ -1993,6 +1997,7 @@ def trtllm_batch_decode_with_kv_cache(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_decode
+    sm_count = get_device_sm_count(query.device)
 
     if out is None:
         out = torch.empty_like(query)
@@ -2014,6 +2019,7 @@ def trtllm_batch_decode_with_kv_cache(
         window_left,
         sum_seq_q,
         sum_seq_kv,
+        sm_count,
     )
     return out
 
@@ -2111,6 +2117,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     When both are provided, the dynamic scale factor tensors will be used.
     """
     run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
+    sm_count = get_device_sm_count(query.device)
 
     if block_size != 32 and block_size != 64:
         raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
@@ -2163,5 +2170,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         bmm2_scale_tensor,
         None,  # max_attention_window_size, sliding window not supported for now
         None,  # cyclic_attention_window_size, cyclic window not supported for now
+        sm_count,
     )
     return out
