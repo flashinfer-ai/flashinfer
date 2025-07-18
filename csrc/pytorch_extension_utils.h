@@ -153,7 +153,10 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
   }
 #else
 #define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
-  static_assert(false, "FP4 E2M1 support requires CUDA 12.8 or newer.");
+  case at::ScalarType::Byte: { \
+    static_assert(false, "FP4 E2M1 support requires CUDA 12.8 or newer."); \
+    break; \
+  }
 #endif
 #else
 #define _DISPATCH_CASE_FP4_E2M1(c_type, ...)
