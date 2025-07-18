@@ -573,33 +573,6 @@ def test_moe_fp8(
 ):
     torch.random.manual_seed(0)
 
-    # # Early skip if shuffling is requested but tensors are too small
-    # if use_shuffled_weight:
-    #     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-    #     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)  # = 32
-
-    #     # Check if block scales will be too small to shuffle
-    #     scale_m_dim = 2 * intermediate_size // 128  # gemm1 scales M dimension
-    #     scale_m_dim2 = hidden_size // 128  # gemm2 scales M dimension
-
-    #     if (
-    #         scale_m_dim % shuffle_block_size != 0
-    #         or scale_m_dim2 % shuffle_block_size != 0
-    #     ):
-    #         pytest.skip(
-    #             f"Skipping shuffle test: scale tensors too small to shuffle "
-    #             f"(scale_dims: {scale_m_dim}, {scale_m_dim2}, "
-    #             f"shuffle_block_size: {shuffle_block_size})"
-    #         )
-    # else:
-    #     if hidden_size == 4096 and intermediate_size == 2048:
-    #         pytest.skip(
-    #             "Skipping test for hidden_size=4096 and intermediate_size=2048 in non-shuffled case"
-    #         )
-
-    #
-    # Data Generation
-    #
     num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
     routed_scaling = 2.5
