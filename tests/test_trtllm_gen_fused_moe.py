@@ -676,46 +676,29 @@ def test_moe_fp8(
     kernel_gemm2_weights = gemm2_weights
     kernel_gemm2_scales = gemm2_scales
 
-    # If using shuffled weights, apply shuffling to both weights and scales
     if use_shuffled_weight:
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
-        # Reorder rows of W1 for fused gated activation
         gemm1_weights_fp8_interleaved = []
-        gemm1_scales_fp8_interleaved = []
         for i in range(num_experts):
             gemm1_weights_fp8_interleaved.append(
                 reorder_rows_for_gated_act_gemm(gemm1_weights[i].clone())
             )
-            gemm1_scales_fp8_interleaved.append(
-                reorder_rows_for_gated_act_gemm(gemm1_scales[i].clone())
-            )
 
-        # Stack weights and scales for all experts
         gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved)
-        gemm1_scales_fp8_interleaved = torch.stack(gemm1_scales_fp8_interleaved)
 
-        # Shuffle weights and scaling factors for transposed mma output
         gemm1_weights_fp8_shuffled = []
-        gemm1_scales_fp8_shuffled = []
         gemm2_weights_fp8_shuffled = []
-        gemm2_scales_fp8_shuffled = []
         for i in range(num_experts):
             gemm1_weights_fp8_shuffled.append(
                 shuffle_matrix_a(
                     gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
                 )
             )
+
             gemm2_weights_fp8_shuffled.append(
                 shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
-            )
-
-            gemm1_scales_fp8_shuffled.append(
-                shuffle_matrix_a(gemm1_scales_fp8_interleaved[i], epilogue_tile_m)
-            )
-            gemm2_scales_fp8_shuffled.append(
-                shuffle_matrix_a(gemm2_scales[i], epilogue_tile_m)
             )
 
         kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
@@ -724,9 +707,6 @@ def test_moe_fp8(
         kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )
-
-        kernel_gemm1_scales = torch.stack(gemm1_scales_fp8_shuffled)
-        kernel_gemm2_scales = torch.stack(gemm2_scales_fp8_shuffled)
 
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
