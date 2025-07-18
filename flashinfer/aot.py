@@ -11,6 +11,7 @@ from torch.utils.cpp_extension import _get_cuda_arch_flags
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
 from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
+from .comm.nvshmem import gen_nvshmem_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
 from .fused_moe import gen_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
@@ -302,6 +303,7 @@ def gen_all_modules(
     has_sm90: bool,
     has_sm100: bool,
     add_gemma: bool,
+    has_non_sm100: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
 
@@ -325,7 +327,9 @@ def gen_all_modules(
         jit_specs.append(gen_fused_moe_sm100_module())
         jit_specs.append(gen_fp4_quantization_sm100_module())
         jit_specs.append(gen_gemm_sm100_module())
-        jit_specs.append(gen_trtllm_comm_module())
+        jit_specs.append(gen_trtllm_comm_module(sm100=True))
+    if has_non_sm100:
+        jit_specs.append(gen_trtllm_comm_module(sm100=False))
 
     jit_specs += [
         gen_cascade_module(),
@@ -491,6 +495,9 @@ def main():
     has_sm100 = any(
         "compute_100" in flag for flag in gencode_flags
     ) and version_at_least(torch.version.cuda, "12.8")
+    has_non_sm100 = not has_sm100 or any(
+        "compute_100" not in flag for flag in gencode_flags
+    )
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
@@ -521,6 +528,7 @@ def main():
     print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
+    print("  has_non_sm100:", has_non_sm100)
     print("  add_gemma:", add_gemma)
 
     # Generate JIT specs
@@ -549,6 +557,7 @@ def main():
         has_sm90,
         has_sm100,
         add_gemma,
+        has_non_sm100,
     )
     print("Total ops:", len(jit_specs))
 
