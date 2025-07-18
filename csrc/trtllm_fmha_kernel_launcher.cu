@@ -78,7 +78,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mNumTokensPerPage = page_size;
   runner_params.mQkvLayout = QkvLayout::PagedKv;
   runner_params.mMultiProcessorCount = sm_count;
-  runner_params.mNumPagesInMemPool = num_pages;
+  runner_params.mNumPagesInMemPool = num_pages * 2;
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
