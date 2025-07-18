@@ -30,7 +30,6 @@ from flashinfer.gemm import (
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 
 
-
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
@@ -144,7 +143,7 @@ def test_fp8_groupwise_group_gemm(
 
     a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
     b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
-    
+
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
@@ -159,11 +158,16 @@ def test_fp8_groupwise_group_gemm(
         scale_major_mode=scale_major_mode,
         out_dtype=out_dtype,
     )
-    for i in range(group_size):
-        ref_c = einsum(a_dequant[m * i : m * (i + 1)], b_dequant[i], "m k, n k -> m n").to(out_dtype)
-        torch.testing.assert_close(
-            out[m * i : m * (i + 1)], ref_c, atol=1e-2, rtol=1e-2
+    ref_c = (
+        einsum(
+            a_dequant.view((group_size, m, k)),
+            b_dequant,
+            "b m k, b n k -> b m n",
         )
+        .view((group_size * m, n))
+        .to(out_dtype)
+    )
+    torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
