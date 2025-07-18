@@ -15,6 +15,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <flashinfer/exception.h>
+#include <flashinfer/trtllm/common.h>
+#include <flashinfer/trtllm/fmha/decoder_impl_common.h>
+#include <flashinfer/trtllm/fmha/fmhaRunnerParams.h>
 #include <nvrtc.h>
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include <flashinfer/utils.cuh>
 #include <iostream>
 #include <optional>
+#include <sstream>
 
 #include "pytorch_extension_utils.h"
 
@@ -134,7 +138,7 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
                                    int64_t block_size, int64_t max_seq_len, double bmm1_scale,
                                    double bmm2_scale, int64_t window_left, int64_t sum_seq_q,
                                    int64_t sum_seq_kv, int64_t sm_count) {
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.dtype(), c_type_q, {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.scalar_type(), c_type_q, [&]() {
     using DTypeQ = c_type_q;
     using DTypeKV = DTypeQ;
     using DTypeO = DTypeQ;
@@ -144,18 +148,19 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
     int head_dim = query.size(2);
     int page_size = block_size;
     int max_num_blocks_per_seq = block_tables.size(-1);
+    int num_pages = key_value_cache.size(0);
 
     auto device = query.device();
     const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
     trtllm_paged_attention_decode_launcher<DTypeQ, DTypeKV, DTypeO>(
-        out.data_ptr<DTypeO>(), query.data_ptr<DTypeQ>(), key_value_cache.data_ptr<DTypeKV>(),
-        workspace_buffer.data_ptr<void>(),
-        reinterpret_cast<KVCachePageIndex*>(block_tables.data_ptr()), seq_lens.data_ptr<int>(),
-        batch_size, max_seq_len, num_pages, num_qo_heads, num_kv_heads, head_dim, page_size,
-        max_num_blocks_per_seq, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
-        sm_count, stream);
-    // Remove return true; as the function is void
+        static_cast<DTypeO*>(out.data_ptr()), static_cast<DTypeQ*>(query.data_ptr()),
+        static_cast<DTypeKV*>(key_value_cache.data_ptr()), workspace_buffer.data_ptr(),
+        static_cast<KVCachePageIndex*>(block_tables.data_ptr()),
+        static_cast<int*>(seq_lens.data_ptr()), batch_size, max_seq_len, num_pages, num_qo_heads,
+        num_kv_heads, head_dim, page_size, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
+        window_left, sum_seq_q, sum_seq_kv, sm_count, stream);
+    return true;
   });
 }
 
@@ -240,7 +245,7 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
                                     int64_t sum_seq_q, int64_t sum_seq_kv,
                                     at::Tensor& cum_seq_lens_q, at::Tensor& cum_seq_lens_kv,
                                     int64_t sm_count) {
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.dtype(), c_type_q, {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.scalar_type(), c_type_q, [&]() {
     using DTypeQ = c_type_q;
     using DTypeKV = DTypeQ;
     using DTypeO = DTypeQ;
@@ -250,18 +255,21 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
     int head_dim = query.size(2);
     int page_size = block_size;
     int max_num_blocks_per_seq = block_tables.size(-1);
+    int num_pages = key_value_cache.size(0);
 
     auto device = query.device();
     const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
     trtllm_paged_attention_context_launcher<DTypeQ, DTypeKV, DTypeO>(
-        out.data_ptr<DTypeO>(), query.data_ptr<DTypeQ>(), key_value_cache.data_ptr<DTypeKV>(),
-        workspace_buffer.data_ptr<void>(),
-        reinterpret_cast<KVCachePageIndex*>(block_tables.data_ptr()), seq_lens.data_ptr<int>(),
-        batch_size_, max_seq_len, num_pages, num_qo_heads, num_kv_heads, head_dim, page_size,
-        max_num_blocks_per_seq, bmm1_scale, bmm2_scale, window_left, sum_seq_q, sum_seq_kv,
-        sm_count, stream, cum_seq_lens_q.defined() ? cum_seq_lens_q.data_ptr<int>() : nullptr,
+        static_cast<DTypeO*>(out.data_ptr()), static_cast<DTypeQ*>(query.data_ptr()),
+        static_cast<DTypeKV*>(key_value_cache.data_ptr()), workspace_buffer.data_ptr(),
+        static_cast<KVCachePageIndex*>(block_tables.data_ptr()),
+        static_cast<int*>(seq_lens.data_ptr()), batch_size_, max_seq_len, num_pages, num_qo_heads,
+        num_kv_heads, head_dim, page_size, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
+        window_left, sum_seq_q, sum_seq_kv, sm_count, stream,
+        cum_seq_lens_q.defined() ? cum_seq_lens_q.data_ptr<int>() : nullptr,
         cum_seq_lens_kv.defined() ? cum_seq_lens_kv.data_ptr<int>() : nullptr);
+    return true;
   });
 }
 
