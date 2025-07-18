@@ -1797,7 +1797,7 @@ class TrtllmGenDecodeModule:
         seq_lens: torch.Tensor,
         block_size: int,
         max_seq_len: int,
-        bmm1_scale: float,
+        bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
         sm_count: int,
         window_left: int = -1,
@@ -1969,7 +1969,7 @@ def trtllm_batch_decode_with_kv_cache(
     block_size: int,
     max_seq_len: int,
     bmm1_scale: float,
-    bmm2_scale: float,
+    bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -2054,13 +2054,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
-    bmm2_scale: Optional[float] = 1.0,  # todo(Yingyi): update to be tensor later
+    bmm2_scale: Optional[float] = 1.0,
     bmm1_scale_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters:
-    query: [batch_size, acc_q_len, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; acc_q_len = num_draft_tokens + 1 is the MTP query length.
+    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode
     qk_nope_head_dim: qk_nope_head_dim, must be 128
@@ -2069,21 +2069,25 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     block_size: page_size
-    max_seq_len: max sequence length
-    scale: model scale of qk, default is 1.0
+    max_seq_len: max sequence length for kv_cache
+    scale: model-specific scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
     bmm2_scale: fused scale for mla bmm2 input.
-    bmm1_scale_tensor: On-device fused scale tensor for mla bmm1 input.
-    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
+    bmm1_scale_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
+    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input. Must be fused with * M_LOG2E before passing in.
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
-    ** For bmm2_scale_tensor, please fuse * M_LOG2E to use faster exp2. **
+    or,
+    bmm1_scale_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)]
+    bmm2_scale_tensor = [v_scale * o_scale * M_LOG2E]
+
     The two scale factors should be static constant for cuda graph capture.
     Either (bmm1_scale, bmm2_scale) or (bmm1_scale_tensor, bmm2_scale_tensor) should be provided.
+
     For static constant scale factors, the scale factors should be provided as float.
         - (bmm1_scale, bmm2_scale)
     For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.

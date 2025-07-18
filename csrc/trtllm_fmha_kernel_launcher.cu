@@ -133,6 +133,8 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(out.scalar_type(), DTypeO, [&]() {
         // NOTE(Zihao): query is [B, Q, H, D]
         // where Q is the number of query tokens per request, used in MTP
+        // based on profiled results, always use decode mode for MTP (q_len is small)
+        // example: when kv_len = 10000, q < 200, decode mode is faster
         int batch_size = query.size(0);
         int q_len_per_request = query.size(1);
         int sum_seq_q = batch_size * q_len_per_request;
