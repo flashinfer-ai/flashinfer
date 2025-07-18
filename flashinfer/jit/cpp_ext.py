@@ -69,6 +69,10 @@ def generate_ninja_build_for_op(
         "-DTORCH_API_INCLUDE_EXTENSION_H",
         "-DPy_LIMITED_API=0x03090000",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1",
+        "-DFLASHINFER_ENABLE_F16",
+        "-DFLASHINFER_ENABLE_BF16",
+        "-DFLASHINFER_ENABLE_FP8_E4M3",
+        "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
@@ -79,10 +83,10 @@ def generate_ninja_build_for_op(
         common_cflags.append(f"-isystem {dir}")
 
     cflags = [
-        "--offload-arch=gfx940",
-        "$common_cflags",
+        "--offload-arch=gfx942",
         "-fPIC",
     ]
+    cflags += common_cflags
     if extra_cflags is not None:
         cflags += extra_cflags
 
@@ -91,15 +95,11 @@ def generate_ninja_build_for_op(
     if cc_env is not None:
         cuda_cflags += ["-ccbin", cc_env]
     cuda_cflags += [
-        "$common_cflags",
-        "--compiler-options=-fPIC",
-        "--expt-relaxed-constexpr",
+        "$cflags",
+        "-fPIC",
+        "-DFLASHINFER_ENABLE_HIP",
     ]
-    cuda_cflags += (
-        _get_rocm_arch_flags()
-        if check_hip_availability()
-        else _get_cuda_arch_flags(extra_cuda_cflags)
-    )
+
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
@@ -156,12 +156,12 @@ def generate_ninja_build_for_op(
             "ldflags = " + join_multiline(ldflags),
             "",
             "rule compile",
-            "  command = amdclang++ -xhip -MF $out.d $cflags -c $in -o $out $post_cflags",
+            "  command = $cxx -MF $out.d $cflags -c $in -o $out $post_cflags $common_cflags",
             "  depfile = $out.d",
             "  deps = gcc",
             "",
             "rule hip_compile",
-            "  command = amdclang++ -xhip --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+            "  command = $amdclang -xhip -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags $cflags",
             "  depfile = $out.d",
             "  deps = gcc",
             "",
@@ -202,12 +202,8 @@ def generate_ninja_build_for_op(
 
     objects = []
     for source in sources:
-        is_cuda = (
-            source.suffix == ".hip.h"
-            if check_hip_availability()
-            else source.suffix == ".cu"
-        )
-        object_suffix = (".cuda.o" or ".hip.o") if is_cuda else ".o"
+        is_cuda = source.suffix == ".cu"
+        object_suffix = ".o"
         cmd = ""
         if is_cuda and check_hip_availability():
             cmd = "hip_compile"

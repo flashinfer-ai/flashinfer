@@ -150,13 +150,12 @@ def gen_jit_spec(
     if check_hip_availability():
         cflags += [
             "--offload-arch=gfx942",
-            "-DFLASHINFER_ENABLE_HIP=ON",
+            "-DFLASHINFER_ENABLE_HIP",
             "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1",
         ]
     cuda_cflags = [
         "-O3",
         "-std=c++20",
-        "--threads=4",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",

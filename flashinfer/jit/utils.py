@@ -72,7 +72,7 @@ dtype_map = {
 }
 
 dtype_map_hip = {
-    torch.float16: "half",
+    torch.float16: "__half",
     torch.bfloat16: "__hip_bfloat16",
     torch.float8_e4m3fn: "__hip_fp8_e4m3_fnuz",
     torch.float8_e5m2: "__hip_fp8_e5m2_fnuz",
