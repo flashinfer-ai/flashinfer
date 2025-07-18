@@ -324,7 +324,7 @@ def test_trtllm_batch_decode_fmha(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        q.unsqueeze(1).contiguous(),
+        q.contiguous(),
         kv_cache,
         workspace_buffer,
         num_kv_heads,
@@ -339,53 +339,41 @@ def test_trtllm_batch_decode_fmha(
 
     # Reference implementation have functional issue or low precision with fp8, use half instead.
     ref_q = q.half() if q_dtype == "fp8" else q
-    if head_grp_size == 5:
-        scale = float(1.0 / (head_dim**0.5))
-        output_ref = reference_paged_attention(
-            ref_q,
-            kv_cache,
-            block_tables,
-            seq_lens_tensor,
-            page_size,
-            scale,
-            num_kv_heads,
-            head_dim,
-        )
-    else:
-        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
-        )
-        blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
-        # Compute kv_indptr as cumulative sum of blocks per sequence
-        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
-        kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
-        # Create kv_indices with only the allocated blocks
-        kv_indices = all_block_ids.int()
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, use_tensor_cores=True
+    )
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
-        # Calculate last page lengths
-        kv_last_page_len = seq_lens_tensor % page_size
-        kv_last_page_len[kv_last_page_len == 0] = page_size
+    # Compute kv_indptr as cumulative sum of blocks per sequence
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
+    # Create kv_indices with only the allocated blocks
+    kv_indices = all_block_ids.int()
 
-        if kv_cache_dtype == "auto":
-            kv_compute_dtype = dtype_map[q_dtype]
-        elif kv_cache_dtype == "fp8":
-            kv_compute_dtype = torch.float8_e4m3fn
+    # Calculate last page lengths
+    kv_last_page_len = seq_lens_tensor % page_size
+    kv_last_page_len[kv_last_page_len == 0] = page_size
 
-        wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode="NONE",
-            data_type=kv_compute_dtype,
-            q_data_type=ref_q.dtype,
-        )
+    if kv_cache_dtype == "auto":
+        kv_compute_dtype = dtype_map[q_dtype]
+    elif kv_cache_dtype == "fp8":
+        kv_compute_dtype = torch.float8_e4m3fn
 
-        output_ref = wrapper.run(ref_q, kv_cache)
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        data_type=kv_compute_dtype,
+        q_data_type=ref_q.dtype,
+    )
+
+    output_ref = wrapper.run(ref_q, kv_cache)
 
     rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (5e-2, 7e-2)
 
