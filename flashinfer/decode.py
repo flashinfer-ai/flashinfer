@@ -34,7 +34,6 @@ from .jit import (
     get_single_decode_uri,
     setup_cubin_loader,
     trtllm_fmha_gen_module,
-    trtllm_mla_gen_module,
 )
 from .page import get_seq_lens
 from .prefill import (
@@ -301,14 +300,6 @@ def get_batch_decode_module(*args):
 @functools.cache
 def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
-
-
-@functools.cache
-def get_trtllm_mla_gen_module():
-    mod = trtllm_mla_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -949,8 +940,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu()
-        self._sum_seq_q = qo_indptr_host[-1]
-        self._sum_seq_kv = torch.sum(kv_lens_arr_host).item()
         if self._backend == "trtllm-gen":
             assert self._kv_layout == "HND"
             assert logits_soft_cap == 0.0
@@ -1284,8 +1273,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._kv_lens_buffer,
                     page_size,
                     self._max_kv_len,
-                    self._sum_seq_q,
-                    self._sum_seq_kv,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1808,8 +1795,6 @@ class TrtllmGenDecodeModule:
         max_seq_len: int,
         bmm1_scale: float,
         bmm2_scale: float,
-        sum_seq_q: int,
-        sum_seq_kv: int,
         sm_count: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
@@ -1819,7 +1804,7 @@ class TrtllmGenDecodeModule:
         sm_count = get_device_sm_count(query.device)
         self._op.trtllm_paged_attention_decode(
             out,
-            query,
+            query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
             kv_cache,
             workspace_buffer,
             num_kv_heads,
@@ -1830,8 +1815,6 @@ class TrtllmGenDecodeModule:
             bmm1_scale,
             bmm2_scale,
             window_left,
-            sum_seq_q,
-            sum_seq_kv,
             sm_count,
         )
         return out
@@ -1899,8 +1882,6 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
-        sum_seq_q: Optional[int] = None,
-        sum_seq_kv: Optional[int] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -1910,8 +1891,6 @@ def get_trtllm_gen_decode_module(*args):
         assert kv_lens_buffer is not None
         assert page_size is not None
         assert max_kv_len is not None
-        assert sum_seq_q is not None
-        assert sum_seq_kv is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_kv_cache,
@@ -1923,8 +1902,6 @@ def get_trtllm_gen_decode_module(*args):
             max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
-            sum_seq_q,
-            sum_seq_kv,
             window_left,
             out=o,
         )
@@ -1965,8 +1942,6 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
-        sum_seq_q: Optional[int] = None,
-        sum_seq_kv: Optional[int] = None,
     ) -> None:
         pass
 
@@ -1991,8 +1966,6 @@ def trtllm_batch_decode_with_kv_cache(
     max_seq_len: int,
     bmm1_scale: float,
     bmm2_scale: float,
-    sum_seq_q: int,
-    sum_seq_kv: int,
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -2017,8 +1990,6 @@ def trtllm_batch_decode_with_kv_cache(
         bmm1_scale,
         bmm2_scale,
         window_left,
-        sum_seq_q,
-        sum_seq_kv,
         sm_count,
     )
     return out
@@ -2116,7 +2087,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
-    run_func = get_trtllm_mla_gen_module().trtllm_paged_attention_mla
+    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
     if block_size != 32 and block_size != 64:
@@ -2157,19 +2128,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         query,
         kv_cache,
         workspace_buffer,
+        1,  # num_kv_heads
         block_tables,
         seq_lens,
         block_size,
         max_seq_len,
-        qk_nope_head_dim,
-        kv_lora_rank,
-        qk_rope_head_dim,
         bmm1_scale,
         bmm2_scale,
-        bmm1_scale_tensor,
-        bmm2_scale_tensor,
-        None,  # max_attention_window_size, sliding window not supported for now
-        None,  # cyclic_attention_window_size, cyclic window not supported for now
+        -1,  # window_left
         sm_count,
     )
     return out

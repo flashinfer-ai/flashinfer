@@ -757,12 +757,11 @@ class TrtllmGenPrefillModule:
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         block_size: int,
-        max_seq_len: int,
+        max_q_len: int,
+        max_kv_len: int,
         bmm1_scale: float,
         bmm2_scale: float,
         batch_size: int,
-        sum_seq_q: int,
-        sum_seq_kv: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         window_left: int = -1,
@@ -780,13 +779,12 @@ class TrtllmGenPrefillModule:
             block_tables,
             seq_lens,
             block_size,
-            max_seq_len,
+            max_q_len,
+            max_kv_len,
             bmm1_scale,
             bmm2_scale,
             batch_size,
             window_left,
-            sum_seq_q,
-            sum_seq_kv,
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
@@ -1565,17 +1563,6 @@ def trtllm_fmha_gen_module():
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
-        ],
-        extra_ldflags=["-lcuda"],
-    )
-
-
-def trtllm_mla_gen_module():
-    return gen_jit_spec(
-        "mla_gen",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mla_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
     )

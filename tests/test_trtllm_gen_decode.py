@@ -239,14 +239,14 @@ def test_trtllm_batch_decode_fmha_wrapper(
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize("acc_q_len", [1, 2])
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
 @pytest.mark.parametrize("dynamic_scale", [False, True])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
     page_size: int,
-    acc_q_len: int,
+    q_len_per_request: int,
     dynamic_scale: bool,
 ):
     if dynamic_scale and dtype != torch.float8_e4m3fn:
@@ -268,7 +268,7 @@ def test_trtllm_batch_decode_mla(
     # Initialize tensors
     query = torch.randn(
         batch_size,
-        acc_q_len,
+        q_len_per_request,
         num_q_heads,
         kv_lora_rank + qk_rope_head_dim,
         device=device,
@@ -380,7 +380,8 @@ def test_trtllm_batch_decode_mla(
         kv_cache = kv_cache.to(torch.bfloat16)
 
     q_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * acc_q_len
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+        * q_len_per_request
     )
     kv_indptr = torch.zeros_like(q_indptr)
     kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
@@ -401,10 +402,10 @@ def test_trtllm_batch_decode_mla(
         kv_cache.dtype,
     )
     q_nope = query[..., :kv_lora_rank].view(
-        batch_size * acc_q_len, num_q_heads, kv_lora_rank
+        batch_size * q_len_per_request, num_q_heads, kv_lora_rank
     )
     q_pe = query[..., kv_lora_rank:].view(
-        batch_size * acc_q_len, num_q_heads, qk_rope_head_dim
+        batch_size * q_len_per_request, num_q_heads, qk_rope_head_dim
     )
 
     # todo: fix kv_cache
@@ -424,7 +425,7 @@ def test_trtllm_batch_decode_mla(
         try:
             torch.testing.assert_close(
                 output,
-                o_ref.view(batch_size, acc_q_len, num_q_heads, -1),
+                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
                 rtol=1e-1,
                 atol=1e-1,
             )  # todo: do reference with normal attention?
@@ -436,7 +437,7 @@ def test_trtllm_batch_decode_mla(
         try:
             torch.testing.assert_close(
                 output,
-                o_ref.view(batch_size, acc_q_len, num_q_heads, -1),
+                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
                 rtol=1e-2,
                 atol=1e-2,
             )
@@ -449,14 +450,14 @@ def test_trtllm_batch_decode_mla(
 if __name__ == "__main__":
     # run all tests in the order of pytest
     # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(1024, 1.0, torch.float8_e4m3fn, 32, 2, False)
-    test_trtllm_batch_decode_fmha_wrapper(
-        kv_layout="HND",
-        batch_size=4,
-        page_size=16,
-        num_kv_heads=2,
-        q_dtype="bf16",
-        head_grp_size=8,
-        kv_cache_dtype="auto",
-        window_left=127,
-    )
+    test_trtllm_batch_decode_mla(1024, 1.0, torch.bfloat16, 32, 1, False)
+    # test_trtllm_batch_decode_fmha_wrapper(
+    #     kv_layout="HND",
+    #     batch_size=4,
+    #     page_size=16,
+    #     num_kv_heads=2,
+    #     q_dtype="bf16",
+    #     head_grp_size=8,
+    #     kv_cache_dtype="auto",
+    #     window_left=127,
+    # )
