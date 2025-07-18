@@ -1983,7 +1983,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     run_func(
         out,
-        query,
+        query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
         kv_cache,
         workspace_buffer,
         num_kv_heads,
