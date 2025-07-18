@@ -42,7 +42,7 @@ def get_page_module():
             _page_module = load_cuda_ops(
                 "page",
                 [
-                    FLASHINFER_CSRC_DIR / "page.cu",
+                    FLASHINFER_CSRC_DIR / "page_hip.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
                 ],
             )

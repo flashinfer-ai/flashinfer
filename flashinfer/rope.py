@@ -36,7 +36,7 @@ def get_rope_module():
             _rope_module = load_cuda_ops(
                 "rope",
                 [
-                    FLASHINFER_CSRC_DIR / "rope.cu",
+                    FLASHINFER_CSRC_DIR / "rope_hip.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
                 ],
             )

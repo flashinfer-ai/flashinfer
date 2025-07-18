@@ -36,7 +36,7 @@ def get_norm_module():
             _norm_module = load_cuda_ops(
                 "norm",
                 [
-                    FLASHINFER_CSRC_DIR / "norm.cu",
+                    FLASHINFER_CSRC_DIR / "norm_hip.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
                 ],
             )
