@@ -89,6 +89,10 @@ def _build_decode_graph(
 ):
     handle = _create_cudnn_handle(torch.cuda.current_stream())
 
+    # WAR: override batch offsets for now, as it leads to a poor performance
+    batch_offsets_q = None
+    batch_offsets_o = None
+
     with cudnn.graph(handle) as (g, _):
 
         if q.dim() == 3:
@@ -224,6 +228,8 @@ def _batch_decode_with_kv_cache(
         batch_offsets_o=batch_offsets_q if batch_offsets_q is not None else None,
     )
 
+    handle_ = _create_cudnn_handle(torch.cuda.current_stream())
+
     var_map = {
         UIDs.Q_UID.value: q,
         UIDs.K_UID.value: k_cache,
@@ -244,7 +250,7 @@ def _batch_decode_with_kv_cache(
         var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
         var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
 
-    graph.execute(var_map, workspace=workspace_buffer)
+    graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
 
     return out
 
