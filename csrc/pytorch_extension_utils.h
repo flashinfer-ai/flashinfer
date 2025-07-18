@@ -152,10 +152,10 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     return __VA_ARGS__();                    \
   }
 #else
-#define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
-  case at::ScalarType::Byte: { \
+#define _DISPATCH_CASE_FP4_E2M1(c_type, ...)                               \
+  case at::ScalarType::Byte: {                                             \
     static_assert(false, "FP4 E2M1 support requires CUDA 12.8 or newer."); \
-    break; \
+    break;                                                                 \
   }
 #endif
 #else
@@ -171,10 +171,10 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     return __VA_ARGS__();                       \
   }
 #else
-#define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...) \
-  case at::ScalarType::Byte: { \
+#define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)                            \
+  case at::ScalarType::Byte: {                                             \
     static_assert(false, "FP8 E8M0 support requires CUDA 12.8 or newer."); \
-    break; \
+    break;                                                                 \
   }
 #endif
 #else
