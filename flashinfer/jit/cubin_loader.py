@@ -110,7 +110,7 @@ def download_file(source, local_path, retries=3, delay=5, timeout=10, lock_timeo
             logger.info(f"Lock file {lock_path} removed.")
 
 
-def load_cubin(cubin_path, sha256):
+def load_cubin(cubin_path, sha256) -> bytes:
     """
     Load a cubin from the provide local path and
     ensure that the sha256 signature matches.
@@ -134,7 +134,7 @@ def load_cubin(cubin_path, sha256):
     except:
         pass
     logger.info(f"Failed loading {cubin_path}")
-    return ""
+    return b""
 
 
 def get_cubin(name, sha256):

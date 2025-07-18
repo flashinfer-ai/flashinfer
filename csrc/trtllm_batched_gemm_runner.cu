@@ -351,20 +351,6 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     }
   }
 
-  for (auto const& configIndex : validConfigIndices) {
-    auto const& config = configs[configIndex].mOptions;
-    std::cout << "Valid config: "
-              << "configIndex=" << configIndex << ", "
-              << "mFunctionName="
-              << (configs[configIndex].mFunctionName ? configs[configIndex].mFunctionName : "")
-              << ",\n"
-              << "mTileM=" << config.mTileM << ", "
-              << "mTileN=" << config.mTileN << ", "
-              << "mTileK=" << config.mTileK << ", "
-              << "mUseShuffledMatrixA=" << (config.mUseShuffledMatrixA ? "true" : "false")
-              << std::endl;
-  }
-
   TORCH_CHECK(!validConfigIndices.empty(), "No valid config found for the given problem shape");
 
   return validConfigIndices;
