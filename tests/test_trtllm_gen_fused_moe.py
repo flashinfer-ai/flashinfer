@@ -651,7 +651,7 @@ def test_moe_fp8(
 
     if use_shuffled_weight:
         # FIXME: this depends on the kernel internals
-        epilogue_tile_m = 128
+        epilogue_tile_m = 64
 
         gemm1_weights_fp8_shuffled = []
         gemm2_weights_fp8_shuffled = []
