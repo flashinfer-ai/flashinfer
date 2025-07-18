@@ -653,24 +653,21 @@ def test_moe_fp8(
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
-        # gemm1_weights_fp8_interleaved = []
-        # for i in range(num_experts):
-        #     gemm1_weights_fp8_interleaved.append(
-        #         reorder_rows_for_gated_act_gemm(gemm1_weights[i].clone())
-        #     )
+        gemm1_weights_fp8_interleaved = []
+        for i in range(num_experts):
+            gemm1_weights_fp8_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_weights[i].clone())
+            )
 
-        # gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved)
+        gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved)
 
         gemm1_weights_fp8_shuffled = []
         gemm2_weights_fp8_shuffled = []
         for i in range(num_experts):
-            # gemm1_weights_fp8_shuffled.append(
-            #     shuffle_matrix_a(
-            #         gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
-            #     )
-            # )
             gemm1_weights_fp8_shuffled.append(
-                shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), epilogue_tile_m)
+                shuffle_matrix_a(
+                    gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+                )
             )
 
             gemm2_weights_fp8_shuffled.append(
