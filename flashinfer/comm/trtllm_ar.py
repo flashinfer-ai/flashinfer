@@ -257,7 +257,7 @@ def get_trtllm_comm_module():
         scale_out: Optional[torch.Tensor],
         rms_gamma: Optional[torch.Tensor],
         rms_eps: Optional[float],
-        scale_factor: Optional[float],
+        scale_factor: Optional[torch.Tensor],
         layout_code: Optional[FP4QuantizationSFLayout],
     ) -> None:
         module.trtllm_allreduce_fusion(
@@ -783,7 +783,7 @@ def trtllm_allreduce_fusion(
     scale_out: Optional[torch.Tensor],
     rms_gamma: Optional[torch.Tensor],
     rms_eps: Optional[float],
-    scale_factor: Optional[float],
+    scale_factor: Optional[torch.Tensor],
     layout_code: Optional[FP4QuantizationSFLayout],
 ) -> None:
     """
