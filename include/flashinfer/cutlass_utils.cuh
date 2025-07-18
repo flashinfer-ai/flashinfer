@@ -103,6 +103,45 @@ void compileTimeDebug(T&&) {
     }                                                                                 \
   } while (0)
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Tllm to Cutlass
+
+template <typename T>
+struct TllmToCutlassTypeAdapter {
+  using type = T;
+};
+
+template <>
+struct TllmToCutlassTypeAdapter<half> {
+  using type = cutlass::half_t;
+};
+
+#if defined(ENABLE_BF16)
+template <>
+struct TllmToCutlassTypeAdapter<__nv_bfloat16> {
+  using type = cutlass::bfloat16_t;
+};
+#endif
+
+#if defined(ENABLE_FP8)
+template <>
+struct TllmToCutlassTypeAdapter<__nv_fp8_e4m3> {
+  using type = cutlass::float_e4m3_t;
+};
+
+template <>
+struct TllmToCutlassTypeAdapter<__nv_fp8_e5m2> {
+  using type = cutlass::float_e5m2_t;
+};
+#endif
+
+#if defined(ENABLE_FP4)
+template <>
+struct TllmToCutlassTypeAdapter<__nv_fp4_e2m1> {
+  using type = cutlass::float_e2m1_t;
+};
+#endif
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_CUTLASS_UTILS_CUH_
