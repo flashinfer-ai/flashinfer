@@ -101,8 +101,10 @@ void trtllm_paged_attention_launcher(
     // Decode
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
     runner_params.mKernelType = FmhaKernelType::Generation;
-    runner_params.mTileScheduler = TileScheduler::Static;
-    runner_params.mMultiCtasKvMode = true;
+    bool use_multi_block = true;
+    runner_params.mTileScheduler =
+        use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
+    runner_params.mMultiCtasKvMode = use_multi_block;
 
     runner_params.mMaxSeqLenQ = 1;
     runner_params.mSumOfSeqLensQ = batch_size;
