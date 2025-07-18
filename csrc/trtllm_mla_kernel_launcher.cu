@@ -51,7 +51,6 @@ void trtllm_paged_attention_mla_launcher(
   static auto fmha_runner = TllmGenFmhaRunner(CACHE_T, CACHE_T, DATA_TYPE_BF16);
 
   TllmGenFmhaRunnerParams runner_params;
-  memset(&runner_params, 0, sizeof(runner_params));
 
   // Parameters to select kernels.
   runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;

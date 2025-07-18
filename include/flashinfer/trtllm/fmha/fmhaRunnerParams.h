@@ -18,6 +18,10 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The attention mask types.
@@ -282,6 +286,11 @@ struct TllmGenFmhaRunnerParams {
                static_cast<int>(maskType));
     }
     return *this;
+  }
+
+  TllmGenFmhaRunnerParams() {
+    // NOTE(Zihao): all fields are POD types, so we can use memset to initialize them to zero
+    memset(this, 0, sizeof(TllmGenFmhaRunnerParams));
   }
 };
 

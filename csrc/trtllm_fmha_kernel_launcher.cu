@@ -69,7 +69,6 @@ void trtllm_paged_attention_decode_launcher(
   static auto fmha_runner = TllmGenFmhaRunner(q_data_type, CACHE_T, io_type);
 
   TllmGenFmhaRunnerParams runner_params;
-  memset(&runner_params, 0, sizeof(runner_params));
 
   runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
   runner_params.mKernelType = FmhaKernelType::Generation;
@@ -227,7 +226,6 @@ void trtllm_paged_attention_context_launcher(
   static auto fmha_runner = TllmGenFmhaRunner(q_data_type, CACHE_T, io_type);
 
   TllmGenFmhaRunnerParams runner_params;
-  memset(&runner_params, 0, sizeof(runner_params));
 
   runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
   runner_params.mKernelType = FmhaKernelType::Context;
