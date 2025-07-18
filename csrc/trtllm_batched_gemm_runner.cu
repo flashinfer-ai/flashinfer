@@ -97,7 +97,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize) {
+        tileSize == mOptions.tileSize &&
+        options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA) {
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }

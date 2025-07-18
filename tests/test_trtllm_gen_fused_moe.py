@@ -7,23 +7,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
-
-
-# The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
-class RoutingMethodType(IntEnum):
-    # Default: Softmax -> TopK
-    Default = (0,)
-    # Renormalize: TopK -> Softmax
-    Renormalize = (1,)
-    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
-    DeepSeekV3 = (2,)
-    # Llama4: Top1 -> Sigmoid
-    Llama4 = (3,)
-    # Qwen3: Softmax -> TopK -> Renormalize
-    RenormalizeNaive = (4,)
-    # Unspecified
-    Unspecified = 5.0
+from flashinfer import RoutingMethodType, shuffle_matrix_sf_a
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -583,13 +567,12 @@ def quant_dequant_per_tensor_fp8(a):
 )
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
-
+@pytest.mark.parametrize("use_shuffled_weight", [False, True])
+def test_moe_fp8(
+    num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
+):
     torch.random.manual_seed(0)
 
-    #
-    # Data Generation
-    #
     num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
     routed_scaling = 2.5
@@ -660,14 +643,42 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         False,
     )
 
+    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+
+    # Prepare weights and scales for the kernel call
+    kernel_gemm1_weights = gemm1_weights
+    kernel_gemm2_weights = gemm2_weights
+
+    if use_shuffled_weight:
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64
+
+        gemm1_weights_fp8_shuffled = []
+        gemm2_weights_fp8_shuffled = []
+        for i in range(num_experts):
+            gemm1_weights_fp8_shuffled.append(
+                shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), epilogue_tile_m)
+            )
+
+            gemm2_weights_fp8_shuffled.append(
+                shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+            )
+
+        kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
+            torch.float8_e4m3fn
+        )
+        kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
+            torch.float8_e4m3fn
+        )
+
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
         routing_bias,
         hidden_states,
         hidden_states_scale,
-        gemm1_weights,
+        kernel_gemm1_weights,
         gemm1_scales,
-        gemm2_weights,
+        kernel_gemm2_weights,
         gemm2_scales,
         num_experts,
         top_k,
@@ -679,17 +690,11 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
     )
 
     output_dequant_actual = output.to(torch.float)
-    #
-    # Run the reference implementations
-    #
-    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
 
-    #
-    # Check the results
-    #
     def check_accuracy(a, b, atol, rtol, percent):
         if torch.any(torch.isnan(a)):
             raise Exception("NaN in a")

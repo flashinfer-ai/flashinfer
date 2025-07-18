@@ -823,6 +823,7 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: float,
         tile_tokens_dim: int,
         routing_method_type: int,
+        use_shuffled_weight: bool = False,
     ) -> torch.Tensor:
 
         # Call the C++ function for block scale MoE
@@ -845,6 +846,7 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             tile_tokens_dim,
             routing_method_type,
+            use_shuffled_weight,
         )
 
         return output
@@ -869,6 +871,7 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: float,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        use_shuffled_weight: bool = False,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1058,6 +1061,7 @@ def trtllm_fp8_block_scale_moe(
     routed_scaling_factor: float,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
+    use_shuffled_weight: bool = True,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1103,6 +1107,7 @@ def trtllm_fp8_block_scale_moe(
         routed_scaling_factor,
         tile_tokens_dim,
         routing_method_type,
+        use_shuffled_weight,
     )
 
 
