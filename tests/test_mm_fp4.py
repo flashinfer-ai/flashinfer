@@ -19,9 +19,9 @@ def quant_fp4(a):
     return a_fp4, a_sf, a_global_sf
 
 
-@pytest.mark.parametrize("m", [48, 128])
-@pytest.mark.parametrize("n", [128, 256])
-@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("m", [48, 128, 256, 512])
+@pytest.mark.parametrize("n", [128, 256, 512])
+@pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 def test_mm_fp4(m, n, k, res_dtype):
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
