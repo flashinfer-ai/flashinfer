@@ -2123,7 +2123,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     run_func(
         out,
         query,
-        kv_cache,
+        kv_cache.unsqueeze(-3),
         workspace_buffer,
         block_tables,
         seq_lens,
