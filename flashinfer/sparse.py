@@ -165,7 +165,11 @@ class BlockSparseAttentionWrapper:
         self._backend = backend
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
+        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -186,6 +190,12 @@ class BlockSparseAttentionWrapper:
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+
+        # Enable user-defined size
+        if vector_sparse_indices_buffer is not None:
+            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
+        if vector_sparse_indptr_buffer is not None:
+            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
     def plan(
         self,
@@ -759,7 +769,11 @@ class VariableBlockSparseAttentionWrapper:
         self._backend = backend
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
+        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -780,6 +794,12 @@ class VariableBlockSparseAttentionWrapper:
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+
+        # Enable user-defined size
+        if vector_sparse_indices_buffer is not None:
+            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
+        if vector_sparse_indptr_buffer is not None:
+            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
     def plan(
         self,
