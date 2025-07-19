@@ -220,6 +220,8 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  int kvStrides[3];
+
   // Head dimension for Q and K.
   int mHeadDimQk;
   // Head dimension for V.
