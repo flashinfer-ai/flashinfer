@@ -124,9 +124,8 @@ void trtllm_paged_attention_launcher(
 }
 
 void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                                   at::Tensor& workspace_buffer, int64_t num_kv_heads,
-                                   at::Tensor& block_tables, at::Tensor& seq_lens,
-                                   int64_t block_size, int64_t max_kv_len, double bmm1_scale,
+                                   at::Tensor& workspace_buffer, at::Tensor& block_tables,
+                                   at::Tensor& seq_lens, int64_t max_kv_len, double bmm1_scale,
                                    double bmm2_scale, int64_t window_left, int64_t sm_count) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.scalar_type(), DTypeQ, [&]() {
     return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(key_value_cache.scalar_type(), DTypeKV, [&]() {
@@ -140,8 +139,10 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
         int sum_seq_q = batch_size * q_len_per_request;
         int num_qo_heads = query.size(2);
         int head_dim_qk = query.size(3);
-        int head_dim_vo = out.size(out.dim() - 1);
-        int page_size = block_size;
+        int head_dim_vo = out.size(-1);
+        // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+        int page_size = key_value_cache.size(-2);
+        int num_kv_heads = key_value_cache.size(-3);
         int max_num_blocks_per_seq = block_tables.size(-1);
         int num_pages = key_value_cache.size(0);
 
@@ -163,9 +164,8 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
 }
 
 void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                                    at::Tensor& workspace_buffer, int64_t num_kv_heads,
-                                    at::Tensor& block_tables, at::Tensor& seq_lens,
-                                    int64_t block_size, int64_t max_q_len, int64_t max_kv_len,
+                                    at::Tensor& workspace_buffer, at::Tensor& block_tables,
+                                    at::Tensor& seq_lens, int64_t max_q_len, int64_t max_kv_len,
                                     double bmm1_scale, double bmm2_scale, int64_t batch_size,
                                     int64_t window_left, at::Tensor& cum_seq_lens_q,
                                     at::Tensor& cum_seq_lens_kv, int64_t sm_count) {
@@ -175,10 +175,12 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
         int num_qo_heads = query.size(1);
         int sum_seq_q = query.size(0);
         int head_dim_qk = query.size(2);
-        int head_dim_vo = out.size(out.dim() - 1);
-        int page_size = block_size;
+        int head_dim_vo = out.size(-1);
         int max_num_blocks_per_seq = block_tables.size(-1);
         int num_pages = key_value_cache.size(0);
+        // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+        int page_size = key_value_cache.size(-2);
+        int num_kv_heads = key_value_cache.size(-3);
 
         auto device = query.device();
         const auto stream = at::cuda::getCurrentCUDAStream(device.index());

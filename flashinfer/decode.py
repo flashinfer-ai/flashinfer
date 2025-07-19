@@ -1792,10 +1792,8 @@ class TrtllmGenDecodeModule:
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
-        num_kv_heads: int,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
-        block_size: int,
         max_seq_len: int,
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
@@ -1811,10 +1809,8 @@ class TrtllmGenDecodeModule:
             query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
             kv_cache,
             workspace_buffer,
-            num_kv_heads,
             block_tables,
             seq_lens,
-            block_size,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
@@ -1899,10 +1895,8 @@ def get_trtllm_gen_decode_module(*args):
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_kv_cache,
             int_workspace_buffer,
-            num_kv_heads,
             block_tables,
             kv_lens_buffer,
-            page_size,
             max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
@@ -1963,10 +1957,8 @@ def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    num_kv_heads: int,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    block_size: int,
     max_seq_len: int,
     bmm1_scale: float,
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
@@ -1986,10 +1978,8 @@ def trtllm_batch_decode_with_kv_cache(
         query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
         kv_cache,
         workspace_buffer,
-        num_kv_heads,
         block_tables,
         seq_lens,
-        block_size,
         max_seq_len,
         bmm1_scale,
         bmm2_scale,
@@ -2050,7 +2040,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_rope_head_dim: int,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    block_size: int,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
@@ -2068,7 +2057,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_rope_head_dim: qk_rope_head_dim, must be 64
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
-    block_size: page_size
     max_seq_len: max sequence length for kv_cache
     scale: model-specific scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
@@ -2098,6 +2086,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
+    block_size = kv_cache.size(-2)
     if block_size != 32 and block_size != 64:
         raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
@@ -2136,10 +2125,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         query,
         kv_cache,
         workspace_buffer,
-        1,  # num_kv_heads
         block_tables,
         seq_lens,
-        block_size,
         max_seq_len,
         bmm1_scale,
         bmm2_scale,

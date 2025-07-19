@@ -320,10 +320,8 @@ def test_trtllm_batch_decode_fmha(
         q.contiguous(),
         kv_cache,
         workspace_buffer,
-        num_kv_heads,
         block_tables,
         seq_lens_tensor,
-        page_size,
         max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
@@ -490,7 +488,6 @@ def test_trtllm_batch_decode_mla(
         qk_rope_head_dim=qk_rope_head_dim,
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
-        block_size=page_size,
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
