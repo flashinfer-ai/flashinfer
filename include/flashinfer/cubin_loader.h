@@ -65,16 +65,16 @@ extern "C" void FlashInferSetMetaInfoCallback(void (*callback)(const char* path,
   callbackGetMetaInfo = callback;
 }
 
-// Thread-local variable that stores the current cubin.
-// It is reset on every call to `getCubin()`.
+// Thread-local variable that stores the current metainfo.
+// It is reset on every call to `getMetaInfo()`.
 thread_local std::string raw_metainfo;
 
-// Called by the callback to set the current cubin.
+// Called by the callback to set the current metainfo.
 extern "C" void FlashInferSetCurrentMetaInfo(const char* binary, int size) {
   raw_metainfo = std::string(binary, size);
 }
 
-// Get the cubin from the python callback.
+// Get the metainfo from the python callback.
 // This is the API for the native library to use.
 std::string getMetaInfo(const std::string& name, const std::string& sha256,
                         const std::string& extension) {
