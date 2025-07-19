@@ -154,7 +154,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
           params[i].merge_o_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_o_indices_offset);
-          params[i].num_packed_qo_len =
+          params[i].num_to_merge_qo_len =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.num_qo_len_offset);
 
           params[i].num_kv_heads = num_kv_heads;

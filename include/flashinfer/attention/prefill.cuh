@@ -2091,10 +2091,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      for (int i = 0; i <= params.padded_batch_size; i++) {
+        printf("Debug: request %d kv_len: %d, qo_len: %d\n", i, params.get_kv_len(i),
+               params.get_qo_len(i));
+      }
+    }
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
+
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
     const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
@@ -2210,6 +2217,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                          chunk_start))
                : chunk_size),
           CTA_TILE_KV);
+
     } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
       num_iterations_prefix = ceil_div(
           min(min(chunk_size,
@@ -2560,7 +2568,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
     return cudaSuccess;
   }
-
+  // bs = num_qo_tiles * num_kv_tiles * gqa_group_size
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
