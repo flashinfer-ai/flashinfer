@@ -194,7 +194,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
               num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
         } else {
-          collective_mainloop.load<LEFT_SLIDING_WINDOW>(
+          collective_mainloop.template load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
         }
