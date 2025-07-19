@@ -478,6 +478,22 @@ class PODWithPagedKVCacheWrapper:
 
         qo_indptr_host_p = qo_indptr_p.to("cpu", non_blocking=True)
         qo_indptr_host_d = _get_range_buf(batch_size_d + 1, "cpu")
+        to_device = lambda x: x.to(self.device, non_blocking=non_blocking)
+        qo_indptr_p = to_device(qo_indptr_p)
+        qo_indptr = torch.cat(
+            [qo_indptr_p, to_device(qo_indptr_host_d)[1:] + qo_indptr_p[-1]]
+        )
+        kv_indptr_p = to_device(kv_indptr_p)
+        kv_indptr = torch.cat(
+            [kv_indptr_p, to_device(kv_indptr_d)[1:] + kv_indptr_p[-1]]
+        )
+        kv_indices_p = to_device(kv_indices_p)
+        kv_indices = torch.cat(
+            [kv_indices_p, to_device(kv_indices_d)[1:] + kv_indices_p[-1]]
+        )
+        last_page_len = torch.cat(
+            [to_device(last_page_len_p), to_device(last_page_len_d)]
+        )
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
@@ -490,48 +506,20 @@ class PODWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf[: batch_size_p + 1].copy_(
-                kv_indptr_p, non_blocking=non_blocking
+            self._paged_kv_indptr_buf[: batch_size + 1].copy_(
+                kv_indptr, non_blocking=non_blocking
             )
-            self._paged_kv_indptr_buf[
-                batch_size_p + 1 : batch_size_p + batch_size_d + 2
-            ].copy_(
-                kv_indptr_d,
-                non_blocking=(kv_indptr_d.device == self.device) and non_blocking,
+            self._paged_kv_last_page_len_buf[: batch_size + 1].copy_(
+                last_page_len, non_blocking=non_blocking
             )
-            self._paged_kv_last_page_len_buf[:batch_size_p].copy_(
-                last_page_len_p, non_blocking=non_blocking
-            )
-            self._paged_kv_last_page_len_buf[
-                batch_size_p : batch_size_p + batch_size_d
-            ].copy_(
-                last_page_len_d,
-                non_blocking=(last_page_len_d.device == self.device) and non_blocking,
-            )
-            self._paged_kv_indices_buf[: len(kv_indices_p)].copy_(
-                kv_indices_p,
-                non_blocking=(kv_indices_p.device == self.device) and non_blocking,
-            )
-            self._paged_kv_indices_buf[
-                len(kv_indices_p) : len(kv_indices_p) + len(kv_indices_d)
-            ].copy_(
-                kv_indices_d,
-                non_blocking=(kv_indices_d.device == self.device) and non_blocking,
+            self._paged_kv_indices_buf[: len(kv_indices)].copy_(
+                kv_indices, non_blocking=non_blocking
             )
         else:
-            to_device = lambda x: x.to(self.device, non_blocking=non_blocking)
-            self._qo_indptr_buf = torch.cat(
-                [to_device(qo_indptr_p), to_device(qo_indptr_host_d)]
-            )
-            self._paged_kv_indptr_buf = torch.cat(
-                [to_device(kv_indptr_p), to_device(kv_indptr_d)]
-            )
-            self._paged_kv_indices_buf = torch.cat(
-                [to_device(kv_indices_p), to_device(kv_indices_d)]
-            )
-            self._paged_kv_last_page_len_buf = torch.cat(
-                [to_device(last_page_len_p), to_device(last_page_len_d)]
-            )
+            self._qo_indptr_buf = qo_indptr
+            self._paged_kv_indptr_buf = kv_indptr
+            self._paged_kv_indices_buf = kv_indices
+            self._paged_kv_last_page_len_buf = last_page_len
 
         kv_indptr_host_p = kv_indptr_p.to("cpu")
         kv_indptr_host_d = kv_indptr_d.to("cpu")
@@ -734,6 +722,7 @@ class PODWithPagedKVCacheWrapper:
             window_left_d != -1,  # use_sliding_window
             logits_soft_cap_d > 0,  # use_logits_soft_cap
         )
+
         module_getter.run_tensor(
             # Shared params
             self._float_workspace_buffer,
