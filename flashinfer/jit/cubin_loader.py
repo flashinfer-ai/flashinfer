@@ -188,3 +188,32 @@ def setup_cubin_loader(dll_path: str):
     dll_cubin_handlers[dll_path] = cb
 
     _LIB.FlashInferSetCubinCallback(cb)
+
+
+dll_metainfo_handlers = {}
+
+
+def setup_metainfo_loader(dll_path: str):
+    if dll_path in dll_metainfo_handlers:
+        return
+
+    _LIB = ctypes.CDLL(dll_path)
+
+    # Define the correct callback type
+    CALLBACK_TYPE = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p
+    )
+
+    def get_metainfo_callback(name, sha256, extension):
+        metainfo = get_cubin(
+            name.decode("utf-8"), sha256.decode("utf-8"), extension.decode("utf-8")
+        )
+        _LIB.FlashInferSetCurrentMetaInfo(
+            convert_to_ctypes_char_p(metainfo), ctypes.c_int(len(metainfo))
+        )
+
+    # Create the callback and keep a reference to prevent GC
+    cb = CALLBACK_TYPE(get_metainfo_callback)
+    dll_metainfo_handlers[dll_path] = cb
+
+    _LIB.FlashInferSetMetaInfoCallback(cb)
