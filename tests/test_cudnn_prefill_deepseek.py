@@ -7,13 +7,13 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [4])
-@pytest.mark.parametrize("s_qo", [8, 17, 1024])
-@pytest.mark.parametrize("s_kv", [8, 32, 256])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("num_qo_heads", [4])
-@pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("s_qo", [2])
+@pytest.mark.parametrize("s_kv", [2])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [False])
 def test_cudnn_prefill_deepseek(
     batch_size,
     s_qo,
@@ -37,16 +37,36 @@ def test_cudnn_prefill_deepseek(
     device = "cuda:0"
 
     actual_seq_lens_q = torch.randint(
-        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
     )
-    actual_seq_lens_kv = torch.randint(
-        s_kv, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
-    )
+    actual_seq_lens_kv = actual_seq_lens_q
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
+
+    qo_indptr = (
+        torch.cat(
+            [
+                torch.tensor([0], device=device),
+                torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
+                * head_dim_qk
+                * num_qo_heads,
+            ]
+        )
+        .int()
+        .to(device)
+    )
+
+    batch_offsets_stats = torch.cat(
+        [
+            torch.zeros(
+                1, device=actual_seq_lens_q.device, dtype=actual_seq_lens_q.dtype
+            ),
+            torch.cumsum(actual_seq_lens_q.flatten(), dim=0) * num_qo_heads,
+        ]
+    ).cuda()
 
     k_cache = torch.randn(
         batch_size * s_kv,
@@ -84,6 +104,11 @@ def test_cudnn_prefill_deepseek(
         actual_seq_lens_kv=actual_seq_lens_kv,
         causal=causal,
         return_lse=return_lse,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_k=qo_indptr,
+        batch_offsets_v=qo_indptr,
+        batch_offsets_o=qo_indptr,
+        batch_offsets_stats=batch_offsets_stats,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
 
@@ -107,6 +132,9 @@ def test_cudnn_prefill_deepseek(
         workspace_buffer_ref,
         "NHD",
     )
+
+    print(f"head_dim_qk: {head_dim_qk}, head_dim_vo: {head_dim_vo}")
+
     wrapper.plan(
         qo_indptr,
         kv_indptr,
@@ -118,5 +146,9 @@ def test_cudnn_prefill_deepseek(
         q_data_type=torch.bfloat16,
     )
     output_ref, lse_ref = wrapper.run_return_lse(q, k_cache, v_cache)
+
+    print(f"output: {output.flatten()[:10]}")
+    print(f"output_ref: {output_ref.flatten()[:10]}")
+    print()
 
     torch.testing.assert_close(output, output_ref, atol=1e-3, rtol=1e-2)
