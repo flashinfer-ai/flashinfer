@@ -278,9 +278,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
             "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
             "-DCOMPILE_HOPPER_TMA_GEMMS",
         ],
-        extra_cflags=[
-            "-DFAST_BUILD",
-        ],
+        extra_cflags=[],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
