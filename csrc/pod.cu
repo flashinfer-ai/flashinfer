@@ -36,9 +36,8 @@ using namespace flashinfer;
 
 at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                               at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
-                              at::Tensor kv_indptr_p, at::Tensor kv_len_arr_p,
-                              int64_t total_num_rows_p, int64_t batch_size_p,
-                              at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
+                              at::Tensor kv_indptr_p, int64_t total_num_rows_p,
+                              int64_t batch_size_p, at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
                               int64_t total_num_rows_d, int64_t batch_size_d,
                               int64_t num_qo_heads_p, int64_t num_kv_heads, int64_t head_dim_qk,
                               int64_t head_dim_vo, int64_t page_size, bool enable_cuda_graph) {
@@ -150,6 +149,10 @@ void PODWithKVCacheTensorRun(
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+
+        IdType* q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+
+        // debug indices
         PrefillParams prefill_params;
         {
           // Make params a reference to prefill_params to set values
@@ -157,6 +160,7 @@ void PODWithKVCacheTensorRun(
           params.q = static_cast<DTypeQ*>(q_p.data_ptr());
           params.paged_kv = paged_kv;
           params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+
           params.o = static_cast<DTypeO*>(o.data_ptr());
           params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
           params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);

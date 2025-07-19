@@ -533,10 +533,8 @@ class PODWithPagedKVCacheWrapper:
                 [to_device(last_page_len_p), to_device(last_page_len_d)]
             )
 
-        kv_indptr_host_p = kv_indptr_p.to("cpu", non_blocking=True)
-        kv_indptr_host_d = kv_indptr_d.to("cpu", non_blocking=True)
-        last_page_len_host_p = last_page_len_p.to("cpu", non_blocking=True)
-        last_page_len_host_d = last_page_len_d.to("cpu", non_blocking=True)
+        kv_indptr_host_p = kv_indptr_p.to("cpu")
+        kv_indptr_host_d = kv_indptr_d.to("cpu")
 
         if data_type is not None:
             if q_data_type is None:
@@ -551,13 +549,6 @@ class PODWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
-        torch.cuda.synchronize()
-        kv_lens_arr_host_p = get_seq_lens(
-            kv_indptr_host_p, last_page_len_host_p, page_size
-        )
-        kv_lens_arr_host_d = get_seq_lens(
-            kv_indptr_host_d, last_page_len_host_d, page_size
-        )
         self._indptr_type = kv_indptr_d.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
@@ -565,6 +556,14 @@ class PODWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        assert (
+            qo_indptr_p.dtype == self._indptr_type
+            and kv_indptr_p.dtype == self._indptr_type
+            and qo_indptr_host_d.dtype == self._indptr_type
+            and kv_indptr_d.dtype == self._indptr_type
+            and f"Indices dtype mismatch: {qo_indptr_p.dtype}, {kv_indptr_p.dtype}, {qo_indptr_host_d.dtype}, {kv_indptr_d.dtype}"
+        )
+
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -590,7 +589,6 @@ class PODWithPagedKVCacheWrapper:
             self._pin_memory_int_workspace_buffer,
             qo_indptr_host_p,
             kv_indptr_host_p,
-            kv_lens_arr_host_p,
             qo_indptr_host_p[-1],  # total_num_rows_p
             batch_size_p,
             qo_indptr_host_d,

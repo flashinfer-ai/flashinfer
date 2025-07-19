@@ -73,6 +73,9 @@ __global__ __launch_bounds__(std::max(
     const int prefill_slots = (prefill_blocks + blk_factor_p - 1) / blk_factor_p;
     const int decode_slots = (decode_blocks + blk_factor_d - 1) / blk_factor_d;
 
+    if (blockIdx.x == 0 and threadIdx.x == 0) {
+      printf("Debug: prefill_slots: %d, decode_slots: %d\n", prefill_slots, decode_slots);
+    }
     if (prefill_slots <= decode_slots) {
       // Total tags = (decode + prefill) / min(decode, prefill)
       // = 1 + decode / prefill; when prefill < decode
@@ -80,7 +83,7 @@ __global__ __launch_bounds__(std::max(
       // For this SM, what's the next operation we want to run?
       op = (atomicAdd(&tbAssign[linear_bid], 1) % total_tags);
       if (op > 0) {
-        op = 1;
+        op = DECODE;
       }
     } else {
       // Total tags = (decode + prefill) / min(decode, prefill)
@@ -90,9 +93,9 @@ __global__ __launch_bounds__(std::max(
       // For this SM, what's the next operation we want to run?
       op = (atomicAdd(&tbAssign[linear_bid], 1) % (pref_tags + 1));
       if (op < pref_tags) {
-        op = 0;
+        op = PREFILL;
       } else {
-        op = 1;
+        op = DECODE;
       }
     }
 
@@ -177,7 +180,6 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params, DecodeP
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-
   // Decode vars setup
   using DTypeQ_D = typename DecodeParams::DTypeQ;
   using DTypeKV_D = typename DecodeParams::DTypeKV;

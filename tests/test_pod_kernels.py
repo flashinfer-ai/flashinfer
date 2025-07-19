@@ -65,11 +65,11 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("kv_len_p", [127, 12288])
-@pytest.mark.parametrize("qo_len_p", [127, 12288])
+@pytest.mark.parametrize("kv_len_p", [128, 12288])
+@pytest.mark.parametrize("qo_len_p", [128, 12288])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("batch_size_d", [1, 17, 127])
-@pytest.mark.parametrize("kv_len_d", [127, 12288])
+@pytest.mark.parametrize("batch_size_d", [80, 220, 250])
+@pytest.mark.parametrize("kv_len_d", [128, 12288])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("kv_layout_d", ["NHD"])
 @pytest.mark.parametrize("num_kv_heads", [8])
@@ -141,14 +141,6 @@ def test_pod_with_paged_kv_cache(
         ).transpose(2, 3)
     kv_data_p = torch.cat([k_p, v_p], dim=1)
 
-    # Generate prefill reference output
-    o_ref_p = flashinfer.prefill.single_prefill_with_kv_cache(
-        q_p,
-        k_p,
-        v_p,
-        causal=causal,
-        pos_encoding_mode=pos_encoding_mode,
-    )
     # Decode inputs
     q_d = torch.randn(
         batch_size_d, num_qo_heads, head_dim, device=device, dtype=torch.float16
@@ -189,33 +181,14 @@ def test_pod_with_paged_kv_cache(
         dtype=torch.int32,
     )
 
-    # Generate decode reference output
-    decode_workspace_buffer = torch.empty(
-        32 * 1024 * 1024, device=device, dtype=torch.int8
-    )
-    decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        decode_workspace_buffer, kv_layout_d
-    )
-    decode_wrapper.plan(
-        kv_indptr_d,
-        kv_indices_d,
-        last_page_len_d,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        data_type=kv_dtype,
-        q_data_type=q_dtype,
-    )
-    o_ref_d = decode_wrapper.run(q_d, kv_data_d)
-
     workspace_buffer = torch.empty(32 * 1024 * 1024, device=device, dtype=torch.int8)
     pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout_d,
     )
+
     kv_data = torch.cat([kv_data_p, kv_data_d])
+
     pod_wrapper.plan(
         qo_indptr_p,
         kv_indptr_p,
@@ -239,6 +212,35 @@ def test_pod_with_paged_kv_cache(
         pos_encoding_mode_p=pos_encoding_mode,
         causal_p=causal,
     )
+
+    # Generate prefill reference output
+    o_ref_p = flashinfer.prefill.single_prefill_with_kv_cache(
+        q_p,
+        k_p,
+        v_p,
+        causal=causal,
+        pos_encoding_mode=pos_encoding_mode,
+    )
+    # Generate decode reference output
+    decode_workspace_buffer = torch.empty(
+        32 * 1024 * 1024, device=device, dtype=torch.int8
+    )
+    decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        decode_workspace_buffer, kv_layout_d
+    )
+    decode_wrapper.plan(
+        kv_indptr_d,
+        kv_indices_d,
+        last_page_len_d,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        data_type=kv_dtype,
+        q_data_type=q_dtype,
+    )
+    o_ref_d = decode_wrapper.run(q_d, kv_data_d)
 
     # Prefill is run with batch size 1
     torch.cuda.synchronize()

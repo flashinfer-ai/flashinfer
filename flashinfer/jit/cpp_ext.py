@@ -57,6 +57,12 @@ def generate_ninja_build_for_op(
     ]
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
+
+    # Add debug flags if FLASHINFER_DEBUG is set
+    debug = os.environ.get("FLASHINFER_DEBUG", "0") == "1"
+    if debug:
+        common_cflags.append("-g")
+
     if extra_include_dirs is not None:
         for dir in extra_include_dirs:
             common_cflags.append(f"-I{dir.resolve()}")
@@ -79,6 +85,11 @@ def generate_ninja_build_for_op(
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
     ]
+
+    # Add debug flags for CUDA if FLASHINFER_DEBUG is set
+    if debug:
+        cuda_cflags += ["-g", "-G"]
+
     cuda_cflags += _get_cuda_arch_flags(extra_cuda_cflags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags

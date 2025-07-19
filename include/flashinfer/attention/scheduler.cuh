@@ -861,10 +861,12 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
   auto [split_kv_p, kv_chunk_size_p] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_bs_p, packed_qo_len_arr_p, kv_len_arr_p,
                                      cta_tile_q_p, min_kv_chunk_size);
+
   auto [split_kv_d, kv_chunk_size_d] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_bs_d, packed_qo_len_arr_d, kv_len_arr_d,
                                      cta_tile_q_d, min_kv_chunk_size);
-
+  printf("Debug: max_bs_p: %d, max_bs_d: %d, kv_chunk_size_p: %d, kv_chunk_size_d: %d\n", max_bs_p,
+         max_bs_d, kv_chunk_size_p, kv_chunk_size_d);
   // step 3: split qo_indptr and kv_indptr
   // Use one set of qkv indices, merge_indptr and o_indptr to simply merging.
   auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr, real_bs_p] =
@@ -1017,7 +1019,7 @@ inline cudaError_t PODPlan(void* float_buffer, size_t float_workspace_size_in_by
   int num_blocks_per_sm = 3;  // TODO(Wenxuan): increase this to reduce wave quantization?
   int max_grid_size = num_blocks_per_sm * num_sm;
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
-
+  printf("Debug: max_batch_size_if_split: %d\n", max_batch_size_if_split);
   // step 2: determine kv_chunk_size
   auto [split_kv, real_batch_size, padded_batch_size_p, padded_batch_size_d, cta_tile_q_p,
         cta_tile_q_d, kv_chunk_size_p, kv_chunk_size_d, request_indices_vec, qo_tile_indices_vec,
