@@ -46,7 +46,8 @@ __global__ void PackBitsKernel(bool* input, uint8_t* output, int64_t num_element
 
   // This fix the INT32_T overflow issue, which is possible in DiT video models
   // where the kv_len could be 128K.
-  // ref: https://github.com/NVIDIA/cub/blob/0fc3c3701632a4be906765b73be20a9ad0da603d/cub/block/block_load.cuh#L711C13-L711C100
+  // ref:
+  // https://github.com/NVIDIA/cub/blob/0fc3c3701632a4be906765b73be20a9ad0da603d/cub/block/block_load.cuh#L711C13-L711C100
   int block_items_end =
       (num_elements - start_offset > INT32_MAX) ? INT32_MAX : num_elements - start_offset;
   BlockLoad(temp_storage).Load(input + start_offset, input_vec, block_items_end, /*default=*/0);
