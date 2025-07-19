@@ -83,7 +83,7 @@ struct DefaultAttention : AttentionVariantBase {
       if (qo_idx >= qo_len || kv_idx >= kv_len) {
         mask = false;
       } else {
-        const uint32_t offset = qo_idx * kv_len + kv_idx;
+        const uint64_t offset = static_cast<uint64_t>(qo_idx) * kv_len + kv_idx;
         mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
       }
     }

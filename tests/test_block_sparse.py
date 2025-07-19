@@ -87,7 +87,7 @@ def test_block_sparse_attention(
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
 
-    set_seed(330)
+    set_seed(33)
     rng = np.random.default_rng()
 
     MB = M // R
@@ -292,5 +292,6 @@ def test_variable_block_sparse_attention_wrapper(
 
 
 if __name__ == "__main__":
-    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128, False)
-    test_block_sparse_attention(16, 16, 256, 256, 16, 16, 256, True)
+    # This test verifies the INT32_T overflow issue.
+    for seq_len in [16 * 1024, 32 * 1024, 40 * 1024, 48 * 1024, 64 * 1024]:
+        test_block_sparse_attention(128, 128, seq_len, seq_len, 1, 1, 128, False)

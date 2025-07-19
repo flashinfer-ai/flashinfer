@@ -38,13 +38,18 @@ enum class BitOrder { kBig = 0U, kLittle = 1U };
 
 template <BitOrder BITORDER>
 __global__ void PackBitsKernel(bool* input, uint8_t* output, int64_t num_elements) {
-  int64_t start_offset = blockIdx.x * blockDim.x * 8, tx = threadIdx.x;
+  int64_t start_offset = static_cast<int64_t>(blockIdx.x) * blockDim.x * 8, tx = threadIdx.x;
   uint8_t ret = 0;
   bool input_vec[8];
   typedef cub::BlockLoad<bool, 256, 8, cub::BLOCK_LOAD_VECTORIZE> BlockLoad;
   __shared__ typename BlockLoad::TempStorage temp_storage;
-  BlockLoad(temp_storage)
-      .Load(input + start_offset, input_vec, num_elements - start_offset, /*default=*/0);
+
+  // This fix the INT32_T overflow issue, which is possible in DiT video models
+  // where the kv_len could be 128K.
+  // ref: https://github.com/NVIDIA/cub/blob/0fc3c3701632a4be906765b73be20a9ad0da603d/cub/block/block_load.cuh#L711C13-L711C100
+  int block_items_end =
+      (num_elements - start_offset > INT32_MAX) ? INT32_MAX : num_elements - start_offset;
+  BlockLoad(temp_storage).Load(input + start_offset, input_vec, block_items_end, /*default=*/0);
 
   if constexpr (BITORDER == BitOrder::kBig) {
     ret = (input_vec[0] << 7) | (input_vec[1] << 6) | (input_vec[2] << 5) | (input_vec[3] << 4) |
