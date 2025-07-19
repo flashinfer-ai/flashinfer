@@ -20,6 +20,7 @@ from typing import List, Optional
 import jinja2
 import torch
 
+from ...utils import get_device_sm_count
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -752,21 +753,19 @@ class TrtllmGenPrefillModule:
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
-        num_kv_heads: int,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
-        block_size: int,
-        max_seq_len: int,
+        max_q_len: int,
+        max_kv_len: int,
         bmm1_scale: float,
         bmm2_scale: float,
         batch_size: int,
-        sum_seq_q: int,
-        sum_seq_kv: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
         self._op.trtllm_paged_attention_context(
@@ -774,19 +773,17 @@ class TrtllmGenPrefillModule:
             query,
             kv_cache,
             workspace_buffer,
-            num_kv_heads,
             block_tables,
             seq_lens,
-            block_size,
-            max_seq_len,
+            max_q_len,
+            max_kv_len,
             bmm1_scale,
             bmm2_scale,
             batch_size,
             window_left,
-            sum_seq_q,
-            sum_seq_kv,
             cum_seq_lens_q,
             cum_seq_lens_kv,
+            sm_count,
         )
         return out
 
@@ -1562,17 +1559,6 @@ def trtllm_fmha_gen_module():
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
-        ],
-        extra_ldflags=["-lcuda"],
-    )
-
-
-def trtllm_mla_gen_module():
-    return gen_jit_spec(
-        "mla_gen",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mla_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
     )
