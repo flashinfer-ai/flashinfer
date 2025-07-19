@@ -67,6 +67,12 @@ def bsr_attention_ref(
     return o
 
 
+def set_seed(seed: int = 42):
+    torch.cuda.manual_seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
 @pytest.mark.parametrize("R", [1, 4, 16])
 @pytest.mark.parametrize("C", [1, 4, 16])
 @pytest.mark.parametrize("M", [64, 128, 256])
@@ -80,7 +86,10 @@ def test_block_sparse_attention(
 ):
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
+
+    set_seed(330)
     rng = np.random.default_rng()
+
     MB = M // R
     NB = N // C
     S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
@@ -182,6 +191,8 @@ def test_variable_block_sparse_attention_wrapper(
     if seq_len // num_blocks_col < 1:
         pytest.skip("seq_len must be greater than num_blocks_col")
 
+    set_seed(330)
+
     def random_partition_batch(
         seq_len: int,
         num_blocks: int,
@@ -209,7 +220,7 @@ def test_variable_block_sparse_attention_wrapper(
         assert sizes.max() <= seq_len
         assert torch.all(sizes.sum(dim=-1) == seq_len)
 
-        return sizes
+        return sizes.to(device=device)
 
     def _test_variable_block_sparse_attention(
         num_qo_heads: int,
@@ -260,12 +271,15 @@ def test_variable_block_sparse_attention_wrapper(
             )
             torch.testing.assert_close(o[kv_head_idx], o_ref, atol=1e-2, rtol=1e-2)
 
-    block_row_sz = random_partition_batch(seq_len, num_blocks_row, num_kv_heads)
-    block_col_sz = random_partition_batch(seq_len, num_blocks_col, num_kv_heads)
+    block_row_sz = random_partition_batch(
+        seq_len, num_blocks_row, num_kv_heads, device="cuda:0"
+    )
+    block_col_sz = random_partition_batch(
+        seq_len, num_blocks_col, num_kv_heads, device="cuda:0"
+    )
     block_mask_map = (
         torch.rand(num_kv_heads, num_blocks_row, num_blocks_col) > block_density
-    )
-    block_mask_map = block_mask_map.to(dtype=torch.bool, device="cpu")
+    ).to(device="cuda:0")
 
     _test_variable_block_sparse_attention(
         num_qo_heads,
