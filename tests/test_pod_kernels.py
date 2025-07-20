@@ -118,13 +118,23 @@ def test_pod_with_paged_kv_cache(
     qo_indptr_p = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(torch.tensor([qo_len_p], device=device), 0),
+            (
+                torch.cumsum(torch.tensor([qo_len_p], device=device), 0)
+                if qo_len_p > 0
+                else torch.empty(0, device=device)
+            ),
         ],
         dim=0,
     ).int()
     total_num_pages_p = kv_len_p_padded // page_size
-    kv_indptr_p = torch.tensor([0, total_num_pages_p], device=device, dtype=torch.int32)
-    kv_indices_p = torch.arange(0, total_num_pages_p, device=device, dtype=torch.int32)
+    kv_indptr_p = torch.tensor(
+        [0, total_num_pages_p] if total_num_pages_p > 0 else [0],
+        device=device,
+        dtype=torch.int32,
+    )
+    kv_indices_p = torch.arange(
+        0, max(1, total_num_pages_p), device=device, dtype=torch.int32
+    )
     last_page_len_p = torch.tensor(
         [(kv_len_p_padded - 1) % page_size + 1], device=device, dtype=torch.int32
     )
