@@ -2101,8 +2101,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t chunk_start = partition_kv ? min(kv_tile_idx * max_chunk_size, kv_len) : 0;
     const uint32_t chunk_end =
         partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    static_assert(chunk_end >= chunk_start,
-                  "chunk_end must >= chunk_start. Check your paged kv indices.");
+    if (chunk_end < chunk_start) {
+      FLASHINFER_RUNTIME_ASSERT("chunk_end must >= chunk_start. Check your paged kv indices.");
+    }
     const uint32_t chunk_size = chunk_end - chunk_start;
     if (chunk_size == 0) {
       return;  // no kv data
