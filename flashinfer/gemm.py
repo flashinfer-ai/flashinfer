@@ -25,13 +25,17 @@ import jinja2
 import torch
 import torch.nn.functional as F
 
-try:
-    import cudnn
-
-    CUDNN_AVAILABLE = True
-except ImportError:
-    cudnn = None
-    CUDNN_AVAILABLE = False
+ try:
+     CUDNN_AVAILABLE = False
+     import cudnn
+     CUDNN_AVAILABLE = True
+ except ImportError:
+     pass
+ except OSError as e:
+     error_msg = str(e).lower()
+     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
+     if not is_lib_missing:
+         raise
 
 from .jit import JitSpec
 from .jit import env as jit_env
