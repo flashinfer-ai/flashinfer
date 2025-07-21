@@ -383,7 +383,6 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
-
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
     uint32_t pos = i / num_heads;
@@ -435,6 +434,8 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
       v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
       if (iter * bdy + ty < num_index_sets) {
         float s = s_smem[(iter % bdx) * bdy + ty];
+        printf("Debug: qo_id: %d, head_idx: %d, kv_id: %d, output: %f\n", pos, head_idx,
+               iter * bdy + ty, s);
         st.merge(v, s, 1);
       }
       __syncthreads();
@@ -702,7 +703,6 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* merge_indptr
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
     num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
-
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
     void* args[] = {&v,        &s,           &merge_indptr, &v_merged,

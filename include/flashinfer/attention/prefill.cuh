@@ -2254,23 +2254,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                            kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
                            chunk_start)),
                    CTA_TILE_KV));
-      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && num_iterations > 100000) {
-        printf(
-            "Debug: kMultiItemScoring num_iterations: %d, chunk_size: %d, sub_if_greater_or_zero: "
-            "%d, divided by CTA_TILE_KV: %d\n",
-            num_iterations, chunk_size,
-            sub_if_greater_or_zero(
-                kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
-                chunk_start),
-            sub_if_greater_or_zero(
-                kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
-                chunk_start) /
-                CTA_TILE_KV);
-      }
     }
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      printf("Debug: block %d request_idx: %d num_iterations: %d, qo_len: %d, kv_len: %d\n",
-             blockIdx.x, request_idx, num_iterations, qo_len, kv_len);
+      printf(
+          "Debug: block %d request_idx: %d num_iterations: %d, qo_len: %d, kv_len: %d, "
+          "chunk_size:%d\n",
+          blockIdx.x, request_idx, num_iterations, qo_len, kv_len, chunk_size);
     }
     const uint32_t window_iteration = ceil_div(
         sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),

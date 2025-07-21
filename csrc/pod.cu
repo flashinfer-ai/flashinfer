@@ -149,7 +149,6 @@ void PODWithKVCacheTensorRun(
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
-
         IdType* q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
 
         // debug indices

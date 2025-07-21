@@ -100,23 +100,23 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
 
 inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
                                            const uint32_t max_batch_size_if_split,
-                                           const std::vector<uint32_t>& packed_qo_len_arr,
-                                           const std::vector<uint32_t>& kv_len_arr,
+                                           const std::vector<int32_t>& packed_qo_len_arr,
+                                           const std::vector<int32_t>& kv_len_arr,
                                            const uint32_t qo_chunk_size,
                                            const uint32_t min_kv_chunk_size = 1) {
-  const uint32_t batch_size = packed_qo_len_arr.size();
-  uint32_t max_kv_len = 1;
-  for (const uint32_t& kv_len : kv_len_arr) {
+  const int32_t batch_size = packed_qo_len_arr.size();
+  int32_t max_kv_len = 1;
+  for (const int32_t& kv_len : kv_len_arr) {
     max_kv_len = std::max(max_kv_len, kv_len);
   }
 
-  uint32_t low = min_kv_chunk_size;
-  uint32_t high = max_kv_len;
-  constexpr uint32_t min_kv_len = 1;
+  int32_t low = min_kv_chunk_size;
+  int32_t high = max_kv_len;
+  constexpr int32_t min_kv_len = 1;
   while (low < high) {
-    const uint32_t mid = (low + high) / 2;
-    uint32_t real_batch_size = 0;
-    for (uint32_t i = 0; i < batch_size; ++i) {
+    const int32_t mid = (low + high) / 2;
+    int32_t real_batch_size = 0;
+    for (int32_t i = 0; i < batch_size; ++i) {
       real_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
                          ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
@@ -495,16 +495,16 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
 template <typename IdType>
 inline auto get_qkv_len_arr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                             uint32_t num_qo_heads, uint32_t gqa_group_size) {
-  std::vector<uint32_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
+  std::vector<int32_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    packed_qo_len_arr[i] = uint32_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * uint32_t(gqa_group_size);
+    packed_qo_len_arr[i] = int32_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int32_t(gqa_group_size);
     if (packed_qo_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
               << qo_indptr_h[i] << " should be non-negative";
       FLASHINFER_ERROR(err_msg.str());
     }
-    kv_len_arr[i] = uint32_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
+    kv_len_arr[i] = int32_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
     printf("Debug: request %d qo_len: %d, kv_len: %d\n", i, packed_qo_len_arr[i], kv_len_arr[i]);
     if (kv_len_arr[i] < 0) {
       std::ostringstream err_msg;
@@ -516,7 +516,7 @@ inline auto get_qkv_len_arr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t b
   return std::make_tuple(packed_qo_len_arr, kv_len_arr);
 }
 
-inline auto get_q_tiles(std::vector<uint32_t> packed_qo_len_arr, uint32_t batch_size,
+inline auto get_q_tiles(std::vector<int32_t> packed_qo_len_arr, uint32_t batch_size,
                         uint32_t head_dim, uint32_t page_size, uint32_t total_num_rows,
                         uint32_t gqa_group_size, bool enable_cuda_graph, bool is_decode = false) {
   uint32_t cta_tile_q;
@@ -559,7 +559,7 @@ inline auto get_q_tiles(std::vector<uint32_t> packed_qo_len_arr, uint32_t batch_
 
 template <typename IdType>
 inline auto get_qkv_tile_indices(
-    const std::vector<uint32_t>& packed_qo_len_arr, const std::vector<uint32_t>& kv_len_arr,
+    const std::vector<int32_t>& packed_qo_len_arr, const std::vector<int32_t>& kv_len_arr,
     uint32_t batch_size, uint32_t cta_tile_q, uint32_t kv_chunk_size, uint32_t gqa_group_size,
     std::vector<IdType>* request_indices = nullptr, std::vector<IdType>* qo_tile_indices = nullptr,
     std::vector<IdType>* kv_tile_indices = nullptr, std::vector<IdType>* merge_indptr = nullptr,
@@ -582,10 +582,10 @@ inline auto get_qkv_tile_indices(
 
   uint32_t real_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-    const uint32_t packed_qo_len = packed_qo_len_arr[request_idx];
-    const uint32_t kv_len = std::max(uint32_t(kv_len_arr[request_idx]), uint32_t(1));
-    const uint32_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
-    const uint32_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
+    const int32_t packed_qo_len = packed_qo_len_arr[request_idx];
+    const int32_t kv_len = std::max(kv_len_arr[request_idx], 1);
+    const int32_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
+    const int32_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
@@ -593,14 +593,18 @@ inline auto get_qkv_tile_indices(
         out_req->push_back(request_idx + start_req_idx);
         out_qo->push_back(q_tile_idx);
         out_kv->push_back(kv_tile_idx);
+        printf("Debug: num_tiles_q: %d, num_tiles_kv: %d, q_tile_idx: %d, kv_tile_idx: %d\n",
+               num_tiles_q, num_tiles_kv, q_tile_idx, kv_tile_idx);
       }
     }
 
     int64_t qo_len = packed_qo_len / gqa_group_size;
     for (uint32_t row = 0; row < qo_len; ++row) {
       out_merge->push_back(out_merge->back() + num_tiles_kv);
+      printf("Debug: merge_indptr[%d]: %d\n", out_merge->size() - 1, out_merge->back());
     }
     out_o->push_back(out_o->back() + qo_len * num_tiles_kv);
+    printf("Debug: o_indptr[%d]: %d\n", out_o->size() - 1, out_o->back());
   }
   return std::make_tuple(std::move(local_req), std::move(local_qo), std::move(local_kv),
                          std::move(local_merge), std::move(local_o), real_batch_size);
@@ -631,7 +635,16 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
         real_batch_size] = get_qkv_tile_indices<IdType>(packed_qo_len_arr, kv_len_arr, batch_size,
                                                         cta_tile_q, kv_chunk_size, gqa_group_size);
-
+  // for (int i = 0; i <=request_indices.size(); i++) {
+  //   printf("Debug: request_indices[%d]: %d, merge_indptr[%d]: %d, o_indptr[%d]: %d\n", i,
+  //   request_indices[i], i, merge_indptr[i], i, o_indptr[i]);
+  // }
+  // for (int i = 0; i < qo_tile_indices.size(); i++) {
+  //   printf("Debug: qo_tile_indices[%d]: %d\n", i, qo_tile_indices[i]);
+  // }
+  // for (int i = 0; i < kv_tile_indices.size(); i++) {
+  //   printf("Debug: kv_tile_indices[%d]: %d\n", i, kv_tile_indices[i]);
+  // }
   const size_t padded_batch_size =
       enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : real_batch_size;
   FLASHINFER_CHECK(real_batch_size <= padded_batch_size,
@@ -876,6 +889,18 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
       get_qkv_tile_indices<IdType>(packed_qo_len_arr_d, kv_len_arr_d, batch_size_d, cta_tile_q_d,
                                    kv_chunk_size_d, gqa_group_size, &request_indices,
                                    &qo_tile_indices, &kv_tile_indices, &merge_indptr, &o_indptr);
+  // print indices
+  for (int i = 0; i < request_indices.size(); i++) {
+    printf("Debug: request_indices[%d]: %d, merge_indptr[%d]: %d, o_indptr[%d]: %d\n", i,
+           request_indices[i], i, merge_indptr[i + 1] - merge_indptr[i], i,
+           o_indptr[i + 1] - o_indptr[i]);
+  }
+  for (int i = 0; i < qo_tile_indices.size(); i++) {
+    printf("Debug: qo_tile_indices[%d]: %d\n", i, qo_tile_indices[i]);
+  }
+  for (int i = 0; i < kv_tile_indices.size(); i++) {
+    printf("Debug: kv_tile_indices[%d]: %d\n", i, kv_tile_indices[i]);
+  }
 
   bool split_kv = split_kv_p || split_kv_d;
   uint32_t real_batch_size = real_bs_p + real_bs_d;
