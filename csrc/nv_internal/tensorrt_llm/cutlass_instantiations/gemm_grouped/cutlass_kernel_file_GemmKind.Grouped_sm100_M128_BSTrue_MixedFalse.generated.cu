@@ -134,6 +134,36 @@ namespace cutlass_kernels
 
 #endif
 
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm100, __nv_fp8_e4m3, SafeFP4, half,
+                EpilogueOpDefault, NONE, 128, 256, 128, 1, 1, 1, true, false);
+
+#endif
+
+
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm100, __nv_fp8_e4m3, SafeFP4, half,
+                EpilogueOpDefault, NONE, 256, 256, 128, 2, 1, 1, true, false);
+
+#endif
+
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm100, __nv_fp8_e4m3, SafeFP4, __nv_bfloat16,
+                EpilogueOpDefault, NONE, 128, 256, 128, 1, 1, 1, true, false);
+
+#endif
+
+
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm100, __nv_fp8_e4m3, SafeFP4, __nv_bfloat16,
+                EpilogueOpDefault, NONE, 256, 256, 128, 2, 1, 1, true, false);
+
+#endif
+
 
 } // namespace cutlass_kernels
 } // namespace kernels

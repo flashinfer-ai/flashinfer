@@ -1,13 +1,17 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 // Ignore CUTLASS warnings about type punning
@@ -51,16 +55,16 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-#include "moe_gemm_kernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_tma_warp_specialized_traits.h"
+#include "../include/moe_gemm_kernels.h"
+#include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./moe_tma_warp_specialized_traits.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <math.h>
 #include <sstream>
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
@@ -85,7 +89,7 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
     //                                           kernels::cutlass_kernels::genericMoeGemmKernelLauncherHopper<T,
     //                                           WeightType,
     //                                               cutlass::arch::Sm90, EpilogueTag, false>;
-    // TODO(dastokes) Re-enable bias when CUTLASS supports it
+    // TODO Re-enable bias when CUTLASS supports it
 
     if constexpr (Arch::kMinComputeCapability < 90)
     {
@@ -155,7 +159,7 @@ constexpr bool are_tile_shapes_supported_sm100()
         // {
         //     return false;
         // }
-        if ((TileN != 64 && TileN != 128) || TileM != 128)
+        if ((TileN != 64 && TileN != 128 && TileN != 256) || TileM != 128)
         {
             return false;
         }
@@ -222,7 +226,7 @@ constexpr bool are_tile_shapes_supported()
     {
         return are_tile_shapes_supported_sm100<CTAShape, ClusterShape, DataType, WeightType>();
     }
-    else if constexpr (Arch::kMinComputeCapability == 120)
+    else if constexpr (Arch::kMinComputeCapability == 120 || Arch::kMinComputeCapability == 121)
     {
         return are_tile_shapes_supported_sm120<CTAShape, ClusterShape, DataType>();
     }
@@ -374,7 +378,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM100 configuration requested");
         }
     }
-    else if (gemm_config.sm_version == 120)
+    else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121)
     {
         TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
         if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
@@ -405,4 +409,4 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     return count;
 }
 
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

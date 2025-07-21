@@ -1,13 +1,17 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -43,7 +47,7 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "../include/moe_kernels.h"
+#include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -51,7 +55,7 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
-#include "../include/moe_util_kernels.h"
+#include "moe_util_kernels.h"
 
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
@@ -66,7 +70,7 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 /**
  * Takes the input maps and prepares the expanded maps for min latency
@@ -4641,4 +4645,4 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::cutlass_kernels
+} // namespace tensorrt_llm::kernels::cutlass_kernels

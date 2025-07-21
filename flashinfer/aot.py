@@ -323,9 +323,9 @@ def gen_all_modules(
     #     jit_specs.append(gen_gemm_sm90_module())
     if has_sm100:
         jit_specs.append(gen_fused_moe_sm100_module())
-        # jit_specs.append(gen_fp4_quantization_sm100_module())
-        # jit_specs.append(gen_gemm_sm100_module())
-        # jit_specs.append(gen_trtllm_comm_module())
+        jit_specs.append(gen_fp4_quantization_sm100_module())
+    #     jit_specs.append(gen_gemm_sm100_module())
+    #     jit_specs.append(gen_trtllm_comm_module())
 
     # jit_specs += [
     #     gen_cascade_module(),

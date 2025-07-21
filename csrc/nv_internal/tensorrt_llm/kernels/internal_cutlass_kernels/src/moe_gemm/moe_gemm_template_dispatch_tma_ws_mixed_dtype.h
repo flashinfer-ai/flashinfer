@@ -1,13 +1,17 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 // Ignore CUTLASS warnings about type punning
@@ -16,24 +20,20 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 
-#include "cutlass/array.h"
-#include "cutlass/numeric_conversion.h"
-
-#include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-
-#include "cutlass/cutlass.h"
-
 #include "cute/tensor.hpp"
-
+#include "cutlass/array.h"
+#include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/numeric_conversion.h"
 #include "cutlass/tensor_ref.h"
 
 #include "cutlass_extensions/compute_occupancy.h"
@@ -46,24 +46,24 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "moe_gemm_kernels.h"
+#include "../include/moe_gemm_kernels.h"
+#include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <math.h>
 #include <sstream>
 
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
 using namespace cute;
-
-namespace tensorrt_llm
-{
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
     typename ClusterShape>
@@ -75,32 +75,35 @@ void sm90_dispatch_mainloop_schedules(GroupedGemmInput<T, WeightType, GemmOutput
     switch (inputs.gemm_config.mainloop_schedule)
     {
     case tkc::MainloopScheduleType::COOPERATIVE:
-        if (get<0>(CTAShape{}) < 128)
+        if constexpr (get<0>(CTAShape{}) < 128)
         {
             TLLM_THROW("COOPERATIVE is only enabled when tile M >= 128.");
         }
-
-        if constexpr ((get<0>(CTAShape{}) == 128) && get<1>(CTAShape{}) == 128)
-        {
-            kernels::cutlass_kernels::sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType,
-                EpilogueTag, CTAShape, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-                cutlass::epilogue::TmaWarpSpecializedCooperative, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
-                inputs, hopper_inputs, sm_count_, workspace_size);
-        }
         else
         {
-            kernels::cutlass_kernels::sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType,
-                EpilogueTag, CTAShape, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
-                cutlass::epilogue::TmaWarpSpecializedCooperative, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
-                inputs, hopper_inputs, sm_count_, workspace_size);
+            if constexpr ((get<0>(CTAShape{}) == 128) && get<1>(CTAShape{}) == 128)
+            {
+                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
+                    ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                    cutlass::epilogue::TmaWarpSpecializedCooperative,
+                    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+                    inputs, hopper_inputs, sm_count_, workspace_size);
+            }
+            else
+            {
+                sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
+                    ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                    cutlass::epilogue::TmaWarpSpecializedCooperative,
+                    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+                    inputs, hopper_inputs, sm_count_, workspace_size);
+            }
         }
 
         break;
     case tkc::MainloopScheduleType::PINGPONG:
-        kernels::cutlass_kernels::sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag,
-            CTAShape, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
-            cutlass::epilogue::TmaWarpSpecializedCooperative, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
-            inputs, hopper_inputs, sm_count_, workspace_size);
+        sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape,
+            cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::epilogue::TmaWarpSpecializedCooperative,
+            cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(inputs, hopper_inputs, sm_count_, workspace_size);
         break;
     default:
         TLLM_THROW(
@@ -224,7 +227,7 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
     GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
     inputs.num_experts = num_experts;
-    kernels::cutlass_kernels::sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
+    sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
         tensorrt_llm::cutlass_extensions::EpilogueOpDefault, Shape<_128, _64, _512>, Shape<_1, _1, _1>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative, cutlass::epilogue::TmaWarpSpecializedCooperative,
         cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
@@ -233,4 +236,4 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
     return count;
 }
 
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

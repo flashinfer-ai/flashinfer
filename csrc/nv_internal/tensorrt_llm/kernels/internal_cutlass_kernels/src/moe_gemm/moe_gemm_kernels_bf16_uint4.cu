@@ -12,8 +12,9 @@
 
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm {
-#ifdef ENABLE_BF16
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+  #ifdef ENABLE_BF16
 template class MoeGemmRunner<__nv_bfloat16, cutlass::uint4b_t, __nv_bfloat16>;
 #endif
 }  // namespace tensorrt_llm

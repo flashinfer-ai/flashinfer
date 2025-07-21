@@ -15,21 +15,22 @@
  */
 
 #if defined(USING_OSS_CUTLASS_MOE_GEMM)
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "moe_kernels.h"
 #else
 #include "moe_gemm_kernels.h"
 #include "moe_kernels.h"
 #endif
 // Always include the public header for moe_gemm_kernels.h
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
+#include "moe_gemm_kernels.h"
 
+#include "pytorch_extension_utils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#include "cutlass_kernel_selector.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-// #include <ATen/native/cuda/Resize.h>
+#include <ATen/native/cuda/Resize.h>
 
 #include <functional>
 
@@ -213,12 +214,12 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
-    torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
-        torch::optional<torch::Tensor> const& token_final_scales, torch::Tensor const& fc1_expert_weights,
-        torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
-        torch::optional<torch::Tensor> const& fc2_expert_biases,
-        torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
-        torch::optional<torch::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
+    at::Tensor runMoe(at::Tensor& output, at::Tensor const& input, at::Tensor const& token_selected_experts,
+        torch::optional<at::Tensor> const& token_final_scales, at::Tensor const& fc1_expert_weights,
+        torch::optional<at::Tensor> const& fc1_expert_biases, at::Tensor const& fc2_expert_weights,
+        torch::optional<at::Tensor> const& fc2_expert_biases,
+        torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales,
+        torch::optional<at::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
@@ -228,14 +229,14 @@ public:
 
         TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
 
-        CHECK_INPUT(input, mActivationDtype)
-        CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
+        CHECK_INPUT_TYPE(input, mActivationDtype)
+        CHECK_INPUT_TYPE(token_selected_experts, at::ScalarType::Int)
         if (token_final_scales)
         {
-            CHECK_INPUT(token_final_scales.value(), at::ScalarType::Float)
+            CHECK_INPUT_TYPE(token_final_scales.value(), at::ScalarType::Float)
         }
-        CHECK_INPUT(fc1_expert_weights, mWeightDtype)
-        CHECK_INPUT(fc2_expert_weights, mWeightDtype)
+        CHECK_INPUT_TYPE(fc1_expert_weights, mWeightDtype)
+        CHECK_INPUT_TYPE(fc2_expert_weights, mWeightDtype)
 
         TORCH_CHECK(input.dim() == 2, "input must be 2D.");
         TORCH_CHECK(token_selected_experts.dim() == 2, "token_selected_experts must be 2D.");
@@ -245,8 +246,8 @@ public:
 
         if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value())
         {
-            CHECK_INPUT(fc1_expert_biases.value(), mOutputDtype);
-            CHECK_INPUT(fc2_expert_biases.value(), mOutputDtype);
+            CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
+            CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
             TORCH_CHECK(fc1_expert_biases.value().dim() == 2, "fc1_expert_biases must be 2D.");
             TORCH_CHECK(fc2_expert_biases.value().dim() == 2, "fc2_expert_biases must be 2D.");
             TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc1_expert_biases.value().sizes()[0],
@@ -305,8 +306,8 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows, hidden_size};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        // std::vector<int64_t> output_shape = {num_rows, hidden_size};
+        // auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode);
@@ -349,12 +350,12 @@ public:
         return output;
     }
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> runMoeMinLantency(torch::Tensor const& input,
-        torch::Tensor const& token_selected_experts, torch::optional<torch::Tensor> const& token_final_scales,
-        torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
-        torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
-        torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
-        torch::optional<torch::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
+    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> runMoeMinLantency(at::Tensor output, at::Tensor const& input,
+        at::Tensor const& token_selected_experts, torch::optional<at::Tensor> const& token_final_scales,
+        at::Tensor const& fc1_expert_weights, torch::optional<at::Tensor> const& fc1_expert_biases,
+        at::Tensor const& fc2_expert_weights, torch::optional<at::Tensor> const& fc2_expert_biases,
+        torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales,
+        torch::optional<at::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
@@ -363,14 +364,14 @@ public:
         // Free the profile workspace to save memory
         freeProfileWorkspace();
 
-        CHECK_INPUT(input, mActivationDtype)
-        CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
+        CHECK_INPUT_TYPE(input, mActivationDtype)
+        CHECK_INPUT_TYPE(token_selected_experts, at::ScalarType::Int)
         if (token_final_scales)
         {
-            CHECK_INPUT(token_final_scales.value(), at::ScalarType::Float)
+            CHECK_INPUT_TYPE(token_final_scales.value(), at::ScalarType::Float)
         }
-        CHECK_INPUT(fc1_expert_weights, mWeightDtype)
-        CHECK_INPUT(fc2_expert_weights, mWeightDtype)
+        CHECK_INPUT_TYPE(fc1_expert_weights, mWeightDtype)
+        CHECK_INPUT_TYPE(fc2_expert_weights, mWeightDtype)
 
         TORCH_CHECK(input.dim() == 2, "input must be 2D.");
         TORCH_CHECK(token_selected_experts.dim() == 2, "token_selected_experts must be 2D.");
@@ -380,8 +381,8 @@ public:
 
         if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value())
         {
-            CHECK_INPUT(fc1_expert_biases.value(), mOutputDtype);
-            CHECK_INPUT(fc2_expert_biases.value(), mOutputDtype);
+            CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
+            CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
             TORCH_CHECK(fc1_expert_biases.value().dim() == 2, "fc1_expert_biases must be 2D.");
             TORCH_CHECK(fc2_expert_biases.value().dim() == 2, "fc2_expert_biases must be 2D.");
             TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc1_expert_biases.value().sizes()[0],
@@ -426,8 +427,8 @@ public:
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, hidden_size};
-        auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
+        // std::vector<int64_t> output_shape = {num_rows * num_experts_on_rank, hidden_size};
+        // auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         auto num_active_experts_per_node = torch::empty({1}, input.options().dtype(at::ScalarType::Int));
         auto experts_to_token_score
@@ -485,9 +486,9 @@ public:
         return mAllProfiles.size();
     }
 
-    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
-        torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
-        torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
+    void runGemmProfile(at::Tensor const& input, at::Tensor const& fc1_expert_weights,
+        torch::optional<at::Tensor> const& fc1_expert_biases, at::Tensor const& fc2_expert_weights,
+        torch::optional<at::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
         int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
         int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
         int64_t const profile_id, bool const do_preparation)
@@ -563,7 +564,7 @@ public:
 private:
     struct WorkspaceInfo
     {
-        torch::Tensor workspace{};
+        at::Tensor workspace{};
         void* src_to_dest_map{};
     };
 
@@ -645,7 +646,7 @@ private:
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
-        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
+        int64_t const inter_size, torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales) const
     {
         if (isFp8Quant())
         {
@@ -658,10 +659,10 @@ private:
             auto const fc1_input_dequant = quant_scales.value()[3];
 
             // Check types
-            CHECK_INPUT(fc1_dequant, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_quant, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_dequant, c10::ScalarType::Float);
-            CHECK_INPUT(fc1_input_dequant, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_dequant, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_quant, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_dequant, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_input_dequant, c10::ScalarType::Float);
             // Check ranks
             TORCH_CHECK(fc1_dequant.dim() == 1, "fc1 dequant must be 1D");
             TORCH_CHECK(fc2_quant.dim() == 0 || fc2_quant.dim() == 1, "fc2 quant must be a scalar or 1-D tensor");
@@ -694,11 +695,11 @@ private:
             // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
             constexpr int FP8_PER_INT32 = 4;
             // Check types
-            CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc1_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_act_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc2_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc1_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_act_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc2_global, c10::ScalarType::Float);
             // Check ranks
             TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be #D");
             TORCH_CHECK(fc1_global.dim() == 1, "fc1 global must be 1D");
@@ -752,10 +753,10 @@ private:
 
             // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
             constexpr int FP8_PER_INT32 = 4;
-            CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc1_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc2_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc1_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc2_global, c10::ScalarType::Float);
             TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be #D");
             TORCH_CHECK(fc1_global.dim() == 1, "fc1 global must be 1D");
             TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
@@ -810,12 +811,12 @@ private:
             // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
             constexpr int FP8_PER_INT32 = 4;
             // Check types
-            CHECK_INPUT(fc1_act_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc1_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_act_global, c10::ScalarType::Float);
-            CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
-            CHECK_INPUT(fc2_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_act_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc1_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc1_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_act_global, c10::ScalarType::Float);
+            CHECK_INPUT_TYPE(fc2_weight_block, c10::ScalarType::Int);
+            CHECK_INPUT_TYPE(fc2_global, c10::ScalarType::Float);
             // Check ranks
             TORCH_CHECK(fc1_act_global.dim() == 0 || fc1_act_global.dim() == 1,
                 "fc1 act global must be a scalar or 1-D tensor");
@@ -932,7 +933,7 @@ private:
 
 } // namespace torch_ext
 
-TORCH_LIBRARY(trtllm, m)
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) 
 {
     m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool>())

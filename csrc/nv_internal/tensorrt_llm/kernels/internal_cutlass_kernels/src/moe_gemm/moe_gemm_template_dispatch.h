@@ -1,13 +1,17 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 #pragma once
 
@@ -55,13 +59,13 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-#include "moe_gemm_kernels.h"
-#include "moe_gemm_template_dispatch_tma_ws.h"
-#include "moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_tma_warp_specialized_traits.h"
-#include <tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.h>
-#include <tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.h>
+#include "../include/moe_gemm_kernels.h"
+#include "./launchers/fused_moe_gemm_launcher_sm80.h"
+#include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
+#include "./moe_gemm_template_dispatch_tma_ws.h"
+#include "./moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
+#include "./moe_tma_warp_specialized_traits.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -69,9 +73,7 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
-namespace kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 
 // ============================= Variable batched Gemm things ===========================
@@ -219,7 +221,6 @@ struct genericMoeGemmKernelLauncher<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType
     {
     }
 };
-} // namespace kernels::cutlass_kernels
 
 template <typename T, typename WeightType, typename GemmOutputType, typename Arch, typename EpilogueTag,
     typename ThreadblockShape, typename WarpShape, int Stages>
@@ -537,7 +538,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
         TLLM_LOG_TRACE("Blackwell is not supported for this configuration, not selecting any TMA WS implementations");
         return {};
     }
-    if (sm == 120 && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
+    if ((sm == 120 || sm == 121) && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
     {
         TLLM_LOG_TRACE(
             "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS implementations");
@@ -567,7 +568,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpe
 {
     return (sm_ == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
         || (sm_ >= 100 && sm_ < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
-        || (sm_ == 120 && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
+        || ((sm_ == 120 || sm_ == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -869,4 +870,4 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels
