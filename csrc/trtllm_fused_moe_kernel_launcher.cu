@@ -548,7 +548,8 @@ at::Tensor trtllm_fp8_block_scale_moe(
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t num_experts,
     int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight) {
+    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
+    int64_t weight_layout) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -558,9 +559,13 @@ at::Tensor trtllm_fp8_block_scale_moe(
         batchedGemm::trtllm::gen::Dtype::E4m3};  // FP8 runner so hard-coded
     bool mUseDeepSeekFp8{true};                  // Always true for BlockScaleMoe
 
+    TORCH_CHECK(0 <= weight_layout && weight_layout <= 2,
+                "the value ofweight_layout is not recognized");
+
     // Properly initialize the runner using make_unique like in the original code
-    auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
-                                                use_shuffled_weight);
+    auto mRunner = std::make_unique<RunnerType>(
+        mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_weight,
+        static_cast<batchedGemm::trtllm::gen::MatrixLayout>(weight_layout));
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
     auto const num_tokens = hidden_states.sizes()[0];
@@ -903,7 +908,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
 
   // Properly initialize the runner using make_unique like in the original code
   auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
-                                              /*useShuffledMatrixA*/ true);
+                                              /*useShuffledMatrixA*/ true,
+                                              batchedGemm::trtllm::gen::MatrixLayout::MajorK);
 
   auto const num_tokens = hidden_states.sizes()[0];
 

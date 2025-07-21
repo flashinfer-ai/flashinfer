@@ -7,7 +7,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
-from flashinfer import RoutingMethodType, shuffle_matrix_sf_a
+from flashinfer import RoutingMethodType
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -567,9 +567,21 @@ def quant_dequant_per_tensor_fp8(a):
 )
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("use_shuffled_weight", [False, True])
+@pytest.mark.parametrize(
+    "use_shuffled_weight,weight_layout",
+    [
+        (False, fused_moe.WeightLayout.MajorK),
+        (True, fused_moe.WeightLayout.MajorK),
+        (True, fused_moe.WeightLayout.BlockMajorK),
+    ],
+)
 def test_moe_fp8(
-    num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
+    num_tokens,
+    expert_info,
+    hidden_size,
+    intermediate_size,
+    use_shuffled_weight,
+    weight_layout,
 ):
     torch.random.manual_seed(0)
 
@@ -671,6 +683,15 @@ def test_moe_fp8(
             torch.float8_e4m3fn
         )
 
+        block_k = 128
+        if weight_layout == fused_moe.WeightLayout.BlockMajorK:
+            kernel_gemm1_weights = fused_moe.convert_to_block_layout(
+                kernel_gemm1_weights, block_k
+            )
+            kernel_gemm2_weights = fused_moe.convert_to_block_layout(
+                kernel_gemm2_weights, block_k
+            )
+
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
         routing_bias,
@@ -690,7 +711,8 @@ def test_moe_fp8(
         routed_scaling,
         tile_tokens_dim,
         routing_method_type,
-        use_shuffled_weight=use_shuffled_weight,
+        use_shuffled_weight,
+        weight_layout,
     )
 
     output_dequant_actual = output.to(torch.float)
