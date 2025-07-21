@@ -489,3 +489,6 @@ def ceil_div(x: int, y: int) -> int:
         The result of the ceiling division.
     """
     return (x + y - 1) // y
+
+def pad_up(x: int, y: int) -> int:
+    return ceil_div(x, y) * y

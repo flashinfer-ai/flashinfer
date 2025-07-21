@@ -238,11 +238,14 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         selected_experts.to(torch.int),
         routing_weights,
         w31_weight,
+        None,  # gemm1 biases
         w2_weight,
+        None,  # gemm2 biases
         flash_output.dtype,
         output=flash_output,
         quant_scales=None,
     )
+
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
@@ -316,7 +319,9 @@ def test_moe_fp8(
         selected_experts.to(torch.int),
         routing_weights,
         w31_weight,
+        None,
         w2_weight,
+        None,
         otype,
         quant_scales=quant_scales,
         output=flash_output,
@@ -431,7 +436,9 @@ def test_moe_nvfp4(
         selected_experts.to(torch.int),
         routing_weights,
         w1_q.contiguous().view(torch.long),
+        None,
         w2_q.contiguous().view(torch.long),
+        None,
         otype,
         quant_scales=quant_scales,
         input_sf=input_sf,
@@ -560,7 +567,9 @@ def test_moe_expert_parallel(
             selected_experts.to(torch.int),
             routing_weights,
             w31_weight_local.contiguous(),
+            None,
             w2_weight_local.contiguous(),
+            None,
             x.dtype,
             ep_size=ep_size,
             ep_rank=ep_rank,
@@ -671,7 +680,9 @@ def test_moe_tensor_parallel(
             selected_experts.to(torch.int),
             routing_weights,
             w31_weight_local.contiguous(),
+            None,
             w2_weight_local.contiguous(),
+            None,
             x.dtype,
             tp_size=tp_size,
             tp_rank=tp_rank,
@@ -791,7 +802,9 @@ def test_moe_tensor_expert_parallel(
                 selected_experts.to(torch.int),
                 routing_weights,
                 w31_weight_local.contiguous(),
+                None,
                 w2_weight_local.contiguous(),
+                None,
                 x.dtype,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
@@ -1010,18 +1023,20 @@ def test_moe_fp8_block_scaling(
     # Call flashinfer implementation with block scaling and expect NotImplementedError
     with pytest.raises(
         NotImplementedError,
-        match="FP8 Block Scaling is not yet implemented for Blackwell",
+        match="DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell",
     ):
         _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),
             routing_weights,
             w31_quant.contiguous(),
+            None,
             w2_quant.contiguous(),
+            None,
             otype,
             tp_size=1,
             tp_rank=0,
-            use_fp8_block_scaling=True,
+            use_deepseek_fp8_block_scale=True,
             quant_scales=quant_scales,
         )
 

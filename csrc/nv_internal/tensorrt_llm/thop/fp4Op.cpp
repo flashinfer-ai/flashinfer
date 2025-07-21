@@ -404,114 +404,114 @@ at::Tensor NVFP4BlockScaleInterleaveReverse(at::Tensor const& blockScale)
     return reversedBlockScale;
 }
 
-// at::Tensor E2M1AndUFP8SFScaleToFloat(at::Tensor valueE2M1, at::Tensor scaleFP8SF, int64_t sfVecSize, int64_t sfType)
-// {
-//     CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
-//     CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
-//     auto packedShape = valueE2M1.sizes();
-//     auto scaleShape = scaleFP8SF.sizes();
-//     TORCH_CHECK(packedShape.size() == 2, "valueE2M1 should be 2D tensor.");
-//     TORCH_CHECK(scaleShape.size() == 1, "scaleFP8SF should be 1D tensor.");
-//     at::Tensor floatTensor
-//         = th::zeros({packedShape[0], packedShape[1] * 2}, th::dtype(th::kFloat32).requires_grad(false));
+at::Tensor E2M1AndUFP8SFScaleToFloat(at::Tensor valueE2M1, at::Tensor scaleFP8SF, int64_t sfVecSize, int64_t sfType)
+{
+    CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
+    CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
+    auto packedShape = valueE2M1.sizes();
+    auto scaleShape = scaleFP8SF.sizes();
+    TORCH_CHECK(packedShape.size() == 2, "valueE2M1 should be 2D tensor.");
+    TORCH_CHECK(scaleShape.size() == 1, "scaleFP8SF should be 1D tensor.");
+    at::Tensor floatTensor
+        = at::zeros({packedShape[0], packedShape[1] * 2}, at::dtype(at::ScalarType::Float).requires_grad(false));
 
-//     int hiddenDim = packedShape[1] * 2;
-//     int packedFp4HiddenDim = hiddenDim / 2;
-//     int groupsPerHiddenDim = hiddenDim / sfVecSize;
+    int hiddenDim = packedShape[1] * 2;
+    int packedFp4HiddenDim = hiddenDim / 2;
+    int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-//     for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
-//     {
-//         for (int group = 0; group < groupsPerHiddenDim; ++group)
-//         {
-//             float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
-//             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
-//             uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
-//             uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(
-//                 vIdx, group, packedShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)];
-//             int scale = fp8Scale;
-//             if (sfType == 0)
-//             {
-//                 scale -= 127;
-//             }
-//             else
-//             {
-//                 scale >>= 3;
-//                 scale -= 7;
-//             }
-//             float scaleFloat = makeExpFloat(scale);
-//             for (int i = 0; i < sfVecSize; ++i)
-//             {
-//                 uint8_t packedFp4 = packedFp4Ptr[i / 2];
-//                 if (i % 2 == 1)
-//                 {
-//                     packedFp4 >>= 4;
-//                 }
-//                 packedFp4 &= 0xf;
-//                 float value = e2M1ToFloat(packedFp4) * scaleFloat;
-//                 floatPtr[i] = value;
-//             }
-//         }
-//     }
-//     return floatTensor;
-// }
+    for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
+    {
+        for (int group = 0; group < groupsPerHiddenDim; ++group)
+        {
+            float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
+            uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
+            uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
+            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(
+                vIdx, group, packedShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)];
+            int scale = fp8Scale;
+            if (sfType == 0)
+            {
+                scale -= 127;
+            }
+            else
+            {
+                scale >>= 3;
+                scale -= 7;
+            }
+            float scaleFloat = makeExpFloat(scale);
+            for (int i = 0; i < sfVecSize; ++i)
+            {
+                uint8_t packedFp4 = packedFp4Ptr[i / 2];
+                if (i % 2 == 1)
+                {
+                    packedFp4 >>= 4;
+                }
+                packedFp4 &= 0xf;
+                float value = e2M1ToFloat(packedFp4) * scaleFloat;
+                floatPtr[i] = value;
+            }
+        }
+    }
+    return floatTensor;
+}
 
-// // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-// at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8SF, at::Tensor globalScale,
-//     int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
-// {
-//     CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
-//     CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
-//     auto packedShape = valueE2M1.sizes();
-//     auto scaleShape = scaleFP8SF.sizes();
-//     TORCH_CHECK(packedShape.size() == 2, "valueE2M1 should be 2D tensor.");
-//     TORCH_CHECK(scaleShape.size() == 1, "scaleFP8SF should be 1D tensor.");
-//     at::Tensor floatTensor
-//         = th::zeros({packedShape[0], packedShape[1] * 2}, th::dtype(th::kFloat32).requires_grad(false));
+// Used by the (fp16 -> int4) quant layer + int4 gemm network.
+at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8SF, at::Tensor globalScale,
+    int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
+{
+    CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
+    CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
+    auto packedShape = valueE2M1.sizes();
+    auto scaleShape = scaleFP8SF.sizes();
+    TORCH_CHECK(packedShape.size() == 2, "valueE2M1 should be 2D tensor.");
+    TORCH_CHECK(scaleShape.size() == 1, "scaleFP8SF should be 1D tensor.");
+    at::Tensor floatTensor
+        = at::zeros({packedShape[0], packedShape[1] * 2}, at::dtype(at::ScalarType::Float).requires_grad(false));
 
-//     CHECK_CPU_INPUT(globalScale, th::kFloat32);
-//     float globalScaleVal = globalScale.data_ptr<float>()[0];
+    CHECK_CPU_INPUT(globalScale, at::ScalarType::Float);
+    float globalScaleVal = globalScale.data_ptr<float>()[0];
 
-//     int hiddenDim = packedShape[1] * 2;
-//     int packedFp4HiddenDim = hiddenDim / 2;
-//     int groupsPerHiddenDim = hiddenDim / sfVecSize;
+    int hiddenDim = packedShape[1] * 2;
+    int packedFp4HiddenDim = hiddenDim / 2;
+    int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-//     tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-//                                                                       : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
 
-//     for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
-//     {
-//         for (int group = 0; group < groupsPerHiddenDim; ++group)
-//         {
-//             float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
-//             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
-//             uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
-//             uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim, layout)];
-//             float scaleFloat;
-//             if (sfType == 0)
-//             {
-//                 uint32_t tmp = uint32_t(fp8Scale) << 23;
-//                 memcpy(&scaleFloat, &tmp, sizeof(scaleFloat));
-//             }
-//             else
-//             {
-//                 scaleFloat = float(reinterpret_cast<__nv_fp8_e4m3&>(fp8Scale));
-//             }
-//             scaleFloat *= globalScaleVal;
-//             for (int i = 0; i < sfVecSize; ++i)
-//             {
-//                 uint8_t packedFp4 = packedFp4Ptr[i / 2];
-//                 if (i % 2 == 1)
-//                 {
-//                     packedFp4 >>= 4;
-//                 }
-//                 packedFp4 &= 0xf;
-//                 float value = e2M1ToFloat(packedFp4) * scaleFloat;
-//                 floatPtr[i] = value;
-//             }
-//         }
-//     }
-//     return floatTensor;
-// }
+    for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
+    {
+        for (int group = 0; group < groupsPerHiddenDim; ++group)
+        {
+            float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
+            uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
+            uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
+            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim, layout)];
+            float scaleFloat;
+            if (sfType == 0)
+            {
+                uint32_t tmp = uint32_t(fp8Scale) << 23;
+                memcpy(&scaleFloat, &tmp, sizeof(scaleFloat));
+            }
+            else
+            {
+                scaleFloat = float(reinterpret_cast<__nv_fp8_e4m3&>(fp8Scale));
+            }
+            scaleFloat *= globalScaleVal;
+            for (int i = 0; i < sfVecSize; ++i)
+            {
+                uint8_t packedFp4 = packedFp4Ptr[i / 2];
+                if (i % 2 == 1)
+                {
+                    packedFp4 >>= 4;
+                }
+                packedFp4 &= 0xf;
+                float value = e2M1ToFloat(packedFp4) * scaleFloat;
+                floatPtr[i] = value;
+            }
+        }
+    }
+    return floatTensor;
+}
 
 } // namespace torch_ext
 
@@ -530,8 +530,10 @@ at::Tensor NVFP4BlockScaleInterleaveReverse(at::Tensor const& blockScale)
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // m.def("fp4_quantize", &torch_ext::fp4_quantize);
-  m.def("nvfp4_block_scale_interleave(Tensor input)", &torch_ext::NVFP4BlockScaleInterleave);
-  m.def("nvfp4_block_scale_interleave_reverse(Tensor input)", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+  m.def("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
+  m.def("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
+//   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloat);
+  m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 }
 
 // TORCH_LIBRARY_FRAGMENT(trtllm, m)

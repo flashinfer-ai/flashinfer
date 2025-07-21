@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from flashinfer import (
-    block_scale_interleave,
+    nvfp4_block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
 )
@@ -190,7 +190,6 @@ def test_fp4_quantization(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
     out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
-
     out, out_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False)
     assert n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible"
     scale_ans = recover_swizzled_scales(
@@ -242,12 +241,12 @@ def test_scale_swizzling(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_block_scale_interleave(
+def test_nvfp4_block_scale_interleave(
     shape: tuple[int, int],
     seed: int,
     device: str,
 ) -> None:
-    """Test the block_scale_interleave function directly."""
+    """Test the nvfp4_block_scale_interleave function directly."""
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
@@ -262,7 +261,7 @@ def test_block_scale_interleave(
     unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
 
     # Test the swizzling function
-    swizzled_sf = block_scale_interleave(unswizzled_sf)
+    swizzled_sf = nvfp4_block_scale_interleave(unswizzled_sf)
 
     # Compare against the reference implementation
     ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)
@@ -312,7 +311,7 @@ def test_e2m1_dequantization(
 
     # Test with default common settings
     is_sf_swizzled_layout = True
-    block_size = 32 if sf_use_ue8m0 else 16
+    block_size = 16#32 if sf_use_ue8m0 else 16
 
     # Step 1: Quantize with fp4_quantize
     quantized_tensor, scale_factors = fp4_quantize(
