@@ -74,16 +74,23 @@ def test_fp8_blockscale_gemm(
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm"])
 def test_fp8_groupwise_gemm(
     m,
     n,
     k,
     scale_major_mode,
-    out_dtype,
+    backend,
 ):
+    if backend == "trtllm":
+        if scale_major_mode != "MN":
+            pytest.skip("trtllm only supports MN scale_major_mode")
+        if k < 256:
+            pytest.skip("k < 256")
+
     torch.random.manual_seed(0)
     tile_size = 128
+    out_dtype = torch.bfloat16
 
     a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
     b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
@@ -105,7 +112,13 @@ def test_fp8_groupwise_gemm(
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
 
     c = gemm_fp8_nt_groupwise(
-        a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
