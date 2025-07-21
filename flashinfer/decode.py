@@ -1784,6 +1784,7 @@ def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
