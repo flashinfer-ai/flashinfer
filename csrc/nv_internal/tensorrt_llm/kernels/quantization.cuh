@@ -419,12 +419,16 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   float outputScale;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
     __nv_fp8_e8m0 tmp;
     // Scale the max value to the range of E2m1.
     vecMax *= reciprocal_approximate_ftz(6.0f);
     tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
     fp8SFVal = tmp.__x;
     outputScale = exp2f_rcp(fp8SFVal);
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
   } else {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
@@ -511,16 +515,21 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmp);
     fp8SFVal = tmp.__x;
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
   }
+
   // Get the output scale.
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
   float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValue) : 0.0f;
@@ -551,6 +560,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 }
 
 // Quantizes the provided PackedVec into the uint64_t output
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 template <class Type, int SF_VEC_SIZE>
 __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -612,6 +622,9 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
   return 0;
 #endif
 }
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
 
 inline __host__ __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx,
                                                            int kIdx, std::optional<int> numRows,
