@@ -18,7 +18,7 @@ import functools
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -257,7 +257,7 @@ def get_trtllm_comm_module():
         scale_out: Optional[torch.Tensor],
         rms_gamma: Optional[torch.Tensor],
         rms_eps: Optional[float],
-        scale_factor: Optional[float],
+        scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[FP4QuantizationSFLayout],
     ) -> None:
         module.trtllm_allreduce_fusion(
@@ -783,7 +783,7 @@ def trtllm_allreduce_fusion(
     scale_out: Optional[torch.Tensor],
     rms_gamma: Optional[torch.Tensor],
     rms_eps: Optional[float],
-    scale_factor: Optional[float],
+    scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[FP4QuantizationSFLayout],
 ) -> None:
     """
@@ -807,7 +807,7 @@ def trtllm_allreduce_fusion(
     - scale_out: the scale output tensor. Initialization referece: tests/test_trtllm_allreduce_fusion.py
     - rms_gamma: the rms gamma tensor. [hidden_dim]
     - rms_eps: the rms epsilon value.
-    - scale_factor: the scale factor.
+    - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
 
     Note:
@@ -833,7 +833,13 @@ def trtllm_allreduce_fusion(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
         use_oneshot = False
-
+    if scale_factor is not None:
+        if isinstance(scale_factor, torch.Tensor):
+            scale_factor = scale_factor.to(torch.float32)
+        else:
+            scale_factor = torch.tensor(
+                [scale_factor], dtype=torch.float32, device=allreduce_in.device
+            )
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
         world_size=world_size,
