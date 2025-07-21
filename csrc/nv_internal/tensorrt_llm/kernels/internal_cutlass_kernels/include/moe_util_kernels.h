@@ -24,7 +24,7 @@
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/NvInferRuntime.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <map>

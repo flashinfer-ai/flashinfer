@@ -147,134 +147,6 @@ int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensor
     }
 }
 
-// torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
-//     at::Tensor floatTensor, int64_t sfVecSize, int64_t sfType, torch::optional<bool> isSfSwizzledLayout)
-// {
-//     CHECK_CPU_INPUT(floatTensor, th::kFloat32);
-//     auto inputShape = floatTensor.sizes();
-//     TORCH_CHECK(inputShape.size() == 2, "Input should be 2D tensor.");
-//     TORCH_CHECK(inputShape[1] % sfVecSize == 0);
-//     at::Tensor valueE2M1 = th::zeros({inputShape[0], inputShape[1] / 2}, th::dtype(FLOAT4_E2M1X2).requires_grad(false));
-//     at::Tensor scaleFP8SF
-//         = th::zeros({tensorrt_llm::computeFP4SwizzledLayoutSFSize(inputShape[0], inputShape[1] / sfVecSize)},
-//             th::dtype(SF_DTYPE).requires_grad(false));
-//     at::Tensor repFloat = th::zeros(inputShape, th::dtype(th::kFloat32).requires_grad(false));
-
-//     int hiddenDim = inputShape[1];
-//     int packedFp4HiddenDim = hiddenDim / 2;
-//     int groupsPerHiddenDim = hiddenDim / sfVecSize;
-
-//     // Note: if isSfSwizzledLayout is provided, use its value; otherwise default to true.
-//     tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout.value_or(true)
-//         ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-//         : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
-
-//     for (size_t vIdx = 0; vIdx < static_cast<size_t>(inputShape[0]); ++vIdx)
-//     {
-//         for (int group = 0; group < groupsPerHiddenDim; ++group)
-//         {
-//             float const* inputPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
-//             float* repPtr = repFloat.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
-//             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
-//             int8_t* scaleFP8SFPtr = static_cast<int8_t*>(scaleFP8SF.data_ptr());
-
-//             float maxAbsValue = 0.0f;
-//             for (int i = 0; i < sfVecSize; ++i)
-//             {
-//                 maxAbsValue = std::max(maxAbsValue, fabs(inputPtr[i]));
-//             }
-//             int scaleExp = getExp(maxAbsValue);
-//             scaleExp -= 2;
-//             if (sfType == 0)
-//             {
-//                 scaleExp = std::max(scaleExp, -126);
-//                 int e8M0Scale = scaleExp + 127;
-//                 TORCH_CHECK_GT(e8M0Scale, 0);
-//                 TORCH_CHECK_LT(e8M0Scale, 255);
-//                 int8_t e8M0ScaleOut = e8M0Scale & 0xff;
-//                 scaleFP8SFPtr[computeSFIndex(vIdx, group, inputShape[0], groupsPerHiddenDim, layout)] = e8M0ScaleOut;
-//             }
-//             else
-//             {
-//                 scaleExp = std::max(scaleExp, -6);
-//                 int e4M3Scale = scaleExp + 7;
-//                 TORCH_CHECK_GT(e4M3Scale, 0);
-//                 TORCH_CHECK_LT(e4M3Scale, 15);
-//                 int8_t e4M3ScaleOut = (e4M3Scale & 0xff) << 3;
-//                 scaleFP8SFPtr[computeSFIndex(vIdx, group, inputShape[0], groupsPerHiddenDim, layout)] = e4M3ScaleOut;
-//             }
-//             float scaleFloat = makeExpFloat(scaleExp);
-//             float invScaleFloat = 1.0 / scaleFloat;
-//             // printf("vIdx=%ld, group=%d, maxAbsValue=%f, scaleExp=%d, e8M0Scale=%d, scaleFloat=%f,
-//             // invScaleFloat=%f\n",
-//             //        vIdx, group, maxAbsValue, scaleExp, e8M0Scale, scaleFloat, invScaleFloat);
-//             for (int i = 0; i < sfVecSize; ++i)
-//             {
-//                 float value = inputPtr[i];
-//                 float scaledValue = invScaleFloat * value;
-//                 uint8_t fp4Value = floatToE2M1(scaledValue);
-//                 float e2M1FloatValue = e2M1ToFloat(fp4Value);
-//                 float repResult = e2M1FloatValue * scaleFloat;
-//                 repPtr[i] = repResult;
-//                 uint8_t packedValue = packedFp4Ptr[i / 2];
-//                 if (i % 2 == 0)
-//                 {
-//                     packedValue &= 0xf0;
-//                     packedValue |= fp4Value;
-//                 }
-//                 else
-//                 {
-//                     packedValue &= 0x0f;
-//                     packedValue |= (fp4Value << 4);
-//                 }
-//                 packedFp4Ptr[i / 2] = packedValue;
-//                 // printf("  i=%d, value=%f, scaledValue=%f, fp4Value=%x, e2M1FloatValue=%f, repResult=%f\n",
-//                 //        i, value, scaledValue, (int)fp4Value, e2M1FloatValue, repResult);
-//             }
-//         }
-//     }
-
-//     return {valueE2M1, scaleFP8SF, repFloat};
-// }
-
-// // Preprocess the weights.
-// torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
-//     at::Tensor halfTensor, at::Tensor globalScale, int64_t sfVecSize, int64_t sfType)
-// {
-//     CHECK_INPUT_TYPE(halfTensor, th::kFloat16);
-//     CHECK_INPUT_TYPE(globalScale, th::kFloat32);
-//     auto inputShape = halfTensor.sizes();
-//     TORCH_CHECK(inputShape.size() == 2 || inputShape.size() == 3, "Input should be 2D or 3D tensor.");
-//     bool has_experts = inputShape.size() == 3;
-//     auto num_experts = has_experts ? inputShape[0] : 1;
-//     auto rows = has_experts ? inputShape[1] : inputShape[0];
-//     auto cols = has_experts ? inputShape[2] : inputShape[1];
-
-//     auto const expert_sf_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols / sfVecSize);
-
-//     TORCH_CHECK(cols % sfVecSize == 0);
-//     std::array<int64_t, 3> shape{num_experts, rows, cols / 2};
-//     th::IntArrayRef shape_ref(shape.data() + !has_experts, shape.size() - !has_experts);
-//     at::Tensor valueE2M1 = th::zeros(shape_ref, th::dtype(FLOAT4_E2M1X2).device(torch::kCUDA).requires_grad(false));
-//     at::Tensor scaleFP8SF
-//         = th::zeros({num_experts * expert_sf_size}, th::dtype(SF_DTYPE).device(torch::kCUDA).requires_grad(false));
-
-//     int const mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-//     for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
-//     {
-//         size_t const expert_elem_offset = rows * cols * eIdx;
-//         size_t const expert_sf_offset = expert_sf_size * eIdx;
-//         constexpr int FP4_PER_INT64 = 16;
-//         constexpr int FP8_PER_INT32 = 4;
-//         tensorrt_llm::kernels::invokeFP4Quantization(rows, cols,
-//             reinterpret_cast<half*>(halfTensor.data_ptr()) + expert_elem_offset, globalScale.data_ptr<float>() + eIdx,
-//             reinterpret_cast<int64_t*>(valueE2M1.data_ptr()) + expert_elem_offset / FP4_PER_INT64,
-//             reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()) + expert_sf_offset / FP8_PER_INT32, sfType == 0,
-//             tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, 0);
-//     }
-
-//     return {valueE2M1, scaleFP8SF};
-// }
 
 // Interleave (and possibly pad) the weights block scaling factor.
 // blockScale: [num_experts, rows, cols] or [rows, cols]
@@ -515,18 +387,6 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
 
 } // namespace torch_ext
 
-// static auto float_to_e2m1_and_ufp8sf_scale
-//     = torch::RegisterOperators("tensorrt_llm::float_to_e2m1_and_ufp8sf_scale", &torch_ext::FloatToE2M1AndUFP8SFScale);
-
-// static auto half_to_e2m1_and_ufp8sf_scale
-//     = torch::RegisterOperators("tensorrt_llm::half_to_e2m1_and_ufp8sf_scale", &torch_ext::HalfToE2M1AndUFP8SFScale);
-
-// static auto e2m1_and_ufp8sf_scale_to_float
-//     = torch::RegisterOperators("tensorrt_llm::e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloat);
-
-// static auto e2m1_and_ufp8sf_scale_to_float_v2 = torch::RegisterOperators(
-//     "tensorrt_llm::e2m1_and_ufp8sf_scale_to_float_v2", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
-
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // m.def("fp4_quantize", &torch_ext::fp4_quantize);
@@ -535,21 +395,3 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
 //   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloat);
   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 }
-
-// TORCH_LIBRARY_FRAGMENT(trtllm, m)
-// {
-//     m.def("nvfp4_block_scale_interleave(Tensor input) -> Tensor");
-//     m.def("nvfp4_block_scale_interleave_reverse(Tensor input) -> Tensor");
-// }
-
-// TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-// {
-//     m.impl("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
-//     m.impl("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
-// }
-
-// TORCH_LIBRARY_IMPL(trtllm, CPU, m)
-// {
-//     m.impl("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
-//     m.impl("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
-// }
