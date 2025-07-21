@@ -604,8 +604,11 @@ inline auto get_qkv_tile_indices(
       printf("Debug: merge_indptr[%d]: %d\n", out_merge->size() - 1, out_merge->back());
     }
     out_o->push_back(out_o->back() + qo_len * num_tiles_kv);
-    printf("Debug: o_indptr[%d]: %d\n", out_o->size() - 1, out_o->back());
+    printf("Debug: o_indptr[%d]: %d, num_kv_tiles: %d, qo_len: %d\n", out_o->size() - 1,
+           out_o->back(), num_tiles_kv, qo_len);
   }
+  printf("Debug: o_indptr.size(): %d, merge_indptr.size(): %d, batch_size: %d\n", out_o->size(),
+         out_merge->size(), batch_size);
   return std::make_tuple(std::move(local_req), std::move(local_qo), std::move(local_kv),
                          std::move(local_merge), std::move(local_o), real_batch_size);
 }
@@ -635,16 +638,24 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   auto [request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
         real_batch_size] = get_qkv_tile_indices<IdType>(packed_qo_len_arr, kv_len_arr, batch_size,
                                                         cta_tile_q, kv_chunk_size, gqa_group_size);
-  // for (int i = 0; i <=request_indices.size(); i++) {
-  //   printf("Debug: request_indices[%d]: %d, merge_indptr[%d]: %d, o_indptr[%d]: %d\n", i,
-  //   request_indices[i], i, merge_indptr[i], i, o_indptr[i]);
-  // }
-  // for (int i = 0; i < qo_tile_indices.size(); i++) {
-  //   printf("Debug: qo_tile_indices[%d]: %d\n", i, qo_tile_indices[i]);
-  // }
-  // for (int i = 0; i < kv_tile_indices.size(); i++) {
-  //   printf("Debug: kv_tile_indices[%d]: %d\n", i, kv_tile_indices[i]);
-  // }
+  // print indices
+  printf("Debug: -------------------------------\n");
+  for (int i = 0; i < request_indices.size(); i++) {
+    printf("Debug: request_indices[%d]: %d\n", i, request_indices[i]);
+  }
+  for (int i = 0; i < merge_indptr.size(); i++) {
+    printf("Debug: merge_indptr[%d]: %d\n", i, merge_indptr[i]);
+  }
+  for (int i = 0; i < o_indptr.size(); i++) {
+    printf("Debug: o_indptr[%d]: %d\n", i, o_indptr[i]);
+  }
+  for (int i = 0; i < qo_tile_indices.size(); i++) {
+    printf("Debug: qo_tile_indices[%d]: %d\n", i, qo_tile_indices[i]);
+  }
+  for (int i = 0; i < kv_tile_indices.size(); i++) {
+    printf("Debug: kv_tile_indices[%d]: %d\n", i, kv_tile_indices[i]);
+  }
+
   const size_t padded_batch_size =
       enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : real_batch_size;
   FLASHINFER_CHECK(real_batch_size <= padded_batch_size,
@@ -890,10 +901,15 @@ inline auto PODSplitQOKVIndptr(IdType* qo_indptr_p, IdType* kv_indptr_p, uint32_
                                    kv_chunk_size_d, gqa_group_size, &request_indices,
                                    &qo_tile_indices, &kv_tile_indices, &merge_indptr, &o_indptr);
   // print indices
+  printf("Debug: -------------------------------\n");
   for (int i = 0; i < request_indices.size(); i++) {
-    printf("Debug: request_indices[%d]: %d, merge_indptr[%d]: %d, o_indptr[%d]: %d\n", i,
-           request_indices[i], i, merge_indptr[i + 1] - merge_indptr[i], i,
-           o_indptr[i + 1] - o_indptr[i]);
+    printf("Debug: request_indices[%d]: %d\n", i, request_indices[i]);
+  }
+  for (int i = 0; i < merge_indptr.size(); i++) {
+    printf("Debug: merge_indptr[%d]: %d\n", i, merge_indptr[i]);
+  }
+  for (int i = 0; i < o_indptr.size(); i++) {
+    printf("Debug: o_indptr[%d]: %d\n", i, o_indptr[i]);
   }
   for (int i = 0; i < qo_tile_indices.size(); i++) {
     printf("Debug: qo_tile_indices[%d]: %d\n", i, qo_tile_indices[i]);

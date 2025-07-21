@@ -43,4 +43,3 @@ using namespace flashinfer;
     });                                                                              \
   });                                                                                \
 }
-

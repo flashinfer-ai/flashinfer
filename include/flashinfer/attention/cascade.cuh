@@ -434,8 +434,8 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
       v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
       if (iter * bdy + ty < num_index_sets) {
         float s = s_smem[(iter % bdx) * bdy + ty];
-        printf("Debug: qo_id: %d, head_idx: %d, kv_id: %d, output: %f\n", pos, head_idx,
-               iter * bdy + ty, s);
+        // printf("Debug: qo_id: %d, head_idx: %d, kv_id: %d, output: %f\n", pos, head_idx,
+        //  iter * bdy + ty, s);
         st.merge(v, s, 1);
       }
       __syncthreads();
