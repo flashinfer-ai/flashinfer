@@ -752,11 +752,18 @@ def _get_native_fp4_dtype():
         return torch.uint8
 
 
-@functools.lru_cache(maxsize=1)
-def _get_cudnn_handle():
+# Global cudnn handle. need to make it per device in future
+_cudnn_handle = None
+
+
+def _get_cudnn_handle(stream: torch.cuda.Stream):
     """Create and return a cached cuDNN handle."""
-    _check_cudnn_availability()
-    return cudnn.create_handle()
+    global _cudnn_handle
+    if _cudnn_handle is None:
+        _check_cudnn_availability()
+        _cudnn_handle = cudnn.create_handle()
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
+    return _cudnn_handle
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -785,7 +792,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 ):
     _check_cudnn_availability()
 
-    with cudnn.graph(_get_cudnn_handle()) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(torch.cuda.current_stream())) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=ab_type
         )
@@ -874,7 +881,9 @@ def execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, c_fin
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
     )
 
-    graph.execute(variant_pack, workspace, handle=_get_cudnn_handle())
+    graph.execute(
+        variant_pack, workspace, handle=_get_cudnn_handle(torch.cuda.current_stream())
+    )
 
 
 @functools.lru_cache(maxsize=128)
@@ -899,7 +908,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
     """
     _check_cudnn_availability()
 
-    with cudnn.graph(_get_cudnn_handle()) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(torch.cuda.current_stream())) as (graph, _):
 
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=a_type
@@ -950,7 +959,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, alpha, c_final):
         UIDs.O_UID.value: c_final,
     }
 
-    cudnn_handle = _get_cudnn_handle()
+    cudnn_handle = _get_cudnn_handle(torch.cuda.current_stream())
 
     workspace = torch.empty(
         graph.get_workspace_size(), device="cuda", dtype=torch.uint8
