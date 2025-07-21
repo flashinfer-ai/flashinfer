@@ -744,6 +744,39 @@ def _check_cudnn_availability():
         )
 
 
+def _check_cudnn_fp4_availability():
+    """Check if cuDNN FP4 support is available and raise exception if not."""
+    _check_cudnn_availability()
+
+    # Check cuDNN version for FP4 support (requires 1.13.* or later)
+    try:
+        version_str = cudnn.__version__
+        major, minor = map(int, version_str.split(".")[:2])
+
+        if (major, minor) < (1, 13):
+            raise RuntimeError(
+                f"cuDNN FP4 requires version 1.13+, found {version_str}. "
+                f"Upgrade: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
+            )
+    except (ImportError, AttributeError, ValueError, IndexError):
+        raise RuntimeError(
+            "Unable to determine cuDNN version. FP4 requires cuDNN 1.13+."
+        )
+
+    # Check cuDNN backend version for FP4 support (requires >= 91002)
+    try:
+        backend_version = cudnn.backend_version()
+        if backend_version < 91002:
+            raise RuntimeError(
+                f"cuDNN FP4 requires backend version >= 91002, found {backend_version}. "
+                f"Please upgrade cuDNN backend."
+            )
+    except (AttributeError, TypeError):
+        raise RuntimeError(
+            "Unable to determine cuDNN backend version. FP4 requires backend >= 91002."
+        )
+
+
 def _get_native_fp4_dtype():
     """get native fp4 datatype if supported in the torch, otherwise return uint8."""
     if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1119,6 +1152,8 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
+    _check_cudnn_fp4_availability()
+
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
