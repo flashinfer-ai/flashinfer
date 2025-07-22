@@ -26,7 +26,7 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("q_dtype", ["half", "bf16"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("window_left", [-1])  # 127
+@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
 def test_trtllm_batch_context_wrapper(
     kv_layout,
     batch_size,
@@ -118,19 +118,3 @@ def test_trtllm_batch_context_wrapper(
     print(f"RMSE between reference_kv_cache and kv_data: {rmse.item()}")
     torch.testing.assert_close(output, reference_output, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(reference_kv_cache, kv_data, rtol=1e-2, atol=1e-2)
-
-
-if __name__ == "__main__":
-    test_trtllm_batch_context_wrapper(
-        kv_layout="HND",
-        batch_size=128,
-        kv_len=2048,
-        qo_len=37,
-        num_qo_heads=32,
-        head_dim=128,
-        page_size=16,
-        num_kv_heads=2,
-        q_dtype="bf16",
-        logits_soft_cap=0.0,
-        window_left=127,
-    )

@@ -466,19 +466,3 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
-
-
-if __name__ == "__main__":
-    # run all tests in the order of pytest
-    # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
-    test_trtllm_batch_decode_mla(1024, 1.0, torch.bfloat16, 32, 1, False)
-    test_trtllm_batch_decode_fmha(
-        kv_layout="HND",
-        batch_size=4,
-        page_size=16,
-        num_kv_heads=2,
-        head_grp_size=8,
-        window_left=127,
-        q_dtype="bf16",
-        kv_cache_dtype="auto",
-    )
