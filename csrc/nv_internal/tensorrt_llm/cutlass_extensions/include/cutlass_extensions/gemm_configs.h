@@ -98,8 +98,9 @@ enum class CutlassTileConfigSM90 {
   CtaShape128x128x128B,
   CtaShape128x256x128B,
 
-  // CTA configs for M=128
+  // CTA configs for M=256
   CtaShape256x128x128B,
+  CtaShape256x256x128B,
 };
 
 enum class CutlassTileConfigSM100 {
