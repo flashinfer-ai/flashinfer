@@ -475,7 +475,7 @@ class AutoTuner:
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
         # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
         # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs, stream)
+        delay_kernel(self.stream_delay_micro_secs)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
