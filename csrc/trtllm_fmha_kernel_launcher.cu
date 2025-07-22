@@ -39,15 +39,15 @@ enum class TllmPagedAttentionMode {
   ForGen,
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO, TllmPagedAttentionMode mode>
 void trtllm_paged_attention_launcher(
-    DTypeO* out, DTypeQ* query, DTypeKV* key_cache, DTypeKV* value_cache, void* workspace_buffer,
-    KVCachePageIndex* block_tables, int* seq_lens, int64_t batch_size, int64_t max_q_len,
-    int64_t max_kv_len, int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_0,
-    int64_t kv_stride_1, int64_t kv_stride_2, int64_t max_num_blocks_per_seq, double bmm1_scale,
-    double bmm2_scale, int64_t window_left, int64_t sum_seq_q, int64_t sm_count,
-    cudaStream_t stream, int* cum_seq_lens_q = nullptr, int* cum_seq_lens_kv = nullptr) {
+    void* out, void* query, void* key_cache, void* value_cache, void* workspace_buffer,
+    int* block_tables, int* seq_lens, int* cum_seq_lens_q, int* cum_seq_lens_kv,
+    Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type,
+    TllmPagedAttentionMode mode, int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
+    int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
+    int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_0, int64_t kv_stride_1,
+    int64_t kv_stride_2, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
+    int64_t window_left, int64_t sum_seq_q, int64_t sm_count, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -55,9 +55,6 @@ void trtllm_paged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  auto q_data_type = TypeToDataType<DTypeQ>::value;
-  auto kv_data_type = TypeToDataType<DTypeKV>::value;
-  auto o_data_type = TypeToDataType<DTypeO>::value;
   static auto fmha_runner = TllmGenFmhaRunner(q_data_type, kv_data_type, o_data_type);
 
   TllmGenFmhaRunnerParams runner_params;
@@ -93,7 +90,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
 
-  if constexpr (mode == TllmPagedAttentionMode::Context) {
+  if (mode == TllmPagedAttentionMode::Context) {
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
     runner_params.mTileScheduler = TileScheduler::Persistent;
@@ -130,54 +127,67 @@ void trtllm_paged_attention_launcher(
   fmha_runner.run(runner_params);
 }
 
+inline Data_type torch_dtype_to_tllm_data_type(at::ScalarType dtype) {
+  if (dtype == at::ScalarType::Float) {
+    return Data_type::DATA_TYPE_FP32;
+  } else if (dtype == at::ScalarType::Half) {
+    return Data_type::DATA_TYPE_FP16;
+  } else if (dtype == at::ScalarType::BFloat16) {
+    return Data_type::DATA_TYPE_BF16;
+  } else if (dtype == at::ScalarType::Float8_e4m3fn) {
+    return Data_type::DATA_TYPE_E4M3;
+  } else if (dtype == at::ScalarType::Float8_e5m2) {
+    return Data_type::DATA_TYPE_E5M2;
+  }
+  return Data_type::DATA_TYPE_UNKNOWN;
+}
+
 void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
                                    at::Tensor& workspace_buffer, at::Tensor& block_tables,
                                    at::Tensor& seq_lens, int64_t max_kv_len, double bmm1_scale,
                                    double bmm2_scale, int64_t window_left, int64_t sm_count) {
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.scalar_type(), DTypeQ, [&]() {
-    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(key_value_cache.scalar_type(), DTypeKV, [&]() {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(out.scalar_type(), DTypeO, [&]() {
-        // NOTE(Zihao): query is [B, Q, H, D]
-        // where Q is the number of query tokens per request, used in MTP
-        // based on profiled results, always use decode mode for MTP (q_len is small)
-        // example: when kv_len = 10000, q < 200, decode mode is faster
-        int batch_size = query.size(0);
-        int q_len_per_request = query.size(1);
-        int sum_seq_q = batch_size * q_len_per_request;
-        int num_qo_heads = query.size(2);
-        int head_dim_qk = query.size(3);
-        int head_dim_vo = out.size(-1);
-        // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
-        TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
-                    "The second dimension of key_value_cache must be 1 or 2, got " +
-                        std::to_string(key_value_cache.size(1)));
-        bool share_kv_cache = key_value_cache.size(1) == 1;
-        int page_size = key_value_cache.size(-2);
-        int num_kv_heads = key_value_cache.size(-3);
-        int max_num_blocks_per_seq = block_tables.size(-1);
-        int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
+  auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
+  auto kv_data_type = torch_dtype_to_tllm_data_type(key_value_cache.scalar_type());
+  auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
+  // NOTE(Zihao): query is [B, Q, H, D]
+  // where Q is the number of query tokens per request, used in MTP
+  // based on profiled results, always use decode mode for MTP (q_len is small)
+  // example: when kv_len = 10000, q < 200, decode mode is faster
+  int batch_size = query.size(0);
+  int q_len_per_request = query.size(1);
+  int sum_seq_q = batch_size * q_len_per_request;
+  int num_qo_heads = query.size(2);
+  int head_dim_qk = query.size(3);
+  int head_dim_vo = out.size(-1);
+  // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+  TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
+              "The second dimension of key_value_cache must be 1 or 2, got " +
+                  std::to_string(key_value_cache.size(1)));
+  bool share_kv_cache = key_value_cache.size(1) == 1;
+  int page_size = key_value_cache.size(-2);
+  int num_kv_heads = key_value_cache.size(-3);
+  int max_num_blocks_per_seq = block_tables.size(-1);
+  int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
 
-        int kv_stride_0 = key_value_cache.stride(-2);  // key/values
-        int kv_stride_1 = key_value_cache.stride(-3);  // head
-        int kv_stride_2 = key_value_cache.stride(0);   // batch
+  int kv_stride_0 = key_value_cache.stride(-2);  // key/values
+  int kv_stride_1 = key_value_cache.stride(-3);  // head
+  int kv_stride_2 = key_value_cache.stride(0);   // batch
 
-        auto device = query.device();
-        const auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  auto device = query.device();
+  const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
-        trtllm_paged_attention_launcher<DTypeQ, DTypeKV, DTypeO, TllmPagedAttentionMode::ForGen>(
-            static_cast<DTypeO*>(out.data_ptr()), static_cast<DTypeQ*>(query.data_ptr()),
-            static_cast<DTypeKV*>(key_value_cache.data_ptr()),
-            static_cast<DTypeKV*>(key_value_cache.data_ptr()) +
-                (share_kv_cache ? 0 : key_value_cache.stride(1)),
-            workspace_buffer.data_ptr(), static_cast<KVCachePageIndex*>(block_tables.data_ptr()),
-            static_cast<int*>(seq_lens.data_ptr()), batch_size, /*max_q_len=*/q_len_per_request,
-            max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
-            page_size, kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale,
-            bmm2_scale, window_left, sum_seq_q, sm_count, stream);
-        return true;
-      });
-    });
-  });
+  trtllm_paged_attention_launcher(
+      out.data_ptr(), query.data_ptr(), key_value_cache.data_ptr(),
+      (char*)key_value_cache.data_ptr() +
+          (share_kv_cache ? 0 : key_value_cache.stride(1) * key_value_cache.element_size()),
+      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
+      static_cast<int*>(seq_lens.data_ptr()),
+      /*cum_seq_lens_q=*/nullptr,
+      /*cum_seq_lens_kv=*/nullptr, q_data_type, kv_data_type, o_data_type,
+      TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
+      num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
+      window_left, sum_seq_q, sm_count, stream);
 }
 
 void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
@@ -186,46 +196,42 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
                                     double bmm1_scale, double bmm2_scale, int64_t batch_size,
                                     int64_t window_left, at::Tensor& cum_seq_lens_q,
                                     at::Tensor& cum_seq_lens_kv, int64_t sm_count) {
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(query.scalar_type(), DTypeQ, [&]() {
-    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(key_value_cache.scalar_type(), DTypeKV, [&]() {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(out.scalar_type(), DTypeO, [&]() {
-        int num_qo_heads = query.size(1);
-        int sum_seq_q = query.size(0);
-        int head_dim_qk = query.size(2);
-        int head_dim_vo = out.size(-1);
-        int max_num_blocks_per_seq = block_tables.size(-1);
-        int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
-        // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
-        TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
-                    "The second dimension of key_value_cache must be 1 or 2, got " +
-                        std::to_string(key_value_cache.size(1)));
-        bool share_kv_cache = key_value_cache.size(1) == 1;
-        int page_size = key_value_cache.size(-2);
-        int num_kv_heads = key_value_cache.size(-3);
+  auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
+  auto kv_data_type = torch_dtype_to_tllm_data_type(key_value_cache.scalar_type());
+  auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
+  int num_qo_heads = query.size(1);
+  int sum_seq_q = query.size(0);
+  int head_dim_qk = query.size(2);
+  int head_dim_vo = out.size(-1);
+  int max_num_blocks_per_seq = block_tables.size(-1);
+  int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
+  // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+  TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
+              "The second dimension of key_value_cache must be 1 or 2, got " +
+                  std::to_string(key_value_cache.size(1)));
+  bool share_kv_cache = key_value_cache.size(1) == 1;
+  int page_size = key_value_cache.size(-2);
+  int num_kv_heads = key_value_cache.size(-3);
 
-        int kv_stride_0 = key_value_cache.stride(-2);  // key/values
-        int kv_stride_1 = key_value_cache.stride(-3);  // head
-        int kv_stride_2 = key_value_cache.stride(0);   // batch
+  int kv_stride_0 = key_value_cache.stride(-2);  // key/values
+  int kv_stride_1 = key_value_cache.stride(-3);  // head
+  int kv_stride_2 = key_value_cache.stride(0);   // batch
 
-        auto device = query.device();
-        const auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  auto device = query.device();
+  const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
-        trtllm_paged_attention_launcher<DTypeQ, DTypeKV, DTypeO, TllmPagedAttentionMode::Context>(
-            static_cast<DTypeO*>(out.data_ptr()), static_cast<DTypeQ*>(query.data_ptr()),
-            static_cast<DTypeKV*>(key_value_cache.data_ptr()),
-            static_cast<DTypeKV*>(key_value_cache.data_ptr()) +
-                (share_kv_cache ? 0 : key_value_cache.stride(1)),
-            workspace_buffer.data_ptr(), static_cast<KVCachePageIndex*>(block_tables.data_ptr()),
-            static_cast<int*>(seq_lens.data_ptr()), batch_size, max_q_len, max_kv_len,
-            num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-            kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
-            window_left, sum_seq_q, sm_count, stream,
-            cum_seq_lens_q.defined() ? cum_seq_lens_q.data_ptr<int>() : nullptr,
-            cum_seq_lens_kv.defined() ? cum_seq_lens_kv.data_ptr<int>() : nullptr);
-        return true;
-      });
-    });
-  });
+  trtllm_paged_attention_launcher(
+      out.data_ptr(), query.data_ptr(), key_value_cache.data_ptr(),
+      (char*)key_value_cache.data_ptr() +
+          (share_kv_cache ? 0 : key_value_cache.stride(1) * key_value_cache.element_size()),
+      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
+      static_cast<int*>(seq_lens.data_ptr()),
+      /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
+      /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), q_data_type, kv_data_type,
+      o_data_type, TllmPagedAttentionMode::Context, batch_size, max_q_len, max_kv_len,
+      num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
+      window_left, sum_seq_q, sm_count, stream);
 }
 
 namespace trtllm_cubin_loader {
