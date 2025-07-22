@@ -46,6 +46,7 @@ from .utils import (
     _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
+    _require_kv_cache_cast,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -1530,6 +1531,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # This is a temporary workaround due to the lack of native
+        # fp8 kv cache support in prefill attention kernels. In such
+        # cases, we have to cast k and v to q_data_type. We should
+        # remove this workaround once we implement full fp8 kv cache support.
+        self._kv_cache_cast = _require_kv_cache_cast(q_data_type, kv_data_type)
+        if self._kv_cache_cast:
+            kv_data_type = q_data_type
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1867,6 +1875,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._kv_cache_cast:
+            k_cache = k_cache.to(q.dtype)
+            v_cache = v_cache.to(q.dtype)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -2398,6 +2409,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # This is a temporary workaround due to the lack of native
+        # fp8 kv cache support in prefill attention kernels. In such
+        # cases, we have to cast k and v to q_data_type. We should
+        # remove this workaround once we implement full fp8 kv cache support.
+        self._kv_cache_cast = _require_kv_cache_cast(q_data_type, kv_data_type)
+        if self._kv_cache_cast:
+            kv_data_type = q_data_type
+
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
 
@@ -2638,6 +2657,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        if self._kv_cache_cast:
+            k = k.to(q.dtype)
+            v = v.to(q.dtype)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )

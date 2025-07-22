@@ -94,8 +94,26 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _is_float8_dtype(t: torch.dtype) -> bool:
+    return t in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+
 def is_float8(x: torch.Tensor) -> bool:
-    return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+    return _is_float8_dtype(x.dtype)
+
+
+def _require_kv_cache_cast(
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+) -> bool:
+    """
+    Determine whether the kv_cache needs to be casted to q_data_type.
+    This is a temporary workaround because native fp8 support for
+    the kv cache in prefill attention kernels is not yet available.
+    We should remove this function once full fp8 kv cache support
+    is implemented.
+    """
+    return not _is_float8_dtype(q_data_type) and _is_float8_dtype(kv_data_type)
 
 
 def get_indptr(x: torch.Tensor) -> torch.Tensor:
