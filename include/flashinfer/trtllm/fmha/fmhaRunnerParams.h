@@ -298,6 +298,9 @@ struct TllmGenFmhaRunnerParams {
 
   TllmGenFmhaRunnerParams() {
     // NOTE(Zihao): all fields are POD types, so we can use memset to initialize them to zero
+    static_assert(std::is_standard_layout<TllmGenFmhaRunnerParams>::value,
+                  "TllmGenFmhaRunnerParams must be a POD type (standard layout) for memset to be "
+                  "safe.");
     memset(this, 0, sizeof(TllmGenFmhaRunnerParams));
   }
 };
