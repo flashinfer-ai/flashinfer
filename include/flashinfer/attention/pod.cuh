@@ -73,10 +73,19 @@ __global__ __launch_bounds__(std::max(
     const int prefill_slots = (prefill_blocks + blk_factor_p - 1) / blk_factor_p;
     const int decode_slots = (decode_blocks + blk_factor_d - 1) / blk_factor_d;
 
-    if (blockIdx.x == 0 and threadIdx.x == 0) {
+    if (blockIdx.x == 0) {
       printf("Debug: prefill_slots: %d, decode_slots: %d\n", prefill_slots, decode_slots);
     }
-    if (prefill_slots <= decode_slots) {
+
+    // Dispatch op type
+    if (prefill_slots == 0 && decode_slots == 0)
+      FLASHINFER_RUNTIME_ASSERT(
+          "Number of prefill and decode slots are both 0. Check your kv indices.");
+    else if (prefill_slots == 0) {
+      op = DECODE;
+    } else if (decode_slots == 0) {
+      op = PREFILL;
+    } else if (prefill_slots <= decode_slots) {
       // Total tags = (decode + prefill) / min(decode, prefill)
       // = 1 + decode / prefill; when prefill < decode
       const int total_tags = decode_slots / prefill_slots + 1;
@@ -97,6 +106,11 @@ __global__ __launch_bounds__(std::max(
       } else {
         op = DECODE;
       }
+    }
+    if (op == 0) {
+      printf("Debug: block %d running prefill. op: %d\n", blockIdx.x, op);
+    } else {
+      printf("Debug: block %d running decode. op: %d\n", blockIdx.x, op);
     }
 
     // Get the next blockId for that operation
