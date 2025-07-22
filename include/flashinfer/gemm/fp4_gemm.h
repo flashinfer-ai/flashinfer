@@ -15,7 +15,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef FLASHINFER_FP4_GEMM_H_
+#define FLASHINFER_FP4_GEMM_H_
 
 #include <cuda_runtime_api.h>
 
@@ -86,3 +87,5 @@ class CutlassFp4GemmRunner : public virtual CutlassFp4GemmRunnerInterface {
 
 }  // namespace gemm
 }  // namespace flashinfer
+
+#endif  // FLASHINFER_FP4_GEMM_H_

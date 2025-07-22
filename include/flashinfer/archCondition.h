@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef FLASHINFER_ARCH_CONDITION_H_
+#define FLASHINFER_ARCH_CONDITION_H_
 
 namespace flashinfer {
 
@@ -89,3 +90,5 @@ inline constexpr bool is_compatible_v = is_compatible<Arch>::value;
 }  // namespace arch
 
 }  // namespace flashinfer
+
+#endif  // FLASHINFER_ARCH_CONDITION_H_

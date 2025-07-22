@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#pragma once
+#ifndef FLASHINFER_NVFP4_NVFP4_GEMM_TEMPLATE_SM100_H_
+#define FLASHINFER_NVFP4_NVFP4_GEMM_TEMPLATE_SM100_H_
 
 #ifndef _WIN32
 #pragma GCC diagnostic push
@@ -285,3 +285,4 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
 
 }  // namespace gemm
 }  // namespace flashinfer
+#endif  // FLASHINFER_NVFP4_NVFP4_GEMM_TEMPLATE_SM100_H_

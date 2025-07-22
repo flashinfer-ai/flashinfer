@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#pragma once
+#ifndef FLASHINFER_FP4_GEMM_TEMPLATE_H_
+#define FLASHINFER_FP4_GEMM_TEMPLATE_H_
 
 #ifndef _WIN32
 #pragma GCC diagnostic push
@@ -266,3 +267,4 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSize(int const m, int c
 
 }  // namespace gemm
 }  // namespace flashinfer
+#endif  // FLASHINFER_FP4_GEMM_TEMPLATE_H_
