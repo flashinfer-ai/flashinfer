@@ -52,6 +52,8 @@ from .utils import (
     register_fake_op,
 )
 
+DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+
 
 def gen_gemm_module() -> JitSpec:
     return gen_jit_spec(
@@ -1311,7 +1313,7 @@ def bmm_fp8(
         return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype)
     elif backend == "cublas":
         workspace_buffer = _get_cache_buf(
-            "bmm_fp8_workspace", 32 * 1024 * 1024, A.device
+            "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
         )
         get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
@@ -1379,7 +1381,7 @@ def gemm_fp8_nt_groupwise(
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
     workspace_buffer = _get_cache_buf(
-        "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
+        "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
@@ -1518,10 +1520,10 @@ def group_gemm_fp8_nt_groupwise(
     to accommodate the kernel's requirement.
     """
     int_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     float_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_fp8_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -1645,10 +1647,10 @@ def group_gemm_mxfp4_nt_groupwise(
     to accommodate the kernel's requirement.
     """
     int_workspace_buffer = _get_cache_buf(
-        "group_gemm_mxfp4_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_mxfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     float_workspace_buffer = _get_cache_buf(
-        "group_gemm_mxfp4_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_mxfp4_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
