@@ -347,9 +347,7 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // m.def("fp4_quantize", &torch_ext::fp4_quantize);
   m.def("nvfp4_block_scale_interleave", &torch_ext::NVFP4BlockScaleInterleave);
   m.def("nvfp4_block_scale_interleave_reverse", &torch_ext::NVFP4BlockScaleInterleaveReverse);
-  //   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloat);
   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
 }

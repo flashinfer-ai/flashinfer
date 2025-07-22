@@ -108,8 +108,4 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 }
 }  // namespace torch_ext
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("fp4_quantize", &torch_ext::fp4_quantize);
-  // m.def("block_scale_interleave", &torch_ext::block_scale_interleave);
-  // m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::e2m1_and_ufp8sf_scale_to_float);
-}
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) { m.def("fp4_quantize", &torch_ext::fp4_quantize); }
