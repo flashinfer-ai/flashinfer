@@ -796,9 +796,13 @@ class TrtllmGenPrefillModule:
     def __init__(self):
         self._mod = trtllm_fmha_gen_module()
         self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import setup_cubin_loader
+        from flashinfer.jit.cubin_loader import (
+            setup_cubin_loader,
+            setup_metainfo_loader,
+        )
 
         setup_cubin_loader(self._mod.get_library_path())
+        setup_metainfo_loader(self._mod.get_library_path())
 
     def build_and_load(self):
         # NOTE(Siyuan): WAR to mimic JIT behavior.

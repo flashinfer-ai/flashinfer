@@ -159,7 +159,7 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
 
         int kv_stride_0 = key_value_cache.stride(-2);  // key/values
         int kv_stride_1 = key_value_cache.stride(-3);  // head
-        int kv_stride_2 = key_value_cache.stride(1);   // batch
+        int kv_stride_2 = key_value_cache.stride(0);   // batch
 
         auto device = query.device();
         const auto stream = at::cuda::getCurrentCUDAStream(device.index());
@@ -205,7 +205,7 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
 
         int kv_stride_0 = key_value_cache.stride(-2);  // key/values
         int kv_stride_1 = key_value_cache.stride(-3);  // head
-        int kv_stride_2 = key_value_cache.stride(1);   // batch
+        int kv_stride_2 = key_value_cache.stride(0);   // batch
 
         auto device = query.device();
         const auto stream = at::cuda::getCurrentCUDAStream(device.index());

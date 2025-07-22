@@ -31,6 +31,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
+    setup_metainfo_loader,
     trtllm_fmha_gen_module,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -2875,6 +2876,7 @@ def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
     return op
 
 

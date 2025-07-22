@@ -237,7 +237,7 @@ class TllmGenFmhaKernel {
   static std::string getCubinPath() {
     const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
     std::string hash =
-        env_hash ? std::string(env_hash) : "e3ecc5f8e43f96e6ac6012b718b0ce7e4c84cb86";
+        env_hash ? std::string(env_hash) : "ba57a63599925db977579fb05d65e557368c9636";
     std::string cubin_path = hash + "/fmha/trtllm-gen/";
     return cubin_path;
   }
@@ -585,7 +585,7 @@ class TllmFmhaKernelFactory {
     if (!metainfo_loaded) {
       std::string metainfo_raw =
           getMetaInfo(TllmGenFmhaKernel::getCubinPath() + "flashInferMetaInfo",
-                      "fca653ee285cf41e2ed43e2ef155471e2192383ce775e6b6fde8d079d83b861f", ".h");
+                      "c4bf0e5fb9a0c4ad400c375d2f2b8affaf54dc7dfc621f48cfdf32ed4a823488", ".h");
       metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
       metainfo_loaded = true;
     }
