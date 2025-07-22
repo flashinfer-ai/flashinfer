@@ -822,10 +822,11 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
     scale_type,
     o_type,
     block_size,
+    device,
 ):
     _check_cudnn_availability()
-
-    with cudnn.graph(_get_cudnn_handle(torch.cuda.current_stream())) as (graph, _):
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=ab_type
         )
@@ -911,12 +912,12 @@ def execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, c_fin
     }
 
     workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+        graph.get_workspace_size(), device=a.device, dtype=torch.uint8
     )
 
-    graph.execute(
-        variant_pack, workspace, handle=_get_cudnn_handle(torch.cuda.current_stream())
-    )
+    stream = torch.cuda.current_stream(a.device)
+
+    graph.execute(variant_pack, workspace, handle=_get_cudnn_handle(stream))
 
 
 @functools.lru_cache(maxsize=128)
@@ -1223,6 +1224,7 @@ def mm_fp4(
         torch.float8_e4m3fn,
         _torch_data_type_to_cudnn_data_type(out_dtype),
         block_size,
+        a.device,
     )
 
     # execute the fp4 cudnn graph
