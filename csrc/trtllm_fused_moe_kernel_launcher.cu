@@ -56,8 +56,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
     int64_t const routing_method_type) {
   auto device = hidden_states.device();
-  
-  static const std::tuple<int, int> device_props = [&device]{
+
+  static const std::tuple<int, int> device_props = [&device] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
@@ -65,8 +65,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   }();
 
   TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-    "This kernel requires SM 100 architecture. Current device has SM ", std::get<0>(device_props),
-    std::get<1>(device_props));
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   if (use_routing_scales_on_input) {
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16,
@@ -318,19 +318,18 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     int64_t const tile_tokens_dim, int64_t const routing_method_type,
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner& moe_runner,
     int64_t moeConfigIndex) {
-    
-    auto device = hidden_states.device();
+  auto device = hidden_states.device();
 
-    static const std::tuple<int, int> device_props = [&device]{
-        int major, minor;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
-        return std::make_tuple(major, minor);
-      }();
-        
-    TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-      "This kernel requires SM 100 architecture. Current device has SM ", std::get<0>(device_props),
-      std::get<1>(device_props));
+  static const std::tuple<int, int> device_props = [&device] {
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
+    return std::make_tuple(major, minor);
+  }();
+
+  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float,
               "routing_logits must be float.");
@@ -607,7 +606,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     int64_t const moeConfigIndex) {
   auto device = hidden_states.device();
 
-  static const std::tuple<int, int> device_props = [&device]{
+  static const std::tuple<int, int> device_props = [&device] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
@@ -615,8 +614,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   }();
 
   TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-    "This kernel requires SM 100 architecture. Current device has SM ", std::get<0>(device_props),
-    std::get<1>(device_props));
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 ||
                   tile_tokens_dim == 64,
