@@ -88,7 +88,7 @@ struct ProfilerEntry {
 
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,     \
                       write_thread_predicate)                                   \
-  int _sm_idx;                                                                  \
+  uint32_t _sm_idx;                                                             \
   asm volatile("mov.u32 %0, %smid;" : "=r"(_sm_idx));                           \
   if (get_block_idx() == 0 && get_thread_idx() == 0) {                          \
     closure.entry.nblocks = get_num_blocks();                                   \
