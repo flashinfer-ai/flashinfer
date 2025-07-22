@@ -225,12 +225,7 @@ def shuffle_matrix_sf_a(
 def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Tensor:
     M, K = input_tensor.shape
     assert K % blockK == 0, "K must be divisible by blockK"
-    return (
-        input_tensor.view(M, K // blockK, blockK)
-        .permute(1, 0, 2)
-        .contiguous()
-        .flatten()
-    )
+    return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
 def gen_fused_moe_sm100_module() -> JitSpec:

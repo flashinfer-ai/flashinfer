@@ -560,7 +560,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
     bool mUseDeepSeekFp8{true};                  // Always true for BlockScaleMoe
 
     TORCH_CHECK(0 <= weight_layout && weight_layout <= 2,
-                "the value ofweight_layout is not recognized");
+                "the value of weight_layout is not recognized");
 
     // Properly initialize the runner using make_unique like in the original code
     auto mRunner = std::make_unique<RunnerType>(
