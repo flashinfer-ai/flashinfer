@@ -21,16 +21,25 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                        OptimizationProfile, TunableRunner, TuningConfig)
+from .autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from .fp4_quantization import nvfp4_block_scale_interleave
+from .fused_moe_utils import (
+    compute_swizzled_sf_shape,
+    fp4_scale_infer_shape,
+    get_last_power_of_2_num_tokens_buckets,
+    last_positive_power_of_2,
+)
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
-from .fused_moe_utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
-                     get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
 
 
 # The type of method in top-K routing, for use in torch custom op
@@ -226,7 +235,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",            
+            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -326,9 +335,16 @@ def get_fused_moe_sm100_module():
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict = dict()
-        tuning_config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                            lambda x: min(last_positive_power_of_2(x), 8192)), ))
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    0,
+                    0,
+                    get_last_power_of_2_num_tokens_buckets(8192),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
+                ),
+            )
+        )
 
         def __init__(
             self,
@@ -363,16 +379,26 @@ def get_fused_moe_sm100_module():
             self.use_w4a8_group_scaling = use_w4a8_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.min_latency_mode = min_latency_mode
-            instance_key = (x_dtype, weight_dtype, output_dtype,
-                            use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
-                            use_mxfp8_act_scaling)
+            instance_key = (
+                x_dtype,
+                weight_dtype,
+                output_dtype,
+                use_deepseek_fp8_block_scale,
+                use_w4a8_group_scaling,
+                use_mxfp8_act_scaling,
+            )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[
-                    instance_key] = torch.classes.fused_moe_sm100.FusedMoeRunner(
-                        x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
-                        use_mxfp8_act_scaling)
+                MoERunner.runner_dict[instance_key] = (
+                    torch.classes.fused_moe_sm100.FusedMoeRunner(
+                        x_dtype,
+                        weight_dtype,
+                        output_dtype,
+                        use_deepseek_fp8_block_scale,
+                        use_w4a8_group_scaling,
+                        use_mxfp8_act_scaling,
+                    )
+                )
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
@@ -389,7 +415,13 @@ def get_fused_moe_sm100_module():
             tactic: int = -1,
             do_preparation: bool = False,
         ):
-            x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+            (
+                x,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
+            ) = inputs
             self.fused_moe_runner.run_gemm_profile(
                 x,
                 fc1_expert_weights,
@@ -414,10 +446,15 @@ def get_fused_moe_sm100_module():
         @functools.lru_cache(maxsize=None)
         def refine_tuning_config(cls, tune_max_num_tokens: int):
             cls.tuning_config = TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 0, get_last_power_of_2_num_tokens_buckets(
-                        tune_max_num_tokens), lambda x: min(
-                            last_positive_power_of_2(x), tune_max_num_tokens)), ))
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        0,
+                        0,
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                )
+            )
 
     @register_custom_op(
         "flashinfer::cutlass_fused_moe_sm100",
@@ -475,8 +512,11 @@ def get_fused_moe_sm100_module():
             [moe_runner],
             MoERunner.tuning_config,
             [
-                input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                fc2_expert_biases
+                input,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
             ],
             gemm_idx=1,
         )
@@ -486,13 +526,20 @@ def get_fused_moe_sm100_module():
             [moe_runner],
             MoERunner.tuning_config,
             [
-                input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                fc2_expert_biases
+                input,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
             ],
             gemm_idx=2,
         )
 
-        run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
+        run_moe = (
+            moe_runner.fused_moe_runner.run_moe_min_latency
+            if min_latency_mode
+            else moe_runner.fused_moe_runner.run_moe
+        )
         result = run_moe(
             output,
             input,
@@ -541,7 +588,7 @@ def get_fused_moe_sm100_module():
         use_w4a8_group_scaling: bool = False,
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
-        tune_max_num_tokens: int = 8192,        
+        tune_max_num_tokens: int = 8192,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]

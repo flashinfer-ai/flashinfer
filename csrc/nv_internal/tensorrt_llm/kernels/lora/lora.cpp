@@ -24,6 +24,8 @@ namespace tensorrt_llm::kernels {
 
 int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
-             void* const* outputs, void* workspace, cudaStream_t stream) {return -1;}
+             void* const* outputs, void* workspace, cudaStream_t stream) {
+  return -1;
+}
 
 }  // namespace tensorrt_llm::kernels

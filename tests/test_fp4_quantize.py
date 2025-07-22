@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from flashinfer import (
-    nvfp4_block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
+    nvfp4_block_scale_interleave,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -311,7 +311,7 @@ def test_e2m1_dequantization(
 
     # Test with default common settings
     is_sf_swizzled_layout = True
-    block_size = 16#32 if sf_use_ue8m0 else 16
+    block_size = 16  # 32 if sf_use_ue8m0 else 16
 
     # Step 1: Quantize with fp4_quantize
     quantized_tensor, scale_factors = fp4_quantize(

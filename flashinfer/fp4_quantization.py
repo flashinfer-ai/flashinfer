@@ -62,8 +62,7 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/thop/fp4Op.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/thop/fp4Op.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",

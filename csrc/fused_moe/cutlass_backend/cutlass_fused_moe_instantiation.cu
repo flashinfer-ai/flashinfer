@@ -17,8 +17,7 @@
 #include "cutlass_fused_moe_kernels.cuh"
 #include "moe_kernels.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels
-{
+namespace tensorrt_llm::kernels::cutlass_kernels {
 // ==================== Variable batched GEMM specializations ==================================
 template class CutlassMoeFCRunner<float, float>;
 
