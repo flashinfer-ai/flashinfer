@@ -34,7 +34,7 @@ from .jit import (
     get_single_decode_uri,
     setup_cubin_loader,
     setup_metainfo_loader,
-    trtllm_fmha_gen_module,
+    trtllm_gen_fmha_module,
 )
 from .page import get_seq_lens
 from .prefill import (
@@ -299,8 +299,8 @@ def get_batch_decode_module(*args):
 
 
 @functools.cache
-def get_trtllm_fmha_gen_module():
-    mod = trtllm_fmha_gen_module()
+def get_trtllm_gen_fmha_module():
+    mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     setup_metainfo_loader(mod.get_library_path())
@@ -1818,7 +1818,7 @@ class TrtllmGenDecodeModule:
         pass
 
     def __init__(self):
-        self._mod = trtllm_fmha_gen_module()
+        self._mod = trtllm_gen_fmha_module()
         self._op = self._mod.build_and_load()
         from flashinfer.jit.cubin_loader import (
             setup_cubin_loader,
@@ -1964,7 +1964,7 @@ def trtllm_batch_decode_with_kv_cache(
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_decode
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
     if out is None:
@@ -2082,7 +2082,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
-    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_decode
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)

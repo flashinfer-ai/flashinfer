@@ -32,7 +32,7 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
     setup_metainfo_loader,
-    trtllm_fmha_gen_module,
+    trtllm_gen_fmha_module,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -85,6 +85,68 @@ def get_fmha_module(
         ).build_and_load()
     else:
         raise ValueError("SM100A is not supported on this device")
+
+
+@functools.cache
+def get_trtllm_gen_prefill_module():
+    mod = trtllm_gen_fmha_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
+
+    def _paged_run(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        window_left: int = -1,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        sm_count = get_device_sm_count(query.device)
+        if out is None:
+            out = torch.empty_like(query)
+        op.trtllm_paged_attention_context(
+            out,
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            batch_size,
+            window_left,
+            cum_seq_lens_q,
+            cum_seq_lens_kv,
+            sm_count,
+        )
+        return out
+
+    def _ragged_run(*args, **kwargs):
+        # TODO(Zihao): trtllm-gen backend already supports variable length attention,
+        # but not integrated into flashinfer yet.
+        raise NotImplementedError(
+            "Variable length is not implemented for trtllm-gen backend yet."
+        )
+
+    def _plan(*args, **kwargs):
+        pass
+
+    return SimpleNamespace(
+        paged_run=_paged_run,
+        ragged_run=_ragged_run,
+        plan=_plan,
+    )
 
 
 @functools.cache
@@ -196,11 +258,18 @@ def get_single_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args):
-    uri = get_batch_prefill_uri(backend, *args)
-    module = gen_batch_prefill_module(backend, *args).build_and_load()
-    plan_func = module.plan.default
-    ragged_run_func = module.ragged_run.default
-    paged_run_func = module.paged_run.default
+    if backend == "trtllm-gen":
+        uri = "trtllm_gen_context"
+        module = get_trtllm_gen_prefill_module()
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    else:
+        uri = get_batch_prefill_uri(backend, *args)
+        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        plan_func = module.plan.default
+        ragged_run_func = module.ragged_run.default
+        paged_run_func = module.paged_run.default
 
     # torch library for ragged_run
 
@@ -2872,8 +2941,8 @@ def fmha_varlen(
 
 
 @functools.cache
-def get_trtllm_fmha_gen_module():
-    mod = trtllm_fmha_gen_module()
+def get_trtllm_gen_fmha_module():
+    mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     setup_metainfo_loader(mod.get_library_path())
@@ -2896,7 +2965,7 @@ def trtllm_batch_context_with_kv_cache(
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_context
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
     if out is None:

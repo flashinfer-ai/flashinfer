@@ -20,7 +20,6 @@ from typing import List, Optional
 import jinja2
 import torch
 
-from ...utils import get_device_sm_count
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -747,78 +746,6 @@ def gen_batch_decode_module(
     )
 
 
-class TrtllmGenPrefillModule:
-    def _paged_run(
-        self,
-        query: torch.Tensor,
-        kv_cache: torch.Tensor,
-        workspace_buffer: torch.Tensor,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-        max_q_len: int,
-        max_kv_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
-        batch_size: int,
-        cum_seq_lens_q: torch.Tensor,
-        cum_seq_lens_kv: torch.Tensor,
-        window_left: int = -1,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        sm_count = get_device_sm_count(query.device)
-        if out is None:
-            out = torch.empty_like(query)
-        self._op.trtllm_paged_attention_context(
-            out,
-            query,
-            kv_cache,
-            workspace_buffer,
-            block_tables,
-            seq_lens,
-            max_q_len,
-            max_kv_len,
-            bmm1_scale,
-            bmm2_scale,
-            batch_size,
-            window_left,
-            cum_seq_lens_q,
-            cum_seq_lens_kv,
-            sm_count,
-        )
-        return out
-
-    def _ragged_run(self, *args, **kwargs):
-        raise NotImplementedError("trtllm-gen doesn't support ragged run")
-
-    def _plan(self, *args, **kwargs):
-        pass
-
-    def __init__(self):
-        self._mod = trtllm_fmha_gen_module()
-        self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import (
-            setup_cubin_loader,
-            setup_metainfo_loader,
-        )
-
-        setup_cubin_loader(self._mod.get_library_path())
-        setup_metainfo_loader(self._mod.get_library_path())
-
-    def build_and_load(self):
-        # NOTE(Siyuan): WAR to mimic JIT behavior.
-        class _Patch:
-            def __init__(self, func):
-                self._func = func
-
-            def default(self, *args, **kwargs):
-                return self._func(*args, **kwargs)
-
-        self.plan = _Patch(self._plan)
-        self.paged_run = _Patch(self._paged_run)
-        self.ragged_run = _Patch(self._ragged_run)
-        return self
-
-
 def gen_batch_prefill_module(
     backend: str,
     dtype_q: torch.dtype,
@@ -850,9 +777,6 @@ def gen_batch_prefill_module(
     # this is used for fp8 tensor core computation
     # KV-only quant is not influenced by this flag
     fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
-
-    if backend == "trtllm-gen":
-        return TrtllmGenPrefillModule()
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
@@ -1557,7 +1481,7 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def trtllm_fmha_gen_module():
+def trtllm_gen_fmha_module():
     return gen_jit_spec(
         "fmha_gen",
         [
