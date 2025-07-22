@@ -310,9 +310,10 @@ struct KernelParams {
   template <class FmhaOptions>
   static auto makeStrideKv(FmhaOptions const& options, bool isK) {
     int strideKeysVals = options.kvStrides[0];
-    int strideHeads = options.kvStrides[2];
-    int strideBatch = options.kvStrides[1];
+    int strideHeads = options.kvStrides[1];
+    int strideBatch = options.kvStrides[2];
 
+    std::cout << strideKeysVals << " " << strideHeads << " " << strideBatch << std::endl;
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
 
