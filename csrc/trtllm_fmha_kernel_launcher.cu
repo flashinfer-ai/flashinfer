@@ -55,7 +55,7 @@ void trtllm_paged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  static auto fmha_runner = TllmGenFmhaRunner(q_data_type, kv_data_type, o_data_type);
+  auto fmha_runner = TllmGenFmhaRunner(q_data_type, kv_data_type, o_data_type);
 
   TllmGenFmhaRunnerParams runner_params;
 
