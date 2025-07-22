@@ -254,6 +254,11 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
+    # for column major input, we need to transpose the input
+    is_column_major = input.stride(-2) == 1
+    if is_column_major:
+        input = input.transpose(-2, -1)
+
     assert input.shape[-1] % sf_vec_size == 0
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
@@ -263,6 +268,10 @@ def fp4_quantize(
         is_sf_swizzled_layout,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    if is_column_major:
+        x_q = x_q.transpose(-2, -1)
+        sf = sf.transpose(-2, -1)
+
     return x_q, sf
 
 

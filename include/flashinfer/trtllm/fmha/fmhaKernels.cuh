@@ -19,6 +19,7 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -32,8 +33,11 @@
 
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
-}
+std::string getMetaInfo(const std::string& name, const std::string& sha256,
+                        const std::string& extension);
+}  // namespace flashinfer::trtllm_cubin_loader
 using flashinfer::trtllm_cubin_loader::getCubin;
+using flashinfer::trtllm_cubin_loader::getMetaInfo;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {
@@ -228,6 +232,14 @@ class TllmGenFmhaKernel {
       // Break the while op.
       break;
     }
+  }
+
+  static std::string getCubinPath() {
+    const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
+    std::string hash =
+        env_hash ? std::string(env_hash) : "4c7bdebb4eba13311fc652a069e64782d5c0723d";
+    std::string cubin_path = hash + "/fmha/trtllm-gen/";
+    return cubin_path;
   }
 
  private:
@@ -517,10 +529,7 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
-      std::string hash =
-          env_hash ? std::string(env_hash) : "e3ecc5f8e43f96e6ac6012b718b0ce7e4c84cb86";
-      std::string cubin_path = hash + "/fmha/trtllm-gen/" + kernelMeta.mFuncName;
+      std::string cubin_path = TllmGenFmhaKernel::getCubinPath() + kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
@@ -568,16 +577,24 @@ class TllmFmhaKernelFactory {
  public:
   using KernelType = TllmGenFmhaKernel;
 
-  KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
-                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv,
-                               Data_type dtypeOut, unsigned int sm) {
+  KernelType const* getKernels(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
+                               unsigned int sm) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
+
+    if (!metainfo_loaded) {
+      std::string metainfo_raw =
+          getMetaInfo(TllmGenFmhaKernel::getCubinPath() + "flashInferMetaInfo",
+                      "b3907fa4e30a75a0f72cfded44e6cf0f04fe5868166659732487726cbc23c0b9", ".h");
+      metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
+      metainfo_loaded = true;
+    }
 
     auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
-      KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+      KernelType* newKernel =
+          new KernelType{metainfo.data(), metainfo.size(), dtypeQ, dtypeKv, dtypeOut, sm};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
@@ -596,6 +613,7 @@ class TllmFmhaKernelFactory {
       TORCH_CHECK(deviceId < 32, "Invalid deviceId %d (max is 32 devices)", deviceId);
       sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());
     }
+
     return *(sFactory[deviceId]);
   }
 
@@ -609,15 +627,14 @@ class TllmFmhaKernelFactory {
   }
 
   std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
+  std::vector<KernelType::KernelMeta> metainfo;
+  bool metainfo_loaded = false;
 };
 
 inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
                                                    Data_type dtypeOut, unsigned int sm) {
 #ifndef EXCLUDE_SM_100
-  return TllmFmhaKernelFactory::Get().getKernels(
-      sTllmGenFmhaKernelMetaInfos,
-      sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv,
-      dtypeOut, sm);
+  return TllmFmhaKernelFactory::Get().getKernels(dtypeQ, dtypeKv, dtypeOut, sm);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100

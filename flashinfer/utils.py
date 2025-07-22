@@ -493,3 +493,7 @@ def ceil_div(x: int, y: int) -> int:
 
 def pad_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
+
+
+def get_device_sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
