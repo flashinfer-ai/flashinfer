@@ -35,7 +35,7 @@ constexpr uint32_t EVENT_IDX_MASK = 0x3FF;
 constexpr uint32_t BEGIN_END_MASK = 0x3;
 
 constexpr uint32_t EVENT_IDX_SHIFT = 2;
-constexpr uint32_t BLOCK_ID_SHIFT = 12;
+constexpr uint32_t BLOCK_GROUP_IDX_SHIFT = 12;
 constexpr uint32_t SM_ID_SHIFT = 24;
 // Tag layout:
 // bits 0-1: event_type (start, end, instant)
@@ -49,8 +49,8 @@ constexpr uint32_t EVENT_INSTANT = 0x2;
 
 __device__ __forceinline__ uint32_t encode_tag(uint32_t sm_id, uint32_t block_id,
                                                uint32_t event_idx, uint32_t event_type) {
-  return (sm_id << SM_ID_SHIFT) | (block_id << BLOCK_ID_SHIFT) | (event_idx << EVENT_IDX_SHIFT) |
-         event_type;
+  return (sm_id << SM_ID_SHIFT) | (block_id << BLOCK_GROUP_IDX_SHIFT) |
+         (event_idx << EVENT_IDX_SHIFT) | event_type;
 }
 
 __device__ __forceinline__ uint32_t get_timestamp() {
