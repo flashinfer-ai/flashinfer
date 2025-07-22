@@ -1,4 +1,4 @@
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
 namespace tensorrt_llm {
 namespace kernels {
 namespace cutlass_kernels {

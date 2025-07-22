@@ -229,31 +229,31 @@ def gen_fused_moe_sm100_module() -> JitSpec:
         "fused_moe_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_stub.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -317,13 +317,13 @@ def gen_fused_moe_sm100_module() -> JitSpec:
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels"
+            / "cutlass_kernels"
             / "include",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels",
+            / "cutlass_kernels",
         ],
     )
 

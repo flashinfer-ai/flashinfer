@@ -10,8 +10,14 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_template_dispatch.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
-template class MoeGemmRunner<half, half, half>;
-}
+#ifdef ENABLE_FP8
+template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>;
+#ifdef ENABLE_BF16
+template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
+#endif
+// template class MoeGemmRunner<__nv_fp8_e5m2, __nv_fp8_e5m2>;
+#endif
+}  // namespace tensorrt_llm::kernels::cutlass_kernels
