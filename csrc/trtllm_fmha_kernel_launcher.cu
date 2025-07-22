@@ -20,8 +20,6 @@
 #include <flashinfer/trtllm/fmha/fmhaRunnerParams.h>
 #include <nvrtc.h>
 
-#include <algorithm>
-#include <cmath>
 #include <flashinfer/semaphore_utils.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
@@ -29,6 +27,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 
 #include "pytorch_extension_utils.h"
 
@@ -37,6 +36,40 @@ namespace flashinfer {
 enum class TllmPagedAttentionMode {
   Context,
   ForGen,
+};
+
+#include <memory>
+#include <mutex>
+
+class TllmGenFmhaRunnerCache {
+ public:
+  using Key = std::tuple<Data_type, Data_type, Data_type>;
+
+  static std::shared_ptr<TllmGenFmhaRunner> get(Data_type q_data_type, Data_type kv_data_type,
+                                                Data_type o_data_type) {
+    static std::unordered_map<Key, std::shared_ptr<TllmGenFmhaRunner>, KeyHash> cache;
+    static std::mutex cache_mutex;
+    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type);
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      return it->second;
+    } else {
+      auto runner = std::make_shared<TllmGenFmhaRunner>(q_data_type, kv_data_type, o_data_type);
+      cache.emplace(key, runner);
+      return runner;
+    }
+  }
+
+ private:
+  struct KeyHash {
+    std::size_t operator()(const Key& k) const {
+      return std::hash<int>()(static_cast<int>(std::get<0>(k))) ^
+             (std::hash<int>()(static_cast<int>(std::get<1>(k))) << 1) ^
+             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2);
+    }
+  };
 };
 
 void trtllm_paged_attention_launcher(
@@ -55,8 +88,7 @@ void trtllm_paged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  auto fmha_runner = TllmGenFmhaRunner(q_data_type, kv_data_type, o_data_type);
-
+  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params;
 
   // Common params
@@ -116,7 +148,7 @@ void trtllm_paged_attention_launcher(
                                  /*enable_pdl=*/true, stream);
   }
 
-  auto [foundKernels, kinfo] = fmha_runner.isSupportedWithInfo(runner_params);
+  auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
   if (!foundKernels) {
     std::ostringstream err_msg;
     err_msg << "Missing TRTLLM-GEN kernel ("
@@ -124,7 +156,7 @@ void trtllm_paged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  fmha_runner.run(runner_params);
+  fmha_runner->run(runner_params);
 }
 
 inline Data_type torch_dtype_to_tllm_data_type(at::ScalarType dtype) {
