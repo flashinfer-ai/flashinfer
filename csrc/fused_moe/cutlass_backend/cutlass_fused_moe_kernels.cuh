@@ -1747,11 +1747,11 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         cudaStream_t stream)
 
 // Instantiate the data types that are used by the external pytorch op
-INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
-INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
-#ifdef ENABLE_BF16
-INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
-#endif
+// INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
+// INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
+// #ifdef ENABLE_BF16
+// INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
+// #endif
 
 enum class ScaleMode : int
 {
@@ -2000,12 +2000,12 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
         int64_t const experts_per_token, int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config,  \
         bool const enable_alltoall, cudaStream_t stream);
 
-// Instantiate the data types that are used by the external pytorch op
-INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
-INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
-#ifdef ENABLE_BF16
-INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
-#endif
+// // Instantiate the data types that are used by the external pytorch op
+// INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
+// INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
+// #ifdef ENABLE_BF16
+// INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+// #endif
 
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
