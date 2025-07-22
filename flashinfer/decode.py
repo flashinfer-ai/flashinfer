@@ -2065,7 +2065,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
-    scale: model-specific scale of qk, default is 1.0
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
     bmm2_scale: fused scale for mla bmm2 input.
