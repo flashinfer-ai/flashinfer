@@ -31,7 +31,8 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
-    trtllm_fmha_gen_module,
+    setup_metainfo_loader,
+    trtllm_gen_fmha_module,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
@@ -49,6 +50,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_device_sm_count,
     is_float8,
     is_sm100a_supported,
     register_custom_op,
@@ -83,6 +85,68 @@ def get_fmha_module(
         ).build_and_load()
     else:
         raise ValueError("SM100A is not supported on this device")
+
+
+@functools.cache
+def get_trtllm_gen_prefill_module():
+    mod = trtllm_gen_fmha_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
+
+    def _paged_run(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        window_left: int = -1,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        sm_count = get_device_sm_count(query.device)
+        if out is None:
+            out = torch.empty_like(query)
+        op.trtllm_paged_attention_context(
+            out,
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            batch_size,
+            window_left,
+            cum_seq_lens_q,
+            cum_seq_lens_kv,
+            sm_count,
+        )
+        return out
+
+    def _ragged_run(*args, **kwargs):
+        # TODO(Zihao): trtllm-gen backend already supports variable length attention,
+        # but not integrated into flashinfer yet.
+        raise NotImplementedError(
+            "Variable length is not implemented for trtllm-gen backend yet."
+        )
+
+    def _plan(*args, **kwargs):
+        pass
+
+    return SimpleNamespace(
+        paged_run=_paged_run,
+        ragged_run=_ragged_run,
+        plan=_plan,
+    )
 
 
 @functools.cache
@@ -194,11 +258,18 @@ def get_single_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args):
-    uri = get_batch_prefill_uri(backend, *args)
-    module = gen_batch_prefill_module(backend, *args).build_and_load()
-    plan_func = module.plan.default
-    ragged_run_func = module.ragged_run.default
-    paged_run_func = module.paged_run.default
+    if backend == "trtllm-gen":
+        uri = "trtllm_gen_context"
+        module = get_trtllm_gen_prefill_module()
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    else:
+        uri = get_batch_prefill_uri(backend, *args)
+        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        plan_func = module.plan.default
+        ragged_run_func = module.ragged_run.default
+        paged_run_func = module.paged_run.default
 
     # torch library for ragged_run
 
@@ -372,10 +443,9 @@ def get_batch_prefill_module(backend, *args):
         block_tables: Optional[torch.Tensor] = None,
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
+        max_q_len: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         batch_size: Optional[int] = None,
-        sum_seq_q: Optional[int] = None,
-        sum_seq_kv: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
     ) -> None:
@@ -389,24 +459,19 @@ def get_batch_prefill_module(backend, *args):
             assert page_size is not None
             assert max_kv_len is not None
             assert batch_size is not None
-            assert sum_seq_q is not None
-            assert sum_seq_kv is not None
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
                 paged_kv_cache,
                 int_workspace_buffer,
-                num_kv_heads,
                 block_tables,
                 kv_lens_buffer,
-                page_size,
+                max_q_len,
                 max_kv_len,
                 sm_scale,
                 1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
                 batch_size,
-                sum_seq_q,
-                sum_seq_kv,
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
                 window_left,
@@ -529,10 +594,9 @@ def get_batch_prefill_module(backend, *args):
         block_tables: Optional[torch.Tensor] = None,
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
+        max_q_len: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         batch_size: Optional[int] = None,
-        sum_seq_q: Optional[int] = None,
-        sum_seq_kv: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
     ) -> None:
@@ -1445,6 +1509,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        block_tables: Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
 
         Note
         ----
@@ -1505,6 +1573,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
             kv_lens_arr_host, non_blocking=non_blocking
         )
+        self._max_q_len = max(qo_indptr_host).item()
         self._max_kv_len = max(kv_lens_arr_host).item()
 
         total_num_rows = qo_indptr_host[-1]
@@ -1614,7 +1683,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._backend, *get_module_args
             )
 
-        self._sum_seq_q = qo_indptr_host[-1]
         if self._backend == "fa3" or self._backend == "trtllm-gen":
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
@@ -1630,9 +1698,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     : len(vector_sparse_indptr_host)
                 ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                 paged_kv_indptr_host = vector_sparse_indptr_host
-                self._sum_seq_kv = vector_sparse_indptr_host[-1]
-        else:
-            self._sum_seq_kv = torch.sum(kv_lens_arr_host).item()
 
         self._block_tables: Optional[torch.Tensor] = block_tables
         if self._backend == "trtllm-gen":
@@ -1921,10 +1986,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._block_tables,
                 self._kv_lens_buffer,
                 page_size,
+                self._max_q_len,
                 self._max_kv_len,
                 self._batch_size,
-                self._sum_seq_q,
-                self._sum_seq_kv,
                 self._qo_indptr_buf,
                 self._vector_sparse_indptr_buffer,
             ]
@@ -2877,10 +2941,11 @@ def fmha_varlen(
 
 
 @functools.cache
-def get_trtllm_fmha_gen_module():
-    mod = trtllm_fmha_gen_module()
+def get_trtllm_gen_fmha_module():
+    mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
@@ -2888,22 +2953,20 @@ def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    num_kv_heads: int,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
+    max_q_len: int,
+    max_kv_len: int,
     bmm1_scale: float,
     bmm2_scale: float,
     batch_size: int,
-    sum_seq_q: int,
-    sum_seq_kv: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention_context
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    sm_count = get_device_sm_count(query.device)
 
     if out is None:
         out = torch.empty_like(query)
@@ -2915,18 +2978,16 @@ def trtllm_batch_context_with_kv_cache(
         query,
         kv_cache,
         workspace_buffer,
-        num_kv_heads,
         block_tables,
         seq_lens,
-        block_size,
-        max_seq_len,
+        max_q_len,
+        max_kv_len,
         bmm1_scale,
         bmm2_scale,
         batch_size,
         window_left,
-        sum_seq_q,
-        sum_seq_kv,
         cum_seq_lens_q,
         cum_seq_lens_kv,
+        sm_count,
     )
     return out
