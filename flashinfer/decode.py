@@ -564,7 +564,11 @@ def single_decode_with_kv_cache(
         )
 
     if v_scale is not None:
-        out *= v_scale
+        # TODO(Zihao): fused into kernel
+        if out.itemsize == 1:
+            out = (out.to(float) * v_scale).to(out.dtype)
+        else:
+            out *= v_scale
     if return_lse:
         return out, lse
     else:
@@ -1313,7 +1317,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cached_module.run(*run_args)
         if v_scale is not None:
-            out *= v_scale
+            # TODO(Zihao): fused into kernel
+            if out.itemsize == 1:
+                out = (out.to(float) * v_scale).to(out.dtype)
+            else:
+                out *= v_scale
 
         return (out, lse) if return_lse else out
 
