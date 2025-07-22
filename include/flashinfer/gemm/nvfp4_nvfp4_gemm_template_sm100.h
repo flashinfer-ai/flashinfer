@@ -28,7 +28,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/gemm.h"
 #include "flashinfer/archCondition.h"
-#include "flashinfer/cutlass_type_conversion.h"
+#include "flashinfer/cutlass_utils.cuh"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
