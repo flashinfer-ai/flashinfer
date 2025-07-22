@@ -98,7 +98,7 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm100(T* D, void const* A, void const*
       break;
     default:
       throw std::runtime_error(
-          "[TensorRT-LLM Error][FP4][dispatch_gemm_cluster_shape] Config is invalid for FP4 GEMM.");
+          "[Error][FP4][dispatch_gemm_cluster_shape] Config is invalid for FP4 GEMM.");
       break;
   }
 }
@@ -141,18 +141,17 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm100(T* D, void const* A, void const* B,
           workspaceBytes, stream, occupancy);
       break;
     case CutlassTileConfigSM100::Undefined:
-      throw std::runtime_error(
-          "[TensorRT-LLM Error][FP4][dispatch_gemm_cta_shape] Gemm config undefined.");
+      throw std::runtime_error("[Error][FP4][dispatch_gemm_cta_shape] Gemm config undefined.");
       break;
     case CutlassTileConfigSM100::ChooseWithHeuristic:
       throw std::runtime_error(
-          "[TensorRT-LLM Error][FP4][dispatch_gemm_cta_shape] Gemm config should have already been "
+          "[Error][FP4][dispatch_gemm_cta_shape] Gemm config should have already been "
           "set by "
           "heuristic.");
       break;
     default:
       throw std::runtime_error(
-          "[TensorRT-LLM Error][FP4][dispatch_gemm_cta_shape] Config is invalid for FP4 GEMM.");
+          "[Error][FP4][dispatch_gemm_cta_shape] Config is invalid for FP4 GEMM.");
       break;
   }
 }
@@ -173,7 +172,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
                                                    workspaceBytes, stream, occupancy);
   } else {
     throw std::runtime_error(
-        "[TensorRT-LLM Error][CutlassFp4GemmRunner][GEMM Dispatch] FP4 Gemm type unsupported for "
+        "[Error][CutlassFp4GemmRunner][GEMM Dispatch] FP4 Gemm type unsupported for "
         "CUTLASS FP4 GEMM");
   }
 }

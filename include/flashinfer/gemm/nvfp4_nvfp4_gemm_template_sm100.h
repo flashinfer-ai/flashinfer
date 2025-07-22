@@ -76,10 +76,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                                     void const* weight_sf, float const* global_sf, int m, int n,
                                     int k, int batch_count, CutlassGemmConfig gemmConfig,
                                     char* workspace, size_t const workspaceBytes,
-                                    cudaStream_t stream, int* occupancy) {
-  static_assert(always_false<T>, "Kernel should be explicitly instantiated.");
-  return 0;
-}
+                                    cudaStream_t stream, int* occupancy);
 
 #ifdef PLACEHOLDER_KERNELS
 
