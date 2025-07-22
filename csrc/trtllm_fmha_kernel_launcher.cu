@@ -45,8 +45,8 @@ void trtllm_paged_attention_launcher(
     Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type,
     TllmPagedAttentionMode mode, int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
     int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
-    int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_0, int64_t kv_stride_1,
-    int64_t kv_stride_2, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
+    int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_keys_values, int64_t kv_stride_heads,
+    int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
     int64_t window_left, int64_t sum_seq_q, int64_t sm_count, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -77,9 +77,9 @@ void trtllm_paged_attention_launcher(
   runner_params.mNumTokensPerPage = page_size;
   runner_params.mQkvLayout = QkvLayout::PagedKv;
   runner_params.mMultiProcessorCount = sm_count;
-  runner_params.kvStrides[0] = kv_stride_0;
-  runner_params.kvStrides[1] = kv_stride_1;
-  runner_params.kvStrides[2] = kv_stride_2;
+  runner_params.kvStrideKeysValues = kv_stride_keys_values;
+  runner_params.kvStrideHeads = kv_stride_heads;
+  runner_params.kvStrideBatch = kv_stride_batch;
   runner_params.mNumPagesInMemPool = num_pages_in_mem_pool;
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
@@ -159,7 +159,9 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
   int num_qo_heads = query.size(2);
   int head_dim_qk = query.size(3);
   int head_dim_vo = out.size(-1);
-  // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+  // NOTE(Zihao): key_value_cache is [num_pages, 1/2, num_kv_heads, page_size, head_dim]
+  // For KV-Cache sharing (MLA), the second dimension is 1 (key/value cache are shared)
+  // otherwise it is 2, one for key and one for value
   TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
               "The second dimension of key_value_cache must be 1 or 2, got " +
                   std::to_string(key_value_cache.size(1)));
@@ -169,9 +171,9 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
   int max_num_blocks_per_seq = block_tables.size(-1);
   int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
 
-  int kv_stride_0 = key_value_cache.stride(-2);  // key/values
-  int kv_stride_1 = key_value_cache.stride(-3);  // head
-  int kv_stride_2 = key_value_cache.stride(0);   // batch
+  int kv_stride_keys_values = key_value_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_value_cache.stride(-3);        // head
+  int kv_stride_batch = key_value_cache.stride(0);         // batch
 
   auto device = query.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
@@ -186,8 +188,8 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
       /*cum_seq_lens_kv=*/nullptr, q_data_type, kv_data_type, o_data_type,
       TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-      kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
-      window_left, sum_seq_q, sm_count, stream);
+      kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
+      bmm2_scale, window_left, sum_seq_q, sm_count, stream);
 }
 
 void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
@@ -205,7 +207,9 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
   int head_dim_vo = out.size(-1);
   int max_num_blocks_per_seq = block_tables.size(-1);
   int num_pages_in_mem_pool = key_value_cache.size(0) * key_value_cache.size(1);
-  // NOTE(Zihao): key_value_cache is [num_pages, 2, num_kv_heads, page_size, head_dim]
+  // NOTE(Zihao): key_value_cache is [num_pages, 1/2, num_kv_heads, page_size, head_dim]
+  // For KV-Cache sharing (MLA), the second dimension is 1 (key/value cache are shared)
+  // otherwise it is 2, one for key and one for value
   TORCH_CHECK(key_value_cache.size(1) == 1 || key_value_cache.size(1) == 2,
               "The second dimension of key_value_cache must be 1 or 2, got " +
                   std::to_string(key_value_cache.size(1)));
@@ -213,9 +217,9 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
   int page_size = key_value_cache.size(-2);
   int num_kv_heads = key_value_cache.size(-3);
 
-  int kv_stride_0 = key_value_cache.stride(-2);  // key/values
-  int kv_stride_1 = key_value_cache.stride(-3);  // head
-  int kv_stride_2 = key_value_cache.stride(0);   // batch
+  int kv_stride_keys_values = key_value_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_value_cache.stride(-3);        // head
+  int kv_stride_batch = key_value_cache.stride(0);         // batch
 
   auto device = query.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
@@ -230,8 +234,8 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
       /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), q_data_type, kv_data_type,
       o_data_type, TllmPagedAttentionMode::Context, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-      kv_stride_0, kv_stride_1, kv_stride_2, max_num_blocks_per_seq, bmm1_scale, bmm2_scale,
-      window_left, sum_seq_q, sm_count, stream);
+      kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
+      bmm2_scale, window_left, sum_seq_q, sm_count, stream);
 }
 
 namespace trtllm_cubin_loader {
