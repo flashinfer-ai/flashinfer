@@ -55,7 +55,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
 
         lamport_use_fp32 = dtype == torch.float32
 
-        # create workspace for moe allreduce fusion
+        # create workspace for allreduce fusion
         ipc_handles, workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 rank,
@@ -336,4 +336,4 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
         _run_correctness_worker,
         target_args=(),
     )
-    print(f"moe allreduce fusion tp = {world_size}: OK")
+    print(f"allreduce fusion tp = {world_size}: OK")

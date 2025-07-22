@@ -87,8 +87,9 @@ void trtllm_paged_attention_launcher(
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
-  runner_params.mChunkedAttentionSize = INT_MAX;
-  runner_params.mAttentionWindowSize = window_left == -1 ? INT_MAX : window_left + 1;
+  runner_params.mChunkedAttentionSize = INT_MAX;  // disable chunked attention by INT_MAX
+  runner_params.mAttentionWindowSize =
+      window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
 
@@ -109,7 +110,8 @@ void trtllm_paged_attention_launcher(
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = use_multi_block;
 
-    size_t num_semaphores = round_up(batch_size * num_qo_heads, 8);
+    size_t num_semaphores =
+        round_up(batch_size * num_qo_heads, 8);  // align multiCtasKvScratchPtr to 16 bytes
     runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
         static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
     runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);

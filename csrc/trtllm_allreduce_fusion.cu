@@ -34,7 +34,7 @@ void trtllm_allreduce_fusion(
     std::optional<at::Tensor> residual_out, std::optional<at::Tensor> norm_out,
     std::optional<at::Tensor> quant_out, std::optional<at::Tensor> scale_out,
     std::optional<at::Tensor> rms_gamma, std::optional<double> rms_eps,
-    std::optional<double> scale_factor, std::optional<int64_t> layout_code) {
+    std::optional<at::Tensor> scale_factor, std::optional<int64_t> layout_code) {
   const c10::cuda::OptionalCUDAGuard device_guard(allreduce_in.device());
   // todo(Yingyi): add dispatch for float and bfloat16
 
@@ -66,8 +66,9 @@ void trtllm_allreduce_fusion(
     params.rms_gamma =
         rms_gamma.has_value() ? reinterpret_cast<void*>(rms_gamma.value().data_ptr()) : nullptr;
     params.rms_eps = rms_eps.has_value() ? static_cast<float>(rms_eps.value()) : 0.0f;
-    params.scale_factor =
-        scale_factor.has_value() ? static_cast<float>(scale_factor.value()) : 0.0f;
+    params.scale_factor = scale_factor.has_value()
+                              ? reinterpret_cast<float*>(scale_factor.value().data_ptr())
+                              : nullptr;
     params.use_oneshot = use_oneshot;
     params.layout = layout_code.has_value()
                         ? static_cast<FP4QuantizationSFLayout>(layout_code.value())

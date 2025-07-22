@@ -460,7 +460,7 @@ def test_trtllm_batch_decode_mla(
     # todo(Yingyi): calculate the actual size of workspace buffer
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    bmm1_scale_tensor = (
+    bmm1_log2_scale_tensor = (
         torch.tensor(
             [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
             dtype=torch.float32,
@@ -488,7 +488,7 @@ def test_trtllm_batch_decode_mla(
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
-        bmm1_scale_tensor=bmm1_scale_tensor,
+        bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
     )
     torch.cuda.synchronize()
@@ -584,13 +584,13 @@ if __name__ == "__main__":
     # run all tests in the order of pytest
     # test_trtllm_batch_decode_mla(16, 0.5, torch.float8_e4m3fn, 32, 1)
     test_trtllm_batch_decode_mla(1024, 1.0, torch.bfloat16, 32, 1, False)
-    # test_trtllm_batch_decode_fmha_wrapper(
-    #     kv_layout="HND",
-    #     batch_size=4,
-    #     page_size=16,
-    #     num_kv_heads=2,
-    #     q_dtype="bf16",
-    #     head_grp_size=8,
-    #     kv_cache_dtype="auto",
-    #     window_left=127,
-    # )
+    test_trtllm_batch_decode_fmha_wrapper(
+        kv_layout="HND",
+        batch_size=4,
+        page_size=16,
+        num_kv_heads=2,
+        q_dtype="bf16",
+        head_grp_size=8,
+        kv_cache_dtype="auto",
+        window_left=127,
+    )

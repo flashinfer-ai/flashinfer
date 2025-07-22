@@ -33,6 +33,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_decode_uri,
     setup_cubin_loader,
+    setup_metainfo_loader,
     trtllm_fmha_gen_module,
 )
 from .page import get_seq_lens
@@ -302,6 +303,7 @@ def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
@@ -1777,12 +1779,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
-# todo(Yingyi): update the params list
 @functools.cache
 def get_trtllm_fmha_gen_module():
     mod = trtllm_fmha_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
@@ -1806,7 +1808,9 @@ class TrtllmGenDecodeModule:
         sm_count = get_device_sm_count(query.device)
         self._op.trtllm_paged_attention_decode(
             out,
-            query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
+            query.unsqueeze(
+                1
+            ),  # [B, 1, H, D], no MTP here so second dim is 1 # todo(Yingyi): add MTP??
             kv_cache,
             workspace_buffer,
             block_tables,
@@ -2044,7 +2048,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,
-    bmm1_scale_tensor: Optional[torch.Tensor] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -2062,24 +2066,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
     bmm2_scale: fused scale for mla bmm2 input.
-    bmm1_scale_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
-    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input. Must be fused with * M_LOG2E before passing in.
+    bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
+    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
     or,
-    bmm1_scale_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)]
-    bmm2_scale_tensor = [v_scale * o_scale * M_LOG2E]
+    bmm1_scale_log2_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5) * M_LOG2E]
+    bmm2_scale_tensor = [v_scale * o_scale]
 
     The two scale factors should be static constant for cuda graph capture.
-    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_tensor, bmm2_scale_tensor) should be provided.
+    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
 
     For static constant scale factors, the scale factors should be provided as float.
         - (bmm1_scale, bmm2_scale)
     For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
-        - (bmm1_scale_tensor, bmm2_scale_tensor)
+        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
@@ -2087,7 +2091,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
-    if block_size != 32 and block_size != 64:
+    if (
+        block_size != 32 and block_size != 64
+    ):  # todo(Yingyi): add support for more block sizes?
         raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
     _check_trtllm_gen_mla_shape(
@@ -2113,7 +2119,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
-    if bmm1_scale_tensor is not None and bmm2_scale_tensor is not None:
+    if bmm1_scale_log2_tensor is not None and bmm2_scale_tensor is not None:
         # dynamic scale factors
         if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
             raise ValueError(
