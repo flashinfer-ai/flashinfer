@@ -1779,15 +1779,6 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
-@functools.cache
-def get_trtllm_fmha_gen_module():
-    mod = trtllm_fmha_gen_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    setup_metainfo_loader(mod.get_library_path())
-    return op
-
-
 class TrtllmGenDecodeModule:
     def _paged_run(
         self,
@@ -1829,9 +1820,13 @@ class TrtllmGenDecodeModule:
     def __init__(self):
         self._mod = trtllm_fmha_gen_module()
         self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import setup_cubin_loader
+        from flashinfer.jit.cubin_loader import (
+            setup_cubin_loader,
+            setup_metainfo_loader,
+        )
 
         setup_cubin_loader(self._mod.get_library_path())
+        setup_metainfo_loader(self._mod.get_library_path())
 
 
 @functools.cache
