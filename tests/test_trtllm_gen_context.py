@@ -25,7 +25,6 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("q_dtype", ["half", "bf16"])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])  # "fp8"
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("window_left", [-1])  # 127
 def test_trtllm_batch_context_wrapper(
@@ -38,7 +37,6 @@ def test_trtllm_batch_context_wrapper(
     page_size,
     num_kv_heads,
     q_dtype,
-    kv_cache_dtype,
     logits_soft_cap,
     window_left,
 ):
@@ -114,10 +112,6 @@ def test_trtllm_batch_context_wrapper(
         window_left=window_left,
     )
     output = wrapper2.run(q, kv_data)
-    print(f"output: {output}")
-    print(f"reference_output: {reference_output}")
-    print(f"reference_kv_cache: {reference_kv_cache}")
-    print(f"kv_data: {kv_data}")
     rmse = torch.sqrt(torch.mean((output - reference_output) ** 2))
     print(f"RMSE between output and reference_output: {rmse.item()}")
     rmse = torch.sqrt(torch.mean((reference_kv_cache - kv_data) ** 2))
@@ -137,7 +131,6 @@ if __name__ == "__main__":
         page_size=16,
         num_kv_heads=2,
         q_dtype="bf16",
-        kv_cache_dtype="auto",
         logits_soft_cap=0.0,
         window_left=127,
     )

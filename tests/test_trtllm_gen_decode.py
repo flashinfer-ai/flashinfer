@@ -173,7 +173,6 @@ def test_trtllm_batch_decode_fmha_wrapper(
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
     kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
     kv_indices = all_block_ids.int()
-    # print(f"kv_indices:{kv_indices}")
 
     # Calculate last page lengths
     kv_last_page_len = seq_lens_tensor % page_size
@@ -213,13 +212,8 @@ def test_trtllm_batch_decode_fmha_wrapper(
         window_left=window_left,
     )
     output = wrapper2.run(q.contiguous(), kv_cache)
-    print(f"output: {output}")
-    print(f"reference_output: {reference_output}")
-    # print(f"reference_kv_cache: {reference_kv_cache}")
-    # print(f"kv_cache: {kv_cache}")
     rmse = torch.sqrt(torch.mean((output - reference_output) ** 2))
     print(f"RMSE between output and reference_output: {rmse.item()}")
-    # print(f"RMSE between reference_kv_cache and kv_cache: {rmse.item()}")
     rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (5e-2, 7e-2)
     torch.testing.assert_close(output, reference_output, rtol=rtol, atol=atol)
     # torch.testing.assert_close(reference_kv_cache, kv_cache, rtol=1e-2, atol=1e-2)
@@ -491,9 +485,6 @@ def test_trtllm_batch_decode_mla(
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
     )
-    torch.cuda.synchronize()
-    print("output shape", output.shape)
-    print("output", output)
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -546,9 +537,6 @@ def test_trtllm_batch_decode_mla(
     kpe = kv_cache[..., kv_lora_rank:]
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
-    torch.cuda.synchronize()
-    print("o_ref shape", o_ref.shape)
-    print("o_ref", o_ref)
 
     # check is nan
     assert not torch.isnan(o_ref).any(), "o_ref is nan"
