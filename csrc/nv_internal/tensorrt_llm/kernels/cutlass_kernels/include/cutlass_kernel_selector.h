@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,16 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
-#include <ATen/cuda/EmptyTensor.h>
 
-#include <cstdint>
-
-#include "tensorrt_llm/common/cudaUtils.h"
-
-namespace torch_ext {
-std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-                                                at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout);
-}  // namespace torch_ext
+// TODO Add other OSS types here
+#if USING_OSS_CUTLASS_MOE_GEMM
+#define CUTLASS_MOE_GEMM_NAMESPACE tensorrt_llm::kernels::cutlass_kernels
+#define CUTLASS_MOE_GEMM_KERNELS_NAMESPACE tensorrt_llm::kernels::cutlass_kernels
+#else
+#define CUTLASS_MOE_GEMM_NAMESPACE tensorrt_llm
+#define CUTLASS_MOE_GEMM_KERNELS_NAMESPACE tensorrt_llm::kernels
+#endif

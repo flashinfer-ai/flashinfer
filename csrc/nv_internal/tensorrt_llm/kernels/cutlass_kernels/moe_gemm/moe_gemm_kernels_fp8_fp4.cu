@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,13 @@
  * limitations under the License.
  */
 
-#pragma once
-#include <ATen/cuda/EmptyTensor.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h"
 
-#include <cstdint>
-
-#include "tensorrt_llm/common/cudaUtils.h"
-
-namespace torch_ext {
-std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-                                                at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout);
-}  // namespace torch_ext
+namespace tensorrt_llm::kernels::cutlass_kernels {
+#ifdef ENABLE_FP4
+template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>;
+#ifdef ENABLE_BF16
+template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16>;
+#endif
+#endif
+}  // namespace tensorrt_llm::kernels::cutlass_kernels

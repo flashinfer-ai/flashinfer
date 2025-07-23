@@ -21,8 +21,21 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .autotuner import AutoTuner, TunableRunner, TuningConfig
-from .fp4_quantization import block_scale_interleave
+from .autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from .fp4_quantization import nvfp4_block_scale_interleave
+from .fused_moe_utils import (
+    compute_swizzled_sf_shape,
+    fp4_scale_infer_shape,
+    get_last_power_of_2_num_tokens_buckets,
+    last_positive_power_of_2,
+)
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
@@ -208,55 +221,63 @@ def shuffle_matrix_sf_a(
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
     # 128x4
-    return block_scale_interleave(w_shuffled)
+    return nvfp4_block_scale_interleave(w_shuffled)
 
 
-def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool) -> JitSpec:
+def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_jit_spec(
         "fused_moe_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_stub.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_1.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M128_BSFalse_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_2.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M128_BSTrue_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_3.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M256_BSFalse_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_4.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M256_BSTrue_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_5.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M64_BSFalse_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_6.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M128_BSFalse_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_7.generated.cu",
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M16_BSFalse_MixedFalse.generated.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M32_BSFalse_MixedFalse.generated.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M64_BSFalse_MixedFalse.generated.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
@@ -277,6 +298,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool) -> JitSpec:
             "-DCOMPILE_BLACKWELL_TMA_GEMMS",
             "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
             "-DCOMPILE_HOPPER_TMA_GEMMS",
+            "-DUSING_OSS_CUTLASS_MOE_GEMM",
         ],
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
         extra_ldflags=["-lcuda"],
@@ -292,13 +314,13 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool) -> JitSpec:
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels"
+            / "cutlass_kernels"
             / "include",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels",
+            / "cutlass_kernels",
         ],
     )
 
@@ -311,7 +333,17 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
-        _runner_dict: Dict[str, module] = dict()
+        runner_dict = dict()
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    0,
+                    0,
+                    get_last_power_of_2_num_tokens_buckets(8192),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
+                ),
+            )
+        )
 
         def __init__(
             self,
@@ -325,8 +357,11 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             ep_rank: int,
             cluster_size: int,
             cluster_rank: int,
-            use_fp8_block_scaling: bool,
+            enable_alltoall: bool,
+            use_deepseek_fp8_block_scale: bool,
             use_w4a8_group_scaling: bool,
+            use_mxfp8_act_scaling: bool,
+            min_latency_mode: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -338,51 +373,39 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             self.ep_rank = ep_rank
             self.cluster_size = cluster_size
             self.cluster_rank = cluster_rank
-            self.use_fp8_block_scaling = use_fp8_block_scaling
+            self.enable_alltoall = enable_alltoall
+            self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
             self.use_w4a8_group_scaling = use_w4a8_group_scaling
-
+            self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+            self.min_latency_mode = min_latency_mode
             instance_key = (
                 x_dtype,
                 weight_dtype,
                 output_dtype,
-                use_fp8_block_scaling,
+                use_deepseek_fp8_block_scale,
                 use_w4a8_group_scaling,
+                use_mxfp8_act_scaling,
             )
 
-            if instance_key not in MoERunner._runner_dict:
-                MoERunner._runner_dict[instance_key] = (
+            if instance_key not in MoERunner.runner_dict:
+                MoERunner.runner_dict[instance_key] = (
                     torch.classes.fused_moe_sm100.FusedMoeRunner(
                         x_dtype,
                         weight_dtype,
                         output_dtype,
-                        use_fp8_block_scaling,
+                        use_deepseek_fp8_block_scale,
                         use_w4a8_group_scaling,
+                        use_mxfp8_act_scaling,
                     )
                 )
-            self._fused_moe_runner = MoERunner._runner_dict[instance_key]
-            self._is_nvfp4 = weight_dtype == torch.int64
+            self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
         ) -> List[int]:
-            x, _, _, min_latency_mode_tensor = inputs
-            min_latency_mode = min_latency_mode_tensor.size(0) == 1
-            m = x.shape[0]
-
-            # Only profile m <= 128 for min latency mode = True
-            # Profile all valid buckets for min latency mode = False
-            # TODO: min_latency_mode = True will cause the following error:
-            # Cannot profile configuration 4: Cutlass GEMM Tactic
-            # [TensorRT-LLM][ERROR] Assertion failed: Failed to initialize cutlass TMA WS grouped gemm.
-            # Should be fixed in the moe_kernels in the future.
-            invalid = (m > 128 and min_latency_mode) or (
-                m <= 128 and min_latency_mode and (not self._is_nvfp4)
-            )
-
-            return (
-                [] if invalid else list(range(self._fused_moe_runner.get_tactic_num()))
-            )
+            return range(self.fused_moe_runner.get_tactic_num())
 
         def forward(
             self,
@@ -391,13 +414,19 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             tactic: int = -1,
             do_preparation: bool = False,
         ):
-            x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
-            min_latency_mode = min_latency_mode_tensor.size(0) == 1
-            # determine if we should use min latency mode according to the profiled seq len
-            self._fused_moe_runner.run_gemm_profile(
+            (
                 x,
                 fc1_expert_weights,
+                fc1_expert_biases,
                 fc2_expert_weights,
+                fc2_expert_biases,
+            ) = inputs
+            self.fused_moe_runner.run_gemm_profile(
+                x,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
                 self.top_k,
                 self.tp_size,
                 self.tp_rank,
@@ -405,10 +434,25 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
                 self.ep_rank,
                 self.cluster_size,
                 self.cluster_rank,
-                min_latency_mode,
+                self.enable_alltoall,
+                self.min_latency_mode,
                 gemm_idx,
                 tactic,
                 do_preparation,
+            )
+
+        @classmethod
+        @functools.lru_cache(maxsize=None)
+        def refine_tuning_config(cls, tune_max_num_tokens: int):
+            cls.tuning_config = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        0,
+                        0,
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                )
             )
 
     @register_custom_op(
@@ -421,7 +465,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
         fc1_expert_weights: torch.Tensor,
+        fc1_expert_biases: Optional[torch.Tensor],
         fc2_expert_weights: torch.Tensor,
+        fc2_expert_biases: Optional[torch.Tensor],
         output_dtype: torch.dtype,
         quant_scales: List[torch.Tensor],
         input_sf: Optional[torch.Tensor] = None,
@@ -431,36 +477,15 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         ep_rank: int = 0,
         cluster_size: int = 1,
         cluster_rank: int = 0,
-        use_fp8_block_scaling: bool = False,
+        enable_alltoall: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
         use_w4a8_group_scaling: bool = False,
+        use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
         tuner = AutoTuner.get()
-
-        def next_positive_power_of_2(x: int) -> int:
-            if x < 1:
-                return 1
-
-            return 1 << (x - 1).bit_length()
-
-        tune_num_tokens_list = []
-        tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
-        while tune_num_tokens > 0:
-            tune_num_tokens_list.append(tune_num_tokens)
-            tune_num_tokens //= 2
-        # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
-        tuning_config = TuningConfig(
-            dynamic_tensors=(
-                # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-                (0, 0, (tuple(tune_num_tokens_list), next_positive_power_of_2)),
-                # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
-                (3, 0, ((0,), lambda x: x)),
-            )
-        )
-
-        # TODO: set min_latency_mode always to False due to the error in the moe_kernels
-        min_latency_tensor = torch.empty(0)
+        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         # allocate workspace for profiling
         moe_runner = MoERunner(
@@ -474,30 +499,45 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
             "trtllm::fused_moe::gemm1",
             [moe_runner],
-            tuning_config,
-            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+            MoERunner.tuning_config,
+            [
+                input,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
+            ],
             gemm_idx=1,
         )
 
         _, gemm_tactic_2 = tuner.choose_one(
             "trtllm::fused_moe::gemm2",
             [moe_runner],
-            tuning_config,
-            [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
+            MoERunner.tuning_config,
+            [
+                input,
+                fc1_expert_weights,
+                fc1_expert_biases,
+                fc2_expert_weights,
+                fc2_expert_biases,
+            ],
             gemm_idx=2,
         )
 
         run_moe = (
-            moe_runner._fused_moe_runner.run_moe_min_latency
+            moe_runner.fused_moe_runner.run_moe_min_latency
             if min_latency_mode
-            else moe_runner._fused_moe_runner.run_moe
+            else moe_runner.fused_moe_runner.run_moe
         )
         result = run_moe(
             output,
@@ -505,7 +545,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             token_selected_experts,
             token_final_scales,
             fc1_expert_weights,
+            fc1_expert_biases,
             fc2_expert_weights,
+            fc2_expert_biases,
             quant_scales,
             input_sf,
             tp_size,
@@ -514,6 +556,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             ep_rank,
             cluster_size,
             cluster_rank,
+            enable_alltoall,
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
         )
@@ -527,7 +570,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
         fc1_expert_weights: torch.Tensor,
+        fc1_expert_biases: Optional[torch.Tensor],
         fc2_expert_weights: torch.Tensor,
+        fc2_expert_biases: Optional[torch.Tensor],
         output_dtype: torch.dtype,
         quant_scales: List[torch.Tensor],
         input_sf: Optional[torch.Tensor] = None,
@@ -537,8 +582,10 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         ep_rank: int = 0,
         cluster_size: int = 1,
         cluster_rank: int = 0,
-        use_fp8_block_scaling: bool = False,
+        enable_alltoall: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
         use_w4a8_group_scaling: bool = False,
+        use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
     ):
@@ -565,8 +612,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
     )
 
 
-# TODO(shuw): wrap into a FusedMoeModule once trtllm-gen is readly.
-# ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe.py#L827
+# ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
 def cutlass_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -575,6 +621,8 @@ def cutlass_fused_moe(
     fc2_expert_weights: torch.Tensor,
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
+    fc1_expert_biases: Optional[torch.Tensor] = None,
+    fc2_expert_biases: Optional[torch.Tensor] = None,
     input_sf: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
@@ -583,8 +631,10 @@ def cutlass_fused_moe(
     cluster_size: int = 1,
     cluster_rank: int = 0,
     output: Optional[torch.Tensor] = None,
-    use_fp8_block_scaling: bool = False,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
@@ -595,14 +645,16 @@ def cutlass_fused_moe(
     and supports various data types and parallelism strategies.
 
     Args:
-        input (torch.Tensor): Input tensor of shape [seq_len, hidden_size].
+        input (torch.Tensor): Input tensor of shape [num_tokens, hidden_size].
             Support float, float16, bfloat16, float8_e4m3fn and nvfp4.
             For FP8, the input must be quantized.
             For NVFP4, both quantized and non-quantized inputs are supported.
         token_selected_experts (torch.Tensor): Indices of selected experts for each token.
         token_final_scales (torch.Tensor): Scaling factors for each token's expert outputs.
         fc1_expert_weights (torch.Tensor): GEMM1 weights for each expert.
+        fc1_expert_biases (torch.Tensor, optional): GEMM1 biases for each expert.
         fc2_expert_weights (torch.Tensor): GEMM2 weights for each expert.
+        fc2_expert_biases (torch.Tensor, optional): GEMM1 biases for each expert.
         output_dtype (torch.dtype): Desired output data type.
         quant_scales (List[torch.Tensor]): Quantization scales for the operation.
             NVFP4:
@@ -625,8 +677,10 @@ def cutlass_fused_moe(
         cluster_size (int, optional): Cluster size. Defaults to 1.
         cluster_rank (int, optional): Cluster rank. Defaults to 0.
         output (torch.Tensor, optional): The output tensor, if not provided, will be allocated internally.
-        use_fp8_block_scaling (bool, optional): Whether to use FP8 block scaling. Defaults to False.
+        enable_alltoall (bool, False): Whether to enable all-to-all communication for expert outputs. Defaults to False.
+        use_deepseek_fp8_block_scale (bool, optional): Whether to use FP8 block scaling. Defaults to False.
         use_w4a8_group_scaling (bool, optional): Whether to use W4A8 group scaling. Defaults to False.
+        use_mxfp8_act_scaling (bool, optional): Whether to use MXFP8 activation scaling. Defaults to False.
         min_latency_mode (bool, optional): Whether to use minimum latency mode. Defaults to False.
         tune_max_num_tokens (int, optional): Maximum number of tokens for tuning. Defaults to 8192.
 
@@ -645,9 +699,9 @@ def cutlass_fused_moe(
         - Currently, some advanced features like FP8 block scaling and minimum latency mode
           are not implemented for Blackwell architecture.
     """
-    if use_fp8_block_scaling:
+    if use_deepseek_fp8_block_scale:
         raise NotImplementedError(
-            "FP8 Block Scaling is not yet implemented for Blackwell."
+            "DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell."
         )
     if use_w4a8_group_scaling:
         raise NotImplementedError(
@@ -655,6 +709,8 @@ def cutlass_fused_moe(
         )
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
+    if use_mxfp8_act_scaling:
+        raise NotImplementedError("mxfp8 not yet implemented for Blackwell.")
 
     num_rows = input.shape[0]
     if min_latency_mode:
@@ -675,7 +731,9 @@ def cutlass_fused_moe(
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
+        fc1_expert_biases,
         fc2_expert_weights,
+        fc2_expert_biases,
         output_dtype,
         quant_scales,
         input_sf,
@@ -685,10 +743,12 @@ def cutlass_fused_moe(
         ep_rank,
         cluster_size,
         cluster_rank,
-        use_fp8_block_scaling,
-        use_w4a8_group_scaling,
-        min_latency_mode,
-        tune_max_num_tokens,
+        enable_alltoall=enable_alltoall,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        min_latency_mode=min_latency_mode,
+        tune_max_num_tokens=8192,
     )
 
 

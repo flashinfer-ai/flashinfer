@@ -243,6 +243,7 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
         output=flash_output,
         quant_scales=None,
     )
+
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
@@ -1010,7 +1011,7 @@ def test_moe_fp8_block_scaling(
     # Call flashinfer implementation with block scaling and expect NotImplementedError
     with pytest.raises(
         NotImplementedError,
-        match="FP8 Block Scaling is not yet implemented for Blackwell",
+        match="DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell",
     ):
         _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
@@ -1021,7 +1022,7 @@ def test_moe_fp8_block_scaling(
             otype,
             tp_size=1,
             tp_rank=0,
-            use_fp8_block_scaling=True,
+            use_deepseek_fp8_block_scale=True,
             quant_scales=quant_scales,
         )
 
