@@ -992,6 +992,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             self._plan_info = self._cached_module.plan()  # None
         elif self._backend == "cudnn":
+            assert self._block_tables is not None
             self._cached_module = get_decode_module(
                 self._backend,
                 q_data_type,
@@ -1009,6 +1010,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._float_workspace_buffer,
                 kv_lens_arr_host,
                 page_size,
+                self._block_tables,
                 self._use_cuda_graph,
             )  # None
         elif self.use_tensor_cores:
@@ -1871,12 +1873,6 @@ class CudnnDecodeModule:
             q.device, non_blocking=True
         )
 
-        batch_size = self._actual_seq_lens_kv_host.shape[0]
-        blocks_per_seq = (self._max_s_kv + self._page_size - 1) // self._page_size
-        block_tables = torch.arange(
-            0, batch_size * blocks_per_seq, dtype=torch.int32, device=q.device
-        ).view(batch_size, blocks_per_seq)
-
         run_func = self._op.decode
         run_func(
             self._max_s_kv,
@@ -1887,7 +1883,7 @@ class CudnnDecodeModule:
             self._workspace_buffer,
             self._actual_seq_lens_kv_host,
             actual_seq_lens_kv_gpu,
-            block_tables,
+            self._block_tables,
             out,
             None,  # batch_offset_q_array
             None,  # batch_offset_o_array
@@ -1902,12 +1898,14 @@ class CudnnDecodeModule:
         workspace_buffer: torch.Tensor,
         kv_lens_arr_host: torch.Tensor,
         page_size: int,
+        block_tables: torch.Tensor,
         is_cuda_graph_enabled: bool,
     ):
         self._workspace_buffer = workspace_buffer
         self._actual_seq_lens_kv_host = kv_lens_arr_host
-        self._max_s_kv = int(self._actual_seq_lens_kv_host.max())
         self._page_size = page_size
+        self._block_tables = block_tables
+        self._max_s_kv = page_size * block_tables.shape[1]
         self._is_cuda_graph_compatible = is_cuda_graph_enabled
 
     def __init__(self):

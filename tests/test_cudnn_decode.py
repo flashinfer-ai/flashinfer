@@ -52,17 +52,6 @@ def test_cudnn_decode(
             1,
         ),
     )
-    k_cache_view = kv_cache[:, 0, :, :, :]
-    v_cache_view = kv_cache[:, 1, :, :, :]
-
-    v_cache = v_cache_view.as_strided(
-        v_cache_view.shape,
-        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
-    )
-    k_cache = k_cache_view.as_strided(
-        k_cache_view.shape,
-        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
-    )
 
     # Now initialize the page tables
     block_tables = torch.tensor(
@@ -74,12 +63,9 @@ def test_cudnn_decode(
         device=device,
     )
 
-    # Initialize scale
-    scale = float(1.0 / (head_dim**0.5))
-
     # Actual sequence lengths (should be randomized across batches. )
     actual_seq_lens_kv = torch.randint(
-        0, s_kv, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
     )
 
     workspace_buffer_size = math.ceil(
@@ -94,18 +80,6 @@ def test_cudnn_decode(
 
     workspace_buffer = torch.empty(
         workspace_buffer_size, dtype=torch.int8, device=device
-    )
-
-    output_x = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
-        q,
-        k_cache,
-        v_cache,
-        scale,
-        workspace_buffer,
-        max_sequence_kv=s_kv,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
-        is_cuda_graph_compatible=is_cuda_graph_compatible,
     )
 
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -160,29 +134,28 @@ def test_cudnn_decode(
         num_kv_heads,
         head_dim,
         page_size,
+        block_tables=block_tables,
         q_data_type=torch.bfloat16,
     )
 
     output = wrapper.run(q, kv_cache)
 
-    torch.testing.assert_close(output, output_x, rtol=1e-2, atol=1e-2)
+    wrapper_ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "HND")
+    wrapper_ref.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.bfloat16,
+    )
 
-    # wrapper_ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "HND")
-    # wrapper_ref.plan(
-    #     kv_indptr,
-    #     kv_indices,
-    #     kv_last_page_len,
-    #     num_qo_heads,
-    #     num_kv_heads,
-    #     head_dim,
-    #     page_size,
-    #     q_data_type=torch.bfloat16,
-    # )
+    output_ref = wrapper_ref.run(q, kv_cache)
 
-    # output_ref = wrapper_ref.run(q, kv_cache)
-
-    # torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
-    test_cudnn_decode(8, 8, 1, 4, 4, True)
+    test_cudnn_decode(4, 40, 1, 4, 4, True)
