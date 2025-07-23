@@ -2072,6 +2072,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
 
     Note:
+    Page size must be 32, 64 or 128.
+
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
@@ -2094,9 +2096,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     block_size = kv_cache.size(-2)
     if (
-        block_size != 32 and block_size != 64
+        block_size != 32 and block_size != 64 and block_size != 128
     ):  # todo(Yingyi): add support for more block sizes?
-        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+        raise ValueError(f"Supported block_size are 32, 64 and 128, got {block_size}")
 
     _check_trtllm_gen_mla_shape(
         query,

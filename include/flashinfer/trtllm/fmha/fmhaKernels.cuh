@@ -236,6 +236,7 @@ class TllmGenFmhaKernel {
 
   static std::string getCubinPath() {
     const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
+    // todo(Yingyi): update the cubin hash for page size 128
     std::string hash =
         env_hash ? std::string(env_hash) : "4c7bdebb4eba13311fc652a069e64782d5c0723d";
     std::string cubin_path = hash + "/fmha/trtllm-gen/";
