@@ -327,24 +327,6 @@ def routing_reference_no_aux(
     return permute_info, scores
 
 
-# Used for API regression testing
-def routing_default(expert_logits, routing_bias, top_k, routed_scaling):
-    padding = 8
-    routing_logits = expert_logits.to(dtype=torch.float, device="cuda")
-    # RoutingMethodType.Default : Softmax -> TopK
-    scores = F.softmax(routing_logits + routing_bias, dim=-1)
-    # Mask out all but top_k
-    _, topk_idx = torch.topk(scores, k=top_k, dim=-1, largest=True, sorted=True)
-    mask = torch.zeros_like(scores)
-    mask.scatter_(-1, topk_idx, 1)
-    scores = scores * mask
-    score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-    scores = scores / score_sum * routed_scaling
-    # permute_info is typically a mapping for token routing, here we use the reference
-    permute_info = routing_reference(scores, top_k, padding)
-    return permute_info, scores
-
-
 def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     input = input.to(torch.float)
     scale = scale.to(torch.float)
@@ -628,12 +610,14 @@ def test_moe_fp8_api_test(num_tokens, expert_info, hidden_size, intermediate_siz
         (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
     ).to(torch.float)
 
-    # RoutingMethodType.Default : Softmax -> TopK
-    permute_info, scores = routing_default(
+    permute_info, scores = routing_reference_no_aux(
         expert_logits,
         routing_bias,
         top_k,
+        n_groups,
+        top_k_groups,
         routed_scaling,
+        padding,
     )
 
     args = moe_args(
@@ -680,6 +664,7 @@ def test_moe_fp8_api_test(num_tokens, expert_info, hidden_size, intermediate_siz
         0,
         num_experts,
         routed_scaling,
+        routing_method_type=RoutingMethodType.DeepSeekV3,
         # DO NOT use any optional arguments
     )
 
@@ -766,11 +751,15 @@ def test_moe_fp8_per_tensor_scale_api_test(
         gemm2_weights
     )
 
-    permute_info, scores = routing_default(
+    permute_info, scores = routing_reference_no_aux(
         expert_logits,
         routing_bias,
         top_k,
+        n_groups,
+        top_k_groups,
         routed_scaling,
+        tile_tokens_dim,
+        use_routing_scales_on_input,
     )
 
     args = moe_args(
@@ -875,7 +864,8 @@ def test_moe_fp8_per_tensor_scale_api_test(
         0,
         num_experts,
         routed_scaling,
-        # DO NOT use any optional arguments
+        routing_method_type=RoutingMethodType.Llama4,
+        # DO NOT use any other optional arguments
     )
 
     output_dequant_actual = output.to(torch.float)
