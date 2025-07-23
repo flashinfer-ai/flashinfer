@@ -1,0 +1,36 @@
+ARG ROCM_VERSION=6.4
+
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ARG ROCM_VERSION=6.4
+ARG PY_VERSION=3.12
+ARG TORCH_VERSION=2.6
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    clang-format \
+    clangd-19 \
+    vim \
+    zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /root/
+
+COPY . /root/flashinfer/
+ARG GFX_ARCH=gfx942
+ENV PYTORCH_ROCM_ARCH=${GFX_ARCH}
+ARG MAMBA_ENV_NAME=flashinfer-py${PY_VERSION}-torch${TORCH_VERSION}-rocm${ROCM_VERSION}
+
+RUN curl -L micro.mamba.pm/install.sh | bash
+RUN ~/.local/bin/micromamba create -n ${MAMBA_ENV_NAME} python=${PY_VERSION} cmake ninja pybind11 -c conda-forge --override-channels -y && \
+~/.local/bin/micromamba run -n ${MAMBA_ENV_NAME} pip install ninja scikit-build-core setuptools-scm numpy pytest
+RUN ~/.local/bin/micromamba run -n ${MAMBA_ENV_NAME} pip install torch==${TORCH_VERSION} -f https://repo.radeon.com/rocm/manylinux/rocm-rel-${ROCM_VERSION}/
+RUN /bin/bash -c "eval \"\$(~/.local/bin/micromamba shell hook --shell bash)\" && \
+    micromamba activate ${MAMBA_ENV_NAME} && \
+    cd /root/flashinfer/ && \
+    FLASHINFER_HIP_ARCHITECTURES=${GFX_ARCH} FLASHINFER_AOT_TORCH_EXTS=ON python -m pip wheel . --wheel-dir=./dist/ --no-deps --no-build-isolation -v 2>&1 | tee build_log_aot_whl.log && \
+    pip install dist/flashinfer-*.whl"
+
+CMD ["/bin/bash"]
