@@ -28,6 +28,7 @@ from flashinfer import (
     RoutingMethodType,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
+    next_positive_power_of_2,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
@@ -1595,7 +1596,19 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2048])
+def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = num_tokens * top_k // num_experts
+
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+    return tile_tokens_dim
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 384])
 @pytest.mark.parametrize(
@@ -1723,7 +1736,7 @@ def test_moe_quantization_classes(
     routed_scaling = routing_config["routed_scaling"]
     num_experts = routing_config["num_experts"]
     routing_method_type = routing_config["routing_method_type"]
-    tile_tokens_dim = 8
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     # Validation checks
     assert top_k <= num_experts
