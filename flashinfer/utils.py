@@ -489,3 +489,7 @@ def ceil_div(x: int, y: int) -> int:
         The result of the ceiling division.
     """
     return (x + y - 1) // y
+
+
+def get_device_sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count

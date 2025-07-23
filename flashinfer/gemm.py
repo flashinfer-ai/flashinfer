@@ -729,8 +729,10 @@ class UIDs(Enum):
 
     A_UID = 0
     B_UID = 1
-    SCALE_UID = 2
-    O_UID = 3
+    ALPHA_UID = 2
+    BLOCK_DESCALE_A_UID = 3
+    BLOCK_DESCALE_B_UID = 4
+    O_UID = 5
 
 
 def _check_cudnn_availability():
@@ -742,11 +744,59 @@ def _check_cudnn_availability():
         )
 
 
-@functools.lru_cache(maxsize=1)
-def _get_cudnn_handle():
-    """Create and return a cached cuDNN handle."""
+def _check_cudnn_fp4_availability():
+    """Check if cuDNN FP4 support is available and raise exception if not."""
     _check_cudnn_availability()
-    return cudnn.create_handle()
+
+    # Check cuDNN version for FP4 support (requires 1.13.* or later)
+    try:
+        version_str = cudnn.__version__
+        major, minor = map(int, version_str.split(".")[:2])
+
+        if (major, minor) < (1, 13):
+            raise RuntimeError(
+                f"cuDNN FP4 requires version 1.13+, found {version_str}. "
+                f"Upgrade: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
+            )
+    except (ImportError, AttributeError, ValueError, IndexError):
+        raise RuntimeError(
+            "Unable to determine cuDNN version. FP4 requires cuDNN 1.13+."
+        )
+
+    # Check cuDNN backend version for FP4 support (requires >= 91002)
+    try:
+        backend_version = cudnn.backend_version()
+        if backend_version < 91002:
+            raise RuntimeError(
+                f"cuDNN FP4 requires backend version >= 91002, found {backend_version}. "
+                f"Please upgrade cuDNN backend."
+            )
+    except (AttributeError, TypeError):
+        raise RuntimeError(
+            "Unable to determine cuDNN backend version. FP4 requires backend >= 91002."
+        )
+
+
+def _get_native_fp4_dtype():
+    """get native fp4 datatype if supported in the torch, otherwise return uint8."""
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    else:
+        return torch.uint8
+
+
+# Global cudnn handle. need to make it per device in future
+_cudnn_handle = None
+
+
+def _get_cudnn_handle(stream: torch.cuda.Stream):
+    """Create and return a cached cuDNN handle."""
+    global _cudnn_handle
+    if _cudnn_handle is None:
+        _check_cudnn_availability()
+        _cudnn_handle = cudnn.create_handle()
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
+    return _cudnn_handle
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -759,8 +809,120 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
 
 
 @functools.lru_cache(maxsize=128)
+def build_cudnn_gemm_block_scale_dequantize_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    a_descale_shape,
+    a_descale_stride,
+    b_descale_shape,
+    b_descale_stride,
+    ab_type,
+    scale_type,
+    o_type,
+    block_size,
+    device,
+):
+    _check_cudnn_availability()
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=a_shape, stride=a_stride, data_type=ab_type
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=b_shape, stride=b_stride, data_type=ab_type
+        )
+        block_descale_a_cudnn_tensor = graph.tensor(
+            name="block_descale_a",
+            dim=a_descale_shape,
+            stride=a_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+        block_descale_b_cudnn_tensor = graph.tensor(
+            name="block_descale_b",
+            dim=b_descale_shape,
+            stride=b_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+        global_scale_cudnn_tensor = graph.tensor(
+            name="global_scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        dequant_a_tensor = graph.block_scale_dequantize(
+            a_cudnn_tensor,
+            block_descale_a_cudnn_tensor,
+            block_size=[1, block_size],
+            name="dequant_a",
+        )
+        dequant_a_tensor.set_data_type(cudnn.data_type.FLOAT)
+        dequant_b_tensor = graph.block_scale_dequantize(
+            b_cudnn_tensor,
+            block_descale_b_cudnn_tensor,
+            block_size=[block_size, 1],
+            name="dequant_b",
+        )
+        dequant_b_tensor.set_data_type(cudnn.data_type.FLOAT)
+        c_tensor = graph.matmul(
+            dequant_a_tensor,
+            dequant_b_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+            name="gemm",
+        )
+        c_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        c_final_cudnn_tensor = graph.mul(
+            name="scale_mul",
+            a=c_tensor,
+            b=global_scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        block_descale_a_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_A_UID.value)
+        block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
+        global_scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        # WAR: the alpha (contains the global scale) is not supported by the cuBLAS backend, need to deselect it.
+        graph.deselect_engines(["eng0"])
+        graph.check_support()
+        graph.build_plans()
+
+        return graph
+
+
+def execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, c_final):
+    variant_pack = {
+        UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
+        UIDs.B_UID.value: b.view(_get_native_fp4_dtype()),
+        UIDs.BLOCK_DESCALE_A_UID.value: a_descale.view(torch.float8_e4m3fn),
+        UIDs.BLOCK_DESCALE_B_UID.value: b_descale.view(torch.float8_e4m3fn),
+        UIDs.ALPHA_UID.value: alpha.view(torch.float),
+        UIDs.O_UID.value: c_final,
+    }
+
+    workspace = torch.empty(
+        graph.get_workspace_size(), device=a.device, dtype=torch.uint8
+    )
+
+    stream = torch.cuda.current_stream(a.device)
+
+    graph.execute(variant_pack, workspace, handle=_get_cudnn_handle(stream))
+
+
+@functools.lru_cache(maxsize=128)
 def build_cudnn_gemm_with_per_tensor_q_graph(
-    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type
+    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
 ):
     """Build a cuDNN graph for GEMM with per-tensor quantization.
 
@@ -780,58 +942,63 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
     """
     _check_cudnn_availability()
 
-    graph = cudnn.pygraph()
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
 
-    a_cudnn_tensor = graph.tensor(
-        name="a", dim=a_shape, stride=a_stride, data_type=a_type
-    )
-    b_cudnn_tensor = graph.tensor(
-        name="b", dim=b_shape, stride=b_stride, data_type=b_type
-    )
-    scale_cudnn_tensor = graph.tensor(
-        name="scale", dim=(1, 1, 1), stride=(1, 1, 1), data_type=cudnn.data_type.FLOAT
-    )
-    c_cudnn_tensor = graph.matmul(
-        name="matmul",
-        A=a_cudnn_tensor,
-        B=b_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
-    c_final_cudnn_tensor = graph.mul(
-        name="scale_mul",
-        a=c_cudnn_tensor,
-        b=scale_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=a_shape, stride=a_stride, data_type=a_type
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=b_shape, stride=b_stride, data_type=b_type
+        )
+        scale_cudnn_tensor = graph.tensor(
+            name="scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor = graph.matmul(
+            name="matmul",
+            A=a_cudnn_tensor,
+            B=b_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
+        c_final_cudnn_tensor = graph.mul(
+            name="scale_mul",
+            a=c_cudnn_tensor,
+            b=scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
-    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
-    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    scale_cudnn_tensor.set_uid(UIDs.SCALE_UID.value)
-    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-    graph.validate()
-    graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans()
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans()
 
-    return graph
+        return graph
 
 
-def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, scale_tensor, c_final):
+def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, alpha, c_final):
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
-        UIDs.SCALE_UID.value: scale_tensor,
+        UIDs.ALPHA_UID.value: alpha,
         UIDs.O_UID.value: c_final,
     }
 
-    cudnn_handle = _get_cudnn_handle()
+    stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(stream)
 
     workspace = torch.empty(
-        graph.get_workspace_size(), device="cuda", dtype=torch.uint8
+        graph.get_workspace_size(), device=a.device, dtype=torch.uint8
     )
 
     graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -872,9 +1039,199 @@ def _cudnn_gemm_fp8(
         _torch_data_type_to_cudnn_data_type(a.dtype),
         _torch_data_type_to_cudnn_data_type(b.dtype),
         _torch_data_type_to_cudnn_data_type(torch_out_dtype),
+        a.device,
     )
 
     execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
+    return out
+
+
+def _get_real_fp4_shape_from_packed_uint8(packed_fp4_tensor):
+    # the FP4 data are packed into uint8, we need to expand the shape and stride information to get the real shape and stride to be used in the cuDNN graph.
+    is_column_major = packed_fp4_tensor.stride(-2) == 1
+    real_shape = list(packed_fp4_tensor.shape)
+    real_stride = list(packed_fp4_tensor.stride())
+
+    # this function will be used for both mm and bmm, so we need to insert batch dimension if the tensor is 2d
+    if len(real_shape) == 2:
+        real_shape.insert(0, 1)
+        real_stride.insert(0, packed_fp4_tensor.numel())
+
+    # each packed uint8 contains 2 fp4 elements
+    real_shape[-2 if is_column_major else -1] *= 2
+    if is_column_major:
+        real_stride[-1] *= 2
+        for i in range(len(real_stride) - 2):
+            real_stride[i] *= 2
+    else:
+        for i in range(len(real_stride) - 1):
+            real_stride[i] *= 2
+
+    return (tuple(real_shape), tuple(real_stride))
+
+
+def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
+    # This function will be shared for both mm and bmm, when 2d block scale tensor is provided, we need unfold the batch dimension. the unfoled dim and stride is returned.
+    block_scale_shape = list(block_scale_tensor.shape)
+    block_scale_stride = list(block_scale_tensor.stride())
+
+    if len(block_scale_shape) == 2:
+        # expand to 3d
+        block_scale_shape.insert(0, batch_size)
+        block_scale_stride.insert(0, 1)
+
+        # update the stride and shape for the expanded dimension
+        is_column_major = block_scale_tensor.stride(-2) == 1
+        expand_dim = 2 if is_column_major else 1
+
+        assert block_scale_shape[expand_dim] % batch_size == 0
+        block_scale_shape[expand_dim] = block_scale_shape[expand_dim] // batch_size
+        block_scale_stride[0] = (
+            block_scale_stride[expand_dim] * block_scale_shape[expand_dim]
+        )
+    elif len(block_scale_shape) == 3:
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported block scale tensor shape: {block_scale_shape}, expected 2d or 3d."
+        )
+
+    return (tuple(block_scale_shape), tuple(block_scale_stride))
+
+
+def mm_fp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+) -> torch.Tensor:
+    r"""MM FP4
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape (m, k), fp4 e2m1fn_x2 or uint8.
+
+    b: torch.Tensor
+        Mat2 tensor, shape (k, n), should be column major, fp4 e2m1fn_x2 or uint8.
+
+    a_descale: torch.Tensor
+        Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8.
+
+    b_descale: torch.Tensor
+        Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
+
+    alpha: torch.Tensor
+        Global scale tensor, float scalar.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16 or fp16.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
+
+    block_size: int
+        Block size for FP4 quantization, only 16 is supported.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (m, n), bf16 or fp16.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer import fp4_quantize, mm_fp4
+    >>> a = torch.randn([48, 128], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([256, 128], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    >>> b_global_sf = (448 * 6) / b.float().abs().nan_to_num().max()
+    >>> a_fp4, a_sf = fp4_quantize(a, a_global_sf, 16, False, True)
+    >>> b_fp4, b_sf = fp4_quantize(b, b_global_sf, 16, False, True)
+    >>> out = mm_fp4(a_fp4, b_fp4, a_sf, b_sf, 1.0/(a_global_sf * b_global_sf), torch.bfloat16, None)
+    >>> out.shape
+    torch.Size([48, 256])
+    """
+    _check_cudnn_fp4_availability()
+
+    # pre-check the input tensor, block scale tensor and alpha tensor
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"K dimension mismatch in mm_fp4. got a.shape[1] = {a.shape[1]}, b.shape[0] = {b.shape[0]}"
+        )
+    if a.dtype not in {torch.uint8, _get_native_fp4_dtype()} or b.dtype not in {
+        torch.uint8,
+        _get_native_fp4_dtype(),
+    }:
+        raise ValueError(
+            f"a and b must have float4_e2m1fn_x2 packed into uint8. "
+            f"Got {a.dtype} and {b.dtype}."
+        )
+    if a_descale.dtype not in {
+        torch.float8_e4m3fn,
+        torch.uint8,
+    } or b_descale.dtype not in {torch.float8_e4m3fn, torch.uint8}:
+        raise ValueError(
+            f"a_descale and b_descale must have float8_e4m3fnx2 packed into uint8. "
+            f"Got {a_descale.dtype} and {b_descale.dtype}."
+        )
+    if alpha.dtype != torch.float:
+        raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
+    if alpha.numel() != 1:
+        raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"Unsupported output dtype: {out_dtype}. "
+            f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
+        )
+    if block_size != 16:
+        raise ValueError(f"Only block_size = 16 is supported for FP4 GEMM operations.")
+
+    # allocate the output tensor if not provided
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=out_dtype,
+        )
+
+    # the fp4 cudnn graph will be shared for both mm and bmm, so here we need to get the 3d shape and stride including the batch dimension for both input and block scale tensors.
+    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+    batch = real_a_shape[0]
+    expanded_a_descale_shape, expanded_a_descale_stride = (
+        _expand_block_scale_tensor_shape(a_descale, batch)
+    )
+    expanded_b_descale_shape, expanded_b_descale_stride = (
+        _expand_block_scale_tensor_shape(b_descale, batch)
+    )
+
+    # build the fp4 cudnn graph
+    graph = build_cudnn_gemm_block_scale_dequantize_graph(
+        real_a_shape,
+        real_a_stride,
+        real_b_shape,
+        real_b_stride,
+        expanded_a_descale_shape,
+        expanded_a_descale_stride,
+        expanded_b_descale_shape,
+        expanded_b_descale_stride,
+        _get_native_fp4_dtype(),
+        torch.float8_e4m3fn,
+        _torch_data_type_to_cudnn_data_type(out_dtype),
+        block_size,
+        a.device,
+    )
+
+    # execute the fp4 cudnn graph
+    execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
     return out
 
 

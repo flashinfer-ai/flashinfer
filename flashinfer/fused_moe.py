@@ -228,7 +228,7 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
-def gen_fused_moe_sm100_module() -> JitSpec:
+def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool) -> JitSpec:
     return gen_jit_spec(
         "fused_moe_sm100",
         [
@@ -295,9 +295,7 @@ def gen_fused_moe_sm100_module() -> JitSpec:
             "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
             "-DCOMPILE_HOPPER_TMA_GEMMS",
         ],
-        extra_cflags=[
-            "-DFAST_BUILD",
-        ],
+        extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -323,8 +321,10 @@ def gen_fused_moe_sm100_module() -> JitSpec:
 
 
 @functools.cache
-def get_fused_moe_sm100_module():
-    module = gen_fused_moe_sm100_module().build_and_load(class_name="FusedMoeRunner")
+def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
+    module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+        class_name="FusedMoeRunner"
+    )
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
@@ -686,7 +686,7 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_fused_moe_sm100_module().cutlass_fused_moe_sm100(
+    return get_cutlass_fused_moe_sm100_module().cutlass_fused_moe_sm100(
         output,
         input,
         token_selected_experts,
