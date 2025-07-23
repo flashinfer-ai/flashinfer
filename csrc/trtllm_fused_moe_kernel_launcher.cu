@@ -565,7 +565,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
     // Properly initialize the runner using make_unique like in the original code
     auto mRunner = std::make_unique<RunnerType>(
         mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_weight,
-        static_cast<batchedGemm::trtllm::gen::MatrixLayout>(weight_layout));
+        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
     auto const num_tokens = hidden_states.sizes()[0];
@@ -909,7 +909,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
   // Properly initialize the runner using make_unique like in the original code
   auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
                                               /*useShuffledMatrixA*/ true,
-                                              batchedGemm::trtllm::gen::MatrixLayout::MajorK);
+                                              batchedGemm::gemm::MatrixLayout::MajorK);
 
   auto const num_tokens = hidden_states.sizes()[0];
 

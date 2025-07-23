@@ -176,7 +176,7 @@ namespace PermuteGemm1 {
 
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeElt, int32_t tileTokensDim, bool useDeepSeekFp8, bool useShuffledMatrixA,
-    batchedGemm::trtllm::gen::MatrixLayout weightLayout) {
+    batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       .eltType = dtypeElt,
       .outputType = dtypeElt,
@@ -193,7 +193,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 }
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrixA,
-               batchedGemm::trtllm::gen::MatrixLayout weightLayout)
+               batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeElt(dtypeElt),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(
@@ -256,7 +256,7 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeElt, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8,
-    bool useShuffledMatrixA, batchedGemm::trtllm::gen::MatrixLayout weightLayout) {
+    bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       .eltType = dtypeElt,
       .outputType = dtypeOut,
@@ -273,7 +273,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 }
 
 Runner::Runner(btg::Dtype dtypeElt, btg::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim,
-               bool useShuffledMatrixA, batchedGemm::trtllm::gen::MatrixLayout weightLayout)
+               bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeElt(dtypeElt),
       mOutputDtype(outputDtype),
       mTileTokensDim(tileTokensDim),
@@ -337,11 +337,11 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 
 namespace MoE {
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
-               bool useShuffledMatrixA, batchedGemm::trtllm::gen::MatrixLayout weightLayout)
+               bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout)
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8, tileTokensDim,
                                          useShuffledMatrixA, weightLayout)),
       mGemm2(Gemm2::Runner(dtypeElt, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim,
-                           useShuffledMatrixA)) {
+                           useShuffledMatrixA, weightLayout)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 

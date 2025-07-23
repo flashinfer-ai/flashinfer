@@ -121,7 +121,7 @@ namespace PermuteGemm1 {
 class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim,
-                  bool useShuffledMatrixA, batchedGemm::trtllm::gen::MatrixLayout weight_layout);
+                  bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -158,7 +158,7 @@ class Runner {
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrixA,
-                  batchedGemm::trtllm::gen::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -295,8 +295,7 @@ class Runner {
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrixA = false,
-         batchedGemm::trtllm::gen::MatrixLayout weight_layout =
-             batchedGemm::trtllm::gen::MatrixLayout::MajorK);
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
            cudaStream_t stream, int64_t configIndex);

@@ -676,21 +676,21 @@ def test_moe_fp8(
                 shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
             )
 
+            if weight_layout == fused_moe.WeightLayout.BlockMajorK:
+                block_k = 128
+                gemm1_weights_fp8_shuffled.append(
+                    shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), block_k)
+                )
+                gemm2_weights_fp8_shuffled.append(
+                    shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), block_k)
+                )
+
         kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )
         kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )
-
-        block_k = 128
-        if weight_layout == fused_moe.WeightLayout.BlockMajorK:
-            kernel_gemm1_weights = fused_moe.convert_to_block_layout(
-                kernel_gemm1_weights, block_k
-            )
-            kernel_gemm2_weights = fused_moe.convert_to_block_layout(
-                kernel_gemm2_weights, block_k
-            )
 
     output = fused_moe.trtllm_fp8_block_scale_moe(
         expert_logits,
