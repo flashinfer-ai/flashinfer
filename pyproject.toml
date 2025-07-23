@@ -20,7 +20,11 @@ authors = [{ name = "FlashInfer team" }]
 # license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-dynamic = ["dependencies", "version"]
+dynamic = ["version"]
+
+dependencies = [
+    "nvidia-cutlass>=3.8.0",
+]
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]

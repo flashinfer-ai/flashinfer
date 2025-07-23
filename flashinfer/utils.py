@@ -489,11 +489,6 @@ def device_support_pdl(device: torch.device) -> bool:
     return major >= 9
 
 
-def round_up(x: int, y: int) -> int:
-    """Round up x to the nearest multiple of y"""
-    return (x + y - 1) // y * y
-
-
 def ceil_div(x: int, y: int) -> int:
     """
     Perform ceiling division of two integers.
@@ -508,7 +503,8 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def pad_up(x: int, y: int) -> int:
+def round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y"""
     return ceil_div(x, y) * y
 
 

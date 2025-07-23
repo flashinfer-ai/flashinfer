@@ -6,12 +6,7 @@ from typing import Dict, List
 
 import torch
 
-from .utils import ceil_div, pad_up
-
-# from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
-# from tensorrt_llm.math_utils import ceil_div, pad_up
-# from tensorrt_llm.quantization.utils import fp4_utils
-
+from ..utils import ceil_div, round_up
 
 is_torch_compiling_flag = False
 
@@ -106,8 +101,8 @@ class Fp4QuantizedTensor:
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
-    padded_row = pad_up(row, 128)
-    padded_col = pad_up(col, 4)
+    padded_row = round_up(row, 128)
+    padded_col = round_up(col, 4)
     return padded_row, padded_col
 
 
@@ -119,7 +114,7 @@ def swizzle_sf(sf: torch.Tensor, rows: int, cols: int, scaling_vector_size: int 
         cols_sf: ceil_div(cols, scaling_vector_size) where cols is the number of columns of the original unquantized tensor
         scaling_vector_size: the size of the scaling vector
     Returns:
-        [b * pad_up(rows, 128) * pad_up(cols_sf, 4), ] 1D swizzled scaling factors, possibly with rows and cols padded.
+        [b * round_up(rows, 128) * round_up(cols_sf, 4), ] 1D swizzled scaling factors, possibly with rows and cols padded.
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
@@ -187,7 +182,7 @@ def _(sf, rows, cols, scaling_vector_size=16):
     padded_rows, padded_sf_cols = compute_swizzled_sf_shape(rows, sf_cols)
     num_partitions = sf.numel() // (padded_rows * padded_sf_cols)
     total_rows = num_partitions * rows
-    sz = pad_up(total_rows, 128) * pad_up(cols, 4)
+    sz = round_up(total_rows, 128) * round_up(cols, 4)
     return sf.new_empty(sz)
 
 
@@ -250,7 +245,7 @@ def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
     output_shape[-1] //= 2
 
     scale_shape = (
-        pad_up(m, 128) * pad_up(input_shape[-1] // sf_vec_size, 4)
+        round_up(m, 128) * round_up(input_shape[-1] // sf_vec_size, 4)
         if is_swizzled_layout
         else m * (input_shape[-1] // sf_vec_size)
     )
