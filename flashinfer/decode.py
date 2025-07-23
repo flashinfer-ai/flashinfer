@@ -759,7 +759,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
-        self._use_tensor_cores = use_tensor_cores or backend == "trtllm-gen"
+        self._use_tensor_cores = use_tensor_cores or backend in ["trtllm-gen", "cudnn"]
         self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:
@@ -977,7 +977,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         ]
                     )
                     block_id += num_blocks_needed
-            self._cached_module = get_trtllm_gen_decode_module(
+            self._cached_module = get_decode_module(
+                self._backend,
                 q_data_type,
                 kv_data_type,
                 q_data_type,
@@ -990,6 +991,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # use_fp16_qk_reduction
             )
             self._plan_info = self._cached_module.plan()  # None
+        elif self._backend == "cudnn":
+            self._cached_module = get_decode_module(
+                self._backend,
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                indptr.dtype,
+                head_dim,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
+            )
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                kv_lens_arr_host,
+                page_size,
+                self._use_cuda_graph,
+            )  # None
         elif self.use_tensor_cores:
             self._max_kv_len = max(kv_lens_arr_host).item()
             if self._jit_module is not None:
@@ -1837,10 +1858,75 @@ class TrtllmGenDecodeModule:
         setup_metainfo_loader(self._mod.get_library_path())
 
 
+class CudnnDecodeModule:
+    def _paged_run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        scale: float,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        actual_seq_lens_kv_gpu = self._actual_seq_lens_kv_host.to(
+            q.device, non_blocking=True
+        )
+
+        batch_size = self._actual_seq_lens_kv_host.shape[0]
+        blocks_per_seq = (self._max_s_kv + self._page_size - 1) // self._page_size
+        block_tables = torch.arange(
+            0, batch_size * blocks_per_seq, dtype=torch.int32, device=q.device
+        ).view(batch_size, blocks_per_seq)
+
+        run_func = self._op.decode
+        run_func(
+            self._max_s_kv,
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            self._workspace_buffer,
+            self._actual_seq_lens_kv_host,
+            actual_seq_lens_kv_gpu,
+            block_tables,
+            out,
+            None,  # batch_offset_q_array
+            None,  # batch_offset_o_array
+            self._is_cuda_graph_compatible,
+        )
+
+    def _ragged_run(self, *args, **kwargs):
+        raise NotImplementedError("cudnn doesn't support ragged run")
+
+    def _plan(
+        self,
+        workspace_buffer: torch.Tensor,
+        kv_lens_arr_host: torch.Tensor,
+        page_size: int,
+        is_cuda_graph_enabled: bool,
+    ):
+        self._workspace_buffer = workspace_buffer
+        self._actual_seq_lens_kv_host = kv_lens_arr_host
+        self._max_s_kv = int(self._actual_seq_lens_kv_host.max())
+        self._page_size = page_size
+        self._is_cuda_graph_compatible = is_cuda_graph_enabled
+
+    def __init__(self):
+        self._mod = cudnn_fmha_gen_module()
+        self._op = self._mod.build_and_load()
+        from flashinfer.jit.cubin_loader import setup_cubin_loader
+
+        setup_cubin_loader(self._mod.get_library_path())
+
+
 @functools.cache
-def get_trtllm_gen_decode_module(*args):
-    uri = get_batch_prefill_uri("trtllm-gen", *args)
-    module = TrtllmGenDecodeModule()
+def get_decode_module(backend, *args):
+    uri = get_batch_prefill_uri(backend, *args)
+
+    if backend == "trtllm-gen":
+        module = TrtllmGenDecodeModule()
+
+    if backend == "cudnn":
+        module = CudnnDecodeModule()
 
     @register_custom_op(
         f"flashinfer::{uri}_ragged_run",
@@ -1890,26 +1976,29 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
     ) -> None:
-        assert maybe_lse is None
-        assert paged_kv_cache is not None
-        assert num_qo_heads is not None
-        assert num_kv_heads is not None
-        assert block_tables is not None
-        assert kv_lens_buffer is not None
-        assert page_size is not None
-        assert max_kv_len is not None
-        o = module._paged_run(
-            q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
-            paged_kv_cache,
-            int_workspace_buffer,
-            block_tables,
-            kv_lens_buffer,
-            max_kv_len,
-            sm_scale,
-            1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
-            window_left,
-            out=o,
-        )
+        if backend == "trtllm-gen":
+            assert maybe_lse is None
+            assert paged_kv_cache is not None
+            assert num_qo_heads is not None
+            assert num_kv_heads is not None
+            assert block_tables is not None
+            assert kv_lens_buffer is not None
+            assert page_size is not None
+            assert max_kv_len is not None
+            o = module._paged_run(
+                q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
+                paged_kv_cache,
+                int_workspace_buffer,
+                block_tables,
+                kv_lens_buffer,
+                max_kv_len,
+                sm_scale,
+                1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+                window_left,
+                out=o,
+            )
+        elif backend == "cudnn":
+            o = module._paged_run(q, paged_k_cache, paged_v_cache, sm_scale, o)
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
     def _fake_paged_run(

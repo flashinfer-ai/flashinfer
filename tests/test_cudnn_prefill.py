@@ -65,48 +65,6 @@ def test_cudnn_prefill(
             1,
         ),
     )
-    k_cache_view = kv_cache[:, 0, :, :, :]
-    v_cache_view = kv_cache[:, 1, :, :, :]
-
-    v_cache = v_cache_view.as_strided(
-        v_cache_view.shape,
-        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
-    )
-    k_cache = k_cache_view.as_strided(
-        k_cache_view.shape,
-        (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
-    )
-
-    # Now initialize the page tables
-    block_tables = torch.tensor(
-        [
-            [k + i * num_pages_per_seq for k in range(num_pages_per_seq)]
-            for i in range(batch_size)
-        ],
-        dtype=torch.int,
-        device=device,
-    )
-
-    # Initialize scale
-    scale = float(1.0 / (head_dim**0.5))
-
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-
-    output, lse = flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
-        q,
-        k_cache,
-        v_cache,
-        scale,
-        workspace_buffer,
-        max_token_per_sequence=s_qo,
-        max_sequence_kv=s_kv,
-        actual_seq_lens_q=actual_seq_lens_q,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
-        causal=causal,
-        return_lse=return_lse,
-        is_cuda_graph_compatible=is_cuda_graph_compatible,
-    )
 
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -158,13 +116,26 @@ def test_cudnn_prefill(
     )
 
     # Workspace buffer
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, "HND"
-    )
+    if is_cuda_graph_compatible:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "HND",
+            backend="cudnn",
+            use_cuda_graph=is_cuda_graph_compatible,
+            qo_indptr_buf=qo_indptr,
+            paged_kv_indptr_buf=kv_indptr,
+            paged_kv_indices_buf=kv_indices,
+            paged_kv_last_page_len_buf=kv_last_page_len,
+        )
+    else:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "HND",
+            backend="cudnn",
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
     wrapper.plan(
         qo_indptr,
         kv_indptr,
@@ -179,6 +150,36 @@ def test_cudnn_prefill(
         q_data_type=torch.bfloat16,
     )
 
-    output_ref = wrapper.run(q, kv_cache)
+    output, lse = wrapper.run(q, kv_cache, return_lse=return_lse)
+
+    wrapper_ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "HND",
+        use_cuda_graph=is_cuda_graph_compatible,
+        qo_indptr_buf=qo_indptr,
+        paged_kv_indptr_buf=kv_indptr,
+        paged_kv_indices_buf=kv_indices,
+        paged_kv_last_page_len_buf=kv_last_page_len,
+    )
+    wrapper_ref.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        causal=causal,
+        q_data_type=torch.bfloat16,
+    )
+
+    output_ref, lse_ref = wrapper.run(q, kv_cache, return_lse=True)
 
     torch.testing.assert_close(output, output_ref)
+    torch.testing.assert_close(lse, lse_ref)
+
+
+if __name__ == "__main__":
+    test_cudnn_prefill(4, 17, 32, 32, 4, 4, 128, True, True, True)

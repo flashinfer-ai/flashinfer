@@ -508,6 +508,15 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
             )
+        elif backend == "cudnn":
+            paged_run_func(
+                q,
+                paged_k_cache,
+                paged_v_cache,
+                sm_scale,
+                o,
+                maybe_lse,
+            )
         else:
             if not is_float8(q):
                 paged_run_func(
@@ -1301,7 +1310,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
-        if backend in ["fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa3", "auto", "trtllm-gen", "cudnn"]:
             # NOTE(Zihao): assume maximum accumulate kv length is 16M
             self._vector_sparse_indices_buffer = torch.empty(
                 (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
@@ -1683,7 +1692,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._backend, *get_module_args
             )
 
-        if self._backend == "fa3" or self._backend == "trtllm-gen":
+        if self._backend in ["fa3", "trtllm-gen", "cudnn"]:
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
@@ -1722,23 +1731,33 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ]
                     block_id += num_blocks_needed
 
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            paged_kv_indptr_host,
-            kv_lens_arr_host,
-            self._max_total_num_rows or total_num_rows,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim_qk,
-            head_dim_vo,
-            causal,
-        )
+        if self._backend == "cudnn":
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                qo_indptr_host,
+                kv_lens_arr_host,
+                self.is_cuda_graph_enabled,
+                page_size,
+                causal,
+            )
+        else:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                paged_kv_indptr_host,
+                kv_lens_arr_host,
+                self._max_total_num_rows or total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim_qk,
+                head_dim_vo,
+                causal,
+            )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -2188,8 +2207,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``.
-            Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or
+            ``trtllm-gen``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 

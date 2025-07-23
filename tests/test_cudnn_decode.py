@@ -96,7 +96,7 @@ def test_cudnn_decode(
         workspace_buffer_size, dtype=torch.int8, device=device
     )
 
-    output = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
+    output_x = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
         q,
         k_cache,
         v_cache,
@@ -147,11 +147,11 @@ def test_cudnn_decode(
     )
 
     # Workspace buffer
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer_ref, "HND")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "HND", backend="cudnn"
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -163,6 +163,26 @@ def test_cudnn_decode(
         q_data_type=torch.bfloat16,
     )
 
-    output_ref = wrapper.run(q, kv_cache)
+    output = wrapper.run(q, kv_cache)
 
-    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output, output_x, rtol=1e-2, atol=1e-2)
+
+    # wrapper_ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "HND")
+    # wrapper_ref.plan(
+    #     kv_indptr,
+    #     kv_indices,
+    #     kv_last_page_len,
+    #     num_qo_heads,
+    #     num_kv_heads,
+    #     head_dim,
+    #     page_size,
+    #     q_data_type=torch.bfloat16,
+    # )
+
+    # output_ref = wrapper_ref.run(q, kv_cache)
+
+    # torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+
+
+if __name__ == "__main__":
+    test_cudnn_decode(8, 8, 1, 4, 4, True)

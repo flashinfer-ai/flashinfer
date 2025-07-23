@@ -358,6 +358,7 @@ class BlockSparseAttentionWrapper:
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
             self._cached_module = get_batch_decode_module(
+                self._backend,
                 q_data_type,
                 kv_data_type,
                 self._o_dtype,
