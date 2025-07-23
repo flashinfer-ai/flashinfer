@@ -20,12 +20,12 @@ from torch.nn import functional as F
 
 from flashinfer import (
     RoutingMethodType,
-    convert_to_block_layout,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
 from flashinfer.fused_moe import (
     WeightLayout,
+    convert_to_block_layout,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
