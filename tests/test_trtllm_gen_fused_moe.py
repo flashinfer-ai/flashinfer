@@ -1,132 +1,34 @@
-import os
-import sys
-from enum import IntEnum
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 
 import pytest
 import torch
 from torch.nn import functional as F
 
-import flashinfer.fused_moe as fused_moe
-from flashinfer import RoutingMethodType
-
-
-def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
-    """
-    Reorders rows in the gemm/MOE_gemm weight matrix for min-latency
-    [r0, r1, r2, r3, ..., rN/2, r(N/2+1), .. r(N-1)]
-    to
-    [r0, rN/2, r1, rN/2+1, ..., r(N/2-1), r(N-1)]
-    """
-    assert x.dim() == 2, f"x should be a 2D tensor, not {x.dim()}"
-    M, K = x.shape
-    assert M % 2 == 0, f"x.shape[0] must be even, not {M}"
-
-    row_indices = torch.arange(M, dtype=torch.long)
-
-    # We split into top half and bottom half, but if M is odd,
-    # the bottom half is one row larger.
-    top = row_indices[: (M + 1) // 2]  # round up
-    bot = row_indices[(M + 1) // 2 :]  # remainder
-
-    # Create the output
-    permuted_row_indices = torch.empty_like(row_indices)
-
-    # We'll place rows of `top` and `bot` in alternation
-    permuted_row_indices[0::2] = top
-    permuted_row_indices[1::2] = bot
-
-    return permuted_row_indices
-
-
-def reorder_rows_for_gated_act_gemm(x):
-    """
-    PyTorch implementation of trt-llm gen `reorderRowsForGatedActGemm`
-    """
-    row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(x)
-
-    permute = lambda x: x[row_indices]
-
-    return permute(x)
-
-
-# yapf: disable
-srcToDstBlk16RowMap = [
-    0,  8,
-    1,  9,
-    2, 10,
-    3, 11,
-    4, 12,
-    5, 13,
-    6, 14,
-    7, 15
-]
-
-srcToDstBlk32RowMap = [
-    0,  8, 16, 24,
-    1,  9, 17, 25,
-    2, 10, 18, 26,
-    3, 11, 19, 27,
-    4, 12, 20, 28,
-    5, 13, 21, 29,
-    6, 14, 22, 30,
-    7, 15, 23, 31
-]
-# yapf: enable
-
-
-def get_shuffle_block_size(epilogue_tile_m: int) -> int:
-    shuffle_block_size = 16
-    if epilogue_tile_m % 128 == 0:
-        shuffle_block_size = 32
-    return shuffle_block_size
-
-
-def get_shuffle_matrix_a_row_indices(
-    input_tensor: torch.Tensor, epilogue_tile_m: int
-) -> torch.Tensor:
-    """
-    Higher-level PyTorch approach to reorder the rows in blocks of size 16 or 32.
-    - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
-    - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
-    """
-    assert (
-        input_tensor.dim() == 2
-    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
-
-    # M, K from the input
-    M, K = input_tensor.shape
-
-    # Choose block size 16 or 32
-    shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
-    row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
-
-    assert (
-        M % shuffle_block_size == 0
-    ), f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
-
-    # row_indices[new_row] = old_row
-    # so row_indices is an array of size M telling us from which old_row
-    # the new_row should be taken.
-    row_indices = torch.empty(M, dtype=torch.long)
-
-    for old_row in range(M):
-        block_idx = old_row // shuffle_block_size
-        row_in_block = old_row % shuffle_block_size
-        mapped_row_in_block = row_map[row_in_block]
-
-        new_row = block_idx * shuffle_block_size + mapped_row_in_block
-
-        row_indices[new_row] = old_row
-
-    return row_indices
-
-
-def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
-    """
-    PyTorch equivalent of trtllm-gen `shuffleMatrixA`
-    """
-    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
-    return torch.index_select(input_tensor, 0, row_indices.to(input_tensor.device))
+from flashinfer import (
+    RoutingMethodType,
+    convert_to_block_layout,
+    reorder_rows_for_gated_act_gemm,
+    shuffle_matrix_a,
+)
+from flashinfer.fused_moe import (
+    WeightLayout,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+)
 
 
 class moe_args:
@@ -570,9 +472,9 @@ def quant_dequant_per_tensor_fp8(a):
 @pytest.mark.parametrize(
     "use_shuffled_weight,weight_layout",
     [
-        (False, fused_moe.WeightLayout.MajorK),
-        (True, fused_moe.WeightLayout.MajorK),
-        (True, fused_moe.WeightLayout.BlockMajorK),
+        (False, WeightLayout.MajorK),
+        (True, WeightLayout.MajorK),
+        (True, WeightLayout.BlockMajorK),
     ],
 )
 def test_moe_fp8(
@@ -675,10 +577,10 @@ def test_moe_fp8(
                 gemm2_weights[i].view(torch.uint8), epilogue_tile_m
             )
 
-            if weight_layout == fused_moe.WeightLayout.BlockMajorK:
+            if weight_layout == WeightLayout.BlockMajorK:
                 block_k = 128
-                tmp_weights1 = fused_moe.convert_to_block_layout(tmp_weights1, block_k)
-                tmp_weights2 = fused_moe.convert_to_block_layout(tmp_weights2, block_k)
+                tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
 
             gemm1_weights_fp8_shuffled.append(tmp_weights1)
 
@@ -690,7 +592,7 @@ def test_moe_fp8(
             torch.float8_e4m3fn
         )
 
-    output = fused_moe.trtllm_fp8_block_scale_moe(
+    output = trtllm_fp8_block_scale_moe(
         expert_logits,
         routing_bias,
         hidden_states,
@@ -884,7 +786,7 @@ def test_moe_fp8_per_tensor_scale(
     # self.fc2_alpha
     scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 / args.gemm2_scales_global)
 
-    output = fused_moe.trtllm_fp8_per_tensor_scale_moe(
+    output = trtllm_fp8_per_tensor_scale_moe(
         (
             expert_logits.to(torch.bfloat16)
             if use_routing_scales_on_input
