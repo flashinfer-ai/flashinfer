@@ -864,6 +864,7 @@ def test_moe_fp8_per_tensor_scale_api_test(
         0,
         num_experts,
         routed_scaling,
+        use_routing_scales_on_input,
         routing_method_type=RoutingMethodType.Llama4,
         # DO NOT use any other optional arguments
     )
