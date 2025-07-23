@@ -327,6 +327,24 @@ def routing_reference_no_aux(
     return permute_info, scores
 
 
+# Used for API regression testing
+def routing_default(expert_logits, routing_bias, top_k, routed_scaling):
+    padding = 8
+    routing_logits = expert_logits.to(dtype=torch.float, device="cuda")
+    # RoutingMethodType.Default : Softmax -> TopK
+    scores = F.softmax(routing_logits + routing_bias, dim=-1)
+    # Mask out all but top_k
+    _, topk_idx = torch.topk(scores, k=top_k, dim=-1, largest=True, sorted=True)
+    mask = torch.zeros_like(scores)
+    mask.scatter_(-1, topk_idx, 1)
+    scores = scores * mask
+    score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
+    scores = scores / score_sum * routed_scaling
+    # permute_info is typically a mapping for token routing, here we use the reference
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
 def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     input = input.to(torch.float)
     scale = scale.to(torch.float)
@@ -561,6 +579,331 @@ def quant_dequant_per_tensor_fp8(a):
     return a_pt.cuda(), a_global_sf
 
 
+@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+def test_moe_fp8_api_test(num_tokens, expert_info, hidden_size, intermediate_size):
+    """
+    API regression test for FP8 block scale MoE
+    Test the behavior of default arguments to ensure later extensions are backwards compatible.
+    """
+
+    torch.random.manual_seed(0)
+
+    num_experts, n_groups, top_k_groups, top_k = expert_info
+    padding = 8
+    routed_scaling = 2.5
+
+    assert top_k <= num_experts
+    assert top_k <= 8
+    assert top_k_groups <= 4
+    assert num_experts > n_groups
+    assert num_experts % n_groups == 0
+    assert num_experts % 4 == 0
+    assert top_k < (top_k_groups * num_experts / n_groups)
+
+    expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
+        torch.float
+    )
+    routing_bias = torch.randn(num_experts, device="cuda", dtype=torch.bfloat16)
+
+    hidden_states = torch.randn((num_tokens, hidden_size), device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    hidden_states_scale = 2 * torch.rand(
+        (hidden_size // 128, num_tokens), device="cuda"
+    ).to(torch.float)
+
+    gemm1_weights = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size), device="cuda"
+    ).to(torch.float8_e4m3fn)
+    gemm1_scales = 2 * torch.rand(
+        (num_experts, 2 * intermediate_size // 128, hidden_size // 128), device="cuda"
+    ).to(torch.float)
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size), device="cuda"
+    ).to(torch.float8_e4m3fn)
+    gemm2_scales = 2 * torch.rand(
+        (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
+    ).to(torch.float)
+
+    # RoutingMethodType.Default : Softmax -> TopK
+    permute_info, scores = routing_default(
+        expert_logits,
+        routing_bias,
+        top_k,
+        routed_scaling,
+    )
+
+    args = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        padding,
+        hidden_states,
+        hidden_states_scale,
+        None,
+        scores,
+        gemm1_weights,
+        gemm1_scales,
+        None,
+        gemm2_weights,
+        gemm2_scales,
+        None,
+        permute_info,
+        False,
+    )
+
+    output_dequant_reference, _ = run_moe_reference_dsfp8(args)
+
+    # Prepare weights and scales for the kernel call
+    kernel_gemm1_weights = gemm1_weights
+    kernel_gemm2_weights = gemm2_weights
+
+    output = fused_moe.trtllm_fp8_block_scale_moe(
+        expert_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        kernel_gemm1_weights,
+        gemm1_scales,
+        kernel_gemm2_weights,
+        gemm2_scales,
+        num_experts,
+        top_k,
+        n_groups,
+        top_k_groups,
+        intermediate_size,
+        0,
+        num_experts,
+        routed_scaling,
+        # DO NOT use any optional arguments
+    )
+
+    output_dequant_actual = output.to(torch.float)
+
+    def check_accuracy(a, b, atol, rtol, percent):
+        if torch.any(torch.isnan(a)):
+            raise Exception("NaN in a")
+        if torch.any(torch.isnan(b)):
+            raise Exception("NaN in b")
+        assert a.shape == b.shape
+        left = torch.abs(a - b)
+        right = atol + rtol * torch.abs(b)
+        count = torch.sum(left > right)
+        mismatch_percent = count / a.numel()
+        if mismatch_percent > 1 - percent:
+            raise Exception(
+                "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
+            )
+
+    check_accuracy(
+        output_dequant_reference,
+        output_dequant_actual,
+        atol=0.1,
+        rtol=0.85,
+        percent=0.925,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
+@pytest.mark.parametrize("hidden_size", [2048])
+@pytest.mark.parametrize("intermediate_size", [2048])
+def test_moe_fp8_per_tensor_scale_api_test(
+    num_tokens, expert_info, hidden_size, intermediate_size
+):
+    """
+    API regression test for FP8 per-tensor scale MoE
+    Test the behavior of default arguments to ensure later extensions are backwards compatible.
+    """
+
+    torch.random.manual_seed(0)
+
+    #
+    # Data Generation
+    #
+    num_experts, n_groups, top_k_groups, top_k, use_routing_scales_on_input = (
+        expert_info
+    )
+    routed_scaling = 2.5
+    tile_tokens_dim = 8
+
+    assert top_k <= num_experts
+    assert top_k <= 8
+    assert top_k_groups <= 4
+    assert num_experts > n_groups
+    assert n_groups == 0 or num_experts % n_groups == 0
+    assert num_experts % 4 == 0
+    assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
+
+    expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
+        torch.float
+    )
+    routing_bias = torch.randn(num_experts, device="cuda", dtype=torch.bfloat16)
+
+    hidden_states = torch.randn((num_tokens, hidden_size), device="cuda").to(
+        torch.bfloat16
+    )
+
+    gemm1_weights = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size), device="cuda"
+    ).to(torch.bfloat16)
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size), device="cuda"
+    ).to(torch.bfloat16)
+
+    hidden_states_quant, hidden_states_global_scale = quant_fp8_per_tensor(
+        hidden_states
+    )
+    gemm1_weights_quant, gemm1_global_scales = quant_fp8_per_tensor_batches(
+        gemm1_weights
+    )
+    gemm2_weights_quant, gemm2_global_scales = quant_fp8_per_tensor_batches(
+        gemm2_weights
+    )
+
+    permute_info, scores = routing_default(
+        expert_logits,
+        routing_bias,
+        top_k,
+        routed_scaling,
+    )
+
+    args = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        tile_tokens_dim,
+        hidden_states_quant,
+        None,
+        hidden_states_global_scale,
+        scores,
+        gemm1_weights_quant,
+        None,
+        gemm1_global_scales,
+        gemm2_weights_quant,
+        None,
+        gemm2_global_scales,
+        permute_info,
+        use_routing_scales_on_input,
+    )
+    #
+    # Run the reference implementations
+    #
+    # It is important to run the reference implementation before the TRT-LLM kernel
+    # because the MoE shuffles the weights in-place.
+    output_dequant_reference, args_dequant = run_moe_reference_per_tensor_scale_fp8(
+        args
+    )
+
+    # FIXME: this depends on the kernel internals
+    epilogue_tile_m = 128
+
+    # Reorder rows of W1 for fused gated activation
+    gemm1_weights_fp8_interleaved = []
+    for i in range(num_experts):
+        gemm1_weights_fp8_interleaved.append(
+            reorder_rows_for_gated_act_gemm(gemm1_weights_quant[i].clone())
+        )
+
+    # Stack weights and scales for all experts
+    gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved).reshape(
+        num_experts, 2 * intermediate_size, hidden_size
+    )
+
+    # Shuffle weights and scaling factors for transposed mma output
+    gemm1_weights_fp8_shuffled = []
+    gemm2_weights_fp8_shuffled = []
+    for i in range(num_experts):
+        gemm1_weights_fp8_shuffled.append(
+            shuffle_matrix_a(
+                gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+            )
+        )
+
+        gemm2_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm2_weights_quant[i].view(torch.uint8), epilogue_tile_m)
+        )
+
+    # Stack weights for all experts
+    gemm1_weights_fp8_shuffled = torch.stack(gemm1_weights_fp8_shuffled).view(
+        torch.float8_e4m3fn
+    )
+    gemm2_weights_fp8_shuffled = torch.stack(gemm2_weights_fp8_shuffled).view(
+        torch.float8_e4m3fn
+    )
+
+    # c_global_sf: fc2_input_scale
+    scale_c_fc1 = (
+        args_dequant.c_global_sf
+        * (1.0 / args.gemm1_scales_global)
+        * (1.0 / args.hidden_states_scale_global)
+    )
+
+    # self.fc31_alpha
+    scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+        1.0 / args.hidden_states_scale_global
+    )
+
+    # self.fc2_alpha
+    scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 / args.gemm2_scales_global)
+
+    output = fused_moe.trtllm_fp8_per_tensor_scale_moe(
+        (
+            expert_logits.to(torch.bfloat16)
+            if use_routing_scales_on_input
+            else expert_logits
+        ),
+        routing_bias,
+        hidden_states_quant,
+        gemm1_weights_fp8_shuffled,
+        scale_c_fc1,
+        scale_gate_fc1,
+        gemm2_weights_fp8_shuffled,
+        scale_c_fc2,
+        num_experts,
+        top_k,
+        n_groups,
+        top_k_groups,
+        intermediate_size,
+        0,
+        num_experts,
+        routed_scaling,
+        # DO NOT use any optional arguments
+    )
+
+    output_dequant_actual = output.to(torch.float)
+
+    def check_accuracy(a, b, atol, rtol, percent):
+        if torch.any(torch.isnan(a)):
+            raise Exception("NaN in a")
+        if torch.any(torch.isnan(b)):
+            raise Exception("NaN in b")
+        assert a.shape == b.shape
+        left = torch.abs(a - b)
+        right = atol + rtol * torch.abs(b)
+        count = torch.sum(left > right)
+        mismatch_percent = count / a.numel()
+        if mismatch_percent > 1 - percent:
+            raise Exception(
+                "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
+            )
+
+    check_accuracy(
+        output_dequant_reference,
+        output_dequant_actual,
+        atol=0.1,
+        rtol=0.85,
+        percent=0.925,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
 @pytest.mark.parametrize(
     "expert_info", [(32, 8, 4, 8), (32, 1, 1, 5), (72, 1, 1, 6), (256, 8, 4, 8)]
@@ -571,6 +914,10 @@ def quant_dequant_per_tensor_fp8(a):
 def test_moe_fp8(
     num_tokens, expert_info, hidden_size, intermediate_size, use_shuffled_weight
 ):
+    """
+    FP8 block scale MoE
+    """
+
     torch.random.manual_seed(0)
 
     num_experts, n_groups, top_k_groups, top_k = expert_info
@@ -726,6 +1073,10 @@ def test_moe_fp8(
 def test_moe_fp8_per_tensor_scale(
     num_tokens, expert_info, hidden_size, intermediate_size
 ):
+    """
+    FP8 per-tensor scale MoE
+    """
+
     torch.random.manual_seed(0)
 
     #

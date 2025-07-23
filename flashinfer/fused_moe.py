@@ -1061,7 +1061,7 @@ def trtllm_fp8_block_scale_moe(
     routed_scaling_factor: float,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
-    use_shuffled_weight: bool = True,
+    use_shuffled_weight: bool = False,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
