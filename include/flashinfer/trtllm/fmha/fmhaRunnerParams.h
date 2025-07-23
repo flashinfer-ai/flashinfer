@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "flashinfer/exception.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The attention mask types.
@@ -288,10 +290,7 @@ struct TllmGenFmhaRunnerParams {
         mMaskType = TrtllmGenAttentionMaskType::Custom;
         break;
       default:
-        // TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
-        //     static_cast<int>(maskType));
-        printf("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
-               static_cast<int>(maskType));
+        FLASHINFER_ERROR("Invalid attention mask type");
     }
     return *this;
   }
