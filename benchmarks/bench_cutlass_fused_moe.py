@@ -14,43 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import argparse
+import json
+
 import torch
 from torch.nn import functional as F
-from triton.testing import do_bench
+from triton.testing import do_bench_cudagraph
 
 import flashinfer
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
+from flashinfer.autotuner import AutoTuner, autotune, get_json_path
 
-BATCH_SIZES = [
-    1,
-    2,
-    4,
-    8,
-    16,
-    24,
-    32,
-    48,
-    64,
-    96,
-    128,
-    256,
-    512,
-    1024,
-    1536,
-    2048,
-    3072,
-    4096,
-]
-
-configs = []
-hidden_size = 7168
-num_experts = [32, 256]
-top_k = [8]
-intermediate_size = [256, 2048]
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-FP8_DTYPE = torch.float8_e4m3fn
+
 
 test_configs = [
     {
@@ -96,6 +74,7 @@ def bench_cutlass_fused_moe(
     num_experts,
     top_k,
     intermediate_size,
+    skip_autotune,
 ):
     torch.manual_seed(42)
     quant_blocksize = 16
@@ -165,12 +144,24 @@ def bench_cutlass_fused_moe(
     ]
     hidden_states = x
     hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    repeats = 3
-    from flashinfer.autotuner import AutoTuner, autotune
 
-    AutoTuner.get().clear_cache()
-    with torch.inference_mode(), autotune():
-        for _ in range(2):
+    # Warmup
+    for _ in range(3):
+        _ = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+            tune_max_num_tokens=16384,
+        )
+
+    if not skip_autotune:
+        with torch.inference_mode(), autotune(True):
             _ = fused_moe.cutlass_fused_moe(
                 hidden_states,
                 selected_experts.to(torch.int),
@@ -181,8 +172,9 @@ def bench_cutlass_fused_moe(
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=flash_output,
+                tune_max_num_tokens=16384,
             )
-    ms = do_bench(
+    ms = do_bench_cudagraph(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
@@ -195,23 +187,40 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         )
     )
-    print(
-        f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
-    )
-    print(f"execution time: {ms}ms")
+    print("input\tweight1\tweight2\ttime(ms)")
+    print(f"{tuple(hidden_states.shape)}\t{tuple(w1.shape)}\t{tuple(w2.shape)}\t{ms}")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--update-json",
+        action="store_true",
+        help="Update the json file with the new profiling results",
+    )
+    parser.add_argument(
+        "--num-tokens", type=int, default=32, help="Number of tokens to profile"
+    )
+    parser.add_argument("--skip-autotune", action="store_true", help="Skip autotuning")
+    args = parser.parse_args()
+    AutoTuner.get().clear_cache()
+
     for config in test_configs:
-        hidden_size = config["hidden_size"]
-        num_experts = config["num_experts"]
-        top_k = config["top_k"]
-        intermediate_size = config["intermediate_size"]
-        for batch_size in BATCH_SIZES:
-            bench_cutlass_fused_moe(
-                batch_size,
-                hidden_size,
-                num_experts,
-                top_k,
-                intermediate_size,
-            )
+        bench_cutlass_fused_moe(
+            args.num_tokens,
+            config["hidden_size"],
+            config["num_experts"],
+            config["top_k"],
+            config["intermediate_size"],
+            args.skip_autotune,
+        )
+
+    configs = AutoTuner.get().profiling_cache
+    if args.update_json and configs:
+        # The original key contains a runner's hash in k[2] which might be different across machines.
+        # So, we remove it for now. v[0] and v[1] are the runner id and the tactic.
+        converted = {str((k[0], k[1], k[3])): (v[0], v[1]) for k, v in configs.items()}
+        json_path = get_json_path()
+        with open(json_path, "w") as f:
+            json.dump(converted, f, indent=4)
+        print(f"Saved the cache to {json_path}")

@@ -748,7 +748,7 @@ def cutlass_fused_moe(
         use_w4a8_group_scaling=use_w4a8_group_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
-        tune_max_num_tokens=8192,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
 

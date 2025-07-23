@@ -2,6 +2,8 @@ import contextlib
 import copy
 import inspect
 import itertools
+import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -9,11 +11,25 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
 
+from flashinfer import __version__ as flashinfer_version
+
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
 from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
+
+
+def get_json_path():
+    device_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    json_name = "trtllm_fused_moe_" + f"{device_name}.json"
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        "configs",
+        flashinfer_version,
+        json_name,
+    )
+    return config_file_path
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -265,6 +281,18 @@ class AutoTunerStatistics:
         return stats_str
 
 
+@lru_cache(maxsize=None)
+def load_from_json(key):
+    path = get_json_path()
+    if os.path.exists(path):
+        with open(get_json_path(), "r") as f:
+            configs = json.load(f)
+        k = str((key[0], key[1], key[3]))
+        if k in configs:
+            return True, configs[k][0], configs[k][1], None
+    return False, 0, -1, None
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -316,11 +344,19 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
+            cache_key = AutoTuner._get_cache_key(
+                custom_op, r, input_shapes, tuning_config
+            )
             if (
-                cache_key := AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config
+                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                and not self.is_tuning_mode
+            ):
+                output = load_from_json(cache_key)
+                logger.info_once(
+                    f"[Autotuner]: Loading for {cache_key} from file: {output[0]}"
                 )
-            ) in self.profiling_cache:
+                return output
+            elif cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
