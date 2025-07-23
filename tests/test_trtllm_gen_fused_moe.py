@@ -668,23 +668,21 @@ def test_moe_fp8(
         gemm1_weights_fp8_shuffled = []
         gemm2_weights_fp8_shuffled = []
         for i in range(num_experts):
-            gemm1_weights_fp8_shuffled.append(
-                shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), epilogue_tile_m)
+            tmp_weights1 = shuffle_matrix_a(
+                gemm1_weights[i].view(torch.uint8), epilogue_tile_m
             )
-
-            gemm2_weights_fp8_shuffled.append(
-                shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+            tmp_weights2 = shuffle_matrix_a(
+                gemm2_weights[i].view(torch.uint8), epilogue_tile_m
             )
 
             if weight_layout == fused_moe.WeightLayout.BlockMajorK:
                 block_k = 128
-                gemm1_weights_fp8_shuffled.append(
-                    shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), block_k)
-                )
-                gemm2_weights_fp8_shuffled.append(
-                    shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), block_k)
-                )
+                tmp_weights1 = fused_moe.convert_to_block_layout(tmp_weights1, block_k)
+                tmp_weights2 = fused_moe.convert_to_block_layout(tmp_weights2, block_k)
 
+            gemm1_weights_fp8_shuffled.append(tmp_weights1)
+
+            gemm2_weights_fp8_shuffled.append(tmp_weights2)
         kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
             torch.float8_e4m3fn
         )

@@ -462,12 +462,26 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
               "hidden_states_scale dim1 must match num_tokens.");
   TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::Float8_e4m3fn,
               "gemm1_weights must be fp8.");
-  TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
-  TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
-  TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2,
-              "intermediate_size has incorrect shape.");
-  TORCH_CHECK(gemm1_weights.sizes()[2] == hidden_states.sizes()[1],
-              "the third dimension of weights must be equal to hidden_size.");
+
+  TORCH_CHECK(gemm1_weights.dim() == 3 || gemm1_weights.dim() == 4,
+              "gemm1_weights must be 3D or 4D.");
+  {
+    int64_t Mn = 0, K = 0;
+    if (gemm1_weights.dim() == 3) {
+      // MajorK [num_experts, M, K]
+      Mn = gemm1_weights.sizes()[1];
+      K = gemm1_weights.sizes()[2];
+    } else if (gemm1_weights.dim() == 4) {
+      // BlockMajorK [num_experts, K/block_k, M, block_k]
+      Mn = gemm1_weights.sizes()[2];
+      int64_t block_k = gemm1_weights.sizes()[3];
+      K = gemm1_weights.sizes()[1] * block_k;
+    }
+    TORCH_CHECK(Mn % 2 == 0, "the second dimension of weights must be even.");
+    TORCH_CHECK(intermediate_size == Mn / 2, "intermediate_size has incorrect shape.");
+    TORCH_CHECK(K == hidden_states.sizes()[1],
+                "the third dimension of weights must be equal to hidden_size.");
+  }
   TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float,
               "gemm1_weights_scale must be float.");
   TORCH_CHECK(gemm1_weights_scale.dim() == 3, "gemm1_weights_scale must be 3D.");
@@ -482,9 +496,22 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
               "gemm1_weights_scale has incorrect shape.");
   TORCH_CHECK(gemm2_weights.scalar_type() == at::ScalarType::Float8_e4m3fn,
               "gemm2_weights must be fp8.");
-  TORCH_CHECK(gemm2_weights.dim() == 3, "gemm2_weights must be 3D.");
-  TORCH_CHECK(gemm2_weights.sizes()[2] == intermediate_size,
-              "the third dimension of weights must be equal to intermediate_size.");
+
+  TORCH_CHECK(gemm2_weights.dim() == 3 || gemm2_weights.dim() == 4,
+              "gemm1_weights must be 3D or 4D.");
+  {
+    int64_t K = 0;
+    if (gemm2_weights.dim() == 3) {
+      // MajorK [num_experts, M, K]
+      K = gemm2_weights.sizes()[2];
+    } else if (gemm2_weights.dim() == 4) {
+      // BlockMajorK [num_experts, K/block_k, M, block_k]
+      int64_t block_k = gemm2_weights.sizes()[3];
+      K = gemm2_weights.sizes()[1] * block_k;
+    }
+    TORCH_CHECK(K == intermediate_size,
+                "the third dimension of weights must be equal to intermediate_size.");
+  }
   TORCH_CHECK(gemm2_weights_scale.scalar_type() == at::ScalarType::Float,
               "gemm2_weights_scale must be float.");
   TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
