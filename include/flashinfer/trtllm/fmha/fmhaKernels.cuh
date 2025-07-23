@@ -408,7 +408,8 @@ class TllmGenFmhaKernel {
 
     // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
     // Here we assume the stepKv is 256.
-    int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + 256 - 1) / 256;
+    int const maxNumCtasPerSeqKv = flashinfer::ceil_div(params.mMaxSeqLenKv, 256);
+    ;
     // The number of Ctas.
     int const numCtas = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ *
                                              divUp(params.mNumHeadsQPerKv, 16));
@@ -416,7 +417,7 @@ class TllmGenFmhaKernel {
     int const numCtasPerSeqKv =
         std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
     // Compute the seqLenPerCtaKv.
-    int const seqLenPerCtaKv = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
+    int const seqLenPerCtaKv = flashinfer::ceil_div(params.mMaxSeqLenKv, numCtasPerSeqKv);
     // Whether we should use the SwapsMmaAbForGeneration kernel for MLA generation.
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
