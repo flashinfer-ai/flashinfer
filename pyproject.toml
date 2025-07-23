@@ -49,6 +49,7 @@ packages = [
     "flashinfer.jit",
     "flashinfer.jit.attention",
     "flashinfer.triton",
+    "flashinfer.profiler",
     "flashinfer.triton.kernels",
     "flashinfer.comm",
     "flashinfer.cudnn",
