@@ -16,11 +16,11 @@ limitations under the License.
 
 from .core import (
     RoutingMethodType,
+    WeightLayout,
+    convert_to_block_layout,
     cutlass_fused_moe,
     gen_cutlass_fused_moe_sm100_module,
     reorder_rows_for_gated_act_gemm,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -28,11 +28,11 @@ from .core import (
 
 __all__ = [
     "RoutingMethodType",
+    "WeightLayout",
+    "convert_to_block_layout",
     "cutlass_fused_moe",
     "gen_cutlass_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
-    "shuffle_matrix_a",
-    "shuffle_matrix_sf_a",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_per_tensor_scale_moe",

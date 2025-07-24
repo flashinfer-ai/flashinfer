@@ -563,3 +563,96 @@ class FP4Tensor:
         self.scale = scale
         self.original_shape = original_shape
         self.dtype = "nvfp4"
+
+
+# yapf: disable
+srcToDstBlk16RowMap = [
+    0,  8,
+    1,  9,
+    2, 10,
+    3, 11,
+    4, 12,
+    5, 13,
+    6, 14,
+    7, 15
+]
+
+srcToDstBlk32RowMap = [
+    0,  8, 16, 24,
+    1,  9, 17, 25,
+    2, 10, 18, 26,
+    3, 11, 19, 27,
+    4, 12, 20, 28,
+    5, 13, 21, 29,
+    6, 14, 22, 30,
+    7, 15, 23, 31
+]
+# yapf: enable
+
+
+def get_shuffle_block_size(epilogue_tile_m: int) -> int:
+    shuffle_block_size = 16
+    if epilogue_tile_m % 128 == 0:
+        shuffle_block_size = 32
+    return shuffle_block_size
+
+
+def get_shuffle_matrix_a_row_indices(
+    input_tensor: torch.Tensor, epilogue_tile_m: int
+) -> torch.Tensor:
+    """
+    Higher-level PyTorch approach to reorder the rows in blocks of size 16 or 32.
+    - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
+    - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
+    """
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+
+    # M, K from the input
+    M, K = input_tensor.shape
+
+    # Choose block size 16 or 32
+    shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
+    row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
+
+    assert (
+        M % shuffle_block_size == 0
+    ), f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
+
+    # row_indices[new_row] = old_row
+    # so row_indices is an array of size M telling us from which old_row
+    # the new_row should be taken.
+    row_indices = torch.empty(M, dtype=torch.long)
+
+    for old_row in range(M):
+        block_idx = old_row // shuffle_block_size
+        row_in_block = old_row % shuffle_block_size
+        mapped_row_in_block = row_map[row_in_block]
+
+        new_row = block_idx * shuffle_block_size + mapped_row_in_block
+
+        row_indices[new_row] = old_row
+
+    return row_indices
+
+
+def get_shuffle_matrix_sf_a_row_indices(
+    input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
+) -> torch.Tensor:
+
+    assert input_tensor.dtype == torch.uint8
+    assert num_elts_per_sf == 16
+
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+
+    # M, K from the input
+    M, K = input_tensor.shape
+    assert M % 128 == 0
+    assert K % 4 == 0
+
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
+
+    return row_indices

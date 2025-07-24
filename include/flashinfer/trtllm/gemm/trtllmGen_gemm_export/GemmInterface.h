@@ -457,7 +457,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "f1126878ceabd30703911cdd58b2f2be88f1a3c2";
+    const std::string pipeline_hash = "fffd607babb0844f24225997409747ca38229333";
     const std::string cubin_path = pipeline_hash + "/" + std::string("gemm-") + TLLM_GEN_COMMIT +
                                    "-" + TLLM_GEN_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
