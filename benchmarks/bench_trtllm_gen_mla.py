@@ -11,6 +11,7 @@ qk_rope_head_dim = 64
 kv_lora_rank = 512
 MAX_SEQ_LEN = 1024
 
+
 def bench_trtllm_mla(batch_size, q_len_per_request, page_size, dtype):
     torch.manual_seed(42)
     device = "cuda:0"
@@ -68,7 +69,6 @@ def bench_trtllm_mla(batch_size, q_len_per_request, page_size, dtype):
     # todo(Yingyi): calculate the actual size of workspace buffer
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
-
     # Run decode-MLA
     # warmup
     flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -83,21 +83,21 @@ def bench_trtllm_mla(batch_size, q_len_per_request, page_size, dtype):
         max_seq_len=max_seq_len,
         bmm1_scale=1.0 / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
-        )
+    )
     # benchmark
     ms = triton.testing.do_bench_cudagraph(
         lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=kv_cache.unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=block_tables,
-        seq_lens=seq_lens_tensor,
-        max_seq_len=max_seq_len,
-        bmm1_scale=1.0 / ((128 + 64) ** 0.5),
-        bmm2_scale=1.0,
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens_tensor,
+            max_seq_len=max_seq_len,
+            bmm1_scale=1.0 / ((128 + 64) ** 0.5),
+            bmm2_scale=1.0,
         ),
         rep=100,
     )
@@ -105,6 +105,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, page_size, dtype):
         f"batch_size={batch_size}, q_len_per_request={q_len_per_request}, num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
     )
     print(f"execution time: {ms} ms")
+
 
 if __name__ == "__main__":
     for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
