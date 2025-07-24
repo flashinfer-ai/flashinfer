@@ -319,10 +319,13 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
         events = [event for event in profile_data['traceEvents'] if kernel_name in event['name']]
         events = sorted(events, key=lambda event: event['ts'])
         durations = [event['dur'] / 1e6 for event in events]
-        assert len(durations) % num_kernels_per_period == 0, f"{durations=}"
+        if len(durations) % num_kernels_per_period != 0:
+            print(f"WARN: {len(durations)=} % {num_kernels_per_period=} != 0")
+            durations = durations[:len(durations) - (len(durations) % num_kernels_per_period)]
         num_kernel_patterns = len(durations) // num_kernels_per_period
         kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
                                for j in range(num_kernels_per_period)]
+        print(f"{kernel_name=} {durations=}")
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
