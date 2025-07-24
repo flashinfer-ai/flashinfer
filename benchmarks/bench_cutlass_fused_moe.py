@@ -108,16 +108,18 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     is_tuple = isinstance(kernel_names, tuple)
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     print(f"prof_lines=\n" + "\n".join(prof_lines))
+
+    # NOTE MOVED
+    # Save chrome traces
+    if trace_path is not None:
+        print(f"export_chrome_trace to {trace_path=}")
+        profiler.export_chrome_trace(trace_path)
+
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     if not with_multiple_kernels:
         for name in kernel_names:
             assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
-
-    # Save chrome traces
-    if trace_path is not None:
-        print(f"export_chrome_trace to {trace_path=}")
-        profiler.export_chrome_trace(trace_path)
 
     # Return average kernel times
     units = {'ms': 1e3, 'us': 1e6}
