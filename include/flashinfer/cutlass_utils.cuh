@@ -71,6 +71,7 @@ struct cutlass_dtype<__nv_fp8_e5m2> {
   using type = cutlass::float_e5m2_t;
 };
 
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 template <>
 struct cutlass_dtype<__nv_fp8_e8m0> {
   using type = cutlass::float_ue8m0_t;
@@ -81,6 +82,7 @@ template <>
 struct cutlass_dtype<__nv_fp4_e2m1> {
   using type = cutlass::float_e2m1_t;
 };
+#endif
 #endif
 
 template <typename T>

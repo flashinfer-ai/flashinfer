@@ -56,11 +56,17 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
     int64_t const routing_method_type) {
   auto device = hidden_states.device();
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device.index());
-  TORCH_CHECK(prop.major == 10 && prop.minor == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ", prop.major,
-              prop.minor, " (", prop.name, ")");
+
+  static const std::tuple<int, int> device_props = [&device] {
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
+    return std::make_tuple(major, minor);
+  }();
+
+  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   if (use_routing_scales_on_input) {
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16,
@@ -262,7 +268,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   args.output_scale = nullptr;
 
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /*useShuffledMatrixA*/ true);
 
   auto const moeConfigIndex =
       moe_runner.getDefaultValidConfigIndex(args.top_k, args.hidden_size, args.intermediate_size,
@@ -313,11 +319,17 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner& moe_runner,
     int64_t moeConfigIndex) {
   auto device = hidden_states.device();
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device.index());
-  TORCH_CHECK(prop.major == 10 && prop.minor == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ", prop.major,
-              prop.minor, " (", prop.name, ")");
+
+  static const std::tuple<int, int> device_props = [&device] {
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
+    return std::make_tuple(major, minor);
+  }();
+
+  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float,
               "routing_logits must be float.");
@@ -548,7 +560,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t num_experts,
     int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
-    int64_t tile_tokens_dim, int64_t routing_method_type) {
+    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -559,7 +571,8 @@ at::Tensor trtllm_fp8_block_scale_moe(
     bool mUseDeepSeekFp8{true};                  // Always true for BlockScaleMoe
 
     // Properly initialize the runner using make_unique like in the original code
-    auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim);
+    auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
+                                                use_shuffled_weight);
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
     auto const num_tokens = hidden_states.sizes()[0];
@@ -592,11 +605,17 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner& moe_runner,
     int64_t const moeConfigIndex) {
   auto device = hidden_states.device();
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device.index());
-  TORCH_CHECK(prop.major == 10 && prop.minor == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ", prop.major,
-              prop.minor, " (", prop.name, ")");
+
+  static const std::tuple<int, int> device_props = [&device] {
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device.index());
+    return std::make_tuple(major, minor);
+  }();
+
+  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
+              "This kernel requires SM 100 architecture. Current device has SM ",
+              std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 ||
                   tile_tokens_dim == 64,
@@ -901,7 +920,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
   bool mUseDeepSeekFp8{false};  // FP4 doesn't use DeepSeek FP8
 
   // Properly initialize the runner using make_unique like in the original code
-  auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim);
+  auto mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim,
+                                              /*useShuffledMatrixA*/ true);
 
   auto const num_tokens = hidden_states.sizes()[0];
 

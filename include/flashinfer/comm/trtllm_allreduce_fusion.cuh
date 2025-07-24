@@ -623,10 +623,14 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmp);
     fp8SFVal = tmp.__x;
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
@@ -756,7 +760,7 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
-  float scale_factor;
+  float* scale_factor;
   bool use_oneshot;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
@@ -905,9 +909,9 @@ class FusedOp {
       m_residual_val.load(reinterpret_cast<T*>(params.residual_in) + m_access_id * VEC_SIZE);
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-      m_scale_factor = 1.f / params.scale_factor;
+      m_scale_factor = 1.f / *(params.scale_factor);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      m_scale_factor = params.scale_factor;
+      m_scale_factor = *(params.scale_factor);
     }
   }
 
@@ -945,7 +949,7 @@ class FusedOp {
           std::nullopt /* batchIdx */, token_id, m_access_id_in_token, std::nullopt /* numRows */,
           m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
-          utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_params.scale_factor, sf_out);
+          utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;

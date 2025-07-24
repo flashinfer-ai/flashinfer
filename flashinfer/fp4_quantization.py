@@ -62,6 +62,7 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/thop/fp4Op.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
@@ -136,10 +137,10 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::block_scale_interleave_sm100",
+        "flashinfer::nvfp4_block_scale_interleave_sm100",
         mutates_args=("",),
     )
-    def block_scale_interleave_sm100(
+    def nvfp4_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
@@ -150,12 +151,12 @@ def get_fp4_quantization_sm100_module():
         Returns:
             torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        return module.block_scale_interleave(
+        return module.nvfp4_block_scale_interleave(
             unswizzled_sf,
         )
 
-    @register_fake_op("flashinfer::block_scale_interleave_sm100")
-    def _fake_block_scale_interleave_sm100(
+    @register_fake_op("flashinfer::nvfp4_block_scale_interleave_sm100")
+    def _fake_nvfp4_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         return unswizzled_sf.new_empty(
@@ -215,7 +216,7 @@ def get_fp4_quantization_sm100_module():
     # Register the module
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
-        block_scale_interleave_sm100=block_scale_interleave_sm100,
+        nvfp4_block_scale_interleave_sm100=nvfp4_block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
     )
 
@@ -253,6 +254,11 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
+    # for column major input, we need to transpose the input
+    is_column_major = input.stride(-2) == 1
+    if is_column_major:
+        input = input.transpose(-2, -1)
+
     assert input.shape[-1] % sf_vec_size == 0
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
@@ -262,10 +268,14 @@ def fp4_quantize(
         is_sf_swizzled_layout,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    if is_column_major:
+        x_q = x_q.transpose(-2, -1)
+        sf = sf.transpose(-2, -1)
+
     return x_q, sf
 
 
-def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
+def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
@@ -284,7 +294,7 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     assert (
         unswizzled_sf.dtype == torch.uint8
     ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    return get_fp4_quantization_sm100_module().block_scale_interleave_sm100(
+    return get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
         unswizzled_sf,
     )
 
