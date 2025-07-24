@@ -1146,8 +1146,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
 
   // NOTE(Zihao): adjust it later
   const int max_total_num_works = 16384;
-  const int max_packed_qo_lens =
-      4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
+  // const int max_packed_qo_lens =
+  //     4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
 
   // calculate kv_len_limit first, considering all workloads
   int64_t total_kv_lens = 0;
@@ -1306,20 +1306,20 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                            len_kv_chunk_vec);
   }
 
-  if (partial_o_nnz > max_packed_qo_lens) {
-    std::ostringstream err_msg;
-    err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
-            << max_packed_qo_lens;
-    FLASHINFER_ERROR(err_msg.str());
-  }
+  // if (partial_o_nnz > max_packed_qo_lens) {
+  //   std::ostringstream err_msg;
+  //   err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
+  //           << max_packed_qo_lens;
+  //   FLASHINFER_ERROR(err_msg.str());
+  // }
 
   // update num_qo_len_vec
   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_packed_qo_lens, 16, "merge_indptr");
-  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * max_packed_qo_lens, 16, "merge_o_indices");
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * partial_o_nnz, 16, "merge_indptr");
+  plan_info.merge_o_indices_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * partial_o_nnz, 16, "merge_o_indices");
   plan_info.num_qo_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
   // copy data to paged cpu buffer
@@ -1336,9 +1336,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   // Note(Yilong): adjust it later
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
+      2 * partial_o_nnz * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof(float), 16, "holistic_partial_lse");
+      2 * partial_o_nnz * sizeof(float), 16, "holistic_partial_lse");
 
   return cudaSuccess;
 }
