@@ -184,9 +184,9 @@ def get_allreduce_mnnvl_workspace(
     mpi_barrier()
 
     # This is a buffer to maintain the state of this allreduce Op
-    # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
+    # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_prev, atomic access counter]
     buffer_flags = torch.tensor(
-        [0, 2, max_num_elements, 0],
+        [0, 2, max_num_elements, 0, 0],
         dtype=torch.uint32,
         device=torch.device("cuda", mapping.local_rank),
     )
