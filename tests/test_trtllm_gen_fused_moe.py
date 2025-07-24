@@ -580,7 +580,6 @@ class FP8BlockScaleMoe(Moe):
         # Use shuffled weights with BlockMajorK layout for better performance
         use_shuffled_weight = weight_processing["use_shuffled_weight"]
         weight_layout = weight_processing["layout"]
-        print(weight_processing)
 
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
@@ -610,7 +609,6 @@ class FP8BlockScaleMoe(Moe):
             kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
                 torch.float8_e4m3fn
             )
-            print(kernel_gemm1_weights.shape, kernel_gemm2_weights.shape)
         else:
             kernel_gemm1_weights = args.gemm1_weights
             kernel_gemm2_weights = args.gemm2_weights
@@ -621,6 +619,7 @@ class FP8BlockScaleMoe(Moe):
             "gemm2_weights": kernel_gemm2_weights,
             "gemm2_scales": args.gemm2_scales,
             "use_shuffled_weight": use_shuffled_weight,
+            "weight_layout": weight_layout,
         }
 
     def call_moe(
@@ -667,6 +666,7 @@ class FP8BlockScaleMoe(Moe):
             tile_tokens_dim,
             routing_method_type,
             use_shuffled_weight=static_data["use_shuffled_weight"],
+            weight_layout=static_data["weight_layout"],
         )
 
         return output.to(torch.float)
