@@ -16,6 +16,18 @@ from flashinfer.comm.mnnvl import McastDeviceMemory, McastGPUBuffer
 from flashinfer.norm import rmsnorm
 
 
+# Fallback rmsnorm for FP32
+def _rmsnorm_fp32(
+    input: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    return torch.nn.functional.rms_norm(
+        input,
+        [input.shape[-1]],
+        weight,
+        eps,
+    )
+
+
 @torch.inference_mode()
 def row_linear_residual_norm_fusion_forward(
     x: torch.Tensor,
@@ -260,7 +272,10 @@ def test_mnnvl_allreduce_full(
                         residual_out.device, norm_weight.device
                     )
                 )
-                norm_out = rmsnorm(residual_out, norm_weight, eps, enable_pdl=False)
+                if not dtype in [torch.bfloat16, torch.float16]:
+                    norm_out = _rmsnorm_fp32(residual_out, norm_weight, eps)
+                else:
+                    norm_out = rmsnorm(residual_out, norm_weight, eps, enable_pdl=False)
 
                 reference_output = (norm_out, residual_out)
             else:
