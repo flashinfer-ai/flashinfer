@@ -87,12 +87,17 @@ def _sdpa_prefill_key_fn(
 
     return (
         graph_b,
+        q.dim(),
+        k_cache.dim(),
+        max_token_seq_q,
+        max_sequence_kv,
         h_qo,
         d_qk,
         h_kv,
         d_vo,
         block_tables is not None,
         return_lse,
+        bottom_right_causal_mask,
     )
 
 
@@ -127,9 +132,6 @@ def _build_prefill_graph(
     graph_s_kv = max_sequence_kv
 
     with cudnn.graph(handle) as (g, _):
-        print(
-            f"Creating graph with q shape: {q.shape}, kv_cache shape: {k_cache.shape} block_tables: {block_tables is not None}"
-        )
         # Create tensors from the input tensors
         if q.dim() == 3:
             h_qo, d_qk = q.shape[1], q.shape[2]
@@ -156,11 +158,11 @@ def _build_prefill_graph(
 
         if v_cache.dim() == 3:
             assert block_tables is None, "block_tables needs 4 dimensions of kv cache"
-            h_kv, d_vo = k_cache.shape[1], k_cache.shape[2]
+            h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
         elif v_cache.dim() == 4:
             h_kv, d_vo = (
-                k_cache.shape[1],
-                k_cache.shape[3],
+                v_cache.shape[1],
+                v_cache.shape[3],
             )
         else:
             raise ValueError(f"Invalid kv cache tensor shape: {k_cache.shape}")
@@ -172,24 +174,26 @@ def _build_prefill_graph(
             cudnn_k_cache = g.tensor(
                 name="k_cache",
                 dim=(graph_b, h_kv, graph_s_kv, d_qk),
-                stride=(h_kv * d_qk, d_qk, d_qk * h_kv, 1),
+                stride=(h_kv * d_qk * graph_s_kv, d_qk, d_qk * h_kv, 1),
                 data_type=cudnn.data_type.BFLOAT16,
             )
 
             if batch_offsets_k is not None:
                 ragged_k = g.tensor_like(batch_offsets_k)
                 ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
+                cudnn_k_cache.set_ragged_offset(ragged_k)
 
             cudnn_v_cache = g.tensor(
                 name="v_cache",
                 dim=(graph_b, h_kv, graph_s_kv, d_vo),
-                stride=(h_kv * d_vo, d_vo, d_vo * h_kv, 1),
+                stride=(h_kv * d_vo * graph_s_kv, d_vo, d_vo * h_kv, 1),
                 data_type=cudnn.data_type.BFLOAT16,
             )
 
             if batch_offsets_v is not None:
                 ragged_v = g.tensor_like(batch_offsets_v)
                 ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
+                cudnn_v_cache.set_ragged_offset(ragged_v)
 
         elif k_cache.dim() == 4:
 
@@ -249,7 +253,7 @@ def _build_prefill_graph(
             use_padding_mask=padding_mask,
             attn_scale=scale,
             generate_stats=return_lse,
-            use_causal_mask=bottom_right_causal_mask,
+            use_causal_mask_bottom_right=bottom_right_causal_mask,
             paged_attention_k_table=(
                 cudnn_k_block_tables if block_tables is not None else None
             ),
