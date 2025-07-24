@@ -28,7 +28,7 @@ def row_linear_residual_norm_fusion_forward(
     fusion: bool,
     reference_output: tuple[torch.Tensor, ...],
     multicast_ptr: int,
-    buffer_ptrs_dev: torch.Tensor,
+    buffer_ptrs_dev: int,
     unicast_ptr: int,
     max_num_elements_mnnvl: int,
     buffer_flags_mnnvl: torch.Tensor,
