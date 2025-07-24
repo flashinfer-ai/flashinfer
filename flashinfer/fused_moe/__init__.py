@@ -17,6 +17,7 @@ limitations under the License.
 from .core import (
     RoutingMethodType,
     cutlass_fused_moe,
+    gen_cutlass_fused_moe_sm100_module,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
@@ -28,6 +29,7 @@ from .core import (
 __all__ = [
     "RoutingMethodType",
     "cutlass_fused_moe",
+    "gen_cutlass_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
