@@ -19,19 +19,6 @@ try:
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
 
-
-from fused_moe import (
-    RoutingMethodType,
-    cutlass_fused_moe,
-    reorder_rows_for_gated_act_gemm,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
-    trtllm_fp4_block_scale_moe,
-    trtllm_fp8_block_scale_moe,
-    trtllm_fp8_per_tensor_scale_moe,
-)
-
-from . import fused_moe as fused_moe
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
@@ -64,6 +51,16 @@ from .fp4_quantization import (
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
     nvfp4_block_scale_interleave,
+)
+from .fused_moe import (
+    RoutingMethodType,
+    cutlass_fused_moe,
+    reorder_rows_for_gated_act_gemm,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
 )
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
