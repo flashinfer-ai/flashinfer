@@ -5,10 +5,10 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer import next_positive_power_of_2
 from flashinfer.fused_moe import (
     RoutingMethodType,
     WeightLayout,
-    next_positive_power_of_2,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
