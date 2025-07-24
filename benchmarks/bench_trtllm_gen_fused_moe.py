@@ -13,8 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
+import json
 import math
+import os
+import time
 
 import pytest
 import torch
@@ -29,6 +31,7 @@ from flashinfer import (
     shuffle_matrix_sf_a,
 )
 from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+from flashinfer.testing.utils import bench_kineto
 
 
 class moe_args:
@@ -843,6 +846,48 @@ def compute_moe_actual_with_routing(
     hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
         torch.float8_e4m3fn
     ).reshape(-1)
+
+    if 1:
+        trace_dir = os.environ.get("BENCH_KINETO_TRACE_DIR")
+        [time_gemm1, time_gemm2] = bench_kineto(
+            lambda: trtllm_fp4_block_scale_moe(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4,
+                static_data["gemm1_weights_fp4_shuffled"],
+                static_data["gemm1_scales_fp4_shuffled"],
+                static_data["gemm2_weights_fp4_shuffled"],
+                static_data["gemm2_scales_fp4_shuffled"],
+                static_data["scale_c_fc1"],
+                static_data["scale_gate_fc1"],
+                static_data["scale_c_fc2"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                tile_tokens_dim,
+                routing_method_type,
+                do_finalize=True,
+            ),
+            kernel_names="TODO_what_name",
+            num_kernels_per_period=2,
+            trace_path=f"{trace_dir}/{time.time()}.trace.json.gz" if trace_dir else None,
+        )
+
+        # NOTE MODIFIED
+        print(f"MAIN_OUTPUT=" + json.dumps(dict(
+            batch_size=batch_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            time_gemm1_us=time_gemm1 * 1e6,
+            time_gemm2_us=time_gemm2 * 1e6,
+        )))
 
     output = trtllm_fp4_block_scale_moe(
         expert_logits,
