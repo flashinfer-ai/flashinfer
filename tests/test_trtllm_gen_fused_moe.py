@@ -243,6 +243,7 @@ class Moe(ABC):
         hidden_size,
         intermediate_size,
         num_experts,
+        weight_processing,
     ):
         """
         Prepare quantized weights for kernel (done offline with weights).
@@ -348,6 +349,7 @@ class FP4Moe(Moe):
         hidden_size,
         intermediate_size,
         num_experts,
+        weight_processing,
     ):
         """Prepare quantized weights for kernel (done offline with weights)."""
         use_ue8m0 = False
@@ -571,9 +573,13 @@ class FP8BlockScaleMoe(Moe):
         hidden_size,
         intermediate_size,
         num_experts,
+        weight_processing,
     ):
         """Prepare quantized weights for kernel (done offline with weights)."""
-        use_shuffled_weight = True  # Default to shuffled weights for better performance
+
+        # Use shuffled weights with BlockMajorK layout for better performance
+        use_shuffled_weight = weight_processing["use_shuffled_weight"]
+        weight_layout = weight_processing["layout"]
 
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
@@ -582,18 +588,21 @@ class FP8BlockScaleMoe(Moe):
             gemm1_weights_fp8_shuffled = []
             gemm2_weights_fp8_shuffled = []
             for i in range(num_experts):
-                gemm1_weights_fp8_shuffled.append(
-                    shuffle_matrix_a(
-                        args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
-                    )
+                tmp_weights1 = shuffle_matrix_a(
+                    args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+                )
+                tmp_weights2 = shuffle_matrix_a(
+                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
                 )
 
-                gemm2_weights_fp8_shuffled.append(
-                    shuffle_matrix_a(
-                        args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
-                    )
-                )
+                if weight_layout == WeightLayout.BlockMajorK:
+                    block_k = 128
+                    tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                    tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
 
+                gemm1_weights_fp8_shuffled.append(tmp_weights1)
+
+                gemm2_weights_fp8_shuffled.append(tmp_weights2)
             kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
                 torch.float8_e4m3fn
             )
@@ -723,6 +732,7 @@ class FP8PerTensorMoe(Moe):
         hidden_size,
         intermediate_size,
         num_experts,
+        weight_processing,
     ):
         """Prepare quantized weights for kernel (done offline with weights)."""
         # FIXME: this depends on the kernel internals
@@ -1705,12 +1715,42 @@ def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> 
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
 def test_moe_quantization_classes(
     num_tokens,
     hidden_size,
     intermediate_size,
     moe_impl,
     routing_config,
+    weight_processing,
 ):
     """
     Test MoE implementations using separated quantization workflow.
@@ -1725,6 +1765,10 @@ def test_moe_quantization_classes(
     if type(moe_impl) not in routing_config["compatible_moe_impls"]:
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {routing_config['routing_method_type'].name}"
+        )
+    if type(moe_impl) not in weight_processing["compatible_moe_impls"]:
+        pytest.skip(
+            f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
         )
 
     seed = 0
@@ -1876,6 +1920,7 @@ def test_moe_quantization_classes(
         routed_scaling=routed_scaling,
         routing_method_type=routing_method_type,
         tile_tokens_dim=tile_tokens_dim,
+        weight_processing=weight_processing,
     )
 
     # Compare outputs using moe_impl-specific tolerances
