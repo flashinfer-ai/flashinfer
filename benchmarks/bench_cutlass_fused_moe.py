@@ -13,6 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import json
+import os
+import sys
+import time
 
 import torch
 from torch.nn import functional as F
@@ -21,6 +25,7 @@ from triton.testing import do_bench
 import flashinfer
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
+from flashinfer.testing.utils import bench_kineto
 
 BATCH_SIZES = [
     1,
@@ -35,7 +40,9 @@ BATCH_SIZES = [
     96,
     128,
     256,
+    384, # NOTE ADD
     512,
+    768, # NOTE ADD
     1024,
     1536,
     2048,
@@ -53,18 +60,40 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 test_configs = [
-    {
-        "hidden_size": 7168,
-        "num_experts": 256,
-        "top_k": 8,
-        "intermediate_size": 256,
-    },
-    {
-        "hidden_size": 7168,
-        "num_experts": 32,
-        "top_k": 8,
-        "intermediate_size": 2048,
-    },
+    # NOTE MODIFIED ADD
+    *[
+        {
+            "hidden_size": 7168,
+            "num_experts": num_experts,
+            "top_k": 8,
+            "intermediate_size": 2048,
+        }
+        for num_experts in [
+            288 // 1,
+            288 // 2,
+            288 // 4,
+            288 // 8,
+            288 // 16,
+            288 // 32,
+            # TODO support
+            # 288 // 48,
+            # 288 // 72,
+        ]
+    ],
+
+    # --- old ---
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 256,
+    #     "top_k": 8,
+    #     "intermediate_size": 256,
+    # },
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 32,
+    #     "top_k": 8,
+    #     "intermediate_size": 2048,
+    # },
 ]
 
 
@@ -182,7 +211,22 @@ def bench_cutlass_fused_moe(
                 input_sf=input_sf,
                 output=flash_output,
             )
-    ms = do_bench(
+    # NOTE MODIFIED
+    # ms = do_bench(
+    #     lambda: fused_moe.cutlass_fused_moe(
+    #         hidden_states,
+    #         selected_experts.to(torch.int),
+    #         routing_weights,
+    #         w1_q.contiguous().view(torch.long),
+    #         w2_q.contiguous().view(torch.long),
+    #         otype,
+    #         quant_scales=quant_scales,
+    #         input_sf=input_sf,
+    #         output=flash_output,
+    #     )
+    # )
+    trace_dir = os.environ.get("BENCH_KINETO_TRACE_DIR")
+    [time_gemm1, time_gemm2] = bench_kineto(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
@@ -193,12 +237,25 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-        )
+        ),
+        kernel_names="cutlass13device_kernelINS_4gemm6kernel",
+        num_kernels_per_period=2,
+        trace_path=f"{trace_dir}/{time.time()}.trace.json.gz" if trace_dir else None,
     )
-    print(
-        f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
-    )
-    print(f"execution time: {ms}ms")
+
+    # NOTE MODIFIED
+    print(f"MAIN_OUTPUT=" + json.dumps(dict(
+        batch_size=batch_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        intermediate_size=intermediate_size,
+        time_gemm1_us=time_gemm1 * 1e6,
+        time_gemm2_us=time_gemm2 * 1e6,
+    )))
+    # print(
+    #     f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
+    # )
+    # print(f"execution time: {ms}ms")
 
 
 if __name__ == "__main__":
