@@ -298,7 +298,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
-    print(f"prof_lines=\n" + "\n".join(prof_lines))
+    # print(f"prof_lines=\n" + "\n".join(prof_lines))
 
     # Save chrome traces
     if trace_path is not None:
@@ -310,33 +310,21 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     for name in kernel_names:
         assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
 
-    # Return average kernel durations
-    units = {'ms': 1e3, 'us': 1e6}
-    kernel_durations = []
-    for name in kernel_names:
-        for line in prof_lines:
-            if name in line:
-                time_str = line.split()[-2]
-                for unit, scale in units.items():
-                    if unit in time_str:
-                        kernel_durations.append(float(time_str.replace(unit, '')) / scale)
-                        break
-                break
+    kernel_durations = [None] * len(kernel_names)
 
     # Expand the kernels by periods
-    if num_kernels_per_period > 1:
-        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
-            profiler.export_chrome_trace(tmp.name)
-            profile_data = json.loads(Path(tmp.name).read_text())
+    with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+        profiler.export_chrome_trace(tmp.name)
+        profile_data = json.loads(Path(tmp.name).read_text())
 
-        for i, kernel_name in enumerate(kernel_names):
-            events = [event for event in profile_data['traceEvents'] if kernel_name in event['name']]
-            events = sorted(events, key=lambda event: event['ts'])
-            durations = [event['dur'] / 1e6 for event in events]
-            assert len(durations) % num_kernels_per_period == 0
-            num_kernel_patterns = len(durations) // num_kernels_per_period
-            kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
-                                   for j in range(num_kernels_per_period)]
+    for i, kernel_name in enumerate(kernel_names):
+        events = [event for event in profile_data['traceEvents'] if kernel_name in event['name']]
+        events = sorted(events, key=lambda event: event['ts'])
+        durations = [event['dur'] / 1e6 for event in events]
+        assert len(durations) % num_kernels_per_period == 0
+        num_kernel_patterns = len(durations) // num_kernels_per_period
+        kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
+                               for j in range(num_kernels_per_period)]
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
