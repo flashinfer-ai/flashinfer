@@ -1,0 +1,24 @@
+# Sample MoE test list for flashinferTest.py
+# This file demonstrates how to benchmark the three TensorRT-LLM MoE functions
+
+# FP4 Block Scale MoE Tests
+--routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 4096 --num_experts 8 --top_k 2 --routing_method_type Default --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp4_block_scale_moe --num_tokens 2048 --hidden_size 4096 --intermediate_size 8192 --num_experts 16 --top_k 4 --routing_method_type Renormalize --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+
+# FP8 Block Scale MoE Tests
+--routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 4096 --num_experts 8 --top_k 2 --routing_method_type Default --weight_layout MajorK --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 4096 --num_experts 8 --top_k 2 --routing_method_type Default --weight_layout MajorK --use_shuffled_weight --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_block_scale_moe --num_tokens 2048 --hidden_size 4096 --intermediate_size 8192 --num_experts 16 --top_k 4 --routing_method_type Default --weight_layout BlockMajorK --use_shuffled_weight --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+
+# FP8 Per-Tensor Scale MoE Tests
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 4096 --num_experts 8 --top_k 2 --routing_method_type Default --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 2048 --hidden_size 4096 --intermediate_size 8192 --num_experts 16 --top_k 4 --routing_method_type Renormalize --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 4096 --num_experts 8 --top_k 1 --routing_method_type Llama4 --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+
+# DeepSeek-style routing (requires specific parameter combinations)
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 2048 --hidden_size 4096 --intermediate_size 8192 --num_experts 32 --top_k 8 --n_groups 8 --top_k_groups 4 --routing_method_type DeepSeekV3 --routed_scaling_factor 2.5 --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+
+# Larger scale tests
+--routine trtllm_fp4_block_scale_moe --num_tokens 4096 --hidden_size 8192 --intermediate_size 16384 --num_experts 32 --top_k 8 --routing_method_type Default --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_block_scale_moe --num_tokens 4096 --hidden_size 8192 --intermediate_size 16384 --num_experts 32 --top_k 8 --routing_method_type Default --weight_layout BlockMajorK --use_shuffled_weight --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 4096 --hidden_size 8192 --intermediate_size 16384 --num_experts 32 --top_k 8 --routing_method_type Default --num_iters 10 --dry_run_iters 3 --no_cuda_graph -v
