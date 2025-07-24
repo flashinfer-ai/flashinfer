@@ -62,7 +62,8 @@ install_requires = [
     "einops",
     "nvidia-nvshmem-cu12",
     "nvidia-cudnn-cu12",
-    "nvidia-cudnn-frontend",
+    # NOTE MODIFIED rm
+    # "nvidia-cudnn-frontend",
 ]
 generate_build_meta({})
 
