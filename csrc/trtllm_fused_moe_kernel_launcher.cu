@@ -118,12 +118,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
 
   args.routing_logits = routing_logits.data_ptr();
   auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::Float;
-  if (routing_bias.has_value()) {
-    args.routing_bias = routing_bias.value().data_ptr();
-  } else {
-    args.routing_bias = nullptr;
-  }
+      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
   args.hidden_states = hidden_states.data_ptr();
   args.gemm1_weights = gemm1_weights.data_ptr();
   args.output1_scales_scalar = output1_scales_scalar.data_ptr<float>();
@@ -392,11 +388,7 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
                         ? batchedGemm::trtllm::gen::Dtype::Bfloat16
                         : batchedGemm::trtllm::gen::Dtype::Fp32;
   args.routing_logits = routing_logits.data_ptr<float>();
-  if (routing_bias.has_value()) {
-    args.routing_bias = routing_bias.value().data_ptr();
-  } else {
-    args.routing_bias = nullptr;
-  }
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
   args.hidden_states = hidden_states.data_ptr();
   args.hidden_states_scale = hidden_states_scale.data_ptr<float>();
   args.gemm1_weights = gemm1_weights.data_ptr();
