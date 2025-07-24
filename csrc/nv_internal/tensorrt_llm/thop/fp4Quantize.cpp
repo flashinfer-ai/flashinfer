@@ -43,10 +43,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 bool sfUseUE8M0, bool isSfSwizzledLayout) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
-  // if (sfUseUE8M0) {
-  // TORCH_CHECK(globalScale.has_value(), "globalScale is required for UE8M0");
   CHECK_INPUT_TYPE(globalScale, c10::ScalarType::Float);
-  // }
   TORCH_CHECK(sfVecSize == 16 || sfVecSize == 32, "sfVecSize can only be 16 or 32");
 
   auto const& inputShape = self.sizes();
