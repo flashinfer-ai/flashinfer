@@ -1,0 +1,12 @@
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn --page_size 16 --batch_size 16 --s_qo 8192 --s_kv 8192 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph
+--routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 192 --head_dim_vo 128 -vv --refcheck --causal --no_cuda_graph
+--routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 -vv --refcheck --causal --no_cuda_graph
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm cudnn --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm cudnn --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --no_cuda_graph
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm cudnn --page_size 16 --batch_size 32 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm cudnn --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck --no_cuda_graph
+--routine gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --no_cuda_graph --refcheck -vv
+--routine gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --refcheck -vv
+--routine group_gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --group_size 2 --no_cuda_graph --scale_major_mode K --refcheck -vv
+--routine group_gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --group_size 2 --scale_major_mode MN --refcheck -vv
