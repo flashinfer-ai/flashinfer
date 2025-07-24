@@ -221,7 +221,7 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_lens: list[int], fusion: bool):
             trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, dtype)
         )
 
-        multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr_as_int64()
+        multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
         buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
         unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
             mapping.tp_rank
