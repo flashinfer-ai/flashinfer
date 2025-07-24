@@ -17,7 +17,7 @@
 #include "cutlass_fused_moe_kernels.cuh"
 #include "moe_kernels.h"
 
-namespace tensorrt_llm::kernels {
+namespace tensorrt_llm::kernels::cutlass_kernels {
 // ==================== Variable batched GEMM specializations ==================================
 template class CutlassMoeFCRunner<float, float>;
 
@@ -43,10 +43,13 @@ template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat1
 #ifdef ENABLE_FP4
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half>;
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half, half>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
 #endif
 #endif
-
-};  // namespace tensorrt_llm::kernels
+};  // namespace tensorrt_llm::kernels::cutlass_kernels

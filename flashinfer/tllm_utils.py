@@ -27,13 +27,13 @@ def get_trtllm_utils_spec():
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels"
+            / "cutlass_kernels"
             / "include",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "tensorrt_llm"
             / "kernels"
-            / "internal_cutlass_kernels",
+            / "cutlass_kernels",
         ],
     )
 

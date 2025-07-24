@@ -49,9 +49,9 @@ from .decode import (
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
-    block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
+    nvfp4_block_scale_interleave,
 )
 from .fused_moe import (
     RoutingMethodType,
@@ -117,3 +117,4 @@ from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_fr
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
+from .utils import next_positive_power_of_2 as next_positive_power_of_2
