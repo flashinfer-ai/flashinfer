@@ -5,10 +5,12 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer import next_positive_power_of_2
+from flashinfer import next_positive_power_of_2, reorder_rows_for_gated_act_gemm
 from flashinfer.fused_moe import (
     RoutingMethodType,
     WeightLayout,
+    convert_to_block_layout,
+    shuffle_matrix_a,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -265,8 +267,8 @@ def test_trtllm_fp4_block_scale_moe(args):
         args.hidden_size // 16,
         args.num_tokens,
         device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.float,
+    ).to(torch.float8_e4m3fn)
 
     # GEMM1 weights: [num_experts, 2*intermediate_size, hidden_size//2] (FP4 packed)
     gemm1_weights = torch.randint(
@@ -279,8 +281,8 @@ def test_trtllm_fp4_block_scale_moe(args):
     gemm1_weights_scale = torch.randn(
         (args.num_experts, 2 * args.intermediate_size, args.hidden_size // 16),
         device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.float,
+    ).to(torch.float8_e4m3fn)
 
     # GEMM2 weights: [num_experts, hidden_size, intermediate_size//2] (FP4 packed)
     gemm2_weights = torch.randint(
@@ -293,8 +295,8 @@ def test_trtllm_fp4_block_scale_moe(args):
     gemm2_weights_scale = torch.randn(
         (args.num_experts, args.hidden_size, args.intermediate_size // 16),
         device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.float,
+    ).to(torch.float8_e4m3fn)
 
     # Output scaling factors
     output1_scale_scalar = torch.randn(
@@ -490,33 +492,61 @@ def test_trtllm_fp8_block_scale_moe(args):
 
     # Create FP8 quantized weights and block scales
     hidden_states_fp8 = test_data["hidden_states"].to(torch.float8_e4m3fn)
-    hidden_states_scale = torch.randn(
-        args.hidden_size // 128, args.num_tokens, device=device, dtype=torch.float
+    # Use deterministic scales for testing consistency (matching reference implementation)
+    hidden_states_scale = 2.0 * torch.ones(
+        (args.hidden_size // 128, args.num_tokens), device=device, dtype=torch.float
     )
 
-    # GEMM1 weights and scales
-    gemm1_weights = torch.randn(
+    # Create base weights in float format first
+    gemm1_weights_base = torch.randn(
         (args.num_experts, 2 * args.intermediate_size, args.hidden_size),
         device=device,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.float,
     )
-    gemm1_weights_scale = torch.randn(
-        (args.num_experts, 2 * args.intermediate_size // 128, args.hidden_size // 128),
+    gemm2_weights_base = torch.randn(
+        (args.num_experts, args.hidden_size, args.intermediate_size),
         device=device,
         dtype=torch.float,
     )
 
-    # GEMM2 weights and scales
-    gemm2_weights = torch.randn(
-        (args.num_experts, args.hidden_size, args.intermediate_size),
+    # Convert to FP8 and generate scales (matching reference implementation)
+    gemm1_weights = gemm1_weights_base.to(torch.float8_e4m3fn)
+    gemm1_weights_scale = 2 * torch.rand(
+        (args.num_experts, 2 * args.intermediate_size // 128, args.hidden_size // 128),
         device=device,
-        dtype=torch.float8_e4m3fn,
-    )
-    gemm2_weights_scale = torch.randn(
+    ).to(torch.float)
+
+    gemm2_weights = gemm2_weights_base.to(torch.float8_e4m3fn)
+    gemm2_weights_scale = 2 * torch.rand(
         (args.num_experts, args.hidden_size // 128, args.intermediate_size // 128),
         device=device,
-        dtype=torch.float,
-    )
+    ).to(torch.float)
+
+    # Apply weight processing (shuffling and layout conversion) if requested
+    if args.use_shuffled_weight:
+        # FIXME: this depends on the kernel internals
+        epilogue_tile_m = 64  # For FP8 block scale
+
+        gemm1_weights_shuffled = []
+        gemm2_weights_shuffled = []
+        for i in range(args.num_experts):
+            tmp_weights1 = shuffle_matrix_a(
+                gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+            )
+            tmp_weights2 = shuffle_matrix_a(
+                gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+            )
+
+            if test_data["weight_layout"] == WeightLayout.BlockMajorK:
+                block_k = 128
+                tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
+
+            gemm1_weights_shuffled.append(tmp_weights1)
+            gemm2_weights_shuffled.append(tmp_weights2)
+
+        gemm1_weights = torch.stack(gemm1_weights_shuffled).view(torch.float8_e4m3fn)
+        gemm2_weights = torch.stack(gemm2_weights_shuffled).view(torch.float8_e4m3fn)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] hidden_states_fp8.shape = {hidden_states_fp8.shape}")
@@ -695,19 +725,55 @@ def test_trtllm_fp8_per_tensor_scale_moe(args):
     # Create FP8 quantized weights with per-tensor scales
     hidden_states_fp8 = test_data["hidden_states"].to(torch.float8_e4m3fn)
 
-    # GEMM1 weights
-    gemm1_weights = torch.randn(
+    # Create base weights in float format first
+    gemm1_weights_base = torch.randn(
         (args.num_experts, 2 * args.intermediate_size, args.hidden_size),
         device=device,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.float,
     )
-
-    # GEMM2 weights
-    gemm2_weights = torch.randn(
+    gemm2_weights_base = torch.randn(
         (args.num_experts, args.hidden_size, args.intermediate_size),
         device=device,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.float,
     )
+
+    # Convert to FP8 (matching reference implementation)
+    gemm1_weights = gemm1_weights_base.to(torch.float8_e4m3fn)
+    gemm2_weights = gemm2_weights_base.to(torch.float8_e4m3fn)
+
+    # Apply weight processing for per-tensor scale (matching reference implementation)
+    # FIXME: this depends on the kernel internals
+    epilogue_tile_m = 128  # For FP8 per-tensor scale
+
+    # Reorder rows of W1 for fused gated activation
+    gemm1_weights_fp8_interleaved = []
+    for i in range(args.num_experts):
+        gemm1_weights_fp8_interleaved.append(
+            reorder_rows_for_gated_act_gemm(gemm1_weights[i].clone())
+        )
+
+    # Stack weights for all experts
+    gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved).reshape(
+        args.num_experts, 2 * args.intermediate_size, args.hidden_size
+    )
+
+    # Shuffle weights for transposed mma output
+    gemm1_weights_fp8_shuffled = []
+    gemm2_weights_fp8_shuffled = []
+    for i in range(args.num_experts):
+        gemm1_weights_fp8_shuffled.append(
+            shuffle_matrix_a(
+                gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+            )
+        )
+
+        gemm2_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+        )
+
+    # Stack weights for all experts
+    gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(torch.float8_e4m3fn)
+    gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn)
 
     # Per-tensor scaling factors
     output1_scales_scalar = torch.randn(
