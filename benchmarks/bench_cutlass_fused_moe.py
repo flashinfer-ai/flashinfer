@@ -116,6 +116,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
 
     # Save chrome traces
     if trace_path is not None:
+        print(f"export_chrome_trace to {trace_path=}")
         profiler.export_chrome_trace(trace_path)
 
     # Return average kernel times
