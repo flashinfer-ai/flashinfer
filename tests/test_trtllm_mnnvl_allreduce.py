@@ -155,7 +155,6 @@ def row_linear_residual_norm_fusion_forward(
 """Main test function that runs on each MPI rank"""
 
 
-# seq_lens = [1, 4, 32, 128]
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -167,7 +166,11 @@ def row_linear_residual_norm_fusion_forward(
     ],
 )  # Test with different sequence length lists
 @pytest.mark.parametrize("fusion", [False, True])
-def test_mnnvl_allreduce_full(monkeypatch, seq_lens: list[int], fusion: bool):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192])
+def test_mnnvl_allreduce_full(
+    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+):
     monkeypatch.setenv("TRTLLM_FORCE_MNNVL_AR", "1")  # force multi-node allreduce.
 
     # Get MPI info
@@ -202,11 +205,8 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_lens: list[int], fusion: bool):
             f"[Node {mapping.node_rank}] Rank {rank} using GPU {torch.cuda.current_device()}"
         )
 
-    hidden_size = 7168
-    dtype = torch.bfloat16
     tensor_parallel_size = world_size
     eps = 1e-5
-
     torch.manual_seed(42)
 
     # Track if this rank failed
@@ -231,7 +231,7 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_lens: list[int], fusion: bool):
         for seq_len in seq_lens:
             if rank == 0:
                 print(
-                    f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}"
+                    f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}, dtype={dtype}"
                 )
 
             # Generate test data (same on all ranks due to same seed)
@@ -289,13 +289,13 @@ def test_mnnvl_allreduce_full(monkeypatch, seq_lens: list[int], fusion: bool):
             # Synchronize before next test
             trtllm_mnnvl_ar.mpi_barrier()
 
-            print(f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}")
+            print(
+                f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}"
+            )
 
     except Exception as e:
         rank_failed = True
-        failure_message = (
-            f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion} failed: {e}"
-        )
+        failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
         print(failure_message)
         # Gather failure status from all ranks
         all_failures = MPI.COMM_WORLD.allgather(rank_failed)
