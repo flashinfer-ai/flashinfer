@@ -654,6 +654,7 @@ struct KernelParams {
 
     params.ptrScaleSfKv = options.kvSfScalePtr;
     params.ptrScaleSfO = options.oSfScalePtr;
+    params.mScaleSfO = options.mScaleSfO;
 
     params.mAttentionWindowSize = options.mAttentionWindowSize;
     if (isSlidingOrChunkedCausalMask(
@@ -687,7 +688,6 @@ struct KernelParams {
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = nullptr;
-
     return params;
   }
 };
