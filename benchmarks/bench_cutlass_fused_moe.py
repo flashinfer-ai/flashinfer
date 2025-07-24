@@ -340,6 +340,7 @@ def bench_cutlass_fused_moe(
     #         output=flash_output,
     #     )
     # )
+    trace_dir = os.environ.get("BENCH_KINETO_TRACE_DIR")
     bench_kineto(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
@@ -353,7 +354,7 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         ),
         kernel_names="what",
-        trace_path=os.environ.get("BENCH_KINETO_TRACE_DIR") + "/" + str(time.time()) + ".json.gz",
+        trace_path=f"{trace_dir}/{time.time()}.json.gz" if trace_dir else None,
     )
 
     # NOTE MODIFIED
