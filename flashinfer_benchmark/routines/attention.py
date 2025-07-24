@@ -693,7 +693,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Check for backend-specific constraints
     if "cudnn" in backends:
         remove_cudnn = False
-        if causal == False:
+        if not causal:
             print(
                 f"[INFO] CUDNN backend does not support non-causal prefill. Skipping."
             )

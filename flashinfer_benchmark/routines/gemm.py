@@ -346,10 +346,6 @@ def testGroupGemmFp8NtGroupwise(args):
 
     c = kernel_fn()
 
-    print(f"[INFO] {a_dequant.shape = }")
-    print(f"[INFO] {b_dequant.shape = }")
-    print(f"[INFO] {c.shape = }")
-
     if run_refcheck:
         ref_c = (
             einsum(

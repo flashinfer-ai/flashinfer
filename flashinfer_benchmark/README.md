@@ -168,8 +168,8 @@ The following support surface applies to attention operations in `flashinfer_ben
 Notes:
 - Currently only support bfloat16 attention only.
 - CUDA graph support is only stable with BatchDecodeWithPagedKVCacheWrapper. For BatchPrefillWithPagedKVCacheWrapper and BatchPrefillWithRaggedKVCacheWrapper, it is recommended that `--no_cuda_graph` is used.
-- cudnn, cutlass, and trtllm backends are supported on [CUDA Comute Capability 10.0 GPUs](https://developer.nvidia.com/cuda-gpus) only.
-- fa3 is supported on [CUDA Comute Capability 9.0 GPUs](https://developer.nvidia.com/cuda-gpus) only.
+- cudnn, cutlass, and trtllm backends are supported on [CUDA Compute Capability 10.0 GPUs](https://developer.nvidia.com/cuda-gpus) only.
+- fa3 is supported on [CUDA Compute Capability 9.0 GPUs](https://developer.nvidia.com/cuda-gpus) only.
 
 ## Example Outputs
 ```bash

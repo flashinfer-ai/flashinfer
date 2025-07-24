@@ -229,7 +229,6 @@ def set_seed(random_seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(random_seed)
         torch.cuda.manual_seed_all(random_seed)
-    return
 
 
 def sleep_after_kernel_run(execution_time):
@@ -242,7 +241,7 @@ def sleep_after_kernel_run(execution_time):
     Returns:
         None
     """
-    if execution_time is not np.inf:
+    if not math.isinf(execution_time):
         sleep_time = np.min([execution_time / 200, 1.0])
     else:
         sleep_time = 0.01
@@ -269,7 +268,7 @@ def attention_flops(
         head_dim_qk (int): Head dimension of the query and key.
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
-        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking. Note: Causal must be false for decode as this function assumes qo_seqlen == kv_seqlen.
+        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking.
 
     Returns:
         total_flops (int): Total FLOPs for the layer.
@@ -463,7 +462,9 @@ def attention_tb_per_sec(
         num_qo_heads (int): Number of query heads.
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
-        datatype (torch.dtype): Data type of the tensors.
+        q_dtype (torch.dtype): Data type of the query.
+        kv_dtype (torch.dtype): Data type of the key and value.
+        o_dtype (torch.dtype): Data type of the output.
 
     Returns:
         tb_per_sec (float): TB per second for the layer.
@@ -503,7 +504,9 @@ def attention_tb_per_sec_with_actual_seq_lens(
         num_qo_heads (int): Number of query heads.
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
-        datatype (torch.dtype): Data type of the tensors.
+        q_dtype (torch.dtype): Data type of the query.
+        kv_dtype (torch.dtype): Data type of the key and value.
+        o_dtype (torch.dtype): Data type of the output.
 
     Returns:
         tb_per_sec (float): TB per second for the layer.
