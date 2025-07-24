@@ -305,37 +305,37 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
 
-    # jit_specs += gen_attention(
-    #     f16_dtype_,
-    #     f8_dtype_,
-    #     fa2_head_dim_,
-    #     fa3_head_dim_,
-    #     use_sliding_window_,
-    #     use_logits_soft_cap_,
-    #     has_sm90,
-    #     has_sm100,
-    #     add_gemma,
-    # )
-    # for act_name in act_func_def_str:
-    #     jit_specs.append(gen_act_and_mul_module(act_name))
-    # jit_specs.append(gen_gemm_module())
-    # if has_sm90:
-    #     jit_specs.append(gen_gemm_sm90_module())
+    jit_specs += gen_attention(
+        f16_dtype_,
+        f8_dtype_,
+        fa2_head_dim_,
+        fa3_head_dim_,
+        use_sliding_window_,
+        use_logits_soft_cap_,
+        has_sm90,
+        has_sm100,
+        add_gemma,
+    )
+    for act_name in act_func_def_str:
+        jit_specs.append(gen_act_and_mul_module(act_name))
+    jit_specs.append(gen_gemm_module())
+    if has_sm90:
+        jit_specs.append(gen_gemm_sm90_module())
     if has_sm100:
         jit_specs.append(gen_cutlass_fused_moe_sm100_module())
-    #     jit_specs.append(gen_fp4_quantization_sm100_module())
-    #     jit_specs.append(gen_gemm_sm100_module())
-    #     jit_specs.append(gen_trtllm_comm_module())
+        jit_specs.append(gen_fp4_quantization_sm100_module())
+        jit_specs.append(gen_gemm_sm100_module())
+        jit_specs.append(gen_trtllm_comm_module())
 
-    # jit_specs += [
-    #     gen_cascade_module(),
-    #     gen_vllm_comm_module(),
-    #     gen_norm_module(),
-    #     gen_page_module(),
-    #     gen_quantization_module(),
-    #     gen_rope_module(),
-    #     gen_sampling_module(),
-    # ]
+    jit_specs += [
+        gen_cascade_module(),
+        gen_vllm_comm_module(),
+        gen_norm_module(),
+        gen_page_module(),
+        gen_quantization_module(),
+        gen_rope_module(),
+        gen_sampling_module(),
+    ]
 
     # dedup
     names = set()
