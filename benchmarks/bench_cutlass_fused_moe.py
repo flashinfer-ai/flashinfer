@@ -239,8 +239,9 @@ def bench_cutlass_fused_moe(
             input_sf=input_sf,
             output=flash_output,
         ),
-        kernel_names="what",
-        trace_path=f"{trace_dir}/{time.time()}.json.gz" if trace_dir else None,
+        kernel_names="cutlass13device_kernelINS_4gemm6kernel",
+        num_kernels_per_period=2,
+        trace_path=f"{trace_dir}/{time.time()}.trace.json.gz" if trace_dir else None,
     )
 
     # NOTE MODIFIED

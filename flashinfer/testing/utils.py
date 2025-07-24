@@ -330,7 +330,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
             profile_data = json.loads(Path(tmp.name).read_text())
 
         for i, kernel_name in enumerate(kernel_names):
-            events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
+            events = [event for event in profile_data['traceEvents'] if kernel_name in event['name']]
             events = sorted(events, key=lambda event: event['ts'])
             durations = [event['dur'] / 1e6 for event in events]
             assert len(durations) % num_kernels_per_period == 0
