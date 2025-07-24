@@ -28,27 +28,26 @@ from flashinfer import fp4_quantize
 from flashinfer.testing.utils import bench_kineto
 
 BATCH_SIZES = [
-    # TODO more
-    # 1,
-    # 2,
-    # 4,
-    # 8,
-    # 16,
-    # 24,
-    # 32,
-    # 48,
-    # 64,
-    # 96,
-    # 128,
-    # 256,
-    # 384, # NOTE ADD
-    # 512,
+    1,
+    2,
+    4,
+    8,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    256,
+    384, # NOTE ADD
+    512,
     768, # NOTE ADD
-    # 1024,
-    # 1536,
-    # 2048,
-    # 3072,
-    # 4096,
+    1024,
+    1536,
+    2048,
+    3072,
+    4096,
 ]
 
 configs = []
@@ -70,13 +69,13 @@ test_configs = [
             "intermediate_size": 2048,
         }
         for num_experts in [
-            # TODO more
-            # 288 // 1,
-            # 288 // 2,
-            # 288 // 4,
-            # 288 // 8,
-            # 288 // 16,
+            288 // 1,
+            288 // 2,
+            288 // 4,
+            288 // 8,
+            288 // 16,
             288 // 32,
+            # TODO support
             # 288 // 48,
             # 288 // 72,
         ]
