@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "gpu_iface/conversion_utils.h"
+
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
@@ -13,7 +15,6 @@
 #include <random>
 #include <sstream>
 
-// #include "flashinfer/exception.h"
 #include "dispatch.inc"
 
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                  \

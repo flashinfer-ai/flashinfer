@@ -3,7 +3,7 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "page.hip.h"
+#include "flashinfer/attention/generic/page.cuh"
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>

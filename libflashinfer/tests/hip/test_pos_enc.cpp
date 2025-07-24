@@ -2,7 +2,7 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "pos_enc.hip.h"
+#include "flashinfer/attention/generic/pos_enc.cuh"
 
 #include <hip/hip_runtime.h>
 

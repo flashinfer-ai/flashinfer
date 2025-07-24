@@ -11,10 +11,9 @@
 #include <iostream>
 #include <string>
 
-#include "../../layout.cuh"
-
 #include "gpu_iface/dispatch.cuh"
 #include "gpu_iface/enums.hpp"
+#include "gpu_iface/layout.cuh"
 #include "gpu_iface/math_ops.hpp"
 #include "gpu_iface/platform.hpp"
 #include "gpu_iface/utils.cuh"
@@ -23,6 +22,7 @@
 namespace flashinfer
 {
 
+using namespace gpu_iface::vec_dtypes;
 /*!
  * \brief Convert PosEncodingMode to string
  * \param pos_encoding_mode A PosEncodingMode value

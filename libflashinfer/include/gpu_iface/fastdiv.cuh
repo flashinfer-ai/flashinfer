@@ -20,6 +20,9 @@
  */
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
+
+#include "macros.hpp"
+
 #include <cstdint>
 
 namespace flashinfer

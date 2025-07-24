@@ -4,7 +4,6 @@
 
 #pragma once
 #include "macros.hpp"
-#include <iostream>
 
 #include "gpu_runtime_compat.hpp"
 

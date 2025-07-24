@@ -32,7 +32,9 @@ set(HIP_HIPCC_FLAGS
 
 # clang-format off Add flashinfer directory here Example:
 # set(FLASHINFER_INCLUDE_DIRS /root/flashinfer/libflashinfer/include/)
-set(FLASHINFER_INCLUDE_DIRS Enter flashinfer include path here)
+set(FLASHINFER_INCLUDE_DIRS
+    ""
+    CACHE PATH "Path to FlashInfer include directory")
 # clang-format on
 
 include_directories(${HIP_INCLUDE_DIRS})

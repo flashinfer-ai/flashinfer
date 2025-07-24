@@ -16,6 +16,8 @@
 #ifndef FLASHINFER_LAYOUT_CUH_
 #define FLASHINFER_LAYOUT_CUH_
 
+#include "macros.hpp"
+
 #include <cstdint>
 #include <string>
 #include <tuple>

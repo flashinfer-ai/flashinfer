@@ -48,13 +48,12 @@ nan_detection_and_accuracy(const std::vector<DType> &o_host,
 }
 
 template <typename DTypeQO, typename DTypeKV>
-void _TestBatchDecodingKernelCorrectness(
-    size_t page_size,
-    size_t batch_size,
-    size_t num_qo_heads,
-    size_t num_kv_heads,
-    size_t head_dim,
-    flashinfer::PosEncodingMode pos_encoding_mode)
+void _TestBatchDecodingKernelCorrectness(size_t page_size,
+                                         size_t batch_size,
+                                         size_t num_qo_heads,
+                                         size_t num_kv_heads,
+                                         size_t head_dim,
+                                         PosEncodingMode pos_encoding_mode)
 {
 
     std::vector<int32_t> seq_lens(batch_size);
@@ -110,7 +109,7 @@ void _TestBatchDecodingKernelCorrectness(
     assert(q.size() == batch_size * num_qo_heads * head_dim);
     assert(o_ref.size() == batch_size * num_qo_heads * head_dim);
 
-    flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
+    paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout, k_data.data(),
         v_data.data(), kv_indices.data(), kv_indptr.data(),
         kv_last_page_len.data());
@@ -148,12 +147,12 @@ void _TestBatchDecodingKernelCorrectness(
               hipMemcpyHostToDevice);
 
     // create paged_kv object
-    flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv(
+    paged_kv_t<DTypeKV, int32_t> paged_kv(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout, k_data_device,
         v_data_device, kv_indices_device, kv_indptr_device,
         kv_last_page_len_device);
 
-    flashinfer::BatchDecodeHandler handler;
+    BatchDecodeHandler handler;
 
     size_t float_workspace_size_in_bytes = 32 * 1024 * 1024;
     char *float_buffer;
@@ -170,8 +169,7 @@ void _TestBatchDecodingKernelCorrectness(
         head_dim, page_size, pos_encoding_mode);
 
     hipError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
-                                                       DTypeQO, int32_t>(
+        BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
             &handler, q_device, /*q_rope_offset=*/nullptr, paged_kv, o_device,
             /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
     EXPECT_EQ(status, hipSuccess)
@@ -192,7 +190,7 @@ void _TestBatchDecodingKernelCorrectness(
               << ", num_kv_heads=" << num_kv_heads
               << ", batch_size=" << batch_size << ", head_dim=" << head_dim
               << ", pos_encoding_mode="
-              << flashinfer::PosEncodingModeToString(pos_encoding_mode)
+              << PosEncodingModeToString(pos_encoding_mode)
               << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy
               << std::endl;
     EXPECT_GT(result_accuracy, 0.90) << "Result correctness test failed.";
@@ -222,7 +220,7 @@ void TestBatchDecodeKernelCorrectness()
                                                                 DTypeKV>(
                                 page_size, batch_size, num_qo_heads,
                                 num_kv_heads, head_dim,
-                                flashinfer::PosEncodingMode(pos_encoding_mode));
+                                PosEncodingMode(pos_encoding_mode));
                         }
                     }
                 }

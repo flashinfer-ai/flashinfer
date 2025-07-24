@@ -2,11 +2,9 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
-#include "math.hip.h"
+#include "gpu_iface/math_ops.hpp"
 
 #include <gtest/gtest.h>
-
-#include <torch/torch.h>
 
 using namespace flashinfer::math;
 
