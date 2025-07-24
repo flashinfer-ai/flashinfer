@@ -931,6 +931,12 @@ inline cudaError_t PrefillSM90Plan(
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
   }
   int total_num_works = work_indptr_vec.back();
+  if (total_num_works > max_total_num_works) {
+    std::ostringstream err_msg;
+    err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
+            << " exceeds max_total_num_works " << max_total_num_works;
+    FLASHINFER_ERROR(err_msg.str());
+  }
   auto qo_tile_indices_vec = flatten(cta_qo_tile_indices, total_num_works);
   auto qo_indptr_vec = flatten(cta_qo_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cta_kv_indptr, total_num_works);
@@ -1317,9 +1323,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * partial_o_nnz, 16, "merge_indptr");
-  plan_info.merge_o_indices_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * partial_o_nnz, 16, "merge_o_indices");
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * merge_indptr.size(), 16, "merge_indptr");
+  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * merge_o_indices.size(), 16, "merge_o_indices");
   plan_info.num_qo_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
   // copy data to paged cpu buffer
