@@ -16,6 +16,7 @@ limitations under the License.
 import json
 import os
 import sys
+import time
 
 import torch
 from torch.nn import functional as F
@@ -140,26 +141,27 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
 # ------------------------------------------------------------------------------------------------
 
 BATCH_SIZES = [
-    1,
-    2,
-    4,
-    8,
-    16,
-    24,
-    32,
-    48,
-    64,
-    96,
-    128,
-    256,
-    384, # NOTE ADD
-    512,
+    # TODO more
+    # 1,
+    # 2,
+    # 4,
+    # 8,
+    # 16,
+    # 24,
+    # 32,
+    # 48,
+    # 64,
+    # 96,
+    # 128,
+    # 256,
+    # 384, # NOTE ADD
+    # 512,
     768, # NOTE ADD
-    1024,
-    1536,
-    2048,
-    3072,
-    4096,
+    # 1024,
+    # 1536,
+    # 2048,
+    # 3072,
+    # 4096,
 ]
 
 configs = []
@@ -181,14 +183,15 @@ test_configs = [
             "intermediate_size": 2048,
         }
         for num_experts in [
-            288 // 1,
-            288 // 2,
-            288 // 4,
-            288 // 8,
-            288 // 16,
+            # TODO more
+            # 288 // 1,
+            # 288 // 2,
+            # 288 // 4,
+            # 288 // 8,
+            # 288 // 16,
             288 // 32,
-            288 // 48,
-            288 // 72,
+            # 288 // 48,
+            # 288 // 72,
         ]
     ],
 
@@ -349,6 +352,7 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         ),
         kernel_names="what",
+        trace_path=os.environ.get("BENCH_KINETO_TRACE_DIR") + "/" + str(time.time()) + ".json.gz",
     )
 
     # NOTE MODIFIED
