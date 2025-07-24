@@ -1666,7 +1666,7 @@ def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> 
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP4Moe],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
             },
             id="Renorm",
             marks=pytest.mark.skip(
