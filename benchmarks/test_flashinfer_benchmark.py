@@ -1,6 +1,5 @@
-import pytest
-
 import flashinfer_benchmark
+import pytest
 
 
 @pytest.mark.parametrize("batch_size", [16, 32])

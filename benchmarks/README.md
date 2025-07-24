@@ -1,6 +1,8 @@
 # FlashInfer Perf Benchmarking Framework -- flashinfer_benchmark.py
 
-A comprehensive testing and benchmarking framework for FlashInfer's attention and GEMM kernels.
+A comprehensive testing and benchmarking framework for FlashInfer's kernels.
+
+The aim of `flashinfer_benchmark.py` is to provide a single framework for benchmarking any FlashInfer kernel and replace standalone benchmarking scripts. Current support surface includes batched prefill & decode, and FP8 gemm.
 
 ## Overview
 
