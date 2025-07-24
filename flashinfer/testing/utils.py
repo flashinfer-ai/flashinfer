@@ -13,8 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
-from typing import Tuple
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Tuple, Union, Optional
+import torch.distributed as dist
 
 import torch
 from einops import rearrange, reduce, repeat
@@ -208,8 +213,6 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
     return out
 
 
-# ----------------------- copy and modified from DeepGEMM -----------------------
-
 class empty_suppress:
     def __enter__(self):
         return self
@@ -253,10 +256,10 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
-def bench_kineto(fn, kernel_names, num_tests: int = 30,
-                 suppress_kineto_output: bool = False,
-                 trace_path: str = None, flush_l2: bool = True,
-                 with_multiple_kernels: bool = False):
+# copy and modified from DeepGEMM and DeepEP
+def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppress_kineto_output: bool = False,
+                 trace_path: Optional[str] = None, barrier_comm_profiling: bool = False, flush_l2: bool = True,
+                 num_kernels_per_period: int = 1):
     # Conflict with Nsight Systems
     using_nsys = int(os.environ.get('DG_NSYS_PROFILING', 0))
 
@@ -273,6 +276,12 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
         profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) if not using_nsys else empty_suppress()
         with profiler:
             for i in range(2):
+                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+                if barrier_comm_profiling:
+                    lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    lhs @ rhs
+                    dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
                 for _ in range(num_tests):
                     if flush_l2:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
@@ -291,7 +300,6 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     print(f"prof_lines=\n" + "\n".join(prof_lines))
 
-    # NOTE MOVED
     # Save chrome traces
     if trace_path is not None:
         print(f"export_chrome_trace to {trace_path=}")
@@ -299,25 +307,36 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
 
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-    if not with_multiple_kernels:
-        for name in kernel_names:
-            assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
-
-    # Return average kernel times
-    units = {'ms': 1e3, 'us': 1e6}
-    kernel_times = []
     for name in kernel_names:
-        total_time = 0
-        total_num = 0
+        assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
+
+    # Return average kernel durations
+    units = {'ms': 1e3, 'us': 1e6}
+    kernel_durations = []
+    for name in kernel_names:
         for line in prof_lines:
             if name in line:
                 time_str = line.split()[-2]
-                num_str = line.split()[-1]
                 for unit, scale in units.items():
                     if unit in time_str:
-                        total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
-                        total_num += int(num_str)
+                        kernel_durations.append(float(time_str.replace(unit, '')) / scale)
                         break
-        kernel_times.append(total_time / total_num)
+                break
 
-    return tuple(kernel_times) if is_tuple else kernel_times[0]
+    # Expand the kernels by periods
+    if num_kernels_per_period > 1:
+        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+            profiler.export_chrome_trace(tmp.name)
+            profile_data = json.loads(Path(tmp.name).read_text())
+
+        for i, kernel_name in enumerate(kernel_names):
+            events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
+            events = sorted(events, key=lambda event: event['ts'])
+            durations = [event['dur'] / 1e6 for event in events]
+            assert len(durations) % num_kernels_per_period == 0
+            num_kernel_patterns = len(durations) // num_kernels_per_period
+            kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
+                                   for j in range(num_kernels_per_period)]
+
+    # Return execution durations
+    return kernel_durations if is_tuple else kernel_durations[0]
