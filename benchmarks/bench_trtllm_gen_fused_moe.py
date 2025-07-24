@@ -1107,7 +1107,7 @@ test_configs = [
             },
         }
         for num_experts in [
-            288 // 1,
+            # 288 // 1, # not supported
             288 // 2,
             288 // 4,
             288 // 8,
