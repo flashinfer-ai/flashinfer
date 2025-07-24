@@ -83,18 +83,18 @@ test_configs = [
     ],
 
     # --- old ---
-    {
-        "hidden_size": 7168,
-        "num_experts": 256,
-        "top_k": 8,
-        "intermediate_size": 256,
-    },
-    {
-        "hidden_size": 7168,
-        "num_experts": 32,
-        "top_k": 8,
-        "intermediate_size": 2048,
-    },
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 256,
+    #     "top_k": 8,
+    #     "intermediate_size": 256,
+    # },
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 32,
+    #     "top_k": 8,
+    #     "intermediate_size": 2048,
+    # },
 ]
 
 
