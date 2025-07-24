@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import json
 
 import torch
 from torch.nn import functional as F
@@ -218,11 +219,18 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         )
     )
-    print(
-        f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
-    )
-    print(f"execution time: {ms}ms")
-    print(f"hi {selected_experts=}")
+    # NOTE MODIFIED
+    print(f"MAIN_OUTPUT=" + json.dumps(dict(
+        batch_size=batch_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        intermediate_size=intermediate_size,
+        execution_time_us=ms * 1000,
+    )))
+    # print(
+    #     f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
+    # )
+    # print(f"execution time: {ms}ms")
 
 
 if __name__ == "__main__":
