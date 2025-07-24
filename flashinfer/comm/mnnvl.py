@@ -795,16 +795,8 @@ class McastDeviceMemory:
             )
         )
 
-    def get_multicast_ptr_as_int64(self) -> int:
-        """Get multicast pointer as int64 (legacy compatibility)"""
-        return self.get_multicast_ptr()
-
-    def get_buffer_ptrs_dev_as_int64(self) -> int:
-        """Get buffer pointers device as int64 (returning first UC pointer for now) (legacy compatibility)"""
-        return self.uc_ptrs[0] if self.uc_ptrs else 0
-
     def lamport_initialize(self, rank: int, dtype: torch.dtype):
-        if dtype == torch.bfloat16:
+        if dtype == torch.bfloat16 or dtype == torch.float16:
             neg_zero = 0x8000
             dsize = 2
             memset_func = cuda.cuMemsetD16
@@ -878,16 +870,6 @@ class McastGPUBuffer:
         """Get the raw multicast pointer"""
         return self.mcast_device_memory.get_multicast_ptr()
 
-    def get_multicast_ptr_as_int64(self) -> int:
-        """Get the multicast pointer as int64"""
-        return self.get_multicast_ptr()
-
     def get_buffer_ptrs_dev(self) -> int:
         """Get the buffer pointers device array"""
         return self.mcast_device_memory.get_buffer_ptrs_dev()
-
-    def get_buffer_ptrs_dev_as_int64(self) -> int:
-        """Get the buffer pointers device as int64 (returning first UC pointer)"""
-        ptrs = self.mcast_device_memory.get_buffer_ptrs_host()
-        assert ptrs is not None
-        return ptrs[0] if ptrs else 0
