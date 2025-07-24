@@ -901,66 +901,6 @@ def compare_moe_outputs(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
-@pytest.mark.parametrize(
-    "routing_info",
-    [
-        pytest.param(
-            {
-                "num_experts": 256,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 8,
-                "top_k_groups": 4,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-            },
-            id="RoutingDSv3",
-        ),
-        pytest.param(
-            {
-                "num_experts": 72,
-                "top_k": 6,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-            },
-            id="RoutingDSlite",
-        ),
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize,
-            },
-            id="RoutingRenormalize",
-        ),
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.RenormalizeNaive,
-            },
-            id="RoutingRenormalizeNaive",
-        ),
-    ],
-)
 def test_moe_nvfp4(
         num_tokens,
         hidden_size,
@@ -1076,3 +1016,70 @@ def test_moe_nvfp4(
         top_k,
         routing_method_type,
     )
+
+# ---------------------------------------------------------------------------
+
+BATCH_SIZES = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    3072,
+    4096,
+]
+
+test_configs = [
+    # NOTE MODIFIED ADD
+    *[
+        {
+            "hidden_size": 7168,
+            "intermediate_size": 2048,
+            # RoutingDSv3
+            "routing_info": {
+                # TODO correct?
+                "num_experts": num_experts,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+            },
+        }
+        for num_experts in [
+            288 // 1,
+            288 // 2,
+            288 // 4,
+            288 // 8,
+            288 // 16,
+            288 // 32,
+            288 // 48,
+            288 // 72,
+        ]
+    ],
+]
+
+if __name__ == '__main__':
+    for config in test_configs:
+        for batch_size in BATCH_SIZES:
+            test_moe_nvfp4(
+                num_tokens=batch_size,
+                hidden_size=config["hidden_size"],
+                intermediate_size=config["intermediate_size"],
+                routing_info=config["routing_info"],
+            )
