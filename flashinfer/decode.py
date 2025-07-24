@@ -33,7 +33,6 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_decode_uri,
     setup_cubin_loader,
-    setup_metainfo_loader,
     trtllm_gen_fmha_module,
 )
 from .page import get_seq_lens
@@ -303,7 +302,6 @@ def get_trtllm_gen_fmha_module():
     mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
-    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
@@ -1828,13 +1826,9 @@ class TrtllmGenDecodeModule:
     def __init__(self):
         self._mod = trtllm_gen_fmha_module()
         self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import (
-            setup_cubin_loader,
-            setup_metainfo_loader,
-        )
+        from flashinfer.jit.cubin_loader import setup_cubin_loader
 
         setup_cubin_loader(self._mod.get_library_path())
-        setup_metainfo_loader(self._mod.get_library_path())
 
 
 @functools.cache
