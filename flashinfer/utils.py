@@ -84,6 +84,23 @@ def _expand_4d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     return x
 
 
+def next_positive_power_of_2(x: int) -> int:
+    if x < 1:
+        return 1
+
+    # Following code is equivalent to 1 << (x - 1).bit_length()
+    # But this impl does not contain bit_length() so can be used by torch compile.
+    # It can correctly handle 64bit number which should be enough for now.
+    n = x - 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    return n + 1
+
+
 def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
@@ -489,6 +506,10 @@ def ceil_div(x: int, y: int) -> int:
         The result of the ceiling division.
     """
     return (x + y - 1) // y
+
+
+def pad_up(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
 
 
 def get_device_sm_count(device: torch.device) -> int:
