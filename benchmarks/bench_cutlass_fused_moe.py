@@ -227,7 +227,7 @@ def bench_cutlass_fused_moe(
     #     )
     # )
     trace_dir = os.environ.get("BENCH_KINETO_TRACE_DIR")
-    bench_kineto(
+    [time_gemm1, time_gemm2] = bench_kineto(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
@@ -250,7 +250,8 @@ def bench_cutlass_fused_moe(
         num_experts=num_experts,
         top_k=top_k,
         intermediate_size=intermediate_size,
-        execution_time_us=ms * 1000,
+        time_gemm1_us=time_gemm1 * 1e6,
+        time_gemm2_us=time_gemm2 * 1e6,
     )))
     # print(
     #     f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
