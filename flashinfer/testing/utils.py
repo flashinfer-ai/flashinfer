@@ -298,7 +298,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
-    # print(f"prof_lines=\n" + "\n".join(prof_lines))
+    print(f"prof_lines=\n" + "\n".join(prof_lines))
 
     # Save chrome traces
     if trace_path is not None:
@@ -319,7 +319,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
         events = [event for event in profile_data['traceEvents'] if kernel_name in event['name']]
         events = sorted(events, key=lambda event: event['ts'])
         durations = [event['dur'] / 1e6 for event in events]
-        assert len(durations) % num_kernels_per_period == 0
+        assert len(durations) % num_kernels_per_period == 0, f"{durations=}"
         num_kernel_patterns = len(durations) // num_kernels_per_period
         kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
                                for j in range(num_kernels_per_period)]
