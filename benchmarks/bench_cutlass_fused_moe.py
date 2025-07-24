@@ -35,7 +35,9 @@ BATCH_SIZES = [
     96,
     128,
     256,
+    384, # NOTE ADD
     512,
+    768, # NOTE ADD
     1024,
     1536,
     2048,
@@ -53,6 +55,27 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 test_configs = [
+    # NOTE MODIFIED ADD
+    *[
+        {
+            "hidden_size": 7168,
+            "num_experts": num_experts,
+            "top_k": 8,
+            "intermediate_size": 2048,
+        }
+        for num_experts in [
+            288 // 1,
+            288 // 2,
+            288 // 4,
+            288 // 8,
+            288 // 16,
+            288 // 32,
+            288 // 48,
+            288 // 72,
+        ]
+    ],
+
+    # --- old ---
     {
         "hidden_size": 7168,
         "num_experts": 256,
@@ -199,6 +222,7 @@ def bench_cutlass_fused_moe(
         f"batch_size={batch_size}, num_experts={num_experts}, top_k={top_k}, intermediate_size={intermediate_size}"
     )
     print(f"execution time: {ms}ms")
+    print(f"hi {selected_experts=}")
 
 
 if __name__ == "__main__":
