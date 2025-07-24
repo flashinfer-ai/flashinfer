@@ -514,3 +514,55 @@ def pad_up(x: int, y: int) -> int:
 
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+class FP4Tensor:
+    """Wrapper class for FP4 tensors.
+
+    Since PyTorch doesn't natively support FP4, this wrapper contains:
+    - data: uint8 tensor storing the compressed FP4 data, the size of innermost dimension is ceil(original_dim / 2) since each uint8 stores 2 FP4 values
+    - scale: float8_e4m3fn tensor storing the scale factors
+    """
+
+    def __init__(
+        self,
+        data: torch.Tensor,
+        scale: torch.Tensor,
+        original_shape: Optional[Tuple[int, ...]] = None,
+    ):
+        """Initialize FP4Tensor.
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            uint8 tensor storing the compressed FP4 data
+        scale : torch.Tensor
+            float8_e4m3fn tensor storing the scale factors
+        original_shape : Optional[Tuple[int, ...]]
+            The original shape before compression.
+        """
+        if data.dtype != torch.uint8:
+            raise ValueError(f"data must be uint8 tensor, got {data.dtype}")
+        if scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"scale must be float8_e4m3fn tensor, got {scale.dtype}")
+
+        # Validate shape relationship if original_shape is provided
+        if original_shape is not None:
+            if data.shape[:-1] != original_shape[:-1]:
+                raise ValueError(
+                    f"data and original_shape must have the same dimensions except the last one. "
+                    f"data.shape={data.shape}, original_shape={original_shape}"
+                )
+
+            # Check the last dimension relationship: data_dim = ceil(original_dim / 2)
+            expected_data_dim = math.ceil(original_shape[-1] / 2)
+            if data.shape[-1] != expected_data_dim:
+                raise ValueError(
+                    f"data last dimension must be ceil(original_shape[-1] / 2). "
+                    f"data.shape[-1]={data.shape[-1]}, original_shape[-1]={original_shape[-1]}, "
+                    f"expected={expected_data_dim}"
+                )
+
+        self.data = data
+        self.scale = scale
+        self.original_shape = original_shape

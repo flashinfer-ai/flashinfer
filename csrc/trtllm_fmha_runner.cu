@@ -24,9 +24,9 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_t
   TORCH_CHECK(
       mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
       "Unsupported Kv data type: " + std::string(toStr(mDtypeKv)));
-  TORCH_CHECK(
-      mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 || mDtypeOut == DATA_TYPE_BF16,
-      "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
+  TORCH_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
+                  mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
+              "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
   mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
 }
 
