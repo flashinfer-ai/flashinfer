@@ -36,17 +36,9 @@ class FlashInferJITLogger(logging.Logger):
         self.handlers[1].setFormatter(
             logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         )
-        # Set to track messages that have been logged once
-        self._logged_once = set()
 
     def info(self, msg):
         super().info("flashinfer.jit: " + msg)
-
-    def info_once(self, msg):
-        """Log a message only once, even if called multiple times with the same message"""
-        if msg not in self._logged_once:
-            self._logged_once.add(msg)
-            super().info("flashinfer.jit: " + msg)
 
 
 logger = FlashInferJITLogger("flashinfer.jit")

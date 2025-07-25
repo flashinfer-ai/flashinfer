@@ -39,6 +39,7 @@ repos:
     rev: 24.8.0
     hooks:
       - id: black
+        exclude: flashinfer/tuning_configs/.*\.py
 
   - repo: https://github.com/pycqa/isort
     rev: 5.13.2

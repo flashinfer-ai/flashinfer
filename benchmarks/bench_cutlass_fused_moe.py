@@ -15,16 +15,15 @@ limitations under the License.
 """
 
 import argparse
-import json
+import pprint
 
 import torch
 from torch.nn import functional as F
-from triton.testing import do_bench_cudagraph
 
-import flashinfer
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
-from flashinfer.autotuner import AutoTuner, autotune, get_json_path
+from flashinfer.autotuner import AutoTuner, autotune, get_config_path
+from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -174,7 +173,7 @@ def bench_cutlass_fused_moe(
                 output=flash_output,
                 tune_max_num_tokens=16384,
             )
-    ms = do_bench_cudagraph(
+    ms_list = bench_gpu_time_with_cudagraph(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
@@ -187,16 +186,19 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         )
     )
+    avg_ms = sum(ms_list) / len(ms_list)
     print("input\tweight1\tweight2\ttime(ms)")
-    print(f"{tuple(hidden_states.shape)}\t{tuple(w1.shape)}\t{tuple(w2.shape)}\t{ms}")
+    print(
+        f"{tuple(hidden_states.shape)}\t{tuple(w1.shape)}\t{tuple(w2.shape)}\t{avg_ms}"
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--update-json",
+        "--update-config",
         action="store_true",
-        help="Update the json file with the new profiling results",
+        help="Update the config file with the new profiling results",
     )
     parser.add_argument(
         "--num-tokens", type=int, default=32, help="Number of tokens to profile"
@@ -216,11 +218,12 @@ if __name__ == "__main__":
         )
 
     configs = AutoTuner.get().profiling_cache
-    if args.update_json and configs:
+    if args.update_config and configs:
         # The original key contains a runner's hash in k[2] which might be different across machines.
         # So, we remove it for now. v[0] and v[1] are the runner id and the tactic.
         converted = {str((k[0], k[1], k[3])): (v[0], v[1]) for k, v in configs.items()}
-        json_path = get_json_path()
-        with open(json_path, "w") as f:
-            json.dump(converted, f, indent=4)
-        print(f"Saved the cache to {json_path}")
+        config_path = get_config_path(is_module=False)
+        with open(config_path, "w") as f:
+            f.write("best_configs = ")
+            pprint.pprint(converted, stream=f)
+        print(f"Saved the cache to {config_path}")
