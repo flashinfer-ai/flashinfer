@@ -68,8 +68,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
                             std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
-                            int64_t page_size,
-                            double sm_scale ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
+                            int64_t page_size, double sm_scale,
+                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -171,6 +171,9 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           params[i].v_stride_n = v_stride_n;
 
           params[i].sm_scale = sm_scale;
+          params[i].logits_soft_cap = logits_soft_cap;
+          // NOTE(Wenxuan) directly using the additional_params_decl from generate_additional_params
+          // will be problematic because of the params[i]
           ADDITIONAL_PARAMS_SETTER
           PROFILER_PARAMS_SETTER
         }

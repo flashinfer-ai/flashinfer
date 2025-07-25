@@ -136,7 +136,7 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
-        logits_soft_cap: Optional[float] = None,
+        logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -179,8 +179,8 @@ class BatchAttention:
             self._num_kv_heads,
             self._page_size,
             self._sm_scale,
-            # ADDITIONAL_FUNC_PARAMS
             logits_soft_cap,
+            # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS
             *profiler_args,
         )
