@@ -62,8 +62,12 @@ install_requires = [
     "einops",
     "nvidia-nvshmem-cu12",
     "nvidia-cudnn-cu12",
-    "nvidia-cudnn-frontend",
 ]
+
+# Only install nvidia-cudnn-frontend for x86 platforms
+machine = platform.machine().lower()
+if machine in ["x86_64", "amd64"]:
+    install_requires.append("nvidia-cudnn-frontend")
 generate_build_meta({})
 
 if enable_aot:
