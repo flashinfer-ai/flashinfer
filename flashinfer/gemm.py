@@ -776,6 +776,11 @@ def _check_cudnn_fp4_availability():
             "Unable to determine cuDNN backend version. FP4 requires backend >= 91002."
         )
 
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        raise RuntimeError(
+            "Torch version is outdated, the float4_e2m1fn_x2 data type is required to enabled cudnn FP4 backend. Please upgrade to Torch 2.8 or later."
+        )
+
 
 def _get_native_fp4_dtype():
     """get native fp4 datatype if supported in the torch, otherwise return uint8."""
