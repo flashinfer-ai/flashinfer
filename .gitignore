@@ -7,6 +7,7 @@ compile_commands.json
 
 # Generated files
 csrc/generated/
+csrc/nv_internal/tensorrt_llm/cutlass_instantiations/
 docs/generated/
 flashinfer/_build_meta.py
 flashinfer/data/

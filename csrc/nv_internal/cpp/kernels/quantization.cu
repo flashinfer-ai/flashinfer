@@ -363,5 +363,7 @@ template void invokeBatchedFP4Quantization<__nv_fp8_e4m3, 32>(
     int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream);
 #endif
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 }  // namespace kernels
 }  // namespace tensorrt_llm
