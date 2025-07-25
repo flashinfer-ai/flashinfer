@@ -1798,13 +1798,13 @@ class TrtllmGenDecodeModule:
         max_seq_len: int,
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
-        sm_count: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
-        sm_count = get_device_sm_count(query.device)
+        if self._sm_count is None:
+            self._sm_count = get_device_sm_count(query.device)
         self._op.trtllm_paged_attention_decode(
             out,
             query.unsqueeze(
@@ -1818,7 +1818,7 @@ class TrtllmGenDecodeModule:
             bmm1_scale,
             bmm2_scale,
             window_left,
-            sm_count,
+            self._sm_count,
         )
         return out
 
@@ -1826,6 +1826,7 @@ class TrtllmGenDecodeModule:
         pass
 
     def __init__(self):
+        self._sm_count: Optional[int] = None
         self._mod = trtllm_gen_fmha_module()
         self._op = self._mod.build_and_load()
         from flashinfer.jit.cubin_loader import (
