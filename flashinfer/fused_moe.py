@@ -789,7 +789,7 @@ def get_trtllm_moe_sm100_module():
     )
     def trtllm_fp8_per_tensor_scale_moe_op(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         output1_scales_scalar: torch.Tensor,
@@ -836,7 +836,7 @@ def get_trtllm_moe_sm100_module():
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         output1_scales_scalar: torch.Tensor,
@@ -866,7 +866,7 @@ def get_trtllm_moe_sm100_module():
     )
     def trtllm_fp8_block_scale_moe_op(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -914,7 +914,7 @@ def get_trtllm_moe_sm100_module():
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -1034,7 +1034,7 @@ def get_trtllm_moe_sm100_module():
 
 def trtllm_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     output1_scales_scalar: torch.Tensor,
@@ -1104,7 +1104,7 @@ def trtllm_fp8_per_tensor_scale_moe(
 
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
