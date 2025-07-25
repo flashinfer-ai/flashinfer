@@ -3,19 +3,16 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
+#pragma once
 #ifndef FLASHINFER_DECODE_PARAMS_CUH_
 #define FLASHINFER_DECODE_PARAMS_CUH_
 
-#if defined(PLATFORM_CUDA_DEVICE)
-#include <cuda_runtime.h>
-#elif defined(PLATFORM_HIP_DEVICE)
-#include <hip/hip_runtime.h>
-#endif
-
-#include <cstdint>
+#include "page.cuh"
 
 #include "gpu_iface/layout.cuh"
-#include "page.cuh"
+#include "gpu_iface/platform.hpp"
+
+#include <cstdint>
 
 namespace flashinfer
 {

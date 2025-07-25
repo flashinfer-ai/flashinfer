@@ -7,6 +7,7 @@
 #define FLASHINFER_ATTENTION_VARIANTS_CUH_
 
 #include "gpu_iface/math_ops.hpp"
+#include "gpu_iface/memory_ops.hpp"
 #include "gpu_iface/platform.hpp"
 #include "gpu_iface/utils.cuh"
 

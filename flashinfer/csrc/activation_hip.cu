@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/hip/activation.hip.h>
+#include <flashinfer/attention/generic/activation.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -49,15 +49,16 @@ void silu_and_mul(at::Tensor &out, at::Tensor &input, bool enable_pdl)
 
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
         uint32_t vec_size = 16 / sizeof(c_type);
-        
+
         uint64_t gridDim = num_tokens;
         uint64_t blockDim = std::min(d / vec_size, 1024U);
         uint64_t dynamicSmemBytes = 0;
         hipStream_t stream = stream;
 
-        flashinfer::activation::act_and_mul_kernel<c_type, silu><<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
-            static_cast<c_type *>(out.data_ptr()),
-            static_cast<c_type *>(input.data_ptr()), d);
+        activation::act_and_mul_kernel<c_type, silu>
+            <<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
+                static_cast<c_type *>(out.data_ptr()),
+                static_cast<c_type *>(input.data_ptr()), d);
 
         hipError_t err = hipGetLastError();
         TORCH_CHECK(err == hipSuccess,
@@ -83,10 +84,10 @@ void gelu_tanh_and_mul(at::Tensor &out, at::Tensor &input, bool enable_pdl)
         uint64_t dynamicSmemBytes = 0;
         hipStream_t stream = stream;
 
-        flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh><<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
-            static_cast<c_type *>(out.data_ptr()),
-            static_cast<c_type *>(input.data_ptr()), d);
-
+        activation::act_and_mul_kernel<c_type, gelu_tanh>
+            <<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
+                static_cast<c_type *>(out.data_ptr()),
+                static_cast<c_type *>(input.data_ptr()), d);
 
         hipError_t err = hipGetLastError();
         TORCH_CHECK(err == hipSuccess,
@@ -111,12 +112,13 @@ void gelu_and_mul(at::Tensor &out, at::Tensor &input, bool enable_pdl)
         uint64_t blockDim = std::min(d / vec_size, 1024U);
         uint64_t dynamicSmemBytes = 0;
         hipStream_t stream = stream;
-        
-        auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu>;
 
-        flashinfer::activation::act_and_mul_kernel<c_type, gelu><<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
-            static_cast<c_type *>(out.data_ptr()),
-            static_cast<c_type *>(input.data_ptr()), d);
+        auto kernel = activation::act_and_mul_kernel<c_type, gelu>;
+
+        activation::act_and_mul_kernel<c_type, gelu>
+            <<<gridDim, blockDim, dynamicSmemBytes, stream>>>(
+                static_cast<c_type *>(out.data_ptr()),
+                static_cast<c_type *>(input.data_ptr()), d);
 
         hipError_t err = hipGetLastError();
         TORCH_CHECK(err == hipSuccess,

@@ -13,9 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/hip/attention/scheduler.hip.h>
-#include <flashinfer/hip/pos_enc.hip.h>
-#include <flashinfer/hip/utils.hip.h>
+#include <flashinfer/attention/generic/pos_enc.cuh>
+#include <flashinfer/attention/generic/scheduler.cuh>
+#include <gpu_iface/utils.cuh>
 #include <optional>
 
 #include "batch_decode_config_hip.inc"
@@ -227,11 +227,10 @@ void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
             }
             params.padded_batch_size = plan_info.padded_batch_size;
 
-            hipError_t status =
-                flashinfer::BatchDecodeWithPagedKVCacheDispatched<
-                    HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant>(
-                    params, tmp_v, tmp_s,
-                    /*stream=*/stream);
+            hipError_t status = BatchDecodeWithPagedKVCacheDispatched<
+                HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant>(
+                params, tmp_v, tmp_s,
+                /*stream=*/stream);
             TORCH_CHECK(status == hipSuccess,
                         "BatchDecodeWithPagedKVCache failed with error ",
                         hipGetErrorString(status));

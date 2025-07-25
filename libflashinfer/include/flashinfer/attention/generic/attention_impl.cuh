@@ -3,13 +3,17 @@
 //
 // SPDX - License - Identifier : Apache 2.0
 
+#pragma once
 #ifndef FLASHINFER_ATTENTION_IMPL_CUH_
 #define FLASHINFER_ATTENTION_IMPL_CUH_
 
-#include "attention/cascade.cuh"
-#include "attention/decode.cuh"
-#include "attention/default_decode_params.cuh"
-// #include "attention/default_prefill_params.cuh"
-#include "attention/variants.cuh"
+#include "cascade.cuh"
+#include "decode.cuh"
+#include "default_decode_params.cuh"
+#include "variants.cuh"
+
+// Disabled Prefill for now
+// #include "default_prefill_params.cuh"
+// #include "prefill.cuh"
 
 #endif // FLASHINFER_ATTENTION_IMPL_CUH_

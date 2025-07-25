@@ -7,6 +7,7 @@
 #define FLASHINFER_STATE_CUH_
 
 #include "gpu_iface/math_ops.hpp"
+#include "gpu_iface/platform.hpp"
 #include "gpu_iface/vec_dtypes.hpp"
 
 // #if defined(PLATFORM_CUDA_DEVICE)

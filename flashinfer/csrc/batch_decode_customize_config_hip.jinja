@@ -1,9 +1,10 @@
 #pragma once
-#include <flashinfer/hip/page.hip.h>
-#include <flashinfer/hip/math.hip.h>
-#include <flashinfer/hip/layout.hip.h>
-#include <flashinfer/hip/pos_enc.hip.h>
-#include <flashinfer/hip/attention/variant_helper.hip.h>
+#include <gpu_iface/math_ops.hpp>
+#include <gpu_iface/layout.cuh>
+
+#include <flashinfer/attention/generic/page.cuh>
+#include <flashinfer/attention/generic/pos_enc.cuh>
+#include <flashinfer/attention/generic/variant_helper.cuh>
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}

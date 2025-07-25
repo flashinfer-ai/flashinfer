@@ -37,7 +37,7 @@ def get_cu_file_str(
     generate_hip,
 ):
     if generate_hip:
-        content = """#include <flashinfer/hip/attention_impl.hip.h>
+        content = """#include <flashinfer/attention/generic/attention_impl.cuh>
 
     namespace flashinfer {{
 

@@ -90,6 +90,13 @@
 #define gpuSuccess hipSuccess
 #endif
 
+#if defined(PLATFORM_CUDA_DEVICE)
+#define gpuLaunchConfig_t cudaLaunchConfig_t
+#define gpuLaunchAttribute cudaLaunchAttribute
+#elif defined(PLATFORM_HIP_DEVICE)
+#define gpuLaunchConfig_t hipLaunchConfig_t
+#define gpuLaunchAttribute hipLaunchAttribute
+#endif
 // CUDA error checking macro (replaces FLASHINFER_CUDA_CALL)
 #define FI_GPU_CALL(call)                                                      \
     do {                                                                       \

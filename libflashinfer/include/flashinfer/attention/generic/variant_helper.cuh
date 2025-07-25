@@ -6,11 +6,7 @@
 #ifndef FLASHINFER_ATTENTION_VARIANT_HELPER_H
 #define FLASHINFER_ATTENTION_VARIANT_HELPER_H
 
-#if defined(PLATFORM_CUDA_DEVICE)
-#include <cuda_runtime.h>
-#elif defined(PLATFORM_HIP_DEVICE)
-#include <hip/hip_runtime.h>
-#endif
+#include "gpu_iface/platform.hpp"
 
 #include <cstdint>
 

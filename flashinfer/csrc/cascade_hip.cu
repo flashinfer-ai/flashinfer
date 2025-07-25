@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/hip/attention/cascade.hip.h>
+#include <flashinfer/attention/generic/cascade.cuh>
 
 #include "pytorch_extension_utils.h"
 
