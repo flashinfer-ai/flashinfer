@@ -92,7 +92,7 @@ class BatchAttention:
             head_dim_qk,
             head_dim_vo,
             PosEncodingMode["NONE"].value,
-            logits_soft_cap,
+            logits_soft_cap > 0.0,
             use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
