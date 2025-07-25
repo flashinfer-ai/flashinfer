@@ -1168,9 +1168,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
 
   // used for remapping the output offsets
   // layout [packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
-  // int partial_o_nnz = 0;
+  int partial_o_nnz = 0;
   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
-  merge_indptr.push_back(0);
+  merge_indptr.push_back(partial_o_nnz);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
     int kv_len_limit = 0;
@@ -1241,6 +1241,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
             merge_o_indices.push_back(qo_indptr_h[i] +
                                       (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
           }
+          partial_o_nnz += row_tile_size * num_kv_tiles;
         }
       }
     }
