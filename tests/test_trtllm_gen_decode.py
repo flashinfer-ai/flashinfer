@@ -103,11 +103,17 @@ def reference_paged_attention(
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize("q_dtype", ["half", "bf16", "fp8"])
-@pytest.mark.parametrize("o_dtype", ["auto", "fp4"])  # auto means same as q_dtype
 @pytest.mark.parametrize(
-    "kv_cache_dtype", ["auto", "fp8"]
-)  # auto means same as q_dtype
+    "q_dtype,kv_cache_dtype,o_dtype",
+    [
+        ("half", "half", "half"),
+        ("half", "fp8", "half"),
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
 def test_trtllm_batch_decode_fmha(
     kv_layout,
     batch_size,
@@ -119,10 +125,6 @@ def test_trtllm_batch_decode_fmha(
     o_dtype,
     kv_cache_dtype,
 ):
-    if kv_cache_dtype == "auto" and q_dtype == "fp8":
-        pytest.skip("duplicated test to fp8 kvcache type")
-    if o_dtype == "fp4" and q_dtype != "fp8":
-        pytest.skip("fp4 output is only supported for fp8 query")
 
     # Set up test parameters
     seed = 0
@@ -141,6 +143,7 @@ def test_trtllm_batch_decode_fmha(
         "half": torch.float16,
         "bf16": torch.bfloat16,
         "fp8": torch.float8_e4m3fn,
+        "nvfp4": "nvfp4",
     }
 
     sm_scale = float(1.0 / (head_dim**0.5))
@@ -215,15 +218,15 @@ def test_trtllm_batch_decode_fmha(
         [k_cache, v_cache], dim=1
     )  # Shape: (num_blocks, 2, num_kv_heads, page_size, head_dim)
 
-    if q_dtype == "fp8" and o_dtype == "auto":  # Output type is fp8.
+    if o_dtype == "fp8":
         o_scale = torch.rand(1).item() * 0.5 + 0.5  # Scale range: 0.5 ~ 1.0
     else:
         o_scale = 1.0
+    o_sf_scale = (
+        0.2 if o_dtype == "nvfp4" else None
+    )  # choose a value to make error smaller by testing.
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    o_sf_scale = (
-        0.2 if o_dtype == "fp4" else None
-    )  # choose a value to make error smaller by testing.
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -235,13 +238,13 @@ def test_trtllm_batch_decode_fmha(
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
-        out_dtype=o_dtype,
+        out_dtype=dtype_map[o_dtype],
         o_sf_scale=o_sf_scale,
-        o_sf_vec_size=16 if o_dtype == "fp4" else None,
+        o_sf_vec_size=16 if o_dtype == "nvfp4" else None,
     )
 
     # Handle different return types based on out_dtype
-    if o_dtype == "fp4":
+    if o_dtype == "nvfp4":
         out_scale_factor = output.scale  # FP4Tensor.scale
         output = output.data  # FP4Tensor.data
     else:
@@ -280,14 +283,14 @@ def test_trtllm_batch_decode_fmha(
 
     output_ref = wrapper.run(ref_q, ref_kv_cache)
 
-    if q_dtype == "fp8" and o_dtype == "fp4":
+    if q_dtype == "fp8" and o_dtype == "nvfp4":
         rtol, atol = 5e-1, 1.1e0
-    elif q_dtype == "fp8" and o_dtype == "auto":
+    elif q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
     else:
         rtol, atol = 1e-2, 5e-2
 
-    if o_dtype == "fp4":
+    if o_dtype == "nvfp4":
         output = cast_from_fp4(output)
         output_ref, out_scale_factor_ref = ref_nvfp4_quant(output_ref, o_sf_scale, 16)
         out_scale_factor = recover_swizzled_scales(
@@ -306,7 +309,7 @@ def test_trtllm_batch_decode_fmha(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
 
-    if o_dtype != "fp4":  # wrapper api does not support fp4 output yet.
+    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper2 = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
