@@ -22,7 +22,7 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
     if _cudnn_handle is None:
         _cudnn_handle = cudnn.create_handle()
-    # cudnn.set_stream(_cudnn_handle, stream.cuda_stream) # TODO: Will fix this in future
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
     return _cudnn_handle
 
 
@@ -248,7 +248,8 @@ def _batch_decode_with_kv_cache(
         var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
         var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
 
-    graph.execute(var_map, workspace=workspace_buffer)
+    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     return out
 

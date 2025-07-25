@@ -10,7 +10,7 @@ try:
     import cudnn
 
     CUDNN_AVAILABLE = True
-except ImportError:
+except Exception as e:
     cudnn = None
     CUDNN_AVAILABLE = False
 
@@ -22,7 +22,7 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
     if _cudnn_handle is None:
         _cudnn_handle = cudnn.create_handle()
-    # cudnn.set_stream(_cudnn_handle, stream.cuda_stream) # TODO: Will fix this in future
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
     return _cudnn_handle
 
 
@@ -62,6 +62,7 @@ def _sdpa_prefill_key_fn(
     actual_seq_lens_q: Optional[torch.Tensor] = None,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
     bottom_right_causal_mask: Optional[bool] = None,
     return_lse: Optional[bool] = False,
     batch_offsets_q: Optional[torch.Tensor] = None,
@@ -85,7 +86,10 @@ def _sdpa_prefill_key_fn(
     elif k_cache.dim() == 4:
         h_kv, d_vo = k_cache.shape[1], k_cache.shape[3]
 
-    return (
+    if block_tables is not None:
+        page_size = k_cache.shape[2]
+
+    key = (
         graph_b,
         q.dim(),
         k_cache.dim(),
@@ -98,7 +102,9 @@ def _sdpa_prefill_key_fn(
         block_tables is not None,
         return_lse,
         bottom_right_causal_mask,
+        page_size,
     )
+    return key
 
 
 @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
@@ -201,15 +207,15 @@ def _build_prefill_graph(
 
             cudnn_k_cache = g.tensor(
                 name="k_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_qk),
-                stride=(h_kv * d_qk, d_qk, d_qk * h_kv, 1),
+                dim=k_cache.shape,
+                stride=k_cache.stride(),
                 data_type=cudnn.data_type.BFLOAT16,
             )
 
             cudnn_v_cache = g.tensor(
                 name="v_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_vo),
-                stride=(h_kv * d_vo, d_vo, d_vo * h_kv, 1),
+                dim=v_cache.shape,
+                stride=v_cache.stride(),
                 data_type=cudnn.data_type.BFLOAT16,
             )
 
@@ -282,11 +288,12 @@ def _build_prefill_graph(
             cudnn.data_type.BFLOAT16
         )
 
-        Stats.set_uid(UIDs.STATS_UID.value).set_output(return_lse).set_data_type(
-            cudnn.data_type.FLOAT
-        ).set_dim([graph_b, h_qo, graph_s_qo, 1]).set_stride(
-            [graph_s_qo * h_qo, 1, h_qo, 1]
-        )
+        if return_lse:
+            Stats.set_uid(UIDs.STATS_UID.value).set_output(return_lse).set_data_type(
+                cudnn.data_type.FLOAT
+            ).set_dim([graph_b, h_qo, graph_s_qo, 1]).set_stride(
+                [graph_s_qo * h_qo, 1, h_qo, 1]
+            )
 
         tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
         if return_lse:
@@ -321,7 +328,7 @@ def _batch_prefill_with_kv_cache(
     batch_offsets_stats: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
 
     graph, tensors = _build_prefill_graph(
         q=q,
@@ -375,12 +382,13 @@ def _batch_prefill_with_kv_cache(
         if batch_offsets_stats is not None:
             var_map[UIDs.RAGGED_STATS_UID.value] = batch_offsets_stats
 
-    graph.execute(var_map, workspace=workspace_buffer)
+    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     if return_lse:
         return out, lse
     else:
-        return out
+        return out, None
 
 
 def cudnn_batch_prefill_with_kv_cache(
@@ -465,7 +473,7 @@ def cudnn_batch_prefill_with_kv_cache(
                 dtype=torch.float32,
             )
 
-    if lse.shape != (num_sequences, max_token_per_sequence, h_qo):
+    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
         raise ValueError(
             "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
         )
