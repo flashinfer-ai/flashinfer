@@ -156,6 +156,52 @@ def get_gemm_module():
     return _gemm_module
 
 
+def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp4"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fp4Gemm.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "fp4GemmRunner.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"fp4_gemm.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        cta_m_n_k_list = [
+            (128, 64, 128),
+            (128, 256, 128),
+            (128, 128, 256),
+            (128, 256, 256),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory / f"fp4_gemm_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    return gen_jit_spec(
+        "fp4_gemm",
+        source_paths,
+        extra_cuda_cflags=sm100a_nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -234,6 +280,13 @@ def gen_gemm_sm100_module() -> JitSpec:
 @functools.cache
 def get_gemm_sm100_module():
     module = gen_gemm_sm100_module().build_and_load()
+
+    return module
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_fp4():
+    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
 
     return module
 
@@ -1113,6 +1166,7 @@ def mm_fp4(
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
+    backend: Literal["cudnn", "cutlass"] = "cudnn",
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -1141,6 +1195,9 @@ def mm_fp4(
 
     block_size: int
         Block size for FP4 quantization, only 16 is supported.
+
+    backend: Literal["cudnn", "cutlass"]
+        The backend to use for the operation. Defaults to ``"cudnn"``.
 
     Returns
     -------
@@ -1218,25 +1275,29 @@ def mm_fp4(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
-    # build the fp4 cudnn graph
-    graph = build_cudnn_gemm_block_scale_dequantize_graph(
-        real_a_shape,
-        real_a_stride,
-        real_b_shape,
-        real_b_stride,
-        expanded_a_descale_shape,
-        expanded_a_descale_stride,
-        expanded_b_descale_shape,
-        expanded_b_descale_stride,
-        _get_native_fp4_dtype(),
-        torch.float8_e4m3fn,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size,
-        a.device,
-    )
+    if backend == "cudnn":
+        # build the fp4 cudnn graph
+        graph = build_cudnn_gemm_block_scale_dequantize_graph(
+            real_a_shape,
+            real_a_stride,
+            real_b_shape,
+            real_b_stride,
+            expanded_a_descale_shape,
+            expanded_a_descale_stride,
+            expanded_b_descale_shape,
+            expanded_b_descale_stride,
+            _get_native_fp4_dtype(),
+            torch.float8_e4m3fn,
+            _torch_data_type_to_cudnn_data_type(out_dtype),
+            block_size,
+        )
 
-    # execute the fp4 cudnn graph
-    execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
+        # execute the fp4 cudnn graph
+        execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
+    elif backend == "cutlass":
+        get_gemm_sm100_module_cutlass_fp4().fp4_gemm.default(
+            a, b.T, a_descale, b_descale.T, alpha, out
+        )
     return out
 
 
