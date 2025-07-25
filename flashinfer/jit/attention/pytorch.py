@@ -746,6 +746,123 @@ def gen_batch_decode_module(
     )
 
 
+class CudnnPrefillModule:
+    def _paged_run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        scale: float,
+        out: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        d_qk = q.shape[2]
+        h_qo = q.shape[1]
+
+        if d_qk == 192:
+            block_tables = None
+        elif d_qk == 128:
+            blocks_per_seq = (self._max_s_kv + self._page_size - 1) // self._page_size
+            block_tables = torch.arange(
+                0, self._batch_size * blocks_per_seq, dtype=torch.int32, device=q.device
+            ).view(self._batch_size, blocks_per_seq)
+        else:
+            raise NotImplementedError
+
+        tmp_lse = torch.empty(
+            self._batch_size * self._max_s_qo,
+            h_qo,
+            device=q.device,
+            dtype=torch.float32,
+        )
+
+        actual_seq_lens_q_gpu = self._actual_seq_lens_q_host.to(
+            q.device, non_blocking=True
+        )
+
+        actual_seq_lens_kv_gpu = self._actual_seq_lens_kv_host.to(
+            q.device, non_blocking=True
+        )
+
+        run_func = self._op.prefill
+        run_func(
+            self._batch_size,
+            self._max_s_qo,
+            self._max_s_kv,
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            self._workspace_buffer,
+            self._actual_seq_lens_q_host,
+            self._actual_seq_lens_kv_host,
+            actual_seq_lens_q_gpu,
+            actual_seq_lens_kv_gpu,
+            block_tables,
+            self._causal,
+            True,  # returl_lse
+            out,
+            tmp_lse,
+            None,  # batch_offset_q_array
+            None,  # batch_offset_o_array
+            None,  # batch_offset_k_array
+            None,  # batch_offset_v_array
+            self._is_cuda_graph_compatible,
+        )
+        if maybe_lse is not None:
+            maybe_lse[::] = tmp_lse[self._lse_map[::]]
+
+    def _ragged_run(self, *args, **kwargs):
+        raise NotImplementedError("cudnn doesn't support ragged run")
+
+    def _plan(
+        self,
+        workspace_buffer: torch.Tensor,
+        qo_indptr_host: torch.Tensor,
+        kv_lens_arr_host: torch.Tensor,
+        is_cuda_graph_enabled: bool,
+        page_size: int,
+        causal: bool,
+    ):
+        self._workspace_buffer = workspace_buffer
+        self._actual_seq_lens_q_host = qo_indptr_host[1:] - qo_indptr_host[:-1]
+        self._actual_seq_lens_kv_host = kv_lens_arr_host
+        self._max_s_qo = int(self._actual_seq_lens_q_host.max())
+        self._max_s_kv = int(self._actual_seq_lens_kv_host.max())
+        self._is_cuda_graph_compatible = is_cuda_graph_enabled
+        self._batch_size = int(kv_lens_arr_host.shape[0])
+        self._page_size = page_size
+        self._causal = causal
+
+        self._lse_map = torch.empty((qo_indptr_host[-1],), dtype=torch.int32)
+        for i in range(self._batch_size):
+            self._lse_map[qo_indptr_host[i] : qo_indptr_host[i + 1]] = (
+                torch.arange(0, self._actual_seq_lens_q_host[i], dtype=torch.int32)
+                + i * self._max_s_qo
+            )
+
+    def __init__(self):
+        self._mod = cudnn_fmha_gen_module()
+        self._op = self._mod.build_and_load()
+        from flashinfer.jit.cubin_loader import setup_cubin_loader
+
+        setup_cubin_loader(self._mod.get_library_path())
+
+    def build_and_load(self):
+        # NOTE(Siyuan): WAR to mimic JIT behavior.
+        class _Patch:
+            def __init__(self, func):
+                self._func = func
+
+            def default(self, *args, **kwargs):
+                return self._func(*args, **kwargs)
+
+        self.plan = _Patch(self._plan)
+        self.paged_run = _Patch(self._paged_run)
+        self.ragged_run = _Patch(self._ragged_run)
+        return self
+
+
 def gen_batch_prefill_module(
     backend: str,
     dtype_q: torch.dtype,
@@ -772,6 +889,9 @@ def gen_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     )
+
+    if backend == "cudnn":
+        return CudnnPrefillModule()
 
     # use `fp8_enabled` flag to use separate kernel template
     # this is used for fp8 tensor core computation
