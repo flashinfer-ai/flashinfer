@@ -32,10 +32,11 @@ struct StandardAttention : AttentionVariantBase {
   template <typename Params>
   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
                                         uint8_t* smem_ptr) {
-    sm_scale_log2 = params.sm_scale * math::log2e;
     if constexpr (use_logits_soft_cap) {
       soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
       sm_scale_log2 = math::log2e * params.logits_soft_cap;
+    }else{
+      sm_scale_log2 = params.sm_scale * math::log2e;
     }
   }
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {

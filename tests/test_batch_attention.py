@@ -128,6 +128,7 @@ def _run_attention(
         causal=causal,
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
+        logits_soft_cap=logits_soft_cap,
     )
     out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
 
