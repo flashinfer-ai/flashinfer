@@ -144,6 +144,11 @@ class BatchAttention:
                 raise ValueError(
                     "Profiler is enabled, profiler_buffer must be provided"
                 )
+        if logits_soft_cap > 0.0 and self._logits_soft_cap <= 0.0:
+            raise ValueError(
+                "logits_soft_cap used in kernel run but not provided in plan(). This will cause template deduction error."
+            )
+
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
             out = torch.empty_like(q)
@@ -175,7 +180,7 @@ class BatchAttention:
             self._page_size,
             self._sm_scale,
             # ADDITIONAL_FUNC_PARAMS
-            self._logits_soft_cap,
+            logits_soft_cap,
             # PROFILER_FUNC_PARAMS
             *profiler_args,
         )
