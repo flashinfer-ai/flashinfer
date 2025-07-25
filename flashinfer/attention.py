@@ -74,10 +74,15 @@ class BatchAttention:
         page_size: int,
         causal: bool = False,
         sm_scale: float = None,
+        logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
         use_profiler: bool = False,
     ) -> None:
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        self._logits_soft_cap = logits_soft_cap
+
         # get jit module
         get_module_args = (
             q_data_type,
@@ -87,6 +92,7 @@ class BatchAttention:
             head_dim_qk,
             head_dim_vo,
             PosEncodingMode["NONE"].value,
+            logits_soft_cap,
             use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
@@ -130,6 +136,7 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        logits_soft_cap: Optional[float] = None,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -167,6 +174,9 @@ class BatchAttention:
             self._num_kv_heads,
             self._page_size,
             self._sm_scale,
+            # ADDITIONAL_FUNC_PARAMS
+            self._logits_soft_cap,
+            # PROFILER_FUNC_PARAMS
             *profiler_args,
         )
 
