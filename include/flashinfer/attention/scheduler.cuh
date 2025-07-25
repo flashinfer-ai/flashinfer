@@ -1145,7 +1145,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
 
   // NOTE(Zihao): adjust it later
-  const int max_total_num_works = 16384;
+  const int max_total_num_works = 65536;
   const int max_num_kv_splits =
       4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
 
