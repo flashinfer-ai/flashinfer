@@ -23,6 +23,7 @@
 #include <vector>
 
 // #include "flashinfer/trtllm/common/Dtype.h"
+#include "trtllmGen_bmm_export/Enums.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
@@ -39,6 +40,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
   bool useShuffledMatrixA{false};
+  batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
 };
 
 class TrtllmGenBatchedGemmRunner {
