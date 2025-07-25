@@ -510,7 +510,7 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
               "gemm2_weights must be fp8.");
 
   TORCH_CHECK(gemm2_weights.dim() == 3 || gemm2_weights.dim() == 4,
-              "gemm1_weights must be 3D or 4D.");
+              "gemm2_weights must be 3D or 4D.");
   {
     int64_t K = 0;
     if (gemm2_weights.dim() == 3) {
