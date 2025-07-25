@@ -25,8 +25,8 @@
 
 #include "../../utils.cuh"
 #include "../common.h"
-#include "cubin/kernelMetaInfo.h"
 #include "cuda_runtime_api.h"
+#include "flashInferMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
