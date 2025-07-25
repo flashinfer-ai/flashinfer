@@ -23,3 +23,4 @@ pip3 install nvidia-cutlass-dsl
 pip3 install ninja pytest numpy scipy build cuda-python pytest
 pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip3 install pre-commit
+pip3 install nvidia-cudnn-cu12==9.1.0.70
