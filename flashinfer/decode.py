@@ -1808,7 +1808,7 @@ class TrtllmGenDecodeModule:
             self._sm_count = get_device_sm_count(query.device)
         self._op.trtllm_paged_attention_decode(
             out,
-            torch.empty(0),  # fp4 output not supported in wrapper api yet.
+            None,  # fp4 output not supported in wrapper api yet.
             query.unsqueeze(
                 1
             ),  # [B, 1, H, D], no MTP here so second dim is 1 # todo(Yingyi): add MTP??
@@ -1819,8 +1819,8 @@ class TrtllmGenDecodeModule:
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
-            -1,
-            -1,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
             window_left,
             self._sm_count,
         )
@@ -2024,7 +2024,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     run_func(
         out,
-        out_scale_factor if out_scale_factor is not None else torch.empty(0),
+        out_scale_factor,
         query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
         kv_cache,
         workspace_buffer,

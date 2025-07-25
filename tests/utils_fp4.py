@@ -1,5 +1,7 @@
 import torch
 
+import flashinfer.utils as utils
+
 FLOAT4_E2M1_MAX = 6.0
 
 # E2M1 to float
@@ -83,10 +85,9 @@ def ref_nvfp4_quant(x, global_scale, block_size):
 
 
 def recover_swizzled_scales(scale, m, n, block_size):
-    round_up = lambda x, y: (x + y - 1) // y * y
-    rounded_m = round_up(m, 128)
+    rounded_m = utils.round_up(m, 128)
     scale_n = n // block_size
-    rounded_n = round_up(scale_n, 4)
+    rounded_n = utils.round_up(scale_n, 4)
     # Recover the swizzled scaling factor to linear layout
     tmp = torch.reshape(scale, (1, rounded_m // 128, rounded_n // 4, 32, 4, 4))
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
