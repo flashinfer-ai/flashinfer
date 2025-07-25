@@ -1342,9 +1342,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   // Note(Yilong): adjust it later
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
-      2 * partial_o_nnz * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
+      2 * max_num_kv_splits * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
-      2 * partial_o_nnz * sizeof(float), 16, "holistic_partial_lse");
+      2 * max_num_kv_splits * sizeof(float), 16, "holistic_partial_lse");
 
   return cudaSuccess;
 }
