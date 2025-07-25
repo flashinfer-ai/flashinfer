@@ -56,7 +56,7 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 class MaskedSchedulerParams:
     def __init__(
         self,
-        masked_m_tensor: cute.Tensor,
+        masked_m: cute.Tensor,
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
         cluster_shape_mnk: cute.Shape,
@@ -72,7 +72,7 @@ class MaskedSchedulerParams:
         print(c.shape)
         print("--------------------------------")
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
-        self.masked_m_tensor = masked_m_tensor
+        self.masked_m = masked_m
         self.c = c
         self.c_tiler = c_tiler
         self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
@@ -97,7 +97,7 @@ class MaskedSchedulerParams:
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
         for obj in [
-            self.masked_m_tensor,
+            self.masked_m,
             self.c,
             self.c_tiler,
             self._cluster_shape_mnk,
@@ -110,7 +110,7 @@ class MaskedSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.masked_m_tensor, self.c, self.c_tiler, self._cluster_shape_mnk],
+            [self.masked_m, self.c, self.c_tiler, self._cluster_shape_mnk],
             self._values_pos,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
@@ -238,25 +238,52 @@ class MaskedScheduler:
         return params.get_grid_shape(max_active_clusters, loc=loc, ip=ip)
 
     # private method
+    @cute.jit
     def _get_current_work_for_linear_idx(
-        self, current_work_linear_idx: Int32, *, loc=None, ip=None
+        self,
+        current_work_linear_idx: Int32,
     ) -> WorkTileInfo:
-        """Compute current tile coord given current_work_linear_idx and cta_id_in_cluster.
+        # is_valid = current_work_linear_idx < cute.size(
+        #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
+        # )
+        num_tiles_n = self.params.problem_shape_ntile_mnl[1]
+        accum_tile_m = self._accum_tile_m
+        batch_idx = self._current_batch_idx
 
-        :param current_work_linear_idx: The linear index of the current work.
-        :type current_work_linear_idx: Int32
+        while (
+            (
+                accum_tile_m
+                + cute.ceil_div(self.params.masked_m[batch_idx], self.params.c_tiler[0])
+            )
+            * num_tiles_n
+            <= current_work_linear_idx
+            and batch_idx < self.params.masked_m.shape[0]
+        ):
+            accum_tile_m += cute.ceil_div(
+                self.params.masked_m[batch_idx], self.params.c_tiler[0]
+            )
+            batch_idx += Int32(1)
 
-        :return: An object containing information about the current tile coordinates
-            and validity status.
-        :rtype: WorkTileInfo
-        """
+        self._accum_tile_m = accum_tile_m
+        self._current_batch_idx = batch_idx
 
-        is_valid = current_work_linear_idx < cute.size(
-            self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
-        )
+        is_valid = self._current_batch_idx < self.params.masked_m.shape[0]
+        if is_valid:
+            is_valid = (
+                self._accum_tile_m
+                + cute.ceil_div(
+                    self.params.masked_m[self._current_batch_idx],
+                    self.params.c_tiler[0],
+                )
+            ) * num_tiles_n > current_work_linear_idx
 
-        cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
-            current_work_linear_idx, loc=loc, ip=ip
+        # cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
+        #     current_work_linear_idx, loc=loc, ip=ip
+        # )
+        cur_cluster_coord = (
+            current_work_linear_idx // num_tiles_n - self._accum_tile_m,
+            current_work_linear_idx % num_tiles_n,
+            self._current_batch_idx,
         )
 
         # cur_tile_coord is a tuple of i32 values
@@ -276,7 +303,7 @@ class MaskedScheduler:
     @dsl_user_op
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         return self._get_current_work_for_linear_idx(
-            self._current_work_linear_idx, loc=loc, ip=ip
+            self._current_work_linear_idx,
         )
 
     @dsl_user_op
@@ -1183,13 +1210,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
-                if tidx % 32 == 0:
-                    cute.printf(
-                        "%d %d %d",
-                        mma_tile_coord_mnl[0],
-                        mma_tile_coord_mnl[1],
-                        mma_tile_coord_mnl[2],
-                    )
+                # if tidx % 32 == 0:
+                #     cute.printf(
+                #         "%d %d %d",
+                #         mma_tile_coord_mnl[0],
+                #         mma_tile_coord_mnl[1],
+                #         mma_tile_coord_mnl[2],
+                #     )
 
                 #
                 # Slice to per mma tile index
