@@ -22,11 +22,11 @@ using namespace flashinfer;
 
 {{ variant_decl }}
 
-template <bool use_logits_soft_cap>
+template <bool USE_LOGITS_SOFT_CAP>
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
-  static constexpr bool use_logits_soft_cap = use_logits_soft_cap;
+  static constexpr bool use_logits_soft_cap = USE_LOGITS_SOFT_CAP;
   PROFILER_CLOSURE_PARAMS_DECL
 
   template <typename Params>

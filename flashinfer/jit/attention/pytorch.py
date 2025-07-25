@@ -1536,7 +1536,6 @@ def gen_customize_batch_attention_module(
             additional_scalar_dtypes,
         )
     )
-
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
     ) as f:
