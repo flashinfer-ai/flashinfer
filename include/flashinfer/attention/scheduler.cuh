@@ -931,12 +931,6 @@ inline cudaError_t PrefillSM90Plan(
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
   }
   int total_num_works = work_indptr_vec.back();
-  if (total_num_works > max_total_num_works) {
-    std::ostringstream err_msg;
-    err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
-            << " exceeds max_total_num_works " << max_total_num_works;
-    FLASHINFER_ERROR(err_msg.str());
-  }
   auto qo_tile_indices_vec = flatten(cta_qo_tile_indices, total_num_works);
   auto qo_indptr_vec = flatten(cta_qo_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cta_kv_indptr, total_num_works);
@@ -1257,6 +1251,12 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
       work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
     }
     int total_num_works = work_indptr_vec.back();
+    if (total_num_works > max_total_num_works) {
+      std::ostringstream err_msg;
+      err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
+              << " exceeds max_total_num_works " << max_total_num_works;
+      FLASHINFER_ERROR(err_msg.str());
+    }
     auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
     auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
     auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
