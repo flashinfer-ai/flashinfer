@@ -43,57 +43,41 @@ def test_cudnn_prefill_deepseek(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
 
-    q_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
-                * head_dim_qk
-                * num_qo_heads,
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    q_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
+            * head_dim_qk
+            * num_qo_heads,
+        ]
+    ).int()
 
-    k_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
-                * head_dim_qk
-                * num_kv_heads,
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    k_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
+            * head_dim_qk
+            * num_kv_heads,
+        ]
+    ).int()
 
-    v_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
-                * head_dim_vo
-                * num_kv_heads,
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    v_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
+            * head_dim_vo
+            * num_kv_heads,
+        ]
+    ).int()
 
-    o_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
-                * head_dim_vo
-                * num_qo_heads,
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    o_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
+            * head_dim_vo
+            * num_qo_heads,
+        ]
+    ).int()
 
     batch_offsets_stats = torch.cat(
         [
@@ -145,33 +129,25 @@ def test_cudnn_prefill_deepseek(
         is_cuda_graph_compatible=True,
     )
 
-    qo_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
 
     # kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * s_kv
 
     # Create kv_indptr as cumulative sum of actual_seq_lens_kv
-    kv_indptr = (
-        torch.cat(
-            [
-                torch.tensor(
-                    [0],
-                    device=device,
-                ),
-                torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    kv_indptr = torch.cat(
+        [
+            torch.tensor(
+                [0],
+                device=device,
+            ),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),

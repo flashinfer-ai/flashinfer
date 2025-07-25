@@ -22,7 +22,7 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
     if _cudnn_handle is None:
         _cudnn_handle = cudnn.create_handle()
-    # cudnn.set_stream(_cudnn_handle, stream.cuda_stream) # TODO: Will fix this in future
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
     return _cudnn_handle
 
 

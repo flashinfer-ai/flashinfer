@@ -10,7 +10,7 @@ try:
     import cudnn
 
     CUDNN_AVAILABLE = True
-except ImportError:
+except Exception as e:
     cudnn = None
     CUDNN_AVAILABLE = False
 
@@ -22,7 +22,7 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
     if _cudnn_handle is None:
         _cudnn_handle = cudnn.create_handle()
-    # cudnn.set_stream(_cudnn_handle, stream.cuda_stream) # TODO: Will fix this in future
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
     return _cudnn_handle
 
 
@@ -62,6 +62,7 @@ def _sdpa_prefill_key_fn(
     actual_seq_lens_q: Optional[torch.Tensor] = None,
     actual_seq_lens_kv: torch.Tensor,
     block_tables: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
     bottom_right_causal_mask: Optional[bool] = None,
     return_lse: Optional[bool] = False,
     batch_offsets_q: Optional[torch.Tensor] = None,
@@ -85,7 +86,10 @@ def _sdpa_prefill_key_fn(
     elif k_cache.dim() == 4:
         h_kv, d_vo = k_cache.shape[1], k_cache.shape[3]
 
-    return (
+    if block_tables is not None:
+        page_size = k_cache.shape[2]
+
+    key = (
         graph_b,
         q.dim(),
         k_cache.dim(),
@@ -98,206 +102,217 @@ def _sdpa_prefill_key_fn(
         block_tables is not None,
         return_lse,
         bottom_right_causal_mask,
+        page_size,
     )
+    return key
 
 
-@cudnn.jit(heur_modes=[cudnn.heur_mode.A])
-@cudnn.graph_cache(key_fn=_sdpa_prefill_key_fn)
-def _build_prefill_graph(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    scale: float,
-    *,
-    max_token_seq_q: Optional[int] = None,
-    max_sequence_kv: Optional[int] = None,
-    actual_seq_lens_q: Optional[torch.Tensor] = None,
-    actual_seq_lens_kv: Optional[torch.Tensor] = None,
-    block_tables: Optional[torch.Tensor] = None,
-    page_size: Optional[int] = None,
-    bottom_right_causal_mask: Optional[bool] = True,
-    return_lse: Optional[bool] = False,
-    batch_offsets_q: Optional[torch.Tensor] = None,
-    batch_offsets_o: Optional[torch.Tensor] = None,
-    batch_offsets_k: Optional[torch.Tensor] = None,
-    batch_offsets_v: Optional[torch.Tensor] = None,
-    batch_offsets_stats: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    lse: Optional[torch.Tensor] = None,
-):
-    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+if CUDNN_AVAILABLE:
 
-    graph_b = actual_seq_lens_q.shape[0]
-    graph_s_qo = max_token_seq_q
-    graph_s_kv = max_sequence_kv
+    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+    @cudnn.graph_cache(key_fn=_sdpa_prefill_key_fn)
+    def _build_prefill_graph(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        scale: float,
+        *,
+        max_token_seq_q: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        actual_seq_lens_q: Optional[torch.Tensor] = None,
+        actual_seq_lens_kv: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        bottom_right_causal_mask: Optional[bool] = True,
+        return_lse: Optional[bool] = False,
+        batch_offsets_q: Optional[torch.Tensor] = None,
+        batch_offsets_o: Optional[torch.Tensor] = None,
+        batch_offsets_k: Optional[torch.Tensor] = None,
+        batch_offsets_v: Optional[torch.Tensor] = None,
+        batch_offsets_stats: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+    ):
+        handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
-    with cudnn.graph(handle) as (g, _):
-        # Create tensors from the input tensors
-        if q.dim() == 3:
-            h_qo, d_qk = q.shape[1], q.shape[2]
-        elif q.dim() == 4:
-            h_qo, d_qk = (
-                q.shape[1],
-                q.shape[2],
-                q.shape[3],
-            )
-        else:
-            raise ValueError(f"Invalid query tensor shape: {q.shape}")
+        graph_b = actual_seq_lens_q.shape[0]
+        graph_s_qo = max_token_seq_q
+        graph_s_kv = max_sequence_kv
 
-        cudnn_q = g.tensor(
-            name="q",
-            dim=(graph_b, h_qo, graph_s_qo, d_qk),
-            stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
-            data_type=cudnn.data_type.BFLOAT16,
-        )
+        with cudnn.graph(handle) as (g, _):
+            # Create tensors from the input tensors
+            if q.dim() == 3:
+                h_qo, d_qk = q.shape[1], q.shape[2]
+            elif q.dim() == 4:
+                h_qo, d_qk = (
+                    q.shape[1],
+                    q.shape[2],
+                    q.shape[3],
+                )
+            else:
+                raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
-        if batch_offsets_q is not None:
-            ragged_q = g.tensor_like(batch_offsets_q)
-            ragged_q.set_uid(UIDs.RAGGED_Q_UID.value)
-            cudnn_q.set_ragged_offset(ragged_q)
-
-        if v_cache.dim() == 3:
-            assert block_tables is None, "block_tables needs 4 dimensions of kv cache"
-            h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
-        elif v_cache.dim() == 4:
-            h_kv, d_vo = (
-                v_cache.shape[1],
-                v_cache.shape[3],
-            )
-        else:
-            raise ValueError(f"Invalid kv cache tensor shape: {k_cache.shape}")
-
-        if block_tables is not None:
-            page_size = k_cache.shape[2]
-
-        if k_cache.dim() == 3:
-            cudnn_k_cache = g.tensor(
-                name="k_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_qk),
-                stride=(h_kv * d_qk * graph_s_kv, d_qk, d_qk * h_kv, 1),
+            cudnn_q = g.tensor(
+                name="q",
+                dim=(graph_b, h_qo, graph_s_qo, d_qk),
+                stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
                 data_type=cudnn.data_type.BFLOAT16,
             )
 
-            if batch_offsets_k is not None:
-                ragged_k = g.tensor_like(batch_offsets_k)
-                ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
-                cudnn_k_cache.set_ragged_offset(ragged_k)
+            if batch_offsets_q is not None:
+                ragged_q = g.tensor_like(batch_offsets_q)
+                ragged_q.set_uid(UIDs.RAGGED_Q_UID.value)
+                cudnn_q.set_ragged_offset(ragged_q)
 
-            cudnn_v_cache = g.tensor(
-                name="v_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_vo),
-                stride=(h_kv * d_vo * graph_s_kv, d_vo, d_vo * h_kv, 1),
-                data_type=cudnn.data_type.BFLOAT16,
+            if v_cache.dim() == 3:
+                assert (
+                    block_tables is None
+                ), "block_tables needs 4 dimensions of kv cache"
+                h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
+            elif v_cache.dim() == 4:
+                h_kv, d_vo = (
+                    v_cache.shape[1],
+                    v_cache.shape[3],
+                )
+            else:
+                raise ValueError(f"Invalid kv cache tensor shape: {k_cache.shape}")
+
+            page_size = None
+            if block_tables is not None:
+                page_size = k_cache.shape[2]
+
+            if k_cache.dim() == 3:
+                cudnn_k_cache = g.tensor(
+                    name="k_cache",
+                    dim=(graph_b, h_kv, graph_s_kv, d_qk),
+                    stride=(h_kv * d_qk * graph_s_kv, d_qk, d_qk * h_kv, 1),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+
+                if batch_offsets_k is not None:
+                    ragged_k = g.tensor_like(batch_offsets_k)
+                    ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
+                    cudnn_k_cache.set_ragged_offset(ragged_k)
+
+                cudnn_v_cache = g.tensor(
+                    name="v_cache",
+                    dim=(graph_b, h_kv, graph_s_kv, d_vo),
+                    stride=(h_kv * d_vo * graph_s_kv, d_vo, d_vo * h_kv, 1),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+
+                if batch_offsets_v is not None:
+                    ragged_v = g.tensor_like(batch_offsets_v)
+                    ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
+                    cudnn_v_cache.set_ragged_offset(ragged_v)
+
+            elif k_cache.dim() == 4:
+
+                cudnn_k_cache = g.tensor(
+                    name="k_cache",
+                    dim=k_cache.shape,
+                    stride=k_cache.stride(),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+
+                cudnn_v_cache = g.tensor(
+                    name="v_cache",
+                    dim=v_cache.shape,
+                    stride=v_cache.stride(),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+
+            cudnn_q.set_uid(UIDs.Q_UID.value)
+            cudnn_k_cache.set_uid(UIDs.K_UID.value)
+            cudnn_v_cache.set_uid(UIDs.V_UID.value)
+
+            if block_tables is not None:
+                nd_block_tables = block_tables.reshape(
+                    block_tables.shape[0], 1, block_tables.shape[1], 1
+                )
+                cudnn_k_block_tables = g.tensor_like(nd_block_tables)
+                cudnn_k_block_tables.set_uid(UIDs.BLOCK_TABLES_K_UID.value)
+
+                cudnn_v_block_tables = g.tensor_like(nd_block_tables)
+                cudnn_v_block_tables.set_uid(UIDs.BLOCK_TABLES_V_UID.value)
+
+            if actual_seq_lens_q is not None:
+                cudnn_actual_seq_lens_q = g.tensor_like(actual_seq_lens_q)
+                cudnn_actual_seq_lens_q.set_name("actual_seq_lens_q")
+                cudnn_actual_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
+
+            if actual_seq_lens_kv is not None:
+                cudnn_actual_seq_lens_kv = g.tensor_like(actual_seq_lens_kv)
+                cudnn_actual_seq_lens_kv.set_name("actual_seq_lens_kv")
+                cudnn_actual_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
+
+            padding_mask = (
+                actual_seq_lens_q is not None and actual_seq_lens_kv is not None
             )
 
-            if batch_offsets_v is not None:
-                ragged_v = g.tensor_like(batch_offsets_v)
-                ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
-                cudnn_v_cache.set_ragged_offset(ragged_v)
-
-        elif k_cache.dim() == 4:
-
-            block_size = page_size if block_tables is not None else graph_s_kv
-
-            cudnn_k_cache = g.tensor(
-                name="k_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_qk),
-                stride=(h_kv * d_qk, d_qk, d_qk * h_kv, 1),
-                data_type=cudnn.data_type.BFLOAT16,
+            O, Stats = g.sdpa(
+                name="sdpa",
+                q=cudnn_q,
+                k=cudnn_k_cache,
+                v=cudnn_v_cache,
+                seq_len_q=(
+                    cudnn_actual_seq_lens_q if actual_seq_lens_q is not None else None
+                ),
+                seq_len_kv=(
+                    cudnn_actual_seq_lens_kv if actual_seq_lens_kv is not None else None
+                ),
+                use_padding_mask=padding_mask,
+                attn_scale=scale,
+                generate_stats=return_lse,
+                use_causal_mask_bottom_right=bottom_right_causal_mask,
+                paged_attention_k_table=(
+                    cudnn_k_block_tables if block_tables is not None else None
+                ),
+                paged_attention_v_table=(
+                    cudnn_v_block_tables if block_tables is not None else None
+                ),
+                paged_attention_max_seq_len_kv=(
+                    graph_s_kv if block_tables is not None else None
+                ),
+                compute_data_type=cudnn.data_type.FLOAT,
             )
 
-            cudnn_v_cache = g.tensor(
-                name="v_cache",
-                dim=(graph_b, h_kv, graph_s_kv, d_vo),
-                stride=(h_kv * d_vo, d_vo, d_vo * h_kv, 1),
-                data_type=cudnn.data_type.BFLOAT16,
+            if batch_offsets_o is not None:
+                ragged_o = g.tensor_like(batch_offsets_o)
+                ragged_o.set_uid(UIDs.RAGGED_O_UID.value)
+                O.set_ragged_offset(ragged_o)
+
+            if batch_offsets_stats is not None:
+                ragged_stats = g.tensor_like(batch_offsets_stats)
+                ragged_stats.set_uid(UIDs.RAGGED_STATS_UID.value)
+                Stats.set_ragged_offset(ragged_stats)
+
+            O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
+                [graph_b, h_qo, graph_s_qo, d_vo]
+            ).set_stride(
+                [graph_s_qo * d_vo * h_qo, d_vo, d_vo * h_qo, 1]
+            ).set_data_type(
+                cudnn.data_type.BFLOAT16
             )
 
-        cudnn_q.set_uid(UIDs.Q_UID.value)
-        cudnn_k_cache.set_uid(UIDs.K_UID.value)
-        cudnn_v_cache.set_uid(UIDs.V_UID.value)
+            if return_lse:
+                Stats.set_uid(UIDs.STATS_UID.value).set_output(
+                    return_lse
+                ).set_data_type(cudnn.data_type.FLOAT).set_dim(
+                    [graph_b, h_qo, graph_s_qo, 1]
+                ).set_stride(
+                    [graph_s_qo * h_qo, 1, h_qo, 1]
+                )
 
-        if block_tables is not None:
-            nd_block_tables = block_tables.reshape(
-                block_tables.shape[0], 1, block_tables.shape[1], 1
-            )
-            cudnn_k_block_tables = g.tensor_like(nd_block_tables)
-            cudnn_k_block_tables.set_uid(UIDs.BLOCK_TABLES_K_UID.value)
+            tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
+            if return_lse:
+                tensors_to_return.append(Stats)
 
-            cudnn_v_block_tables = g.tensor_like(nd_block_tables)
-            cudnn_v_block_tables.set_uid(UIDs.BLOCK_TABLES_V_UID.value)
+            if actual_seq_lens_q is not None:
+                tensors_to_return.append(cudnn_actual_seq_lens_q)
+            if actual_seq_lens_kv is not None:
+                tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
-        if actual_seq_lens_q is not None:
-            cudnn_actual_seq_lens_q = g.tensor_like(actual_seq_lens_q)
-            cudnn_actual_seq_lens_q.set_name("actual_seq_lens_q")
-            cudnn_actual_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
-
-        if actual_seq_lens_kv is not None:
-            cudnn_actual_seq_lens_kv = g.tensor_like(actual_seq_lens_kv)
-            cudnn_actual_seq_lens_kv.set_name("actual_seq_lens_kv")
-            cudnn_actual_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
-
-        padding_mask = actual_seq_lens_q is not None and actual_seq_lens_kv is not None
-
-        O, Stats = g.sdpa(
-            name="sdpa",
-            q=cudnn_q,
-            k=cudnn_k_cache,
-            v=cudnn_v_cache,
-            seq_len_q=(
-                cudnn_actual_seq_lens_q if actual_seq_lens_q is not None else None
-            ),
-            seq_len_kv=(
-                cudnn_actual_seq_lens_kv if actual_seq_lens_kv is not None else None
-            ),
-            use_padding_mask=padding_mask,
-            attn_scale=scale,
-            generate_stats=return_lse,
-            use_causal_mask_bottom_right=bottom_right_causal_mask,
-            paged_attention_k_table=(
-                cudnn_k_block_tables if block_tables is not None else None
-            ),
-            paged_attention_v_table=(
-                cudnn_v_block_tables if block_tables is not None else None
-            ),
-            paged_attention_max_seq_len_kv=(
-                graph_s_kv if block_tables is not None else None
-            ),
-            compute_data_type=cudnn.data_type.FLOAT,
-        )
-
-        if batch_offsets_o is not None:
-            ragged_o = g.tensor_like(batch_offsets_o)
-            ragged_o.set_uid(UIDs.RAGGED_O_UID.value)
-            O.set_ragged_offset(ragged_o)
-
-        if batch_offsets_stats is not None:
-            ragged_stats = g.tensor_like(batch_offsets_stats)
-            ragged_stats.set_uid(UIDs.RAGGED_STATS_UID.value)
-            Stats.set_ragged_offset(ragged_stats)
-
-        O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
-            [graph_b, h_qo, graph_s_qo, d_vo]
-        ).set_stride([graph_s_qo * d_vo * h_qo, d_vo, d_vo * h_qo, 1]).set_data_type(
-            cudnn.data_type.BFLOAT16
-        )
-
-        Stats.set_uid(UIDs.STATS_UID.value).set_output(return_lse).set_data_type(
-            cudnn.data_type.FLOAT
-        ).set_dim([graph_b, h_qo, graph_s_qo, 1]).set_stride(
-            [graph_s_qo * h_qo, 1, h_qo, 1]
-        )
-
-        tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
-        if return_lse:
-            tensors_to_return.append(Stats)
-
-        if actual_seq_lens_q is not None:
-            tensors_to_return.append(cudnn_actual_seq_lens_q)
-        if actual_seq_lens_kv is not None:
-            tensors_to_return.append(cudnn_actual_seq_lens_kv)
-
-        return g, tensors_to_return
+            return g, tensors_to_return
 
 
 def _batch_prefill_with_kv_cache(
@@ -321,7 +336,7 @@ def _batch_prefill_with_kv_cache(
     batch_offsets_stats: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
 
     graph, tensors = _build_prefill_graph(
         q=q,
@@ -375,12 +390,13 @@ def _batch_prefill_with_kv_cache(
         if batch_offsets_stats is not None:
             var_map[UIDs.RAGGED_STATS_UID.value] = batch_offsets_stats
 
-    graph.execute(var_map, workspace=workspace_buffer)
+    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     if return_lse:
         return out, lse
     else:
-        return out
+        return out, None
 
 
 def cudnn_batch_prefill_with_kv_cache(
@@ -465,7 +481,7 @@ def cudnn_batch_prefill_with_kv_cache(
                 dtype=torch.float32,
             )
 
-    if lse.shape != (num_sequences, max_token_per_sequence, h_qo):
+    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
         raise ValueError(
             "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
         )
