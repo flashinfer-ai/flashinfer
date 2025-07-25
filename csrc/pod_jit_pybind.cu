@@ -16,25 +16,33 @@
 #include "pod_config.inc"
 #include "pytorch_extension_utils.h"
 
-void pod_with_kv_cache_tensor(
-    // Prefill params
-    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
-    std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
-    int64_t window_left_p, std::optional<at::Tensor> maybe_custom_mask_p,
-    std::optional<at::Tensor> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
-    double rope_rcp_scale_p, double rope_rcp_theta_p,
-    // Decode params
+void PODWithKVCacheTensorRun(
+    // Shared params
     at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
-    at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
-    at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
-    std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
-    std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    bool enable_pdl);
+    at::Tensor plan_info_vec, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
+    at::Tensor qo_indptr, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+    at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+    int64_t layout,
+    // Prefill params
+    at::Tensor q_p, int64_t mask_mode_code_p, int64_t window_left_p,
+    std::optional<at::Tensor> maybe_custom_mask_p, std::optional<at::Tensor> maybe_alibi_slopes_p,
+    double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
+    // Decode params
+    at::Tensor q_d, int64_t mask_mode_code_d, int64_t window_left_d,
+    std::optional<at::Tensor> maybe_custom_mask_d, std::optional<at::Tensor> maybe_mask_indptr_d,
+    std::optional<at::Tensor> maybe_alibi_slopes_d, double logits_soft_cap_d, double sm_scale_d,
+    double rope_rcp_scale_d, double rope_rcp_theta_d, bool enable_pdl);
+
+at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                              at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
+                              at::Tensor kv_indptr_p, int64_t total_num_rows_p,
+                              int64_t batch_size_p, at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
+                              int64_t total_num_rows_d, int64_t batch_size_d,
+                              int64_t num_qo_heads_p, int64_t num_kv_heads, int64_t head_dim_qk,
+                              int64_t head_dim_vo, int64_t page_size, bool enable_cuda_graph);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache operator
-  m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
+  m.def("PODWithKVCacheTensor", PODWithKVCacheTensorRun);
+  m.def("PODWithKVCachePlan", PODWithKVCachePlan);
 }
