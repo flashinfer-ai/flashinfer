@@ -566,3 +566,4 @@ class FP4Tensor:
         self.data = data
         self.scale = scale
         self.original_shape = original_shape
+        self.dtype = "nvfp4"
