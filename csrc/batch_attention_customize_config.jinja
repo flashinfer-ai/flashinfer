@@ -26,6 +26,7 @@ template <bool use_logits_soft_cap>
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
+  static constexpr bool use_logits_soft_cap = use_logits_soft_cap;
   PROFILER_CLOSURE_PARAMS_DECL
 
   template <typename Params>

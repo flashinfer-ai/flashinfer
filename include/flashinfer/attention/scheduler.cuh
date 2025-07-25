@@ -1146,8 +1146,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
 
   // NOTE(Zihao): adjust it later
   const int max_total_num_works = 16384;
-  // const int max_packed_qo_lens =
-  //     4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
+  const int max_num_kv_splits =
+      16 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
 
   // calculate kv_len_limit first, considering all workloads
   int64_t total_kv_lens = 0;
@@ -1167,10 +1167,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   }
 
   // used for remapping the output offsets
-  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
-  int partial_o_nnz = 0;
+  // layout [packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
+  // int partial_o_nnz = 0;
   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
-  merge_indptr.push_back(partial_o_nnz);
+  merge_indptr.push_back(0);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
     int kv_len_limit = 0;
@@ -1241,7 +1241,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
             merge_o_indices.push_back(qo_indptr_h[i] +
                                       (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
           }
-          partial_o_nnz += row_tile_size * num_kv_tiles;
         }
       }
     }
@@ -1312,20 +1311,20 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                            len_kv_chunk_vec);
   }
 
-  // if (partial_o_nnz > max_packed_qo_lens) {
-  //   std::ostringstream err_msg;
-  //   err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
-  //           << max_packed_qo_lens;
-  //   FLASHINFER_ERROR(err_msg.str());
-  // }
+  if (merge_indptr.size() > max_num_kv_splits) {
+    std::ostringstream err_msg;
+    err_msg << "Number of kv splits " << merge_indptr.size() << " exceeds max buffer size "
+            << max_num_kv_splits << ". Please increase the threshold.";
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
   // update num_qo_len_vec
   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * merge_indptr.size(), 16, "merge_indptr");
-  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * merge_o_indices.size(), 16, "merge_o_indices");
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_indptr");
+  plan_info.merge_o_indices_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_o_indices");
   plan_info.num_qo_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
   // copy data to paged cpu buffer
