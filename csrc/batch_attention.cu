@@ -109,7 +109,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, PersistentParams, [&] {
+      AttentionVariant, PersistentParams, [&] {
         PersistentParams params[2];
 
         for (int i = 0; i < 2; i++) {
