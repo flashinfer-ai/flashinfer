@@ -37,6 +37,8 @@ void trtllm_mnnvl_all_reduce(at::Tensor& in, int64_t multicast_buffer_ptr, int64
     int64_t token_dim = in.size(1);
 
     // Validate input parameters
+    TORCH_CHECK(token_dim % (sizeof(float2) / sizeof(c_type)) == 0,
+                "token_dim must be divisible by ", sizeof(float2) / sizeof(c_type));
     TORCH_CHECK(nranks >= 2 && nranks <= 64, "nranks must be between 2 and 64, got ", nranks);
     TORCH_CHECK(rank >= 0 && rank < nranks, "rank must be between 0 and nranks-1, got ", rank);
     TORCH_CHECK(out.has_value() || !wait_for_results,
