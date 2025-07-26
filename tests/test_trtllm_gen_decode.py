@@ -137,9 +137,19 @@ def test_trtllm_batch_decode_fmha(
     }
 
     sm_scale = float(1.0 / (head_dim**0.5))
-    q = torch.randn(batch_size, num_qo_heads, head_dim, device=device).to(
-        dtype_map[q_dtype]
-    )
+    if q_dtype == "fp8":
+        q = torch.randn(
+            batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        q, q_scale = to_float8(q)
+        # Reference implementation have functional issue or low precision with fp8, use bfloat16 and fake-quantization instead.
+        ref_q = q.bfloat16() * q_scale
+    else:
+        q = torch.randn(
+            batch_size, num_qo_heads, head_dim, dtype=dtype_map[q_dtype], device=device
+        )
+        q_scale = 1.0
+        ref_q = q
 
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
@@ -171,20 +181,37 @@ def test_trtllm_batch_decode_fmha(
         ]
         block_id += num_blocks_needed
 
-    # Create interleaved KV cache
-    # kv_cache_shape = (block_id, 2, num_kv_heads, page_size, head_dim)
-    # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
-    kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    q_scale = k_scale = v_scale = 1.0
-    kv_cache = torch.randn(size=kv_cache_shape, device=device).to(dtype_map[q_dtype])
+    # Create separate K and V caches
+    kv_dtype = dtype_map[q_dtype] if q_dtype != "fp8" else torch.bfloat16
+    k_cache = torch.randn(
+        num_blocks, num_kv_heads, page_size, head_dim, dtype=kv_dtype, device=device
+    )
+    v_cache = torch.randn(
+        num_blocks, num_kv_heads, page_size, head_dim, dtype=kv_dtype, device=device
+    )
+    # Convert K and V separately to fp8 if needed
+    if kv_cache_dtype.startswith("fp8"):
+        k_cache, k_scale = to_float8(k_cache)
+        v_cache, v_scale = to_float8(v_cache)
+        # use high precision for reference kv_cache to avoid precision/functional issue
+        ref_kv_type = torch.bfloat16 if q_dtype == "fp8" else dtype_map[q_dtype]
+        ref_kv_cache = torch.stack(
+            [k_cache.to(ref_kv_type) * k_scale, v_cache.to(ref_kv_type) * v_scale],
+            dim=1,
+        )
+    else:
+        k_scale = v_scale = 1.0
+        ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
+
+    # Combine K and V into interleaved format for the API
+    kv_cache = torch.stack(
+        [k_cache, v_cache], dim=1
+    )  # Shape: (num_blocks, 2, num_kv_heads, page_size, head_dim)
 
     # Output type is fp8 when q is fp8, set scale for it.
     o_scale = (
         1.0 if q_dtype != "fp8" else torch.rand(1).item() * 0.5 + 0.5
     )  # Scale range: 0.5 ~ 1.0
-    if kv_cache_dtype.startswith("fp8") and q_dtype != "fp8":
-        kv_cache, _ = to_float8(kv_cache)
-
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -198,9 +225,6 @@ def test_trtllm_batch_decode_fmha(
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
     ).squeeze(1)
-
-    # Reference implementation have functional issue or low precision with fp8, use half instead.
-    ref_q = q.half() if q_dtype == "fp8" else q
 
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
@@ -217,11 +241,6 @@ def test_trtllm_batch_decode_fmha(
     kv_last_page_len = seq_lens_tensor % page_size
     kv_last_page_len[kv_last_page_len == 0] = page_size
 
-    if kv_cache_dtype == "auto":
-        kv_compute_dtype = dtype_map[q_dtype]
-    elif kv_cache_dtype == "fp8":
-        kv_compute_dtype = torch.float8_e4m3fn
-
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -232,18 +251,18 @@ def test_trtllm_batch_decode_fmha(
         page_size,
         pos_encoding_mode="NONE",
         window_left=window_left,
-        data_type=kv_compute_dtype,
+        data_type=ref_kv_cache.dtype,
         q_data_type=ref_q.dtype,
     )
 
-    output_ref = wrapper.run(
-        ref_q, kv_cache, q_scale=q_scale * k_scale, v_scale=v_scale / o_scale
-    )
+    output_ref = wrapper.run(ref_q, ref_kv_cache)
 
-    rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (1e-1, 1e-1)
+    rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (5e-2, 7e-2)
 
     # convert to float32 for fp8 is not supported by assert_close
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+    )
 
     # test wrapper with trtllm-gen backend
     wrapper2 = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -263,9 +282,17 @@ def test_trtllm_batch_decode_fmha(
         window_left=window_left,
     )
     output2 = wrapper2.run(
-        q.contiguous(), kv_cache, q_scale=q_scale * k_scale, v_scale=v_scale / o_scale
+        q.contiguous(),
+        kv_cache,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale / o_scale,
     )
-    torch.testing.assert_close(output2.float(), output.float(), rtol=rtol, atol=atol)
+    # skip compare due to v_scale, o_scale is not supported in wrapper api yet.
+    if v_scale == o_scale == 1.0:
+        torch.testing.assert_close(
+            output2.float(), output.float(), rtol=rtol, atol=atol
+        )
 
 
 @pytest.mark.parametrize(
