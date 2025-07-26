@@ -42,6 +42,7 @@ except OSError as e:
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit.cubin_loader import setup_cubin_loader
 from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 from .utils import (
     _get_cache_buf,
@@ -51,6 +52,8 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
+
+DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
 def gen_gemm_module() -> JitSpec:
@@ -944,7 +947,6 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
-
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=a_type
         )
@@ -1311,7 +1313,7 @@ def bmm_fp8(
         return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype)
     elif backend == "cublas":
         workspace_buffer = _get_cache_buf(
-            "bmm_fp8_workspace", 32 * 1024 * 1024, A.device
+            "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
         )
         get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
@@ -1379,7 +1381,7 @@ def gemm_fp8_nt_groupwise(
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
     workspace_buffer = _get_cache_buf(
-        "gemm_fp8_nt_groupwise_workspace", 32 * 1024 * 1024, a.device
+        "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
@@ -1420,6 +1422,99 @@ def gemm_fp8_nt_groupwise(
         *scale_granularity_mnk,
         scale_major_mode,
         mma_sm,
+    )
+
+    return out
+
+
+def trtllm_gemm_gen_module() -> JitSpec:
+    return gen_jit_spec(
+        "trtllm_gemm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_gemm_runner.cu",
+        ],
+        extra_cuda_cflags=[
+            "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_ENABLE_CUDA",
+        ]
+        + sm100a_nvcc_flags,
+        extra_ldflags=["-lcuda"],
+    )
+
+
+@functools.cache
+def get_trtllm_gemm_module():
+    mod = trtllm_gemm_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
+
+def gemm_fp8_blockwise_trtllm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""FP8 GEMM with block-wise scaling using TensorRT-LLM kernels.
+
+    This function performs the matrix multiplication C = A @ B, where A and B are
+    FP8 tensors with block-wise scaling factors.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        The first input tensor of shape (M, K) and dtype ``torch.float8_e4m3fn``.
+    b : torch.Tensor
+        The second input tensor of shape (N, K) and dtype ``torch.float8_e4m3fn``.
+    a_scale : torch.Tensor
+        The scaling factors for tensor `a` with shape (M, K // 128) and dtype ``torch.float32``.
+        These represent block-wise scaling factors where each 128-element block shares a scale.
+    b_scale : torch.Tensor
+        The scaling factors for tensor `b` with shape (N // 128, K // 128) and dtype ``torch.float32``.
+        These represent block-wise scaling factors where each 128x128 block shares a scale.
+    out : Optional[torch.Tensor]
+        The output tensor of shape (M, N) and dtype ``torch.bfloat16``. If not
+        provided, a new tensor will be created.
+
+    Returns
+    -------
+    torch.Tensor
+        The result of the matrix multiplication, a tensor of shape (M, N) with dtype ``torch.bfloat16``.
+    """
+
+    b = b.t()
+
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
+
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
+        )
+
+    if out is not None:
+        assert out.dtype == torch.bfloat16
+    else:
+        out_dtype = torch.bfloat16
+        out = torch.empty(
+            a.shape[0],
+            b.shape[0],
+            device=a.device,
+            dtype=out_dtype,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "gemm_fp8_blockwise_trtllm", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    get_trtllm_gemm_module().trtllm_gemm(
+        workspace_buffer,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
     )
 
     return out
@@ -1518,10 +1613,10 @@ def group_gemm_fp8_nt_groupwise(
     to accommodate the kernel's requirement.
     """
     int_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     float_workspace_buffer = _get_cache_buf(
-        "group_gemm_fp8_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_fp8_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -1645,10 +1740,12 @@ def group_gemm_mxfp4_nt_groupwise(
     to accommodate the kernel's requirement.
     """
     int_workspace_buffer = _get_cache_buf(
-        "group_gemm_mxfp4_nt_groupwise_int_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_mxfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
     float_workspace_buffer = _get_cache_buf(
-        "group_gemm_mxfp4_nt_groupwise_float_workspace", 32 * 1024 * 1024, a.device
+        "group_gemm_mxfp4_nt_groupwise_float_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        a.device,
     )
 
     assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
