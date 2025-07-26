@@ -2363,8 +2363,7 @@ class MaskedBatchedMatmulCuteDSL:
     ):
         """
         Initialize the MaskedBatchedMatmulCuteDSL
-        :param use_cuda_graph: Whether to use cuda graph
-        :type use_cuda_graph: bool
+        use_cuda_graph: bool = False, whether to use cuda graph
         """
         self._use_cuda_graph = use_cuda_graph
 
@@ -2380,12 +2379,25 @@ class MaskedBatchedMatmulCuteDSL:
         ab_dtype: torch.dtype,
         sf_dtype: torch.dtype,
         c_dtype: torch.dtype,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
+        sf_vec_size: int = 16,
+        mma_tiler_mn: Tuple[int, int] = (128, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 1),
     ):
         """
         Plan the masked batched matmul
+        m: int, # matrix A shape
+        n: int, # matrix B shape
+        k: int, # matrix A/B shape
+        l: int, # batch size
+        a_major: str, # ["k", "m"]. row major or column major
+        b_major: str, # ["k", "n"]. row major or column major
+        c_major: str, # ["n", "m"]. row major or column major
+        ab_dtype: data type of A and B
+        sf_dtype: data type of scale factor
+        c_dtype: data type of C
+        sf_vec_size: vector size of scale factor
+        mma_tiler_mn: (M, N) shape of MMA instruction tiler
+        cluster_shape_mn: (ClusterM, ClusterN) shape of CTA cluster
         """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required.")
