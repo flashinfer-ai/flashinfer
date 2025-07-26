@@ -269,6 +269,8 @@ struct TllmGenFmhaRunnerParams {
   int mSfStartTokenIdx;
   // The SF scale for Kv.
   float mScaleSfKv;
+  // The SF scale for output.
+  float mScaleSfO;
   // The cuda stream.
   cudaStream_t stream;
 
