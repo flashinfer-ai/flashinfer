@@ -39,6 +39,7 @@ from .fused_moe_utils import (
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from .jit.cubin_loader import get_cubin
 from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 
 
@@ -756,6 +757,13 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+    hash = "f5deee96023f1d74b1ff71ac69f782a96741a053"
+    metainfo = get_cubin(
+        f"{hash}/batched_gemm-c603ed2-3fa89e1/include/KernelMetaInfo",
+        "d789c63aaeee1aa0a68ebf22fa693b6b82a7c2319bd933a00a10306ca08d9e0e",
+        ".h",
+    )
+    assert metainfo, "KernelMetaInfo.h not found"
     return gen_jit_spec(
         "fused_moe_sm100",
         [
@@ -773,6 +781,13 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_FP4",
         ]
         + sm100a_nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CACHE_DIR
+            / "cubins"
+            / hash
+            / "batched_gemm-c603ed2-3fa89e1"
+            / "include"
+        ],
         extra_ldflags=["-lcuda"],
     )
 
