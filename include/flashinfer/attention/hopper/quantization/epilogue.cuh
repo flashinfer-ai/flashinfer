@@ -205,7 +205,7 @@ struct FP8CollectiveEpilogue {
     static_assert(CTA_Q <= NUM_MMA_THREADS);
     if (epilogue_params.lse_ptr) {  // don't write to LSE if it's nullptr
       if (thread_idx < qo_len - qo_tile_idx * CTA_Q) {
-        gLSE(thread_idx) = -math::inf;
+        gLSE(thread_idx) = math::neg_inf<float>();
       }
     }
   }
