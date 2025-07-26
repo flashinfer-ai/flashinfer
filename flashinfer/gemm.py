@@ -1223,7 +1223,7 @@ def mm_fp4(
         expanded_a_descale_stride,
         expanded_b_descale_shape,
         expanded_b_descale_stride,
-        _get_native_fp4_dtype(),
+        cudnn.data_type.FP4_E2M1,
         torch.float8_e4m3fn,
         _torch_data_type_to_cudnn_data_type(out_dtype),
         block_size,
