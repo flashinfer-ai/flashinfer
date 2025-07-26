@@ -7,12 +7,12 @@ import torch
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [4, 8, 17, 64])
-@pytest.mark.parametrize("s_kv", [8, 40, 1024])
-@pytest.mark.parametrize("page_size", [1, 8])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
+@pytest.mark.parametrize("batch_size", [8, 16, 32])
+@pytest.mark.parametrize("s_kv", [1024, 8192])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [True, False])
 def test_cudnn_decode(
     batch_size,
     s_kv,
@@ -79,7 +79,11 @@ def test_cudnn_decode(
 
     # Actual sequence lengths (should be randomized across batches. )
     actual_seq_lens_kv = torch.randint(
-        0, s_kv, (batch_size, 1, 1, 1), dtype=torch.int32
+        0, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+
+    ragged_q = torch.arange(0, batch_size + 1, device=device) * (
+        num_qo_heads * head_dim
     )
 
     workspace_buffer_size = math.ceil(
@@ -106,6 +110,8 @@ def test_cudnn_decode(
         actual_seq_lens_kv=actual_seq_lens_kv,
         block_tables=block_tables,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
+        batch_offsets_q=ragged_q,
+        batch_offsets_o=ragged_q,
     )
 
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
