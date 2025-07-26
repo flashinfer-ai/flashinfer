@@ -65,6 +65,7 @@ def _run_attention(
     head_dim=128,
     layout="NHD",
     test_dtype=torch.bfloat16,
+    logits_soft_cap=0.0,
     device="cuda",
     causal=True,
 ):
@@ -127,6 +128,7 @@ def _run_attention(
         causal=causal,
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
+        logits_soft_cap=logits_soft_cap,
     )
     out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
 
@@ -145,8 +147,9 @@ def _run_attention(
         causal=causal,
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
+        logits_soft_cap=logits_soft_cap,
     )
-    out_new, lse_new = wrapper.run(q, kv_data)
+    out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
@@ -161,6 +164,7 @@ def _run_attention(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
 def test_batch_attention_correctness(
     seq_len_pairs,
     page_block_size,
@@ -170,6 +174,7 @@ def test_batch_attention_correctness(
     causal,
     layout,
     test_dtype,
+    logits_soft_cap,
 ):
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
@@ -185,5 +190,6 @@ def test_batch_attention_correctness(
         causal=causal,
         layout=layout,
         test_dtype=test_dtype,
+        logits_soft_cap=logits_soft_cap,
         device="cuda",
     )

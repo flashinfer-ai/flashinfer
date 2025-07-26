@@ -1145,8 +1145,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
 
   // NOTE(Zihao): adjust it later
-  const int max_total_num_works = 16384;
-  const int max_packed_qo_lens =
+  const int max_total_num_works = 65536;
+  const int max_num_kv_splits =
       4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
 
   // calculate kv_len_limit first, considering all workloads
@@ -1167,7 +1167,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   }
 
   // used for remapping the output offsets
-  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
+  // layout [packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
   int partial_o_nnz = 0;
   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
   merge_indptr.push_back(partial_o_nnz);
@@ -1251,6 +1251,12 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
       work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
     }
     int total_num_works = work_indptr_vec.back();
+    if (total_num_works > max_total_num_works) {
+      std::ostringstream err_msg;
+      err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
+              << " exceeds max_total_num_works " << max_total_num_works;
+      FLASHINFER_ERROR(err_msg.str());
+    }
     auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
     auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
     auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
@@ -1306,10 +1312,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                            len_kv_chunk_vec);
   }
 
-  if (partial_o_nnz > max_packed_qo_lens) {
+  if (merge_indptr.size() > max_num_kv_splits) {
     std::ostringstream err_msg;
-    err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
-            << max_packed_qo_lens;
+    err_msg << "Number of kv splits " << merge_indptr.size() << " exceeds max buffer size "
+            << max_num_kv_splits << ". Please increase the threshold.";
     FLASHINFER_ERROR(err_msg.str());
   }
 
@@ -1317,9 +1323,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_packed_qo_lens, 16, "merge_indptr");
-  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * max_packed_qo_lens, 16, "merge_o_indices");
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_indptr");
+  plan_info.merge_o_indices_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_o_indices");
   plan_info.num_qo_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
   // copy data to paged cpu buffer
@@ -1336,9 +1342,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   // Note(Yilong): adjust it later
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
+      2 * max_num_kv_splits * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof(float), 16, "holistic_partial_lse");
+      2 * max_num_kv_splits * sizeof(float), 16, "holistic_partial_lse");
 
   return cudaSuccess;
 }
