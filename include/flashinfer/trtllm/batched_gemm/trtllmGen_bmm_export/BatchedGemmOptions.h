@@ -302,8 +302,6 @@ struct BatchedGemmConfig {
   // defined. In this case, the cubins will be loaded from the provided data and function name.
   // Otherwise, the kernel will be loaded from the CudaRunner.
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-  uint8_t const* mData{nullptr};
-  uint32_t const mSize{0};
   uint32_t const mSharedMemSize{0};
   char const* mFunctionName{nullptr};
   uint32_t const mNumThreadsPerCTA{0};

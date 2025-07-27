@@ -24,7 +24,7 @@
 #include "trtllm/gen/CudaKernelLauncher.h"
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-#include "KernelMetaInfo.h"
+#include "flashinferMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
 namespace flashinfer::trtllm_cubin_loader {
@@ -466,7 +466,8 @@ BatchedGemmConfig const* BatchedGemmInterface::getBatchedGemmConfigs() const {
 
 size_t BatchedGemmInterface::getNumBatchedGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-  return tensorrt_llm::kernels::tllmGenBatchedGemmListLen;
+  return sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList) /
+         sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList[0]);
 #else
   return 0;
 #endif
@@ -645,8 +646,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "991e7438224199de85ef08a2730ce18c12b4e0aa";
-    const std::string cubin_path = pipeline_hash + "/" + std::string("batched_gemm-") +
+    const std::string cubin_path = std::string(PIPELINE_HASH) + "/" + std::string("batched_gemm-") +
                                    TLLM_GEN_COMMIT + "-" + TLLM_GEN_BATCHED_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
     if (!fname_cubin.empty()) {
