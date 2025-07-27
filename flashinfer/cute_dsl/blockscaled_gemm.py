@@ -2327,6 +2327,88 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
 
 
+# Create scale factor tensor SFA/SFB
+def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    sf_k = ceil_div(k, sf_vec_size)
+    ref_shape = (l, mn, sf_k)
+
+    atom_m = (32, 4)
+    atom_k = 4
+    mma_shape = (
+        l,
+        ceil_div(mn, atom_m[0] * atom_m[1]),
+        ceil_div(sf_k, atom_k),
+        atom_m[0],
+        atom_m[1],
+        atom_k,
+    )
+
+    ref_permute_order = (1, 2, 0)
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+
+    # Create f32 ref torch tensor (cpu)
+    ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
+        ref_shape,
+        torch.float32,
+        permute_order=ref_permute_order,
+        init_type=cutlass_torch.TensorInitType.RANDOM,
+        init_config=cutlass_torch.RandomInitConfig(
+            min_val=1,
+            max_val=3,
+        ),
+    )
+
+    # Create f32 cute torch tensor (cpu)
+    cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
+        mma_shape,
+        torch.float32,
+        permute_order=mma_permute_order,
+        init_type=cutlass_torch.TensorInitType.RANDOM,
+        init_config=cutlass_torch.RandomInitConfig(
+            min_val=0,
+            max_val=1,
+        ),
+    )
+
+    # convert ref f32 tensor to cute f32 tensor
+    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+        from_dlpack(ref_f32_torch_tensor_cpu),
+        from_dlpack(cute_f32_torch_tensor_cpu),
+    )
+    cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
+
+    # reshape makes memory contiguous
+    ref_f32_torch_tensor_cpu = (
+        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
+        .unsqueeze(-1)
+        .expand(l, mn, sf_k, sf_vec_size)
+        .reshape(l, mn, sf_k * sf_vec_size)
+        .permute(*ref_permute_order)
+    )
+    # prune to mkl for reference check.
+    ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
+
+    # Create dtype cute torch tensor (cpu)
+    cute_tensor, cute_torch_tensor = cutlass_torch.cute_tensor_like(
+        cute_f32_torch_tensor_cpu,
+        dtype,
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    # Convert f32 cute tensor to dtype cute tensor
+    cute_tensor = cutlass_torch.convert_cute_tensor(
+        cute_f32_torch_tensor,
+        cute_tensor,
+        dtype,
+        is_dynamic_layout=True,
+    )
+    return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
+
+
 class MaskedBatchedMatmulCuteDSL:
     """
     Use example:
@@ -2437,12 +2519,13 @@ class MaskedBatchedMatmulCuteDSL:
         self._c_dtype = c_dtype
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
+        self._cluster_shape_mn = cluster_shape_mn
 
         # Compute max active clusters on current device
         hardware_info = cutlass.utils.HardwareInfo()
         print(hardware_info)
         max_active_clusters = hardware_info.get_max_active_clusters(
-            self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
 
         # Create tensor A/B/C
@@ -2573,7 +2656,12 @@ class MaskedBatchedMatmulCuteDSL:
         # Initialize Stream
         current_stream = cutlass_torch.default_stream()
 
-        print(masked_m_tensor)  # todo(Yingyi): cleanup
+        print("a_tensor: ", a_tensor)
+        print("b_tensor: ", b_tensor)
+        print("c_tensor: ", c_tensor)
+        print("sfa_tensor: ", sfa_tensor)
+        print("sfb_tensor: ", sfb_tensor)
+        print("masked_m_tensor: ", masked_m_tensor)
 
         # Configure gemm kernel
         masked_bmm = Sm100BlockScaledPersistentDenseGemmKernel(
@@ -2595,16 +2683,16 @@ class MaskedBatchedMatmulCuteDSL:
             current_stream,
         )
 
-        # Compute the result
-        compiled_masked_bmm(
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            c_tensor,
-            masked_m_tensor,
-            current_stream,
-        )
+        # Compute the result: skip in plan()
+        # compiled_masked_bmm(
+        #     a_tensor,
+        #     b_tensor,
+        #     sfa_tensor,
+        #     sfb_tensor,
+        #     c_tensor,
+        #     masked_m_tensor,
+        #     current_stream,
+        # )
         self._compiled_masked_bmm = compiled_masked_bmm
 
     def run(
@@ -2616,31 +2704,26 @@ class MaskedBatchedMatmulCuteDSL:
         c_tensor_gpu: Optional[torch.Tensor],
         masked_m_tensor_gpu: torch.Tensor,
     ):
+        """
+        Run the masked batched matmul
+        a_tensor_gpu: torch.Tensor of shape (l, m, k), with planned layout (row major if a_major == "k", column major if a_major == "m")
+        b_tensor_gpu: torch.Tensor of shape (l, n, k), with planned layout (row major if b_major == "k", column major if b_major == "n")
+        sfa_tensor_gpu: torch.Tensor of shape (l, m, k/sf_vec_size), with planned layout (row major if a_major == "k", column major if a_major == "m")
+        sfb_tensor_gpu: torch.Tensor of shape (l, n, k/sf_vec_size), with planned layout (row major if b_major == "k", column major if b_major == "n")
+        c_tensor_gpu: Optional[torch.Tensor],
+        masked_m_tensor_gpu: torch.Tensor,
+        """
         if self._compiled_masked_bmm is None:
             raise RuntimeError("MaskedBatchedMatmulCuteDSL: Not planned")
 
-        # todo(Yingyi): add dtype check if the passed-in tensors are of the target dtype
-        # def check_dtype(tensor: torch.Tensor, dtype: cutlass.dtype):
-        #     if tensor.dtype == torch.float8_e4m3fn:
-        #         assert dtype == cutlass.Float8E4M3FNU
-        #     elif tensor.dtype == torch.float8_e5m2:
-        #         assert dtype == cutlass.Float8E5M2
-        #     # todo(Yingyi): add fp4 types? we should pass bf16 tensor and quantize before passing in.
-
-        # check_dtype(a_tensor_gpu, self._ab_dtype)
-        # check_dtype(b_tensor_gpu, self._ab_dtype)
-        # check_dtype(sfa_tensor_gpu, self._sf_dtype)
-        # check_dtype(sfb_tensor_gpu, self._sf_dtype)
-        # if c_tensor_gpu is not None:
-        #     check_dtype(c_tensor_gpu, self._c_dtype)
-
-        a_tensor = from_dlpack(a_tensor_gpu, assumed_align=16, is_dynamic_layout=True)
-        b_tensor = from_dlpack(b_tensor_gpu, assumed_align=16, is_dynamic_layout=True)
-        sfa_tensor = from_dlpack(
-            sfa_tensor_gpu, assumed_align=16, is_dynamic_layout=True
+        a_tensor = from_dlpack(a_tensor_gpu, assumed_align=16)
+        b_tensor = from_dlpack(b_tensor_gpu, assumed_align=16)
+        # todo(Yingyi): leading dim?
+        sfa_tensor = from_dlpack(sfa_tensor_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
         )
-        sfb_tensor = from_dlpack(
-            sfb_tensor_gpu, assumed_align=16, is_dynamic_layout=True
+        sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
         )
         if c_tensor_gpu is None:
             c_tensor_gpu = torch.empty(
@@ -2648,7 +2731,7 @@ class MaskedBatchedMatmulCuteDSL:
                 dtype=self._c_dtype,
                 device="cuda",
             )
-        c_tensor = from_dlpack(c_tensor_gpu, assumed_align=16, is_dynamic_layout=True)
+        c_tensor = from_dlpack(c_tensor_gpu, assumed_align=16)
         masked_m_tensor = from_dlpack(
             masked_m_tensor_gpu, assumed_align=1
         ).mark_layout_dynamic(leading_dim=0)

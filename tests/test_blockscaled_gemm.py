@@ -17,6 +17,7 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
 from flashinfer.cute_dsl.blockscaled_gemm import (
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L,  # not used in python interface
 )
+from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
 
 
 def run(
@@ -256,7 +257,12 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
-    print(masked_m_tensor)
+    print("a_tensor: ", a_tensor)
+    print("b_tensor: ", b_tensor)
+    print("c_tensor: ", c_tensor)
+    print("sfa_tensor: ", sfa_tensor)
+    print("sfb_tensor: ", sfb_tensor)
+    print("masked_m_tensor: ", masked_m_tensor)
 
     # Compile gemm kernel
     compiled_gemm = cute.compile(
@@ -417,21 +423,47 @@ def test_blockscaled_gemm(
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
-@pytest.mark.parametrize("warmup_iterations", [0])
-@pytest.mark.parametrize("iterations", [1])
-@pytest.mark.parametrize("skip_ref_check", [False])
-@pytest.mark.parametrize("use_cold_l2", [False])
-def test_blockscaled_gemm_python_interface():
-    m, n, k, l = (1500, 2048, 2048, 100)
-    ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E8M0FNU
-    sf_vec_size = 16
-    c_dtype = cutlass.Float16
-    a_major = "k"
-    b_major = "k"
-    c_major = "n"
-    mma_tiler_mn = (128, 128)
-    cluster_shape_mn = (1, 1)
+def test_blockscaled_gemm_python_interface(
+    mnkl: Tuple[int, int, int, int],
+    ab_dtype: cutlass.dtype,
+    sf_dtype: cutlass.dtype,
+    sf_vec_size: int,
+    c_dtype: cutlass.dtype,
+    a_major: str,
+    b_major: str,
+    c_major: str,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    tolerance: float,
+):
+    m, n, k, l = mnkl
+
+    # Create tensors on GPU first to initialize CUDA context before plan
+    # todo(Yingyi): the dtype should be fp8 or fp4. fix the fp32 later.
+    a_tensor_gpu = (
+        torch.randn(l, m, k, device="cuda", dtype=torch.float32)
+        if a_major == "m"
+        else torch.randn(l, k, m, device="cuda", dtype=torch.float32)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    b_tensor_gpu = (
+        torch.randn(l, n, k, device="cuda", dtype=torch.float32)
+        if b_major == "n"
+        else torch.randn(l, k, n, device="cuda", dtype=torch.float32)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    _, _, sfa_tensor_gpu = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
+    _, _, sfb_tensor_gpu = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
+    c_tensor_gpu = (
+        torch.randn(l, m, n, device="cuda", dtype=torch.float32)
+        if c_major == "m"
+        else torch.randn(l, n, m, device="cuda", dtype=torch.float32)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     wrapper.plan(
@@ -449,33 +481,6 @@ def test_blockscaled_gemm_python_interface():
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
     )
-    # todo(Yingyi): the dtype should be fp8 or fp4. fix the fp32 later.
-    a_tensor_gpu = (
-        torch.randn(l, m, k, device="cuda", dtype=torch.float32)
-        if a_major == "m"
-        else torch.randn(l, k, m, device="cuda", dtype=torch.float32)
-    )
-    b_tensor_gpu = (
-        torch.randn(l, n, k, device="cuda", dtype=torch.float32)
-        if b_major == "n"
-        else torch.randn(l, k, n, device="cuda", dtype=torch.float32)
-    )
-    sfa_tensor_gpu = (
-        torch.randn(l, m, k, device="cuda", dtype=torch.float32)
-        if a_major == "m"
-        else torch.randn(l, k, m, device="cuda", dtype=torch.float32)
-    )
-    sfb_tensor_gpu = (
-        torch.randn(l, n, k, device="cuda", dtype=torch.float32)
-        if b_major == "n"
-        else torch.randn(l, k, n, device="cuda", dtype=torch.float32)
-    )
-    c_tensor_gpu = (
-        torch.randn(l, m, n, device="cuda", dtype=torch.float32)
-        if c_major == "m"
-        else torch.randn(l, n, m, device="cuda", dtype=torch.float32)
-    )
-    masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
     c = wrapper.run(
         a_tensor_gpu,
         b_tensor_gpu,
