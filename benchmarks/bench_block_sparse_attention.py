@@ -96,7 +96,7 @@ def bench_variable_block_sparse_attention(
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),
     )
-    sparse_ms_fa2 = np.mean(measurements_fa2)
+    sparse_ms_fa2 = np.median(measurements_fa2)
 
     # Benchmark sparse attention with FA3
     measurements_fa3 = bench_gpu_time(
@@ -107,12 +107,11 @@ def bench_variable_block_sparse_attention(
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),
     )
-    sparse_ms_fa3 = np.mean(measurements_fa3)
+    sparse_ms_fa3 = np.median(measurements_fa3)
 
     q = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
-
     dense_sm80_ms, dense_sm90_ms = (
         np.median(
             bench_gpu_time(
