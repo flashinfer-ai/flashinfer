@@ -1,8 +1,10 @@
 import argparse
 import enum
 import os
+import sys
 from itertools import product
 
+sys.path.append(os.path.dirname(__file__))
 from cutlass_library import *
 
 

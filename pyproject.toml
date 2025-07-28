@@ -22,10 +22,6 @@ readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["version"]
 
-dependencies = [
-    "nvidia-cutlass>=3.8.0",
-]
-
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "custom_backend"
