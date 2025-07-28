@@ -263,7 +263,7 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
 void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_nope_in,
                        at::Tensor k_nope_in, at::Tensor q_rope_out, at::Tensor k_rope_out,
                        at::Tensor q_nope_out, at::Tensor k_nope_out, at::Tensor pos_ids,
-                       float quant_scale_q, float quant_scale_kv, bool interleave) {
+                       double quant_scale_q, double quant_scale_kv, bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS(q_nope_in);
