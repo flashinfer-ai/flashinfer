@@ -439,30 +439,62 @@ def test_blockscaled_gemm_python_interface(
     m, n, k, l = mnkl
 
     # Create tensors on GPU first to initialize CUDA context before plan
-    # todo(Yingyi): the dtype should be fp8 or fp4. fix the fp32 later.
-    a_tensor_gpu = (
-        torch.randn(l, m, k, device="cuda", dtype=torch.float32)
-        if a_major == "m"
-        else torch.randn(l, k, m, device="cuda", dtype=torch.float32)
-        .permute(0, 2, 1)
-        .contiguous()
+    # 1. Create torch tensors using size fp32 and cast to torch_dtype
+    def create_torch_tensor(l, mode0, mode1, is_mode0_major, cutlass_dtype, device):
+        """
+        Create a torch tensor with specified shape and dtype for testing. Optionally permute it.
+        todo(Yingyi): Initialize it with specified init type and config
+        For dtype, you should pass:
+        - Float32: torch.float32
+        - Float16: torch.float16
+        - BFloat16: torch.bfloat16
+        - Float8E5M2: torch.uint8
+        - Float8E4M3FN: torch.uint8
+        - Float8E4M3B11FNUZ: torch.uint8
+        - Float8E8M0FNU: torch.uint8
+        - Float4E2M1FN: torch.int8
+
+        - Return: torch tensor with cutlass dtype
+        """
+        torch_type_map = {
+            # TFloat32 is just alias of float32
+            cutlass.TFloat32: torch.float32,
+            cutlass.Float16: torch.float16,
+            cutlass.Float8E5M2: torch.float8_e5m2,
+            cutlass.Float8E4M3FN: torch.float8_e4m3fn,
+            cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
+            cutlass.Float4E2M1FN: torch.int8,
+        }
+        shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
+
+        if cutlass_dtype == cutlass.Float4E2M1FN:
+            mode0 = mode0 // 2 if is_mode0_major else mode0
+            mode1 = mode1 if is_mode0_major else mode1 // 2
+
+        shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
+        permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
+        # fp32_torch_tensor = torch.empty(*shape, dtype=torch.float32, device=device)
+        # fp32_torch_tensor = fp32_torch_tensor.permute(permute_order)
+        # dtype_torch_tensor = fp32_torch_tensor.to(dtype=torch_type_map[cutlass_dtype])
+        dtype_torch_tensor = torch.empty(
+            *shape, dtype=torch_type_map[cutlass_dtype], device=device
+        )
+        # todo(Yingyi): add init value
+        dtype_torch_tensor = dtype_torch_tensor.permute(permute_order)
+
+        return dtype_torch_tensor
+
+    # create helper tensors for testing
+    # todo(Yingyi): use int8 and 1/2 shape for fp4？
+    a_tensor_gpu = create_torch_tensor(
+        l, m, k, a_major == "m", cutlass.Float4E2M1FN, "cuda"
     )
-    b_tensor_gpu = (
-        torch.randn(l, n, k, device="cuda", dtype=torch.float32)
-        if b_major == "n"
-        else torch.randn(l, k, n, device="cuda", dtype=torch.float32)
-        .permute(0, 2, 1)
-        .contiguous()
+    b_tensor_gpu = create_torch_tensor(
+        l, n, k, b_major == "n", cutlass.Float4E2M1FN, "cuda"
     )
+    c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", cutlass.Float16, "cuda")
     _, _, sfa_tensor_gpu = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
     _, _, sfb_tensor_gpu = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
-    c_tensor_gpu = (
-        torch.randn(l, m, n, device="cuda", dtype=torch.float32)
-        if c_major == "m"
-        else torch.randn(l, n, m, device="cuda", dtype=torch.float32)
-        .permute(0, 2, 1)
-        .contiguous()
-    )
     masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
@@ -489,6 +521,7 @@ def test_blockscaled_gemm_python_interface(
         c_tensor_gpu,
         masked_m_tensor_gpu,
     )
+    print("PASS")
 
     # todo(Yingyi): add reference check
 
