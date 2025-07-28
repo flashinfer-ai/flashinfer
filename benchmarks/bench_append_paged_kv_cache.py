@@ -109,16 +109,13 @@ def main():
                 )
 
             batch_indices, positions = fn_convert()
-            convert_latencies = cast(
-                float,
-                bench_gpu_time(
-                    fn_convert,
-                    dry_runs=25,
-                    num_iters=100,
-                    l2_flush=True,
-                    l2_flush_size_mb=256,
-                    l2_flush_device=device,
-                ),
+            convert_latencies = bench_gpu_time(
+                fn_convert,
+                dry_runs=25,
+                num_iters=100,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=device,
             )
 
             convert_latency_ms = np.median(convert_latencies)
@@ -137,16 +134,13 @@ def main():
                     "NHD",
                 )
 
-            latencies = cast(
-                float,
-                bench_gpu_time(
-                    fn,
-                    dry_runs=25,
-                    num_iters=100,
-                    l2_flush=True,
-                    l2_flush_size_mb=256,
-                    l2_flush_device=device,
-                ),
+            latencies = bench_gpu_time(
+                fn,
+                dry_runs=25,
+                num_iters=100,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=device,
             )
             latency_ms = np.median(latencies)
             all_layers_latency_ms = convert_latency_ms + latency_ms * model.num_layers
