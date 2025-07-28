@@ -343,6 +343,18 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType, typename QuantType>
+__global__ void MLARopeQuantizeKernel(DType* q, DType* k, QuantType* q_rope, QuantType* k_rope,
+                                      IdType* __restrict__ pos_ids, uint32_t nnz,
+                                      uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                      uint32_t rotary_dim, size_t q_stride_n, size_t q_stride_h,
+                                      size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
+                                      size_t q_rope_stride_h, size_t k_rope_stride_n,
+                                      size_t k_rope_stride_h, float smooth_a, float smooth_b,
+                                      float rope_rcp_scale, float rope_rcp_theta,
+                                      float quant_scale_q, float quant_scale_kv) {}
+
+template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ pos_ids, uint32_t nnz,
