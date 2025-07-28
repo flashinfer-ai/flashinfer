@@ -316,7 +316,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
           cudaError_t status = BatchPrefillWithPagedKVCacheDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
-              AttentionVariant>(params, stream);
+              AttentionVariant>(params, /*enable_pdl=*/false, stream);
           CHECK(status == cudaSuccess) << "BatchPrefillWithPagedKVCacheSM90Run failed with error: "
                                        << cudaGetErrorString(status);
           return true;

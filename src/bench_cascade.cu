@@ -381,6 +381,6 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
       .add_int64_axis("use_cascade", {1, 0})                                    \
       .add_int64_axis("head_dim", {128})
 
-BENCH_FLASHINFER_MERGE_KERNELS(half);
-BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(half);
-BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_APPEND_KERNELS(half);
+BENCH_FLASHINFER_MERGE_KERNELS(__half);
+BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(__half);
+BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_APPEND_KERNELS(__half);

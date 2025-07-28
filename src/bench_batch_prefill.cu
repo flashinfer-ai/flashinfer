@@ -19,9 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <nvbench/nvbench.cuh>
-#include <optional>
 
-#include "flashinfer/attention/scheduler.cuh"
 #include "flashinfer/layout.cuh"
 #include "flashinfer/pos_enc.cuh"
 #include "flashinfer_ops.cuh"
@@ -129,4 +127,4 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
       .add_int64_axis("use_fp16_qk_reduction", {0})                                            \
       .add_int64_axis("cooperative", {1})
 
-BENCH_FLASHINFER_BATCH_PREFILL_WITH_RAGGED_KV(half, half);
+BENCH_FLASHINFER_BATCH_PREFILL_WITH_RAGGED_KV(__half, __half);

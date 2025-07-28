@@ -42,7 +42,6 @@ void bench_flashinfer_batch_decode_mla(nvbench::state& state) {
   constexpr size_t head_dim_ckv = 512;
   constexpr size_t head_dim_kpe = head_dim_ckv / 8;
   const size_t num_qo_heads = state.get_int64("num_qo_heads");
-  ;
 
   size_t batch_size = state.get_int64("batch_size");
   size_t seqlen = state.get_int64("seqlen");
@@ -119,4 +118,4 @@ void bench_flashinfer_batch_decode_mla(nvbench::state& state) {
       .add_int64_axis("seqlen", {1024, 16384})                                                  \
       .add_int64_axis("num_qo_heads", {8, 16, 32, 40, 64, 128})
 
-BENCH_FLASHINFER_BATCH_DECODE(half);
+BENCH_FLASHINFER_BATCH_DECODE(__half);

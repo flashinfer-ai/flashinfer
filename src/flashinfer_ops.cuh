@@ -31,11 +31,13 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, cudaStream_t stream);
+                                                  float* tmp_s, bool enable_pdl,
+                                                  cudaStream_t stream);
 
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Params::DTypeO* tmp_v,
-                                                     float* tmp_s, cudaStream_t stream);
+                                                     float* tmp_s, bool enable_pdl,
+                                                     cudaStream_t stream);
 
 class BatchDecodeHandler {
  public:
@@ -163,13 +165,15 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, cudaStream_t stream);
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream);
+                                                   float* tmp_s, bool enable_pdl,
+                                                   cudaStream_t stream);
 
 class BatchPrefillHandler {
  public:
@@ -423,7 +427,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                   BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
                                                           POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                                                           MASK_MODE, AttentionVariant>(
-                      params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
+                      params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), false, stream);
                 });
               })})})});
   return cudaSuccess;
@@ -481,7 +485,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                   return BatchPrefillWithPagedKVCacheDispatched<
                       CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                       MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),
-                                                   handler->GetTmpS(), stream);
+                                                   handler->GetTmpS(), false, stream);
                 })
               })})})});
   return cudaSuccess;
@@ -577,7 +581,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
         params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
 
         return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
-            params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
+            params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), false, stream);
       })});
   return cudaSuccess;
 }
@@ -608,10 +612,13 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
 }
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
-cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
-    BatchDecodeHandler* handler, DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_rope_offset,
-    paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(BatchDecodeHandler* handler, DTypeQ* q_nope,
+                                                  DTypeQ* q_pe, IdType* q_rope_offset,
+                                                  paged_kv_mla_t<DTypeKV, IdType> paged_kv,
+                                                  DTypeO* o, float* lse, uint32_t num_qo_heads,
+                                                  float sm_scale, float rope_scale = 1.f,
+                                                  float rope_theta = 1e4, bool enable_pdl = false,
+                                                  cudaStream_t stream = nullptr) {
   DISPATCH_head_dim(paged_kv.head_dim_ckv, HEAD_DIM_CKV, {
     // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for
     // all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
@@ -629,8 +636,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
     params.block_valid_mask = handler->GetBlockValidMask();
     params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
 
-    return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant>(
-        params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
+    return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant,
+                                                    Params>(params, handler->GetTmpV<DTypeO>(),
+                                                            handler->GetTmpS(), enable_pdl, stream);
   });
   return cudaSuccess;
 }

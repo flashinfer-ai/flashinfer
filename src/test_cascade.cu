@@ -101,7 +101,7 @@ void _TestVariableLengthMergeKernelCorrectness(size_t seq_len, size_t num_heads,
                             thrust::raw_pointer_cast(indptr_device.data()),
                             thrust::raw_pointer_cast(V_merged_1_device.data()),
                             thrust::raw_pointer_cast(S_merged_1_device.data()), seq_len, nullptr,
-                            num_heads, head_dim);
+                            num_heads, head_dim, false);
 
   thrust::host_vector<T> V_merged_0_host(V_merged_0_device), V_merged_1_host(V_merged_1_device);
   thrust::host_vector<float> S_merged_0_host(S_merged_0_device), S_merged_1_host(S_merged_1_device);
@@ -171,14 +171,15 @@ void _TestVariableLengthMergeKernelPaddedCorrectness(size_t max_seq_len, size_t 
                             thrust::raw_pointer_cast(indptr_device.data()),
                             thrust::raw_pointer_cast(V_merged_0_device.data()),
                             thrust::raw_pointer_cast(S_merged_0_device.data()), seq_len, nullptr,
-                            num_heads, head_dim);
+                            num_heads, head_dim, false);
   // Expected: use VariableLengthMergeStates on a padded input
   VariableLengthMergeStates(thrust::raw_pointer_cast(V_ragged_device.data()),
                             thrust::raw_pointer_cast(S_ragged_device.data()),
                             thrust::raw_pointer_cast(indptr_device.data()),
                             thrust::raw_pointer_cast(V_merged_1_device.data()),
                             thrust::raw_pointer_cast(S_merged_1_device.data()), max_seq_len,
-                            thrust::raw_pointer_cast(seq_len_device.data()), num_heads, head_dim);
+                            thrust::raw_pointer_cast(seq_len_device.data()), num_heads, head_dim,
+                            false);
 
   thrust::host_vector<T> V_merged_0_host(V_merged_0_device), V_merged_1_host(V_merged_1_device);
   thrust::host_vector<float> S_merged_0_host(S_merged_0_device), S_merged_1_host(S_merged_1_device);
@@ -637,21 +638,21 @@ void TestTwoLevelSinglePrefixCascadeAppendCorrectness() {
 }
 
 TEST(FlashInferCorrectnessTest, MergeKernelCorrectnessTestFP16) {
-  TestMergeKernelCorrectness<half>();
+  TestMergeKernelCorrectness<__half>();
 }
 
 TEST(FlashInferCorrectnessTest, VariableLengthMergeKernelCorrectnessTestFP16) {
-  TestVariableLengthMergeKernelCorrectness<half>();
+  TestVariableLengthMergeKernelCorrectness<__half>();
 }
 
 TEST(FlashInferCorrectnessTest, VariableLengthMergeKernelPaddedCorrectnessTestFP16) {
-  TestVariableLengthMergeKernelPaddedCorrectness<half>();
+  TestVariableLengthMergeKernelPaddedCorrectness<__half>();
 }
 
 TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeDecodeTestFP16) {
-  TestTwoLevelSinglePrefixCascadeDecodeCorrectness<half>();
+  TestTwoLevelSinglePrefixCascadeDecodeCorrectness<__half>();
 }
 
 TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeAppendTestFP16) {
-  TestTwoLevelSinglePrefixCascadeAppendCorrectness<half>();
+  TestTwoLevelSinglePrefixCascadeAppendCorrectness<__half>();
 }

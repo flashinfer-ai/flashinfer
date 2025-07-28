@@ -160,7 +160,7 @@ void TestBatchDecodeKernelCorrectness() {
 }
 
 TEST(FlashInferCorrectnessTest, BatchDecodeKernelCorrectnessTestFP16) {
-  TestBatchDecodeKernelCorrectness<half, half>();
+  TestBatchDecodeKernelCorrectness<__half, __half>();
 }
 
 #ifdef FLASHINFER_ENABLE_BF16
@@ -171,12 +171,12 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessBF16) {
 
 #ifdef FLASHINFER_ENABLE_FP8_E4M3
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE4M3) {
-  TestBatchDecodeKernelCorrectness<half, __nv_fp8_e4m3>();
+  TestBatchDecodeKernelCorrectness<__half, __nv_fp8_e4m3>();
 }
 #endif
 
 #ifdef FLASHINFER_ENABLE_FP8_E5M2
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
-  TestBatchDecodeKernelCorrectness<half, __nv_fp8_e5m2>();
+  TestBatchDecodeKernelCorrectness<__half, __nv_fp8_e5m2>();
 }
 #endif
