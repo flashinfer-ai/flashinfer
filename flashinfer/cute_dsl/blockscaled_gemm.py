@@ -2449,6 +2449,8 @@ class MaskedBatchedMatmulCuteDSL:
         """
         self._use_cuda_graph = use_cuda_graph
 
+    # todo(Yingyi): should we use static layout and have a plan phase?
+    # todo(Yingyi): use dynamic layout since no optimizations for static layout was implemented
     def plan(
         self,
         m: int,
