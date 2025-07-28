@@ -262,8 +262,9 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
 
 void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_nope_in,
                        at::Tensor k_nope_in, at::Tensor q_rope_out, at::Tensor k_rope_out,
-                       at::Tensor q_nope_out, at::Tensor k_nope_out, at::Tensor pos_ids,
-                       double quant_scale_q, double quant_scale_kv, bool interleave) {
+                       at::Tensor q_nope_out, at::Tensor k_nope_out, at::Tensor cos_sin_cache,
+                       at::Tensor pos_ids, double quant_scale_q, double quant_scale_kv,
+                       bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS(q_nope_in);
@@ -272,6 +273,7 @@ void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_
   CHECK_LAST_DIM_CONTIGUOUS(k_rope_out);
   CHECK_LAST_DIM_CONTIGUOUS(q_nope_out);
   CHECK_LAST_DIM_CONTIGUOUS(k_nope_out);
+  CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
 
   CHECK_EQ(q_rope_in.size(-1), 64);
@@ -338,6 +340,7 @@ void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_
             static_cast<c_quant_type*>(k_rope_out.data_ptr()),
             static_cast<c_quant_type*>(q_nope_out.data_ptr()),
             static_cast<c_quant_type*>(k_nope_out.data_ptr()),
+            static_cast<float*>(cos_sin_cache.data_ptr()),
             static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_heads, q_rope_in_stride_n,
             q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h, q_rope_out_stride_n,
             q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h, k_rope_in_stride,

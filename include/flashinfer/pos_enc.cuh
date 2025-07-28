@@ -347,13 +347,15 @@ template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, type
 __global__ void MLARopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
-    IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_heads, size_t q_rope_in_stride_n,
-    size_t q_rope_in_stride_h, size_t q_nope_in_stride_n, size_t q_nope_in_stride_h,
-    size_t q_rope_out_stride_n, size_t q_rope_out_stride_h, size_t q_nope_out_stride_n,
-    size_t q_nope_out_stride_h, size_t k_rope_in_stride, size_t k_nope_in_stride,
-    size_t k_rope_out_stride, size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv) {
+    float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_heads, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_nope_in_stride, size_t k_rope_out_stride,
+    size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
   constexpr uint32_t rotary_dim = 64;
 
   vec_t<float, vec_size> cos, sin;
@@ -698,8 +700,8 @@ __global__ void BatchQKApplyRotaryKernel(
 template <typename DType, typename IdType, typename QuantType>
 cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
                             QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
-                            QuantType* k_nope_out, IdType* pos_ids, uint32_t nnz,
-                            uint32_t num_heads, size_t q_rope_in_stride_n,
+                            QuantType* k_nope_out, float* cos_sin_cache, IdType* pos_ids,
+                            uint32_t nnz, uint32_t num_heads, size_t q_rope_in_stride_n,
                             size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
                             size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
                             size_t q_rope_out_stride_h, size_t q_nope_out_stride_n,
@@ -728,6 +730,7 @@ cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in
                     (void*)&k_rope_out,
                     (void*)&q_nope_out,
                     (void*)&k_nope_out,
+                    (void*)&cos_sin_cache,
                     (void*)&pos_ids,
                     (void*)&nnz,
                     (void*)&num_heads,
