@@ -134,19 +134,25 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
 
-## Run Benchmarks
+## Running Tests And Benchmarks
 
-We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
+We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and test their functionality with [gtest](https://github.com/google/googletest).
 
+The `Makefile` offers some example workflows to build and run the benchmarks and tests. For example, to run the benchmarks on an optimized (release) development build:
 ```bash
-mkdir build
-cp cmake/config.cmake build # you can modify the config.cmake to enable/disable benchmarks and change CUDA architectures
-cd build
-cmake ..
-make -j12
+make release-devel-bench
 ```
+or to run the tests on an optimized (release) build:
+```bash
+make release-devel-test
+```
+Refer to the `Makefile` to author your own workloads.
 
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
+You can also run individual benchmarks/tests by directly running the executable in the build directory:
+```bash
+build_release_devel/test_cascade
+build_release_devel/bench_norm
+```
 
 ## C++ API and TVM Bindings
 

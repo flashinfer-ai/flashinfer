@@ -272,6 +272,7 @@ if(FLASHINFER_DECODE AND ENABLE_TESTING)
     test_single_decode PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_single_decode PRIVATE gtest gtest_main decode_kernels flashinfer_dispatch)
   target_compile_options(test_single_decode PRIVATE -Wno-switch-bool)
+  add_test(NAME test_single_decode COMMAND test_single_decode)
 
   message(STATUS "Compile batch decode kernel benchmarks.")
   file(GLOB_RECURSE BENCH_DECODE_SRCS
@@ -281,6 +282,7 @@ if(FLASHINFER_DECODE AND ENABLE_TESTING)
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_link_libraries(bench_batch_decode PRIVATE nvbench::main decode_kernels prefill_kernels flashinfer_dispatch)
   target_compile_options(bench_batch_decode PRIVATE -Wno-switch-bool)
+  add_test(NAME bench_batch_decode COMMAND bench_batch_decode)
 
   message(STATUS "Compile batch mla decode kernel benchmarks.")
   file(GLOB_RECURSE BENCH_DECODE_MLA_SRCS
@@ -290,6 +292,7 @@ if(FLASHINFER_DECODE AND ENABLE_TESTING)
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_link_libraries(bench_batch_decode_mla PRIVATE nvbench::main decode_kernels flashinfer_dispatch)
   target_compile_options(bench_batch_decode_mla PRIVATE -Wno-switch-bool)
+  add_test(NAME bench_batch_decode_mla COMMAND bench_batch_decode_mla)
 
   message(STATUS "Compile batch decode kernel tests.")
   file(GLOB_RECURSE TEST_DECODE_SRCS
@@ -301,6 +304,7 @@ if(FLASHINFER_DECODE AND ENABLE_TESTING)
     test_batch_decode PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_batch_decode PRIVATE gtest gtest_main decode_kernels flashinfer_dispatch)
   target_compile_options(test_batch_decode PRIVATE -Wno-switch-bool)
+  add_test(NAME test_batch_decode COMMAND test_batch_decode)
 endif(FLASHINFER_DECODE AND ENABLE_TESTING)
 
 if(FLASHINFER_PREFILL AND ENABLE_TESTING)
@@ -313,6 +317,7 @@ if(FLASHINFER_PREFILL AND ENABLE_TESTING)
   target_link_libraries(bench_single_prefill PRIVATE nvbench::main
                                                      prefill_kernels flashinfer_dispatch)
   target_compile_options(bench_single_prefill PRIVATE -Wno-switch-bool)
+  add_test(NAME bench_single_prefill COMMAND bench_single_prefill)
 
   message(STATUS "Compile single prefill kernel tests.")
   file(GLOB_RECURSE TEST_PREFILL_SRCS
@@ -325,6 +330,7 @@ if(FLASHINFER_PREFILL AND ENABLE_TESTING)
   target_link_libraries(test_single_prefill PRIVATE gtest gtest_main
                                                     prefill_kernels flashinfer_dispatch)
   target_compile_options(test_single_prefill PRIVATE -Wno-switch-bool)
+  add_test(NAME test_single_prefill COMMAND test_single_prefill)
 
   message(STATUS "Compile batch prefill kernel benchmarks.")
   file(GLOB_RECURSE BENCH_PREFILL_SRCS
@@ -335,6 +341,7 @@ if(FLASHINFER_PREFILL AND ENABLE_TESTING)
   target_link_libraries(bench_batch_prefill PRIVATE nvbench::main
                                                     prefill_kernels flashinfer_dispatch)
   target_compile_options(bench_batch_prefill PRIVATE -Wno-switch-bool)
+  add_test(NAME bench_batch_prefill COMMAND bench_batch_prefill)
 
   message(STATUS "Compile batch prefill kernel tests.")
   file(GLOB_RECURSE TEST_PREFILL_SRCS
@@ -347,6 +354,8 @@ if(FLASHINFER_PREFILL AND ENABLE_TESTING)
   target_link_libraries(test_batch_prefill PRIVATE gtest gtest_main
                                                    prefill_kernels flashinfer_dispatch)
   target_compile_options(test_batch_prefill PRIVATE -Wno-switch-bool)
+  add_test(NAME test_batch_prefill COMMAND test_batch_prefill)
+
 endif(FLASHINFER_PREFILL AND ENABLE_TESTING)
 
 if(FLASHINFER_PAGE AND ENABLE_TESTING)
@@ -358,6 +367,7 @@ if(FLASHINFER_PAGE AND ENABLE_TESTING)
                                                ${gtest_SOURCE_DIR})
   target_link_libraries(test_page PRIVATE gtest gtest_main flashinfer_dispatch)
   target_compile_options(test_page PRIVATE -Wno-switch-bool)
+  add_test(NAME test_page COMMAND test_page)
 endif(FLASHINFER_PAGE AND ENABLE_TESTING)
 
 if(FLASHINFER_CASCADE AND ENABLE_TESTING)
@@ -369,7 +379,8 @@ if(FLASHINFER_CASCADE AND ENABLE_TESTING)
   target_link_libraries(bench_cascade PRIVATE nvbench::main decode_kernels
                                               prefill_kernels flashinfer_dispatch)
   target_compile_options(bench_cascade PRIVATE -Wno-switch-bool)
-
+  add_test(NAME bench_cascade COMMAND bench_cascade)
+  
   message(STATUS "Compile cascade kernel tests.")
   file(GLOB_RECURSE TEST_CASCADE_SRCS ${PROJECT_SOURCE_DIR}/src/test_cascade.cu)
   add_executable(test_cascade ${TEST_CASCADE_SRCS})
@@ -379,6 +390,8 @@ if(FLASHINFER_CASCADE AND ENABLE_TESTING)
   target_link_libraries(test_cascade PRIVATE gtest gtest_main decode_kernels
                                              prefill_kernels flashinfer_dispatch)
   target_compile_options(test_cascade PRIVATE -Wno-switch-bool)
+  add_test(NAME test_cascade COMMAND test_cascade)
+
 endif(FLASHINFER_CASCADE AND ENABLE_TESTING)
 
 if(FLASHINFER_SAMPLING AND ENABLE_TESTING)
@@ -389,6 +402,7 @@ if(FLASHINFER_SAMPLING AND ENABLE_TESTING)
   target_include_directories(bench_sampling PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_link_libraries(bench_sampling PRIVATE nvbench::main flashinfer_dispatch)
   target_compile_options(bench_sampling PRIVATE -Wno-switch-bool)
+  add_test(NAME bench_sampling COMMAND bench_sampling)
 
   message(STATUS "Compile sampling kernel tests.")
   file(GLOB_RECURSE TEST_SAMPLING_SRCS
@@ -399,6 +413,7 @@ if(FLASHINFER_SAMPLING AND ENABLE_TESTING)
                                                    ${gtest_SOURCE_DIR})
   target_link_libraries(test_sampling PRIVATE gtest gtest_main flashinfer_dispatch)
   target_compile_options(test_sampling PRIVATE -Wno-switch-bool)
+  add_test(NAME test_sampling COMMAND test_sampling)
 endif(FLASHINFER_SAMPLING AND ENABLE_TESTING)
 
 if(FLASHINFER_NORM AND ENABLE_TESTING)
@@ -408,7 +423,8 @@ if(FLASHINFER_NORM AND ENABLE_TESTING)
   target_include_directories(bench_norm PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_link_libraries(bench_norm PRIVATE nvbench::main flashinfer_dispatch)
   target_compile_options(bench_norm PRIVATE -Wno-switch-bool)
-
+  add_test(NAME bench_norm COMMAND bench_norm)
+  
   message(STATUS "Compile normalization kernel tests.")
   file(GLOB_RECURSE TEST_NORM_SRCS ${PROJECT_SOURCE_DIR}/src/test_norm.cu)
   add_executable(test_norm ${TEST_NORM_SRCS})
@@ -417,6 +433,7 @@ if(FLASHINFER_NORM AND ENABLE_TESTING)
                                                ${gtest_SOURCE_DIR})
   target_link_libraries(test_norm PRIVATE gtest gtest_main flashinfer_dispatch)
   target_compile_options(test_norm PRIVATE -Wno-switch-bool)
+  add_test(NAME test_norm COMMAND test_norm)
 endif(FLASHINFER_NORM AND ENABLE_TESTING)
 
 if(FLASHINFER_FASTDIV_TEST AND ENABLE_TESTING)
@@ -427,6 +444,7 @@ if(FLASHINFER_FASTDIV_TEST AND ENABLE_TESTING)
   target_include_directories(test_fastdiv PRIVATE ${gtest_SOURCE_DIR}/include
                                                   ${gtest_SOURCE_DIR})
   target_link_libraries(test_fastdiv PRIVATE gtest gtest_main flashinfer_dispatch)
+  add_test(NAME test_fastdiv COMMAND test_fastdiv)
 endif(FLASHINFER_FASTDIV_TEST AND ENABLE_TESTING)
 
 if(FLASHINFER_FASTDEQUANT_TEST AND ENABLE_TESTING)
@@ -439,5 +457,6 @@ if(FLASHINFER_FASTDEQUANT_TEST AND ENABLE_TESTING)
   target_include_directories(
     test_fast_dequant PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_fast_dequant PRIVATE gtest gtest_main flashinfer_dispatch)
+  add_test(NAME test_fast_dequant COMMAND test_fast_dequant)
 endif(FLASHINFER_FASTDEQUANT_TEST AND ENABLE_TESTING)
 # ----------------------------------------------------------------------------------#

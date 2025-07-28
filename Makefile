@@ -26,8 +26,12 @@ release-devel-build:
 	cmake --build --preset=gcc_release_devel
 
 # Runs the tests for the optimized (release) development build.
-release-devel-test:
-	ctest --preset=gcc_release_devel --output-on-failure --verbose
+release-devel-bench: release-devel-build
+	ctest --preset=gcc_release_devel --output-on-failure --verbose --tests-regex "^bench_"
+
+# Runs the benchmarks for the optimized (release) development build.
+release-devel-test: release-devel-build
+	ctest --preset=gcc_release_devel --output-on-failure --verbose --tests-regex "^test_"
 
 # Well-known combinations of the individual targets above.
 release-devel-configure-build: release-devel-configure release-devel-build
