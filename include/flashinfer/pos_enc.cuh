@@ -402,7 +402,7 @@ __global__ void MLARopeQuantizeKernel(
       }
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        q_rope_out_ptr[i] = q_rope_vec[i] * quant_scale_q;
+        q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
       }
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
     } else if (by == num_heads) {
@@ -423,7 +423,7 @@ __global__ void MLARopeQuantizeKernel(
       }
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        k_rope_out_ptr[i] = k_rope_vec[i] * quant_scale_kv;
+        k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
       }
       k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
     } else if (by <= num_heads + 8) {
@@ -440,7 +440,7 @@ __global__ void MLARopeQuantizeKernel(
       k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        k_nope_out_ptr[i] = k_nope_vec[i] * quant_scale_kv;
+        k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
       }
       k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
     } else {
@@ -458,7 +458,7 @@ __global__ void MLARopeQuantizeKernel(
       q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        q_nope_out_ptr[i] = q_nope_vec[i] * quant_scale_q;
+        q_nope_vec[i] = q_nope_vec[i] * quant_scale_q;
       }
       q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
     }
@@ -716,7 +716,7 @@ cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     constexpr uint32_t rotary_dim = 64;
-    constexpr uint32_t vec_size = std::max(16 / sizeof(DType));
+    constexpr uint32_t vec_size = 16 / sizeof(DType);
     constexpr uint32_t bdx = rotary_dim / vec_size;
     uint32_t num_threads = 128U;
     uint32_t bdy = num_threads / bdx;
@@ -748,8 +748,9 @@ cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in
                     (void*)&k_nope_out_stride,
                     (void*)&quant_scale_q,
                     (void*)&quant_scale_kv};
-    auto kernel = MLARopeQuantizeKernel<INTERLEAVE, rotary_dim, vec_size, bdx, DType, IdType>;
-    dim3 nblks(nblks_x, num_heads + 8 + 1 + num_heads * 8) dim3 nthrs(bdx, bdy);
+    auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
+    dim3 nblks(nblks_x, num_heads + 8 + 1 + num_heads * 8);
+    dim3 nthrs(bdx, bdy);
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
 

@@ -327,13 +327,13 @@ void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_
   const uint32_t k_rope_out_stride = k_rope_out.stride(0);
   const uint32_t k_nope_out_stride = k_nope_out.stride(0);
 
-  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  const c10::cuda::OptionalCUDAGuard device_guard(q_rope_in.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(scalar_type_in, c_type, [&], {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(quant_type_out, c_quant_type, [&], {
-      DISPATCH_PYTORCH_IDTYPE_TO_CTYPE(pos_ids.scalar_type(), c_idtype, [&], {
-        cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(scalar_type_in, c_type, [&] {
+    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(quant_type_out, c_quant_type, [&] {
+      return DISPATCH_PYTORCH_IDTYPE_TO_CTYPE(pos_ids.scalar_type(), c_idtype, [&] {
+        cudaError_t status = MLARopeQuantize(
             static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
             static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
             static_cast<c_quant_type*>(q_rope_out.data_ptr()),
