@@ -20,7 +20,7 @@ authors = [{ name = "FlashInfer team" }]
 # license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-dynamic = ["version"]
+dynamic = ["dependencies", "version"]
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]
@@ -49,6 +49,7 @@ packages = [
     "flashinfer.fused_moe",
     "flashinfer.jit",
     "flashinfer.jit.attention",
+    "flashinfer.testing",
     "flashinfer.triton",
     "flashinfer.profiler",
     "flashinfer.triton.kernels",

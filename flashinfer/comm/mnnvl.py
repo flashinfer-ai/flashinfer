@@ -18,7 +18,7 @@ import logging
 import platform
 import sys
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import pynvml
 import torch
@@ -108,6 +108,26 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
     except Exception as e:
         print(f"DEBUG: Memory access test FAILED for ptr=0x{ptr:x}: {e}")
         return False
+
+
+def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
+    """
+    A helper function that allocates memory on cuda and copies the data from the host to the device.
+    """
+    if not host_ptr_array:
+        return None
+
+    ArrayType = ctypes.c_uint64 * len(host_ptr_array)
+    c_array = ArrayType(*host_ptr_array)
+    size_in_bytes = ctypes.sizeof(c_array)
+
+    device_ptr: cuda.CUdeviceptr = checkCudaErrors(cuda.cuMemAlloc(size_in_bytes))
+    checkCudaErrors(
+        cuda.cuMemcpyHtoD(device_ptr, ctypes.addressof(c_array), size_in_bytes)
+    )
+    # c_array should be freed by GC
+
+    return device_ptr
 
 
 class MpiComm:
@@ -423,7 +443,9 @@ class McastDeviceMemory:
         # CUDA memory handles and pointers
         self.mc_ptr = 0  # CUdeviceptr mMcPtr
         self.uc_ptrs: List[int] = []  # std::vector<CUdeviceptr> mUcPtrs
-        self.signal_pads_dev: List[int] = []  # std::vector<CUdeviceptr> mSignalPadsDev
+        self.signal_pads: List[int] = []  # mSignalPads
+        self.signal_pads_dev = 0  # std::vector<CUdeviceptr> mSignalPadsDev
+        self.uc_ptrs_dev = 0
         self.mc_handle = 0  # CUmemGenericAllocationHandle mMcHandle
         self.uc_handles: List[int] = (
             []
@@ -475,13 +497,17 @@ class McastDeviceMemory:
             raise NotImplementedError("Single-node NVLS allocation not implemented yet")
 
         # Initialize signal pads
-        self.signal_pads_dev = [0] * self.group_size
+        self.signal_pads = [0] * self.group_size
         for i in range(self.group_size):
-            self.signal_pads_dev[i] = self.uc_ptrs[i] + self.signal_pad_offset
+            self.signal_pads[i] = self.uc_ptrs[i] + self.signal_pad_offset
             if i == self.group_rank:
                 checkCudaErrors(
-                    cuda.cuMemsetD8(self.signal_pads_dev[i], 0, self.SIGNAL_PAD_SIZE)
+                    cuda.cuMemsetD8(self.signal_pads[i], 0, self.SIGNAL_PAD_SIZE)
                 )
+
+        # Create device pointers
+        self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
+        self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
@@ -504,6 +530,12 @@ class McastDeviceMemory:
         except Exception as e:
             print(f"Destructor: CUDA context invalid, skipping cleanup: {e}")
             return
+
+        # Free device pointers
+        if self.signal_pads_dev:
+            checkCudaErrors(cuda.cuMemFree(self.signal_pads_dev))
+        if self.uc_ptrs_dev:
+            checkCudaErrors(cuda.cuMemFree(self.uc_ptrs_dev))
 
         # Unmap UC regions and release their handles
         if hasattr(self, "uc_handles") and self.uc_handles:
@@ -541,13 +573,21 @@ class McastDeviceMemory:
             except Exception as e:
                 print(f"Destructor: Failed to release MC handle: {e}")
 
-    def get_signal_pad_ptrs_dev(self) -> List[int]:
+    def get_signal_pad_ptrs_host(self) -> List[int]:
+        """Get the raw array of signal pad pointers to all ranks (including self)"""
+        return self.signal_pads
+
+    def get_buffer_ptrs_host(self) -> List[int]:
+        """Get the raw array of unicast pointers to all ranks (including self)"""
+        return self.uc_ptrs
+
+    def get_signal_pad_ptrs_dev(self) -> int:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
         return self.signal_pads_dev
 
-    def get_buffer_ptrs_dev(self) -> List[int]:
+    def get_buffer_ptrs_dev(self) -> int:
         """Get the raw array of unicast pointers to all ranks (including self)"""
-        return self.uc_ptrs
+        return self.uc_ptrs_dev
 
     def get_unicast_ptr(self, rank: int) -> int:
         """Get the raw unicast pointer to a given rank"""
@@ -755,16 +795,8 @@ class McastDeviceMemory:
             )
         )
 
-    def get_multicast_ptr_as_int64(self) -> int:
-        """Get multicast pointer as int64 (legacy compatibility)"""
-        return self.get_multicast_ptr()
-
-    def get_buffer_ptrs_dev_as_int64(self) -> int:
-        """Get buffer pointers device as int64 (returning first UC pointer for now) (legacy compatibility)"""
-        return self.uc_ptrs[0] if self.uc_ptrs else 0
-
     def lamport_initialize(self, rank: int, dtype: torch.dtype):
-        if dtype == torch.bfloat16:
+        if dtype == torch.bfloat16 or dtype == torch.float16:
             neg_zero = 0x8000
             dsize = 2
             memset_func = cuda.cuMemsetD16
@@ -838,33 +870,6 @@ class McastGPUBuffer:
         """Get the raw multicast pointer"""
         return self.mcast_device_memory.get_multicast_ptr()
 
-    def get_multicast_ptr_as_int64(self) -> int:
-        """Get the multicast pointer as int64"""
-        return self.get_multicast_ptr()
-
-    def get_buffer_ptrs_dev(self) -> List[int]:
+    def get_buffer_ptrs_dev(self) -> int:
         """Get the buffer pointers device array"""
         return self.mcast_device_memory.get_buffer_ptrs_dev()
-
-    def get_buffer_ptrs_dev_as_int64(self) -> int:
-        """Get the buffer pointers device as int64 (returning first UC pointer)"""
-        ptrs = self.get_buffer_ptrs_dev()
-        assert ptrs is not None
-        return ptrs[0] if ptrs else 0
-
-    def get_buffer_ptrs_dev_as_ctypes_ptr(self) -> int:
-        """
-        Get buffer pointers as ctypes array pointer (equivalent to C++ void**).
-        Returns the address of a ctypes array that can be cast to int64_t and back to void**.
-
-        This matches the C++ pattern:
-        reinterpret_cast<int64_t>(reinterpret_cast<void**>(mUcPtrs.data()))
-        """
-        # Create ctypes array of void pointers
-        ArrayType = ctypes.c_void_p * len(self.mcast_device_memory.uc_ptrs)
-        self._buffer_ptrs_array = ArrayType(
-            *self.mcast_device_memory.uc_ptrs
-        )  # Keep reference to prevent GC
-
-        # Return the address of this array (equivalent to .data() in C++)
-        return ctypes.cast(self._buffer_ptrs_array, ctypes.c_void_p).value

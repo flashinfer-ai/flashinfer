@@ -59,6 +59,17 @@ class RoutingMethodType(IntEnum):
     Unspecified = 5
 
 
+# See MatrixLayout from include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h
+class WeightLayout(IntEnum):
+    # K-major layout (default). [Mn, K]
+    MajorK = 0
+    # M-major for A and N-major for B. [K, Mn]
+    MajorMn = 1
+    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
+    # where blockK is fixed at 128B
+    BlockMajorK = 2
+
+
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     """
     Reorders rows in the gemm/MOE_gemm weight matrix for min-latency
@@ -222,6 +233,12 @@ def shuffle_matrix_sf_a(
 
     # 128x4
     return nvfp4_block_scale_interleave(w_shuffled)
+
+
+def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Tensor:
+    M, K = input_tensor.shape
+    assert K % blockK == 0, "K must be divisible by blockK"
+    return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
@@ -864,7 +881,7 @@ def get_trtllm_moe_sm100_module():
     )
     def trtllm_fp8_per_tensor_scale_moe_op(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         output1_scales_scalar: torch.Tensor,
@@ -911,7 +928,7 @@ def get_trtllm_moe_sm100_module():
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         output1_scales_scalar: torch.Tensor,
@@ -941,7 +958,7 @@ def get_trtllm_moe_sm100_module():
     )
     def trtllm_fp8_block_scale_moe_op(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -959,6 +976,7 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         use_shuffled_weight: bool = False,
+        weight_layout: int = 0,
     ) -> torch.Tensor:
 
         # Call the C++ function for block scale MoE
@@ -982,6 +1000,7 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim,
             routing_method_type,
             use_shuffled_weight,
+            weight_layout,
         )
 
         return output
@@ -989,7 +1008,7 @@ def get_trtllm_moe_sm100_module():
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
         routing_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -1007,6 +1026,7 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
+        weight_layout: int = 0,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1109,7 +1129,7 @@ def get_trtllm_moe_sm100_module():
 
 def trtllm_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     output1_scales_scalar: torch.Tensor,
@@ -1179,7 +1199,7 @@ def trtllm_fp8_per_tensor_scale_moe(
 
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -1196,7 +1216,8 @@ def trtllm_fp8_block_scale_moe(
     routed_scaling_factor: float,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
-    use_shuffled_weight: bool = True,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1243,6 +1264,7 @@ def trtllm_fp8_block_scale_moe(
         tile_tokens_dim,
         routing_method_type,
         use_shuffled_weight,
+        weight_layout,
     )
 
 
