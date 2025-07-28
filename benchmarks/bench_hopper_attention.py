@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_single_prefill(seq_len, num_heads, causal, head_dim):
@@ -26,16 +27,31 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
 
-    sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                q, k, v, causal=causal, backend=backend
-            ),
-            warmup=100,
-            rep=1000,
-        )
-        for backend in ["fa2", "fa3"]
+    # Benchmark sm80 attention
+    measurements_sm80 = bench_gpu_time(
+        lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+            q, k, v, causal=False, backend="fa2"
+        ),
+        dry_runs=10,
+        num_iters=100,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
     )
+    sm80_ms = np.mean(measurements_sm80)
+
+    # Benchmark sm90 attention
+    measurements_sm90 = bench_gpu_time(
+        lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+            q, k, v, causal=False, backend="fa3"
+        ),
+        dry_runs=10,
+        num_iters=100,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
+    )
+    sm90_ms = np.mean(measurements_sm90)
 
     def flops(ms):
         if causal:
@@ -83,10 +99,15 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
         )
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: wrapper.run(q, k, v),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: wrapper.run(q, k, v),
+                dry_runs=10,
+                num_iters=100,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=torch.device("cuda:0"),
+            )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
     )
@@ -160,10 +181,15 @@ def bench_batch_paged_prefill(
         )
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: wrapper.run(q, (k, v)),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: wrapper.run(q, (k, v)),
+                dry_runs=10,
+                num_iters=100,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=torch.device("cuda:0"),
+            )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
     )

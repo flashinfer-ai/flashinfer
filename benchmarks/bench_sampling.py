@@ -1,7 +1,8 @@
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def normal_distribution(std):
@@ -67,11 +68,15 @@ def main():
                     samples = torch.zeros(
                         batch_size, dtype=torch.int32, device=probs.device
                     )
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: init_seed_sampling(probs, deterministic=deterministic),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
 
                     io = (
                         probs.numel() * probs.element_size()
@@ -99,13 +104,17 @@ def main():
                         samples = torch.zeros(
                             batch_size, dtype=torch.int32, device=probs.device
                         )
-                        ms = do_bench(
+                        measurements = bench_gpu_time(
                             lambda: init_seed_top_k_sampling(
                                 probs, k, deterministic=deterministic
                             ),
-                            warmup=100,
-                            rep=1000,
+                            dry_runs=100,
+                            num_iters=1000,
+                            l2_flush=True,
+                            l2_flush_size_mb=256,
+                            l2_flush_device=torch.device("cuda:0"),
                         )
+                        ms = np.median(measurements)
 
                         io = (
                             probs.numel() * probs.element_size()
@@ -134,13 +143,17 @@ def main():
                         samples = torch.zeros(
                             batch_size, dtype=torch.int32, device=probs.device
                         )
-                        ms = do_bench(
+                        measurements = bench_gpu_time(
                             lambda: init_seed_top_p_sampling(
                                 probs, p, deterministic=deterministic
                             ),
-                            warmup=100,
-                            rep=1000,
+                            dry_runs=100,
+                            num_iters=1000,
+                            l2_flush=True,
+                            l2_flush_size_mb=256,
+                            l2_flush_device=torch.device("cuda:0"),
                         )
+                        ms = np.median(measurements)
 
                         io = (
                             probs.numel() * probs.element_size()
@@ -166,13 +179,17 @@ def main():
                     samples = torch.zeros(
                         batch_size, dtype=torch.int32, device=logits.device
                     )
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: init_seed_sampling_from_softmax_logits(
                             logits, samples, deterministic=deterministic
                         ),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
                     io = (
                         logits.numel() * logits.element_size()
                         + samples.numel() * samples.element_size()
@@ -197,13 +214,17 @@ def main():
                     samples = torch.zeros(
                         batch_size, dtype=torch.int32, device=logits.device
                     )
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: init_seed_sampling_from_logits(
                             logits, samples, deterministic=deterministic
                         ),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
 
                     io = (
                         logits.numel() * logits.element_size()

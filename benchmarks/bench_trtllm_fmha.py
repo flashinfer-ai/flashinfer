@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
 
 page_size = 16
 num_kv_heads = 4
@@ -49,10 +49,15 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     wrapper.run(q, kv_data)
     torch.cuda.synchronize()
 
-    ms = triton.testing.do_bench_cudagraph(
+    measurements = bench_gpu_time(
         lambda: wrapper.run(q, kv_data),
-        rep=4,
+        dry_runs=10,
+        num_iters=50,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
     )
+    ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     print(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
@@ -160,10 +165,15 @@ def bench_trtllm_fmha_wrapper(
     wrapper.run(q, kv_cache)
     torch.cuda.synchronize()
 
-    ms = triton.testing.do_bench_cudagraph(
+    measurements = bench_gpu_time_with_cudagraph(
         lambda: wrapper.run(q, kv_cache),
-        rep=1000,
+        dry_runs=10,
+        num_iters=1000,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
     )
+    ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"

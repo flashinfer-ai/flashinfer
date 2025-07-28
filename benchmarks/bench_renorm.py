@@ -1,7 +1,8 @@
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def normal_distribution(std):
@@ -38,11 +39,15 @@ def main():
                 for p in [0.1, 0.5, 0.9]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_p_renorm_probs(probs, p),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
 
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
@@ -63,11 +68,15 @@ def main():
                 for k in [10, 100, 1000, 5000]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_k_renorm_probs(probs, k),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
 
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
@@ -87,11 +96,15 @@ def main():
             ]:
                 for k in [10, 100, 1000, 5000]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
-                    ms = do_bench(
+                    measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_k_mask_logits(logits, k),
-                        warmup=100,
-                        rep=1000,
+                        dry_runs=100,
+                        num_iters=1000,
+                        l2_flush=True,
+                        l2_flush_size_mb=256,
+                        l2_flush_device=torch.device("cuda:0"),
                     )
+                    ms = np.median(measurements)
 
                     io = (logits.numel() * logits.element_size()) * 2
                     bandwidth = io * 1e-6 / ms

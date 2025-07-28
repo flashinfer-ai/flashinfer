@@ -1,9 +1,10 @@
+import numpy as np
 import torch
 import triton
-from triton.testing import do_bench
 
 import flashinfer
 import flashinfer.triton
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def is_cuda():
@@ -15,7 +16,7 @@ def supports_tma():
 
 
 def bench_gemm_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000):
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: flashinfer.triton.sm_constraint_gemm.gemm_persistent(
             a=torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype),
             b=torch.randn((N, K), device="cuda", dtype=torch.float16).to(dtype),
@@ -23,9 +24,13 @@ def bench_gemm_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000)
             beta=0.0,
             num_sms=num_sms,
         ),
-        warmup=warmup_reps,
-        rep=reps,
+        dry_runs=warmup_reps,
+        num_iters=reps,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
     )
+    ms = np.median(measurements)
 
     # matmul: 2 * M * N * K
     # scale and add: 3 * M * N
@@ -40,7 +45,7 @@ def bench_gemm_descriptor_persistent(
 ):
     if dtype == torch.float32:
         return
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
             a=torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype),
             b=torch.randn((N, K), device="cuda", dtype=torch.float16).to(dtype),
@@ -48,9 +53,13 @@ def bench_gemm_descriptor_persistent(
             beta=0.0,
             num_sms=num_sms,
         ),
-        warmup=warmup_reps,
-        rep=reps,
+        dry_runs=warmup_reps,
+        num_iters=reps,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=torch.device("cuda:0"),
     )
+    ms = np.median(measurements)
 
     # matmul: 2 * M * N * K
     # scale and add: 3 * M * N

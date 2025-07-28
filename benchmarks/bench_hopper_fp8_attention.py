@@ -1,7 +1,8 @@
+import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_single_prefill(seq_len, num_heads, causal, head_dim):
@@ -11,12 +12,17 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                q, k, v, causal=causal, backend=backend
-            ),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+                    q, k, v, causal=causal, backend=backend
+                ),
+                dry_runs=10,
+                num_iters=100,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=torch.device("cuda:0"),
+            )
         )
         for backend in ["fa2", "fa3"]
     )
@@ -31,12 +37,17 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
         seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda"
     ).to(dtype=torch.float8_e4m3fn)
 
-    fp8_sm90_ms = triton.testing.do_bench(
-        lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-            q, k, v, causal=causal, backend="fa3", o_dtype=torch.half
-        ),
-        warmup=100,
-        rep=1000,
+    fp8_sm90_ms = np.median(
+        bench_gpu_time(
+            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+                q, k, v, causal=causal, backend="fa3", o_dtype=torch.half
+            ),
+            dry_runs=100,
+            num_iters=1000,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=torch.device("cuda:0"),
+        )
     )
 
     def flops(ms):

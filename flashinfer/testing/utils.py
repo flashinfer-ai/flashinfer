@@ -535,10 +535,9 @@ def bench_gpu_time(
     fn,
     dry_runs: int = 5,
     num_iters: int = 20,
-    nvtx_range_name: str = "kernel",
     l2_flush: bool = True,
     l2_flush_size_mb: int = 256,
-    l2_flush_device: str = None,
+    l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
 ):
     """
@@ -551,7 +550,6 @@ def bench_gpu_time(
         fn: Function to benchmark.
         dry_runs: Number of dry runs during which times does not count.
         num_iters: Number of iterations.
-        nvtx_range_name: Name of the NVTX range to encapsulate the kernel
         l2_flush: Whether to flush L2 cache.
         l2_flush_size_mb: Size of the L2 cache to flush.
         l2_flush_device: Device that needs to flush L2 cache.
@@ -586,15 +584,11 @@ def bench_gpu_time(
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     torch.cuda.synchronize()
     for iter_idx in range(num_iters):
-        with torch.autograd.profiler.emit_nvtx():
-            if l2_flush:
-                buffer.zero_()
-                torch.cuda.synchronize()
-            torch.cuda.nvtx.range_push(nvtx_range_name)
-            start_events[iter_idx].record()
-            fn()
-            end_events[iter_idx].record()
-            torch.cuda.nvtx.range_pop()
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        fn()
+        end_events[iter_idx].record()
 
         if sleep_after_run:
             sleep_after_kernel_run(median_dry_run_time)
@@ -612,10 +606,9 @@ def bench_gpu_time_with_cudagraph(
     dry_runs: int = 5,
     num_iters: int = 20,
     num_iters_within_graph: int = 10,
-    nvtx_range_name: str = "kernel",
     l2_flush: bool = True,
     l2_flush_size_mb: int = 256,
-    l2_flush_device: str = None,
+    l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
 ):
     """
@@ -633,7 +626,6 @@ def bench_gpu_time_with_cudagraph(
         dry_runs: Number of dry runs during which times does not count.
         num_iters: Number of iterations to run the CUDA Graph.
         num_iters_within_graph: Number of iterations to run within the graph.
-        nvtx_range_name: Name of the NVTX range to encapsulate the kernel.
         l2_flush: Whether to flush L2 cache.
         l2_flush_size_mb: Size of the L2 cache to flush.
         l2_flush_device: Device that needs to flush L2 cache.
@@ -685,15 +677,11 @@ def bench_gpu_time_with_cudagraph(
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     torch.cuda.synchronize()
     for iter_idx in range(num_iters):
-        with torch.autograd.profiler.emit_nvtx():
-            if l2_flush:
-                buffer.zero_()
-                torch.cuda.synchronize()
-            torch.cuda.nvtx.range_push(nvtx_range_name)
-            start_events[iter_idx].record()
-            g.replay()
-            end_events[iter_idx].record()
-            torch.cuda.nvtx.range_pop()
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        g.replay()
+        end_events[iter_idx].record()
 
         if sleep_after_run:
             sleep_after_kernel_run(median_dry_run_time)

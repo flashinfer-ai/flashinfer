@@ -16,10 +16,11 @@ limitations under the License.
 
 from itertools import product
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_groupwise_grouped_gemm_mxfp4_blackwell(
@@ -79,7 +80,7 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
     for mma_sm, tile_m, tile_n, tile_k, swap_ab in product(
         mma_sm_list, tile_m_list, tile_n_list, tile_k_list, swap_ab_list
     ):
-        ms = do_bench(
+        measurements = bench_gpu_time(
             lambda: flashinfer.gemm.group_gemm_mxfp4_nt_groupwise(
                 a,
                 b,
@@ -93,9 +94,13 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
                 tile_k=tile_k,
                 swap_ab=swap_ab,
             ),
-            warmup=10,
-            rep=100,
+            dry_runs=10,
+            num_iters=100,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=torch.device("cuda:0"),
         )
+        ms = np.median(measurements)
         if ms < ms_best:
             ms_best = ms
             config_best = {

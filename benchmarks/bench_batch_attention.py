@@ -6,9 +6,9 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def run_bench(
@@ -65,7 +65,15 @@ def run_bench(
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
     )
-    ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
+    measurements_old = bench_gpu_time(
+        lambda: wrapper_old.run(q, kv_data),
+        dry_runs=10,
+        num_iters=100,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+    )
+    ms_old = np.mean(measurements_old)
 
     # new
     wrapper = flashinfer.BatchAttention(kv_layout="NHD")
@@ -83,7 +91,15 @@ def run_bench(
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
     )
-    ms_new = do_bench(lambda: wrapper.run(q, kv_data))
+    measurements_new = bench_gpu_time(
+        lambda: wrapper.run(q, kv_data),
+        dry_runs=10,
+        num_iters=100,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+    )
+    ms_new = np.mean(measurements_new)
 
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()

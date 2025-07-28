@@ -2,10 +2,11 @@ import argparse
 import dataclasses
 from typing import Tuple, cast
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -92,7 +93,18 @@ def main():
                 )
 
             batch_indices, positions = fn_convert()
-            convert_latency_ms = cast(float, do_bench(fn_convert))
+            convert_latencies = cast(
+                float,
+                bench_gpu_time(
+                    fn_convert,
+                    dry_runs=25,
+                    num_iters=100,
+                    l2_flush=True,
+                    l2_flush_size_mb=256,
+                    l2_flush_device=device,
+                ),
+            )
+            convert_latency_ms = np.median(convert_latencies)
 
             @torch.cuda.nvtx.range(f"append model={model_name}, seqlens={seqlens}")
             def fn() -> None:
@@ -108,7 +120,18 @@ def main():
                     kv_last_page_len,
                 )
 
-            latency_ms = cast(float, do_bench(fn))
+            latencies = cast(
+                float,
+                bench_gpu_time(
+                    fn,
+                    dry_runs=25,
+                    num_iters=100,
+                    l2_flush=True,
+                    l2_flush_size_mb=256,
+                    l2_flush_device=device,
+                ),
+            )
+            latency_ms = np.median(latencies)
             all_layers_latency_ms = convert_latency_ms + latency_ms * model.num_layers
             throughput = (
                 (ckv.numel() + kpe.numel())
