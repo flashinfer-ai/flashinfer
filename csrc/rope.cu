@@ -259,3 +259,95 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
     });
   });
 }
+
+void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_nope_in,
+                       at::Tensor k_nope_in, at::Tensor q_rope_out, at::Tensor k_rope_out,
+                       at::Tensor q_nope_out, at::Tensor k_nope_out, at::Tensor pos_ids,
+                       float quant_scale_q, float quant_scale_kv, bool interleave) {
+  CHECK_LAST_DIM_CONTIGUOUS(q_rope_in);
+  CHECK_LAST_DIM_CONTIGUOUS(k_rope_in);
+  CHECK_LAST_DIM_CONTIGUOUS(q_nope_in);
+  CHECK_LAST_DIM_CONTIGUOUS(k_nope_in);
+  CHECK_LAST_DIM_CONTIGUOUS(q_rope_out);
+  CHECK_LAST_DIM_CONTIGUOUS(k_rope_out);
+  CHECK_LAST_DIM_CONTIGUOUS(q_nope_out);
+  CHECK_LAST_DIM_CONTIGUOUS(k_nope_out);
+  CHECK_INPUT(pos_ids);
+
+  CHECK_EQ(q_rope_in.size(-1), 64);
+  CHECK_EQ(k_rope_in.size(-1), 64);
+  CHECK_EQ(q_nope_in.size(-1), 512);
+  CHECK_EQ(k_nope_in.size(-1), 512);
+  CHECK_EQ(q_rope_out.size(-1), 64);
+  CHECK_EQ(k_rope_out.size(-1), 64);
+  CHECK_EQ(q_nope_out.size(-1), 512);
+  CHECK_EQ(k_nope_out.size(-1), 512);
+  auto scalar_type_in = q_rope_in.scalar_type();
+  TORCH_CHECK(scalar_type_in == k_rope_in.scalar_type());
+  TORCH_CHECK(scalar_type_in == q_nope_in.scalar_type());
+  TORCH_CHECK(scalar_type_in == k_nope_in.scalar_type());
+  auto quant_type_out = q_rope_out.scalar_type();
+  TORCH_CHECK(quant_type_out == k_rope_out.scalar_type());
+  TORCH_CHECK(quant_type_out == q_nope_out.scalar_type());
+  TORCH_CHECK(quant_type_out == k_nope_out.scalar_type());
+
+  CHECK_DIM(3, q_rope_in);   // q_rope_in: (nnz, H_Q, 64)
+  CHECK_DIM(3, q_nope_in);   // q_nope_in: (nnz, H_Q, 512)
+  CHECK_DIM(2, k_rope_in);   // k_rope_in: (nnz, 64)
+  CHECK_DIM(2, k_nope_in);   // k_nope_in: (nnz, 512)
+  CHECK_DIM(3, q_rope_out);  // q_rope_out: (nnz, H_Q, 64)
+  CHECK_DIM(3, q_nope_out);  // q_nope_out: (nnz, H_Q, 512)
+  CHECK_DIM(2, k_rope_out);  // k_rope_out: (nnz, 64)
+  CHECK_DIM(2, k_nope_out);  // k_nope_out: (nnz, 512)
+  uint32_t nnz = q_rope_in.size(0);
+  CHECK_EQ(q_nope_in.size(0), nnz);
+  CHECK_EQ(k_nope_in.size(0), nnz);
+  CHECK_EQ(q_rope_out.size(0), nnz);
+  CHECK_EQ(k_rope_out.size(0), nnz);
+  CHECK_EQ(q_nope_out.size(0), nnz);
+  CHECK_EQ(k_nope_out.size(0), nnz);
+  uint32_t num_heads = q_rope_in.size(1);
+  CHECK_EQ(q_rope_in.size(1), num_heads);
+  CHECK_EQ(q_nope_in.size(1), num_heads);
+  CHECK_EQ(q_rope_out.size(1), num_heads);
+  CHECK_EQ(k_rope_out.size(1), num_heads);
+
+  const uint32_t q_rope_in_stride_n = q_rope_in.stride(0);
+  const uint32_t q_rope_in_stride_h = q_rope_in.stride(1);
+  const uint32_t q_nope_in_stride_n = q_nope_in.stride(0);
+  const uint32_t q_nope_in_stride_h = q_nope_in.stride(1);
+  const uint32_t q_rope_out_stride_n = q_rope_out.stride(0);
+  const uint32_t q_rope_out_stride_h = q_rope_out.stride(1);
+  const uint32_t q_nope_out_stride_n = q_nope_out.stride(0);
+  const uint32_t q_nope_out_stride_h = q_nope_out.stride(1);
+  const uint32_t k_rope_in_stride = k_rope_in.stride(0);
+  const uint32_t k_nope_in_stride = k_nope_in.stride(0);
+  const uint32_t k_rope_out_stride = k_rope_out.stride(0);
+  const uint32_t k_nope_out_stride = k_nope_out.stride(0);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(scalar_type_in, c_type, [&], {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(quant_type_out, c_quant_type, [&], {
+      DISPATCH_PYTORCH_IDTYPE_TO_CTYPE(pos_ids.scalar_type(), c_idtype, [&], {
+        cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
+            static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
+            static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
+            static_cast<c_quant_type*>(q_rope_out.data_ptr()),
+            static_cast<c_quant_type*>(k_rope_out.data_ptr()),
+            static_cast<c_quant_type*>(q_nope_out.data_ptr()),
+            static_cast<c_quant_type*>(k_nope_out.data_ptr()),
+            static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_heads, q_rope_in_stride_n,
+            q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h, q_rope_out_stride_n,
+            q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h, k_rope_in_stride,
+            k_nope_in_stride, k_rope_out_stride, k_nope_out_stride, quant_scale_q, quant_scale_kv,
+            interleave, stream);
+        TORCH_CHECK(status == cudaSuccess,
+                    "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " +
+                        std::string(cudaGetErrorString(status)));
+        return true;
+      });
+    });
+  });
+}
