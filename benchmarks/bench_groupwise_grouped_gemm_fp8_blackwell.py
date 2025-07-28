@@ -44,8 +44,8 @@ def bench_groupwise_grouped_gemm_fp8_blackwell(
         lambda: flashinfer.gemm.group_gemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, segment_offsets, out=out, mma_sm=2
         ),
-        dry_runs=10,
-        num_iters=100,
+        dry_runs=100,
+        num_iters=1000,
         l2_flush=True,
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),

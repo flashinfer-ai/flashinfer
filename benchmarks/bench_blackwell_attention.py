@@ -64,8 +64,8 @@ def bench_fmha_blackwell(
     o = wrapper.run(q, k, v)
     measurements = bench_gpu_time(
         lambda: wrapper.run(q, k, v),
-        dry_runs=10,
-        num_iters=100,
+        dry_runs=100,
+        num_iters=1000,
         l2_flush=True,
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),

@@ -90,8 +90,8 @@ def bench_variable_block_sparse_attention(
     # Benchmark sparse attention with FA2
     measurements_fa2 = bench_gpu_time(
         lambda: sparse_wrapper_fa2.run(q, k, v),
-        dry_runs=10,
-        num_iters=100,
+        dry_runs=100,
+        num_iters=1000,
         l2_flush=True,
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),
@@ -101,8 +101,8 @@ def bench_variable_block_sparse_attention(
     # Benchmark sparse attention with FA3
     measurements_fa3 = bench_gpu_time(
         lambda: sparse_wrapper_fa3.run(q, k, v),
-        dry_runs=10,
-        num_iters=100,
+        dry_runs=100,
+        num_iters=1000,
         l2_flush=True,
         l2_flush_size_mb=256,
         l2_flush_device=torch.device("cuda:0"),
@@ -113,29 +113,21 @@ def bench_variable_block_sparse_attention(
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
 
-    # Benchmark dense attention
-    measurements_dense_sm80 = bench_gpu_time(
-        lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-            q, k, v, causal=False, backend="fa2"
-        ),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+    dense_sm80_ms, dense_sm90_ms = (
+        np.median(
+            bench_gpu_time(
+                lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+                    q, k, v, causal=False, backend=backend
+                ),
+                dry_runs=100,
+                num_iters=1000,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=torch.device("cuda:0"),
+            )
+        )
+        for backend in ["fa2", "fa3"]
     )
-    measurements_dense_sm90 = bench_gpu_time(
-        lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-            q, k, v, causal=False, backend="fa3"
-        ),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
-    )
-    dense_sm80_ms = np.mean(measurements_dense_sm80)
-    dense_sm90_ms = np.mean(measurements_dense_sm90)
 
     def flops(ms):
         return seq_len * seq_len * num_qo_heads * head_dim * 4 / ms / 1e9
