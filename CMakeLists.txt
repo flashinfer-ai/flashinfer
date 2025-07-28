@@ -16,7 +16,7 @@ if (ENABLE_TESTING)
 
   enable_testing()
 
-  # Add lineinfo to the nvcc flags only in release builds.
+  # lineinfo's are stripped in release builds. We explicitly keep them in development builds to allow for source mapping when using profiling tools such as NCU.
   if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
   endif()
@@ -31,6 +31,14 @@ if (ENABLE_TESTING)
   )
   include(${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake)
   CPMAddPackage("gh:NVIDIA/nvbench#main")
+
+  # gtest for unit testing of the CUDA/C++ code.
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/32f9f4c82afa4249af66b55278df15c16b3031ea.zip
+  )
+  FetchContent_MakeAvailable(googletest)
 
 endif()
 
@@ -105,21 +113,6 @@ else(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
 endif(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
-if(FLASHINFER_PREFILL
-   OR FLASHINFER_DECODE
-   OR FLASHINFER_PAGE
-   OR FLASHINFER_CASCADE
-   OR FLASHINFER_SAMPLING
-   OR FLASHINFER_NORM)
-  message(STATUS "NVBench and GoogleTest enabled")
-  add_subdirectory(3rdparty/googletest)
-endif(
-  FLASHINFER_PREFILL
-  OR FLASHINFER_DECODE
-  OR FLASHINFER_PAGE
-  OR FLASHINFER_CASCADE
-  OR FLASHINFER_SAMPLING
-  OR FLASHINFER_NORM)
 find_package(Thrust REQUIRED)
 
 set(FLASHINFER_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
@@ -209,7 +202,6 @@ set(AOT_GENERATE_COMMAND
     --enable_bf16 ${FLASHINFER_ENABLE_BF16} --enable_fp8_e4m3
     ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
     ${FLASHINFER_ENABLE_FP8_E5M2})
-MESSAGE(STATUS "AOT_GENERATE_COMMAND=${AOT_GENERATE_COMMAND}")
 
 set(AOT_GENERATE_DISPATCH_INC_COMMAND
     ${Python3_EXECUTABLE} -m aot_build_utils.generate_dispatch_inc --path
@@ -217,7 +209,6 @@ set(AOT_GENERATE_DISPATCH_INC_COMMAND
     --head_dims_sm90 ${HEAD_DIMS_SM90} --pos_encoding_modes
     ${POS_ENCODING_MODES} --use_fp16_qk_reductions ${USE_FP16_QK_REDUCTIONS}
     --mask_modes ${MASK_MODES})
-MESSAGE(STATUS "AOT_GENERATE_DISPATCH_INC_COMMAND=${AOT_GENERATE_DISPATCH_INC_COMMAND}")
 
 execute_process(COMMAND ${AOT_GENERATE_COMMAND}
                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

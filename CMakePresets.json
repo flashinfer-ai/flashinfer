@@ -49,7 +49,7 @@
                     "type": "STRING"
                 },
                 "FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS": {
-                    "value": "false;true",
+                    "value": "ON",
                     "type": "STRING"
                 },
                 "FLASHINFER_GEN_MASK_MODES": {
@@ -61,7 +61,7 @@
         {
             "name": "gcc_release",
             "inherits": "base",
-            "binaryDir": "${sourceDir}/build",
+            "binaryDir": "${sourceDir}/build_release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": {
                     "value": "release",
@@ -77,7 +77,7 @@
         {
             "name": "gcc_release_devel",
             "inherits": "base",
-            "binaryDir": "${sourceDir}/build",
+            "binaryDir": "${sourceDir}/build_release_devel",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": {
                     "value": "release",
@@ -93,7 +93,7 @@
         {
             "name": "gcc_debug_devel",
             "inherits": "base",
-            "binaryDir": "${sourceDir}/build_debug",
+            "binaryDir": "${sourceDir}/build_debug_devel",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": {
                     "value": "debug",
