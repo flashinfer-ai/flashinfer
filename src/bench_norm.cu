@@ -38,7 +38,8 @@ void bench_rms_norm(nvbench::state& state) {
     timer.start();
     cudaError_t status =
         norm::RMSNorm<T>(thrust::raw_pointer_cast(x.data()), thrust::raw_pointer_cast(w.data()),
-                         thrust::raw_pointer_cast(y.data()), batch_size, hidden_dim, 1e-5);
+                         thrust::raw_pointer_cast(y.data()), batch_size, hidden_dim, hidden_dim,
+                         hidden_dim, 1e-5, false);
     timer.stop();
     if (status != cudaSuccess) {
       state.skip("RMSNorm kernel launch failed");

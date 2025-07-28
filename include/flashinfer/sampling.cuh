@@ -824,7 +824,6 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
                                            uint64_t philox_seed, uint64_t philox_offset) {
-  const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -939,7 +938,6 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            float* top_p_arr, float top_p_val, uint32_t d,
                                            uint64_t philox_seed, uint64_t philox_offset) {
-  const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);

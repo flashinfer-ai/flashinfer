@@ -1,0 +1,151 @@
+{
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER_LAUNCHER": {
+                    "value": "ccache",
+                    "type": "STRING"
+                },
+                "CMAKE_CUDA_COMPILER_LAUNCHER": {
+                    "value": "ccache",
+                    "type": "STRING"
+                },
+                "FLASHINFER_DECODE": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_PREFILL": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_PAGE": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_CASCADE": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_SAMPLING": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_NORM": {
+                    "value": "ON",
+                    "type": "STRING"
+                },
+                "FLASHINFER_CUDA_ARCHITECTURES": {
+                    "value": "90a",
+                    "type": "STRING"
+                },
+                "FLASHINFER_GEN_HEAD_DIMS": {
+                    "value": "64;128;256;512",
+                    "type": "STRING"
+                },
+                "FLASHINFER_GEN_POS_ENCODING_MODES": {
+                    "value": "0;1;2",
+                    "type": "STRING"
+                },
+                "FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS": {
+                    "value": "false;true",
+                    "type": "STRING"
+                },
+                "FLASHINFER_GEN_MASK_MODES": {
+                    "value": "0;1;2",
+                    "type": "STRING"
+                }
+            }
+        },
+        {
+            "name": "gcc_release",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": {
+                    "value": "release",
+                    "type": "STRING"
+                },
+                "ENABLE_TESTING": {
+                    "value": "OFF",
+                    "type": "STRING"
+                }
+            },
+            "generator": "Ninja"
+        },
+        {
+            "name": "gcc_release_devel",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": {
+                    "value": "release",
+                    "type": "STRING"
+                },
+                "ENABLE_TESTING": {
+                    "value": "ON",
+                    "type": "STRING"
+                }
+            },
+            "generator": "Ninja"
+        },
+        {
+            "name": "gcc_debug_devel",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build_debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": {
+                    "value": "debug",
+                    "type": "STRING"
+                },
+                "CMAKE_CUDA_FLAGS": {
+                    "value": "-g -G",
+                    "type": "STRING"
+                },
+                "ENABLE_TESTING": {
+                    "value": "ON",
+                    "type": "STRING"
+                }
+            },
+            "generator": "Ninja"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "gcc_release",
+            "configurePreset": "gcc_release"
+        },
+        {
+            "name": "gcc_release_devel",
+            "configurePreset": "gcc_release_devel"
+        },
+        {
+            "name": "gcc_debug_devel",
+            "configurePreset": "gcc_debug_devel"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "gcc_release_devel",
+            "configurePreset": "gcc_release_devel",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "jobs": 4
+            }
+        },
+        {
+            "name": "gcc_debug_devel",
+            "configurePreset": "gcc_debug_devel",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "jobs": 4
+            }
+        }
+    ],
+    "version": 6
+}

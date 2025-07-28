@@ -1,6 +1,39 @@
 cmake_minimum_required(VERSION 3.23.1)
 project(flashinfer CUDA CXX)
 
+option(ENABLE_TESTING "Enable testing" ON)
+
+# Everything in here should NOT happen when building the package for distribution.
+if (ENABLE_TESTING)
+
+  # Generates the compile_commands.json file, which is used by the language server (clangd) to do static analysis.
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+  # By default, CUDA uses response files to pass arguments to the compiler. This is not well supported by tooling, such as clangd.
+  set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+  set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
+  set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS 0)
+
+  enable_testing()
+
+  # Add lineinfo to the nvcc flags only in release builds.
+  if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+  endif()
+
+  # NVBench for kernel level benchmarking.
+  # download CPM.cmake
+  file(
+    DOWNLOAD
+    https://github.com/cpm-cmake/CPM.cmake/releases/download/v0.42.0/CPM.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake
+    EXPECTED_HASH SHA256=2020b4fc42dba44817983e06342e682ecfc3d2f484a581f11cc5731fbe4dce8a
+  )
+  include(${CMAKE_CURRENT_BINARY_DIR}/cmake/CPM.cmake)
+  CPMAddPackage("gh:NVIDIA/nvbench#main")
+
+endif()
+
 include(cmake/utils/Utils.cmake)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -79,7 +112,6 @@ if(FLASHINFER_PREFILL
    OR FLASHINFER_SAMPLING
    OR FLASHINFER_NORM)
   message(STATUS "NVBench and GoogleTest enabled")
-  add_subdirectory(3rdparty/nvbench)
   add_subdirectory(3rdparty/googletest)
 endif(
   FLASHINFER_PREFILL
@@ -177,6 +209,7 @@ set(AOT_GENERATE_COMMAND
     --enable_bf16 ${FLASHINFER_ENABLE_BF16} --enable_fp8_e4m3
     ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
     ${FLASHINFER_ENABLE_FP8_E5M2})
+MESSAGE(STATUS "AOT_GENERATE_COMMAND=${AOT_GENERATE_COMMAND}")
 
 set(AOT_GENERATE_DISPATCH_INC_COMMAND
     ${Python3_EXECUTABLE} -m aot_build_utils.generate_dispatch_inc --path
@@ -184,6 +217,7 @@ set(AOT_GENERATE_DISPATCH_INC_COMMAND
     --head_dims_sm90 ${HEAD_DIMS_SM90} --pos_encoding_modes
     ${POS_ENCODING_MODES} --use_fp16_qk_reductions ${USE_FP16_QK_REDUCTIONS}
     --mask_modes ${MASK_MODES})
+MESSAGE(STATUS "AOT_GENERATE_DISPATCH_INC_COMMAND=${AOT_GENERATE_DISPATCH_INC_COMMAND}")
 
 execute_process(COMMAND ${AOT_GENERATE_COMMAND}
                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -193,11 +227,11 @@ execute_process(COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
 file(GLOB_RECURSE FLASHINFER_GENERATORS
      ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
 file(GLOB_RECURSE DECODE_KERNELS_SRCS
-     ${PROJECT_SOURCE_DIR}/src/generated/*decode_head*.cu)
+     ${GENERATED_SOURCE_DIR}/*decode_head*.cu)
 file(GLOB_RECURSE PREFILL_KERNELS_SRCS
-     ${PROJECT_SOURCE_DIR}/src/generated/*prefill_head*.cu)
+     ${GENERATED_SOURCE_DIR}/*prefill_head*.cu)
 file(GLOB_RECURSE DISPATCH_INC_FILE
-     ${PROJECT_SOURCE_DIR}/src/generated/dispatch.inc)
+     ${GENERATED_SOURCE_DIR}/dispatch.inc)
 
 add_custom_command(
   OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS} ${DISPATCH_INC_FILE}
@@ -211,8 +245,9 @@ add_custom_target(dispatch_inc DEPENDS ${DISPATCH_INC_FILE})
 
 string(CONCAT CXX_FLAGS "-fpic " "-fPIC ")
 
+# For -static-global-template-stub=false, see https://developer.nvidia.com/blog/cuda-c-compiler-updates-impacting-elf-visibility-and-linkage/
 string(CONCAT NVCC_FLAGS "-O3 " "--threads=1 " "-Xfatbin=-compress-all "
-              "-use_fast_math " "--expt-relaxed-constexpr ")
+              "-use_fast_math " "--expt-relaxed-constexpr " "-static-global-template-stub=false ")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS}")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS}")
@@ -237,8 +272,6 @@ if(FLASHINFER_DECODE)
   add_executable(bench_single_decode ${BENCH_DECODE_SRCS})
   target_include_directories(bench_single_decode
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_single_decode
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_single_decode dispatch_inc)
   target_link_libraries(bench_single_decode
                         PRIVATE nvbench::main decode_kernels prefill_kernels)
@@ -253,8 +286,7 @@ if(FLASHINFER_DECODE)
   target_include_directories(
     test_single_decode PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   add_dependencies(test_single_decode dispatch_inc)
-  target_link_libraries(test_single_decode PRIVATE gtest gtest_main
-                                                   decode_kernels)
+  target_link_libraries(test_single_decode PRIVATE gtest gtest_main decode_kernels)
   target_compile_options(test_single_decode PRIVATE -Wno-switch-bool)
 
   message(STATUS "Compile batch decode kernel benchmarks.")
@@ -263,11 +295,8 @@ if(FLASHINFER_DECODE)
   add_executable(bench_batch_decode ${BENCH_DECODE_SRCS})
   target_include_directories(bench_batch_decode
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_decode
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_batch_decode dispatch_inc)
-  target_link_libraries(bench_batch_decode PRIVATE nvbench::main decode_kernels
-                                                   prefill_kernels)
+  target_link_libraries(bench_batch_decode PRIVATE nvbench::main decode_kernels prefill_kernels)
   target_compile_options(bench_batch_decode PRIVATE -Wno-switch-bool)
 
   message(STATUS "Compile batch mla decode kernel benchmarks.")
@@ -276,11 +305,8 @@ if(FLASHINFER_DECODE)
   add_executable(bench_batch_decode_mla ${BENCH_DECODE_MLA_SRCS})
   target_include_directories(bench_batch_decode_mla
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_decode_mla
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_batch_decode_mla dispatch_inc)
-  target_link_libraries(bench_batch_decode_mla PRIVATE nvbench::main
-                                                       decode_kernels)
+  target_link_libraries(bench_batch_decode_mla PRIVATE nvbench::main decode_kernels)
   target_compile_options(bench_batch_decode_mla PRIVATE -Wno-switch-bool)
 
   message(STATUS "Compile batch decode kernel tests.")
@@ -292,8 +318,7 @@ if(FLASHINFER_DECODE)
   target_include_directories(
     test_batch_decode PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   add_dependencies(test_batch_decode dispatch_inc)
-  target_link_libraries(test_batch_decode PRIVATE gtest gtest_main
-                                                  decode_kernels)
+  target_link_libraries(test_batch_decode PRIVATE gtest gtest_main decode_kernels)
   target_compile_options(test_batch_decode PRIVATE -Wno-switch-bool)
 endif(FLASHINFER_DECODE)
 
@@ -304,8 +329,6 @@ if(FLASHINFER_PREFILL)
   add_executable(bench_single_prefill ${BENCH_PREFILL_SRCS})
   target_include_directories(bench_single_prefill
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_single_prefill
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_single_prefill dispatch_inc)
   target_link_libraries(bench_single_prefill PRIVATE nvbench::main
                                                      prefill_kernels)
@@ -330,8 +353,6 @@ if(FLASHINFER_PREFILL)
   add_executable(bench_batch_prefill ${BENCH_PREFILL_SRCS})
   target_include_directories(bench_batch_prefill
                              PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_prefill
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_batch_prefill dispatch_inc)
   target_link_libraries(bench_batch_prefill PRIVATE nvbench::main
                                                     prefill_kernels)
@@ -368,8 +389,6 @@ if(FLASHINFER_CASCADE)
        ${PROJECT_SOURCE_DIR}/src/bench_cascade.cu)
   add_executable(bench_cascade ${BENCH_CASCADE_SRCS})
   target_include_directories(bench_cascade PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_cascade
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   add_dependencies(bench_cascade dispatch_inc)
   target_link_libraries(bench_cascade PRIVATE nvbench::main decode_kernels
                                               prefill_kernels)
@@ -393,8 +412,6 @@ if(FLASHINFER_SAMPLING)
        ${PROJECT_SOURCE_DIR}/src/bench_sampling.cu)
   add_executable(bench_sampling ${BENCH_SAMPLING_SRCS})
   target_include_directories(bench_sampling PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_sampling
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   target_link_libraries(bench_sampling PRIVATE nvbench::main)
   target_compile_options(bench_sampling PRIVATE -Wno-switch-bool)
 
@@ -414,8 +431,6 @@ if(FLASHINFER_NORM)
   file(GLOB_RECURSE BENCH_NORM_SRCS ${PROJECT_SOURCE_DIR}/src/bench_norm.cu)
   add_executable(bench_norm ${BENCH_NORM_SRCS})
   target_include_directories(bench_norm PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_norm
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
   target_link_libraries(bench_norm PRIVATE nvbench::main)
   target_compile_options(bench_norm PRIVATE -Wno-switch-bool)
 
