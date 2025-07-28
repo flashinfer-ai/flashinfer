@@ -3,6 +3,7 @@
         {
             "name": "base",
             "hidden": true,
+            "description": "A shared collection of variables used by all presets.",
             "cacheVariables": {
                 "CMAKE_CXX_COMPILER_LAUNCHER": {
                     "value": "ccache",
@@ -60,6 +61,7 @@
         },
         {
             "name": "gcc_release",
+            "description": "Use this preset to build the optimized native artifacts that can be used by the Python API.",
             "inherits": "base",
             "binaryDir": "${sourceDir}/build_release",
             "cacheVariables": {
@@ -76,6 +78,7 @@
         },
         {
             "name": "gcc_release_devel",
+            "description": "Use this preset to build optimized native artifacts, with CUDA lineinfo. Good starting point for development.",
             "inherits": "base",
             "binaryDir": "${sourceDir}/build_release_devel",
             "cacheVariables": {
@@ -92,6 +95,7 @@
         },
         {
             "name": "gcc_debug_devel",
+            "description": "Use this preset to build unoptimized native artifacts with full debug symbols. For developers who need to debug the code line by line.",
             "inherits": "base",
             "binaryDir": "${sourceDir}/build_debug_devel",
             "cacheVariables": {
