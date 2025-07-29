@@ -581,6 +581,8 @@ def bench_gpu_time(
     torch.cuda.synchronize()
     start_event.record()
     for _ in range(measurement_iters):
+        if l2_flush:
+            buffer.zero_()
         fn()
     end_event.record()
     torch.cuda.synchronize()
@@ -693,6 +695,8 @@ def bench_gpu_time_with_cudagraph(
     measurement_iters = 5
     start_event.record()
     for _ in range(measurement_iters):
+        if l2_flush:
+            buffer.zero_()
         g.replay()
     end_event.record()
     torch.cuda.synchronize()

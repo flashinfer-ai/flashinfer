@@ -62,7 +62,11 @@ def bench_fmha_blackwell(
         kv_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
-    measurements = bench_gpu_time(lambda: wrapper.run(q, k, v))
+    measurements = bench_gpu_time(
+        lambda: wrapper.run(q, k, v),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+    )
     ms = np.median(measurements)
 
     def flops(ms):
