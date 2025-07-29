@@ -420,6 +420,7 @@ class McastDeviceMemory:
         group_rank: int,
         device_idx: int,
         is_multi_node: bool = True,
+        group: dist.ProcessGroup = None,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -437,6 +438,7 @@ class McastDeviceMemory:
         self.device_idx = device_idx
         self.group_size = group_size
         self.group_rank = group_rank
+        self.group = group
         self.buf_size = buf_size
         self.signal_pad_offset = 0
         self.allocation_size = 0
@@ -695,7 +697,9 @@ class McastDeviceMemory:
 
         # Use all_gather_object to collect fabric handles from all ranks
         all_fabric_handles = [None for _ in range(self.group_size)]
-        dist.all_gather_object(all_fabric_handles, my_fabric_handle.data)
+        dist.all_gather_object(
+            all_fabric_handles, my_fabric_handle.data, group=self.group
+        )
         cuda.cuCtxSynchronize()
 
         # Import remote handles
@@ -726,7 +730,12 @@ class McastDeviceMemory:
 
         # Broadcast multicast handle
         mc_fabric_handle_list = [mc_fabric_handle.data] if mc_fabric_handle else [None]
-        dist.broadcast_object_list(mc_fabric_handle_list, src=0)
+        if self.group:
+            dist.broadcast_object_list(
+                mc_fabric_handle_list, group_src=0, group=self.group
+            )
+        else:
+            dist.broadcast_object_list(mc_fabric_handle_list, src=0)
         mc_fabric_handle_data = mc_fabric_handle_list[0]
 
         # Sync device to ensure broadcast is complete
