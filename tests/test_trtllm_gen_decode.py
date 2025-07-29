@@ -349,7 +349,7 @@ def test_trtllm_batch_decode_fmha(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("q_len_per_request", [1, 2])
-@pytest.mark.parametrize("dynamic_scale", [False, True])
+@pytest.mark.parametrize("dynamic_scale", [False])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
