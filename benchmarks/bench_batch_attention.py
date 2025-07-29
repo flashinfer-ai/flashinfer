@@ -196,6 +196,7 @@ def main() -> None:
         ],
     )
     print(df.to_markdown(index=False, floatfmt=".2f"))
+    df.to_csv("bench_batch_attention.csv", index=False)
 
 
 if __name__ == "__main__":
