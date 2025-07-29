@@ -200,6 +200,12 @@ def bench_batch_paged_prefill(
 
 
 if __name__ == "__main__":
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability[0] != 9:
+        print(f"Current device capability: {device_capability}.")
+        print("Current benchmark targets capability (9, 0). Returning...")
+        exit()
+
     bench_batch_paged_prefill(1, 128, 32, 1024, True, 128)
     bench_batch_paged_prefill(1, 64, 32, 2048, True, 128)
     bench_batch_paged_prefill(1, 32, 32, 4096, True, 128)

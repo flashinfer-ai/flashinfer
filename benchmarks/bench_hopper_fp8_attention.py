@@ -62,6 +62,12 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
 
 
 if __name__ == "__main__":
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability[0] != 9:
+        print(f"Current device capability: {device_capability}.")
+        print("Current benchmark targets capability (9, 0). Returning...")
+        exit()
+
     for seq_len in [4096, 8192, 16384]:
         for num_heads in [24, 32]:
             for causal in [True, False]:
