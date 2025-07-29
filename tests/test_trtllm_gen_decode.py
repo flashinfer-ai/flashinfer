@@ -131,13 +131,7 @@ def test_trtllm_batch_decode_fmha(
     torch.manual_seed(seed)
     device = "cuda:0"
     head_dim = 128
-    num_qo_heads = num_kv_heads * head_grp_size
-    batch_size = batch_size
     MAX_SEQ_LEN = 110
-
-    # Initialize tensors
-    num_tokens = MAX_SEQ_LEN * batch_size
-    num_blocks = (num_tokens + page_size - 1) // page_size
 
     dtype_map = {
         "half": torch.float16,
@@ -146,26 +140,27 @@ def test_trtllm_batch_decode_fmha(
         "nvfp4": "nvfp4",
     }
 
-    sm_scale = float(1.0 / (head_dim**0.5))
-    if q_dtype == "fp8":
-        q = torch.randn(
-            batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        q, q_scale = to_float8(q)
-        # Reference implementation have functional issue or low precision with fp8, use bfloat16 and fake-quantization instead.
-        ref_q = q.bfloat16() * q_scale
-    else:
-        q = torch.randn(
-            batch_size, num_qo_heads, head_dim, dtype=dtype_map[q_dtype], device=device
-        )
-        q_scale = 1.0
-        ref_q = q
-
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = MAX_SEQ_LEN
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
+    num_qo_heads = num_kv_heads * head_grp_size
+
+    q = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16 if q_dtype == "fp8" else dtype_map[q_dtype],
+        device=device,
+    )
+    if q_dtype == "fp8":
+        q, q_scale = to_float8(q)
+        # Reference implementation have functional issue or low precision with fp8, use bfloat16 and fake-quantization instead.
+        ref_q = q.bfloat16() * q_scale
+    else:
+        q_scale = 1.0
+        ref_q = q
 
     blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
     max_num_blocks_per_seq = max(blocks_per_seq)
@@ -179,7 +174,7 @@ def test_trtllm_batch_decode_fmha(
     # Generate unique block IDs for all sequences
     block_id = 0
     block_tables = torch.zeros(
-        (batch_size, max_num_blocks_per_seq), dtype=torch.int, device=device
+        (batch_size, max_num_blocks_per_seq), dtype=torch.int32, device=device
     )
 
     # Populate block tables and track block assignments
@@ -192,6 +187,9 @@ def test_trtllm_batch_decode_fmha(
         block_id += num_blocks_needed
 
     # Create separate K and V caches
+    num_tokens = MAX_SEQ_LEN * batch_size
+    num_blocks = (num_tokens + page_size - 1) // page_size
+
     kv_dtype = dtype_map[q_dtype] if q_dtype != "fp8" else torch.bfloat16
     k_cache = torch.randn(
         num_blocks, num_kv_heads, page_size, head_dim, dtype=kv_dtype, device=device
@@ -226,7 +224,17 @@ def test_trtllm_batch_decode_fmha(
         0.2 if o_dtype == "nvfp4" else None
     )  # choose a value to make error smaller by testing.
 
+    sm_scale = float(1.0 / (head_dim**0.5))
+
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    # Compute kv_indptr as cumulative sum of blocks per sequence
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.cumsum(blocks_per_seq, dim=0),
+        ]
+    )
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -257,9 +265,6 @@ def test_trtllm_batch_decode_fmha(
     )
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
-    # Compute kv_indptr as cumulative sum of blocks per sequence
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
-    kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
     # Create kv_indices with only the allocated blocks
     kv_indices = all_block_ids.int()
 

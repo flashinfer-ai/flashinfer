@@ -1812,6 +1812,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         *args,
+        q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
@@ -1890,6 +1891,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        if q_scale is not None:
+            sm_scale *= q_scale
         if k_scale is not None:
             sm_scale *= k_scale
         if rope_scale is None:
@@ -1994,8 +1997,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
 
         self._cached_module.paged_run(*run_args)
-        if v_scale is not None:
-            out *= v_scale
 
         return (out, lse) if return_lse else out
 
