@@ -64,11 +64,8 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
 
     measurements = bench_gpu_time(
         lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     ms = np.median(measurements)
 

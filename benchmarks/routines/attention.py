@@ -521,9 +521,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if is_cuda_graph_compatible:
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 num_iters_within_graph=20,
-                num_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,
@@ -532,8 +532,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         else:
             backend_times[cur_backend] = bench_gpu_time(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
-                num_iters=args.num_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,
@@ -968,9 +968,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         if is_cuda_graph_compatible:
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 num_iters_within_graph=20,
-                num_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,
@@ -979,8 +979,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         else:
             backend_times[cur_backend] = bench_gpu_time(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
-                num_iters=args.num_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,
@@ -1331,9 +1331,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if is_cuda_graph_compatible:
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 num_iters_within_graph=20,
-                num_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,
@@ -1342,8 +1342,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         else:
             backend_times[cur_backend] = bench_gpu_time(
                 fn=lambda: run_backend_wrapper(cur_backend),
-                dry_runs=args.dry_run_iters,
-                num_iters=args.num_iters,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
                 l2_flush=True,
                 l2_flush_size_mb=256,
                 l2_flush_device=device,

@@ -170,12 +170,7 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out)
 
     measurements = bench_gpu_time(
-        lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out)
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
@@ -187,12 +182,7 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     a_scale = a_scale.transpose(0, 1).contiguous()
     b_scale = b_scale.transpose(0, 1).contiguous()
     measurements = bench_gpu_time(
-        lambda: triton_w8a8_block_fp8_matmul(a, b, a_scale, b_scale, tl_out),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        lambda: triton_w8a8_block_fp8_matmul(a, b, a_scale, b_scale, tl_out)
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms

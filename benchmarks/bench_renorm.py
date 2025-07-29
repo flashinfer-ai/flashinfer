@@ -41,11 +41,8 @@ def main():
                     probs = torch.softmax(logits, dim=-1)
                     measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_p_renorm_probs(probs, p),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
 
@@ -70,11 +67,8 @@ def main():
                     probs = torch.softmax(logits, dim=-1)
                     measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_k_renorm_probs(probs, k),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
 
@@ -98,11 +92,8 @@ def main():
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     measurements = bench_gpu_time(
                         lambda: flashinfer.sampling.top_k_mask_logits(logits, k),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
 

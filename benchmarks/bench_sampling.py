@@ -70,11 +70,8 @@ def main():
                     )
                     measurements = bench_gpu_time(
                         lambda: init_seed_sampling(probs, deterministic=deterministic),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
 
@@ -108,11 +105,8 @@ def main():
                             lambda: init_seed_top_k_sampling(
                                 probs, k, deterministic=deterministic
                             ),
-                            dry_runs=100,
-                            num_iters=1000,
-                            l2_flush=True,
-                            l2_flush_size_mb=256,
-                            l2_flush_device=torch.device("cuda:0"),
+                            dry_run_time_ms=100,
+                            repeat_time_ms=1000,
                         )
                         ms = np.median(measurements)
 
@@ -147,11 +141,8 @@ def main():
                             lambda: init_seed_top_p_sampling(
                                 probs, p, deterministic=deterministic
                             ),
-                            dry_runs=100,
-                            num_iters=1000,
-                            l2_flush=True,
-                            l2_flush_size_mb=256,
-                            l2_flush_device=torch.device("cuda:0"),
+                            dry_run_time_ms=100,
+                            repeat_time_ms=1000,
                         )
                         ms = np.median(measurements)
 
@@ -183,11 +174,8 @@ def main():
                         lambda: init_seed_sampling_from_softmax_logits(
                             logits, samples, deterministic=deterministic
                         ),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
                     io = (
@@ -218,11 +206,8 @@ def main():
                         lambda: init_seed_sampling_from_logits(
                             logits, samples, deterministic=deterministic
                         ),
-                        dry_runs=100,
-                        num_iters=1000,
-                        l2_flush=True,
-                        l2_flush_size_mb=256,
-                        l2_flush_device=torch.device("cuda:0"),
+                        dry_run_time_ms=100,
+                        repeat_time_ms=1000,
                     )
                     ms = np.median(measurements)
 

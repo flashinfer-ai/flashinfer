@@ -24,11 +24,8 @@ def bench_gemm_persistent(num_sms, dtype, M, N, K, reps=1000, warmup_reps=10000)
             beta=0.0,
             num_sms=num_sms,
         ),
-        dry_runs=warmup_reps,
-        num_iters=reps,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=warmup_reps,
+        repeat_time_ms=reps,
     )
     ms = np.median(measurements)
 
@@ -53,11 +50,8 @@ def bench_gemm_descriptor_persistent(
             beta=0.0,
             num_sms=num_sms,
         ),
-        dry_runs=warmup_reps,
-        num_iters=reps,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=warmup_reps,
+        repeat_time_ms=reps,
     )
     ms = np.median(measurements)
 

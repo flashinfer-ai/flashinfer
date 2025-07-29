@@ -69,14 +69,7 @@ def run_bench(
         kv_data_type=torch.bfloat16,
     )
     o = wrapper_old.run(q, kv_data)
-    measurements = bench_gpu_time(
-        lambda: wrapper_old.run(q, kv_data),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
-    )
+    measurements = bench_gpu_time(lambda: wrapper_old.run(q, kv_data))
     ms_old = np.median(measurements)
 
     if len(p_kv_lens) == 1:

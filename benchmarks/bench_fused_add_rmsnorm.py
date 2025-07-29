@@ -43,14 +43,7 @@ def main():
                     flashinfer.fused_add_rmsnorm(x, residual, weight, eps)
 
                 # Run benchmarking
-                measurements = bench_gpu_time(
-                    fn,
-                    dry_runs=10,
-                    num_iters=100,
-                    l2_flush=True,
-                    l2_flush_size_mb=256,
-                    l2_flush_device=torch.device("cuda:0"),
-                )
+                measurements = bench_gpu_time(fn)
                 latency_ms = np.median(measurements)
                 throughput = (
                     x.numel() * x.element_size() * 2

@@ -42,12 +42,7 @@ def bench_grouped_gemm(
     )
 
     measurements = bench_gpu_time(
-        lambda: segment_gemm.run(X, W, batch_size, True, out=Y, seg_indptr=seg_indptr),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        lambda: segment_gemm.run(X, W, batch_size, True, out=Y, seg_indptr=seg_indptr)
     )
     ms = np.median(measurements)
     flops = 2 * batch_size * num_tokens_per_group * d_in * d_out

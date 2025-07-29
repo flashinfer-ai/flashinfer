@@ -49,14 +49,7 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     wrapper.run(q, kv_data)
     torch.cuda.synchronize()
 
-    measurements = bench_gpu_time(
-        lambda: wrapper.run(q, kv_data),
-        dry_runs=10,
-        num_iters=50,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
-    )
+    measurements = bench_gpu_time(lambda: wrapper.run(q, kv_data))
     ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     print(
@@ -109,7 +102,6 @@ def bench_trtllm_fmha_wrapper(
     # Sequence lengths and block tables
     seq_lens = torch.full((batch_size,), max_seq_len)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
-
     blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
 
     # Generate random but unique block IDs for all sequences
@@ -167,11 +159,8 @@ def bench_trtllm_fmha_wrapper(
 
     measurements = bench_gpu_time_with_cudagraph(
         lambda: wrapper.run(q, kv_cache),
-        dry_runs=10,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()

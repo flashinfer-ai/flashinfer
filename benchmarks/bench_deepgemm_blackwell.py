@@ -52,11 +52,8 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
         lambda: group_deepgemm_fp8_nt_groupwise(
             a_fp8, b_fp8, a_scale, b_scale, m_indices, out=out, out_dtype=out_dtype
         ),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
@@ -105,11 +102,8 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
             out=out,
             out_dtype=out_dtype,
         ),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     ms = np.median(measurements)
 

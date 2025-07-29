@@ -67,14 +67,7 @@ def bench_batch_decode(
         q_data_type=q_dtype,
     )
 
-    measurements = bench_gpu_time(
-        lambda: wrapper.run(q, kv_data),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
-    )
+    measurements = bench_gpu_time(lambda: wrapper.run(q, kv_data))
     ms = np.median(measurements)
 
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()

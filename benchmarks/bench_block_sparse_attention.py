@@ -90,22 +90,16 @@ def bench_variable_block_sparse_attention(
     # Benchmark sparse attention with FA2
     measurements_fa2 = bench_gpu_time(
         lambda: sparse_wrapper_fa2.run(q, k, v),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     sparse_ms_fa2 = np.median(measurements_fa2)
 
     # Benchmark sparse attention with FA3
     measurements_fa3 = bench_gpu_time(
         lambda: sparse_wrapper_fa3.run(q, k, v),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     sparse_ms_fa3 = np.median(measurements_fa3)
 
@@ -118,11 +112,8 @@ def bench_variable_block_sparse_attention(
                 lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
                     q, k, v, causal=False, backend=backend
                 ),
-                dry_runs=100,
-                num_iters=1000,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=torch.device("cuda:0"),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
             )
         )
         for backend in ["fa2", "fa3"]

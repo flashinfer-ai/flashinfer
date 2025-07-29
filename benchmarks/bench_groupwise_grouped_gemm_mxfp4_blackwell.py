@@ -94,11 +94,8 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
                 tile_k=tile_k,
                 swap_ab=swap_ab,
             ),
-            dry_runs=10,
-            num_iters=100,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=torch.device("cuda:0"),
+            dry_run_time_ms=10,
+            repeat_time_ms=100,
         )
         ms = np.median(measurements)
         if ms < ms_best:

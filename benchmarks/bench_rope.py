@@ -196,14 +196,7 @@ def benchmark(
     )
 
     # Get raw measurements
-    measurements = bench_gpu_time(
-        lambda: rope_forward(pos_ids, query, key),
-        dry_runs=10,
-        num_iters=100,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
-    )
+    measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)

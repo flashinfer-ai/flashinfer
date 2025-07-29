@@ -44,11 +44,8 @@ def bench_groupwise_grouped_gemm_fp8_blackwell(
         lambda: flashinfer.gemm.group_gemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, segment_offsets, out=out, mma_sm=2
         ),
-        dry_runs=100,
-        num_iters=1000,
-        l2_flush=True,
-        l2_flush_size_mb=256,
-        l2_flush_device=torch.device("cuda:0"),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms

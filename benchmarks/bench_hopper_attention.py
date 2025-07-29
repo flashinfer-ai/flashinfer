@@ -33,11 +33,8 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
                 lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
                     q, k, v, causal=causal, backend=backend
                 ),
-                dry_runs=100,
-                num_iters=1000,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=torch.device("cuda:0"),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
             )
         )
         for backend in ["fa2", "fa3"]
@@ -92,11 +89,8 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
         np.median(
             bench_gpu_time(
                 lambda: wrapper.run(q, k, v),
-                dry_runs=10,
-                num_iters=100,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=torch.device("cuda:0"),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
             )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
@@ -174,11 +168,8 @@ def bench_batch_paged_prefill(
         np.median(
             bench_gpu_time(
                 lambda: wrapper.run(q, (k, v)),
-                dry_runs=10,
-                num_iters=100,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=torch.device("cuda:0"),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
             )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
