@@ -312,7 +312,7 @@ void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_
   CHECK_EQ(q_rope_in.size(1), num_heads);
   CHECK_EQ(q_nope_in.size(1), num_heads);
   CHECK_EQ(q_rope_out.size(1), num_heads);
-  CHECK_EQ(k_rope_out.size(1), num_heads);
+  CHECK_EQ(q_nope_out.size(1), num_heads);
 
   const uint32_t q_rope_in_stride_n = q_rope_in.stride(0);
   const uint32_t q_rope_in_stride_h = q_rope_in.stride(1);
