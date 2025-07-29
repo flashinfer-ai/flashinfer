@@ -1978,13 +1978,28 @@ def trtllm_batch_decode_with_kv_cache(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
-    window_left: int = -1,
+    bmm1_scale: Optional[float] = 1.0,
+    bmm2_scale: Optional[float] = 1.0,
+    window_left: Optional[int] = -1,
     out: Optional[torch.Tensor] = None,
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Parameters:
+    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
+    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: query_len
+    max_seq_len: max sequence length for kv_cache
+    bmm1_scale: fused scale for bmm1 input. If bmm1_scale_log2_tensor is provided, bmm1_scale will be ignored.
+    bmm2_scale: fused scale for bmm2 input. If bmm2_scale_tensor is provided, bmm2_scale will be ignored.
+    out: output tensor, if not provided, will be allocated internally
+    window_left: window_left for sliding window attention.
+    bmm1_scale_log2_tensor: On-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+    bmm2_scale_tensor: On-device fused scale tensor for bmm2 input.
+    """
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
@@ -2081,8 +2096,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: fused scale for mla bmm1 input.
-    bmm2_scale: fused scale for mla bmm2 input.
+    bmm1_scale: fused scale for mla bmm1 input. If bmm1_scale_log2_tensor is provided, bmm1_scale will be ignored.
+    bmm2_scale: fused scale for mla bmm2 input. If bmm2_scale_tensor is provided, bmm2_scale will be ignored.
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
 
