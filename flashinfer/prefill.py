@@ -109,6 +109,8 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_kv: torch.Tensor,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -129,6 +131,8 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
+            bmm1_scale_log2_tensor,
+            bmm2_scale_tensor,
         )
         return out
 
@@ -448,6 +452,8 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -599,6 +605,8 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1765,6 +1773,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
@@ -1775,7 +1785,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
+        return self.run(
+            q,
+            paged_kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
+        )
 
     @overload
     def run(
@@ -1790,6 +1807,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1805,6 +1824,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1819,6 +1840,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1991,6 +2014,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._batch_size,
                 self._qo_indptr_buf,
                 self._vector_sparse_indptr_buffer,
+                bmm1_scale_log2_tensor,
+                bmm2_scale_tensor,
             ]
 
         self._cached_module.paged_run(*run_args)
@@ -2964,6 +2989,8 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
@@ -2989,5 +3016,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     return out
