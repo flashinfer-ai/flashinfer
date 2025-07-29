@@ -1082,6 +1082,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: this function is deprecated, please use :meth:`run` instead."""
         self._pos_encoding_mode = pos_encoding_mode
@@ -1091,7 +1093,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run(
-            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            q,
+            paged_kv_cache,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     @overload
@@ -1108,6 +1116,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1124,6 +1134,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1139,6 +1151,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1176,6 +1190,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        bmm1_scale_log2_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+        bmm2_scale_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm2 input.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1286,6 +1304,25 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 ]
 
             self._cached_module.paged_run(*run_args)
+        elif self._backend == "trtllm-gen":
+            run_args = [
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
+                q,
+                k_cache,
+                v_cache,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                out,
+                lse,
+                TensorLayout[self._kv_layout].value,
+                window_left,
+                enable_pdl,
+                bmm1_scale_log2_tensor,
+                bmm2_scale_tensor,
+            ]
         else:
             run_args = [
                 self._float_workspace_buffer,
@@ -1338,6 +1375,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
         self._pos_encoding_mode = pos_encoding_mode
@@ -1353,6 +1392,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             k_scale=k_scale,
             v_scale=v_scale,
             return_lse=True,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     run_return_lse = functools.partialmethod(run, return_lse=True)

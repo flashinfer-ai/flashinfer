@@ -104,6 +104,9 @@ def reference_paged_attention(
 @pytest.mark.parametrize("window_left", [-1, 127])
 @pytest.mark.parametrize("q_dtype", ["half", "bf16", "fp8"])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize(
+    "dynamic_scale", [False, True]
+)  # todo(Zihao): enable dynamic scale after publishing cubins
 def test_trtllm_batch_decode_fmha(
     kv_layout,
     batch_size,
@@ -113,6 +116,7 @@ def test_trtllm_batch_decode_fmha(
     window_left,
     q_dtype,
     kv_cache_dtype,
+    dynamic_scale,
 ):
     if kv_cache_dtype == "auto" and q_dtype == "fp8":
         pytest.skip("duplicated test to fp8 kvcache type.")
@@ -265,6 +269,17 @@ def test_trtllm_batch_decode_fmha(
     )
 
     # test wrapper with trtllm-gen backend
+    bmm1_scale_log2_tensor = (
+        torch.tensor(
+            [q_scale * k_scale * sm_scale / math.sqrt(head_dim) * math.log2(math.e)],
+            device=device,
+        )
+        if dynamic_scale
+        else None
+    )
+    bmm2_scale_tensor = (
+        torch.tensor([v_scale / o_scale], device=device) if dynamic_scale else None
+    )
     wrapper2 = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="trtllm-gen"
     )
@@ -284,9 +299,11 @@ def test_trtllm_batch_decode_fmha(
     output2 = wrapper2.run(
         q.contiguous(),
         kv_cache,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale / o_scale,
+        q_scale=q_scale if not dynamic_scale else 0.0,
+        k_scale=k_scale if not dynamic_scale else 0.0,
+        v_scale=v_scale / o_scale if not dynamic_scale else 0.0,
+        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
     )
     # skip compare due to v_scale, o_scale is not supported in wrapper api yet.
     if v_scale == o_scale == 1.0:
