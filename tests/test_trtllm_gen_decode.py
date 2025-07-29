@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
 
 import flashinfer
 
@@ -102,8 +103,17 @@ def reference_paged_attention(
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize("q_dtype", ["half", "bf16", "fp8"])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize(
+    "q_dtype,kv_cache_dtype,o_dtype",
+    [
+        ("half", "half", "half"),
+        ("half", "fp8", "half"),
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
 @pytest.mark.parametrize(
     "dynamic_scale", [False, True]
 )  # todo(Zihao): enable dynamic scale after publishing cubins
@@ -115,11 +125,10 @@ def test_trtllm_batch_decode_fmha(
     head_grp_size,
     window_left,
     q_dtype,
+    o_dtype,
     kv_cache_dtype,
     dynamic_scale,
 ):
-    if kv_cache_dtype == "auto" and q_dtype == "fp8":
-        pytest.skip("duplicated test to fp8 kvcache type.")
 
     # Set up test parameters
     seed = 0
@@ -138,6 +147,7 @@ def test_trtllm_batch_decode_fmha(
         "half": torch.float16,
         "bf16": torch.bfloat16,
         "fp8": torch.float8_e4m3fn,
+        "nvfp4": "nvfp4",
     }
 
     sm_scale = float(1.0 / (head_dim**0.5))
@@ -212,10 +222,14 @@ def test_trtllm_batch_decode_fmha(
         [k_cache, v_cache], dim=1
     )  # Shape: (num_blocks, 2, num_kv_heads, page_size, head_dim)
 
-    # Output type is fp8 when q is fp8, set scale for it.
-    o_scale = (
-        1.0 if q_dtype != "fp8" else torch.rand(1).item() * 0.5 + 0.5
-    )  # Scale range: 0.5 ~ 1.0
+    if o_dtype == "fp8":
+        o_scale = torch.rand(1).item() * 0.5 + 0.5  # Scale range: 0.5 ~ 1.0
+    else:
+        o_scale = 1.0
+    o_sf_scale = (
+        0.2 if o_dtype == "nvfp4" else None
+    )  # choose a value to make error smaller by testing.
+
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -228,7 +242,19 @@ def test_trtllm_batch_decode_fmha(
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
-    ).squeeze(1)
+        out_dtype=dtype_map[o_dtype],
+        o_sf_scale=o_sf_scale,
+        o_sf_vec_size=16 if o_dtype == "nvfp4" else None,
+    )
+
+    # Handle different return types based on out_dtype
+    if o_dtype == "nvfp4":
+        out_scale_factor = output.scale  # FP4Tensor.scale
+        output = output.data  # FP4Tensor.data
+    else:
+        out_scale_factor = None
+
+    output = output.squeeze(1)
 
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
@@ -261,55 +287,81 @@ def test_trtllm_batch_decode_fmha(
 
     output_ref = wrapper.run(ref_q, ref_kv_cache)
 
-    rtol, atol = (1e-2, 5e-2) if q_dtype != "fp8" else (5e-2, 7e-2)
+    if q_dtype == "fp8" and o_dtype == "nvfp4":
+        rtol, atol = 5e-1, 1.1e0
+    elif q_dtype == "fp8" and o_dtype == "fp8":
+        rtol, atol = 5e-2, 7e-2
+    else:
+        rtol, atol = 1e-2, 5e-2
+
+    if o_dtype == "nvfp4":
+        output = cast_from_fp4(output)
+        output_ref, out_scale_factor_ref = ref_nvfp4_quant(output_ref, o_sf_scale, 16)
+        out_scale_factor = recover_swizzled_scales(
+            out_scale_factor, output.shape[0], output.shape[1] * output.shape[2], 16
+        )
+
+        torch.testing.assert_close(
+            out_scale_factor.float().reshape(out_scale_factor_ref.shape),
+            out_scale_factor_ref.float(),
+            rtol=rtol,
+            atol=atol,
+        )
 
     # convert to float32 for fp8 is not supported by assert_close
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
 
-    # test wrapper with trtllm-gen backend
-    bmm1_scale_log2_tensor = (
-        torch.tensor(
-            [q_scale * k_scale * sm_scale / math.sqrt(head_dim) * math.log2(math.e)],
-            device=device,
+    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
+        # test wrapper with trtllm-gen backend
+        bmm1_scale_log2_tensor = (
+            torch.tensor(
+                [
+                    q_scale
+                    * k_scale
+                    * sm_scale
+                    / math.sqrt(head_dim)
+                    * math.log2(math.e)
+                ],
+                device=device,
+            )
+            if dynamic_scale
+            else None
         )
-        if dynamic_scale
-        else None
-    )
-    bmm2_scale_tensor = (
-        torch.tensor([v_scale / o_scale], device=device) if dynamic_scale else None
-    )
-    wrapper2 = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, backend="trtllm-gen"
-    )
-    wrapper2.plan(
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        pos_encoding_mode="NONE",
-        data_type=kv_cache.dtype,
-        q_data_type=q.dtype,
-        window_left=window_left,
-    )
-    output2 = wrapper2.run(
-        q.contiguous(),
-        kv_cache,
-        q_scale=q_scale if not dynamic_scale else 0.0,
-        k_scale=k_scale if not dynamic_scale else 0.0,
-        v_scale=v_scale / o_scale if not dynamic_scale else 0.0,
-        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
-        bmm2_scale_tensor=bmm2_scale_tensor,
-    )
-    # skip compare due to v_scale, o_scale is not supported in wrapper api yet.
-    if v_scale == o_scale == 1.0:
-        torch.testing.assert_close(
-            output2.float(), output.float(), rtol=rtol, atol=atol
+        bmm2_scale_tensor = (
+            torch.tensor([v_scale / o_scale], device=device) if dynamic_scale else None
         )
+        wrapper2 = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout, backend="trtllm-gen"
+        )
+        wrapper2.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            pos_encoding_mode="NONE",
+            data_type=kv_cache.dtype,
+            q_data_type=q.dtype,
+            window_left=window_left,
+        )
+        output2 = wrapper2.run(
+            q.contiguous(),
+            kv_cache,
+            q_scale=q_scale if not dynamic_scale else 0.0,
+            k_scale=k_scale if not dynamic_scale else 0.0,
+            v_scale=v_scale / o_scale if not dynamic_scale else 0.0,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
+        )
+        # v_scale, o_scale is not supported in wrapper api yet.
+        if v_scale == o_scale == 1.0:
+            torch.testing.assert_close(
+                output2.float(), output.float(), rtol=rtol, atol=atol
+            )
 
 
 @pytest.mark.parametrize(
