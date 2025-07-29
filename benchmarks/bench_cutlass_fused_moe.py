@@ -17,13 +17,14 @@ limitations under the License.
 import argparse
 import pprint
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
 from flashinfer.autotuner import AutoTuner, autotune, get_config_path
-from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -173,7 +174,7 @@ def bench_cutlass_fused_moe(
                 output=flash_output,
                 tune_max_num_tokens=16384,
             )
-    ms_list = bench_gpu_time_with_cudagraph(
+    ms_list = bench_gpu_time(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
@@ -184,12 +185,12 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-        )
+        ),
     )
-    avg_ms = sum(ms_list) / len(ms_list)
+    median_ms = np.median(ms_list)
     print(f"{'input':<15} {'weight1':<20} {'weight2':<20} {'time(ms)'}")
     print(
-        f"{str(tuple(hidden_states.shape)):<15} {str(tuple(w1.shape)):<20} {str(tuple(w2.shape)):<20} {avg_ms:.3f}"
+        f"{str(tuple(hidden_states.shape)):<15} {str(tuple(w1.shape)):<20} {str(tuple(w2.shape)):<20} {median_ms:.3f}"
     )
 
 

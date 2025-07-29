@@ -16,9 +16,9 @@ limitations under the License.
 
 import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_grouped_gemm(
@@ -41,9 +41,10 @@ def bench_grouped_gemm(
         device="cuda:0",
     )
 
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: segment_gemm.run(X, W, batch_size, True, out=Y, seg_indptr=seg_indptr)
     )
+    ms = np.median(measurements)
     flops = 2 * batch_size * num_tokens_per_group * d_in * d_out
 
     print(
@@ -53,6 +54,12 @@ def bench_grouped_gemm(
 
 
 if __name__ == "__main__":
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability[0] != 9:
+        print(f"Current device capability: {device_capability}.")
+        print("Current benchmark targets capability (9, 0). Returning...")
+        exit()
+
     for dtype_in in [torch.float8_e4m3fn, torch.bfloat16]:
         for dtype_out in [torch.bfloat16]:
             for batch_size in [1, 3, 8, 16]:

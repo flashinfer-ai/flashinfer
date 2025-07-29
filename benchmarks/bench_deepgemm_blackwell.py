@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
 )
-from flashinfer.testing.utils import quantize_fp8
+from flashinfer.testing.utils import bench_gpu_time, quantize_fp8
 
 
 def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):
@@ -48,14 +48,14 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
     out = torch.empty(batch_size * m, n, device="cuda", dtype=out_dtype)
 
     # Benchmark the DeepGEMM function
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: group_deepgemm_fp8_nt_groupwise(
             a_fp8, b_fp8, a_scale, b_scale, m_indices, out=out, out_dtype=out_dtype
         ),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
-
+    ms = np.median(measurements)
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
     memory_bandwidth_per_second = (
         sum(
@@ -91,7 +91,7 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
     out = torch.empty((batch_size, m, n), device="cuda", dtype=out_dtype)
 
     # Benchmark the DeepGEMM function
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: batch_deepgemm_fp8_nt_groupwise(
             a_fp8,
             b_fp8,
@@ -102,9 +102,10 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
             out=out,
             out_dtype=out_dtype,
         ),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
 
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
     memory_bandwidth_per_second = (

@@ -202,9 +202,8 @@ def testGemmFp8NtGroupwise(args):
     if is_cuda_graph_compatible:
         measured_times = bench_gpu_time_with_cudagraph(
             fn=kernel_fn,
-            dry_runs=args.dry_run_iters,
-            num_iters=args.num_iters,
-            nvtx_range_name=f"gemm_fp8_nt_groupwise",
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
             l2_flush=True,
             l2_flush_size_mb=256,
             l2_flush_device=device,
@@ -213,9 +212,8 @@ def testGemmFp8NtGroupwise(args):
     else:
         measured_times = bench_gpu_time(
             fn=kernel_fn,
-            dry_runs=args.dry_run_iters,
-            num_iters=args.num_iters,
-            nvtx_range_name=f"gemm_fp8_nt_groupwise",
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
             l2_flush=True,
             l2_flush_size_mb=256,
             l2_flush_device=device,
@@ -369,9 +367,8 @@ def testGroupGemmFp8NtGroupwise(args):
     if is_cuda_graph_compatible:
         measured_times = bench_gpu_time_with_cudagraph(
             fn=kernel_fn,
-            dry_runs=args.dry_run_iters,
-            num_iters=args.num_iters,
-            nvtx_range_name=f"group_gemm_fp8_nt_groupwise",
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
             l2_flush=True,
             l2_flush_size_mb=256,
             l2_flush_device=device,
@@ -380,9 +377,8 @@ def testGroupGemmFp8NtGroupwise(args):
     else:
         measured_times = bench_gpu_time(
             fn=kernel_fn,
-            dry_runs=args.dry_run_iters,
-            num_iters=args.num_iters,
-            nvtx_range_name=f"group_gemm_fp8_nt_groupwise",
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
             l2_flush=True,
             l2_flush_size_mb=256,
             l2_flush_device=device,
