@@ -212,9 +212,9 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> con
                                               std::to_string(head_dim_kv) + " and " +
                                               std::to_string(head_dim_qk));
   int head_dim_vo = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
-  TORCH_CHECK(head_dim_kv == head_dim_vo, "head_dim_kv and head_dim_vo must be the same, got " +
-                                              std::to_string(head_dim_kv) + " and " +
-                                              std::to_string(head_dim_vo));
+  TORCH_CHECK((head_dim_kv == 576 && head_dim_vo == 512) || head_dim_kv == head_dim_vo,
+              "head_dim_kv and head_dim_vo must be the same for non-MLA attention, got " +
+                  std::to_string(head_dim_kv) + " and " + std::to_string(head_dim_vo));
   // NOTE(Zihao): key_value_cache is [num_pages, 1/2, num_kv_heads, page_size, head_dim]
   // For KV-Cache sharing (MLA), the second dimension is 1 (key/value cache are shared)
   // otherwise it is 2, one for key and one for value
