@@ -80,7 +80,8 @@ void trtllm_paged_attention_launcher(
     int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
     int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_keys_values, int64_t kv_stride_heads,
     int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
-    int64_t window_left, int64_t sum_seq_q, int64_t sm_count, cudaStream_t stream) {
+    float* bmm1_scale_log2_ptr, float* bmm2_scale_ptr, int64_t window_left, int64_t sum_seq_q,
+    int64_t sm_count, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -116,6 +117,8 @@ void trtllm_paged_attention_launcher(
   runner_params.stream = stream;
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+  runner_params.outputScalePtr = bmm2_scale_ptr;
+  runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.mChunkedAttentionSize = INT_MAX;  // disable chunked attention by INT_MAX
   runner_params.mAttentionWindowSize =
       window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
@@ -177,7 +180,9 @@ inline Data_type torch_dtype_to_tllm_data_type(at::ScalarType dtype) {
 void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
                                    at::Tensor& workspace_buffer, at::Tensor& block_tables,
                                    at::Tensor& seq_lens, int64_t max_kv_len, double bmm1_scale,
-                                   double bmm2_scale, int64_t window_left, int64_t sm_count) {
+                                   double bmm2_scale, int64_t window_left, int64_t sm_count,
+                                   std::optional<at::Tensor> bmm1_scale_log2_tensor,
+                                   std::optional<at::Tensor> bmm2_scale_tensor) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
   auto kv_data_type = torch_dtype_to_tllm_data_type(key_value_cache.scalar_type());
   auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
@@ -210,6 +215,15 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
   auto device = query.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
+  float* bmm1_scale_log2_ptr = nullptr;
+  float* bmm2_scale_ptr = nullptr;
+  if (bmm1_scale_log2_tensor.has_value()) {
+    bmm1_scale_log2_ptr = static_cast<float*>(bmm1_scale_log2_tensor.value().data_ptr());
+  }
+  if (bmm2_scale_tensor.has_value()) {
+    bmm2_scale_ptr = static_cast<float*>(bmm2_scale_tensor.value().data_ptr());
+  }
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key_value_cache.data_ptr(),
       (char*)key_value_cache.data_ptr() +
@@ -221,7 +235,7 @@ void trtllm_paged_attention_decode(at::Tensor& out, at::Tensor& query, at::Tenso
       TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
-      bmm2_scale, window_left, sum_seq_q, sm_count, stream);
+      bmm2_scale, bmm1_scale_log2_ptr, bmm2_scale_ptr, window_left, sum_seq_q, sm_count, stream);
 }
 
 void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
@@ -229,7 +243,9 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
                                     at::Tensor& seq_lens, int64_t max_q_len, int64_t max_kv_len,
                                     double bmm1_scale, double bmm2_scale, int64_t batch_size,
                                     int64_t window_left, at::Tensor& cum_seq_lens_q,
-                                    at::Tensor& cum_seq_lens_kv, int64_t sm_count) {
+                                    at::Tensor& cum_seq_lens_kv, int64_t sm_count,
+                                    std::optional<at::Tensor> bmm1_scale_log2_tensor,
+                                    std::optional<at::Tensor> bmm2_scale_tensor) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
   auto kv_data_type = torch_dtype_to_tllm_data_type(key_value_cache.scalar_type());
   auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
@@ -255,6 +271,14 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
 
   auto device = query.device();
   const auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  float* bmm1_scale_log2_ptr = nullptr;
+  float* bmm2_scale_ptr = nullptr;
+  if (bmm1_scale_log2_tensor.has_value()) {
+    bmm1_scale_log2_ptr = static_cast<float*>(bmm1_scale_log2_tensor.value().data_ptr());
+  }
+  if (bmm2_scale_tensor.has_value()) {
+    bmm2_scale_ptr = static_cast<float*>(bmm2_scale_tensor.value().data_ptr());
+  }
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key_value_cache.data_ptr(),
@@ -267,7 +291,7 @@ void trtllm_paged_attention_context(at::Tensor& out, at::Tensor& query, at::Tens
       o_data_type, TllmPagedAttentionMode::Context, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
-      bmm2_scale, window_left, sum_seq_q, sm_count, stream);
+      bmm2_scale, bmm1_scale_log2_ptr, bmm2_scale_ptr, window_left, sum_seq_q, sm_count, stream);
 }
 
 namespace trtllm_cubin_loader {

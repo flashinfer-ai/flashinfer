@@ -1800,6 +1800,8 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1819,6 +1821,8 @@ class TrtllmGenDecodeModule:
             bmm2_scale,
             window_left,
             self._sm_count,
+            bmm1_scale_log2_tensor,
+            bmm2_scale_tensor,
         )
         return out
 
@@ -1890,6 +1894,8 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -1910,6 +1916,8 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
             out=o,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -1948,6 +1956,8 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1972,6 +1982,8 @@ def trtllm_batch_decode_with_kv_cache(
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
@@ -1993,6 +2005,8 @@ def trtllm_batch_decode_with_kv_cache(
         bmm2_scale,
         window_left,
         sm_count,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     return out
 
@@ -2141,5 +2155,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         bmm2_scale,
         -1,  # window_left
         sm_count,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     return out
