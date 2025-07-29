@@ -141,10 +141,6 @@ def test_trtllm_batch_decode_fmha(
     }
 
     # Sequence lengths and block tables
-    seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
-    seq_lens[-1] = MAX_SEQ_LEN
-    max_seq_len = max(seq_lens)
-    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
     num_qo_heads = num_kv_heads * head_grp_size
 
     q = torch.randn(
@@ -162,13 +158,18 @@ def test_trtllm_batch_decode_fmha(
         q_scale = 1.0
         ref_q = q
 
-    blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
-    max_num_blocks_per_seq = max(blocks_per_seq)
+    seq_lens = torch.randint(1, MAX_SEQ_LEN, (batch_size,), dtype=torch.int32)
+    seq_lens[-1] = MAX_SEQ_LEN
+    seq_lens_gpu = seq_lens.to(device)
+    max_seq_len = torch.max(seq_lens).item()
+
+    blocks_per_seq = (seq_lens + page_size - 1) // page_size
+    max_num_blocks_per_seq = torch.max(blocks_per_seq).item()
 
     # Generate random but unique block IDs for all sequences
-    total_blocks_needed = sum(blocks_per_seq)
+    total_blocks_needed = torch.sum(blocks_per_seq).item()
     all_block_ids = torch.randperm(
-        total_blocks_needed, device=device
+        total_blocks_needed, dtype=torch.int32, device=device
     )  # Random permutation
 
     # Generate unique block IDs for all sequences
@@ -187,7 +188,7 @@ def test_trtllm_batch_decode_fmha(
         block_id += num_blocks_needed
 
     # Create separate K and V caches
-    num_tokens = MAX_SEQ_LEN * batch_size
+    num_tokens = max_seq_len * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
 
     kv_dtype = dtype_map[q_dtype] if q_dtype != "fp8" else torch.bfloat16
@@ -232,7 +233,7 @@ def test_trtllm_batch_decode_fmha(
     kv_indptr = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(blocks_per_seq, dim=0),
+            torch.cumsum(blocks_per_seq.to(device), dim=0, dtype=torch.int32),
         ]
     )
 
@@ -241,7 +242,7 @@ def test_trtllm_batch_decode_fmha(
         kv_cache,
         workspace_buffer,
         block_tables,
-        seq_lens_tensor,
+        seq_lens_gpu,
         max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
@@ -263,18 +264,15 @@ def test_trtllm_batch_decode_fmha(
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
     )
-    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
-
-    # Create kv_indices with only the allocated blocks
-    kv_indices = all_block_ids.int()
+    blocks_per_seq = (seq_lens_gpu + page_size - 1) // page_size
 
     # Calculate last page lengths
-    kv_last_page_len = seq_lens_tensor % page_size
+    kv_last_page_len = seq_lens_gpu % page_size
     kv_last_page_len[kv_last_page_len == 0] = page_size
 
     wrapper.plan(
         kv_indptr,
-        kv_indices,
+        all_block_ids,
         kv_last_page_len,
         num_qo_heads,
         num_kv_heads,
@@ -321,7 +319,7 @@ def test_trtllm_batch_decode_fmha(
         )
         wrapper2.plan(
             kv_indptr,
-            kv_indices,
+            all_block_ids,
             kv_last_page_len,
             num_qo_heads,
             num_kv_heads,
@@ -341,9 +339,7 @@ def test_trtllm_batch_decode_fmha(
         )
         # v_scale, o_scale is not supported in wrapper api yet.
         if v_scale == o_scale == 1.0:
-            torch.testing.assert_close(
-                output2.float(), output.float(), rtol=rtol, atol=atol
-            )
+            assert (output2 == output).all()
 
 
 @pytest.mark.parametrize(

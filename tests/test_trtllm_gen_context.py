@@ -232,7 +232,7 @@ def test_trtllm_batch_prefill(
     device = "cuda:0"
     head_dim = 128
     MAX_Q_LEN = 512
-    MAX_KV_LEN = 2048
+    MAX_IN_KV_LEN = 2048
 
     dtype_map = {
         "half": torch.float16,
@@ -244,12 +244,12 @@ def test_trtllm_batch_prefill(
     # Sequence lengths and block tables
     q_lens = torch.randint(1, MAX_Q_LEN, (batch_size,), dtype=torch.int32)
     q_lens[-1] = MAX_Q_LEN
-    max_q_len = torch.max(q_lens)
+    max_q_len = torch.max(q_lens).item()
     q_lens_tensor = q_lens.to(device)
     num_qo_heads = num_kv_heads * head_grp_size
 
     q = torch.randn(
-        sum(q_lens),
+        torch.sum(q_lens).item(),
         num_qo_heads,
         head_dim,
         dtype=torch.bfloat16 if q_dtype == "fp8" else dtype_map[q_dtype],
@@ -263,18 +263,18 @@ def test_trtllm_batch_prefill(
         q_scale = 1.0
         ref_q = q
 
-    kv_lens = torch.randint(0, MAX_KV_LEN, (batch_size,), dtype=torch.int)
-    kv_lens[-1] = MAX_KV_LEN
-    max_kv_len = torch.max(kv_lens)
-    seq_lens = kv_lens + q_lens
+    in_kv_lens = torch.randint(0, MAX_IN_KV_LEN, (batch_size,), dtype=torch.int)
+    in_kv_lens[-1] = MAX_IN_KV_LEN
+    max_in_kv_len = torch.max(in_kv_lens).item()
+    seq_lens = in_kv_lens + q_lens
     seq_lens_gpu = seq_lens.to(device)
-    max_seq_len = torch.max(seq_lens)
+    max_seq_len = torch.max(seq_lens).item()
 
     blocks_per_seq = (seq_lens + page_size - 1) // page_size
-    max_num_blocks_per_seq = torch.max(blocks_per_seq)
+    max_num_blocks_per_seq = torch.max(blocks_per_seq).item()
 
     # Generate random but unique block IDs for all sequences
-    total_blocks_needed = torch.sum(blocks_per_seq)
+    total_blocks_needed = torch.sum(blocks_per_seq).item()
     all_block_ids = torch.randperm(
         total_blocks_needed, dtype=torch.int32, device=device
     )  # Random permutation
@@ -355,7 +355,7 @@ def test_trtllm_batch_prefill(
         block_tables,
         seq_lens_gpu,
         max_q_len,
-        max_kv_len,
+        max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         batch_size,
@@ -402,7 +402,7 @@ def test_trtllm_batch_prefill(
     elif q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
     else:
-        rtol, atol = 5e-2, 5e-2
+        rtol, atol = 1e-2, 1e-2
 
     if o_dtype == "nvfp4":
         output = cast_from_fp4(output)
