@@ -51,18 +51,20 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
-_package_root = pathlib.Path(__file__).resolve().parents[1]
-FLASHINFER_DATA = _package_root / "data"
-FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
-# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
-FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
-FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
+# TODO (pranavm): Check if this is right?
+# Why were these pointing to non-existent directories? Must be a copy missing somewhere?
+_package_root = pathlib.Path(__file__).resolve().parents[2]
+FLASHINFER_DATA = _package_root
+FLASHINFER_INCLUDE_DIR = _package_root  / "include"
+FLASHINFER_CSRC_DIR = _package_root  / "csrc"
+# FLASHINFER_SRC_DIR = _package_root  / "src"
+FLASHINFER_TVM_BINDING_DIR = _package_root  / "tvm_binding"
+FLASHINFER_AOT_DIR = _package_root  / "aot"
 CUTLASS_INCLUDE_DIRS = [
-    _package_root / "data" / "cutlass" / "include",
-    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
+    _package_root / "3rdparty" / "cutlass" / "include",
+    _package_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
 ]
-SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
+SPDLOG_INCLUDE_DIR = _package_root / "3rdparty" / "spdlog" / "include"
 
 
 def get_nvshmem_include_dirs():

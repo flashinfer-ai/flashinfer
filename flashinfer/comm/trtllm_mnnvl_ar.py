@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-from mpi4py import MPI
+import torch.distributed as dist
 
 from flashinfer.comm.mapping import Mapping
 
@@ -21,9 +21,6 @@ from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer
 
 
-def mpi_barrier():
-    """MPI barrier - could potentially be replaced with dist.barrier()"""
-    MPI.COMM_WORLD.Barrier()
 
 
 def gen_trtllm_mnnvl_comm_module() -> JitSpec:
@@ -181,7 +178,7 @@ def get_allreduce_mnnvl_workspace(
 
     # CPU barrier since we assume this should not be called in cuda graph
     torch.cuda.synchronize()
-    mpi_barrier()
+    dist.barrier()
 
     # This is a buffer to maintain the state of this allreduce Op
     # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_prev, atomic access counter]

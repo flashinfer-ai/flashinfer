@@ -1,16 +1,13 @@
 # Check torch version:
 import os
 import sys
-import traceback
 
 import pytest
 import torch
-from mpi4py import MPI  # Added MPI import
+import torch.distributed as dist
 
-import flashinfer.comm as comm
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import McastDeviceMemory, McastGPUBuffer
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
@@ -42,7 +39,7 @@ def row_linear_residual_norm_fusion_forward(
     tensor_parallel_size = mapping.tp_size
     tensor_parallel_rank = mapping.tp_rank
 
-    MPI.COMM_WORLD.barrier()
+    dist.barrier()
 
     def func(
         input,
@@ -70,7 +67,7 @@ def row_linear_residual_norm_fusion_forward(
             prenorm_output = torch.empty_like(residual)
             normed_output = torch.empty_like(residual)
 
-            trtllm_mnnvl_ar.mpi_barrier()
+            dist.barrier()
 
             trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_rmsnorm(
                 prenorm_output,
@@ -152,7 +149,7 @@ def row_linear_residual_norm_fusion_forward(
         )
 
 
-"""Main test function that runs on each MPI rank"""
+"""Main test function that runs on each distributed rank"""
 
 
 @pytest.mark.parametrize(
@@ -173,9 +170,29 @@ def test_mnnvl_allreduce_full(
 ):
     monkeypatch.setenv("TRTLLM_FORCE_MNNVL_AR", "1")  # force multi-node allreduce.
 
-    # Get MPI info
-    rank = MPI.COMM_WORLD.Get_rank()
-    world_size = MPI.COMM_WORLD.Get_size()
+    # Hack to get an address that all nodes in the slurm job can reach
+    master_addr = os.environ.get("MASTER_ADDR", None)
+    if master_addr is None:
+        # Use SLURM's first node as master
+        master_addr = os.environ.get("SLURM_NODELIST", "localhost").split(",")[0]
+        # Remove brackets if present (e.g., "node[01-02]" -> "node01")
+        if "[" in master_addr:
+            import re
+
+            master_addr = re.sub(r"\[.*\]", "0", master_addr)
+    master_port = os.environ.get("MASTER_PORT", "12345")
+
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://{master_addr}:{master_port}",
+            world_size=2,
+            rank=int(os.environ.get("SLURM_PROCID")),
+        )
+
+    # Get distributed info
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     gpus_per_node = torch.cuda.device_count()
 
     if gpus_per_node == 0:
@@ -184,7 +201,9 @@ def test_mnnvl_allreduce_full(
     # Ensure we have exactly 2 ranks for this test
     if world_size < 2:
         if rank == 0:
-            print(f"ERROR: This test requires at least 2 MPI ranks, got {world_size}")
+            print(
+                f"ERROR: This test requires at least 2 distributed ranks, got {world_size}"
+            )
         sys.exit(1)
 
     mapping = Mapping(
@@ -287,7 +306,7 @@ def test_mnnvl_allreduce_full(
             )
 
             # Synchronize before next test
-            trtllm_mnnvl_ar.mpi_barrier()
+            dist.barrier()
 
             print(
                 f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}"
@@ -298,7 +317,8 @@ def test_mnnvl_allreduce_full(
         failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
         print(failure_message)
         # Gather failure status from all ranks
-        all_failures = MPI.COMM_WORLD.allgather(rank_failed)
+        all_failures = [None for _ in range(world_size)]
+        dist.all_gather_object(all_failures, rank_failed)
 
         # If any rank failed, fail the test
         if any(all_failures):
@@ -308,7 +328,7 @@ def test_mnnvl_allreduce_full(
 
             # Fail the test on all ranks
             pytest.fail(f"Test failed on ranks {failed_ranks}")
-            trtllm_mnnvl_ar.mpi_barrier()
+            dist.barrier()
 
     finally:
         # Ensure cleanup happens for this list's workspace
@@ -316,4 +336,4 @@ def test_mnnvl_allreduce_full(
             del mcast_buffer_mnnvl
 
     # Final synchronization and check for failures across all ranks
-    trtllm_mnnvl_ar.mpi_barrier()
+    dist.barrier()

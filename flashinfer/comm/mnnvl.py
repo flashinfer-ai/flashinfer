@@ -17,13 +17,12 @@ import ctypes
 import logging
 import platform
 import sys
-from dataclasses import dataclass
 from typing import List, Optional
 
 import pynvml
 import torch
+import torch.distributed as dist
 from cuda import cuda
-from mpi4py import MPI
 
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
@@ -130,17 +129,6 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
     return device_ptr
 
 
-class MpiComm:
-    _comm: MPI.Intracomm = MPI.COMM_WORLD
-
-    @classmethod
-    def set_mpi_comm(cls, new_comm: MPI.Intracomm):
-        cls._comm = new_comm
-
-    def __getattr__(self, name):
-        return getattr(self._comm, name)
-
-
 class MnnvlMemory:
     initialized: bool = False
 
@@ -198,6 +186,19 @@ class MnnvlMemory:
     def get_comm(mapping: Mapping):
         if MnnvlMemory.comm is not None:
             return MnnvlMemory.comm
+
+        from mpi4py import MPI
+
+        class MpiComm:
+            _comm: MPI.Intracomm = MPI.COMM_WORLD
+
+            @classmethod
+            def set_mpi_comm(cls, new_comm: MPI.Intracomm):
+                cls._comm = new_comm
+
+            def __getattr__(self, name):
+                return getattr(self._comm, name)
+
         comm = MpiComm().Split(
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
         )
@@ -628,9 +629,6 @@ class McastDeviceMemory:
         except Exception as e:
             print(f"Error checking CUDA context: {e}")
 
-        # Get MPI communicator
-        comm = MpiComm()
-
         # Set up allocation properties
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 
@@ -692,7 +690,12 @@ class McastDeviceMemory:
         )
 
         # All-gather fabric handles
-        all_fabric_handles = comm.allgather(my_fabric_handle.data)
+        if not dist.is_initialized():
+            raise RuntimeError("torch.distributed must be initialized before use.")
+
+        # Use all_gather_object to collect fabric handles from all ranks
+        all_fabric_handles = [None for _ in range(self.group_size)]
+        dist.all_gather_object(all_fabric_handles, my_fabric_handle.data)
         cuda.cuCtxSynchronize()
 
         # Import remote handles
@@ -722,9 +725,10 @@ class McastDeviceMemory:
             mc_fabric_handle = None
 
         # Broadcast multicast handle
-        mc_fabric_handle_data = comm.bcast(
-            mc_fabric_handle.data if mc_fabric_handle else None, root=0
-        )
+        mc_fabric_handle_list = [mc_fabric_handle.data] if mc_fabric_handle else [None]
+        dist.broadcast_object_list(mc_fabric_handle_list, src=0)
+        mc_fabric_handle_data = mc_fabric_handle_list[0]
+
         # Sync device to ensure broadcast is complete
         cuda.cuCtxSynchronize()
         # Import multicast handle for non-root ranks
