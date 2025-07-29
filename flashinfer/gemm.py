@@ -834,7 +834,7 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
         )
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_block_scale_dequantize_graph(
     a_shape,
     a_stride,
@@ -946,7 +946,7 @@ def execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, c_fin
     graph.execute(variant_pack, workspace, handle=_get_cudnn_handle(stream))
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_with_per_tensor_q_graph(
     a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
 ):
