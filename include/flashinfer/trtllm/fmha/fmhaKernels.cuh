@@ -146,7 +146,7 @@ class TllmGenFmhaKernel {
       auto const findFuncIter = mFunctions.find(hashId);
       if (findFuncIter == mFunctions.end()) {
         // Load the kernel on-demand.
-        loadKernel(hashId, findMetaIter->second);
+        loadKernel(hashId, findMetaIter->second, params);
       }
       // Retrieve the loaded kernel.
       auto const& kernelInfo = mFunctions.at(hashId);
@@ -236,6 +236,15 @@ class TllmGenFmhaKernel {
 
   static std::string getCubinPath() {
     const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
+    std::string hash =
+        env_hash ? std::string(env_hash) : "4c7bdebb4eba13311fc652a069e64782d5c0723d";
+    std::string cubin_path = hash + "/fmha/trtllm-gen/";
+    return cubin_path;
+  }
+
+  static std::string getDynamicScaleCubinPath() {
+    // todo(Zihao): add hash here
+    const char* env_hash = std::getenv("FLASHINFER_CUBIN_DYN_SCALE_ARTIFACTORY_HASH");
     std::string hash =
         env_hash ? std::string(env_hash) : "4c7bdebb4eba13311fc652a069e64782d5c0723d";
     std::string cubin_path = hash + "/fmha/trtllm-gen/";
@@ -524,7 +533,7 @@ class TllmGenFmhaKernel {
   }
 
   // Load a single kernel (called by `run()` when needed).
-  void loadKernel(uint64_t hashId, unsigned int metaIndex) const {
+  void loadKernel(uint64_t hashId, unsigned int metaIndex, RunnerParams const& params) const {
     auto const& kernelMeta = mKernelMeta[metaIndex];
     CUmodule hmod{0};
     std::string kernelName(kernelMeta.mFuncName);
@@ -539,7 +548,12 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path = TllmGenFmhaKernel::getCubinPath() + kernelMeta.mFuncName;
+      std::string cubin_path;
+      if (params.outputScalePtr != nullptr && params.scaleSoftmaxLog2Ptr != nullptr) {
+        cubin_path = TllmGenFmhaKernel::getDynamicScaleCubinPath() + kernelMeta.mFuncName;
+      } else {
+        cubin_path = TllmGenFmhaKernel::getCubinPath() + kernelMeta.mFuncName;
+      }
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
