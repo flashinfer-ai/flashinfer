@@ -24,7 +24,7 @@ from torch.nn import functional as F
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
 from flashinfer.autotuner import AutoTuner, autotune, get_config_path
-from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
