@@ -2206,6 +2206,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     run_func(
         out,
+        None,  # fp4 output not supported in wrapper api yet.
         query,
         kv_cache.unsqueeze(-3),
         workspace_buffer,
@@ -2214,6 +2215,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         max_seq_len,
         bmm1_scale,
         bmm2_scale,
+        -1,  # o_sf_scale
+        -1,  # o_sf_vec_size
         -1,  # window_left
         sm_count,
     )
