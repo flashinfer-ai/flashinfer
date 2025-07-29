@@ -303,7 +303,9 @@ def test_trtllm_batch_decode_fmha(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("q_len_per_request", [1, 2])
-@pytest.mark.parametrize("dynamic_scale", [False, True])
+@pytest.mark.parametrize(
+    "dynamic_scale", [False, True]
+)  # todo(Zihao): enable dynamic scale after publishing cubins
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
@@ -407,8 +409,8 @@ def test_trtllm_batch_decode_mla(
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
-        bmm1_scale=scale / ((128 + 64) ** 0.5),
-        bmm2_scale=1.0,
+        bmm1_scale=scale / ((128 + 64) ** 0.5) if not dynamic_scale else 0.0,
+        bmm2_scale=1.0 if not dynamic_scale else 0.0,
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
     )
