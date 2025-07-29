@@ -1083,8 +1083,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
-        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: this function is deprecated, please use :meth:`run` instead."""
         self._pos_encoding_mode = pos_encoding_mode
@@ -1099,8 +1097,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
-            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     @overload
@@ -1321,8 +1317,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
-                bmm1_scale_log2_tensor,
-                bmm2_scale_tensor,
             ]
         else:
             run_args = [
@@ -1393,8 +1387,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             k_scale=k_scale,
             v_scale=v_scale,
             return_lse=True,
-            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
-            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
