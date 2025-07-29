@@ -1092,7 +1092,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run(
-            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            q,
+            paged_kv_cache,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     @overload
@@ -1109,6 +1113,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1125,6 +1131,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1140,6 +1148,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1177,6 +1187,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        bmm1_scale_log2_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+        bmm2_scale_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm2 input.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1287,6 +1301,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 ]
 
             self._cached_module.paged_run(*run_args)
+        elif self._backend == "trtllm-gen":
+            run_args = [
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
+                q,
+                k_cache,
+                v_cache,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                out,
+                lse,
+                TensorLayout[self._kv_layout].value,
+                window_left,
+                enable_pdl,
+            ]
         else:
             run_args = [
                 self._float_workspace_buffer,
@@ -1339,6 +1370,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
         self._pos_encoding_mode = pos_encoding_mode
@@ -1801,6 +1834,8 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1823,6 +1858,8 @@ class TrtllmGenDecodeModule:
             -1,  # o_sf_vec_size
             window_left,
             self._sm_count,
+            bmm1_scale_log2_tensor,
+            bmm2_scale_tensor,
         )
         return out
 
@@ -1894,6 +1931,8 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -1914,6 +1953,8 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
             out=o,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -1952,6 +1993,8 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1972,13 +2015,15 @@ def trtllm_batch_decode_with_kv_cache(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
-    window_left: int = -1,
+    bmm1_scale: Optional[float] = 1.0,
+    bmm2_scale: Optional[float] = 1.0,
+    window_left: Optional[int] = -1,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters:
@@ -2001,6 +2046,21 @@ def trtllm_batch_decode_with_kv_cache(
     out: output torch.Tensor or FP4Tensor.
     """
 
+    """
+    Parameters:
+    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
+    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: query_len
+    max_seq_len: max sequence length for kv_cache
+    bmm1_scale: fused scale for bmm1 input. If bmm1_scale_log2_tensor is provided, bmm1_scale will be ignored.
+    bmm2_scale: fused scale for bmm2 input. If bmm2_scale_tensor is provided, bmm2_scale will be ignored.
+    out: output tensor, if not provided, will be allocated internally
+    window_left: window_left for sliding window attention.
+    bmm1_scale_log2_tensor: On-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+    bmm2_scale_tensor: On-device fused scale tensor for bmm2 input.
+    """
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
@@ -2065,6 +2125,8 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_vec_size or -1,
         window_left,
         sm_count,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
 
     return (
@@ -2142,8 +2204,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: fused scale for mla bmm1 input.
-    bmm2_scale: fused scale for mla bmm2 input.
+    bmm1_scale: fused scale for mla bmm1 input. If bmm1_scale_log2_tensor is provided, bmm1_scale will be ignored.
+    bmm2_scale: fused scale for mla bmm2 input. If bmm2_scale_tensor is provided, bmm2_scale will be ignored.
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
 
@@ -2206,6 +2268,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     run_func(
         out,
+        None,  # fp4 output not supported in wrapper api yet.
         query,
         kv_cache.unsqueeze(-3),
         workspace_buffer,
@@ -2214,7 +2277,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         max_seq_len,
         bmm1_scale,
         bmm2_scale,
+        -1,  # o_sf_scale
+        -1,  # o_sf_vec_size
         -1,  # window_left
         sm_count,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     return out

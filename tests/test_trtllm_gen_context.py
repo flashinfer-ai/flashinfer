@@ -27,6 +27,9 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("q_dtype", ["half", "bf16"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
+@pytest.mark.parametrize(
+    "dynamic_scale", [False, True]
+)  # todo(Zihao): enable dynamic scale after publishing cubins
 def test_trtllm_batch_context_wrapper(
     kv_layout,
     batch_size,
@@ -39,6 +42,7 @@ def test_trtllm_batch_context_wrapper(
     q_dtype,
     logits_soft_cap,
     window_left,
+    dynamic_scale,
 ):
     seed = 0
     torch.manual_seed(seed)
@@ -93,6 +97,12 @@ def test_trtllm_batch_context_wrapper(
     reference_kv_cache = kv_data.clone()
 
     # trtllm-gen
+    bmm1_scale_log2_tensor = (
+        torch.tensor([1.0 / math.sqrt(head_dim) * math.log2(math.e)], device=device)
+        if dynamic_scale
+        else None
+    )
+    bmm2_scale_tensor = torch.tensor([1.0], device=device) if dynamic_scale else None
     wrapper2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="trtllm-gen"
     )
@@ -111,7 +121,14 @@ def test_trtllm_batch_context_wrapper(
         q_data_type=torch.bfloat16 if q_dtype == "bf16" else torch.float16,
         window_left=window_left,
     )
-    output = wrapper2.run(q, kv_data)
+    output = wrapper2.run(
+        q,
+        kv_data,
+        k_scale=0.0 if dynamic_scale else None,
+        v_scale=0.0 if dynamic_scale else None,
+        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
+    )
     rmse = torch.sqrt(torch.mean((output - reference_output) ** 2))
     print(f"RMSE between output and reference_output: {rmse.item()}")
     rmse = torch.sqrt(torch.mean((reference_kv_cache - kv_data) ** 2))
