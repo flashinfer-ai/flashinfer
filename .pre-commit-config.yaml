@@ -52,4 +52,4 @@ repos:
       - id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-          (?x)^(3rdparty/.* src/generated/.* flashinfer/jit/aot_config.py)$
+          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
