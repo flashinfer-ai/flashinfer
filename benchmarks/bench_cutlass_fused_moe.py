@@ -187,9 +187,9 @@ def bench_cutlass_fused_moe(
         )
     )
     avg_ms = sum(ms_list) / len(ms_list)
-    print("input\tweight1\tweight2\ttime(ms)")
+    print(f"{'input':<15} {'weight1':<20} {'weight2':<20} {'time(ms)'}")
     print(
-        f"{tuple(hidden_states.shape)}\t{tuple(w1.shape)}\t{tuple(w2.shape)}\t{avg_ms}"
+        f"{str(tuple(hidden_states.shape)):<15} {str(tuple(w1.shape)):<20} {str(tuple(w2.shape)):<20} {avg_ms:.3f}"
     )
 
 
