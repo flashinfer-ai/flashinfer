@@ -482,6 +482,8 @@ def get_batch_prefill_module(backend, *args):
                 cum_seq_lens_kv,
                 window_left,
                 out=o,
+                bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+                bmm2_scale_tensor=bmm2_scale_tensor,
             )
         elif backend == "fa2":
             assert not is_float8(q)
