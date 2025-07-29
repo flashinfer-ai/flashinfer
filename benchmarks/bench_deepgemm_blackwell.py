@@ -132,6 +132,8 @@ if __name__ == "__main__":
     for batch_size in [1, 4, 8, 64, 128, 256]:
         for m in [128, 256, 1024, 8192, 16384]:
             for n, k in [(128, 512), (512, 128), (4096, 7168), (7168, 2048)]:
+                if m // batch_size < 128:
+                    continue
                 if m * batch_size <= 16384:  # Limit total problem size
                     bench_deepgemm_grouped_fp8_blackwell(
                         batch_size, m, n, k, torch.float8_e4m3fn, torch.bfloat16
