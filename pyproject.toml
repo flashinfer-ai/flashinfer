@@ -51,6 +51,7 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.testing",
     "flashinfer.triton",
+    "flashinfer.tuning_configs",
     "flashinfer.profiler",
     "flashinfer.triton.kernels",
     "flashinfer.comm",

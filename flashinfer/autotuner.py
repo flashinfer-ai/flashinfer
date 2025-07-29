@@ -1,7 +1,9 @@
 import contextlib
 import copy
+import importlib
 import inspect
 import itertools
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -9,11 +11,27 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
 
+from flashinfer import __version__ as flashinfer_version
+
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
 from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
+
+
+def get_config_path(is_module: bool):
+    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    fi_ver = flashinfer_version.replace(".", "_")
+    config_name = f"v{fi_ver}_trtllm_fused_moe_{dev_name}"
+    if is_module:
+        return f"flashinfer.tuning_configs.{config_name}"
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "tuning_configs",
+            config_name + ".py",
+        )
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -265,6 +283,25 @@ class AutoTunerStatistics:
         return stats_str
 
 
+@lru_cache(maxsize=None)
+def load_from_file(key):
+    module_name = get_config_path(is_module=True)
+    try:
+        module = importlib.import_module(module_name)
+        best_configs = module.best_configs
+    except (ImportError, AttributeError):
+        best_configs = None
+    if best_configs is not None:
+        k = str((key[0], key[1], key[3]))
+        if k in best_configs:
+            logger.info(f"[Autotuner]: Loading configs for {k} from file.")
+            return True, best_configs[k][0], best_configs[k][1], None
+    logger.info(
+        f"[Autotuner]: Loading configs for {key} from file failed; Using default configs instead."
+    )
+    return False, 0, -1, None
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -316,11 +353,16 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
+            cache_key = AutoTuner._get_cache_key(
+                custom_op, r, input_shapes, tuning_config
+            )
             if (
-                cache_key := AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config
-                )
-            ) in self.profiling_cache:
+                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                and not self.is_tuning_mode
+            ):
+                output = load_from_file(cache_key)
+                return output
+            elif cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
