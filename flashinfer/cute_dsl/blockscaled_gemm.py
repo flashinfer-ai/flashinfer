@@ -52,6 +52,8 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
+from .dlpack_utils import create_dlpack_capsule
+
 
 class MaskedSchedulerParams:
     def __init__(
@@ -2727,10 +2729,34 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
             leading_dim=3
         )
+
+        def dtype(cutlass_dtype):
+            """
+            Return the corresponding torch.dtype per the given DSL type
+            """
+            torch_dtype = getattr(torch, cutlass_dtype.__name__.lower(), None)
+
+            torch_type_map = {
+                cutlass.dtypes.TFloat32: torch.float32,
+                cutlass.dtypes.Float32: torch.float32,
+                cutlass.dtypes.Float16: torch.float16,
+                cutlass.dtypes.BFloat16: torch.bfloat16,
+                cutlass.dtypes.Float8E5M2: torch.float8_e5m2,
+                cutlass.dtypes.Float8E4M3FN: torch.float8_e4m3fn,
+                cutlass.dtypes.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
+            }
+            if torch_dtype is None:
+                torch_dtype = torch_type_map.get(cutlass_dtype)
+
+            if torch_dtype is None:
+                raise TypeError(f"{cutlass_dtype} is not supported by torch")
+            return torch_dtype
+
         if c_tensor_gpu is None:
+            # fp4 gemm output is not supported
             c_tensor_gpu = torch.empty(
                 (self._l, self._m, self._n),
-                dtype=self._c_dtype,
+                dtype=dtype(self._c_dtype),
                 device="cuda",
             )
         c_tensor = from_dlpack(c_tensor_gpu, assumed_align=16)
@@ -2754,6 +2780,31 @@ class MaskedBatchedMatmulCuteDSL:
             stride_order=(2, 0, 1) if self._c_major == "n" else (2, 1, 0),
             divisibility=2 if self._c_dtype == cutlass.Float4E2M1FN else 1,
         )
+
+        print("a_tensor_gpu shape: ", a_tensor_gpu.shape)
+        print("a_tensor_gpu stride: ", a_tensor_gpu.stride())
+        print("a_tensor shape: ", a_tensor.shape)
+        print("a_tensor stride: ", a_tensor.stride)
+
+        print("b_tensor_gpu shape: ", b_tensor_gpu.shape)
+        print("b_tensor_gpu stride: ", b_tensor_gpu.stride())
+        print("b_tensor shape: ", b_tensor.shape)
+        print("b_tensor stride: ", b_tensor.stride)
+
+        print("c_tensor_gpu shape: ", c_tensor_gpu.shape)
+        print("c_tensor_gpu stride: ", c_tensor_gpu.stride())
+        print("c_tensor shape: ", c_tensor.shape)
+        print("c_tensor stride: ", c_tensor.stride)
+
+        print("sfa_tensor_gpu shape: ", sfa_tensor_gpu.shape)
+        print("sfa_tensor_gpu stride: ", sfa_tensor_gpu.stride())
+        print("sfa_tensor shape: ", sfa_tensor.shape)
+        print("sfa_tensor stride: ", sfa_tensor.stride)
+
+        print("sfb_tensor_gpu shape: ", sfb_tensor_gpu.shape)
+        print("sfb_tensor_gpu stride: ", sfb_tensor_gpu.stride())
+        print("sfb_tensor shape: ", sfb_tensor.shape)
+        print("sfb_tensor stride: ", sfb_tensor.stride)
 
         current_stream = cutlass_torch.default_stream()
         self._compiled_masked_bmm(

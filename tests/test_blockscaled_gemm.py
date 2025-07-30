@@ -8,6 +8,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from flashinfer import fp4_quantize
 from flashinfer.cute_dsl.blockscaled_gemm import (
     MaskedBatchedMatmulCuteDSL,  # python interface
 )
@@ -18,6 +19,20 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L,  # not used in python interface
 )
 from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
+
+
+def quant_fp4(a):
+    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    sf_vec_size = 16
+
+    a_fp4, a_sf = fp4_quantize(
+        a.cuda(),
+        a_global_sf.cuda(),
+        sf_vec_size,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=True,
+    )
+    return a_fp4, a_sf, a_global_sf
 
 
 def run(
@@ -119,13 +134,15 @@ def run(
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
-
+    print("a_tensor created")
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
+    print("b_tensor created")
     b_tensor, b_torch = cutlass_torch.cute_tensor_like(
         b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
+    print("c_tensor created")
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
         c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
     )
@@ -233,9 +250,11 @@ def run(
         )
         return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
+    print("sfa_tensor created")
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
         l, m, k, sf_vec_size, sf_dtype
     )
+    print("sfb_tensor created")
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
         l, n, k, sf_vec_size, sf_dtype
     )
