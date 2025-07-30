@@ -294,28 +294,18 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
     group_gemm_sm100_dir = output_dir / "gemm_grouped/100"
     group_gemm_sm80_dir = output_dir / "gemm_grouped/80"
-    need_generate_sm100 = any(
-        not (group_gemm_sm100_dir / kernel).exists()
-        for kernel in required_kernels_sm100
-    )
-    need_generate_sm80 = any(
-        not (group_gemm_sm80_dir / kernel).exists() for kernel in required_kernels_sm80
-    )
-    if need_generate_sm100 or need_generate_sm80:
-        print("Generating required Cutlass kernels...")
 
-        try:
-            # Create output directory if it doesn't exist
-            output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # Create output directory if it doesn't exist
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            generate_gemm_operations(
-                output_dir,
-                "100;100-real",
-            )
+        generate_gemm_operations(
+            output_dir,
+            "100;100-real",
+        )
 
-            print("Cutlass kernel generation completed successfully.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
 
     return gen_jit_spec(
         "fused_moe_sm100",
