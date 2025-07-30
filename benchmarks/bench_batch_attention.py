@@ -102,7 +102,7 @@ def synthesize_seq_len_configs() -> List[List[Tuple[int, int]]]:
         [(8192, 1)] * 128,  # decode-only
         [(4096, 128)] * 4,  # prefill-only
         [(600, 1)] * 122 + [(10_000, 17)] * 8,  # hybird
-        [(8192, 1)] * 127 * 2 + [(2048, 512)] * 1,  # hybrid (chunked-prefill)
+        [(8192, 1)] * 127 * 2 + [(8192, 4096)] * 1,  # hybrid (chunked-prefill)
     ]
 
     def _rand_case(bsz: int, lo: int, hi: int) -> List[Tuple[int, int]]:
@@ -198,6 +198,7 @@ def main() -> None:
         ],
     )
     print(df.to_markdown(index=False, floatfmt=".2f"))
+    df.to_csv("bench_batch_attention.csv", index=False)
 
 
 if __name__ == "__main__":
