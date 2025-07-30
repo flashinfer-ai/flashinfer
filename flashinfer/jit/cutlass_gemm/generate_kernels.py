@@ -4,8 +4,7 @@ import os
 import sys
 from itertools import product
 
-sys.path.append(os.path.dirname(__file__))
-from cutlass_library import *
+from .cutlass_library import *
 
 
 ################################################################################
@@ -861,38 +860,10 @@ def generate_sm80_operations(is_arch_enabled):
     return operations
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Print the output directory")
-
-    # Add the output_dir argument with short and long options
-    parser.add_argument(
-        "-o",
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Path to the output directory",
-    )
-    parser.add_argument(
-        "-a",
-        "--architectures",
-        type=str,
-        required=True,
-        help="Architectures to generate kernels for",
-    )
-    parser.add_argument(
-        "-i",
-        "--internal",
-        action="store_true",
-        required=False,
-        help="Generate the internal build kernels",
-    )
-
-    # Parse the command line arguments
-    args = parser.parse_args()
-
-    arches = args.architectures.split(";")
+def generate_gemm_operations(output_dir, architectures):
+    arches = architectures.split(";")
     # Get the absolute path of the provided directory
-    output_dir = os.path.abspath(args.output_dir)
+    output_dir = os.path.abspath(output_dir)
 
     fpA_intB_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
     moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"

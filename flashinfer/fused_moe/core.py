@@ -33,6 +33,7 @@ from ..fp4_quantization import nvfp4_block_scale_interleave
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 from .utils import (
     compute_swizzled_sf_shape,
@@ -242,10 +243,6 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
-    generate_script = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py"
-    )
     output_dir = (
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
     )
@@ -306,31 +303,19 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     )
     if need_generate_sm100 or need_generate_sm80:
         print("Generating required Cutlass kernels...")
-        import subprocess
 
         try:
             # Create output directory if it doesn't exist
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run the generation command
-            subprocess.run(
-                [
-                    "python",
-                    str(generate_script),
-                    "-a",
-                    "100;100-real",
-                    "-o",
-                    str(output_dir),
-                ],
-                check=True,
+            generate_gemm_operations(
+                output_dir,
+                "100;100-real",
             )
+
             print("Cutlass kernel generation completed successfully.")
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
-        except FileNotFoundError as e:
-            raise FileNotFoundError(
-                f"Could not find generate_kernels.py at {generate_script}: {e}"
-            )
 
     return gen_jit_spec(
         "fused_moe_sm100",
