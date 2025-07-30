@@ -49,6 +49,7 @@ packages = [
     "flashinfer.fused_moe",
     "flashinfer.jit",
     "flashinfer.jit.attention",
+    "flashinfer.jit.cutlass_gemm",
     "flashinfer.testing",
     "flashinfer.triton",
     "flashinfer.tuning_configs",
