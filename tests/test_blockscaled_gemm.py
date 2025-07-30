@@ -359,14 +359,31 @@ def run(
 
 # run tests provided by cutlass example
 # SHOULD BE REMOVED LATER
-@pytest.mark.parametrize("mnkl", [(1500, 2048, 2048, 100)])
-@pytest.mark.parametrize("ab_dtype", [cutlass.Float4E2M1FN])
-@pytest.mark.parametrize("sf_dtype", [cutlass.Float8E8M0FNU])
-@pytest.mark.parametrize("sf_vec_size", [16])
-@pytest.mark.parametrize("c_dtype", [cutlass.Float16])
-@pytest.mark.parametrize("a_major", ["k"])
-@pytest.mark.parametrize("b_major", ["k"])
-@pytest.mark.parametrize("c_major", ["n"])
+@pytest.mark.parametrize("mnkl", [(512, 256, 256, 1)])
+@pytest.mark.parametrize(
+    "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
+    [
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float32, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.BFloat16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float32, 16),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
+    ],
+)
+@pytest.mark.parametrize("a_major", ["k", "m"])
+@pytest.mark.parametrize("b_major", ["k", "n"])
+@pytest.mark.parametrize("c_major", ["n", "m"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
@@ -562,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mnkl",
         type=parse_comma_separated_ints,
-        default=(1500, 2048, 2048, 100),
+        default=((512, 256, 256, 1)),
         help="mnkl dimensions (comma-separated)",
     )
     parser.add_argument(
