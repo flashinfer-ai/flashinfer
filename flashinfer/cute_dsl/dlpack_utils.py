@@ -112,15 +112,12 @@ class CapsuleWrapper:
         )
 
 
-def create_dlpack_capsule(
-    ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id
-):
+def create_dlpack_capsule(ptr, shape, strides, torch_dtype, dev_id, is_fp4=False):
     """
     Parameters:
       ptr: GPU memory address obtained from cudaMalloc (Python int)
-      segment_size: Memory size of each segments in bytes
-      segment_stride: Memory stride size between segments in bytes
-      num_segments: Number of segments
+      shape: The shape of the tensor.
+      strides: The strides of the tensor.
       torch_dtype: torch dtype
       dev_id: device id.
     Returns:
@@ -146,13 +143,17 @@ def create_dlpack_capsule(
     elif torch_dtype in [torch.uint8, torch.uint16, torch.uint32, torch.uint64]:
         bits_per_elements = torch.iinfo(torch_dtype).bits
         dldata_type_code = 1
+    elif is_fp4:
+        bits_per_elements = 4
+        # a custom data type that is not in DLPack spec, use float as type code?
+        dldata_type_code = 2
     else:
         raise NotImplementedError(torch_dtype)
-    bytes_per_element = bits_per_elements // 8
-    # Allocate space for shape (constructing a one-dimensional tensor here)
-    ShapeArrayType = c_int64 * 2  # 1 dimension
-    shape_array = ShapeArrayType(num_segments, segment_size // bytes_per_element)
-    stride_array = ShapeArrayType(segment_stride // bytes_per_element, 1)
+    ndim = len(shape)
+    # Allocate space for shape and strides
+    ShapeArrayType = c_int64 * ndim
+    shape_array = ShapeArrayType(*shape)
+    stride_array = ShapeArrayType(*strides)
     # Set device information: GPU (device_type=2) and device_id=dev_id (modify as needed)
     device = DLDevice(device_type=2, device_id=dev_id)
     # Set data type
@@ -161,7 +162,7 @@ def create_dlpack_capsule(
     dltensor = DLTensor()
     dltensor.data = c_void_p(ptr)
     dltensor.device = device
-    dltensor.ndim = 2
+    dltensor.ndim = ndim
     dltensor.dtype = dtype
     dltensor.shape = ctypes.cast(shape_array, POINTER(c_int64))
     dltensor.strides = ctypes.cast(stride_array, POINTER(c_int64))
@@ -201,8 +202,8 @@ def pack_strided_memory(
 
     Parameters:
         ptr: GPU memory address obtained from cudaMalloc
-        segment_size: Memory size of each segment in bytes
-        segment_stride: Memory stride size between segments in bytes
+        segment_size: Memory size of each segment in bits
+        segment_stride: Memory stride size between segments in bits
         num_segments: Number of segments
         dtype: PyTorch data type for the resulting tensor
         dev_id: CUDA device ID
@@ -221,39 +222,3 @@ def pack_strided_memory(
     torch_tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
     torch_tensor._capsule_wrapper = capsule_wrapper
     return torch_tensor
-
-# def create_tensor_from_cuda_memory(
-#     ptr: int, shape: tuple, dtype: torch.dtype, device_id: int
-# ) -> torch.Tensor:
-#     """
-#     Create a PyTorch tensor from a CUDA memory pointer using DLPack.
-
-#     Args:
-#         ptr: CUDA memory pointer address as integer
-#         shape: Desired tensor shape
-#         dtype: PyTorch data type
-#         device_id: CUDA device ID
-
-#     Returns:
-#         PyTorch tensor that wraps the CUDA memory
-#     """
-#     # Calculate total size in elements
-#     numel = 1
-#     for dim in shape:
-#         numel *= dim
-
-#     # Get element size in bytes
-#     element_size = torch.tensor([], dtype=dtype).element_size()
-#     total_size_bytes = numel * element_size
-
-#     # Create DLPack capsule for contiguous memory (stride = element_size, num_segments = numel)
-#     capsule_wrapper = create_dlpack_capsule(
-#         ptr, element_size, element_size, numel, dtype, device_id
-#     )
-
-#     # Convert to tensor and reshape
-#     tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
-#     tensor._capsule_wrapper = capsule_wrapper  # Keep reference to prevent GC
-
-#     # Reshape to desired shape
-#     return tensor.view(shape)
