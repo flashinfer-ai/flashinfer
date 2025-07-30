@@ -174,6 +174,8 @@ def test_single_prefill_with_kv_cache(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_ref.squeeze(0), rtol=1e-3, atol=1e-3)
 
+    torch.cuda.empty_cache()
+
 
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [544, 977])
@@ -242,6 +244,8 @@ def test_batch_prefill_with_ragged_kv_cache(
     wrapper.run(q, k, v, out=o_buffer, lse=lse_buffer)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+
+    torch.cuda.empty_cache()
 
 
 def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
@@ -396,6 +400,8 @@ def test_batch_mla_varlen_page_attention(
         # if kv_lens[i] != 0:
         #     torch.testing.assert_close(lse_i, lse_ref, rtol=1e-3, atol=1e-3)
 
+    torch.cuda.empty_cache()
+
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 6, 7, 157])
 @pytest.mark.parametrize("kv_len", [17, 33, 75, 197])
@@ -475,6 +481,8 @@ def test_batch_mla_oob_kv_nan(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7, 157])
@@ -618,6 +626,8 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+    torch.cuda.empty_cache()
+
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
@@ -704,6 +714,8 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     )
     o_ans = mla_ans.run(q_nope, q_pe, ckv, kpe, kv_len=kv_lens, page_table=page_table)
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
+
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
