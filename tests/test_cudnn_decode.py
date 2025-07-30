@@ -8,7 +8,7 @@ import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
-@pytest.mark.parametrize("s_kv", [1024, 8192])
+@pytest.mark.parametrize("s_kv", [512, 8192])
 @pytest.mark.parametrize("page_size", [16])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("num_qo_heads", [32])
