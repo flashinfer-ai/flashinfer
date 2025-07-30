@@ -640,6 +640,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       if (cute::elect_one_sync()) {
         // one thread updates the count linking token to chosen expert
         auto expertTokenCount = 0;
+        // If the expert index is out of range, set it to 0 as a fail-safe
+        // mechanism.
+        if (warpMaxExpertIdx[0] >= params.mNumExperts || warpMaxExpertIdx[0] < 0) {
+          warpMaxExpertIdx[0] = 0;
+        }
         setBits</* IsZero= */ true>(expertTokenCount, 1, warpMaxExpertIdx[0] % ExpertsPerThread);
         smemExpertTokenCountFull[tokenIdx][warpMaxExpertIdx[0] / ExpertsPerThread] =
             expertTokenCount;
