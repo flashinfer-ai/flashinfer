@@ -15,9 +15,9 @@
  */
 // NOTE(Zihao): this is the include file for AOT mode
 #pragma once
-#include <flashinfer/hip/attention/default_decode_params.hip.h>
-#include <flashinfer/hip/attention/variants.hip.h>
-#include <flashinfer/hip/pos_enc.hip.h>
+#include <flashinfer/attention/generic/default_decode_params.cuh>
+#include <flashinfer/attention/generic/variants.cuh>
+#include <flashinfer/attention/generic/pos_enc.cuh>
 
 #include "aot_default_additional_params.h"
 #include "aot_extension_utils.h"

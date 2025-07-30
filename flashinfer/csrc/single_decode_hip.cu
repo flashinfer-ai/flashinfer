@@ -16,7 +16,7 @@
 #include "pytorch_extension_utils.h"
 #include "single_decode_config_hip.inc"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <flashinfer/hip/pos_enc.hip.h>
+#include <flashinfer/attention/generic/pos_enc.cuh>
 #include <optional>
 
 namespace flashinfer

@@ -21,12 +21,12 @@ namespace detail = flashinfer::gpu_iface::vec_dtypes::detail::cuda;
 #elif defined(PLATFORM_HIP_DEVICE)
 #include "backend/hip/vec_dtypes_hip.h"
 #define HIP_ENABLE_WARP_SYNC_BUILTINS 1
-namespace detail = flashinfer::gpu_iface::vec_dtypes::detail::hip;
+namespace detail_t = flashinfer::gpu_iface::vec_dtypes::detail::hip;
 #endif
 
 // Re-export types and functions from the appropriate backend
 // This allows code to use flashinfer::gpu_iface::vec_dtypes::vec_t<float, 4>
-using detail::vec_t;
+using detail_t::vec_t;
 
 } // namespace vec_dtypes
 } // namespace gpu_iface

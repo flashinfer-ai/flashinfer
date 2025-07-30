@@ -430,7 +430,7 @@ def gen_single_decode_module(
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
         (
-            f"#include<flashinfer/hip/attention/variants.hip.h>"
+            f"#include<flashinfer/attention/generic/variants.cuh>"
             if check_hip_availability()
             else f"#include<flashinfer/attention/variants.cuh>"
         ),  # variant_decl
@@ -711,7 +711,7 @@ def gen_batch_decode_module(
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
         (
-            f"#include<flashinfer/hip/attention/variants.hip.h>"
+            f"#include<flashinfer/attention/generic/variants.cuh>"
             if check_hip_availability()
             else f"#include<flashinfer/attention/variants.cuh>"
         ),  # variant_decl
