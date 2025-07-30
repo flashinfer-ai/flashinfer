@@ -129,7 +129,7 @@ def get_trtllm_mnnvl_comm_module():
 
 
 def get_allreduce_mnnvl_workspace(
-    mapping: Mapping, dtype: torch.dtype
+    mapping: Mapping, dtype: torch.dtype, group: Optional[dist.ProcessGroup] = None
 ) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
 
@@ -171,6 +171,7 @@ def get_allreduce_mnnvl_workspace(
         mapping.tp_rank,
         torch.device("cuda", mapping.local_rank),
         mapping.is_multi_node() or force_mn,
+        group=group,
     )
 
     # Initialize the unicast buffer with -0.0

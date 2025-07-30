@@ -843,6 +843,7 @@ class McastGPUBuffer:
         group_rank: int,
         device: torch.device,
         mn_nvlink: bool = True,
+        group: dist.ProcessGroup = None,
     ):
         """
         Constructor for McastGpuBuffer.
@@ -855,7 +856,7 @@ class McastGPUBuffer:
             mn_nvlink: Flag indicating if multi-node NVLink is used
         """
         self.mcast_device_memory = McastDeviceMemory(
-            buf_size, group_size, group_rank, device.index, mn_nvlink
+            buf_size, group_size, group_rank, device.index, mn_nvlink, group
         )
         self.buf_size = buf_size
         self.local_device = device
