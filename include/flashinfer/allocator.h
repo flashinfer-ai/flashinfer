@@ -45,7 +45,7 @@ struct AlignedAllocator {
       std::ostringstream oss;
       oss << "Buffer overflow when allocating memory for " << name << " with size " << size
           << " and alignment " << alignment
-          << " in AlignedAllocator. Increase the workspace buffer size.";
+          << " in AlignedAllocator. Please increase the workspace buffer size.";
       FLASHINFER_ERROR(oss.str());
     }
     return nullptr;
