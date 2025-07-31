@@ -449,10 +449,27 @@ def test_blockscaled_gemm(
 
 # todo(Yingyi): complete this test for target python interface
 @pytest.mark.parametrize("mnkl", [(1500, 2048, 2048, 100)])
-@pytest.mark.parametrize("ab_dtype", [cutlass.Float4E2M1FN])
-@pytest.mark.parametrize("sf_dtype", [cutlass.Float8E8M0FNU])
-@pytest.mark.parametrize("sf_vec_size", [16])
-@pytest.mark.parametrize("c_dtype", [cutlass.Float16])
+@pytest.mark.parametrize(
+    "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
+    [
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float32, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.BFloat16, 16),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float32, 16),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
+        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
+    ],
+)
 @pytest.mark.parametrize("a_major", ["k"])
 @pytest.mark.parametrize("b_major", ["k"])
 @pytest.mark.parametrize("c_major", ["n"])
@@ -473,6 +490,24 @@ def test_blockscaled_gemm_python_interface(
     tolerance: float,
 ):
     m, n, k, l = mnkl
+    if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        c_dtype,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        m,
+        n,
+        k,
+        l,
+        a_major,
+        b_major,
+        c_major,
+    ):
+        pytest.skip(
+            f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+        )
 
     # Create tensors on GPU first to initialize CUDA context before plan
     # 1. Create torch tensors using size fp32 and cast to torch_dtype
@@ -495,6 +530,8 @@ def test_blockscaled_gemm_python_interface(
         torch_type_map = {
             # TFloat32 is just alias of float32
             cutlass.TFloat32: torch.float32,
+            cutlass.Float32: torch.float32,
+            cutlass.BFloat16: torch.bfloat16,
             cutlass.Float16: torch.float16,
             cutlass.Float8E5M2: torch.float8_e5m2,
             cutlass.Float8E4M3FN: torch.float8_e4m3fn,
@@ -512,9 +549,11 @@ def test_blockscaled_gemm_python_interface(
         # fp32_torch_tensor = torch.empty(*shape, dtype=torch.float32, device=device)
         # fp32_torch_tensor = fp32_torch_tensor.permute(permute_order)
         # dtype_torch_tensor = fp32_torch_tensor.to(dtype=torch_type_map[cutlass_dtype])
-        dtype_torch_tensor = torch.empty(
-            *shape, dtype=torch_type_map[cutlass_dtype], device=device
-        )
+        fp32_torch_tensor = torch.randn(*shape, dtype=torch.float32, device=device)
+        dtype_torch_tensor = fp32_torch_tensor.to(dtype=torch_type_map[cutlass_dtype])
+        # dtype_torch_tensor = torch.empty(
+        #     *shape, dtype=torch_type_map[cutlass_dtype], device=device
+        # )
         # todo(Yingyi): add init value
         dtype_torch_tensor = dtype_torch_tensor.permute(permute_order)
 
@@ -522,13 +561,9 @@ def test_blockscaled_gemm_python_interface(
 
     # create helper tensors for testing
     # todo(Yingyi): use int8 and 1/2 shape for fp4？
-    a_tensor_gpu = create_torch_tensor(
-        l, m, k, a_major == "m", cutlass.Float4E2M1FN, "cuda"
-    )
-    b_tensor_gpu = create_torch_tensor(
-        l, n, k, b_major == "n", cutlass.Float4E2M1FN, "cuda"
-    )
-    c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", cutlass.Float16, "cuda")
+    a_tensor_gpu = create_torch_tensor(l, m, k, a_major == "m", ab_dtype, "cuda")
+    b_tensor_gpu = create_torch_tensor(l, n, k, b_major == "n", ab_dtype, "cuda")
+    c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", c_dtype, "cuda")
     _, _, sfa_tensor_gpu = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
     _, _, sfb_tensor_gpu = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
     masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
@@ -557,6 +592,7 @@ def test_blockscaled_gemm_python_interface(
         c_tensor_gpu,
         masked_m_tensor_gpu,
     )
+    torch.cuda.synchronize()
     print("PASS")
 
     # todo(Yingyi): add reference check

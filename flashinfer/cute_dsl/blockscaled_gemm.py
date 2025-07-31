@@ -2341,6 +2341,17 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
 
 
+@cute.jit
+def cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(
+    sf_mma_tensor: cute.Tensor,
+):
+    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
+    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
+    # group to ((32, 4, rest_m), (4, rest_k), l)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+
+
 # Create scale factor tensor SFA/SFB
 def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
     def ceil_div(a, b):
@@ -2710,6 +2721,7 @@ class MaskedBatchedMatmulCuteDSL:
         #     current_stream,
         # )
         self._compiled_masked_bmm = compiled_masked_bmm
+        print("============compiled_masked_bmm============")
 
     def run(
         self,
@@ -2741,6 +2753,9 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
             leading_dim=3
         )
+
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
 
         def dtype(cutlass_dtype):
             """
@@ -2828,5 +2843,6 @@ class MaskedBatchedMatmulCuteDSL:
             masked_m_tensor,
             current_stream,
         )
+        torch.cuda.synchronize()
 
         return c_tensor_gpu
