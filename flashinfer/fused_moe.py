@@ -774,15 +774,15 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    hash = "6b93c394210c89dccef13833c89797f1b8f8aefb"
-    tllm_gen_commit = "ce8ce46"
+    hash = "5e0cff4583554d182ae3fee461ff87b481ff3464"
+    tllm_gen_commit = "573cd5a"
     tllm_gen_config_hash = "2dc78d9"
     include_path = (
         f"{hash}/batched_gemm-{tllm_gen_commit}-{tllm_gen_config_hash}/include"
     )
     metainfo = get_cubin(
         f"{include_path}/flashinferMetaInfo",
-        "b24fd5e7ae6b20e903c866ecb1d4a68f238301ba9b76df6a536056f2059a0d56",
+        "a13e1ca232f60ca9eefb3298153aba03ccab6916748cf7e68b731d8dc4e9ccbc",
         ".h",
     )
     assert metainfo, "KernelMetaInfo.h not found"
