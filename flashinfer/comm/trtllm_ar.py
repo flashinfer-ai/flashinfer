@@ -21,9 +21,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from torch.utils.cpp_extension import _get_cuda_arch_flags
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
