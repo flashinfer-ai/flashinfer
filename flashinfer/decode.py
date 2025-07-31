@@ -1988,12 +1988,12 @@ def trtllm_batch_decode_with_kv_cache(
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
     max_seq_len: max sequence length for kv_cache
-    out: output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
-    out_dtype: output dtype, if not provided, will use the type of ``out``.
     bmm1_scale: fused scale for bmm1 input.
     bmm2_scale: fused scale for bmm2 input.
     window_left: The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+    out: output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+    out_dtype: output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
     o_sf_scale: scale for nvfp4 output tensor scale factor.
     o_sf_vec_size: vector size for nvfp4 output tensor scale factor.
 
@@ -2020,8 +2020,8 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
         if isinstance(out, FP4Tensor):
-            out_scale_factor = out.scale_factor
-            out = out.tensor
+            out_scale_factor = out.scale
+            out = out.data
         elif out is None:
             out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
             out_scale_factor = torch.empty(
