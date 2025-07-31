@@ -2021,7 +2021,7 @@ def trtllm_batch_decode_with_kv_cache(
 
         if isinstance(out, FP4Tensor):
             out_scale_factor = out.scale
-            out = out.tensor
+            out = out.data
         elif out is None:
             out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
             out_scale_factor = torch.empty(
