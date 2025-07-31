@@ -228,7 +228,7 @@ def test_e2m1_dequantization(
 
     # Test with default common settings
     is_sf_swizzled_layout = True
-    block_size = 16  # 32 if sf_use_ue8m0 else 16
+    block_size = 32 if sf_use_ue8m0 else 16
 
     # Step 1: Quantize with fp4_quantize
     quantized_tensor, scale_factors = fp4_quantize(

@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .autotuner import (
+from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
     DynamicTensorSpec,
@@ -29,17 +29,18 @@ from .autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from .fp4_quantization import nvfp4_block_scale_interleave
-from .fused_moe_utils import (
+from ..fp4_quantization import nvfp4_block_scale_interleave
+from ..jit import JitSpec
+from ..jit import env as jit_env
+from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
+from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
+from .utils import (
     compute_swizzled_sf_shape,
     fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
-from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 
 
 # The type of method in top-K routing, for use in torch custom op
@@ -242,6 +243,70 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
+    output_dir = (
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
+    )
+
+    required_kernels_sm100 = [
+        # M128 kernels
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group2.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group2.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group3.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group4.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group5.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group6.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group7.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M128_group8.generated.cu",
+        # M256 kernels
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group2.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_group2.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M256_group3.generated.cu",
+        # M64 kernels
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group2.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group3.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group4.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm100_M64_group5.generated.cu",
+    ]
+    required_kernels_sm80 = [
+        # M128 kernels
+        "cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu",
+        # M16 kernels
+        "cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu",
+        # M32 kernels
+        "cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu",
+        # M64 kernels
+        "cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu",
+        "cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu",
+    ]
+    group_gemm_sm100_dir = output_dir / "gemm_grouped/100"
+    group_gemm_sm80_dir = output_dir / "gemm_grouped/80"
+
+    try:
+        # Create output directory if it doesn't exist
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        generate_gemm_operations(
+            output_dir,
+            "100;100-real",
+        )
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
+
     return gen_jit_spec(
         "fused_moe_sm100",
         [
@@ -277,24 +342,9 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M128_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M128_BSTrue_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M256_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M256_BSTrue_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm100_M64_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M128_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M16_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M32_BSFalse_MixedFalse.generated.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/cutlass_instantiations/gemm_grouped/cutlass_kernel_file_GemmKind.Grouped_sm80_M64_BSFalse_MixedFalse.generated.cu",
+            # Add all generated kernels
+            *(group_gemm_sm100_dir / kernel for kernel in required_kernels_sm100),
+            *(group_gemm_sm80_dir / kernel for kernel in required_kernels_sm80),
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",

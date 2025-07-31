@@ -88,7 +88,7 @@ python -m flashinfer.aot
 # Build AOT wheel
 python -m build --no-isolation --wheel
 # Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
+python -m pip install dist/flashinfer_*.whl
 ```
 
 For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
