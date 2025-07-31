@@ -18,6 +18,7 @@ import math
 
 import pytest
 import torch
+from conftest import clear_cuda_cache
 
 import flashinfer
 from flashinfer.jit import build_jit_specs
@@ -157,14 +158,16 @@ def test_single_prefill_with_kv_cache(
     backend,
     dtype,
 ):
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     head_dim_qk = 192
     head_dim_vo = 128
-    q = torch.randn(qo_len, num_heads, head_dim_qk, dtype=dtype, device="cuda")
-    k = torch.randn(kv_len, num_heads, head_dim_qk, dtype=dtype, device="cuda")
-    v = torch.randn(kv_len, num_heads, head_dim_vo, dtype=dtype, device="cuda")
+    q = torch.randn(qo_len, num_heads, head_dim_qk, dtype=dtype, device=device)
+    k = torch.randn(kv_len, num_heads, head_dim_qk, dtype=dtype, device=device)
+    v = torch.randn(kv_len, num_heads, head_dim_vo, dtype=dtype, device=device)
     o, lse = flashinfer.single_prefill_with_kv_cache(
         q, k, v, causal=causal, backend=backend, return_lse=True
     )
@@ -173,8 +176,6 @@ def test_single_prefill_with_kv_cache(
     o_ref, lse_ref = attention_ref(1, q, k, v, causal, sm_scale)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_ref.squeeze(0), rtol=1e-3, atol=1e-3)
-
-    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -193,30 +194,32 @@ def test_batch_prefill_with_ragged_kv_cache(
     backend,
     dtype,
 ):
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     kv_layout = "NHD"
     head_dim_qk = 192
     head_dim_vo = 128
     q = torch.randn(
-        batch_size * qo_len, num_heads, head_dim_qk, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_heads, head_dim_qk, dtype=dtype, device=device
     )
     q_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * qo_len
     )
 
     k = torch.zeros(
-        batch_size * kv_len, num_heads, head_dim_qk, dtype=dtype, device="cuda"
+        batch_size * kv_len, num_heads, head_dim_qk, dtype=dtype, device=device
     )
     v = torch.zeros(
-        batch_size * kv_len, num_heads, head_dim_vo, dtype=dtype, device="cuda"
+        batch_size * kv_len, num_heads, head_dim_vo, dtype=dtype, device=device
     )
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * kv_len
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout, backend=backend
     )
@@ -244,8 +247,6 @@ def test_batch_prefill_with_ragged_kv_cache(
     wrapper.run(q, k, v, out=o_buffer, lse=lse_buffer)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
-
-    torch.cuda.empty_cache()
 
 
 def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
@@ -288,7 +289,9 @@ def test_batch_mla_varlen_page_attention(
     backend,
     dtype,
 ):
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > min(kv_len_0, kv_len_1, kv_len_2):
         pytest.skip("qo_len > kv_len not supported for causal attention")
@@ -302,14 +305,14 @@ def test_batch_mla_varlen_page_attention(
         num_heads,
         head_dim_ckv,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     q_pe = torch.randn(
         num_different_kv_len * batch_size * qo_len,
         num_heads,
         head_dim_kpe,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     pages_nums = torch.tensor(
         [math.ceil(kv_len / page_size) for kv_len in kv_lens],
@@ -323,23 +326,23 @@ def test_batch_mla_varlen_page_attention(
         page_size,
         head_dim_ckv,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     kpe = torch.randn(
         batch_size * pages_nums_sum,
         page_size,
         head_dim_kpe,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     sm_scale = 1.0 / ((128 + 64) ** 0.5)
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer, backend=backend
     )
     q_indptr = (
         torch.arange(
-            0, num_different_kv_len * batch_size + 1, device="cuda", dtype=torch.int32
+            0, num_different_kv_len * batch_size + 1, device=device, dtype=torch.int32
         )
         * qo_len
     )
@@ -352,9 +355,9 @@ def test_batch_mla_varlen_page_attention(
         dim=-1,
     ).flatten()
     kv_indices = torch.arange(
-        0, batch_size * pages_nums_sum, device="cuda", dtype=torch.int32
+        0, batch_size * pages_nums_sum, device=device, dtype=torch.int32
     )
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").repeat(batch_size)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
     wrapper.plan(
         q_indptr,
         kv_indptr,
@@ -400,8 +403,6 @@ def test_batch_mla_varlen_page_attention(
         # if kv_lens[i] != 0:
         #     torch.testing.assert_close(lse_i, lse_ref, rtol=1e-3, atol=1e-3)
 
-    torch.cuda.empty_cache()
-
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 6, 7, 157])
 @pytest.mark.parametrize("kv_len", [17, 33, 75, 197])
@@ -414,7 +415,9 @@ def test_batch_mla_varlen_page_attention(
 def test_batch_mla_oob_kv_nan(
     batch_size, kv_len, qo_len, num_heads, causal, page_size, backend, dtype
 ):
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > kv_len:
         pytest.skip("qo_len > kv_len not supported for causal attention")
@@ -422,17 +425,17 @@ def test_batch_mla_oob_kv_nan(
     head_dim_ckv = 512
     head_dim_kpe = 64
     q_nope = torch.randn(
-        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device=device
     )
     q_pe = torch.randn(
-        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device=device
     )
     pages_num = math.ceil(kv_len / page_size)
     ckv = torch.randn(
-        batch_size * pages_num, page_size, head_dim_ckv, dtype=dtype, device="cuda"
+        batch_size * pages_num, page_size, head_dim_ckv, dtype=dtype, device=device
     )
     kpe = torch.randn(
-        batch_size * pages_num, page_size, head_dim_kpe, dtype=dtype, device="cuda"
+        batch_size * pages_num, page_size, head_dim_kpe, dtype=dtype, device=device
     )
 
     # Fill oob positions with nan
@@ -442,20 +445,20 @@ def test_batch_mla_oob_kv_nan(
         kpe[(i + 1) * pages_num - 1, last_page_len:, :] = float("nan")
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer, backend=backend
     )
     q_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * qo_len
     )
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * pages_num
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * pages_num
     )
     kv_indices = torch.arange(
-        0, batch_size * pages_num, device="cuda", dtype=torch.int32
+        0, batch_size * pages_num, device=device, dtype=torch.int32
     )
-    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda")
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
 
     wrapper.plan(
         q_indptr,
@@ -482,8 +485,6 @@ def test_batch_mla_oob_kv_nan(
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
-    torch.cuda.empty_cache()
-
 
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7, 157])
 @pytest.mark.parametrize("kv_len", [0, 17, 33, 96, 97, 114, 514, 1024])
@@ -505,7 +506,9 @@ def test_batch_mla_page_attention(
     use_cuda_graph,
     dtype,
 ):
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > kv_len:
         pytest.skip("qo_len > kv_len not supported for causal attention")
@@ -513,10 +516,10 @@ def test_batch_mla_page_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
     q_nope = torch.randn(
-        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device=device
     )
     q_pe = torch.randn(
-        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device="cuda"
+        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device=device
     )
     pages_num = math.ceil(kv_len / page_size)
     ckv = torch.randn(
@@ -524,43 +527,43 @@ def test_batch_mla_page_attention(
         page_size,
         head_dim_ckv,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     kpe = torch.randn(
         batch_size * pages_num,
         page_size,
         head_dim_kpe,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer,
         backend=backend,
         use_cuda_graph=True,
-        qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device="cuda"),
-        kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device="cuda"),
-        kv_indices=torch.empty(1048576, dtype=torch.int32, device="cuda"),
-        kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device="cuda"),
+        qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+        kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
+        kv_len_arr=torch.empty(batch_size, dtype=torch.int32, device=device),
     )
     q_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * qo_len
     )
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * pages_num
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * pages_num
     )
     kv_indices = torch.arange(
-        0, batch_size * pages_num, device="cuda", dtype=torch.int32
+        0, batch_size * pages_num, device=device, dtype=torch.int32
     )
-    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda")
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
 
     if use_cuda_graph:
-        kv_indptr_warmup = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
+        kv_indptr_warmup = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
         kv_indices_warmup = torch.arange(
-            0, batch_size, device="cuda", dtype=torch.int32
+            0, batch_size, device=device, dtype=torch.int32
         )
-        kv_lens_warmup = torch.full((batch_size,), 0, dtype=torch.int32, device="cuda")
+        kv_lens_warmup = torch.full((batch_size,), 0, dtype=torch.int32, device=device)
         wrapper.plan(
             q_indptr,
             kv_indptr_warmup,
@@ -626,15 +629,15 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
-    torch.cuda.empty_cache()
-
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
 @pytest.mark.parametrize("page_size", [1, 16, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
 def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
-    if not is_sm100a_supported(torch.device("cuda")):
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if not is_sm100a_supported(device):
         pytest.skip("Cutlass MLA is not supported on this device")
 
     torch.manual_seed(42)
@@ -652,7 +655,7 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
             num_local_heads,
             head_dim_ckv + head_dim_kpe,
             dtype=dtype,
-            device="cuda",
+            device=device,
         )
         * 100
     )
@@ -661,9 +664,9 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         page_size,
         head_dim_ckv + head_dim_kpe,
         dtype=dtype,
-        device="cuda",
+        device=device,
     )
-    kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device="cuda")
+    kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
     page_num_per_batch = (max_seq_len + page_size - 1) // page_size
     # Cutlass MLA requires small pages (< 128) are packed into a 128 page.
     assert page_num_per_batch % (128 // page_size) == 0
@@ -672,17 +675,20 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         total_page_num,
         (batch_size, page_num_per_batch),
         dtype=torch.int32,
-        device="cuda",
+        device=device,
     )
 
     mla_ref = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0), backend="fa2"
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device), backend="fa2"
     )
 
     # for decode, each query length is 1
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int()
-    kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32).to(0)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * page_num_per_batch
+    q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+    kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+        * page_num_per_batch
+    )
     kv_indices = page_table.flatten()
 
     q_nope = q_nope_pe[..., :head_dim_ckv]
@@ -710,12 +716,11 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     o_ref = mla_ref.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
     mla_ans = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0), backend="cutlass"
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device),
+        backend="cutlass",
     )
     o_ans = mla_ans.run(q_nope, q_pe, ckv, kpe, kv_len=kv_lens, page_table=page_table)
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
-
-    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
