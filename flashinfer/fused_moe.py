@@ -39,6 +39,7 @@ from .fused_moe_utils import (
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from .jit.cubin_loader import get_cubin
 from .utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 
 
@@ -773,6 +774,18 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+    hash = "5e0cff4583554d182ae3fee461ff87b481ff3464"
+    tllm_gen_commit = "573cd5a"
+    tllm_gen_config_hash = "2dc78d9"
+    include_path = (
+        f"{hash}/batched_gemm-{tllm_gen_commit}-{tllm_gen_config_hash}/include"
+    )
+    metainfo = get_cubin(
+        f"{include_path}/flashinferMetaInfo",
+        "a13e1ca232f60ca9eefb3298153aba03ccab6916748cf7e68b731d8dc4e9ccbc",
+        ".h",
+    )
+    assert metainfo, "KernelMetaInfo.h not found"
     return gen_jit_spec(
         "fused_moe_sm100",
         [
@@ -788,8 +801,12 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
+            f'-DPIPELINE_HASH=\\"{hash}\\"',
+            f'-DTLLM_GEN_COMMIT=\\"{tllm_gen_commit}\\"',
+            f'-DTLLM_GEN_BATCHED_GEMM_CONFIG_HASH=\\"{tllm_gen_config_hash}\\"',
         ]
         + sm100a_nvcc_flags,
+        extra_include_paths=[jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path],
         extra_ldflags=["-lcuda"],
     )
 

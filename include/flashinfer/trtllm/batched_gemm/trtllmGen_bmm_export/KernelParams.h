@@ -212,6 +212,15 @@ struct KernelParams {
   // Shape is [B]. One scaling factor per tensor in batch.
   float const* ptrScaleGate{nullptr};
 
+  // The clamp limit before the activation.
+  // Shape is [1].
+  // Clamp is INF if nullptr.
+  // If applied on SwiGlu, it will be:
+  //
+  //   x_glu    = x_glu.clamp(min=None, max=limit)
+  //   x_linear = x_linear.clamp(min=-limit, max=limit)
+  float const* ptrClampLimit{nullptr};
+
   // The alpha and beta for SwiGlu.
   // Shape is [B]. One alpha and one beta per tensor in batch.
   // Alpha is 1.f if nullptr.
@@ -695,8 +704,8 @@ struct KernelParams {
       GemmOptions_ const& options, bool const batchM, void const* ptrA, void const* ptrB,
       void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA,
       void const* ptrPerTokenSfB, void const* ptrBias, void* dSfC, float const* ptrScaleC,
-      float const* ptrScaleGate, float const* ptrSwiGluAlpha, float const* ptrSwiGluBeta,
-      int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
+      float const* ptrScaleGate, float const* ptrClampLimit, float const* ptrSwiGluAlpha,
+      float const* ptrSwiGluBeta, int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
       int32_t const* ptrNumNonExitingCtas = nullptr,
       int32_t const* ptrTotalNumPaddedTokens = nullptr,
       int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
@@ -712,6 +721,8 @@ struct KernelParams {
 
     params.ptrScaleC = ptrScaleC;
     params.ptrScaleGate = ptrScaleGate;
+
+    params.ptrClampLimit = ptrClampLimit;
 
     params.ptrSwiGluAlpha = ptrSwiGluAlpha;
     params.ptrSwiGluBeta = ptrSwiGluBeta;

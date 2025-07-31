@@ -22,6 +22,7 @@ import torch
 
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ..cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -1487,13 +1488,23 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def trtllm_gen_fmha_module():
+    hash = "6b93c394210c89dccef13833c89797f1b8f8aefb"
+    include_path = f"{hash}/fmha/trtllm-gen/include"
+    metainfo = get_cubin(
+        f"{include_path}/flashInferMetaInfo",
+        "ba35dc13249cd09bf39eed43e785b088d329acaf81a3f940a615904b81bfa02f",
+        ".h",
+    )
+    assert metainfo, "flashInferMetaInfo.h not found"
     return gen_jit_spec(
         "fmha_gen",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
+        extra_include_paths=[jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[f'-DPIPELINE_HASH=\\"{hash}\\"'],
     )
 
 
