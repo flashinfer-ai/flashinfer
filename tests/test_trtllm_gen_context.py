@@ -205,13 +205,9 @@ def test_trtllm_batch_context_wrapper(
     "q_dtype,kv_cache_dtype,o_dtype",
     [
         ("half", "half", "half"),
-        # ("half", "fp8", "half"),
         ("bf16", "bf16", "bf16"),
-        # ("bf16", "fp8", "bf16"),
         ("fp8", "fp8", "fp8"),
-        # ("fp8", "fp8", "half"),
-        # ("fp8", "fp8", "bf16"),
-        # ("fp8", "fp8", "nvfp4"),
+        ("fp8", "fp8", "nvfp4"),
     ],
 )
 def test_trtllm_batch_prefill(
@@ -329,7 +325,7 @@ def test_trtllm_batch_prefill(
     else:
         o_scale = 1.0
     o_sf_scale = (
-        0.2 if o_dtype == "nvfp4" else None
+        300 if o_dtype == "nvfp4" else None
     )  # choose a value to make error smaller by testing.
 
     sm_scale = float(1.0 / (head_dim**0.5))
@@ -362,6 +358,9 @@ def test_trtllm_batch_prefill(
         q_indptr,
         kv_indptr,
         window_left,  # window_left
+        out_dtype=dtype_map[o_dtype],
+        o_sf_scale=o_sf_scale,
+        o_sf_vec_size=16 if o_dtype == "nvfp4" else None,
     )
 
     # Handle different return types based on out_dtype
@@ -398,7 +397,7 @@ def test_trtllm_batch_prefill(
     output_ref = wrapper.run(ref_q, ref_kv_cache)
 
     if q_dtype == "fp8" and o_dtype == "nvfp4":
-        rtol, atol = 5e-1, 1.1e0
+        rtol, atol = 4e-1, 1e0
     elif q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
     else:
@@ -414,9 +413,14 @@ def test_trtllm_batch_prefill(
         torch.testing.assert_close(
             out_scale_factor.float().reshape(out_scale_factor_ref.shape),
             out_scale_factor_ref.float(),
-            rtol=rtol,
-            atol=atol,
+            rtol=2e-1,
+            atol=2e-1,
         )
+        rmse = torch.sqrt(
+            torch.mean((output.float() * o_scale - output_ref.float()) ** 2)
+        )
+        assert rmse.item() < 0.3
+
     # convert to float32 for fp8 is not supported by assert_close
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol

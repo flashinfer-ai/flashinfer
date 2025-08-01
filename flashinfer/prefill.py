@@ -37,6 +37,7 @@ from .jit import (
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
+    FP4Tensor,
     MaskMode,
     PosEncodingMode,
     TensorLayout,
@@ -115,6 +116,7 @@ def get_trtllm_gen_prefill_module():
             out = torch.empty_like(query)
         op.trtllm_paged_attention_context(
             out,
+            None,  # fp4 output not supported in wrapper api yet.
             query,
             kv_cache,
             workspace_buffer,
@@ -124,6 +126,8 @@ def get_trtllm_gen_prefill_module():
             max_kv_len,
             bmm1_scale,
             bmm2_scale,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
             batch_size,
             window_left,
             cum_seq_lens_q,
@@ -2964,18 +2968,87 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out_dtype: Optional[Union[torch.dtype, str]] = None,
+    o_sf_scale: Optional[float] = None,
+    o_sf_vec_size: Optional[int] = None,
+) -> Union[torch.Tensor, FP4Tensor]:
+    """
+    Parameters:
+    query: query tensor with shape [num_tokens, num_heads, head_dim]
+    kv_cache: kv_cache tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+    workspace_buffer: workspace
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+    max_q_len: max sequence length for query
+    max_kv_len: max sequence length for kv_cache
+    bmm1_scale: fused scale for bmm1 input.
+    bmm2_scale: fused scale for bmm2 input.
+    batch_size: batch size
+    cum_seq_lens_q: cumulative sequence length for query. shape: ``[batch_size + 1]``
+    cum_seq_lens_kv: cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
+    window_left: The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+    out: output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+    out_dtype: output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+    o_sf_scale: scale for nvfp4 output tensor scale factor.
+    o_sf_vec_size: vector size for nvfp4 output tensor scale factor.
+
+    Returns:
+    out: output torch.Tensor or FP4Tensor.
+    """
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
-    if out is None:
-        out = torch.empty_like(query)
-    else:
+    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+        assert (
+            query.dtype == torch.float8_e4m3fn
+        ), "query must be fp8 when out_dtype is nvfp4."
+        assert o_sf_scale is not None
+        assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
+        o_sf_vec_size = o_sf_vec_size or 16
+
+        fp4_out_shape = query.shape[:-1] + (math.ceil(query.shape[-1] / 2),)
+
+        fp4_out_scale_shape = (
+            math.ceil(query.shape[0] / 128) * 128,
+            math.ceil(query.shape[1] * query.shape[2] / o_sf_vec_size / 4) * 4,
+        )
+
+        if isinstance(out, FP4Tensor):
+            out_scale_factor = out.scale
+            out = out.data
+        elif out is None:
+            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
+            out_scale_factor = torch.empty(
+                fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
+            )
+        else:
+            raise ValueError(f"Invalid out: {out}")
+
+        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+
+        # Use uint8 as the container dtype to compliant with next fp4 gemm.
+        _check_shape_dtype_device(
+            out_scale_factor,
+            fp4_out_scale_shape,
+            torch.float8_e4m3fn,
+            query.device,
+            "out_scale_factor",
+        )
+    elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
+        assert o_sf_scale is None
+        assert o_sf_vec_size is None
+        out_scale_factor = None
+        out_dtype = out_dtype or query.dtype
+        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+    else:
+        raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
     run_func(
         out,
+        out_scale_factor,
         query,
         kv_cache,
         workspace_buffer,
@@ -2985,10 +3058,14 @@ def trtllm_batch_context_with_kv_cache(
         max_kv_len,
         bmm1_scale,
         bmm2_scale,
+        o_sf_scale or -1.0,
+        o_sf_vec_size or -1,
         batch_size,
         window_left,
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
     )
-    return out
+    return (
+        out if out_dtype != "nvfp4" else FP4Tensor(out, out_scale_factor, query.shape)
+    )
