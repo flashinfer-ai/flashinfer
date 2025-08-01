@@ -49,7 +49,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
             comm.FP4QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
-        use_oneshots = [True, False]
+        use_oneshots = [True, False, None]
         trigger_completion_at_ends = [True, False]
         fp32_accs = [True, False]
 
