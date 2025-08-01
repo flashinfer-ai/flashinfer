@@ -32,6 +32,13 @@ __device__ __forceinline__ void load_128b(T *smem_ptr, const T *gmem_ptr)
         *reinterpret_cast<const uint4 *>(gmem_ptr);
 }
 
+template <PrefetchMode PrefetchOpt, typename T>
+__device__ __forceinline__ void load_64b(T *smem_ptr, const T *gmem_ptr)
+{
+    *reinterpret_cast<uint2 *>(smem_ptr) =
+        *reinterpret_cast<const uint2 *>(gmem_ptr);
+}
+
 // Predicated 128-bit load
 template <PrefetchMode PrefetchOpt, SharedMemFillMode FillOpt, typename T>
 __device__ __forceinline__ void
@@ -44,6 +51,21 @@ pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
     else {
         if constexpr (FillOpt == SharedMemFillMode::kFillZero) {
             *reinterpret_cast<uint4 *>(smem_ptr) = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+template <PrefetchMode PrefetchOpt, SharedMemFillMode FillOpt, typename T>
+__device__ __forceinline__ void
+pred_load_64b(T *smem_ptr, const T *gmem_ptr, bool predicate)
+{
+    if (predicate) {
+        *reinterpret_cast<uint2 *>(smem_ptr) =
+            *reinterpret_cast<const uint2 *>(gmem_ptr);
+    }
+    else {
+        if constexpr (FillOpt == SharedMemFillMode::kFillZero) {
+            *reinterpret_cast<uint2 *>(smem_ptr) = make_uint2(0, 0);
         }
     }
 }

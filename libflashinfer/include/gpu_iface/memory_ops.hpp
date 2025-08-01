@@ -68,6 +68,16 @@ __device__ __forceinline__ void load_128b(T *smem_ptr, const T *gmem_ptr)
     detail::load_128b<PrefetchOpt>(smem_ptr, gmem_ptr);
 }
 
+template <PrefetchMode PrefetchOpt, typename T>
+__device__ __forceinline__ void load_64b(T *smem_ptr, const T *gmem_ptr)
+{
+#if defined(PLATFORM_HIP_DEVICE)
+    detail::load_64b<PrefetchOpt>(smem_ptr, gmem_ptr);
+#else
+#error "load_64b not implemented for this platform"
+#endif
+}
+
 /**
  * @brief Conditionally loads 128 bits from global to shared memory
  *
@@ -83,6 +93,17 @@ __device__ __forceinline__ void
 pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
 {
     detail::pred_load_128b<PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr, predicate);
+}
+
+template <PrefetchMode PrefetchOpt, SharedMemFillMode FillOpt, typename T>
+__device__ __forceinline__ void
+pred_load_64b(T *smem_ptr, const T *gmem_ptr, bool predicate)
+{
+#if defined(PLATFORM_HIP_DEVICE)
+    detail::pred_load_64b<PrefetchOpt, FillOpt>(smem_ptr, gmem_ptr, predicate);
+#else
+#error "pred_load_64b not implemented for this platform"
+#endif
 }
 
 /**

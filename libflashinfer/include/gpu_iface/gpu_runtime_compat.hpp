@@ -34,20 +34,26 @@
 #define gpuLaunchKernel cudaLaunchKernel
 #define gpuFuncSetAttribute cudaFuncSetAttribute
 #define gpuDeviceGetAttribute cudaDeviceGetAttribute
+#define gpuDeviceSynchronize cudaDeviceSynchronize
 #elif defined(PLATFORM_HIP_DEVICE)
 #define gpuGetDevice hipGetDevice
 #define gpuLaunchKernel hipLaunchKernel
 #define gpuFuncSetAttribute hipFuncSetAttribute
 #define gpuDeviceGetAttribute hipDeviceGetAttribute
+#define gpuDeviceSynchronize hipDeviceSynchronize
 #endif
 
 #if defined(PLATFORM_CUDA_DEVICE)
-#define gpuMemCpy cudaMemcpy
+#define gpuMemcpy cudaMemcpy
+#define gpuMalloc cudaMalloc
+#define gpFree cudaFree
 #define gpuMemCpyAsync cudaMemcpyAsync
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #elif defined(PLATFORM_HIP_DEVICE)
-#define gpuMemCpy hipMemcpy
+#define gpuMemcpy hipMemcpy
+#define gpuMalloc hipMalloc
+#define gpuFree hipFree
 #define gpuMemcpyAsync hipMemcpyAsync
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost

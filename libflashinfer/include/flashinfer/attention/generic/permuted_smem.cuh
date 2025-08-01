@@ -28,27 +28,37 @@ enum class SwizzleMode
 // Use 128bit as the granularity to fetch/store data per thread to maximize
 // memory bandwidth
 using b128_t = uint4;
+// 64b type to support 16-bit CDNA3 WMMA ops where each thread in a 64 thread
+// wavefront loads a four element fragment.
+using b64_t = uint2;
 
 /*!
  * \brief Compute the number of elements that can be stored in a b128_t.
  * \tparam T The data type of the elements.
  */
-template <typename T>
+template <typename T, size_t NumBits = 128>
 constexpr __host__ __device__ __forceinline__ uint32_t upcast_size()
 {
-    return sizeof(b128_t) / sizeof(T);
+    static_assert(NumBits == 128 || NumBits == 64,
+                  "Only 64 and 128 bits are supported");
+    if constexpr (NumBits == 128) {
+        return sizeof(b128_t) / sizeof(T);
+    }
+    else if constexpr (NumBits == 64) {
+        return sizeof(b64_t) / sizeof(T);
+    }
 }
 
 /*!
  * \brief The shared memory wrapper.
  */
-template <SwizzleMode swizzle_mode> struct smem_t
+template <SwizzleMode swizzle_mode, typename BasePtrTy = b128_t> struct smem_t
 {
     // The base pointer.
-    b128_t *base;
+    BasePtrTy *base;
     __device__ __forceinline__ smem_t() : base(nullptr) {}
     template <typename T>
-    __device__ __forceinline__ smem_t(T *base) : base((b128_t *)base)
+    __device__ __forceinline__ smem_t(T *base) : base((BasePtrTy *)base)
     {
     }
 
@@ -96,7 +106,8 @@ template <SwizzleMode swizzle_mode> struct smem_t
         }
         else {
             // swizzle_mode == SwizzleMode::k64B
-            static_assert(step_size == 2, "Unsupported step size");
+            static_assert(step_size == 2 || step_size == 4,
+                          "Unsupported step size");
             return (offset ^ 0x2) + (step_idx % 2 == 1) * 4;
         }
     }
@@ -184,7 +195,7 @@ template <SwizzleMode swizzle_mode> struct smem_t
     {
         b128_t *smem_ptr = base + offset;
         gpu_mem::pred_load_128b<gpu_mem::PrefetchMode::kPrefetch, fill_mode>(
-            smem_ptr, gptr, predicate);
+            smem_ptr, reinterpret_cast<const b128_t *>(gptr), predicate);
     }
 
     template <typename T>
@@ -194,6 +205,24 @@ template <SwizzleMode swizzle_mode> struct smem_t
         b128_t *smem_ptr = base + offset;
         gpu_mem::load_128b<gpu_mem::PrefetchMode::kPrefetch>(
             smem_ptr, reinterpret_cast<const b128_t *>(gptr));
+    }
+
+    template <gpu_mem::SharedMemFillMode fill_mode, typename T>
+    __device__ __forceinline__ void
+    load_64b_async(uint32_t offset, const T *gptr, bool predicate)
+    {
+        b64_t *smem_ptr = base + offset;
+        gpu_mem::pred_load_64b<gpu_mem::PrefetchMode::kPrefetch, fill_mode>(
+            smem_ptr, reinterpret_cast<const b64_t *>(gptr), predicate);
+    }
+
+    template <typename T>
+    __device__ __forceinline__ void load_64b_async(uint32_t offset,
+                                                   const T *gptr)
+    {
+        b64_t *smem_ptr = base + offset;
+        gpu_mem::load_64b<gpu_mem::PrefetchMode::kPrefetch>(
+            smem_ptr, reinterpret_cast<const b64_t *>(gptr));
     }
 
     template <typename T>
