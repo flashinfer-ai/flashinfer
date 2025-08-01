@@ -84,7 +84,8 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
 
 
-def recover_swizzled_scales(scale, m, n, block_size):
+def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
+    assert sf_start_index + m <= scale.shape[0]
     rounded_m = utils.round_up(m, 128)
     scale_n = n // block_size
     rounded_n = utils.round_up(scale_n, 4)
@@ -92,4 +93,4 @@ def recover_swizzled_scales(scale, m, n, block_size):
     tmp = torch.reshape(scale, (1, rounded_m // 128, rounded_n // 4, 32, 4, 4))
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
     result = torch.reshape(tmp, (rounded_m, rounded_n)).to(torch.float32)
-    return result[:m, :scale_n]
+    return result[sf_start_index : sf_start_index + m, :scale_n]
