@@ -53,7 +53,7 @@ class ArtifactPath:
         "991e7438224199de85ef08a2730ce18c12b4e0aa/batched_gemm-c603ed2-2dc78d9/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "fffd607babb0844f24225997409747ca38229333/gemm-c603ed2-f2b0c24/"
+        "07a5f242a649533ff6885f87c42b2476a9e46233/gemm-c603ed2-434a6e1/"
     )
     CUDNN_SDPA: str = "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
     DEEPGEMM: str = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
@@ -64,12 +64,18 @@ class MetaInfoHash:
         "8c5630020c0452fb1cd1ea7e3b8fdbb7bf94f71bd899ed5b704a490bdb4f7368"
     )
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
+    TRTLLM_GEN_GEMM: str = (
+        "50c5627324003c822efbdd1d368b1e569f4f67f4bb0a2fbb7397cd56c6d14c2a"
+    )
 
 
 def download_artifacts() -> bool:
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
-    cubin_files = [(ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h")]
+    cubin_files = [
+        (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_GEMM + "KernelMetaInfo", ".h"),
+    ]
     for kernel in [
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,

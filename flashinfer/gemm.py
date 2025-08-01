@@ -25,7 +25,7 @@ import jinja2
 import torch
 import torch.nn.functional as F
 
-from .artifacts import ArtifactPath
+from .artifacts import ArtifactPath, MetaInfoHash
 from .autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -38,6 +38,7 @@ from .fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
+from .jit.cubin_loader import get_cubin
 
 CUDNN_AVAILABLE = False
 try:
@@ -302,6 +303,13 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
+    header_name = "KernelMetaInfo"
+    metainfo = get_cubin(
+        f"{ArtifactPath.TRTLLM_GEN_GEMM}/{header_name}",
+        MetaInfoHash.TRTLLM_GEN_GEMM,
+        ".h",
+    )
+    assert metainfo, f"{header_name}.h not found"
     return gen_jit_spec(
         "trtllm_gemm",
         [
@@ -313,6 +321,11 @@ def trtllm_gemm_gen_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CACHE_DIR / "cubins" / ArtifactPath.TRTLLM_GEN_GEMM,
+            jit_env.FLASHINFER_INCLUDE_DIR
+            / "flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+        ],
         extra_ldflags=["-lcuda"],
     )
 
