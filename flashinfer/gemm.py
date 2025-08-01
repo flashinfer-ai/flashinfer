@@ -1549,7 +1549,7 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: Literal["MN", "K"] = "MN",
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
     mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
@@ -1575,7 +1575,7 @@ def gemm_fp8_nt_groupwise(
             Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
             or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
         if the backend is ``trtllm``:
-            only scale_major_mode == "MN" is supported, the scale tensor should be (m, k // block_size),
+            scale_major_mode should be None, the scale tensor should be (m, k // block_size),
             contiguous on the first dimension
 
     b_scale: torch.Tensor
@@ -1583,7 +1583,7 @@ def gemm_fp8_nt_groupwise(
             Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
             or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
         if the backend is ``trtllm``:
-            only scale_major_mode == "MN" is supported, the scale tensor should be (k // block_size, n // block_size),
+            scale_major_mode should be None, the scale tensor should be (k // block_size, n // block_size),
             contiguous on the first dimension
 
     scale_granularity_mnk: Tuple[int, int, int]
@@ -1650,6 +1650,7 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
+        assert scale_major_mode is not None
         get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
             workspace_buffer,
             a,
@@ -1663,7 +1664,6 @@ def gemm_fp8_nt_groupwise(
         )
     elif backend == "trtllm":
         assert scale_granularity_mnk == (1, 128, 128)
-        assert scale_major_mode == "MN"
         assert a.shape[1] >= 256
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(

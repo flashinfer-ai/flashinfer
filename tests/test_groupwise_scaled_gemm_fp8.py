@@ -112,8 +112,7 @@ def test_fp8_groupwise_gemm(
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
 
     if backend == "trtllm":
-        a_scale = a_scale.t()
-        b_scale = b_scale.t().contiguous().t()
+        b_scale = b_scale.t().contiguous()
 
     c = gemm_fp8_nt_groupwise(
         a_fp8,
