@@ -1571,12 +1571,20 @@ def gemm_fp8_nt_groupwise(
         Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
-        or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
+        if the backend is ``cutlass``:
+            Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
+            or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
+        if the backend is ``trtllm``:
+            only scale_major_mode == "MN" is supported, the scale tensor should be (m, k // block_size),
+            contiguous on the first dimension
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
-        or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
+        if the backend is ``cutlass``:
+            Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
+            or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
+        if the backend is ``trtllm``:
+            only scale_major_mode == "MN" is supported, the scale tensor should be (k //block_size, n //block_size),
+            contiguous on the first dimension
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
