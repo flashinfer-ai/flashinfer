@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from enum import Enum
 from functools import cache
 from types import SimpleNamespace
 from typing import Any, Optional, Tuple
@@ -24,7 +25,12 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
-from .utils import register_custom_op, register_fake_op
+from .utils import (
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 def _pad_scale_factors(
@@ -99,6 +105,7 @@ def get_fp4_quantization_sm100_module():
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
@@ -108,6 +115,7 @@ def get_fp4_quantization_sm100_module():
             sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
             sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+            is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -120,6 +128,7 @@ def get_fp4_quantization_sm100_module():
             sf_vec_size,
             sf_use_ue8m0,
             is_sf_swizzled_layout,
+            is_sf_8x4_layout,
         )
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
@@ -227,6 +236,7 @@ def fp4_quantize(
     sf_vec_size: int = 16,
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -239,6 +249,7 @@ def fp4_quantize(
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
         sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+        is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -249,7 +260,7 @@ def fp4_quantize(
         NotImplementedError: If any of the following features are requested but not implemented:
             - BFloat16 input when BFloat16 is not enabled
             - FP8 input when FP8 is not enabled
-            - sf_vec_size other than 16
+            - sf_vec_size other than 16 or 32
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
@@ -266,6 +277,7 @@ def fp4_quantize(
         sf_vec_size,
         sf_use_ue8m0,
         is_sf_swizzled_layout,
+        is_sf_8x4_layout,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     if is_column_major:
@@ -333,3 +345,96 @@ def e2m1_and_ufp8sf_scale_to_float(
         ufp8_type,
         is_sf_swizzled_layout,
     )
+
+
+def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
+    """
+    PyTorch equivalent of trtllm-gen `shuffleMatrixA`
+    """
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
+
+    return input_tensor[row_indices.to(input_tensor.device)]
+
+
+def shuffle_matrix_sf_a(
+    input_tensor: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: int = 16,
+):
+    """
+    Cuda implementation of trtllm-gen `shuffleMatrixSfA` but with a caveat.
+    `shuffleMatrixSfA` expects the input to be in 128x4 layout and then
+    apply the same shuffling in `shuffleMatrixA` and writes out in 128x4
+    layout.
+    This function expects the input to be in linear layout. It's done this
+    way because the scaling factors in the NVFP4 checkpoints are quantized
+    and are in linear layout.
+    This function doesn't add padding.
+    """
+
+    row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor, epilogue_tile_m)
+
+    w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
+
+    # 128x4
+    return nvfp4_block_scale_interleave(w_shuffled)
+
+
+class SfLayout(Enum):
+    """
+    Layout of scale factors for NVFP4.
+    """
+
+    layout_128x4 = 0
+    layout_8x4 = 1
+    layout_linear = 2
+
+
+def nvfp4_quantize(
+    a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False, sf_vec_size=16
+):
+    """
+    Quantize input tensor to NVFP4 format.
+
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
+        sfLayout (SfLayout, optional): Scale factor layout. Defaults to SfLayout.layout_128x4.
+        do_shuffle (bool, optional): Whether to shuffle the scale factors. Defaults to False. Only TRTLLM backend needs to shuffle the tensor B scale factors.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    if do_shuffle:
+        # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
+        assert sfLayout == SfLayout.layout_128x4
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            a_global_sf.cuda(),
+            sf_vec_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
+        )
+
+        epilogue_tile_m = 128
+        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+        a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+            a_sf.shape
+        )
+    else:
+        # Activations with 8x4 layout for SFs (GEMM with small tileN)
+        # Activations with 128x4 layout for SFs (GEMM with large tileN)
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            a_global_sf.cuda(),
+            sf_vec_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=True,
+            is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
+        )
+
+    return a_fp4, a_sf

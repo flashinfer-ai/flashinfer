@@ -40,7 +40,8 @@ namespace torch_ext {
 // ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout) {
+                                                bool sfUseUE8M0, bool isSfSwizzledLayout,
+                                                bool isSf8x4Layout) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   CHECK_INPUT_TYPE(globalScale, c10::ScalarType::Float);
@@ -63,17 +64,24 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   at::Tensor valueE2M1 =
       at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
 
-  int64_t SFSize = isSfSwizzledLayout
-                       ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
-                       : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
+  int64_t SFSize =
+      isSfSwizzledLayout
+          ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize, isSf8x4Layout ? 8 : 128)
+          : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
 
   at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-                                         : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  auto layout = tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  if (isSf8x4Layout) {
+    TORCH_CHECK(isSfSwizzledLayout, "8x4layout must be swizzled layout");
+    layout = tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_8x4;
+  } else {
+    layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4
+                                : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  }
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \

@@ -24,6 +24,7 @@ from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .attention import BatchAttention as BatchAttention
+from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
 )
@@ -48,16 +49,18 @@ from .decode import (
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
+    SfLayout,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
     nvfp4_block_scale_interleave,
+    nvfp4_quantize,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
 )
 from .fused_moe import (
     RoutingMethodType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
