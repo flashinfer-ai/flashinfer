@@ -15,8 +15,6 @@
  */
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
-#include <Python.h>
 #include <cuda.h>
 
 #include <string>
