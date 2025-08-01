@@ -315,7 +315,7 @@ def multi_process_parallel(
         ), f"Process {i} failed with exit code {procs[i].exitcode}"
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_dim", [1024, 2048, 4096, 7168, 8192])
 def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
