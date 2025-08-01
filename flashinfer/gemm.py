@@ -1583,7 +1583,7 @@ def gemm_fp8_nt_groupwise(
             Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
             or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
         if the backend is ``trtllm``:
-            only scale_major_mode == "MN" is supported, the scale tensor should be (k //block_size, n //block_size),
+            only scale_major_mode == "MN" is supported, the scale tensor should be (k // block_size, n // block_size),
             contiguous on the first dimension
 
     scale_granularity_mnk: Tuple[int, int, int]
