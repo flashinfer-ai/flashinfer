@@ -476,6 +476,7 @@ def test_blockscaled_gemm(
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
+@pytest.mark.parametrize("iterations", [3])
 def test_blockscaled_gemm_python_interface(
     mnkl: Tuple[int, int, int, int],
     ab_dtype: cutlass.dtype,
@@ -488,6 +489,7 @@ def test_blockscaled_gemm_python_interface(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     tolerance: float,
+    iterations: int,
 ):
     m, n, k, l = mnkl
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
@@ -533,9 +535,9 @@ def test_blockscaled_gemm_python_interface(
             cutlass.Float32: torch.float32,
             cutlass.BFloat16: torch.bfloat16,
             cutlass.Float16: torch.float16,
-            cutlass.Float8E5M2: torch.float8_e5m2,
-            cutlass.Float8E4M3FN: torch.float8_e4m3fn,
-            cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
+            cutlass.Float8E5M2: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e5m2,
+            cutlass.Float8E4M3FN: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e4m3fn,
+            cutlass.Float8E4M3B11FNUZ: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e4m3fnuz,
             cutlass.Float4E2M1FN: torch.int8,
         }
         shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
@@ -584,15 +586,16 @@ def test_blockscaled_gemm_python_interface(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
     )
-    c = wrapper.run(
-        a_tensor_gpu,
-        b_tensor_gpu,
-        sfa_tensor_gpu,
-        sfb_tensor_gpu,
-        c_tensor_gpu,
-        masked_m_tensor_gpu,
-    )
-    torch.cuda.synchronize()
+    for _ in range(iterations):
+        c = wrapper.run(
+            a_tensor_gpu,
+            b_tensor_gpu,
+            sfa_tensor_gpu,
+            sfb_tensor_gpu,
+            c_tensor_gpu,
+            masked_m_tensor_gpu,
+        )
+        torch.cuda.synchronize()  # todo(Yingyi): must enabled, otherwise illegal memory access, should be removed later
     print("PASS")
 
     # todo(Yingyi): add reference check
