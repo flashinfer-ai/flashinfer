@@ -453,10 +453,11 @@ def test_trtllm_batch_prefill(
             out_scale_factor_ref.float(),
             rtol=2e-1,
             atol=2e-1,
-        )
+
         rmse = torch.sqrt(
             torch.mean((output.float() * o_scale - output_ref.float()) ** 2)
         )
+
         assert rmse.item() < 0.3
 
     # convert to float32 for fp8 is not supported by assert_close

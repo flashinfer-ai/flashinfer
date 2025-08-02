@@ -43,8 +43,9 @@ struct AlignedAllocator {
       return result;
     } else {
       std::ostringstream oss;
-      oss << "Failed to allocate memory for " << name << " with size " << size << " and alignment "
-          << alignment << " in AlignedAllocator";
+      oss << "Buffer overflow when allocating memory for " << name << " with size " << size
+          << " and alignment " << alignment << ", but only " << remaining_space
+          << " bytes available in AlignedAllocator. Increase the workspace buffer size.";
       FLASHINFER_ERROR(oss.str());
     }
     return nullptr;
