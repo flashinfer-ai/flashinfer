@@ -50,9 +50,11 @@ struct arch_info {
 #endif
 
 #if __CUDA_ARCH__ >= 900
+#if CUDA_VERSION >= 12090
 #if !defined(__CUDA_ARCH_SPECIFIC__) && !defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
 #error \
     "Compiling for SM90 or newer architectures must use Arch specific or Arch Family specific target"
+#endif
 #endif
 #endif
 
