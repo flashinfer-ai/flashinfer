@@ -90,11 +90,6 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
 constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;  // uint8_t
 constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
 
-#define CHECK_GPU_INPUT(x, st)                             \
-  TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")    \
-  TORCH_CHECK(x.is_contiguous(), #x " must be contiguous") \
-  TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
-
 // mat1: [B, M, K / 2], FLOAT4_E2M1X2 or [B, M, K], FLOAT8_E4M3FN
 // mat2: [B, N, K / 2], FLOAT4_E2M1X2
 // out: [B, M, N], fp16/bf16/fp32
@@ -105,15 +100,15 @@ constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
                         at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor out,
                         at::Tensor workspace_buffer, int64_t tactic) {
-  CHECK_GPU_INPUT(mat1, FLOAT4_E2M1X2);
-  CHECK_GPU_INPUT(mat2, FLOAT4_E2M1X2);
+  CHECK_INPUT_AND_TYPE(mat1, FLOAT4_E2M1X2);
+  CHECK_INPUT_AND_TYPE(mat2, FLOAT4_E2M1X2);
 
   int mat2_k_scale = 1;
 
-  CHECK_GPU_INPUT(mat1Scale, SF_DTYPE);
-  CHECK_GPU_INPUT(mat2Scale, SF_DTYPE);
+  CHECK_INPUT_AND_TYPE(mat1Scale, SF_DTYPE);
+  CHECK_INPUT_AND_TYPE(mat2Scale, SF_DTYPE);
 
-  CHECK_GPU_INPUT(globalScale, at::ScalarType::Float);
+  CHECK_INPUT_AND_TYPE(globalScale, at::ScalarType::Float);
 
   int64_t m, n, k, b;
   if (mat1.dim() == 2) {
