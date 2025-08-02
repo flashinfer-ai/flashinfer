@@ -100,7 +100,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                                              XSM_)                                                           \
   struct                                                                                                     \
       DeviceGemmFp4GemmSm100_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_ {   \
-    using OutElementType = flashinfer::TllmToCutlassTypeAdapter<T>::type;                                    \
+    using OutElementType = flashinfer::cutlass_dtype<T>::type;                                               \
     using CTAShape = cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                   \
     /*using ClusterShape = cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>;*/           \
     using ClusterShape = cute::Shape<int, int, _1>;                                                          \
