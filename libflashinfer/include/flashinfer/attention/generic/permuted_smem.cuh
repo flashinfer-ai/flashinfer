@@ -23,6 +23,7 @@ enum class SwizzleMode
 {
     k64B,
     k128B,
+    kLinear,
 };
 
 // Use 128bit as the granularity to fetch/store data per thread to maximize
@@ -77,10 +78,13 @@ template <SwizzleMode swizzle_mode, typename BasePtrTy = b128_t> struct smem_t
         if constexpr (swizzle_mode == SwizzleMode::k128B) {
             return i * stride + (j ^ (i % 8));
         }
-        else {
-            // swizzle_mode == SwizzleMode::k64B
+        else if constexpr (swizzle_mode == SwizzleMode::k64B) {
             static_assert(stride == 4);
             return i * stride + (j ^ ((i / 2) % 4));
+        }
+        else {
+            // swizzle_mode == SwizzleMode::kLinear
+            return i * stride + j;
         }
     }
 
@@ -104,11 +108,14 @@ template <SwizzleMode swizzle_mode, typename BasePtrTy = b128_t> struct smem_t
                 return offset + step_size;
             }
         }
-        else {
-            // swizzle_mode == SwizzleMode::k64B
+        else if constexpr (swizzle_mode == SwizzleMode::k64B) {
             static_assert(step_size == 2 || step_size == 4,
                           "Unsupported step size");
             return (offset ^ 0x2) + (step_idx % 2 == 1) * 4;
+        }
+        else {
+            // swizzle_mode == SwizzleMode::kLinear
+            return offset + step_size;
         }
     }
 
@@ -127,7 +134,7 @@ template <SwizzleMode swizzle_mode, typename BasePtrTy = b128_t> struct smem_t
                 return offset + step_size * row_stride;
             }
         }
-        else {
+        else if constexpr (swizzle_mode == SwizzleMode::k64B) {
             static_assert(step_size == 4 || step_size % 8 == 0,
                           "Unsupported step size");
             if constexpr (step_size == 4) {
@@ -137,6 +144,10 @@ template <SwizzleMode swizzle_mode, typename BasePtrTy = b128_t> struct smem_t
                 // step_size % 8 == 0
                 return offset + step_size * row_stride;
             }
+        }
+        else {
+            // swizzle_mode == SwizzleMode::kLinear
+            return offset + step_size * row_stride;
         }
     }
 
