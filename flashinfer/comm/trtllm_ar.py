@@ -775,10 +775,10 @@ def trtllm_allreduce_fusion(
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
     launch_with_pdl: bool,
-    use_oneshot: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     pattern_code: AllReduceFusionPattern,
+    use_oneshot: Optional[bool],
     allreduce_out: Optional[torch.Tensor],
     residual_in: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
@@ -815,14 +815,16 @@ def trtllm_allreduce_fusion(
     - layout_code: the layout code.
 
     Note:
-    Regarding the `use_oneshot` parameter:
-
-    It should only be enabled when:
-    (1) Force to use the one-shot strategy based on your use case.
-    (2) In min-latency mode, the sequence length is less than the one-shot max token number (currently 128).
-
-    Otherwise, it should be disabled (as False).
+    Regarding the `use_oneshot` parameter, you could force to use the one-shot strategy based on your use case.
+    Otherwise, it would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode.
     """
+
+    if use_oneshot is None:
+        logging.warning(
+            f"use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
+        )
+        use_oneshot = token_num <= 128
+
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"
 

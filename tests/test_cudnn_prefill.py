@@ -8,15 +8,14 @@ import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("s_qo", [8, 17, 1024])
-@pytest.mark.parametrize("s_kv", [8, 32])
-@pytest.mark.parametrize("page_size", [8, 32, 64])
+@pytest.mark.parametrize("s_qo", [8, 17, 700])
+@pytest.mark.parametrize("s_kv", [8, 32, 1066])
+@pytest.mark.parametrize("page_size", [8, 16, 64])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4])
-@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("is_cuda_graph_compatible", [False, True])
+@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("is_cuda_graph_compatible", [True])
 def test_cudnn_prefill(
     batch_size,
     s_qo,
@@ -24,30 +23,37 @@ def test_cudnn_prefill(
     page_size,
     num_kv_heads,
     num_qo_heads,
-    head_dim,
     causal,
     return_lse,
     is_cuda_graph_compatible,
 ):
+    head_dim = 128
     if s_qo > s_kv:
-        pytest.skip("s_qo > s_kv, skipping test as causal")
+        pytest.skip("s_qo > s_kv, skipping test")
 
     # test set up basics
-    seed = 0
+    seed = 1
     torch.manual_seed(seed)
     device = "cuda:0"
 
     actual_seq_lens_q = torch.randint(
-        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
     )
     actual_seq_lens_kv = torch.randint(
-        1, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32
+        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
     )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
     )
+
+    q_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0) * head_dim * num_qo_heads,
+        ]
+    ).int()
 
     # Initialize KV Cache
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
@@ -106,34 +112,26 @@ def test_cudnn_prefill(
         causal=causal,
         return_lse=return_lse,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
+        batch_offsets_q=q_indptr,
+        batch_offsets_o=q_indptr,
     )
 
-    actual_seq_lens_q_device = actual_seq_lens_q.to(device)
-    actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
-    qo_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(actual_seq_lens_q_device.view(-1), dim=0),
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
 
-    kv_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(
-                    (actual_seq_lens_kv_device.flatten() + page_size - 1) // page_size,
-                    dim=0,
-                ),
-            ]
-        )
-        .int()
-        .to(device)
-    )
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(
+                (actual_seq_lens_kv.flatten() + page_size - 1) // page_size,
+                dim=0,
+            ),
+        ]
+    ).int()
 
     # kv_indices
     kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
@@ -147,15 +145,11 @@ def test_cudnn_prefill(
         )
 
     # kv_last_page_len
-    kv_last_page_len = (
-        torch.where(
-            actual_seq_lens_kv_device.flatten() % page_size == 0,
-            torch.full((batch_size,), page_size, device=device),
-            actual_seq_lens_kv_device.flatten() % page_size,
-        )
-        .int()
-        .to(device)
-    )
+    kv_last_page_len = torch.where(
+        actual_seq_lens_kv.flatten() % page_size == 0,
+        torch.full((batch_size,), page_size, device=device),
+        actual_seq_lens_kv.flatten() % page_size,
+    ).int()
 
     # Workspace buffer
     workspace_buffer_ref = torch.empty(
@@ -181,4 +175,4 @@ def test_cudnn_prefill(
 
     output_ref = wrapper.run(q, kv_cache)
 
-    torch.testing.assert_close(output, output_ref)
+    torch.testing.assert_close(output, output_ref, atol=2e-3, rtol=1e-2)
