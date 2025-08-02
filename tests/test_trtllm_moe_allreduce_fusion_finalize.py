@@ -104,21 +104,51 @@ def _run_correctness_worker(
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
-                    comm.trtllm_moe_finalize_allreduce_fusion(
-                        allreduce_in=fc2_output,
-                        residual_in=residual,
-                        norm_weight=norm_weight,
-                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                        workspace_ptrs=workspace_tensor,
-                        launch_with_pdl=launch_with_pdl,
-                        world_rank=rank,
-                        world_size=world_size,
-                        eps=eps,
-                        shared_expert_output=shared_expert_output,
-                        expert_scale_factor=scale,
-                        norm_out=norm_out,
-                        residual_out=residual_out,
-                    )
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    # warmup
+                    with torch.cuda.stream(s):
+                        for _ in range(test_loop):
+                            comm.trtllm_moe_finalize_allreduce_fusion(
+                                allreduce_in=fc2_output,
+                                residual_in=residual,
+                                norm_weight=norm_weight,
+                                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                                workspace_ptrs=workspace_tensor,
+                                launch_with_pdl=launch_with_pdl,
+                                world_rank=rank,
+                                world_size=world_size,
+                                eps=eps,
+                                shared_expert_output=shared_expert_output,
+                                expert_scale_factor=scale,
+                                norm_out=norm_out,
+                                residual_out=residual_out,
+                            )
+                    torch.cuda.current_stream().wait_stream(s)
+
+                    # capture
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        for _ in range(test_loop):
+                            comm.trtllm_moe_finalize_allreduce_fusion(
+                                allreduce_in=fc2_output,
+                                residual_in=residual,
+                                norm_weight=norm_weight,
+                                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                                workspace_ptrs=workspace_tensor,
+                                launch_with_pdl=launch_with_pdl,
+                                world_rank=rank,
+                                world_size=world_size,
+                                eps=eps,
+                                shared_expert_output=shared_expert_output,
+                                expert_scale_factor=scale,
+                                norm_out=norm_out,
+                                residual_out=residual_out,
+                            )
+
+                    # replay
+                    g.replay()
+
                     torch.cuda.synchronize()
 
                     # == Calculate reference output ==
