@@ -101,3 +101,55 @@ def test_sinqle_prefill_with_paged_kv_cache(
 
     o_ref = single_prefill_with_kv_cache_ref(q, k, v, causal=causal)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("kv_len", [501, 2042, 3771, 4932])
+@pytest.mark.parametrize("qo_len", [37, 127, 577, 1024])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [4, 7])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+def test_sinqle_prefill_with_paged_kv_cache_neginf(
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    pos_encoding_mode,
+):
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    q = (
+        torch.ones(
+            qo_len,
+            num_qo_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        * -200
+    )
+    k = torch.ones(
+        kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    v = torch.randn(
+        kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    o = flashinfer.prefill.single_prefill_with_kv_cache(
+        q, k, v, causal=causal, pos_encoding_mode=pos_encoding_mode, backend="fa2"
+    )
+
+    o_ref = single_prefill_with_kv_cache_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)

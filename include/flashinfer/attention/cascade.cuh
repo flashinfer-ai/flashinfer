@@ -223,7 +223,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
     v.fill(DTypeO(0.f));
     v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
-      s_merged[pos * num_heads + head_idx] = -math::inf;
+      s_merged[pos * num_heads + head_idx] = math::neg_inf<float>();
     }
     return;
   }
@@ -396,7 +396,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
       v.fill(DTypeO(0.f));
       v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
-        s_merged[pos * num_heads + head_idx] = -math::inf;
+        s_merged[pos * num_heads + head_idx] = math::neg_inf<float>();
       }
       continue;
     }
