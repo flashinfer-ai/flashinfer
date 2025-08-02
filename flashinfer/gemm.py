@@ -172,6 +172,52 @@ def get_gemm_module():
     return _gemm_module
 
 
+def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp4"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"fp4_gemm_cutlass.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        cta_m_n_k_list = [
+            (128, 64, 128),
+            (128, 256, 128),
+            (128, 128, 256),
+            (128, 256, 256),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"fp4_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    return gen_jit_spec(
+        "fp4_gemm_cutlass",
+        source_paths,
+        extra_cuda_cflags=sm100a_nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -275,6 +321,97 @@ def get_trtllm_gemm_module():
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_fp4():
+    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+
+    class CutlassFp4GemmRunner(TunableRunner):
+        def __init__(self):
+            self._fp4_gemm_runner = module.fp4_gemm
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return list(range(module.fp4_gemm_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int,
+        ):
+            a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
+            module.fp4_gemm.default(
+                a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
+            )
+            return out
+
+    @register_custom_op(
+        "flashinfer::cutlass_fp4_gemm",
+        mutates_args=(""),
+    )
+    def cutlass_fp4_gemm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_descale: torch.Tensor,
+        b_descale: torch.Tensor,
+        alpha: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ):
+        tuner = AutoTuner.get()
+
+        m = a.shape[0]
+        n = b.shape[1]
+        k = a.shape[1]
+
+        a_tensor_index = 0
+        a_scale_tensor_index = 2
+        out_tensor_index = 5
+
+        def pad_up(x, y):
+            return ((x + y - 1) // y) * y
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    a_tensor_index,
+                    0,
+                    get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2,
+                ),
+            ),
+            constraint_specs=(
+                ConstraintSpec(
+                    a_scale_tensor_index,
+                    0,
+                    lambda shapes: pad_up(shapes[a_tensor_index][0], 128),
+                ),
+                ConstraintSpec(
+                    out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
+                ),
+            ),
+        )
+
+        fp4_runner = CutlassFp4GemmRunner()
+
+        inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
+        _, tactic = tuner.choose_one(
+            "cutlass_fp4_gemm",
+            [fp4_runner],
+            tuning_config,
+            inputs,
+        )
+
+        fp4_runner(inputs=inputs, tactic=tactic)
+
+    # Register the module
+    return SimpleNamespace(
+        cutlass_fp4_gemm=cutlass_fp4_gemm,
+    )
 
 
 def gen_gemm_sm90_module() -> JitSpec:
@@ -1150,7 +1287,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -1183,12 +1320,12 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm"]
+    backend: Literal["cudnn", "trtllm", "cutlass"]
         Backend to use, defaults to "cudnn".
 
     Notes
     -----
-    When cudnn backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
+    When cudnn/cutlass backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
 
     Returns
@@ -1310,6 +1447,15 @@ def mm_fp4(
             out,
             use_8x4_sf_layout=use_8x4_sf_layout,
             workspace_buffer=workspace_buffer,
+        )
+    elif backend == "cutlass":
+        # cutlass require uint8 scale when a/b is fp4 packed uint8.
+        if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
+            a_descale = a_descale.view(torch.uint8)
+        if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
+            b_descale = b_descale.view(torch.uint8)
+        get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm(
+            a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
         )
     return out
 

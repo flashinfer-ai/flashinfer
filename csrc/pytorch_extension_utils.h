@@ -314,6 +314,10 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
   CHECK_CONTIGUOUS(x)
 #define CHECK_INPUT_TYPE(x, st) \
   TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
+#define CHECK_INPUT_AND_TYPE(x, st) \
+  CHECK_CUDA(x);                    \
+  CHECK_CONTIGUOUS(x);              \
+  CHECK_INPUT_TYPE(x, st)
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)
