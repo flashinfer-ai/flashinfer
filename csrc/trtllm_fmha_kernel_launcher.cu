@@ -80,8 +80,8 @@ void trtllm_paged_attention_launcher(
     int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
     int64_t head_dim_vo, int64_t page_size, int64_t kv_stride_keys_values, int64_t kv_stride_heads,
     int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
-    double o_sf_scale, int64_t o_sf_vec_size, int64_t window_left, int64_t sum_seq_q,
-    int64_t sm_count, cudaStream_t stream) {
+    double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left,
+    int64_t sum_seq_q, int64_t sm_count, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -118,6 +118,7 @@ void trtllm_paged_attention_launcher(
   runner_params.outputScale = bmm2_scale;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
   runner_params.oSfPtr = out_scale_factor;
+  runner_params.mSfStartTokenIdx = o_sf_start_index;
   runner_params.mScaleSfO = o_sf_scale;
   TORCH_CHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1,
               "Only support o_sf_vec_size == 16 or -1(not used)");
@@ -189,7 +190,8 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out
                                    at::Tensor workspace_buffer, at::Tensor block_tables,
                                    at::Tensor seq_lens, int64_t max_kv_len, double bmm1_scale,
                                    double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
-                                   int64_t window_left, int64_t sm_count) {
+                                   int64_t o_sf_start_index, int64_t window_left,
+                                   int64_t sm_count) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
   auto kv_data_type = torch_dtype_to_tllm_data_type(key_value_cache.scalar_type());
   auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
@@ -242,7 +244,8 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out
       TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
-      bmm2_scale, o_sf_scale, o_sf_vec_size, window_left, sum_seq_q, sm_count, stream);
+      bmm2_scale, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sm_count,
+      stream);
 }
 
 void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> out_scale_factor,
@@ -250,7 +253,8 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
                                     at::Tensor workspace_buffer, at::Tensor block_tables,
                                     at::Tensor seq_lens, int64_t max_q_len, int64_t max_kv_len,
                                     double bmm1_scale, double bmm2_scale, double o_sf_scale,
-                                    int64_t o_sf_vec_size, int64_t batch_size, int64_t window_left,
+                                    int64_t o_sf_vec_size, int64_t o_sf_start_index,
+                                    int64_t batch_size, int64_t window_left,
                                     at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
                                     int64_t sm_count) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
@@ -299,7 +303,8 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
       o_data_type, TllmPagedAttentionMode::Context, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
-      bmm2_scale, o_sf_scale, o_sf_vec_size, window_left, sum_seq_q, sm_count, stream);
+      bmm2_scale, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sm_count,
+      stream);
 }
 
 namespace trtllm_cubin_loader {

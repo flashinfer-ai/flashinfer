@@ -1821,6 +1821,7 @@ class TrtllmGenDecodeModule:
             bmm2_scale,
             -1,  # o_sf_scale
             -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
             window_left,
             self._sm_count,
         )
@@ -2021,12 +2022,14 @@ def trtllm_batch_decode_with_kv_cache(
 
         if isinstance(out, FP4Tensor):
             out_scale_factor = out.scale
+            o_sf_start_index = out.scale_start_index
             out = out.data
         elif out is None:
-            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
             )
+            o_sf_start_index = 0
+            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
         else:
             raise ValueError(f"Invalid out: {out}")
 
@@ -2044,6 +2047,7 @@ def trtllm_batch_decode_with_kv_cache(
         assert o_sf_scale is None
         assert o_sf_vec_size is None
         out_scale_factor = None
+        o_sf_start_index = 0
         out_dtype = out_dtype or query.dtype
         out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
@@ -2063,12 +2067,15 @@ def trtllm_batch_decode_with_kv_cache(
         bmm2_scale,
         o_sf_scale or -1.0,
         o_sf_vec_size or -1,
+        o_sf_start_index,
         window_left,
         sm_count,
     )
 
     return (
-        out if out_dtype != "nvfp4" else FP4Tensor(out, out_scale_factor, query.shape)
+        out
+        if out_dtype != "nvfp4"
+        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
 
 
@@ -2217,6 +2224,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         bmm2_scale,
         -1,  # o_sf_scale
         -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
         -1,  # window_left
         sm_count,
     )
