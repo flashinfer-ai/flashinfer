@@ -154,7 +154,9 @@ def _run_attention(
         logits_soft_cap=logits_soft_cap,
         window_left=window_left,
     )
-    out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
+    out_new, lse_new = wrapper.run(
+        q, kv_data, logits_soft_cap=logits_soft_cap, window_left=window_left
+    )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
@@ -204,14 +206,14 @@ def test_batch_attention_correctness(
 
 
 test_batch_attention_correctness(
-    seq_len_pairs=[(2048, 1)] * 77,
-    page_block_size=1,
+    seq_len_pairs=[(2048, 1)] * 17,
+    page_block_size=8,
     num_kv_heads=1,
     gqa_group_size=1,
-    head_dim=128,
+    head_dim=64,
     layout="NHD",
     test_dtype=torch.bfloat16,
     logits_soft_cap=0.0,
     window_left=13,
-    causal=True,
+    causal=False,
 )
