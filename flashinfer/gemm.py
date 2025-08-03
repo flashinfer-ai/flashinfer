@@ -1549,7 +1549,7 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: Literal["MN", "K"] = "MN",
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
     mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
@@ -1571,12 +1571,20 @@ def gemm_fp8_nt_groupwise(
         Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
-        or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
+        if the backend is ``cutlass``:
+            Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
+            or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
+        if the backend is ``trtllm``:
+            scale_major_mode should be None, the scale tensor should be (m, k // block_size),
+            contiguous on the first dimension
 
     b_scale: torch.Tensor
-        Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
-        or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
+        if the backend is ``cutlass``:
+            Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
+            or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
+        if the backend is ``trtllm``:
+            scale_major_mode should be None, the scale tensor should be (k // block_size, n // block_size),
+            contiguous on the first dimension
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
@@ -1642,6 +1650,7 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
+        assert scale_major_mode is not None
         get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
             workspace_buffer,
             a,
@@ -1655,15 +1664,14 @@ def gemm_fp8_nt_groupwise(
         )
     elif backend == "trtllm":
         assert scale_granularity_mnk == (1, 128, 128)
-        assert scale_major_mode == "MN"
         assert a.shape[1] >= 256
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(
             workspace_buffer,
             a,
             b,
-            a_scale.t(),
-            b_scale.t().contiguous().t(),
+            a_scale,
+            b_scale,
             None,
             out,
             False,
