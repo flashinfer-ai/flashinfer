@@ -20,6 +20,7 @@ from typing import List, Optional
 import jinja2
 import torch
 
+from ...artifacts import ArtifactPath
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -30,7 +31,6 @@ from ..utils import (
     write_if_different,
 )
 from .utils import generate_additional_params
-from ...artifacts import ArtifactPath
 
 
 def get_single_decode_uri(

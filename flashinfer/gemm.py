@@ -25,6 +25,7 @@ import jinja2
 import torch
 import torch.nn.functional as F
 
+from .artifacts import ArtifactPath
 from .autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -37,7 +38,6 @@ from .fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from .artifacts import ArtifactPath
 
 CUDNN_AVAILABLE = False
 try:

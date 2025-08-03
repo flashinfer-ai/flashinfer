@@ -35,11 +35,11 @@ from typing import Any, Dict, Optional, Tuple
 import cuda.bindings.driver as cbd
 import torch
 
+from .artifacts import ArtifactPath
 from .cuda_utils import checkCudaErrors
 from .jit.cubin_loader import get_cubin
 from .jit.env import FLASHINFER_CACHE_DIR
 from .utils import ceil_div, round_up
-from .artifacts import ArtifactPath
 
 
 class GemmType(enum.Enum):

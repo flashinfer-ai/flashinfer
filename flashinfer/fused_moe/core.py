@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ..artifacts import ArtifactPath
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -41,7 +42,6 @@ from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from ..artifacts import ArtifactPath
 
 
 # The type of method in top-K routing, for use in torch custom op

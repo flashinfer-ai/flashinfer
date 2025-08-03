@@ -16,13 +16,13 @@ limitations under the License.
 
 import os
 import re
-import requests
 import time
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+
 from .jit.core import logger
-from .jit.cubin_loader import get_cubin, FLASHINFER_CUBINS_REPOSITORY
+from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY, get_cubin
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
