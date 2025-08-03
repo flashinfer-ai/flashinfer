@@ -298,7 +298,7 @@ struct BlockBatchPagedAttentionPersistent {
             __syncthreads();
 
             compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-            if constexpr (AttentionVariant::use_logits_soft_cap) {
+            if constexpr (AttentionVariant::UseLogitsSoftCap) {
               logits_transform<KTraits>(
                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
                   kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
@@ -306,8 +306,8 @@ struct BlockBatchPagedAttentionPersistent {
                   q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
             }
             if constexpr (WITH_MASK) {
-              logits_mask<KTraits>(
-                  params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+              logits_mask<KTraits>(  // work_idx is for window_left
+                  params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
                   kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
                                  NUM_MMA_KV * 16,
                   q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
@@ -336,7 +336,7 @@ struct BlockBatchPagedAttentionPersistent {
 #pragma unroll
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-        if constexpr (AttentionVariant::use_logits_soft_cap) {
+        if constexpr (AttentionVariant::UseLogitsSoftCap) {
           logits_transform<KTraits>(
               params, variant, /*batch_idx=*/0, qo_packed_idx_base,
               kv_start +
@@ -344,7 +344,7 @@ struct BlockBatchPagedAttentionPersistent {
               q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
         }
         logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+            params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
             kv_start +
                 (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);

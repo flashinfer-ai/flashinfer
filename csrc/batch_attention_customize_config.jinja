@@ -7,7 +7,7 @@
 #include <flashinfer/fastdiv.cuh>
 #include <flashinfer/attention/variant_helper.cuh>
 #include <flashinfer/profiler.cuh>
-
+#include <cassert>
 using namespace flashinfer;
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
@@ -22,28 +22,43 @@ using namespace flashinfer;
 
 {{ variant_decl }}
 
-template <bool UseLogitsSoftCap>
+template <bool use_sliding_window, bool use_logits_soft_cap>
 struct StandardAttention : AttentionVariantBase {
-  float sm_scale_log2;
-  float soft_cap_pre_tanh_scale;
-  static constexpr bool use_logits_soft_cap = UseLogitsSoftCap;
+  static constexpr bool UseLogitsSoftCap = use_logits_soft_cap;
+  static constexpr bool UseSlidingWindow = use_sliding_window;
+
+  uint32_t window_left;
+  float sm_scale_log2, soft_cap_pre_tanh_scale;
   PROFILER_CLOSURE_PARAMS_DECL
 
   template <typename Params>
   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
                                         uint8_t* smem_ptr) {
-    if constexpr (UseLogitsSoftCap) {
+    if constexpr (use_logits_soft_cap) {
       soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
       sm_scale_log2 = math::log2e * params.logits_soft_cap;
     }else{
       sm_scale_log2 = params.sm_scale * math::log2e;
     }
+
   }
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    if constexpr (UseLogitsSoftCap) {
+    if constexpr (use_logits_soft_cap) {
       logits = float(math::tanh(logits * soft_cap_pre_tanh_scale));
     }
     return logits;
+  })
+
+  REGISTER_LOGITS_MASK(params, work_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    bool mask = true;
+    // TODO: to support custom mask (only used by Spec decoding in SGL), must register request_indices in plan info
+    if constexpr (use_sliding_window) {
+      uint32_t qo_len = params.q_len[work_idx];
+      uint32_t kv_len = params.kv_len[work_idx];
+      window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+      mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+    }
+    return mask;
   })
 };
 
@@ -110,6 +125,7 @@ struct PersistentParams {
 
   float sm_scale;
   double logits_soft_cap;
+  uint32_t window_left;
   {{ additional_params_decl }}
 
   PROFILER_PARAMS_DECL

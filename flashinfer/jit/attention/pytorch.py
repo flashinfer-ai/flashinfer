@@ -395,6 +395,7 @@ def get_batch_attention_uri(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_profiler: bool,
 ) -> str:
@@ -406,6 +407,7 @@ def get_batch_attention_uri(
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
         f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
         f"use_profiler_{str(use_profiler).lower()}"
     )
@@ -864,6 +866,7 @@ def gen_batch_attention_module(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
+    use_sliding_window: bool,
     use_profiler: bool,
 ):
     uri = get_batch_attention_uri(
@@ -875,6 +878,7 @@ def gen_batch_attention_module(
         head_dim_vo,
         pos_encoding_mode,
         use_logits_soft_cap,
+        use_sliding_window,
         use_profiler,
     )
 
@@ -882,7 +886,7 @@ def gen_batch_attention_module(
     additional_tensor_dtypes = []
     additional_scalar_names = []
     additional_scalar_dtypes = []
-    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
+    variant_name = f"StandardAttention<{str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}>"
     variant_decl = f"#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
@@ -901,6 +905,7 @@ def gen_batch_attention_module(
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
         use_logits_soft_cap=use_logits_soft_cap,
+        use_sliding_window=use_sliding_window,
         use_profiler=use_profiler,
     )
 
@@ -1513,6 +1518,7 @@ def gen_customize_batch_attention_module(
     variant_decl: str,
     pos_encoding_mode: int = 0,
     use_logits_soft_cap: bool = False,
+    use_sliding_window: bool = False,
     use_profiler: bool = False,
 ):
     kwargs = {
@@ -1526,6 +1532,7 @@ def gen_customize_batch_attention_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_sliding_window": str(use_sliding_window).lower(),
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (

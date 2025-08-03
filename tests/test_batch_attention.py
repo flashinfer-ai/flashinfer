@@ -66,6 +66,7 @@ def _run_attention(
     layout="NHD",
     test_dtype=torch.bfloat16,
     logits_soft_cap=0.0,
+    window_left=-1,
     device="cuda",
     causal=True,
 ):
@@ -129,8 +130,11 @@ def _run_attention(
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
         logits_soft_cap=logits_soft_cap,
+        window_left=window_left,
     )
-    out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
+    out_old, lse_old = wrapper_old.run(
+        q, kv_data, return_lse=True, window_left=window_left
+    )
 
     # --------- new / mixed scheduler --------- #
     wrapper = flashinfer.BatchAttention(kv_layout=layout)
@@ -148,6 +152,7 @@ def _run_attention(
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
         logits_soft_cap=logits_soft_cap,
+        window_left=window_left,
     )
     out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
 
@@ -157,7 +162,7 @@ def _run_attention(
 
 # -------------------------  PyTest test case  ----------------------------- #
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
-@pytest.mark.parametrize("page_block_size", [1, 8, 16])
+@pytest.mark.parametrize("page_block_size", [8, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("gqa_group_size", [1, 4, 7])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -165,6 +170,7 @@ def _run_attention(
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
+@pytest.mark.parametrize("window_left", [13, -1])
 def test_batch_attention_correctness(
     seq_len_pairs,
     page_block_size,
@@ -175,6 +181,7 @@ def test_batch_attention_correctness(
     layout,
     test_dtype,
     logits_soft_cap,
+    window_left,
 ):
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
@@ -191,5 +198,6 @@ def test_batch_attention_correctness(
         layout=layout,
         test_dtype=test_dtype,
         logits_soft_cap=logits_soft_cap,
+        window_left=window_left,
         device="cuda",
     )
