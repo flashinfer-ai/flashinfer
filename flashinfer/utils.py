@@ -524,6 +524,7 @@ class FP4Tensor:
         self,
         data: torch.Tensor,
         scale: torch.Tensor,
+        scale_start_index: int = 0,
         original_shape: Optional[Tuple[int, ...]] = None,
     ):
         """Initialize FP4Tensor.
@@ -534,6 +535,8 @@ class FP4Tensor:
             uint8 tensor storing the compressed FP4 data
         scale : torch.Tensor
             float8_e4m3fn tensor storing the scale factors
+        scale_start_index : int
+            The start token index of the scale factors. This is needed when two kernels (like prefill and decode kernels) are reusing the same scale factor tensor with different offsets.
         original_shape : Optional[Tuple[int, ...]]
             The original shape before compression.
         """
@@ -561,6 +564,7 @@ class FP4Tensor:
 
         self.data = data
         self.scale = scale
+        self.scale_start_index = scale_start_index
         self.original_shape = original_shape
         self.dtype = "nvfp4"
 
