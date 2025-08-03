@@ -31,7 +31,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
             response = requests.get(source, timeout=timeout)
             response.raise_for_status()
             hrefs = re.findall(r'\<a href=".*\.cubin">', response.text)
-            files = [h[9:-8] for h in hrefs]
+            files = [(h[9:-8], ".cubin") for h in hrefs]
             return files
 
         except requests.exceptions.RequestException as e:
@@ -62,24 +62,23 @@ class ArtifactPath:
 def download_artifacts():
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
-    cubin_paths = []
+    cubin_files = [(ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h")]
     for kernel in [
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
         ArtifactPath.DEEPGEMM,
     ]:
-        cubin_paths += [
-            kernel + cf
-            for cf in get_available_cubin_files(
+        cubin_files += [
+            (kernel + name, extension)
+            for name, extension in get_available_cubin_files(
                 FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
-            )[:2]
+            )
         ]
     pool = ThreadPoolExecutor(32)
     futures = []
-    for path in cubin_paths:
-        print(path)
-        ret = pool.submit(get_cubin, path, "")
+    for name, extension in cubin_files:
+        ret = pool.submit(get_cubin, name, "", extension)
         futures.append(ret)
     for ret in as_completed(futures):
         assert ret.result()
