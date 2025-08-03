@@ -28,4 +28,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.download_cubin:
-        download_artifacts()
+        if download_artifacts():
+            print("✅ All cubin download tasks completed successfully.")
+        else:
+            print("❌ Some cubin download tasks failed.")

@@ -66,7 +66,7 @@ class MetaInfoHash:
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
 
 
-def download_artifacts():
+def download_artifacts() -> bool:
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
     cubin_files = [(ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h")]
@@ -82,14 +82,19 @@ def download_artifacts():
                 FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
             )
         ]
-    pool = ThreadPoolExecutor(32)
+    pool = ThreadPoolExecutor(4)
     futures = []
     for name, extension in cubin_files:
         ret = pool.submit(get_cubin, name, "", extension)
         futures.append(ret)
+    results = []
     for ret in as_completed(futures):
-        assert ret.result()
+        result = ret.result()
+        results.append(result)
+    all_success = all(results)
     if not env_backup:
         os.environ.pop("FLASHINFER_CUBIN_CHECKSUM_DISABLED")
     else:
         os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = env_backup
+
+    return all_success
