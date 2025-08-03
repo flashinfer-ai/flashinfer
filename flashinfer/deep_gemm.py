@@ -39,6 +39,7 @@ from .cuda_utils import checkCudaErrors
 from .jit.cubin_loader import get_cubin
 from .jit.env import FLASHINFER_CACHE_DIR
 from .utils import ceil_div, round_up
+from .artifacts import ArtifactPath
 
 
 class GemmType(enum.Enum):
@@ -887,17 +888,17 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
-_artifact_hash = "d25901733420c7cddc1adf799b0d4639ed1e162f"
-
-
 def load_all():
     for cubin_name in KERNEL_MAP:
         if cubin_name in RUNTIME_CACHE:
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
-        cubin_prefix = f"{_artifact_hash}/deep-gemm/"
-        get_cubin(cubin_prefix + cubin_name, sha256)
-        path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
+        get_cubin(ArtifactPath.DEEPGEMM + cubin_name, sha256)
+        path = (
+            FLASHINFER_CACHE_DIR
+            / "cubins"
+            / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
+        )
         assert path.exists()
         RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
 
@@ -910,9 +911,10 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
-    cubin_prefix = f"{_artifact_hash}/deep-gemm/"
-    get_cubin(cubin_prefix + cubin_name, sha256)
-    path = FLASHINFER_CACHE_DIR / "cubins" / f"{cubin_prefix + cubin_name}.cubin"
+    get_cubin(ArtifactPath.DEEPGEMM + cubin_name, sha256)
+    path = (
+        FLASHINFER_CACHE_DIR / "cubins" / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
+    )
     assert path.exists()
     RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
     return RUNTIME_CACHE[cubin_name]
@@ -1436,8 +1438,7 @@ class KernelMap:
         self.indice = None
 
     def init_indices(self):
-        cubin_prefix = f"{_artifact_hash}/deep-gemm/"
-        indice_path = cubin_prefix + "kernel_map"
+        indice_path = ArtifactPath.DEEPGEMM + "kernel_map"
         assert get_cubin(
             indice_path, self.sha256, file_extension=".json"
         ), "cubin kernel map file not found, nor downloaded with matched sha256"

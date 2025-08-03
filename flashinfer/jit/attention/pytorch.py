@@ -30,6 +30,7 @@ from ..utils import (
     write_if_different,
 )
 from .utils import generate_additional_params
+from ...artifacts import ArtifactPath
 
 
 def get_single_decode_uri(
@@ -1494,6 +1495,9 @@ def trtllm_gen_fmha_module():
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
+        ],
     )
 
 
@@ -1593,4 +1597,7 @@ def cudnn_fmha_gen_module():
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
+        ],
     )

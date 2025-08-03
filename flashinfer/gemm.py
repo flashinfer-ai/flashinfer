@@ -37,6 +37,7 @@ from .fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
+from .artifacts import ArtifactPath
 
 CUDNN_AVAILABLE = False
 try:
@@ -309,6 +310,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
