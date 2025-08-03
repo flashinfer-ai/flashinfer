@@ -44,7 +44,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
                 time.sleep(delay)
             else:
                 logger.error("Max retries reached. Fetch failed.")
-                return False
+                return []
 
 
 class ArtifactPath:
