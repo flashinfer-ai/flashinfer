@@ -201,3 +201,17 @@ def test_batch_attention_correctness(
         window_left=window_left,
         device="cuda",
     )
+
+
+test_batch_attention_correctness(
+    seq_len_pairs=[(2048, 1)] * 77,
+    page_block_size=1,
+    num_kv_heads=1,
+    gqa_group_size=1,
+    head_dim=128,
+    layout="NHD",
+    test_dtype=torch.bfloat16,
+    logits_soft_cap=0.0,
+    window_left=13,
+    causal=True,
+)

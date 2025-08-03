@@ -54,6 +54,9 @@ struct StandardAttention : AttentionVariantBase {
     if constexpr (use_sliding_window) {
       uint32_t qo_len = params.q_len[work_idx];
       uint32_t kv_len = params.kv_len[work_idx];
+      if (qo_head_idx == 0 && kv_idx <= 100 && qo_idx == 0) {
+        printf("Persistent qo_len: %d, kv_len: %d,  qo_idx: %d, kv_idx: %d, window_left: %d\n", qo_len, kv_len, qo_idx, kv_idx, params.window_left);
+      }
       window_left = (params.window_left >= 0) ? params.window_left : kv_len;
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
     }
@@ -124,7 +127,7 @@ struct PersistentParams {
 
   float sm_scale;
   double logits_soft_cap;
-  uint32_t window_left;
+  int64_t window_left;
   {{ additional_params_decl }}
 
   PROFILER_PARAMS_DECL

@@ -183,7 +183,7 @@ class BatchAttention:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         logits_soft_cap: float = 0.0,
-        window_left: Optional[int] = None,
+        window_left: int = -1,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -194,6 +194,10 @@ class BatchAttention:
         if logits_soft_cap > 0.0 and self._logits_soft_cap <= 0.0:
             raise ValueError(
                 "logits_soft_cap used in kernel run but not provided in plan(). This will cause the wrong template used."
+            )
+        if window_left >= 0 and self._window_left < 0:
+            raise ValueError(
+                "Sliding window attention used in kernel run but not provided in plan(). This will cause the wrong template used."
             )
 
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
