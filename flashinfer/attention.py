@@ -120,7 +120,7 @@ class BatchAttention:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         use_profiler : bool
-            Whether to use the profiler, defaults to ``False``.
+            Whether to use the CTA-level profiler, defaults to ``False``.
         """
 
         if logits_soft_cap is None:
