@@ -111,7 +111,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       AttentionVariant, PersistentParams, [&] {
         PersistentParams params[2];
-
+        IdType* len_kv_chunk =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.len_kv_chunk_offset);
         for (int i = 0; i < 2; i++) {
           params[i].q = static_cast<DTypeQ*>(q.data_ptr());
           params[i].k = static_cast<DTypeKV*>(k_cache.data_ptr());
@@ -138,8 +139,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_head_idx_offset);
           params[i].work_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
-          params[i].len_kv_chunk =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].len_kv_chunk_offset);
+          params[i].len_kv_chunk = len_kv_chunk[i];
 
           params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =

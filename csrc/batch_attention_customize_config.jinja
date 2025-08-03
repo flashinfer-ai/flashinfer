@@ -54,7 +54,7 @@ struct StandardAttention : AttentionVariantBase {
     if constexpr (use_sliding_window) {
       uint32_t qo_len = params.q_len[work_idx];
       uint32_t kv_len = params.kv_len[work_idx];
-      if (qo_head_idx == 0 && kv_idx <= 100 && qo_idx == 0) {
+      if (qo_head_idx == 0 && qo_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
         printf("Persistent qo_len: %d, kv_len: %d,  qo_idx: %d, kv_idx: %d, window_left: %d\n", qo_len, kv_len, qo_idx, kv_idx, params.window_left);
       }
       window_left = (params.window_left >= 0) ? params.window_left : kv_len;
@@ -105,7 +105,7 @@ struct PersistentParams {
   IdType* kv_end;
   IdType* kv_head_idx_arr;
   IdType* work_indptr;
-  IdType* len_kv_chunk;
+  IdType len_kv_chunk;
 
   // for state reduction
   IdType* merge_indptr;

@@ -88,7 +88,7 @@ struct DefaultAttention : AttentionVariantBase {
       }
     }
     if constexpr (use_sliding_window) {
-      if (qo_head_idx == 0 && kv_idx <= 100 && qo_idx == 0) {
+      if (qo_head_idx == 0 && kv_idx <= 100 && qo_idx == 0 && blockIdx.x == 0) {
         printf("Default qo_len: %d, kv_len: %d, qo_idx: %d, kv_idx: %d, window_left: %d\n", qo_len,
                kv_len, qo_idx, kv_idx, window_left);
       }
