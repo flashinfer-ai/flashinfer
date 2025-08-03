@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ..artifacts import ArtifactPath
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -712,6 +713,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
+            f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],

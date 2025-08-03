@@ -27,6 +27,12 @@
 #include "KernelMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
+#ifdef TLLM_GEN_BMM_CUBIN_PATH
+static const std::string tllm_gen_bmm_cubin_path = std::string(TLLM_GEN_BMM_CUBIN_PATH);
+#else
+static_assert(false, "TLLM_GEN_BMM_CUBIN_PATH macro is not defined when compiling");
+#endif
+
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 }
@@ -645,14 +651,11 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "991e7438224199de85ef08a2730ce18c12b4e0aa";
-    const std::string cubin_path = pipeline_hash + "/" + std::string("batched_gemm-") +
-                                   TLLM_GEN_COMMIT + "-" + TLLM_GEN_BATCHED_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
     if (!fname_cubin.empty()) {
       fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
     }
-    fname_cubin = cubin_path + fname_cubin;
+    fname_cubin = tllm_gen_bmm_cubin_path + fname_cubin;
     std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };

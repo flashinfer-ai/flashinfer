@@ -31,6 +31,18 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
+#ifdef TLLM_GEN_FMHA_CUBIN_PATH
+static const std::string tllm_gen_fmha_cubin_path = std::string(TLLM_GEN_FMHA_CUBIN_PATH);
+#else
+static_assert(false, "TLLM_GEN_FMHA_CUBIN_PATH macro is not defined when compiling");
+#endif
+
+#ifdef TLLM_GEN_FMHA_METAINFO_HASH
+static const std::string tllm_gen_fmha_metainfo_hash = std::string(TLLM_GEN_FMHA_METAINFO_HASH);
+#else
+static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when compiling");
+#endif
+
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 std::string getMetaInfo(const std::string& name, const std::string& sha256,
@@ -232,14 +244,6 @@ class TllmGenFmhaKernel {
       // Break the while op.
       break;
     }
-  }
-
-  static std::string getCubinPath() {
-    const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
-    std::string hash =
-        env_hash ? std::string(env_hash) : "52e676342c67a3772e06f10b84600044c0c22b76";
-    std::string cubin_path = hash + "/fmha/trtllm-gen/";
-    return cubin_path;
   }
 
  private:
@@ -539,7 +543,7 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path = TllmGenFmhaKernel::getCubinPath() + kernelMeta.mFuncName;
+      std::string cubin_path = tllm_gen_fmha_cubin_path + kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
@@ -593,9 +597,8 @@ class TllmFmhaKernelFactory {
     std::lock_guard<std::mutex> lg(s_mutex);
 
     if (!metainfo_loaded) {
-      std::string metainfo_raw =
-          getMetaInfo(TllmGenFmhaKernel::getCubinPath() + "flashInferMetaInfo",
-                      "8c5630020c0452fb1cd1ea7e3b8fdbb7bf94f71bd899ed5b704a490bdb4f7368", ".h");
+      std::string metainfo_raw = getMetaInfo(tllm_gen_fmha_cubin_path + "flashInferMetaInfo",
+                                             tllm_gen_fmha_metainfo_hash, ".h");
       metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
       metainfo_loaded = true;
     }

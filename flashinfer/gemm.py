@@ -25,6 +25,7 @@ import jinja2
 import torch
 import torch.nn.functional as F
 
+from .artifacts import ArtifactPath
 from .autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -309,6 +310,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
