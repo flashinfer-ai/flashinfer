@@ -59,6 +59,13 @@ class ArtifactPath:
     DEEPGEMM: str = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
 
 
+class MetaInfoHash:
+    TRTLLM_GEN_FMHA: str = (
+        "8c5630020c0452fb1cd1ea7e3b8fdbb7bf94f71bd899ed5b704a490bdb4f7368"
+    )
+    DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
+
+
 def download_artifacts():
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"

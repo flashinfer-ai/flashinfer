@@ -20,7 +20,7 @@ from typing import List, Optional
 import jinja2
 import torch
 
-from ...artifacts import ArtifactPath
+from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -1497,6 +1497,7 @@ def trtllm_gen_fmha_module():
         extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
             f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
+            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',
         ],
     )
 

@@ -35,7 +35,7 @@ from typing import Any, Dict, Optional, Tuple
 import cuda.bindings.driver as cbd
 import torch
 
-from .artifacts import ArtifactPath
+from .artifacts import ArtifactPath, MetaInfoHash
 from .cuda_utils import checkCudaErrors
 from .jit.cubin_loader import get_cubin
 from .jit.env import FLASHINFER_CACHE_DIR
@@ -1459,6 +1459,4 @@ class KernelMap:
         return self.indice[key]
 
 
-KERNEL_MAP = KernelMap(
-    "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
-)
+KERNEL_MAP = KernelMap(MetaInfoHash.DEEPGEMM)
