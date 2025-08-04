@@ -1349,8 +1349,6 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
-    _check_cudnn_fp4_availability()
-
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
@@ -1397,21 +1395,26 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
-    # the fp4 cudnn graph will be shared for both mm and bmm, so here we need to get the 3d shape and stride including the batch dimension for both input and block scale tensors.
-    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    expanded_a_descale_shape, expanded_a_descale_stride = (
-        _expand_block_scale_tensor_shape(a_descale, batch)
-    )
-    expanded_b_descale_shape, expanded_b_descale_stride = (
-        _expand_block_scale_tensor_shape(b_descale, batch)
-    )
     workspace_buffer = _get_cache_buf(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     if backend == "cudnn":
+        _check_cudnn_fp4_availability()
+
+        # the fp4 cudnn graph will be shared for both mm and bmm, so
+        # here we need to get the 3d shape and stride including the
+        # batch dimension for both input and block scale tensors.
+        real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+        real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+        batch = real_a_shape[0]
+        expanded_a_descale_shape, expanded_a_descale_stride = (
+            _expand_block_scale_tensor_shape(a_descale, batch)
+        )
+        expanded_b_descale_shape, expanded_b_descale_stride = (
+            _expand_block_scale_tensor_shape(b_descale, batch)
+        )
+
         # build the fp4 cudnn graph
         graph = build_cudnn_gemm_block_scale_dequantize_graph(
             real_a_shape,
