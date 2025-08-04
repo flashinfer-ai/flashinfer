@@ -16,6 +16,8 @@
 #ifndef FLASHINFER_CUTLASS_UTILS_CUH_
 #define FLASHINFER_CUTLASS_UTILS_CUH_
 
+#include <cuda_fp8.h>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -39,11 +41,8 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #if defined(FLASHINFER_ENABLE_FP4_E2M1)
 #include <cuda_fp4.h>
-#endif
 #endif
 
 namespace flashinfer {
