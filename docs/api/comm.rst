@@ -3,9 +3,7 @@
 flashinfer.comm
 ===============
 
-.. currentmodule:: flashinfer.comm
 
-This module provides communication primitives and utilities for distributed computing, including CUDA IPC, AllReduce operations, and memory management utilities.
 
 MNNVL (Multi-Node NVLink)
 -------------------------
