@@ -2755,10 +2755,6 @@ def fmha_varlen(
         lse,
         mask_mode_code,
         sm_scale,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo,
         max_qo_len,
     )
 

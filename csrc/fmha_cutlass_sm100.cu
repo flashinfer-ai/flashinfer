@@ -78,14 +78,17 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
                          at::Tensor work_indptr, at::Tensor qo_tile_indices,
                          at::Tensor qo_head_indices, at::Tensor batch_indices, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len) {
+                         double sm_scale, int64_t max_qo_len) {
   CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   int total_qo_len = q.size(0);
   int total_kv_len = k.size(0);
+  int num_qo_heads = q.size(1);
+  int num_kv_heads = k.size(1);
+  int head_dim_qk = q.size(2);
+  int head_dim_vo = v.size(2);
   int batch_size = qo_segment_offsets.size(0) - 1;
   int q_stride_n = q.stride(0);
   int q_stride_h = q.stride(1);
