@@ -12,7 +12,7 @@ from pathlib import Path
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 root = Path(__file__).parents[1].resolve()
-sys.path.append(str(root))
+sys.path.insert(0, str(root))
 os.environ["BUILD_DOC"] = "1"
 autodoc_mock_imports = [
     "torch",
@@ -21,6 +21,7 @@ autodoc_mock_imports = [
     "cuda",
     "numpy",
     "einops",
+    "mpi4py",
 ]
 
 project = "FlashInfer"
