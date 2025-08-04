@@ -2975,28 +2975,48 @@ def trtllm_batch_context_with_kv_cache(
     o_sf_vec_size: Optional[int] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
-    Parameters:
-    query: query tensor with shape [num_tokens, num_heads, head_dim]
-    kv_cache: kv_cache tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
-    workspace_buffer: workspace
-    block_tables: page_table of kv cache, [batch_size, num_pages]
-    seq_lens: A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
-    max_q_len: max sequence length for query
-    max_kv_len: max sequence length for kv_cache
-    bmm1_scale: fused scale for bmm1 input.
-    bmm2_scale: fused scale for bmm2 input.
-    batch_size: batch size
-    cum_seq_lens_q: cumulative sequence length for query. shape: ``[batch_size + 1]``
-    cum_seq_lens_kv: cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
-    window_left: The left (inclusive) window size for the attention window, when set to ``-1``, the window
-            size will be set to the full length of the sequence. Defaults to ``-1``.
-    out: output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
-    out_dtype: output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
-    o_sf_scale: scale for nvfp4 output tensor scale factor.
-    o_sf_vec_size: vector size for nvfp4 output tensor scale factor.
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    kv_cache : torch.Tensor
+        kv_cache tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+    workspace_buffer : torch.Tensor
+        workspace
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+    max_q_len : int
+        max sequence length for query
+    max_kv_len : int
+        max sequence length for kv_cache
+    bmm1_scale : float
+        fused scale for bmm1 input.
+    bmm2_scale : float
+        fused scale for bmm2 input.
+    batch_size : int
+        batch size
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence length for query. shape: ``[batch_size + 1]``
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
+    out : Optional[Union[torch.Tensor, FP4Tensor]] = None
+        output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+    out_dtype : Optional[Union[torch.dtype, str]] = None
+        output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+    o_sf_scale : Optional[float] = None
+        scale for nvfp4 output tensor scale factor.
+    o_sf_vec_size : Optional[int] = None
+        vector size for nvfp4 output tensor scale factor.
 
-    Returns:
-    out: output torch.Tensor or FP4Tensor.
+    Returns
+    -------
+    out: Union[torch.Tensor, FP4Tensor]
+        output torch.Tensor or FP4Tensor.
     """
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)

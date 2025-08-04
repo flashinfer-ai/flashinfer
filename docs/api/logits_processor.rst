@@ -63,7 +63,7 @@ Types
     TaggedTensor
 
 Customization Features
--------------
+----------------------
 
 Custom Logits Processor
 ^^^^^^^^^^^^^^^^^^^^^^^
