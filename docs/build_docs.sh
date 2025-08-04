@@ -10,7 +10,7 @@ if ! python3 -c "import flashinfer" &> /dev/null; then
 fi
 
 make clean
-make html
+make SPHINXOPTS='-T -v' html
 
 # Add RunLLM widget to generated HTML files
 echo "Adding RunLLM widget to documentation..."
