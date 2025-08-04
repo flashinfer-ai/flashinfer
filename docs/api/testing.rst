@@ -17,7 +17,7 @@ Test Environment Setup
     sleep_after_kernel_run
 
 Performance Analysis
--------------------
+--------------------
 
 FLOPS Calculation
 ~~~~~~~~~~~~~~~~~

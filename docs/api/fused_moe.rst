@@ -32,10 +32,9 @@ CUTLASS Fused MoE
     :toctree: ../generated
 
     cutlass_fused_moe
-    gen_cutlass_fused_moe_sm100_module
 
 TensorRT-LLM Fused MoE
----------------------
+----------------------
 
 .. autosummary::
     :toctree: ../generated

@@ -2167,11 +2167,10 @@ def group_deepgemm_fp8_nt_groupwise(
     like mixture of experts (MoE) where different tokens are routed to different experts.
 
     The operation can be conceptualized as:
-    ```
-    for i in range(num_groups):
-        row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
-        output[row_slice] = a[row_slice] @ b[i].T
-    ```
+
+    >>> for i in range(num_groups):
+    >>>    row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+    >>>    output[row_slice] = a[row_slice] @ b[i].T
 
     Currently only supported on NVIDIA Blackwell (SM100) architecture.
 
@@ -2294,10 +2293,9 @@ def batch_deepgemm_fp8_nt_groupwise(
     useful for scenarios like mixture of experts (MoE) where different tokens are routed to different experts.
 
     The operation can be conceptualized as:
-    ```
-    for i in range(num_groups):
-        output[i] = a[i][:masked_m[i]] @ b[i][:masked_m[i]].T
-    ```
+
+    >>> for i in range(num_groups):
+    >>>     output[i] = a[i][:masked_m[i]] @ b[i][:masked_m[i]].T
 
     Currently only supported on NVIDIA Blackwell (SM100) architecture.
 

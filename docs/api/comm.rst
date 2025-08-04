@@ -125,9 +125,6 @@ TensorRT-LLM MNNVL AllReduce
 .. autosummary::
     :toctree: ../generated
 
-    gen_trtllm_mnnvl_comm_module
-    get_trtllm_mnnvl_comm_module
-    get_allreduce_mnnvl_workspace
     trtllm_mnnvl_all_reduce
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
