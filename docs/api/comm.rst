@@ -14,7 +14,7 @@ CUDA IPC Utilities
     :toctree: ../generated
 
     cuda_ipc.create_shared_buffer
-    free_shared_buffer
+    cuda_ipc.free_shared_buffer
 
 
 DLPack Utilities
@@ -23,7 +23,7 @@ DLPack Utilities
 .. autosummary::
     :toctree: ../generated
 
-    pack_strided_memory
+    dlpack_utils.pack_strided_memory
 
 Mapping Utilities
 -----------------
@@ -31,7 +31,7 @@ Mapping Utilities
 .. autosummary::
     :toctree: ../generated
 
-    Mapping
+    mapping.Mapping
 
 TensorRT-LLM AllReduce
 ----------------------
