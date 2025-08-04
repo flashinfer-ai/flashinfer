@@ -78,7 +78,6 @@ Initialization and Utilities
 
     trtllm_lamport_initialize
     trtllm_lamport_initialize_all
-    compute_fp4_swizzled_layout_sf_size
 
 vLLM AllReduce
 --------------
