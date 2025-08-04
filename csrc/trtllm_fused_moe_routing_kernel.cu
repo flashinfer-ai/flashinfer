@@ -561,7 +561,7 @@ __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSiz
                                                    DataType const* ptrScores) {
   DataType minScore = DataType{-INFINITY};
   DataType maxScore = minScore;
-  int32_t maxExpertIdx{-1};
+  int32_t maxExpertIdx{0};
   using DataTypeVec = std::conditional_t<sizeof(DataType) == 2, float2, float4>;
 
   // Non-vectorized loading: directly access ptrScores with expertIdx

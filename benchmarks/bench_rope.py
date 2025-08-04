@@ -8,6 +8,7 @@ $ python bench_rope.py
 
 from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.rotary_embedding import (
 )
 
 from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+from flashinfer.testing.utils import bench_gpu_time
 
 
 class FlashInferRotaryEmbedding(nn.Module):
@@ -193,10 +195,12 @@ def benchmark(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: rope_forward(pos_ids, query, key), quantiles=quantiles
-    )
+    # Get raw measurements
+    measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
+    # Calculate statistics to match original return values
+    ms = np.median(measurements)
+    min_ms = np.percentile(measurements, 20)
+    max_ms = np.percentile(measurements, 80)
 
     return ms, min_ms, max_ms
 

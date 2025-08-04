@@ -20,6 +20,7 @@ from typing import List, Optional
 import jinja2
 import torch
 
+from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -395,6 +396,7 @@ def get_batch_attention_uri(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
     use_profiler: bool,
 ) -> str:
     return (
@@ -405,6 +407,7 @@ def get_batch_attention_uri(
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
+        f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
         f"use_profiler_{str(use_profiler).lower()}"
     )
 
@@ -861,6 +864,7 @@ def gen_batch_attention_module(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
     use_profiler: bool,
 ):
     uri = get_batch_attention_uri(
@@ -871,6 +875,7 @@ def gen_batch_attention_module(
         head_dim_qk,
         head_dim_vo,
         pos_encoding_mode,
+        use_logits_soft_cap,
         use_profiler,
     )
 
@@ -878,7 +883,7 @@ def gen_batch_attention_module(
     additional_tensor_dtypes = []
     additional_scalar_names = []
     additional_scalar_dtypes = []
-    variant_name = f"StandardAttention"
+    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = f"#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
@@ -896,6 +901,7 @@ def gen_batch_attention_module(
         variant_name,
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
     )
 
@@ -1489,6 +1495,10 @@ def trtllm_gen_fmha_module():
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
+            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',
+        ],
     )
 
 
@@ -1507,6 +1517,7 @@ def gen_customize_batch_attention_module(
     variant_name: str,
     variant_decl: str,
     pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
     use_profiler: bool = False,
 ):
     kwargs = {
@@ -1519,6 +1530,7 @@ def gen_customize_batch_attention_module(
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
@@ -1529,7 +1541,6 @@ def gen_customize_batch_attention_module(
             additional_scalar_dtypes,
         )
     )
-
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
     ) as f:
@@ -1587,4 +1598,7 @@ def cudnn_fmha_gen_module():
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
+        ],
     )

@@ -533,25 +533,32 @@ def attention_tb_per_sec_with_actual_seq_lens(
 
 def bench_gpu_time(
     fn,
-    dry_runs: int = 5,
-    num_iters: int = 20,
-    nvtx_range_name: str = "kernel",
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
     l2_flush: bool = True,
     l2_flush_size_mb: int = 256,
-    l2_flush_device: str = None,
+    l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
 ):
     """
     Benchmark kernel execution time without using CUDA graphs.
     Measures kernel launch latency + actual kernel execution time for fn().
-    Uses NVTX to label kernel launches and allows the ability to flush L2 cache and sleep after the run.
+    Can flush L2 cache and sleep after the run.
+
+    Number of dry run and actual run iterations can be set by iteration count or time:
+    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
+    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+
     Returns an array of measured times so that the caller can compute statistics.
 
     Args:
         fn: Function to benchmark.
-        dry_runs: Number of dry runs during which times does not count.
-        num_iters: Number of iterations.
-        nvtx_range_name: Name of the NVTX range to encapsulate the kernel
+        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
+        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
+        dry_run_time_ms: Time to run the dry run in milliseconds.
+        repeat_time_ms: Time to run the repeat in milliseconds.
         l2_flush: Whether to flush L2 cache.
         l2_flush_size_mb: Size of the L2 cache to flush.
         l2_flush_device: Device that needs to flush L2 cache.
@@ -567,62 +574,80 @@ def bench_gpu_time(
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
         buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
 
-    # Dry run -- median time will be used to set sleep time
+    ## Estimate kernel execution time by running the kernel 5 times
+    measurement_iters = 5
     torch.cuda.synchronize()
-    dry_run_times = []
-    for _ in range(dry_runs):
+    fn()  # Call once to exclude initial overhead
+    torch.cuda.synchronize()
+    start_event.record()
+    for _ in range(measurement_iters):
         if l2_flush:
             buffer.zero_()
-            torch.cuda.synchronize()
-        start_event.record()
         fn()
-        end_event.record()
-        torch.cuda.synchronize()
-        dry_run_times.append(start_event.elapsed_time(end_event))
-    median_dry_run_time = np.median(dry_run_times) if len(dry_run_times) > 0 else 0.0
+    end_event.record()
+    torch.cuda.synchronize()
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
+
+    ## Set dry run and repeat iterations
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / estimated_kernel_execution_time))
+    if repeat_iters is None:
+        repeat_iters = max(1, int(repeat_time_ms / estimated_kernel_execution_time))
+
+    # Dry runs
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if l2_flush:
+            buffer.zero_()
+        fn()
+    torch.cuda.synchronize()
 
     # Actual run
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     torch.cuda.synchronize()
-    for iter_idx in range(num_iters):
-        with torch.autograd.profiler.emit_nvtx():
-            if l2_flush:
-                buffer.zero_()
-                torch.cuda.synchronize()
-            torch.cuda.nvtx.range_push(nvtx_range_name)
-            start_events[iter_idx].record()
-            fn()
-            end_events[iter_idx].record()
-            torch.cuda.nvtx.range_pop()
+    for iter_idx in range(repeat_iters):
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        fn()
+        end_events[iter_idx].record()
 
         if sleep_after_run:
-            sleep_after_kernel_run(median_dry_run_time)
+            sleep_after_kernel_run(estimated_kernel_execution_time)
 
     # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
     measured_times = []
-    for iter_idx in range(num_iters):
+    for iter_idx in range(repeat_iters):
         measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
     return measured_times
 
 
 def bench_gpu_time_with_cudagraph(
     fn,
-    dry_runs: int = 5,
-    num_iters: int = 20,
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
     num_iters_within_graph: int = 10,
-    nvtx_range_name: str = "kernel",
     l2_flush: bool = True,
     l2_flush_size_mb: int = 256,
-    l2_flush_device: str = None,
+    l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
 ):
     """
     Benchmark GPU time using by constructing CUDA graphs with kernel launch and then replaying the graph.
     Increasing the number of iterations within graph can amortize kernel launch latency to help
     obtain measurements close to GPU kernel time of fn().
-    Uses NVTX to label kernel launches and allows the ability to flush L2 cache and sleep after the run.
+    Can flush L2 cache and sleep after the run.
+
+    Number of dry run and actual run iterations can be set by iteration count or time:
+    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
+    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+
     Returns an array of measured times so that the caller can compute statistics.
 
     Uses PyTorch's API to construt and use CUDA Graphs.
@@ -630,10 +655,11 @@ def bench_gpu_time_with_cudagraph(
 
     Args:
         fn: Function to benchmark.
-        dry_runs: Number of dry runs during which times does not count.
-        num_iters: Number of iterations to run the CUDA Graph.
+        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
+        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
+        dry_run_time_ms: Time to run the dry run in milliseconds.
+        repeat_time_ms: Time to run the repeat in milliseconds.
         num_iters_within_graph: Number of iterations to run within the graph.
-        nvtx_range_name: Name of the NVTX range to encapsulate the kernel.
         l2_flush: Whether to flush L2 cache.
         l2_flush_size_mb: Size of the L2 cache to flush.
         l2_flush_device: Device that needs to flush L2 cache.
@@ -665,43 +691,51 @@ def bench_gpu_time_with_cudagraph(
             fn()
     torch.cuda.synchronize()
 
-    # Dry run -- median time will be used to set sleep time
-    dry_run_times = []
-    for _ in range(dry_runs):
+    ## Estimate kernel execution time by running the kernel 5 times
+    measurement_iters = 5
+    start_event.record()
+    for _ in range(measurement_iters):
         if l2_flush:
             buffer.zero_()
-            torch.cuda.synchronize()
-        start_event.record()
         g.replay()
-        end_event.record()
-        torch.cuda.synchronize()
-        dry_run_times.append(
-            start_event.elapsed_time(end_event) / num_iters_within_graph
-        )
-    median_dry_run_time = np.median(dry_run_times) if len(dry_run_times) > 0 else 0.0
+    end_event.record()
+    torch.cuda.synchronize()
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
+
+    ## Set dry run and repeat iterations
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / estimated_kernel_execution_time))
+    if repeat_iters is None:
+        repeat_iters = max(1, int(repeat_time_ms / estimated_kernel_execution_time))
+
+    # Dry run
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if l2_flush:
+            buffer.zero_()
+        g.replay()
+    torch.cuda.synchronize()
 
     # Actual run
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     torch.cuda.synchronize()
-    for iter_idx in range(num_iters):
-        with torch.autograd.profiler.emit_nvtx():
-            if l2_flush:
-                buffer.zero_()
-                torch.cuda.synchronize()
-            torch.cuda.nvtx.range_push(nvtx_range_name)
-            start_events[iter_idx].record()
-            g.replay()
-            end_events[iter_idx].record()
-            torch.cuda.nvtx.range_pop()
+    for iter_idx in range(repeat_iters):
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        g.replay()
+        end_events[iter_idx].record()
 
         if sleep_after_run:
-            sleep_after_kernel_run(median_dry_run_time)
+            sleep_after_kernel_run(estimated_kernel_execution_time)
 
     # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
     measured_times = []
-    for iter_idx in range(num_iters):
+    for iter_idx in range(repeat_iters):
         measured_times.append(
             start_events[iter_idx].elapsed_time(end_events[iter_idx])
             / num_iters_within_graph

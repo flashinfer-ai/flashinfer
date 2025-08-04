@@ -983,7 +983,7 @@ __device__ auto quantizePackedFPXValue(
   auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
                                                    NumThreadsPerSF, VecSize>(
       std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
-      std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
+      std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED_128x4);
 
   // Do the conversion and set the output and scaling factor
   auto func = [&]() {
@@ -1023,7 +1023,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
   auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
                                                    NumThreadsPerSF, VecSize>(
       std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
-      std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
+      std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED_128x4);
   if (sf_out) {
     if (input_sf) {
       auto const sf_in =
@@ -1031,7 +1031,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
                                              NumThreadsPerSF, VecSize>(
               std::nullopt /* batchIdx */, source_token_id, elem_idx, std::nullopt /* numRows */,
               num_cols, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-              FP4QuantizationSFLayout::SWIZZLED);
+              FP4QuantizationSFLayout::SWIZZLED_128x4);
       *sf_out = *sf_in;
     } else {
       *sf_out = 0x00;

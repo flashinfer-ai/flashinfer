@@ -64,13 +64,8 @@ def swizzle_blockscale(
         _pad_scale_factors(unswizzled_sf[i], m, n, sf_vec_size) for i in range(b)
     ]
     padded_input_sf = torch.stack(padded_input_sf_chunked)
-    out = torch.empty_like(padded_input_sf)
-    get_fp4_quantization_sm100_module().fp4_swizzle_blockscale_sm100(
-        padded_input_sf.flatten(0, 1),
-        out.flatten(0, 1),
-        out.shape[0],
-        out.shape[1],
-        out.shape[2],
+    out = get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
+        padded_input_sf
     )
     out = out.view(padded_input_sf.shape)
     return out
