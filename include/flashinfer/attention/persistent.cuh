@@ -34,7 +34,8 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
   return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
                     params.partial_indptr[work_idx], params.q_len[work_idx],
                     params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx], params.kv_head_idx_arr[work_idx], params.len_kv_chunk);
+                    params.kv_end[work_idx], params.kv_head_idx_arr[work_idx],
+                    *params.len_kv_chunk);
 }
 
 template <typename KTraits>

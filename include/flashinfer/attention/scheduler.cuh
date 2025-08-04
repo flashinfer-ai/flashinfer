@@ -1021,8 +1021,8 @@ struct HolisticPlanInfo {
   int64_t merge_o_indices_offset;
   int64_t num_qo_len_offset;
 
-  static constexpr uint32_t NUM_TASK_ARGS = 11;
-  static constexpr uint32_t NUM_SHARED_ARGS = 7;
+  static constexpr uint32_t NUM_TASK_ARGS = 10;
+  static constexpr uint32_t NUM_SHARED_ARGS = 8;
 
   std::vector<int64_t> ToVector() const {
     std::vector<int64_t> vec;
@@ -1040,7 +1040,7 @@ struct HolisticPlanInfo {
       vec.push_back(tasks[i].kv_head_idx_offset);
       vec.push_back(tasks[i].work_indptr_offset);
     }
-    vec.push_back(len_kv_chunk);
+    vec.push_back(len_kv_chunk_offset);
     vec.push_back(partial_o_offset);
     vec.push_back(partial_lse_offset);
     vec.push_back(merge_indptr_offset);
@@ -1070,7 +1070,7 @@ struct HolisticPlanInfo {
       tasks[i].kv_head_idx_offset = vec[2 + i * NUM_TASK_ARGS + 8];
       tasks[i].work_indptr_offset = vec[2 + i * NUM_TASK_ARGS + 9];
     }
-    len_kv_chunk_offset = vec[2 + NUM_TASKS * NUM_TASK_ARGS + 10];
+    len_kv_chunk_offset = vec[2 + NUM_TASKS * NUM_TASK_ARGS];
     partial_o_offset = vec[3 + NUM_TASKS * NUM_TASK_ARGS];
     partial_lse_offset = vec[4 + NUM_TASKS * NUM_TASK_ARGS];
     merge_indptr_offset = vec[5 + NUM_TASKS * NUM_TASK_ARGS];
@@ -1266,7 +1266,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
     auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
     auto kv_head_idx_vec = flatten(cluster_kv_head_idx, total_num_works);
-    auto len_kv_chunk_vec = cluster_len_kv_chunk;
 
     plan_info.tasks[task].q_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_indptr");
@@ -1288,8 +1287,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_head_idx");
     plan_info.tasks[task].work_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "work_indptr");
-    plan_info.tasks[task].len_kv_chunk =
-        int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "len_kv_chunk");
 
     CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_indptr_offset,
                            q_indptr_vec);
@@ -1311,7 +1308,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   }
   plan_info.len_kv_chunk_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * NUM_TASKS, 16, "len_kv_chunk");
-  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.len_kv_chunk_offset, len_kv_chunk_vec);
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.len_kv_chunk_offset,
+                         cluster_len_kv_chunk);
 
   if (merge_indptr.size() > max_num_kv_splits) {
     std::ostringstream err_msg;

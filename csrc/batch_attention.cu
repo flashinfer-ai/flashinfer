@@ -139,7 +139,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_head_idx_offset);
           params[i].work_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
-          params[i].len_kv_chunk = len_kv_chunk[i];
+          params[i].len_kv_chunk = len_kv_chunk + i;
 
           params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =
