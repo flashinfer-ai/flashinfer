@@ -10,6 +10,8 @@ This module provides communication primitives and utilities for distributed comp
 CUDA IPC Utilities
 ------------------
 
+.. currentmodule:: flashinfer.comm.cuda_ipc
+
 .. autosummary::
     :toctree: ../generated
 
@@ -20,6 +22,8 @@ CUDA IPC Utilities
 DLPack Utilities
 ----------------
 
+.. currentmodule:: flashinfer.comm.dlpack_utils
+
 .. autosummary::
     :toctree: ../generated
 
@@ -28,6 +32,8 @@ DLPack Utilities
 Mapping Utilities
 -----------------
 
+.. currentmodule:: flashinfer.comm.mapping
+
 .. autosummary::
     :toctree: ../generated
 
@@ -35,6 +41,8 @@ Mapping Utilities
 
 TensorRT-LLM AllReduce
 ----------------------
+
+.. currentmodule:: flashinfer.comm.trtllm_ar
 
 Types and Enums
 ~~~~~~~~~~~~~~~
@@ -82,6 +90,8 @@ Initialization and Utilities
 
 vLLM AllReduce
 --------------
+
+.. currentmodule:: flashinfer.comm.vllm_ar
 
 .. autosummary::
     :toctree: ../generated
