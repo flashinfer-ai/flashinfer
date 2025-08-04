@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-from mpi4py import MPI
 
 from flashinfer.comm.mapping import Mapping
 
@@ -22,6 +21,8 @@ from .mnnvl import McastGPUBuffer
 
 
 def mpi_barrier():
+    from mpi4py import MPI
+
     """MPI barrier - could potentially be replaced with dist.barrier()"""
     MPI.COMM_WORLD.Barrier()
 
