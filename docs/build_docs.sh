@@ -3,6 +3,12 @@ set -eo pipefail
 set -x
 echo "Building FlashInfer documentation..."
 
+if ! python3 -c "import flashinfer" &> /dev/null; then
+  cd ..
+  pip install -e . -v --no-deps --no-build-isolation
+  cd docs
+fi
+
 make clean
 make html
 
