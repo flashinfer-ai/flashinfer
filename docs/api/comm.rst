@@ -15,7 +15,6 @@ CUDA IPC Utilities
 .. autosummary::
     :toctree: ../generated
 
-    CudaRTLibrary
     create_shared_buffer
     free_shared_buffer
 
