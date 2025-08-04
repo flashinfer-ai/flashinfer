@@ -29,7 +29,6 @@
 #include "device/fmha.hpp"
 #include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
-#include "pytorch_extension_utils.h"
 
 namespace flashinfer {
 

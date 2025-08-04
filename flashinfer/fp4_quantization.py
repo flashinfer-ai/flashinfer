@@ -1,14 +1,36 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import functools
+from enum import Enum
 from functools import cache
 from types import SimpleNamespace
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
-from .utils import register_custom_op, register_fake_op
+from .utils import (
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 def _pad_scale_factors(
@@ -46,6 +68,7 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/thop/fp4Op.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
@@ -78,19 +101,21 @@ def get_fp4_quantization_sm100_module():
     )
     def fp4_quantize_sm100(
         input: torch.Tensor,
-        global_scale: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
-            global_scale (torch.Tensor): Global scale factor of shape [1] and dtype float32.
+            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
             sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
             sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+            is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -103,12 +128,13 @@ def get_fp4_quantization_sm100_module():
             sf_vec_size,
             sf_use_ue8m0,
             is_sf_swizzled_layout,
+            is_sf_8x4_layout,
         )
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
         input: torch.Tensor,
-        global_scale: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
@@ -120,56 +146,97 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::fp4_swizzle_blockscale_sm100",
-        mutates_args=("swizzled_sf",),
+        "flashinfer::nvfp4_block_scale_interleave_sm100",
+        mutates_args=("",),
     )
-    def fp4_swizzle_blockscale_sm100(
+    def nvfp4_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
-        swizzled_sf: torch.Tensor,
-        b: int,
-        m: int,
-        n: int,
-    ) -> None:
+    ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
 
         Args:
             unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8.
-            swizzled_sf (torch.Tensor): output tensor for swizzled block scale with dtype uint8.
-            b (int): Batch dimension.
-            m (int): M dimension.
-            n (int): N dimension.
+
+        Returns:
+            torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        module.fp4_swizzle_blockscale(
+        return module.nvfp4_block_scale_interleave(
             unswizzled_sf,
-            swizzled_sf,
-            b,
-            m,
-            n,
         )
 
-    @register_fake_op("flashinfer::fp4_swizzle_blockscale_sm100")
-    def _fake_fp4_swizzle_blockscale_sm100(
+    @register_fake_op("flashinfer::nvfp4_block_scale_interleave_sm100")
+    def _fake_nvfp4_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
-        swizzled_sf: torch.Tensor,
-        b: int,
-        m: int,
-        n: int,
-    ) -> None:
-        pass
+    ) -> torch.Tensor:
+        return unswizzled_sf.new_empty(
+            [unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8
+        )
+
+    @register_custom_op(
+        "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
+        mutates_args=(""),
+    )
+    def e2m1_and_ufp8sf_scale_to_float_sm100(
+        e2m1_tensor: torch.Tensor,
+        ufp8_scale_tensor: torch.Tensor,
+        global_scale_tensor: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        ufp8_type: int = 1,
+        is_sf_swizzled_layout: bool = True,
+    ) -> torch.Tensor:
+        """Convert E2M1 format tensor and UFP8 scale factors to float tensor.
+
+        This function performs dequantization by converting a packed FP4 tensor in E2M1 format
+        back to float values using the associated UFP8 scale factors and global scale.
+
+        Args:
+            e2m1_tensor (torch.Tensor): Packed FP4 tensor in E2M1 format of shape [M, K/2] with dtype uint8.
+            ufp8_scale_tensor (torch.Tensor): Scale factors tensor in UFP8 format with dtype uint8.
+            global_scale_tensor (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
+            sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+            ufp8_type (int, optional): UFP8 scale factor type (0 for UE8M0, 1 for E4M3). Defaults to 1.
+            is_sf_swizzled_layout (bool, optional): Whether scale factors use swizzled layout. Defaults to True.
+
+        Returns:
+            torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
+        """
+        return module.e2m1_and_ufp8sf_scale_to_float(
+            e2m1_tensor.cpu(),
+            ufp8_scale_tensor.cpu().reshape(-1),
+            global_scale_tensor.cpu(),
+            sf_vec_size,
+            ufp8_type,
+            is_sf_swizzled_layout,
+        )
+
+    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
+    def _fake_e2m1_and_ufp8sf_scale_to_float_sm100(
+        e2m1_tensor: torch.Tensor,
+        ufp8_scale_tensor: torch.Tensor,
+        global_scale_tensor: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        ufp8_type: int = 1,
+        is_sf_swizzled_layout: bool = True,
+    ) -> torch.Tensor:
+        return e2m1_tensor.new_empty(
+            [e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2], dtype=torch.float32
+        )
 
     # Register the module
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
-        fp4_swizzle_blockscale_sm100=fp4_swizzle_blockscale_sm100,
+        nvfp4_block_scale_interleave_sm100=nvfp4_block_scale_interleave_sm100,
+        e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
     )
 
 
 def fp4_quantize(
     input: torch.Tensor,
-    global_scale: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
     sf_vec_size: int = 16,
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -178,10 +245,11 @@ def fp4_quantize(
 
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
-        global_scale (torch.Tensor): Global scale factor of shape [1] and dtype float32.
+        global_scale (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
         sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+        is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -192,10 +260,15 @@ def fp4_quantize(
         NotImplementedError: If any of the following features are requested but not implemented:
             - BFloat16 input when BFloat16 is not enabled
             - FP8 input when FP8 is not enabled
-            - sf_vec_size other than 16
+            - sf_vec_size other than 16 or 32
     """
-    if sf_vec_size != 16:
-        raise NotImplementedError("sf_vec_size can only be 16")
+    if sf_vec_size != 16 and sf_vec_size != 32:
+        raise NotImplementedError("sf_vec_size can only be 16 or 32")
+
+    # for column major input, we need to transpose the input
+    is_column_major = input.stride(-2) == 1
+    if is_column_major:
+        input = input.transpose(-2, -1)
 
     assert input.shape[-1] % sf_vec_size == 0
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
@@ -204,14 +277,17 @@ def fp4_quantize(
         sf_vec_size,
         sf_use_ue8m0,
         is_sf_swizzled_layout,
+        is_sf_8x4_layout,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    if is_column_major:
+        x_q = x_q.transpose(-2, -1)
+        sf = sf.transpose(-2, -1)
+
     return x_q, sf
 
 
-def fp4_swizzle_blockscale(
-    unswizzled_sf: torch.Tensor, m: int, n: int, sf_vec_size: int = 16
-) -> torch.Tensor:
+def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
@@ -219,9 +295,6 @@ def fp4_swizzle_blockscale(
 
     Args:
         unswizzled_sf (torch.Tensor): Input tensor with dtype uint8.
-        m (int): M dimension.
-        n (int): N dimension.
-        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
 
     Returns:
         torch.Tensor: Swizzled tensor with the same shape as input.
@@ -233,15 +306,135 @@ def fp4_swizzle_blockscale(
     assert (
         unswizzled_sf.dtype == torch.uint8
     ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    assert sf_vec_size == 16, f"Currently only support sf_vec_size 16!"
-    padded_input_sf = _pad_scale_factors(unswizzled_sf, m, n, sf_vec_size)
-    out = torch.empty_like(padded_input_sf)
-    o_m, o_n = out.shape
-    get_fp4_quantization_sm100_module().fp4_swizzle_blockscale_sm100(
-        padded_input_sf,
-        out,
-        1,
-        o_m,
-        o_n,
+    return get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
+        unswizzled_sf,
     )
-    return out
+
+
+def e2m1_and_ufp8sf_scale_to_float(
+    e2m1_tensor: torch.Tensor,
+    ufp8_scale_tensor: torch.Tensor,
+    global_scale_tensor: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    ufp8_type: int = 1,
+    is_sf_swizzled_layout: bool = True,
+) -> torch.Tensor:
+    """Convert E2M1 format tensor and UFP8 scale factors to float tensor.
+
+    This function performs dequantization by converting a packed FP4 tensor in E2M1 format
+    back to float values using the associated UFP8 scale factors and global scale.
+
+    Args:
+        e2m1_tensor (torch.Tensor): Packed FP4 tensor in E2M1 format of shape [M, K/2] with dtype uint8.
+        ufp8_scale_tensor (torch.Tensor): Scale factors tensor in UFP8 format with dtype uint8.
+        global_scale_tensor (torch.Tensor, optional): Global scale factor of shape [1] and dtype float32.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+        ufp8_type (int, optional): UFP8 scale factor type (0 for UE8M0, 1 for E4M3). Defaults to 1.
+        is_sf_swizzled_layout (bool, optional): Whether scale factors use swizzled layout. Defaults to True.
+
+    Returns:
+        torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
+
+    """
+
+    return get_fp4_quantization_sm100_module().e2m1_and_ufp8sf_scale_to_float_sm100(
+        e2m1_tensor,
+        ufp8_scale_tensor,
+        global_scale_tensor,
+        sf_vec_size,
+        ufp8_type,
+        is_sf_swizzled_layout,
+    )
+
+
+def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
+    """
+    PyTorch equivalent of trtllm-gen `shuffleMatrixA`
+    """
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
+
+    return input_tensor[row_indices.to(input_tensor.device)]
+
+
+def shuffle_matrix_sf_a(
+    input_tensor: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: int = 16,
+):
+    """
+    Cuda implementation of trtllm-gen `shuffleMatrixSfA` but with a caveat.
+    `shuffleMatrixSfA` expects the input to be in 128x4 layout and then
+    apply the same shuffling in `shuffleMatrixA` and writes out in 128x4
+    layout.
+    This function expects the input to be in linear layout. It's done this
+    way because the scaling factors in the NVFP4 checkpoints are quantized
+    and are in linear layout.
+    This function doesn't add padding.
+    """
+
+    row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor, epilogue_tile_m)
+
+    w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
+
+    # 128x4
+    return nvfp4_block_scale_interleave(w_shuffled)
+
+
+class SfLayout(Enum):
+    """
+    Layout of scale factors for NVFP4.
+    """
+
+    layout_128x4 = 0
+    layout_8x4 = 1
+    layout_linear = 2
+
+
+def nvfp4_quantize(
+    a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False, sf_vec_size=16
+):
+    """
+    Quantize input tensor to NVFP4 format.
+
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
+        sfLayout (SfLayout, optional): Scale factor layout. Defaults to SfLayout.layout_128x4.
+        do_shuffle (bool, optional): Whether to shuffle the scale factors. Defaults to False. Only TRTLLM backend needs to shuffle the tensor B scale factors.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    if do_shuffle:
+        # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
+        assert sfLayout == SfLayout.layout_128x4
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            a_global_sf.cuda(),
+            sf_vec_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
+        )
+
+        epilogue_tile_m = 128
+        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+        a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+            a_sf.shape
+        )
+    else:
+        # Activations with 8x4 layout for SFs (GEMM with small tileN)
+        # Activations with 128x4 layout for SFs (GEMM with large tileN)
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            a_global_sf.cuda(),
+            sf_vec_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=True,
+            is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
+        )
+
+    return a_fp4, a_sf

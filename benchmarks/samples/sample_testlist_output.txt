@@ -1,0 +1,213 @@
+$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path sample_teslist_output.csv
+[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn'], page_size=16, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=8, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
+[INFO] Running testBatchPrefillWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 327
+[VVERBOSE] actual_seq_lens_q.flatten() = tensor([103, 436, 861, 271, 107,  72, 701,  21, 615, 122, 467, 215, 331, 459,
+         88, 373], dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([5242, 8, 128])
+[VVERBOSE] num_pages_per_seq = 64
+[VVERBOSE] total_num_pages = 1024
+[VVERBOSE] kv_cache.shape = torch.Size([1024, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([16, 64])
+[VVERBOSE] qo_indptr.shape = torch.Size([17])
+[VVERBOSE] qo_indptr.dtype = torch.int32
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indices.shape = torch.Size([335])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 0.094 ms; std 0.011 ms; achieved tflops 57.979 TFLOPs/sec; achieved tb_per_sec 0.459 TB/sec
+[PERF] cudnn   :: median time 0.075 ms; std 0.017 ms; achieved tflops 72.592 TFLOPs/sec; achieved tb_per_sec 0.575 TB/sec
+[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn'], page_size=16, batch_size=16, s_qo=8192, s_kv=8192, num_qo_heads=8, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
+[INFO] Running testBatchPrefillWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 4743
+[VVERBOSE] actual_seq_lens_q.flatten() = tensor([7271, 7604,  861, 5391, 5227, 5192, 3773, 3093, 5735, 6266,  467, 5335,
+        4427, 5579, 6232, 3445], dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([75898, 8, 128])
+[VVERBOSE] num_pages_per_seq = 512
+[VVERBOSE] total_num_pages = 8192
+[VVERBOSE] kv_cache.shape = torch.Size([8192, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([16, 512])
+[VVERBOSE] qo_indptr.shape = torch.Size([17])
+[VVERBOSE] qo_indptr.dtype = torch.int32
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indices.shape = torch.Size([4751])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 2.710 ms; std 0.022 ms; achieved tflops 318.084 TFLOPs/sec; achieved tb_per_sec 0.229 TB/sec
+[PERF] cudnn   :: median time 0.944 ms; std 0.011 ms; achieved tflops 912.984 TFLOPs/sec; achieved tb_per_sec 0.659 TB/sec
+[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn', 'cutlass'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=8, num_kv_heads=8, head_dim_qk=192, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=False)
+[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 1024
+[VVERBOSE] actual_seq_lens_q.flatten() = tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
+        1024, 1024, 1024, 1024], dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([16384, 8, 192])
+[VVERBOSE] k.shape = torch.Size([16384, 8, 192])
+[VVERBOSE] v.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] qo_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] scale = 0.07216878364870323
+[PERF] fa2     :: median time 0.229 ms; std 0.013 ms; achieved tflops 187.756 TFLOPs/sec; achieved tb_per_sec 0.733 TB/sec
+[PERF] cudnn   :: median time 0.155 ms; std 0.003 ms; achieved tflops 276.995 TFLOPs/sec; achieved tb_per_sec 1.082 TB/sec
+[PERF] cutlass :: median time 0.169 ms; std 0.012 ms; achieved tflops 253.504 TFLOPs/sec; achieved tb_per_sec 0.990 TB/sec
+[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn', 'cutlass'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=False)
+[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 1024
+[VVERBOSE] actual_seq_lens_q.flatten() = tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
+        1024, 1024, 1024, 1024], dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([16384, 128, 192])
+[VVERBOSE] k.shape = torch.Size([16384, 128, 192])
+[VVERBOSE] v.shape = torch.Size([16384, 128, 128])
+[VVERBOSE] qo_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] scale = 0.07216878364870323
+[PERF] fa2     :: median time 2.190 ms; std 0.017 ms; achieved tflops 313.744 TFLOPs/sec; achieved tb_per_sec 1.226 TB/sec
+[PERF] cudnn   :: median time 1.008 ms; std 0.023 ms; achieved tflops 681.762 TFLOPs/sec; achieved tb_per_sec 2.663 TB/sec
+[PERF] cutlass :: median time 1.456 ms; std 0.018 ms; achieved tflops 471.948 TFLOPs/sec; achieved tb_per_sec 1.844 TB/sec
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'fa2_tc', 'trtllm', 'cudnn'], page_size=16, batch_size=16, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
+[INFO] Running testBatchDecodeWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 3893
+[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([4180, 5994, 4263, 1715, 6418, 6880, 5183, 3885, 6925, 1474, 5914, 4322,
+         510, 2547, 1548,  541], device='cuda:0', dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([16, 64, 128])
+[VVERBOSE] num_pages_per_seq = 512
+[VVERBOSE] total_num_pages = 8192
+[VVERBOSE] kv_cache.shape = torch.Size([8192, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([16, 512])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indices.shape = torch.Size([3901])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 0.162 ms; std 0.000 ms; achieved tflops 12.613 TFLOPs/sec; achieved tb_per_sec 1.580 TB/sec
+[PERF] fa2_tc  :: median time 0.055 ms; std 0.000 ms; achieved tflops 36.985 TFLOPs/sec; achieved tb_per_sec 4.633 TB/sec
+[PERF] trtllm  :: median time 0.051 ms; std 0.000 ms; achieved tflops 39.969 TFLOPs/sec; achieved tb_per_sec 5.006 TB/sec
+[PERF] cudnn   :: median time 0.113 ms; std 0.000 ms; achieved tflops 18.059 TFLOPs/sec; achieved tb_per_sec 2.262 TB/sec
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'fa2_tc', 'trtllm', 'cudnn'], page_size=16, batch_size=16, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
+[INFO] Running testBatchDecodeWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 3893
+[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([4180, 5994, 4263, 1715, 6418, 6880, 5183, 3885, 6925, 1474, 5914, 4322,
+         510, 2547, 1548,  541], device='cuda:0', dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([16, 64, 128])
+[VVERBOSE] num_pages_per_seq = 512
+[VVERBOSE] total_num_pages = 8192
+[VVERBOSE] kv_cache.shape = torch.Size([8192, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([16, 512])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indices.shape = torch.Size([3901])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 0.195 ms; std 0.006 ms; achieved tflops 10.470 TFLOPs/sec; achieved tb_per_sec 1.311 TB/sec
+[PERF] fa2_tc  :: median time 0.097 ms; std 0.005 ms; achieved tflops 21.040 TFLOPs/sec; achieved tb_per_sec 2.635 TB/sec
+[PERF] trtllm  :: median time 0.104 ms; std 0.004 ms; achieved tflops 19.720 TFLOPs/sec; achieved tb_per_sec 2.470 TB/sec
+[PERF] cudnn   :: median time 0.129 ms; std 0.002 ms; achieved tflops 15.842 TFLOPs/sec; achieved tb_per_sec 1.984 TB/sec
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'fa2_tc', 'trtllm', 'cudnn'], page_size=16, batch_size=32, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=False)
+[INFO] Running testBatchDecodeWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 8192
+[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192], device='cuda:0',
+       dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([32, 64, 128])
+[VVERBOSE] num_pages_per_seq = 512
+[VVERBOSE] total_num_pages = 16384
+[VVERBOSE] kv_cache.shape = torch.Size([16384, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([32, 512])
+[VVERBOSE] kv_indptr.shape = torch.Size([33])
+[VVERBOSE] kv_indices.shape = torch.Size([16384])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([32])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 0.711 ms; std 0.000 ms; achieved tflops 12.085 TFLOPs/sec; achieved tb_per_sec 1.512 TB/sec
+[PERF] fa2_tc  :: median time 0.173 ms; std 0.002 ms; achieved tflops 49.661 TFLOPs/sec; achieved tb_per_sec 6.214 TB/sec
+[PERF] trtllm  :: median time 0.155 ms; std 0.000 ms; achieved tflops 55.324 TFLOPs/sec; achieved tb_per_sec 6.922 TB/sec
+[PERF] cudnn   :: median time 0.253 ms; std 0.000 ms; achieved tflops 33.992 TFLOPs/sec; achieved tb_per_sec 4.253 TB/sec
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'fa2_tc', 'trtllm', 'cudnn'], page_size=16, batch_size=16, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=False)
+[INFO] Running testBatchDecodeWithPagedKVCacheWrapper
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VERBOSE] Average actual seq len: 8192
+[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+        8192, 8192, 8192, 8192], device='cuda:0', dtype=torch.int32)
+[VVERBOSE] q.shape = torch.Size([16, 64, 128])
+[VVERBOSE] num_pages_per_seq = 512
+[VVERBOSE] total_num_pages = 8192
+[VVERBOSE] kv_cache.shape = torch.Size([8192, 2, 8, 16, 128])
+[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
+[VVERBOSE] block_tables.shape = torch.Size([16, 512])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] kv_indices.shape = torch.Size([8192])
+[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
+[VVERBOSE] scale = 0.08838834764831843
+[PERF] fa2     :: median time 0.356 ms; std 0.004 ms; achieved tflops 12.076 TFLOPs/sec; achieved tb_per_sec 1.511 TB/sec
+[PERF] fa2_tc  :: median time 0.142 ms; std 0.003 ms; achieved tflops 30.209 TFLOPs/sec; achieved tb_per_sec 3.780 TB/sec
+[PERF] trtllm  :: median time 0.138 ms; std 0.004 ms; achieved tflops 31.166 TFLOPs/sec; achieved tb_per_sec 3.900 TB/sec
+[PERF] cudnn   :: median time 0.145 ms; std 0.003 ms; achieved tflops 29.625 TFLOPs/sec; achieved tb_per_sec 3.707 TB/sec
+[INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, m=8192, n=4096, k=16384, tile_size=128, group_size=1, scale_major_mode='MN', out_dtype='bfloat16', mma_sm=2)
+[INFO] Running testGemmFp8NtGroupwise
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VVERBOSE] a_val.shape = torch.Size([8192, 16384])
+[VVERBOSE] b_val.shape = torch.Size([4096, 16384])
+[VVERBOSE] a_fp8.shape = torch.Size([8192, 16384])
+[VVERBOSE] b_fp8.shape = torch.Size([4096, 16384])
+[VVERBOSE] a_scale.shape = torch.Size([128, 8192])
+[VVERBOSE] b_scale.shape = torch.Size([128, 32])
+[PERF] gemm_fp8:: median time 0.635 ms; std 0.010 ms; achieved tflops 1731.056 TFLOPs/sec; achieved tb_per_sec 0.423 TB/sec
+[INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, m=8192, n=4096, k=16384, tile_size=128, group_size=1, scale_major_mode='MN', out_dtype='bfloat16', mma_sm=2)
+[INFO] Running testGemmFp8NtGroupwise
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VVERBOSE] a_val.shape = torch.Size([8192, 16384])
+[VVERBOSE] b_val.shape = torch.Size([4096, 16384])
+[VVERBOSE] a_fp8.shape = torch.Size([8192, 16384])
+[VVERBOSE] b_fp8.shape = torch.Size([4096, 16384])
+[VVERBOSE] a_scale.shape = torch.Size([128, 8192])
+[VVERBOSE] b_scale.shape = torch.Size([128, 32])
+[PERF] gemm_fp8:: median time 0.590 ms; std 0.005 ms; achieved tflops 1862.115 TFLOPs/sec; achieved tb_per_sec 0.455 TB/sec
+[INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, m=8192, n=4096, k=16384, tile_size=128, group_size=2, scale_major_mode='K', out_dtype='bfloat16', mma_sm=2)
+[INFO] Running testGroupGemmFp8NtGroupwise
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VVERBOSE] a_val.shape = torch.Size([16384, 16384])
+[VVERBOSE] b_val.shape = torch.Size([2, 4096, 16384])
+[VVERBOSE] a_fp8.shape = torch.Size([16384, 16384])
+[VVERBOSE] b_fp8.shape = torch.Size([2, 4096, 16384])
+[VVERBOSE] a_scale.shape = torch.Size([16384, 128])
+[VVERBOSE] b_scale.shape = torch.Size([2, 32, 128])
+[VVERBOSE] m_indptr.shape = torch.Size([3])
+[INFO] a_dequant.shape = torch.Size([16384, 16384])
+[INFO] b_dequant.shape = torch.Size([2, 4096, 16384])
+[INFO] c.shape = torch.Size([16384, 4096])
+[PERF] grp_gemm:: median time 1.414 ms; std 0.013 ms; achieved tflops 1555.320 TFLOPs/sec; achieved tb_per_sec 0.380 TB/sec
+[INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, m=8192, n=4096, k=16384, tile_size=128, group_size=2, scale_major_mode='MN', out_dtype='bfloat16', mma_sm=2)
+[INFO] Running testGroupGemmFp8NtGroupwise
+[INFO] FlashInfer version: 0.2.8
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[VVERBOSE] a_val.shape = torch.Size([16384, 16384])
+[VVERBOSE] b_val.shape = torch.Size([2, 4096, 16384])
+[VVERBOSE] a_fp8.shape = torch.Size([16384, 16384])
+[VVERBOSE] b_fp8.shape = torch.Size([2, 4096, 16384])
+[VVERBOSE] a_scale.shape = torch.Size([128, 16384])
+[VVERBOSE] b_scale.shape = torch.Size([2, 128, 32])
+[VVERBOSE] m_indptr.shape = torch.Size([3])
+[INFO] a_dequant.shape = torch.Size([16384, 16384])
+[INFO] b_dequant.shape = torch.Size([2, 4096, 16384])
+[INFO] c.shape = torch.Size([16384, 4096])
+[PERF] grp_gemm:: median time 1.324 ms; std 0.232 ms; achieved tflops 1660.344 TFLOPs/sec; achieved tb_per_sec 0.405 TB/sec

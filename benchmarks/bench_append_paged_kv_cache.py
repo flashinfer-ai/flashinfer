@@ -2,10 +2,11 @@ import argparse
 import dataclasses
 from typing import Tuple, cast
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -108,7 +109,8 @@ def main():
                 )
 
             batch_indices, positions = fn_convert()
-            convert_latency_ms = cast(float, do_bench(fn_convert))
+            convert_latencies = bench_gpu_time(fn_convert)
+            convert_latency_ms = np.median(convert_latencies)
 
             @torch.cuda.nvtx.range(f"append model={model_name}, seqlens={seqlens}")
             def fn() -> None:
@@ -124,7 +126,8 @@ def main():
                     "NHD",
                 )
 
-            latency_ms = cast(float, do_bench(fn))
+            latencies = bench_gpu_time(fn)
+            latency_ms = np.median(latencies)
             all_layers_latency_ms = convert_latency_ms + latency_ms * model.num_layers
             throughput = (
                 k.numel()

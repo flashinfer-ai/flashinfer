@@ -1,6 +1,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 
 #include <cuda/std/optional>
 #include <tuple>
@@ -522,7 +523,17 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   return nullptr;
 }
 
+__forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3) {
+  uint32_t val0 = c0;
+  uint32_t val1 = c1;
+  uint32_t val2 = c2;
+  uint32_t val3 = c3;
+
+  return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+// NOTE: bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   uint32_t val;
@@ -543,8 +554,14 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
         "f"(array[6]), "f"(array[7]));
   return val;
 #else
-  // static_assert(false, "not supported.");
-  return 0;
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(*(((float2*)array) + i), __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
 #endif
 }
 
@@ -569,8 +586,14 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   return val;
 #else
-  // static_assert(false, "not supported.");
-  return 0;
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(array[i], __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
 #endif
 }
 
@@ -600,10 +623,14 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmp);
     fp8SFVal = tmp.__x;
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
@@ -733,7 +760,7 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
-  float scale_factor;
+  float* scale_factor;
   bool use_oneshot;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
@@ -882,9 +909,9 @@ class FusedOp {
       m_residual_val.load(reinterpret_cast<T*>(params.residual_in) + m_access_id * VEC_SIZE);
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-      m_scale_factor = 1.f / params.scale_factor;
+      m_scale_factor = 1.f / *(params.scale_factor);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      m_scale_factor = params.scale_factor;
+      m_scale_factor = *(params.scale_factor);
     }
   }
 
@@ -922,7 +949,7 @@ class FusedOp {
           std::nullopt /* batchIdx */, token_id, m_access_id_in_token, std::nullopt /* numRows */,
           m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
-          utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_params.scale_factor, sf_out);
+          utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;

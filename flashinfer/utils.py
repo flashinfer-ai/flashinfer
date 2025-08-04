@@ -84,6 +84,23 @@ def _expand_4d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     return x
 
 
+def next_positive_power_of_2(x: int) -> int:
+    if x < 1:
+        return 1
+
+    # Following code is equivalent to 1 << (x - 1).bit_length()
+    # But this impl does not contain bit_length() so can be used by torch compile.
+    # It can correctly handle 64bit number which should be enough for now.
+    n = x - 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    return n + 1
+
+
 def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
@@ -472,6 +489,174 @@ def device_support_pdl(device: torch.device) -> bool:
     return major >= 9
 
 
+def ceil_div(x: int, y: int) -> int:
+    """
+    Perform ceiling division of two integers.
+
+    Args:
+        x: the dividend.
+        y: the divisor.
+
+    Returns:
+        The result of the ceiling division.
+    """
+    return (x + y - 1) // y
+
+
 def round_up(x: int, y: int) -> int:
     """Round up x to the nearest multiple of y"""
-    return (x + y - 1) // y * y
+    return ceil_div(x, y) * y
+
+
+def get_device_sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+class FP4Tensor:
+    """Wrapper class for FP4 tensors.
+
+    Since PyTorch doesn't natively support FP4, this wrapper contains:
+    - data: uint8 tensor storing the compressed FP4 data, the size of innermost dimension is ceil(original_dim / 2) since each uint8 stores 2 FP4 values
+    - scale: float8_e4m3fn tensor storing the scale factors
+    """
+
+    def __init__(
+        self,
+        data: torch.Tensor,
+        scale: torch.Tensor,
+        scale_start_index: int = 0,
+        original_shape: Optional[Tuple[int, ...]] = None,
+    ):
+        """Initialize FP4Tensor.
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            uint8 tensor storing the compressed FP4 data
+        scale : torch.Tensor
+            float8_e4m3fn tensor storing the scale factors
+        scale_start_index : int
+            The start token index of the scale factors. This is needed when two kernels (like prefill and decode kernels) are reusing the same scale factor tensor with different offsets.
+        original_shape : Optional[Tuple[int, ...]]
+            The original shape before compression.
+        """
+        if data.dtype != torch.uint8:
+            raise ValueError(f"data must be uint8 tensor, got {data.dtype}")
+        if scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"scale must be float8_e4m3fn tensor, got {scale.dtype}")
+
+        # Validate shape relationship if original_shape is provided
+        if original_shape is not None:
+            if data.shape[:-1] != original_shape[:-1]:
+                raise ValueError(
+                    f"data and original_shape must have the same dimensions except the last one. "
+                    f"data.shape={data.shape}, original_shape={original_shape}"
+                )
+
+            # Check the last dimension relationship: data_dim = ceil(original_dim / 2)
+            expected_data_dim = math.ceil(original_shape[-1] / 2)
+            if data.shape[-1] != expected_data_dim:
+                raise ValueError(
+                    f"data last dimension must be ceil(original_shape[-1] / 2). "
+                    f"data.shape[-1]={data.shape[-1]}, original_shape[-1]={original_shape[-1]}, "
+                    f"expected={expected_data_dim}"
+                )
+
+        self.data = data
+        self.scale = scale
+        self.scale_start_index = scale_start_index
+        self.original_shape = original_shape
+        self.dtype = "nvfp4"
+
+
+# yapf: disable
+srcToDstBlk16RowMap = [
+    0,  8,
+    1,  9,
+    2, 10,
+    3, 11,
+    4, 12,
+    5, 13,
+    6, 14,
+    7, 15
+]
+
+srcToDstBlk32RowMap = [
+    0,  8, 16, 24,
+    1,  9, 17, 25,
+    2, 10, 18, 26,
+    3, 11, 19, 27,
+    4, 12, 20, 28,
+    5, 13, 21, 29,
+    6, 14, 22, 30,
+    7, 15, 23, 31
+]
+# yapf: enable
+
+
+def get_shuffle_block_size(epilogue_tile_m: int) -> int:
+    shuffle_block_size = 16
+    if epilogue_tile_m % 128 == 0:
+        shuffle_block_size = 32
+    return shuffle_block_size
+
+
+def get_shuffle_matrix_a_row_indices(
+    input_tensor: torch.Tensor, epilogue_tile_m: int
+) -> torch.Tensor:
+    """
+    Higher-level PyTorch approach to reorder the rows in blocks of size 16 or 32.
+    - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
+    - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
+    """
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+
+    # M, K from the input
+    M, K = input_tensor.shape
+
+    # Choose block size 16 or 32
+    shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
+    row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
+
+    assert (
+        M % shuffle_block_size == 0
+    ), f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
+
+    # row_indices[new_row] = old_row
+    # so row_indices is an array of size M telling us from which old_row
+    # the new_row should be taken.
+    row_indices = torch.empty(M, dtype=torch.long)
+
+    for old_row in range(M):
+        block_idx = old_row // shuffle_block_size
+        row_in_block = old_row % shuffle_block_size
+        mapped_row_in_block = row_map[row_in_block]
+
+        new_row = block_idx * shuffle_block_size + mapped_row_in_block
+
+        row_indices[new_row] = old_row
+
+    return row_indices
+
+
+def get_shuffle_matrix_sf_a_row_indices(
+    input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
+) -> torch.Tensor:
+
+    assert input_tensor.dtype == torch.uint8
+    assert num_elts_per_sf == 16
+
+    assert (
+        input_tensor.dim() == 2
+    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+
+    # M, K from the input
+    M, K = input_tensor.shape
+    assert M % 128 == 0
+    assert K % 4 == 0
+
+    row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
+
+    return row_indices

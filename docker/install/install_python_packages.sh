@@ -20,4 +20,5 @@ set -e
 set -u
 
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip3 install ninja pytest numpy scipy build pynvml cuda-python einops
+pip3 install requests ninja pytest numpy scipy build pynvml cuda-python einops nvidia-nvshmem-cu12
+pip3 install 'nvidia-cudnn-frontend>=1.13.0' 'nvidia-cudnn-cu12>=9.11.0.98'

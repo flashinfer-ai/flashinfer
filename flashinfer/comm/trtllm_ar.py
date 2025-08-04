@@ -18,16 +18,17 @@ import functools
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, sm100a_nvcc_flags
-from ..utils import register_custom_op, round_up
+from ..utils import register_custom_op, round_up, version_at_least
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
 
@@ -96,6 +97,10 @@ class FP4QuantizationSFLayout:
 
 
 def gen_trtllm_comm_module() -> JitSpec:
+    gencode_flags = _get_cuda_arch_flags()
+    has_sm100 = any(
+        "compute_100" in flag for flag in gencode_flags
+    ) and version_at_least(torch.version.cuda, "12.8")
     return gen_jit_spec(
         "trtllm_comm",
         [
@@ -103,7 +108,7 @@ def gen_trtllm_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=sm100a_nvcc_flags if has_sm100 else [],
     )
 
 
@@ -256,7 +261,7 @@ def get_trtllm_comm_module():
         scale_out: Optional[torch.Tensor],
         rms_gamma: Optional[torch.Tensor],
         rms_eps: Optional[float],
-        scale_factor: Optional[float],
+        scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[FP4QuantizationSFLayout],
     ) -> None:
         module.trtllm_allreduce_fusion(
@@ -770,10 +775,10 @@ def trtllm_allreduce_fusion(
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
     launch_with_pdl: bool,
-    use_oneshot: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     pattern_code: AllReduceFusionPattern,
+    use_oneshot: Optional[bool],
     allreduce_out: Optional[torch.Tensor],
     residual_in: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
@@ -782,7 +787,7 @@ def trtllm_allreduce_fusion(
     scale_out: Optional[torch.Tensor],
     rms_gamma: Optional[torch.Tensor],
     rms_eps: Optional[float],
-    scale_factor: Optional[float],
+    scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[FP4QuantizationSFLayout],
 ) -> None:
     """
@@ -806,18 +811,20 @@ def trtllm_allreduce_fusion(
     - scale_out: the scale output tensor. Initialization referece: tests/test_trtllm_allreduce_fusion.py
     - rms_gamma: the rms gamma tensor. [hidden_dim]
     - rms_eps: the rms epsilon value.
-    - scale_factor: the scale factor.
+    - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
 
     Note:
-    Regarding the `use_oneshot` parameter:
-
-    It should only be enabled when:
-    (1) Force to use the one-shot strategy based on your use case.
-    (2) In min-latency mode, the sequence length is less than the one-shot max token number (currently 128).
-
-    Otherwise, it should be disabled (as False).
+    Regarding the `use_oneshot` parameter, you could force to use the one-shot strategy based on your use case.
+    Otherwise, it would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode.
     """
+
+    if use_oneshot is None:
+        logging.warning(
+            f"use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
+        )
+        use_oneshot = token_num <= 128
+
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"
 
@@ -832,7 +839,13 @@ def trtllm_allreduce_fusion(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
         use_oneshot = False
-
+    if scale_factor is not None:
+        if isinstance(scale_factor, torch.Tensor):
+            scale_factor = scale_factor.to(torch.float32)
+        else:
+            scale_factor = torch.tensor(
+                [scale_factor], dtype=torch.float32, device=allreduce_in.device
+            )
     get_trtllm_comm_module().trtllm_allreduce_fusion(
         allreduce_in=allreduce_in,
         world_size=world_size,

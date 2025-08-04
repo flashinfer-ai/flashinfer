@@ -19,6 +19,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_fp8.h>
 #include <limits.h>
 #include <stdint.h>
 #ifndef _WIN32  // Linux
@@ -268,6 +269,11 @@ struct TypeToDataType<__half> {
 
 template <>
 struct TypeToDataType<uint8_t> {
+  static constexpr Data_type value = Data_type::DATA_TYPE_E4M3;
+};
+
+template <>
+struct TypeToDataType<__nv_fp8_e4m3> {
   static constexpr Data_type value = Data_type::DATA_TYPE_E4M3;
 };
 

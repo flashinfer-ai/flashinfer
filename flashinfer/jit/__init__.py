@@ -61,14 +61,14 @@ from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
-from .attention import trtllm_fmha_gen_module as trtllm_fmha_gen_module
+from .attention import trtllm_gen_fmha_module as trtllm_gen_fmha_module
 from .core import JitSpec as JitSpec
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
-from .cubin_loader import setup_cubin_loader
+from .cubin_loader import setup_cubin_loader, setup_metainfo_loader
 
 
 @functools.cache
