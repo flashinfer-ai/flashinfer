@@ -42,11 +42,11 @@ Types and Enums
 .. autosummary::
     :toctree: ../generated
 
-    AllReduceFusionOp
-    AllReduceFusionPattern
-    AllReduceStrategyConfig
-    AllReduceStrategyType
-    FP4QuantizationSFLayout
+    trtllm_ar.AllReduceFusionOp
+    trtllm_ar.AllReduceFusionPattern
+    trtllm_ar.AllReduceStrategyConfig
+    trtllm_ar.AllReduceStrategyType
+    trtllm_ar.FP4QuantizationSFLayout
 
 Core Operations
 ~~~~~~~~~~~~~~
