@@ -55,11 +55,11 @@ FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
 # Why were these pointing to non-existent directories? Must be a copy missing somewhere?
 _package_root = pathlib.Path(__file__).resolve().parents[2]
 FLASHINFER_DATA = _package_root
-FLASHINFER_INCLUDE_DIR = _package_root  / "include"
-FLASHINFER_CSRC_DIR = _package_root  / "csrc"
+FLASHINFER_INCLUDE_DIR = _package_root / "include"
+FLASHINFER_CSRC_DIR = _package_root / "csrc"
 # FLASHINFER_SRC_DIR = _package_root  / "src"
-FLASHINFER_TVM_BINDING_DIR = _package_root  / "tvm_binding"
-FLASHINFER_AOT_DIR = _package_root  / "aot"
+FLASHINFER_TVM_BINDING_DIR = _package_root / "tvm_binding"
+FLASHINFER_AOT_DIR = _package_root / "aot"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "3rdparty" / "cutlass" / "include",
     _package_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",

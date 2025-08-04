@@ -21,8 +21,6 @@ from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer
 
 
-
-
 def gen_trtllm_mnnvl_comm_module() -> JitSpec:
     return gen_jit_spec(
         "trtllm_mnnvl_comm",
