@@ -3,6 +3,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from einops import einsum
 
 import flashinfer
@@ -13,6 +14,8 @@ from flashinfer.testing.utils import (
     quantize_fp8,
     set_seed,
 )
+
+from .flashinfer_benchmark_utils import print_perf_metrics
 
 
 def run_gemm_test(args):
@@ -29,6 +32,8 @@ def run_gemm_test(args):
         return testGemmFp8NtGroupwise(args)
     elif args.routine == "group_gemm_fp8_nt_groupwise":
         return testGroupGemmFp8NtGroupwise(args)
+    elif args.routine == "bmm_fp8":
+        return testBmmFp8(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -44,6 +49,13 @@ def parse_gemm_args(line, parser):
     Returns:
         Parsed argument namespace
     """
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        required=False,
+        default=1,
+        help="Batch size of test case.",
+    )
     parser.add_argument(
         "--m", type=int, required=True, help="Number of rows in the first matrix."
     )
@@ -79,11 +91,24 @@ def parse_gemm_args(line, parser):
         help="Scale major mode.",
     )
     parser.add_argument(
+        "--input_dtype",
+        type=str,
+        required=False,
+        default="fp8_e4m3",
+        help="Data type of the input.",
+    )
+    parser.add_argument(
+        "--mat2_dtype",
+        type=str,
+        required=False,
+        default="fp8_e4m3",
+        help="Data type of the mat2.",
+    )
+    parser.add_argument(
         "--out_dtype",
         type=str,
         required=False,
         default="bfloat16",
-        choices=["bfloat16", "float16"],
         help="Data type of the output.",
     )
     parser.add_argument(
@@ -93,6 +118,15 @@ def parse_gemm_args(line, parser):
         default=1,
         choices=[1, 2],
         help="How many SMs to use for the MMA operation, must be 1 or 2",
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        required=False,
+        nargs="+",
+        default=["cudnn"],
+        choices=["cudnn", "cublas"],
+        help="Kernel backends to test. Default: cudnn",
     )
 
     args = parser.parse_args(line)
@@ -241,14 +275,18 @@ def testGemmFp8NtGroupwise(args):
         cur_res["std_time"] = std_time
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
+        # cur_res["batch_size"] = None  # Not applicable
         cur_res["m"] = m
         cur_res["n"] = n
         cur_res["k"] = k
         cur_res["tile_size"] = tile_size
         cur_res["group_size"] = group_size
         cur_res["scale_major_mode"] = scale_major_mode
+        # cur_res["input_dtype"] = None  # Not applicable
+        # cur_res["mat2_dtype"] = None  # Not applicable
         cur_res["out_dtype"] = out_dtype
         cur_res["mma_sm"] = mma_sm
+        # cur_res["backend"] = None  # Not applicable
         res.append(cur_res)
     return res
 
@@ -406,13 +444,223 @@ def testGroupGemmFp8NtGroupwise(args):
         cur_res["std_time"] = std_time
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
+        # cur_res["batch_size"] = None  # Not applicable
         cur_res["m"] = m
         cur_res["n"] = n
         cur_res["k"] = k
         cur_res["group_size"] = group_size
         cur_res["tile_size"] = tile_size
         cur_res["scale_major_mode"] = scale_major_mode
+        # cur_res["input_dtype"] = None  # Not applicable
+        # cur_res["mat2_dtype"] = None  # Not applicable
         cur_res["out_dtype"] = out_dtype
         cur_res["mma_sm"] = mma_sm
+        # cur_res["backend"] = None  # Not applicable
         res.append(cur_res)
+    return res
+
+
+def to_float8(x, dtype=torch.float8_e4m3fn):
+    finfo = torch.finfo(dtype)
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    scale = finfo.max / amax
+    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    return x_scl_sat.to(dtype), scale.float().reciprocal()
+
+
+def testBmmFp8(args):
+    """
+    Test bmm_fp8 API.
+
+    This test:
+    1. Generates random input tensors
+    2. Quantizes input tensors to FP8
+    3. Runs bmm_fp8
+    4. Runs reference check
+    5. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print(f"[INFO] Running testBmmFp8")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    # Basic setup
+    set_seed(args.random_seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {gpu_name = }")
+
+    backends = args.backends
+    batch_size = args.batch_size
+    m = args.m
+    n = args.n
+    k = args.k
+    input_dtype = args.input_dtype
+    mat2_dtype = args.mat2_dtype
+    res_dtype = args.out_dtype
+    backends = args.backends
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+
+    if input_dtype == "fp8_e4m3":
+        input_dtype = torch.float8_e4m3fn
+    elif input_dtype == "fp8_e5m2":
+        input_dtype = torch.float8_e5m2
+    else:
+        raise ValueError(
+            f"Unsupported input dtype: {input_dtype}. Supported dtypes are fp8_e4m3 and fp8_e5m2."
+        )
+
+    if mat2_dtype == "fp8_e4m3":
+        mat2_dtype = torch.float8_e4m3fn
+    elif mat2_dtype == "fp8_e5m2":
+        mat2_dtype = torch.float8_e5m2
+    else:
+        raise ValueError(
+            f"Unsupported mat2 dtype: {mat2_dtype}. Supported dtypes are fp8_e4m3 and fp8_e5m2."
+        )
+
+    if res_dtype == "bfloat16":
+        res_dtype = torch.bfloat16
+    elif res_dtype == "float16":
+        res_dtype = torch.float16
+    else:
+        raise ValueError(
+            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
+        )
+
+    # Storage for timing results and outputs
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+
+    input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
+    input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)
+
+    mat2 = torch.randn(
+        [batch_size, n, k], device=device, dtype=torch.bfloat16
+    ).transpose(-2, -1)
+    mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=mat2_dtype)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_fp8.shape = }")
+        print(f"[VVERBOSE] {input_fp8.dtype = }")
+        print(f"[VVERBOSE] {mat2_fp8.shape = }")
+        print(f"[VVERBOSE] {mat2_fp8.dtype = }")
+        print(f"[VVERBOSE] {input_inv_s = }")
+        print(f"[VVERBOSE] {input_inv_s.dtype = }")
+        print(f"[VVERBOSE] {mat2_inv_s = }")
+        print(f"[VVERBOSE] {mat2_inv_s.dtype = }")
+
+    def run_backend(backend):
+        if backend in ["cudnn", "cublas"]:
+            return flashinfer.gemm.bmm_fp8(
+                A=input_fp8,
+                B=mat2_fp8,
+                A_scale=input_inv_s,
+                B_scale=mat2_inv_s,
+                dtype=res_dtype,
+                backend=backend,
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_output = torch.bmm(input, mat2)
+        has_reference_output = True
+
+    # Iterate over each backend:
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend).detach()
+        if is_cuda_graph_compatible:
+            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
+                fn=lambda: run_backend(cur_backend),
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                num_iters_within_graph=20,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=device,
+                sleep_after_run=True,
+            )
+        else:
+            backend_times[cur_backend] = bench_gpu_time(
+                fn=lambda: run_backend(cur_backend),
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                l2_flush=True,
+                l2_flush_size_mb=256,
+                l2_flush_device=device,
+                sleep_after_run=True,
+            )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 1:
+        if run_refcheck and has_reference_output:
+            if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                print(
+                    f"[INFO] Reference output is FP8. Converting to float32 for reference check."
+                )
+                reference_output = reference_output.to(torch.float32)
+                tested_outputs = [output.to(torch.float32) for output in tested_outputs]
+            for i in range(len(tested_backends)):
+                try:
+                    cos_sim = F.cosine_similarity(
+                        reference_output.reshape(-1),
+                        tested_outputs[i].reshape(-1),
+                        dim=0,
+                    )
+                    assert cos_sim > 0.99
+                except AssertionError as e:
+                    print(
+                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                    )
+                    if not args.allow_output_mismatch:
+                        print(e)
+                        raise
+
+    res = []
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+            problem_flops = 2 * m * n * k * batch_size
+            problem_bytes = (
+                m * k * input_dtype.itemsize
+                + n * k * mat2_dtype.itemsize
+                + m * n * res_dtype.itemsize
+            )
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["batch_size"] = batch_size
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                # cur_res["tile_size"] = None  # Not applicable
+                # cur_res["group_size"] = None  # Not applicable
+                # cur_res["scale_major_mode"] = None  # Not applicable
+                cur_res["input_dtype"] = input_dtype
+                cur_res["mat2_dtype"] = mat2_dtype
+                cur_res["out_dtype"] = res_dtype
+                # cur_res["mma_sm"] = None  # Not applicable
+                cur_res["backend"] = backend
+                res.append(cur_res)
     return res

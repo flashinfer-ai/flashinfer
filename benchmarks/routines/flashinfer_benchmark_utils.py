@@ -17,6 +17,8 @@ output_column_dict = {
         "num_kv_heads",
         "head_dim_qk",
         "head_dim_vo",
+        "head_dim_ckv",
+        "head_dim_kpe",
         "causal",
         "q_dtype",
         "kv_dtype",
@@ -47,3 +49,10 @@ full_output_columns = (
     + output_column_dict["gemm"]
     + output_column_dict["general"]
 )
+
+
+def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
+    output_backend_width = 10
+    print(
+        f"[PERF] {backend.ljust(output_backend_width)[:output_backend_width]}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
+    )

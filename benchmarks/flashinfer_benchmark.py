@@ -19,11 +19,13 @@ def run_test(args):
         "BatchDecodeWithPagedKVCacheWrapper",
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",
+        "BatchMLAPagedAttentionWrapper",
     ]:
         res = run_attention_test(args)
     elif args.routine in [
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
+        "bmm_fp8",
     ]:
         res = run_gemm_test(args)
     else:
@@ -67,8 +69,10 @@ def parse_args(line=sys.argv[1:]):
             "BatchDecodeWithPagedKVCacheWrapper",
             "BatchPrefillWithPagedKVCacheWrapper",
             "BatchPrefillWithRaggedKVCacheWrapper",
+            "BatchMLAPagedAttentionWrapper",
             "gemm_fp8_nt_groupwise",
             "group_gemm_fp8_nt_groupwise",
+            "bmm_fp8",
         ],
     )
     args, _ = parser.parse_known_args(line[:])
@@ -126,11 +130,13 @@ def parse_args(line=sys.argv[1:]):
         "BatchDecodeWithPagedKVCacheWrapper",
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",
+        "BatchMLAPagedAttentionWrapper",
     ]:
         args = parse_attention_args(line, parser)
     elif args.routine in [
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
+        "bmm_fp8",
     ]:
         args = parse_gemm_args(line, parser)
     else:
