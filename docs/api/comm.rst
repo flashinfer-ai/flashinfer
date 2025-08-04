@@ -7,6 +7,16 @@ flashinfer.comm
 
 This module provides communication primitives and utilities for distributed computing, including CUDA IPC, AllReduce operations, and memory management utilities.
 
+CUDA IPC Utilities
+------------------
+
+.. currentmodule:: flashinfer.comm.cuda_ipc
+
+.. autosummary::
+    :toctree: ../generated
+
+    create_shared_buffer
+    free_shared_buffer
 
 
 DLPack Utilities
