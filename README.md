@@ -73,6 +73,9 @@ Alternatively, build FlashInfer from source:
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
 python -m pip install -v .
+
+# for development & contribution, install in editable mode
+python -m pip install --no-build-isolation -e . -v
 ```
 
 To pre-compile essential kernels ahead-of-time (AOT), run the following command:
@@ -85,7 +88,7 @@ python -m flashinfer.aot
 # Build AOT wheel
 python -m build --no-isolation --wheel
 # Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
+python -m pip install dist/flashinfer_*.whl
 ```
 
 For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
@@ -130,20 +133,6 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 ## Custom Attention Variants
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
-
-## Run Benchmarks
-
-We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
-
-```bash
-mkdir build
-cp cmake/config.cmake build # you can modify the config.cmake to enable/disable benchmarks and change CUDA architectures
-cd build
-cmake ..
-make -j12
-```
-
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
 
 ## C++ API and TVM Bindings
 

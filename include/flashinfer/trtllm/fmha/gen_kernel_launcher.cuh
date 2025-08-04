@@ -19,10 +19,3 @@
 
 #include "decoder_impl_common.h"
 #include "decoder_params.h"
-#include "pytorch_extension_utils.h"
-
-void trtllm_paged_attention(at::Tensor& out, at::Tensor& query, at::Tensor& key_value_cache,
-                            at::Tensor& workspace_buffer, int64_t num_heads, int64_t num_kv_heads,
-                            double scale, at::Tensor& block_tables, at::Tensor& seq_lens,
-                            int64_t block_size, int64_t max_seq_len,
-                            const std::string kv_cache_dtype, double k_scale, double v_scale);

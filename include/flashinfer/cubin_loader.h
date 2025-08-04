@@ -35,7 +35,6 @@ void (*callbackGetCubin)(const char* path, const char* sha256) = nullptr;
 
 // Set the python callback, called by the python code using ctypes.
 extern "C" void FlashInferSetCubinCallback(void (*callback)(const char* path, const char* sha256)) {
-  std::cerr << "FlashInferSetCubinCallback " << callback << std::endl;
   callbackGetCubin = callback;
 }
 
@@ -54,7 +53,34 @@ std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
-  std::cout << "getCubin: " << name << " " << sha256 << " " << callbackGetCubin << std::endl;
   callbackGetCubin(name.c_str(), sha256.c_str());
   return current_cubin;
+}
+
+void (*callbackGetMetaInfo)(const char* path, const char* sha256, const char* extension) = nullptr;
+
+// Set the python callback, called by the python code using ctypes.
+extern "C" void FlashInferSetMetaInfoCallback(void (*callback)(const char* path, const char* sha256,
+                                                               const char* extension)) {
+  callbackGetMetaInfo = callback;
+}
+
+// Thread-local variable that stores the current metainfo.
+// It is reset on every call to `getMetaInfo()`.
+thread_local std::string raw_metainfo;
+
+// Called by the callback to set the current metainfo.
+extern "C" void FlashInferSetCurrentMetaInfo(const char* binary, int size) {
+  raw_metainfo = std::string(binary, size);
+}
+
+// Get the metainfo from the python callback.
+// This is the API for the native library to use.
+std::string getMetaInfo(const std::string& name, const std::string& sha256,
+                        const std::string& extension) {
+  if (!callbackGetMetaInfo) {
+    throw std::runtime_error("FlashInferSetMetaInfoCallback not set");
+  }
+  callbackGetMetaInfo(name.c_str(), sha256.c_str(), extension.c_str());
+  return raw_metainfo;
 }

@@ -380,6 +380,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          continue;
+        }
+
         bool is_softmax_0 = role == WarpRole::Softmax0;
 
         mainloop.softmax(
@@ -401,6 +405,13 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          mainloop.correction_empty(blk_coord, params.mainloop, logical_problem_shape,
+                                    params.problem_shape, shared_storage.epilogue,
+                                    pipeline_corr_epi, pipeline_corr_epi_producer_state, epilogue);
           continue;
         }
 
@@ -437,6 +448,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          continue;
+        }
+
         mainloop.mma(
             blk_coord, params.mainloop, logical_problem_shape, shared_storage.mainloop,
             pipeline_load_q, pipeline_load_q_consumer_state, pipeline_load_k,
@@ -458,6 +473,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          work_idx++;
           continue;
         }
 
@@ -491,6 +511,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         epilogue.store(blk_coord, logical_problem_shape, params.epilogue, params.problem_shape,
                        shared_storage.epilogue, pipeline_corr_epi,
                        pipeline_corr_epi_consumer_state);
+
         work_idx++;
       }
 

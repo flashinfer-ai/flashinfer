@@ -39,6 +39,7 @@ class BatchAttention:
     def __init__(
         self,
         kv_layout: str = "NHD",
+        device: str = "cuda",
     ):
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -46,12 +47,12 @@ class BatchAttention:
         self.float_workspace_buffer = torch.empty(
             256 * 1024 * 1024,
             dtype=torch.uint8,
-            device=torch.device("cuda"),
+            device=torch.device(device),
         )
         self.int_workspace_buffer = torch.empty(
             8 * 1024 * 1024,
             dtype=torch.uint8,
-            device=torch.device("cuda"),
+            device=torch.device(device),
         )
         self.page_locked_int_workspace_buffer = torch.empty(
             8 * 1024 * 1024,
@@ -73,10 +74,15 @@ class BatchAttention:
         page_size: int,
         causal: bool = False,
         sm_scale: float = None,
+        logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
         use_profiler: bool = False,
     ) -> None:
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        self._logits_soft_cap = logits_soft_cap
+
         # get jit module
         get_module_args = (
             q_data_type,
@@ -86,6 +92,8 @@ class BatchAttention:
             head_dim_qk,
             head_dim_vo,
             PosEncodingMode["NONE"].value,
+            logits_soft_cap > 0.0,
+            use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
 
@@ -128,6 +136,7 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -135,6 +144,11 @@ class BatchAttention:
                 raise ValueError(
                     "Profiler is enabled, profiler_buffer must be provided"
                 )
+        if logits_soft_cap > 0.0 and self._logits_soft_cap <= 0.0:
+            raise ValueError(
+                "logits_soft_cap used in kernel run but not provided in plan(). This will cause template deduction error."
+            )
+
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
             out = torch.empty_like(q)
@@ -145,6 +159,9 @@ class BatchAttention:
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+        # profiler_buffer is optional
+        profiler_args = (profiler_buffer,) if self._use_profiler else ()
 
         self.module.run(
             self.float_workspace_buffer,
@@ -162,6 +179,10 @@ class BatchAttention:
             self._num_kv_heads,
             self._page_size,
             self._sm_scale,
+            logits_soft_cap,
+            # ADDITIONAL_FUNC_PARAMS
+            # PROFILER_FUNC_PARAMS
+            *profiler_args,
         )
 
         return out, lse

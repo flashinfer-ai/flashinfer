@@ -13,18 +13,38 @@ using namespace flashinfer;
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
+#ifdef FLASHINFER_ENABLE_PROFILER
+#define PROFILER_PARAMS_SETTER \
+  params[i].profiler_buffer = static_cast<uint64_t*>(profiler_buffer.data_ptr());
+#else
+#define PROFILER_PARAMS_SETTER
+#endif
+
 {{ variant_decl }}
 
+template <bool UseLogitsSoftCap>
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
-
+  float soft_cap_pre_tanh_scale;
+  static constexpr bool use_logits_soft_cap = UseLogitsSoftCap;
   PROFILER_CLOSURE_PARAMS_DECL
 
   template <typename Params>
   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
                                         uint8_t* smem_ptr) {
-    sm_scale_log2 = params.sm_scale * math::log2e;
+    if constexpr (UseLogitsSoftCap) {
+      soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
+      sm_scale_log2 = math::log2e * params.logits_soft_cap;
+    }else{
+      sm_scale_log2 = params.sm_scale * math::log2e;
+    }
   }
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    if constexpr (UseLogitsSoftCap) {
+      logits = float(math::tanh(logits * soft_cap_pre_tanh_scale));
+    }
+    return logits;
+  })
 };
 
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, AttentionVariant, Params, ...) \
@@ -89,7 +109,7 @@ struct PersistentParams {
   uint32_t v_stride_n;
 
   float sm_scale;
-
+  double logits_soft_cap;
   {{ additional_params_decl }}
 
   PROFILER_PARAMS_DECL

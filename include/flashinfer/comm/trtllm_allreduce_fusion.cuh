@@ -1,6 +1,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 
 #include <cuda/std/optional>
 #include <tuple>
@@ -15,13 +16,380 @@ namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
+enum class FP4QuantizationSFLayout {
+  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
+  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
+  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
+  // columns to the nearest multiple of 4.
+  //
+  // The scale factor block rows map to data block rows in an interleaved pattern:
+  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
+  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
+  //
+  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
+  SWIZZLED,
+  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
+  // kernels standard.
+  LINEAR
+};
+
 namespace details {
 
+static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
+static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
 }  // namespace details
+
+namespace maths {
+// // ============================== Cast ==============================
+template <typename T_OUT, typename T_IN>
+__device__ inline T_OUT cuda_cast(T_IN val) {
+  return val;
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int2>(int2 val) {
+  return make_float2(val.x, val.y);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, float>(float val) {
+  return make_float2(val, val);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, half2>(half2 val) {
+  return __half22float2(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float2>(float2 val) {
+  return __float22half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float>(float val) {
+  return __float2half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, half>(half val) {
+  return __half2half2(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, half>(half val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  union {
+    half fp16;
+    int16_t int16_in;
+  };
+
+  fp16 = val;
+  asm volatile("cvt.rni.sat.s8.f16 %0, %1;" : "=h"(int16) : "h"(int16_in));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, half2>(half2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, float>(float val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, float2>(float2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_half2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_float2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int32_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int8_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast(__nv_bfloat16 val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline float cuda_cast<float, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __bfloat162float(val);
+}
+
+inline __device__ float2 bf1622float2(const __nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = __low2float(val);
+  f_val.y = __high2float(val);
+  return f_val;
+#else
+  return __bfloat1622float2(val);
+#endif
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622float2(val);
+}
+
+template <>
+__device__ inline half cuda_cast<half, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __float2half(__bfloat162float(val));
+}
+
+inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = max(min(__low2float(val), 127.f), -128.f);
+  f_val.y = max(min(__high2float(val), 127.f), -128.f);
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(f_val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(f_val.y));
+  return int16;
+#else
+  val = __hmin2(val, make_bfloat162(127., 127.));
+  val = __hmax2(val, make_bfloat162(-128., -128.));
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(val.y));
+  return int16;
+#endif
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622int16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, float>(float val) {
+  return __float2bfloat16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, half>(half val) {
+  return __float2bfloat16(__half2float(val));
+}
+
+inline __device__ __nv_bfloat162 bf162bf162(const __nv_bfloat16 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  __nv_bfloat162 val2;
+  val2.x = val;
+  val2.y = val;
+  return val2;
+#else
+  return __bfloat162bfloat162(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, __nv_bfloat16>(__nv_bfloat16 val) {
+  return bf162bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float>(float val) {
+  return __float2bfloat162_rn(val);
+}
+
+inline __device__ __nv_bfloat162 float22bf162(const float2 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  return __floats2bfloat162_rn(val.x, val.y);
+#else
+  return __float22bfloat162_rn(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float2>(float2 val) {
+  return float22bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  __nv_bfloat162 res;
+  res.x = cuda_cast<__nv_bfloat16>(int8[0]);
+  res.y = cuda_cast<__nv_bfloat16>(int8[1]);
+  return res;
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val) {
+  return float22bf162(__half22float2(val));
+}
+
+// // ============================== Abs ==============================
+template <typename T>
+__device__ inline T cuda_abs(T val) {
+  assert(false);
+  return {};
+}
+
+template <>
+__device__ inline float cuda_abs(float val) {
+  return fabs(val);
+}
+
+template <>
+__device__ inline float2 cuda_abs(float2 val) {
+  return make_float2(fabs(val.x), fabs(val.y));
+}
+
+template <>
+__device__ inline half cuda_abs(half val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline half2 cuda_abs(half2 val) {
+  return __habs2(val);
+}
+
+#if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
+template <>
+__device__ inline __nv_bfloat16 cuda_abs(__nv_bfloat16 val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val) {
+  return __habs2(val);
+}
+#endif
+
+// // ============================== Max ==============================
+template <typename To, typename Ti>
+__device__ inline To cuda_max(Ti val) {
+  return cuda_cast<To>(val);
+};
+
+template <>
+__device__ inline float cuda_max(float2 val) {
+  return fmaxf(val.x, val.y);
+}
+
+template <>
+__device__ inline half cuda_max(half2 val) {
+  return __hmax(val.x, val.y);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  return __hmax(val.x, val.y);
+#else
+  assert(0);
+  asm volatile("brkpt;\n" ::);
+  return __nv_bfloat16(0);
+#endif
+}
+
+// Binary maximum: compute the max of two values.
+template <typename T>
+__device__ inline T cuda_max(T val1, T val2) {
+  return (val1 > val2) ? val1 : val2;
+}
+
+template <>
+__device__ inline float2 cuda_max(float2 val1, float2 val2) {
+  float2 out;
+  out.x = fmaxf(val1.x, val2.x);
+  out.y = fmaxf(val1.y, val2.y);
+  return out;
+}
+
+template <>
+__device__ inline half2 cuda_max(half2 val1, half2 val2) {
+  return __hmax2(val1, val2);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 val2) {
+  return __hmax2(val1, val2);
+}
+
+// // ============================== Reciprocal ==============================
+// Fast reciprocal.
+inline __device__ float reciprocal_approximate_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
+}
+}  // namespace maths
 
 namespace utils {
 
@@ -76,6 +444,234 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
+                                                  std::optional<int> numRows, int numCols) {
+  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  // batched tensor
+  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+  int64_t innerMStride = 4 * innerKStride;  // 4
+
+  // M tile layout [32, 4] is column-major.
+  int32_t outerMIdx = (mIdx % 32);
+  int64_t outerMStride = 4 * innerMStride;  // 16
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = 32 * outerMStride;  // 512
+
+  // SF vector size 16. We round the "numCols" up to a multiple of 64.
+  int factor = details::CVT_FP4_SF_VEC_SIZE * 4;
+  int32_t numKTiles = (numCols + factor - 1) / factor;
+  int32_t mTileIdx = mIdx / (32 * 4);
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  // Each SF block has 128 rows so pad rows to the multiple of 128.
+  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+  int64_t bTileStride = numMTiles * mTileStride;
+
+  // Compute the global offset.
+  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
+                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
+                     innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
+                                                       int colIdx, std::optional<int> numRows,
+                                                       int numCols, SFType* SFout,
+                                                       FP4QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+
+  // One pair of threads write one SF to global memory.
+  // TODO: stage through smem for packed STG.32
+  // is it better than STG.8 from 4 threads ?
+  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
+    if (layout == FP4QuantizationSFLayout::SWIZZLED) {
+      // SF vector index (16 elements share one SF in the K dimension).
+      // numRows and numCols are unpadded.
+      int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+      int32_t mIdx = rowIdx;
+
+      auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else if (layout == FP4QuantizationSFLayout::LINEAR) {
+      // Linear row-major layout, no padding required.
+      int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+
+      int32_t numKTiles = numCols / details::CVT_FP4_SF_VEC_SIZE;
+      int64_t mTileStride = numKTiles;
+
+      int64_t BTileStride = numRows.value_or(0) * mTileStride;
+
+      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else {
+      return nullptr;
+    }
+  }
+#endif
+  return nullptr;
+}
+
+__forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3) {
+  uint32_t val0 = c0;
+  uint32_t val1 = c1;
+  uint32_t val2 = c2;
+  uint32_t val3 = c3;
+
+  return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
+}
+
+// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+// NOTE: bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
+inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
+        "f"(array[6]), "f"(array[7]));
+  return val;
+#else
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(*(((float2*)array) + i), __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
+#endif
+}
+
+// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
+        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+  return val;
+#else
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(array[i], __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
+#endif
+}
+
+// Quantizes the provided PackedVec into the uint32_t output
+template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
+__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
+                                         uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Get absolute maximum values among the local 8 values.
+  auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
+
+#pragma unroll
+  for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
+  }
+
+  // Get the absolute maximum among all 16 values (two threads).
+  localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  // Get the final absolute maximum values.
+  float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
+
+  // Get the SF (max value of the vector / max value of e2m1).
+  // maximum value of e2m1 = 6.0.
+  // TODO: use half as compute data type.
+  float SFValue = SFScaleVal * (vecMax * maths::reciprocal_approximate_ftz(6.0f));
+  // 8 bits representation of the SF.
+  uint8_t fp8SFVal;
+  // Write the SF to global memory (STG.8).
+  if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+    __nv_fp8_e8m0 tmp;
+    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+    SFValue = static_cast<float>(tmp);
+    fp8SFVal = tmp.__x;
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
+  } else {
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+  }
+  // Get the output scale.
+  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+  float outputScale = SFValue != 0 ? maths::reciprocal_approximate_ftz(
+                                         SFValue * maths::reciprocal_approximate_ftz(SFScaleVal))
+                                   : 0.0f;
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[details::CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<T, half>) {
+      fp2Vals[i] = __half22float2(get_vec2_element(vec, i));
+    } else {
+      fp2Vals[i] = __bfloat1622float2(get_vec2_element(vec, i));
+    }
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+
+  // Convert to e2m1 values.
+  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
 }  // namespace utils
 
 template <typename T, uint32_t VEC_SIZE>
@@ -98,23 +694,6 @@ enum class AllReduceFusionPattern : int {
   // the result of the norm.
   kARResidualRMSNormOutFP8Quant = 4,
   kARResidualRMSNormOutFP4Quant = 5
-};
-
-enum class FP4QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
 };
 
 enum class QuantType : int {
@@ -181,7 +760,7 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
-  float scale_factor;
+  float* scale_factor;
   bool use_oneshot;
   FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
@@ -233,8 +812,8 @@ struct LamportComm {
     int data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
     for (int r = 0; r < NRanks; ++r) {
-      data_bufs[r] =
-          reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
+      data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) +
+                     static_cast<int64_t>(data_offset) * comm_size;
     }
     clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
     __syncthreads();
@@ -330,9 +909,9 @@ class FusedOp {
       m_residual_val.load(reinterpret_cast<T*>(params.residual_in) + m_access_id * VEC_SIZE);
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-      m_scale_factor = 1.f / params.scale_factor;
+      m_scale_factor = 1.f / *(params.scale_factor);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      m_scale_factor = params.scale_factor;
+      m_scale_factor = *(params.scale_factor);
     }
   }
 
@@ -363,28 +942,26 @@ class FusedOp {
         val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
-    // todo(yingyi): add quant support
-    //     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-    //       constexpr int SF_VEC_SIZE = 16;
-    //       using PackedVec = PackedVec<DType>;
-    //       PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
-    //       auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(
-    //           std::nullopt, token_id, m_access_id_in_token, std::nullopt, m_params.hidden_dim,
-    //           reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
-    //       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
-    //           cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
-    //     } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
-    //       using PackedQuantizedType = std::conditional_t<std::is_same_v<DType, float>, float,
-    //       float2>; PackedQuantizedType ret;
-    // #pragma unroll
-    //       for (int i = 0; i < kMathCount; ++i) {
-    //         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-    //             static_cast<float>(reinterpret_cast<DType*>(&val)[i]) * m_scale_factor);
-    //       }
-    //       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
-    //     } else {
-    //       static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
-    //     }
+
+    if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
+      // NOTE(Yingyi): might update later
+      auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+          std::nullopt /* batchIdx */, token_id, m_access_id_in_token, std::nullopt /* numRows */,
+          m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+      reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
+          utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
+            static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
+    } else {
+      static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
+    }
   }
 
  protected:

@@ -73,10 +73,13 @@ def cancel_previous_build() {
 }
 
 def is_last_build() {
-  // whether it is last build
-  def job = Jenkins.instance.getItem(env.JOB_NAME)
-  def lastBuild = job.getLastBuild()
-  return lastBuild.getNumber() == env.BUILD_NUMBER
+  // check whether it is last build
+  try {
+    return currentBuild.number == currentBuild.rawBuild.project.getLastBuild().number
+  } catch (Throwable ex) {
+    echo 'Error during check is_last_build ' + ex.toString()
+    return false
+  }
 }
 
 def init_git(submodule = false) {
@@ -134,6 +137,7 @@ stage('Unittest') {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT')
       } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
           // retry if we are currently at last build
           // mark the current stage as success
@@ -142,7 +146,7 @@ stage('Unittest') {
           currentBuild.result = 'SUCCESS'
           run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
         } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+          echo 'Exit since it is not last build'
           throw ex
         }
       }
@@ -151,6 +155,7 @@ stage('Unittest') {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 1)
       } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
           // retry if we are currently at last build
           // mark the current stage as success
@@ -159,7 +164,7 @@ stage('Unittest') {
           currentBuild.result = 'SUCCESS'
           shard_run_unittest_GPU('GPU-G5', 1)
         } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+          echo 'Exit since it is not last build'
           throw ex
         }
       }
@@ -168,6 +173,7 @@ stage('Unittest') {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 2)
       } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
           // retry if we are currently at last build
           // mark the current stage as success
@@ -176,7 +182,7 @@ stage('Unittest') {
           currentBuild.result = 'SUCCESS'
           shard_run_unittest_GPU('GPU-G5', 2)
         } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+          echo 'Exit since it is not last build'
           throw ex
         }
       }
@@ -185,6 +191,7 @@ stage('Unittest') {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 3)
       } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
           // retry if we are currently at last build
           // mark the current stage as success
@@ -193,7 +200,7 @@ stage('Unittest') {
           currentBuild.result = 'SUCCESS'
           shard_run_unittest_GPU('GPU-G5', 3)
         } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+          echo 'Exit since it is not last build'
           throw ex
         }
       }
@@ -202,6 +209,7 @@ stage('Unittest') {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 4)
       } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
           // retry if we are currently at last build
           // mark the current stage as success
@@ -210,7 +218,7 @@ stage('Unittest') {
           currentBuild.result = 'SUCCESS'
           shard_run_unittest_GPU('GPU-G5', 4)
         } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+          echo 'Exit since it is not last build'
           throw ex
         }
       }

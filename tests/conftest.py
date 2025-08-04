@@ -1,3 +1,5 @@
+import functools
+import gc
 import os
 import types
 
@@ -136,6 +138,21 @@ def pytest_runtest_call(item):
             pytest.skip("Skipping due to OOM")
         else:
             raise
+
+
+@functools.cache
+def get_device_properties(device: torch.device) -> dict:
+    return torch.cuda.get_device_properties(device)
+
+
+def clear_cuda_cache(device: torch.device) -> None:
+    if (
+        torch.cuda.memory_allocated()
+        or torch.cuda.memory_reserved()
+        > 0.8 * get_device_properties(device).total_memory
+    ):
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # collected from gsk8k trace in sglang

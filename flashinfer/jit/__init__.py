@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import functools
 import os
 
 # Re-export
@@ -22,6 +23,7 @@ from . import cubin_loader
 from . import env as env
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
+from .attention import cudnn_fmha_gen_module as cudnn_fmha_gen_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
@@ -59,14 +61,23 @@ from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
-from .attention import trtllm_fmha_gen_module as trtllm_fmha_gen_module
+from .attention import trtllm_gen_fmha_module as trtllm_gen_fmha_module
 from .core import JitSpec as JitSpec
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
-from .cubin_loader import setup_cubin_loader
+from .cubin_loader import setup_cubin_loader, setup_metainfo_loader
+
+
+@functools.cache
+def get_cudnn_fmha_gen_module():
+    mod = cudnn_fmha_gen_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
 
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"

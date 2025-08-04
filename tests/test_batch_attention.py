@@ -1,4 +1,19 @@
-# test_flashinfer_attention.py
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import numpy as np
 import pytest
 import torch
@@ -16,6 +31,9 @@ def _build_seq_len_configs():
     torch.manual_seed(42)
 
     seq_len_configs = [
+        [(67, 1)],
+        [(182, 1)],
+        [(2011, 1)],
         [(2048, 1)] * 77,  # decode-only
         [(4099, 129)] * 2,  # prefill-only
         [(600, 1)] * 132 * 2 + [(5000, 3)] * 128,
@@ -47,6 +65,7 @@ def _run_attention(
     head_dim=128,
     layout="NHD",
     test_dtype=torch.bfloat16,
+    logits_soft_cap=0.0,
     device="cuda",
     causal=True,
 ):
@@ -109,6 +128,7 @@ def _run_attention(
         causal=causal,
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
+        logits_soft_cap=logits_soft_cap,
     )
     out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
 
@@ -127,8 +147,9 @@ def _run_attention(
         causal=causal,
         q_data_type=test_dtype,
         kv_data_type=test_dtype,
+        logits_soft_cap=logits_soft_cap,
     )
-    out_new, lse_new = wrapper.run(q, kv_data)
+    out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
@@ -143,6 +164,7 @@ def _run_attention(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
 def test_batch_attention_correctness(
     seq_len_pairs,
     page_block_size,
@@ -152,6 +174,7 @@ def test_batch_attention_correctness(
     causal,
     layout,
     test_dtype,
+    logits_soft_cap,
 ):
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
@@ -167,5 +190,6 @@ def test_batch_attention_correctness(
         causal=causal,
         layout=layout,
         test_dtype=test_dtype,
+        logits_soft_cap=logits_soft_cap,
         device="cuda",
     )

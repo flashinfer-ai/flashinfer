@@ -110,7 +110,7 @@ def download_file(source, local_path, retries=3, delay=5, timeout=10, lock_timeo
             logger.info(f"Lock file {lock_path} removed.")
 
 
-def load_cubin(cubin_path, sha256):
+def load_cubin(cubin_path, sha256) -> bytes:
     """
     Load a cubin from the provide local path and
     ensure that the sha256 signature matches.
@@ -134,10 +134,10 @@ def load_cubin(cubin_path, sha256):
     except:
         pass
     logger.info(f"Failed loading {cubin_path}")
-    return ""
+    return b""
 
 
-def get_cubin(name, sha256):
+def get_cubin(name, sha256, file_extension=".cubin"):
     """
     Load a cubin from the local cache directory with {name} and
     ensure that the sha256 signature matches.
@@ -147,7 +147,7 @@ def get_cubin(name, sha256):
     Returns:
     None on failure.
     """
-    cubin_fname = name + ".cubin"
+    cubin_fname = name + file_extension
     cubin_path = FLASHINFER_CACHE_DIR / "cubins" / cubin_fname
     cubin = load_cubin(cubin_path, sha256)
     if cubin:
@@ -188,3 +188,32 @@ def setup_cubin_loader(dll_path: str):
     dll_cubin_handlers[dll_path] = cb
 
     _LIB.FlashInferSetCubinCallback(cb)
+
+
+dll_metainfo_handlers = {}
+
+
+def setup_metainfo_loader(dll_path: str):
+    if dll_path in dll_metainfo_handlers:
+        return
+
+    _LIB = ctypes.CDLL(dll_path)
+
+    # Define the correct callback type
+    CALLBACK_TYPE = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p
+    )
+
+    def get_metainfo_callback(name, sha256, extension):
+        metainfo = get_cubin(
+            name.decode("utf-8"), sha256.decode("utf-8"), extension.decode("utf-8")
+        )
+        _LIB.FlashInferSetCurrentMetaInfo(
+            convert_to_ctypes_char_p(metainfo), ctypes.c_int(len(metainfo))
+        )
+
+    # Create the callback and keep a reference to prevent GC
+    cb = CALLBACK_TYPE(get_metainfo_callback)
+    dll_metainfo_handlers[dll_path] = cb
+
+    _LIB.FlashInferSetMetaInfoCallback(cb)

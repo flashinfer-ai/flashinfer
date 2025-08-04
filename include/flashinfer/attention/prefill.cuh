@@ -2293,7 +2293,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
       logits_transform<KTraits>(
           params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,

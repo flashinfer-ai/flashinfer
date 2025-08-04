@@ -18,6 +18,7 @@ autodoc_mock_imports = [
     "torch",
     "triton",
     "flashinfer._build_meta",
+    "cuda",
 ]
 
 project = "FlashInfer"

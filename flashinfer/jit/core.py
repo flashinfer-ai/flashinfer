@@ -60,7 +60,11 @@ def clear_cache_dir():
 
 
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"]
-sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"]
+sm100a_nvcc_flags = [
+    "-gencode=arch=compute_100a,code=sm_100a",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+    "-DFLASHINFER_ENABLE_FP4_E2M1",
+]
 
 
 @dataclasses.dataclass
@@ -142,7 +146,7 @@ def gen_jit_spec(
     cuda_cflags = [
         "-O3",
         "-std=c++17",
-        "--threads=4",
+        f"--threads={min(os.cpu_count() or 4, 32)}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
