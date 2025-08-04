@@ -33,6 +33,20 @@ output_column_dict = {
         "out_dtype",
         "mma_sm",
     ],
+    "moe": [
+        "num_tokens",
+        "hidden_size",
+        "intermediate_size",
+        "num_experts",
+        "top_k",
+        "n_groups",
+        "top_k_groups",
+        "routing_method_type",
+        "routed_scaling_factor",
+        "tile_tokens_dim",
+        "use_shuffled_weight",
+        "weight_layout",
+    ],
     "general": [
         "refcheck",
         "no_cuda_graph",
@@ -45,5 +59,6 @@ full_output_columns = (
     output_column_dict["perf"]
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
+    + output_column_dict["moe"]
     + output_column_dict["general"]
 )
