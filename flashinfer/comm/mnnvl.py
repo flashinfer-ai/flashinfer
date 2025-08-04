@@ -208,8 +208,8 @@ if IS_BUILDING_DOCS:
             return False
 
 else:
-    from mpi4py import MPI
     import pynvml
+    from mpi4py import MPI
 
     class MpiComm:
         _comm: MPI.Intracomm = MPI.COMM_WORLD
