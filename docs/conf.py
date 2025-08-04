@@ -19,6 +19,8 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    "numpy",
+    "einops",
 ]
 
 project = "FlashInfer"
