@@ -1,4 +1,6 @@
 #!/bin/bash
+set -eo pipefail
+set -x
 echo "Building FlashInfer documentation..."
 
 make clean
