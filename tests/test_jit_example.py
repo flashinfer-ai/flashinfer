@@ -40,6 +40,10 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
     const uint32_t offset = kv_idx;
     return ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
   })
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    return output;
+  })
 };
 """
     jit_module = gen_customize_single_decode_module(
@@ -97,6 +101,10 @@ struct FlashSigmoid : AttentionVariantBase {
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits * sigmoid_scale_log2 + sigmoid_bias_log2)));
   });
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    return output;
+  })
 };
 """
 

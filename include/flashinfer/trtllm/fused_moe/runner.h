@@ -16,18 +16,18 @@
 
 #pragma once
 
+#include <string>
+
 #include "DevKernel.h"
 #include "RoutingKernel.h"
 // #include "flashinfer/trtllm/common/cudaDriverWrapper.h"
-#include <string>
-
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 
 namespace tensorrt_llm {
 namespace kernels {
-namespace trtllmGenFp8BlockScaleMoe {
+namespace trtllmgen_moe {
 
 namespace Routing {
 
@@ -120,8 +120,10 @@ class Runner {
 namespace PermuteGemm1 {
 class Runner {
  public:
-  explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim,
-                  bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weight_layout);
+  explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
+                  batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
+                  int tileTokensDim, ActType actType, bool useShuffledMatrixA,
+                  batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -138,6 +140,7 @@ class Runner {
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
+           float* ptrBias, float* ptrSwiGluAlpha, float* ptrSwiGluBeta, float* ptrClampLimit,
            void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
            int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
@@ -146,7 +149,8 @@ class Runner {
            int device, cudaStream_t stream, int32_t configIndex);
 
  private:
-  batchedGemm::trtllm::gen::Dtype mDtypeElt;
+  batchedGemm::trtllm::gen::Dtype mDtypeAct;
+  batchedGemm::trtllm::gen::Dtype mDtypeWeights;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
@@ -155,7 +159,8 @@ class Runner {
 namespace Gemm2 {
 class Runner {
  public:
-  explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt,
+  explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
+                  batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrixA,
                   batchedGemm::gemm::MatrixLayout weight_layout);
@@ -174,15 +179,17 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
-           void* weightScale, float* outputScalesScalar, void* output, void* outputScale,
-           int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-           int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
-           int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-           int device, cudaStream_t stream, int32_t configIndex);
+           void* weightScale, float* outputScalesScalar, float* ptrBias, void* output,
+           void* outputScale, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
+           int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
+           int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
+           int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
+           int32_t configIndex);
 
  private:
-  batchedGemm::trtllm::gen::Dtype mDtypeElt;
-  batchedGemm::trtllm::gen::Dtype mOutputDtype;
+  batchedGemm::trtllm::gen::Dtype mDtypeAct;
+  batchedGemm::trtllm::gen::Dtype mDtypeWeights;
+  batchedGemm::trtllm::gen::Dtype mDtypeOut;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
@@ -206,9 +213,19 @@ struct MoERunnerArgs {
   void* gemm2_weights = nullptr;
   void* gemm2_weights_scale = nullptr;
 
+  float* gemm1_bias = nullptr;
+  float* gemm1_alpha = nullptr;
+  float* gemm1_beta = nullptr;
+  float* gemm1_clamp_limit = nullptr;
+  float* gemm2_bias = nullptr;
+
   int32_t num_tokens{0};
   int32_t num_experts{0};
+  // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
+  // Hidden dimension output of MoE block. It is not padded.
+  // If not provided it is the same as hidden_size.
+  std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
   int32_t n_group{0};
@@ -293,6 +310,10 @@ struct MoEConfig {
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
+  Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
+         bool useDeepSeekFp8, int tileTokensDim = 8, ActType actType = ActType::SwiGlu,
+         bool useShuffledMatrixA = false,
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrixA = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
@@ -330,6 +351,6 @@ class Runner {
 };
 }  // namespace MoE
 
-}  // namespace trtllmGenFp8BlockScaleMoe
+}  // namespace trtllmgen_moe
 }  // namespace kernels
 }  // namespace tensorrt_llm

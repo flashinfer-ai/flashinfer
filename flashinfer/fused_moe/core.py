@@ -752,15 +752,31 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+    debug_cubin_path = (
+        jit_env.FLASHINFER_INCLUDE_DIR
+        / "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/cubins"
+    )
+    import glob
+
+    debug_cubin_files = glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+
     return gen_jit_spec(
         "fused_moe_sm100",
         [
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_kernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_llama4.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ],
+        ]
+        + debug_cubin_files,
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
@@ -771,6 +787,10 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+        ],
     )
 
 
@@ -943,17 +963,24 @@ def get_trtllm_moe_sm100_module():
         mutates_args=(""),
     )
     def trtllm_fp4_block_scale_moe_op(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
-        hidden_states_scale: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor],
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: Optional[torch.Tensor],
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output1_scale_scalar: torch.Tensor,
-        output1_scale_gate_scalar: torch.Tensor,
-        output2_scale_scalar: torch.Tensor,
+        gemm2_bias: Optional[torch.Tensor],
+        output1_scale_scalar: Optional[torch.Tensor],
+        output1_scale_gate_scalar: Optional[torch.Tensor],
+        output2_scale_scalar: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -965,18 +992,55 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
+        output: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        if routing_logits is None:
+            assert (
+                topk_ids is not None
+            ), "either topk_ids or routing_logits must be provided."
+            assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
+            routing_dtype = torch.bfloat16
+        else:
+            routing_dtype = routing_logits.dtype
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        num_tokens = hidden_states.shape[0]
+
+        # workspace buffers required by trtllm-gen
+        if topk_ids is None:
+            topk_ids = torch.zeros(
+                num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+            )
+        if expert_weights is None:
+            expert_weights = torch.zeros(
+                num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
+            )
+        if output is None:
+            output = torch.zeros(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
 
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp4_block_scale_moe(
             routing_logits,
+            topk_ids,
+            expert_weights,
             routing_bias,
             hidden_states,
             hidden_states_scale,
             gemm1_weights,
             gemm1_weights_scale,
+            gemm1_bias,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
             gemm2_weights,
             gemm2_weights_scale,
+            gemm2_bias,
             output1_scale_scalar,
             output1_scale_gate_scalar,
             output2_scale_scalar,
@@ -991,6 +1055,7 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim,
             routing_method_type,
             do_finalize,
+            output,
         )
 
         return output
@@ -998,16 +1063,23 @@ def get_trtllm_moe_sm100_module():
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
         routing_logits: torch.Tensor,
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: Optional[torch.Tensor],
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output1_scale_scalar: torch.Tensor,
-        output1_scale_gate_scalar: torch.Tensor,
-        output2_scale_scalar: torch.Tensor,
+        gemm2_bias: Optional[torch.Tensor],
+        output1_scale_scalar: Optional[torch.Tensor],
+        output1_scale_gate_scalar: Optional[torch.Tensor],
+        output2_scale_scalar: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -1177,14 +1249,19 @@ def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
-    output1_scale_scalar: torch.Tensor,
-    output1_scale_gate_scalar: torch.Tensor,
-    output2_scale_scalar: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -1195,52 +1272,73 @@ def trtllm_fp4_block_scale_moe(
     routed_scaling_factor: Optional[float],
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
-    do_finalize: bool = False,
+    do_finalize: bool = True,
+    output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
     Args:
-        routing_logits: [seq_len, num_experts] tensor of routing logits
-        routing_bias: [num_experts] tensor of routing bias (can be None for some routing methods)
-        hidden_states: [seq_len, hidden_size] tensor of input hidden states
-        hidden_states_scale: [hidden_size//128, seq_len] tensor of hidden states block scales
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
-        gemm1_weights_scale: [num_experts, 2*intermediate_size//128, hidden_size//128] tensor of first layer block scales
-        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
-        gemm2_weights_scale: [num_experts, hidden_size//128, intermediate_size//128] tensor of second layer block scales
-        output1_scale_scalar: [local_num_experts] tensor of scaling factors for first layer activation output
-        output1_scale_gate_scalar: [local_num_experts] tensor of scaling factors for first layer gate output
-        output2_scale_scalar: [local_num_experts] tensor of scaling factors for second layer output
-        num_experts: Total number of experts
-        top_k: Number of experts to route to per token
-        n_group: Number of expert groups (can be None for some routing methods)
-        topk_group: Number of groups to consider for top-k routing (can be None for some routing methods)
-        intermediate_size: Size of intermediate layer
-        local_expert_offset: Offset of local experts in global expert space
-        local_num_experts: Number of experts handled by this device
-        routed_scaling_factor: Scaling factor for routing (can be None for some routing methods)
-        tile_tokens_dim: Tile dimension for tokens (default: 8)
-        routing_method_type: Type of routing method to use (default: 0)
+        routing_logits (torch.Tensor): shape [seq_len, num_experts]
+            Input tensor of routing logits. Supports float32, bfloat16.
+        routing_bias (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size]
+            Tensor of input hidden states. Supports bfloat16, mxfp8
+        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // 32]
+            Scale tensor of mxfp8 hidden states. Dtype must be float8.
+        gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
+            Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
+        gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
+            Scale tensor of FC1 weights. Dtype must be float8.
+        gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
+            Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size//128, intermediate_size//128]
+            Scale tensor of FC2 weights. Dtype must be float8.
+        output1_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for first layer activation output
+        output1_scale_gate_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for first layer gate output
+        output2_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for second layer output
+        num_experts (int): Total number of experts
+        top_k (int): Number of experts to route to per token
+        n_group (Optional[int]): Number of expert groups (can be None for some routing methods)
+        topk_group (Optional[int]): Number of groups to consider for top-k routing (can be None for some routing methods)
+        intermediate_size (int): Size of intermediate layer
+        local_expert_offset (int): Offset of local experts in global expert space
+        local_num_experts (int): Number of experts handled by this device
+        routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
+        routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
-        do_finalize: Whether to finalize the output (default: False)
+        do_finalize (bool): Whether to finalize the output (default: False)
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+            Optional inplace output tensor.
 
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results that need further processing.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
+        None,
+        None,
         routing_bias,
         hidden_states,
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
+        gemm2_bias,
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -1255,4 +1353,119 @@ def trtllm_fp4_block_scale_moe(
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
+        output,
+    )
+
+
+def trtllm_fp4_block_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    tile_tokens_dim: int = 8,
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    output: Optional[torch.Tensor] = None,
+) -> List[torch.Tensor]:
+    """FP4 block scale MoE operation.
+
+    Args:
+        topk_ids (torch.Tensor): shape [seq_len, top_k]
+            Tensor of top-k indices and expert weights. Dtype must be int32.
+            It must represent a packed value. The most significant 16/32 bits represent the score and
+            the least significant 16 bits represent the index of the chosen expert (unsigned).
+        routing_bias (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 32]
+            Tensor of input hidden states. Supports bfloat16, mxfp8
+        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // 32]
+            Scale tensor of mxfp8 hidden states. Dtype must be float8.
+        gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
+            Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
+        gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
+            Scale tensor of FC1 weights. Dtype must be float8.
+        gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
+            Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size//128, intermediate_size//128]
+            Scale tensor of FC2 weights. Dtype must be float8.
+        output1_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for first layer activation output
+        output1_scale_gate_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for first layer gate output
+        output2_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
+            Tensor of scaling factors for second layer output
+        num_experts (int): Total number of experts
+        top_k (int): Number of experts to route to per token
+        n_group (Optional[int]): Number of expert groups (can be None for some routing methods)
+        topk_group (Optional[int]): Number of groups to consider for top-k routing (can be None for some routing methods)
+        intermediate_size (int): Size of intermediate layer
+        local_expert_offset (int): Offset of local experts in global expert space
+        local_num_experts (int): Number of experts handled by this device
+        routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
+        routing_method_type (int): Type of routing method to use (default: 0)
+            - 0: Default (Softmax -> TopK)
+            - 1: Renormalize (TopK -> Softmax)
+            - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
+            - 3: Llama4 (Top1 -> Sigmoid)
+            - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+        do_finalize (bool): Whether to finalize the output (default: False)
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+            Optional inplace output tensor.
+
+    Returns:
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+    """
+    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+        None,
+        topk_ids,
+        None,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm2_bias,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        tile_tokens_dim,
+        routing_method_type,
+        do_finalize,
+        output,
     )
