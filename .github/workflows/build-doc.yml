@@ -23,15 +23,15 @@ jobs:
     name: Deploy Docs
     runs-on: ubuntu-latest
 
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
-
     steps:
     - uses: actions/checkout@v2
       with:
         submodules: recursive
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
 
     - name: Configuring build Environment
       run: |
