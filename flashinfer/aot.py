@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
+import torch.version
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
@@ -579,7 +580,7 @@ def main():
     def has_sm(compute: str, version: str) -> bool:
         if not any("compute_90" in flag for flag in gencode_flags):
             return False
-        if torch.cuda.version is None:
+        if torch.version.cuda is None:
             return True
         return version_at_least(torch.version.cuda, version)
 
