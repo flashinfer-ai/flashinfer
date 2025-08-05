@@ -798,6 +798,15 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         .int()
         .to(device)
     )
+    qo_indptr_cudnn = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q_device.view(-1), dim=0)
+            * head_dim_qk
+            * num_qo_heads,
+        ]
+    ).int()
+
     # Because actual_seq_lens_kv is the same as actual_seq_lens_q, kv_indptr will become the same as qo_indptr
     kv_indptr = (
         torch.cat(
