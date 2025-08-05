@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
+#include "pytorch_extension_utils.h"
 
 namespace moe::dev::routing {
 namespace routingRenormalize {

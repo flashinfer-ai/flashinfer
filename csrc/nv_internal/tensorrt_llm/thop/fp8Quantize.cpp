@@ -24,18 +24,15 @@
 
 namespace torch_ext {
 
-// self: [M, K], fp16/bf16/fp8_quantized
+// input: [M, K], fp32/fp16/bf16/fp8_quantized
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
 // linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
 // returns
-// self_fp8, self_block_scale_factors
-// self_fp8: [M, K], uint8_t
-// self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / 32 / 4) * 4, uint8_t
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor self, bool isSfSwizzledLayout) {
-  CHECK_TH_CUDA(self);
-  CHECK_CONTIGUOUS(self);
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout) {
+  CHECK_TH_CUDA(input);
+  CHECK_CONTIGUOUS(input);
 
-  auto const& inputShape = self.sizes();
+  auto const& inputShape = input.sizes();
   auto const& rank = inputShape.size();
 
   TORCH_CHECK(rank >= 2, "Input should be >=2D tensor.");
@@ -51,14 +48,14 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor self, bool isSfSwiz
   outputShape[rank - 1] = k;
 
   at::Tensor valueFP8 =
-      at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, self.device(),
+      at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, input.device(),
                              /* stride */ std::nullopt);
 
   int64_t SFSize = isSfSwizzledLayout
                        ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
                        : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
 
-  at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
+  at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, input.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -68,14 +65,14 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor self, bool isSfSwiz
 
 #define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                \
   tensorrt_llm::kernels::invokeMxFP8Quantization<T>(                                   \
-      1, m, k, reinterpret_cast<T*>(self.data_ptr()),                                  \
+      1, m, k, reinterpret_cast<T*>(input.data_ptr()),                                 \
       reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                 \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
-      at::cuda::getCurrentCUDAStream(self.get_device()));
+      at::cuda::getCurrentCUDAStream(input.get_device()));
 
-  if (self.scalar_type() == at::ScalarType::Half) {
+  if (input.scalar_type() == at::ScalarType::Half) {
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
-  } else if (self.scalar_type() == at::ScalarType::BFloat16) {
+  } else if (input.scalar_type() == at::ScalarType::BFloat16) {
 #ifdef ENABLE_BF16
     LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
