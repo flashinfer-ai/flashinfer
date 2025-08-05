@@ -1,5 +1,6 @@
 import os
 import sys
+import warnings
 from pathlib import Path
 
 # import tlcpack_sphinx_addon
@@ -76,3 +77,21 @@ html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }
+
+
+warnings.filterwarnings("error", category=ImportWarning)
+
+
+def autodoc_skip_member(app, what, name, obj, skip, options):
+    try:
+        if hasattr(obj, "__module__"):
+            module_name = obj.__module__
+            if module_name:
+                __import__(module_name)
+    except ImportError as e:
+        return True
+    return skip
+
+
+def setup(app):
+    app.connect("autodoc-skip-member", autodoc_skip_member)
