@@ -1,7 +1,6 @@
 name: Build FlashInfer Docs
 
 on:
-  pull_request:
   push:
     branches:
       - main
@@ -43,6 +42,17 @@ jobs:
         python -m pip install -r docs/requirements.txt
 
     - name: Bulid Documentation
+      if: github.ref == 'refs/heads/main'
       run: |
         cd docs
         ./build_docs.sh
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        # Upload entire repository
+        path: 'docs/_build/html'
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
