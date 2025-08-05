@@ -269,7 +269,24 @@ struct BlockBatchPagedAttentionPersistent {
                   : kv_end) /
               CTA_TILE_KV -
           (kv_start / CTA_TILE_KV);
-
+      int window_tile_idx =
+          (CAUSAL ? min(kv_end, kv_len - q_len + ceil_div(packed_qo_start, gqa_group_size))
+                  : kv_end) /
+              CTA_TILE_KV -
+          (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      window_tile_idx = params.window_left > 0 ? window_tile_idx : 0;
+      // if ( blockIdx.x == 0 && blockIdx.y == 0) {
+      //   printf("kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d\n", kv_tile_idx,
+      //   mask_tile_idx, window_tile_idx);
+      // }
+      // int window_tile_idx = 0;
+      // if (params.window_left > 0) {
+      //   window_tile_idx =
+      //       ceil_div(min(kv_end, kv_len + ceil_div(packed_qo_start + cluster_tile_q,
+      //       gqa_group_size)),
+      //           CTA_TILE_KV) -
+      //               1 - (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      // }
       uint32_t block_iter_base = kv_indptr * block_size + kv_start;
       // last kv tile
       __syncthreads();
@@ -289,7 +306,8 @@ struct BlockBatchPagedAttentionPersistent {
 
       // loop with mask
       LOOP_SPLIT_MASK(
-          kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
+          kv_tile_idx,
+          (kv_tile_idx >= mask_tile_idx || kv_tile_idx < window_tile_idx) && kv_tile_idx > 0,
           kv_tile_idx + 1 > NUM_STAGES, {
             prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                                      packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h,
@@ -343,11 +361,13 @@ struct BlockBatchPagedAttentionPersistent {
                   (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
               q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
         }
+        // if (kv_tile_idx < window_tile_idx) { // TODO: check why adding this leads to nan
         logits_mask<KTraits>(
             params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
             kv_start +
                 (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
+        // }
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
       }
