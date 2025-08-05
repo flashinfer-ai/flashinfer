@@ -472,7 +472,7 @@ def test_trtllm_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        q,
+        q.contiguous(),
         kv_cache,
         workspace_buffer,
         page_table,
