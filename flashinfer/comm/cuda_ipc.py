@@ -68,6 +68,8 @@ def find_loaded_library(lib_name) -> Optional[str]:
 
 
 class CudaRTLibrary:
+    """CudaRTLibrary"""
+
     exported_functions = [
         # ​cudaError_t cudaSetDevice ( int  device )
         Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
@@ -199,10 +201,6 @@ def create_shared_buffer(
     Creates a shared buffer and returns a list of pointers
     representing the buffer on all processes in the group.
     """
-    """
-    Creates a shared buffer and returns a list of pointers
-    representing the buffer on all processes in the group.
-    """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
     if group is None:
@@ -228,6 +226,9 @@ def create_shared_buffer(
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
 ) -> None:
+    """
+    Frees a shared buffer.
+    """
     if group is None:
         group = dist.group.WORLD
     rank = dist.get_rank(group=group)
