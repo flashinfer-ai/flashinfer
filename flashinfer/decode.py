@@ -1140,6 +1140,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1284,6 +1285,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._kv_lens_buffer,
                     page_size,
                     self._max_kv_len,
+                    sinks,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1792,7 +1794,8 @@ class TrtllmGenDecodeModule:
     def _paged_run(
         self,
         query: torch.Tensor,
-        kv_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -1801,6 +1804,7 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1812,7 +1816,8 @@ class TrtllmGenDecodeModule:
             query.unsqueeze(
                 1
             ),  # [B, 1, H, D], no MTP here so second dim is 1 # todo(Yingyi): add MTP??
-            kv_cache,
+            k_cache,
+            v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
@@ -1824,6 +1829,7 @@ class TrtllmGenDecodeModule:
             0,  # o_sf_start_index
             window_left,
             self._sm_count,
+            sinks,
         )
         return out
 
@@ -1895,6 +1901,7 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -1906,7 +1913,8 @@ def get_trtllm_gen_decode_module(*args):
         assert max_kv_len is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
-            paged_kv_cache,
+            paged_k_cache,
+            paged_v_cache,
             int_workspace_buffer,
             block_tables,
             kv_lens_buffer,
@@ -1915,6 +1923,7 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
             out=o,
+            sinks=sinks,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -1953,6 +1962,7 @@ def get_trtllm_gen_decode_module(*args):
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1968,7 +1978,7 @@ def get_trtllm_gen_decode_module(*args):
 
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1980,6 +1990,7 @@ def trtllm_batch_decode_with_kv_cache(
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -1987,8 +1998,9 @@ def trtllm_batch_decode_with_kv_cache(
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim]
 
-    kv_cache : torch.Tensor
-        kv_cache tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
 
     workspace_buffer : torch.Tensor
         workspace
@@ -2024,11 +2036,27 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_vec_size : Optional[int] = None
         vector size for nvfp4 output tensor scale factor.
 
+    sinks : Optional[List[torch.Tensor]] = None
+        additional value per head in the denominator of the softmax.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
     """
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
 
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
@@ -2086,7 +2114,8 @@ def trtllm_batch_decode_with_kv_cache(
         out,
         out_scale_factor,
         query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
-        kv_cache,
+        k_cache,
+        v_cache,
         workspace_buffer,
         block_tables,
         seq_lens,
@@ -2098,6 +2127,7 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_start_index,
         window_left,
         sm_count,
+        sinks,
     )
 
     return (
@@ -2164,6 +2194,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: Optional[float] = 1.0,
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -2181,6 +2212,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: fused scale for mla bmm2 input.
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
+    sinks: additional value per head in the denominator of the softmax.
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
@@ -2243,7 +2275,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out,
         None,  # fp4 output not supported in wrapper api yet.
         query,
-        kv_cache.unsqueeze(-3),
+        kv_cache,
+        kv_cache,
         workspace_buffer,
         block_tables,
         seq_lens,
@@ -2255,5 +2288,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         0,  # o_sf_start_index
         -1,  # window_left
         sm_count,
+        sinks,
     )
     return out

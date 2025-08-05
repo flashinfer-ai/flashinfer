@@ -41,6 +41,13 @@ enum class FP4QuantizationSFLayout {
   LINEAR
 };
 
+// This denotes the input and output data types of the block scale quantization.
+enum class BlockScaleQuantizationType {
+  FP16_TO_FP4 = 0,
+  FP8_TO_FP4 = 1,
+  FP16_TO_MXFP8 = 2,
+};
+
 #define PadUpFn(X, Y) ((X + Y - 1) / (Y) * (Y))
 
 // totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
@@ -85,6 +92,11 @@ void invokeNVFP4BlockScaleInterleave(int b, int m, int m_padded, int n, int n_pa
 void invokeNVFP4BlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn,
                                             uint8_t* SFOutput, int multiProcessorCount,
                                             cudaStream_t stream = 0);
+
+template <typename T>
+void invokeMxFP8Quantization(int b, int m, int n, T const* input, int64_t* output, int32_t* SFOuput,
+                             FP4QuantizationSFLayout layout, int multiProcessorCount,
+                             cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
