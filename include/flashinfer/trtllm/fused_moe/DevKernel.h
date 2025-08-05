@@ -33,7 +33,7 @@
 
 namespace moe::dev {
 
-#define CHECK_CUDA(cmd)                                                                      \
+#define CHECK_CUDA_ERROR(cmd)                                                                \
   do {                                                                                       \
     cudaError_t e = cmd;                                                                     \
     if (e != cudaSuccess) {                                                                  \
@@ -46,34 +46,34 @@ namespace moe::dev {
 
 #define LAUNCH_ESC(...) __VA_ARGS__
 
-#define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream)    \
-  cudaLaunchConfig_t config{};                                                                  \
-  config.gridDim = numBlocks;                                                                   \
-  config.blockDim = numThreads;                                                                 \
-  config.dynamicSmemBytes = smemSize;                                                           \
-  config.stream = (cudaStream_t)stream;                                                         \
-                                                                                                \
-  cudaLaunchAttribute attributes[2] = {};                                                       \
-  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                        \
-  attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);                 \
-  attributes[1].id = cudaLaunchAttributeCooperative;                                            \
-  attributes[1].val.cooperative = int(coopLaunch);                                              \
-  config.attrs = attributes;                                                                    \
-  config.numAttrs = 2;                                                                          \
-  if (data.mUsePdl) {                                                                           \
-    auto params = KernelParams<types, true>::setKernelParams(data);                             \
-    auto kernelTyped = kernel<KernelParams<types, true>>;                                       \
-    if (smemSize > 48 * 1024)                                                                   \
-      CHECK_CUDA(cudaFuncSetAttribute(kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, \
-                                      smemSize));                                               \
-    CHECK_CUDA(cudaLaunchKernelEx(&config, kernelTyped, params));                               \
-  } else {                                                                                      \
-    auto params = KernelParams<types, false>::setKernelParams(data);                            \
-    auto kernelTyped = kernel<KernelParams<types, false>>;                                      \
-    if (smemSize > 48 * 1024)                                                                   \
-      CHECK_CUDA(cudaFuncSetAttribute(kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, \
-                                      smemSize));                                               \
-    CHECK_CUDA(cudaLaunchKernelEx(&config, kernelTyped, params));                               \
+#define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream) \
+  cudaLaunchConfig_t config{};                                                               \
+  config.gridDim = numBlocks;                                                                \
+  config.blockDim = numThreads;                                                              \
+  config.dynamicSmemBytes = smemSize;                                                        \
+  config.stream = (cudaStream_t)stream;                                                      \
+                                                                                             \
+  cudaLaunchAttribute attributes[2] = {};                                                    \
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                     \
+  attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);              \
+  attributes[1].id = cudaLaunchAttributeCooperative;                                         \
+  attributes[1].val.cooperative = int(coopLaunch);                                           \
+  config.attrs = attributes;                                                                 \
+  config.numAttrs = 2;                                                                       \
+  if (data.mUsePdl) {                                                                        \
+    auto params = KernelParams<types, true>::setKernelParams(data);                          \
+    auto kernelTyped = kernel<KernelParams<types, true>>;                                    \
+    if (smemSize > 48 * 1024)                                                                \
+      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                                 \
+          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));              \
+    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));                      \
+  } else {                                                                                   \
+    auto params = KernelParams<types, false>::setKernelParams(data);                         \
+    auto kernelTyped = kernel<KernelParams<types, false>>;                                   \
+    if (smemSize > 48 * 1024)                                                                \
+      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                                 \
+          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));              \
+    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));                      \
   }
 
 #define LAUNCH(data, kernel, numBlocks, numThreads, smemSize, stream)                              \

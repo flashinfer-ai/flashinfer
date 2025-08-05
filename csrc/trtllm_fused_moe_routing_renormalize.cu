@@ -272,9 +272,9 @@ void run(Data const& data, void* stream) {
                                      stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
     } else {
       // Reset the global histograms.
-      CHECK_CUDA(cudaMemsetAsync(data.mPtrExpertCounts, 0,
-                                 static_cast<size_t>(2 * NumThreads) * sizeof(int32_t),
-                                 (cudaStream_t)stream));
+      CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
+                                       static_cast<size_t>(2 * NumThreads) * sizeof(int32_t),
+                                       (cudaStream_t)stream));
     }
     LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramKernel, numBlocksHistogram,
                                    NumThreadsHist,
