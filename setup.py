@@ -64,6 +64,11 @@ install_requires = [
     "nvidia-cudnn-cu12",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
+
+# Skip nvidia-nvshmem-cu12 if SKIP_NVSHMEM_PIP environment variable is set
+if os.environ.get("SKIP_NVSHMEM_PIP", "0") == "1":
+    install_requires.remove("nvidia-nvshmem-cu12")
+
 generate_build_meta({})
 
 if enable_aot:

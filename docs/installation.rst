@@ -194,6 +194,18 @@ You can follow the steps below to install FlashInfer from source code:
                python -m build --no-isolation --wheel
                ls -la dist/
 
+Environment Variables
+^^^^^^^^^^^^^^^^^^^^
+
+FlashInfer supports the following environment variables to customize the installation process:
+
+- ``SKIP_NVSHMEM_PIP``: When set to "1", skips installing the ``nvidia-nvshmem-cu12`` dependency via pip. This is useful when the package is already provided as a system-level package (e.g., via RPM on RHEL-based distributions via the NVIDIA CUDA repository).
+
+  .. code-block:: bash
+
+      export SKIP_NVSHMEM_PIP=1
+      pip install --no-build-isolation --verbose .
+
 C++ API
 -------
 
