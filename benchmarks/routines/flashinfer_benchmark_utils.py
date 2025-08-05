@@ -85,3 +85,20 @@ def get_device(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {gpu_name = }")
     return device
+
+
+def dtype_str_to_torch_dtype(dtype_str):
+    if dtype_str == "bfloat16":
+        return torch.bfloat16
+    elif dtype_str == "float16":
+        return torch.float16
+    elif dtype_str == "float32":
+        return torch.float32
+    elif dtype_str == "float64":
+        return torch.float64
+    elif dtype_str == "fp8_e4m3":
+        return torch.float8_e4m3fn
+    elif dtype_str == "fp8_e5m2":
+        return torch.float8_e5m2
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")

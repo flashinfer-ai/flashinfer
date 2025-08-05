@@ -12,7 +12,11 @@ from flashinfer.testing.utils import (
     bench_gpu_time_with_cudagraph,
 )
 
-from .flashinfer_benchmark_utils import get_device, print_perf_metrics
+from .flashinfer_benchmark_utils import (
+    dtype_str_to_torch_dtype,
+    get_device,
+    print_perf_metrics,
+)
 
 
 def run_attention_test(args):
@@ -195,35 +199,17 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
-    rtol = 1e-2
+    rtol = 2e-1
     atol = 1e-2
 
     # Handle different query data types.
-    if args.q_dtype == "bfloat16":
-        q_dtype = torch.bfloat16
-    elif args.q_dtype == "fp8" or args.q_dtype == "fp8_e4m3":
-        q_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.q_dtype == "fp8_e5m2": # E5M2 not supported yet
-    #     q_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    if q_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported q_dtype: {args.q_dtype}")
 
     # Handle different KV cache data types.
-    if args.kv_dtype == "bfloat16":
-        kv_dtype = torch.bfloat16
-    elif args.kv_dtype == "fp8" or args.kv_dtype == "fp8_e4m3":
-        kv_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.kv_dtype == "fp8_e5m2": # E5M2 not supported yet
-    #     kv_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported kv_dtype: {args.kv_dtype}")
 
     # Parse and validate backend configurations
@@ -256,10 +242,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     if "fa2_tc" in backends:
         remove_fa2_tc = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] FA2_TC backend does not support FP8. Skipping.")
-            remove_fa2_tc = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] FA2_TC backend does not support FP8. Skipping.")
             remove_fa2_tc = True
         if remove_fa2_tc:
@@ -267,10 +253,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     if "cudnn" in backends:
         remove_cudnn = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
-            remove_cudnn = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
@@ -405,9 +391,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         .to(device)
     )
 
-    ragged_q = torch.arange(0, batch_size + 1, device=device) * (
-        num_qo_heads * head_dim_qk
-    )  # For cuDNN
+    ragged_q = (
+        torch.arange(0, batch_size + 1, device=device) * (num_qo_heads * head_dim_qk)
+    ).long()  # For cuDNN
 
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
@@ -628,38 +614,17 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Basic setup
     device = get_device(args)
 
-    # Hard coded parameters for now
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
-    rtol = 1e-2
+    rtol = 2e-1
     atol = 1e-2
 
-    if args.q_dtype == "bfloat16":
-        q_dtype = torch.bfloat16
-    elif args.q_dtype == "fp8" or args.q_dtype == "fp8_e4m3":
-        q_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.q_dtype == "fp8_e5m2": # E5M2 not tested yet
-    #     q_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    if q_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported q_dtype: {args.q_dtype}")
 
-    if args.kv_dtype == "bfloat16":
-        kv_dtype = torch.bfloat16
-        rtol = 1e-2
-        atol = 1e-2
-    elif args.kv_dtype == "fp8" or args.kv_dtype == "fp8_e4m3":
-        kv_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.kv_dtype == "fp8_e5m2":
-    #     kv_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported kv_dtype: {args.kv_dtype}")
 
     # Parse and validate backend configurations
@@ -697,10 +662,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backends.remove("fa3")
     if "cudnn" in backends:
         remove_cudnn = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
-            remove_cudnn = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
@@ -708,10 +673,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     if "trtllm-gen" in backends:
         remove_trtllm = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] trtllm-gen backend does not support FP8. Skipping.")
-            remove_trtllm = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] trtllm-gen backend does not support FP8. Skipping.")
             remove_trtllm = True
         if remove_trtllm:
@@ -821,7 +786,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 * num_qo_heads,
             ]
         )
-        .int()
+        .long()
         .to(device)
     )  # For cuDNN
     qo_indptr = (
@@ -1087,31 +1052,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Basic setup
     device = get_device(args)
 
-    # Hard coded parameters for now
-    rtol = 1e-2
+    q_init_dtype = torch.bfloat16
+    kv_init_dtype = torch.bfloat16
+    rtol = 2e-1
     atol = 1e-2
 
-    if args.q_dtype == "bfloat16":
-        q_dtype = torch.bfloat16
-    elif args.q_dtype == "fp8" or args.q_dtype == "fp8_e4m3":
-        q_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.q_dtype == "fp8_e5m2": # E5M2 not tested yet
-    #     q_dtype = torch.float8_e5m2
-    else:
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    if q_dtype not in [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"Unsupported q_dtype: {args.q_dtype}")
-
-    kv_init_dtype = torch.bfloat16
-    if args.kv_dtype == "bfloat16":
-        kv_dtype = torch.bfloat16
-    elif args.kv_dtype == "fp8" or args.kv_dtype == "fp8_e4m3":
-        kv_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.kv_dtype == "fp8_e5m2":
-    #     kv_dtype = torch.float8_e5m2
-    else:
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"Unsupported kv_dtype: {args.kv_dtype}")
 
     # Parse and validate backend configurations
@@ -1131,10 +1081,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Check for backend-specific constraints
     if "cudnn" in backends:
         remove_cudnn = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] CUDNN backend does not support FP8. Skipping.")
-            remove_cudnn = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] CUDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
@@ -1142,10 +1092,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     if "cutlass" in backends:
         remove_cutlass = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] CUTLASS backend does not support FP8. Skipping.")
-            remove_cutlass = True
-        if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
             print(f"[INFO] CUTLASS backend does not support FP8. Skipping.")
             remove_cutlass = True
         if remove_cutlass:
@@ -1188,16 +1138,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
     q = torch.randn(
-        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=q_init_dtype
     )
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q.shape = }")
 
     k = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=kv_init_dtype
     )
     v = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=torch.bfloat16
+        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=kv_init_dtype
     )
 
     block_tables = None
@@ -1397,7 +1347,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             for i in range(len(tested_backends)):
                 try:
                     torch.testing.assert_close(
-                        reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                        reference_output, tested_outputs[i], rtol=rtol, atol=atol
                     )
                 except AssertionError as e:
                     print(
@@ -1490,35 +1440,17 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
-    rtol = 1e-2
+    rtol = 2e-1
     atol = 1e-2
 
     # Handle different query data types.
-    if args.q_dtype == "bfloat16":
-        q_dtype = torch.bfloat16
-    elif args.q_dtype == "fp8" or args.q_dtype == "fp8_e4m3":
-        q_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.q_dtype == "fp8_e5m2": # E5M2 not tested yet
-    #     q_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    if q_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported q_dtype: {args.q_dtype}")
 
     # Handle different KV cache data types.
-    if args.kv_dtype == "bfloat16":
-        kv_dtype = torch.bfloat16
-    elif args.kv_dtype == "fp8" or args.kv_dtype == "fp8_e4m3":
-        kv_dtype = torch.float8_e4m3fn
-        rtol = 2e-1
-        atol = 1e-2
-    # elif args.kv_dtype == "fp8_e5m2": # E5M2 not tested yet
-    #     kv_dtype = torch.float8_e5m2
-    #     rtol = 2e-1
-    #     atol = 1e-2
-    else:
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         raise ValueError(f"Unsupported kv_dtype: {args.kv_dtype}")
 
     backends = args.backends

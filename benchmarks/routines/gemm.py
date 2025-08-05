@@ -14,7 +14,11 @@ from flashinfer.testing.utils import (
     quantize_fp8,
 )
 
-from .flashinfer_benchmark_utils import get_device, print_perf_metrics
+from .flashinfer_benchmark_utils import (
+    dtype_str_to_torch_dtype,
+    get_device,
+    print_perf_metrics,
+)
 
 
 def run_gemm_test(args):
@@ -184,11 +188,8 @@ def testGemmFp8NtGroupwise(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
 
-    if args.out_dtype == "bfloat16":
-        out_dtype = torch.bfloat16
-    elif args.out_dtype == "float16":
-        out_dtype = torch.float16
-    else:
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(f"Unsupported output dtype: {args.out_dtype}")
     ## Done parsing input arguments
 
@@ -382,11 +383,8 @@ def testGroupGemmFp8NtGroupwise(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
 
-    if args.out_dtype == "bfloat16":
-        out_dtype = torch.bfloat16
-    elif args.out_dtype == "float16":
-        out_dtype = torch.float16
-    else:
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(f"Unsupported output dtype: {args.out_dtype}")
     ## Done parsing input arguments
     ## Prepare input tensors
@@ -564,29 +562,20 @@ def testBmmFp8(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
 
-    if input_dtype == "fp8_e4m3":
-        input_dtype = torch.float8_e4m3fn
-    elif input_dtype == "fp8_e5m2":
-        input_dtype = torch.float8_e5m2
-    else:
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(
             f"Unsupported input dtype: {input_dtype}. Supported dtypes are fp8_e4m3 and fp8_e5m2."
         )
 
-    if mat2_dtype == "fp8_e4m3":
-        mat2_dtype = torch.float8_e4m3fn
-    elif mat2_dtype == "fp8_e5m2":
-        mat2_dtype = torch.float8_e5m2
-    else:
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    if mat2_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(
             f"Unsupported mat2 dtype: {mat2_dtype}. Supported dtypes are fp8_e4m3 and fp8_e5m2."
         )
 
-    if res_dtype == "bfloat16":
-        res_dtype = torch.bfloat16
-    elif res_dtype == "float16":
-        res_dtype = torch.float16
-    else:
+    res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if res_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
@@ -751,11 +740,8 @@ def testMmFp4(args):
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
 
-    if res_dtype == "bfloat16":
-        res_dtype = torch.bfloat16
-    elif res_dtype == "float16":
-        res_dtype = torch.float16
-    else:
+    res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if res_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
