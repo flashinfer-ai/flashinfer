@@ -2,7 +2,11 @@ import argparse
 import sys
 
 from routines.attention import parse_attention_args, run_attention_test
-from routines.flashinfer_benchmark_utils import full_output_columns, output_column_dict
+from routines.flashinfer_benchmark_utils import (
+    benchmark_apis,
+    full_output_columns,
+    output_column_dict,
+)
 from routines.gemm import parse_gemm_args, run_gemm_test
 
 
@@ -15,18 +19,9 @@ def run_test(args):
     """
 
     ## Depending on routine type, route to corresponding test routine
-    if args.routine in [
-        "BatchDecodeWithPagedKVCacheWrapper",
-        "BatchPrefillWithPagedKVCacheWrapper",
-        "BatchPrefillWithRaggedKVCacheWrapper",
-        "BatchMLAPagedAttentionWrapper",
-    ]:
+    if args.routine in benchmark_apis["attention"]:
         res = run_attention_test(args)
-    elif args.routine in [
-        "gemm_fp8_nt_groupwise",
-        "group_gemm_fp8_nt_groupwise",
-        "bmm_fp8",
-    ]:
+    elif args.routine in benchmark_apis["gemm"]:
         res = run_gemm_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
@@ -65,15 +60,7 @@ def parse_args(line=sys.argv[1:]):
         "-R",
         type=str,
         required=True,
-        choices=[
-            "BatchDecodeWithPagedKVCacheWrapper",
-            "BatchPrefillWithPagedKVCacheWrapper",
-            "BatchPrefillWithRaggedKVCacheWrapper",
-            "BatchMLAPagedAttentionWrapper",
-            "gemm_fp8_nt_groupwise",
-            "group_gemm_fp8_nt_groupwise",
-            "bmm_fp8",
-        ],
+        choices=list(benchmark_apis["attention"]) + list(benchmark_apis["gemm"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -126,18 +113,9 @@ def parse_args(line=sys.argv[1:]):
     )
 
     ## Check routine and pass on to routine-specific argument parser
-    if args.routine in [
-        "BatchDecodeWithPagedKVCacheWrapper",
-        "BatchPrefillWithPagedKVCacheWrapper",
-        "BatchPrefillWithRaggedKVCacheWrapper",
-        "BatchMLAPagedAttentionWrapper",
-    ]:
+    if args.routine in benchmark_apis["attention"]:
         args = parse_attention_args(line, parser)
-    elif args.routine in [
-        "gemm_fp8_nt_groupwise",
-        "group_gemm_fp8_nt_groupwise",
-        "bmm_fp8",
-    ]:
+    elif args.routine in benchmark_apis["gemm"]:
         args = parse_gemm_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")

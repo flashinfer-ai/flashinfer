@@ -1,15 +1,22 @@
 ## Attention Prefill
---routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 trtllm-gen cudnn --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph
---routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn trtllm-gen cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 -vv --refcheck --causal --no_cuda_graph
-
+# Llama 3.1 70B
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 8192 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
+# DeepSeek-R1
+--routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cutlass cudnn --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
+--routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cutlass cudnn --batch_size 16 --s_qo 8192 --s_kv 8192 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
 ## Attention Decode
---routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm-gen cudnn --page_size 16 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck
+# Llama 3.1 70B
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16
 
 ## Attention MLA
---routine BatchMLAPagedAttentionWrapper --backends fa2 --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
+# DeepSeek-R1
+--routine BatchMLAPagedAttentionWrapper --backends fa2 --page_size 1 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
+--routine BatchMLAPagedAttentionWrapper --backends fa2 --page_size 1 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16
 
 ## GEMM
---routine gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --no_cuda_graph --refcheck -vv
+--routine gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --no_cuda_graph --refcheck -vv --backend cutlass trtllm --scale_major_mode MN
 --routine group_gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --group_size 2 --no_cuda_graph --scale_major_mode K --refcheck -vv
---routine group_gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --group_size 2 --scale_major_mode MN --refcheck -vv
 --routine bmm_fp8 --m 8192 --n 4096 --k 16384 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas --refcheck -vv
+--routine mm_fp4 --m 8192 --n 4096 --k 16384 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --refcheck -vv

@@ -10,10 +10,9 @@ from flashinfer.testing.utils import (
     attention_tflops_per_sec_with_actual_seq_lens,
     bench_gpu_time,
     bench_gpu_time_with_cudagraph,
-    set_seed,
 )
 
-from .flashinfer_benchmark_utils import print_perf_metrics
+from .flashinfer_benchmark_utils import get_device, print_perf_metrics
 
 
 def run_attention_test(args):
@@ -192,11 +191,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
-    set_seed(args.random_seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {gpu_name = }")
+    device = get_device(args)
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
@@ -631,11 +626,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
-    set_seed(args.random_seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {gpu_name = }")
+    device = get_device(args)
 
     # Hard coded parameters for now
     q_init_dtype = torch.bfloat16
@@ -1094,11 +1085,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
-    set_seed(args.random_seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {gpu_name = }")
+    device = get_device(args)
 
     # Hard coded parameters for now
     rtol = 1e-2
@@ -1228,7 +1215,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 * num_qo_heads,
             ]
         )
-        .int()
+        .long()
         .to(device)
     )  # For cuDNN
 
@@ -1239,7 +1226,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             * head_dim_qk
             * num_kv_heads,
         ]
-    ).int()
+    ).long()
 
     v_indptr = torch.cat(
         [
@@ -1248,7 +1235,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             * head_dim_vo
             * num_kv_heads,
         ]
-    ).int()
+    ).long()
 
     o_indptr = torch.cat(
         [
@@ -1257,7 +1244,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             * head_dim_vo
             * num_qo_heads,
         ]
-    ).int()
+    ).long()
 
     batch_offsets_stats = torch.cat(
         [
@@ -1499,11 +1486,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
-    set_seed(args.random_seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {gpu_name = }")
+    device = get_device(args)
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
