@@ -1282,10 +1282,10 @@ def trtllm_fp4_block_scale_moe(
             Input tensor of routing logits. Supports float32, bfloat16.
         routing_bias (Optional[torch.Tensor]): shape [num_experts]
             Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
-        hidden_states (torch.Tensor): shape [seq_len, hidden_size]
-            Tensor of input hidden states. Supports bfloat16, mxfp8
-        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // 32]
-            Scale tensor of mxfp8 hidden states. Dtype must be float8.
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
+            Tensor of input hidden states. Supports bfloat16, mxfp8, and nvfp4 (packed into uint8)
+        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // (32 if mxfp8, 16 if mxfp4)]
+            Scale tensor of mxfp8 / nvfp4 hidden states. Dtype must be float8.
         gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
             Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
         gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
@@ -1396,10 +1396,10 @@ def trtllm_fp4_block_scale_routed_moe(
             the least significant 16 bits represent the index of the chosen expert (unsigned).
         routing_bias (Optional[torch.Tensor]): shape [num_experts]
             Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
-        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 32]
-            Tensor of input hidden states. Supports bfloat16, mxfp8
-        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // 32]
-            Scale tensor of mxfp8 hidden states. Dtype must be float8.
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
+            Tensor of input hidden states. Supports bfloat16, mxfp8, and nvfp4 (packed into uint8)
+        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // (32 if mxfp8, 16 if mxfp4)]
+            Scale tensor of mxfp8 / nvfp4 hidden states. Dtype must be float8.
         gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
             Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
         gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
