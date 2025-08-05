@@ -86,12 +86,12 @@ def generate_ninja_build_for_op(
     ldflags = [
         "-shared",
         "-L$torch_home/lib",
+        "-L$cuda_home/lib64",
         "-lc10",
         "-lc10_cuda",
         "-ltorch_cpu",
         "-ltorch_cuda",
         "-ltorch",
-        "-L$cuda_home/lib64",
         "-lcudart",
     ]
 
