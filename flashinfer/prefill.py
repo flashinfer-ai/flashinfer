@@ -97,7 +97,8 @@ def get_trtllm_gen_prefill_module():
 
     def _paged_run(
         query: torch.Tensor,
-        kv_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
         workspace_buffer: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -118,7 +119,8 @@ def get_trtllm_gen_prefill_module():
             out,
             None,  # fp4 output not supported in wrapper api yet.
             query,
-            kv_cache,
+            k_cache,
+            v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
@@ -442,7 +444,6 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
-        paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -456,7 +457,6 @@ def get_batch_prefill_module(backend, *args):
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
-            assert paged_kv_cache is not None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -468,7 +468,8 @@ def get_batch_prefill_module(backend, *args):
             assert cum_seq_lens_kv is not None
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
-                paged_kv_cache,
+                paged_k_cache,
+                paged_v_cache,
                 int_workspace_buffer,
                 block_tables,
                 kv_lens_buffer,
@@ -593,7 +594,6 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
-        paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -1988,7 +1988,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 rope_scale,
                 rope_theta,
                 self._token_pos_in_items_len,
-                paged_kv_cache,
                 self._num_qo_heads,
                 self._num_kv_heads,
                 self._block_tables,
@@ -2957,7 +2956,7 @@ def get_trtllm_gen_fmha_module():
 
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2979,8 +2978,9 @@ def trtllm_batch_context_with_kv_cache(
     ----------
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim]
-    kv_cache : torch.Tensor
-        kv_cache tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
     workspace_buffer : torch.Tensor
         workspace
     block_tables : torch.Tensor
@@ -3018,6 +3018,20 @@ def trtllm_batch_context_with_kv_cache(
     out: Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
     """
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
@@ -3074,7 +3088,8 @@ def trtllm_batch_context_with_kv_cache(
         out,
         out_scale_factor,
         query,
-        kv_cache,
+        k_cache,
+        v_cache,
         workspace_buffer,
         block_tables,
         seq_lens,
