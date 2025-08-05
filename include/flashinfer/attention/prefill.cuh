@@ -158,7 +158,8 @@ struct KernelTraits {
                 "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
                 "then recompile to support fp16 reduction");
   static constexpr DTypeQKAccum MaskFillValue =
-      AttentionVariant::use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f);
+      AttentionVariant::use_softmax ? DTypeQKAccum(std::numeric_limits<float>::lowest())
+                                    : DTypeQKAccum(0.f);
 #endif
 };
 
@@ -417,7 +418,8 @@ __device__ __forceinline__ void init_states(typename KTraits::AttentionVariant v
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        m[mma_q][j] = typename KTraits::DTypeQKAccum(-math::inf);
+        m[mma_q][j] =
+            typename KTraits::DTypeQKAccum(math::neg_inf<typename KTraits::DTypeQKAccum>());
         d[mma_q][j] = 1.f;
       }
     }
@@ -886,7 +888,7 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
+          float o_scale = math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
@@ -897,14 +899,14 @@ __device__ __forceinline__ void update_mdo_states(
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            s_frag[mma_q][mma_kv][j * 2 + 0] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 1] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 5] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 0] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 0] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 1] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 1] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 4] - m[mma_q][j]) * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 5] =
+                math::ptx_exp2((s_frag[mma_q][mma_kv][j * 2 + 5] - m[mma_q][j]) * sm_scale);
           }
         }
       }
@@ -1042,7 +1044,8 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        d_rcp[mma_q][j] = (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf))
+        d_rcp[mma_q][j] = (m[mma_q][j] != typename KTraits::DTypeQKAccum(
+                                              math::neg_inf<typename KTraits::DTypeQKAccum>()))
                               ? math::ptx_rcp(d[mma_q][j])
                               : 0.f;
       }
@@ -1070,7 +1073,8 @@ __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant va
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
+        if (m[mma_q][j] !=
+            typename KTraits::DTypeQKAccum(math::neg_inf<typename KTraits::DTypeQKAccum>())) {
           m[mma_q][j] *= variant.sm_scale_log2;
         }
       }
@@ -1122,7 +1126,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
         float o_scale[2][KTraits::NUM_WARPS_KV];
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          float m_new = -math::inf, d_new = 1.f;
+          float m_new = math::neg_inf<float>(), d_new = 1.f;
 #pragma unroll
           for (uint32_t i = 0; i < KTraits::NUM_WARPS_KV; ++i) {
             float2 md = smem_md[(((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) *

@@ -105,7 +105,7 @@ struct KernelTraits {
                                           HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO>;
   using AttentionVariant = StandardAttention;
 
-  static constexpr DTypeQKAccum MaskFillValue = -math::inf;
+  static constexpr DTypeQKAccum MaskFillValue = std::numeric_limits<DTypeQKAccum>::lowest();
 };
 
 template <typename KTraits>
@@ -121,7 +121,7 @@ __device__ __forceinline__ void init_states_(float (*o_frag)[8], typename KTrait
 
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    m[j] = typename KTraits::DTypeQKAccum(-math::inf);
+    m[j] = typename KTraits::DTypeQKAccum(math::neg_inf<typename KTraits::DTypeQKAccum>());
     d[j] = 1.f;
   }
 }
@@ -595,7 +595,10 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
   // compute reciprocal of d
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    d_rcp[j] = (m[j] != typename KTraits::DTypeQKAccum(-math::inf)) ? math::ptx_rcp(d[j]) : 0.f;
+    d_rcp[j] =
+        (m[j] != typename KTraits::DTypeQKAccum(math::neg_inf<typename KTraits::DTypeQKAccum>()))
+            ? math::ptx_rcp(d[j])
+            : 0.f;
   }
 
 #pragma unroll
@@ -613,7 +616,7 @@ __device__ __forceinline__ void finalize_m_(typename KTraits::AttentionVariant v
   if constexpr (variant.use_softmax) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      if (m[j] != typename KTraits::DTypeQKAccum(-math::inf)) {
+      if (m[j] != typename KTraits::DTypeQKAccum(math::neg_inf<typename KTraits::DTypeQKAccum>())) {
         m[j] *= variant.sm_scale_log2;
       }
     }

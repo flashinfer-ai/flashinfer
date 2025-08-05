@@ -96,7 +96,7 @@ __device__ __forceinline__ void compute_qk(
 
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
                                    kv_head_idx);
-    s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
+    s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : math::neg_inf<float>();
     st.m = max(st.m, s[j]);
   }
 
@@ -854,7 +854,7 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
-    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -math::inf;
+    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : math::neg_inf<float>();
     st.m = max(st.m, s[j]);
   }
 

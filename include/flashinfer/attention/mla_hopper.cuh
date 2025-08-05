@@ -110,7 +110,7 @@ __device__ __forceinline__ void init_states_(float* o_frag, float* m, float* d, 
 
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    m[j] = -math::inf;
+    m[j] = math::neg_inf<float>();
     d[j] = 1.f;
     o_scale[j] = 1.f;
   }
@@ -439,7 +439,7 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
   // compute reciprocal of d
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    d_rcp[j] = (m[j] != -math::inf) ? math::ptx_rcp(d[j]) : 0.f;
+    d_rcp[j] = (m[j] != math::neg_inf<float>()) ? math::ptx_rcp(d[j]) : 0.f;
   }
 
 #pragma unroll

@@ -165,7 +165,7 @@ struct DefaultUpdater {
 
 template <int NUM_ROWS_PER_THREAD, bool WITH_SCALE>
 struct OnlineSoftmax {
-  constexpr static float fill_value = -math::inf;
+  constexpr static float fill_value = std::numeric_limits<float>::lowest();
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
   TensorT row_max, row_sum, scores_scale;
   float sm_scale_log2;
