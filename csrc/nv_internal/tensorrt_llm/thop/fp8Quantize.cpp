@@ -26,11 +26,15 @@ namespace torch_ext {
 
 // input: [M, K], fp32/fp16/bf16/fp8_quantized
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
-// linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
+// linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout) {
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout, int64_t alignment) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
+
+  // Fixed SF_VEC_SIZE as 32
+  static constexpr int SF_VEC_SIZE = 32;
+  TORCH_CHECK(alignment % SF_VEC_SIZE == 0, "alignment must be divisible by SF_VEC_SIZE = 32");
 
   auto const& inputShape = input.sizes();
   auto const& rank = inputShape.size();
@@ -41,52 +45,49 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
     m *= inputShape[i];
   }
   auto const k = inputShape[rank - 1];
-  int32_t const sfVecSize = 32;
-  TORCH_CHECK(k % sfVecSize == 0);
+  TORCH_CHECK(k % SF_VEC_SIZE == 0, "k must be divisible by SF_VEC_SIZE = 32");
+  auto const padded_k = ((k + alignment - 1) / alignment) * alignment;
 
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-  outputShape[rank - 1] = k;
+  outputShape[rank - 1] = padded_k;
 
-  at::Tensor valueFP8 =
-      at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, input.device(),
-                             /* stride */ std::nullopt);
+  at::Tensor valMxFP8
+      = at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, input.device(), /* stride */ std::nullopt);
 
-  int64_t SFSize = isSfSwizzledLayout
-                       ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
-                       : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
+  int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, padded_k / SF_VEC_SIZE)
+                                      : tensorrt_llm::computeLinearLayoutSFSize(m, padded_k / SF_VEC_SIZE);
 
-  at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, input.device(),
-                                                 /* stride */ std::nullopt);  // 1D tensor
+  at::Tensor scaleFP8SF
+      = at::detail::empty_cuda({SFSize}, SF_DTYPE, input.device(), /* stride */ std::nullopt); // 1D tensor
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4
-                                         : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                         : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                \
-  tensorrt_llm::kernels::invokeMxFP8Quantization<T>(                                   \
-      1, m, k, reinterpret_cast<T*>(input.data_ptr()),                                 \
-      reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                 \
-      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
-      at::cuda::getCurrentCUDAStream(input.get_device()));
+#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                                                \
+  tensorrt_llm::kernels::invokeMxFP8Quantization(1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),             \
+      reinterpret_cast<int64_t*>(valMxFP8.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout,      \
+      mMultiProcessorCount, at::cuda::getCurrentCUDAStream(input.get_device()));
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
-  } else if (input.scalar_type() == at::ScalarType::BFloat16) {
+  if (input.scalar_type() == at::ScalarType::Half)
+  {
+      LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
+  }
+  else if (input.scalar_type() == at::ScalarType::BFloat16)
+  {
 #ifdef ENABLE_BF16
-    LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
+      LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
-    C10_THROW_ERROR(NotImplementedError,
-                    "BFloat16 must be enabled to quantize an bf16 tensor to mxfp8.");
+    C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to mxfp8.");
 #endif
   } else {
-    C10_THROW_ERROR(NotImplementedError,
-                    "mxfp8_quantize only supports input tensor with dtypes fp16/bf16.");
+    C10_THROW_ERROR(NotImplementedError, "mxfp8_quantize only supports input tensor with dtypes fp16/bf16.");
   }
 
 #undef LAUNCH_MXFP8_QUANTIZE_KERNEL
 
-  return {valueFP8, scaleFP8SF};
+  return {valMxFP8, scaleFP8SF};
 }
 
 inline uint8_t float_to_ue8m0(float value) {
@@ -119,14 +120,14 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize_host(at::Tensor x_fp32,
                                                 /* pinned */ true, at::MemoryFormat::Contiguous);
   int64_t sf_size =
       is_sf_swizzled_layout
-          ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)
-          : tensorrt_llm::computeFP4LinearLayoutSFSize(num_tokens, hidden_dim / sf_vec_size);
+          ? tensorrt_llm::computeSwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)
+          : tensorrt_llm::computeLinearLayoutSFSize(num_tokens, hidden_dim / sf_vec_size);
   at::Tensor scale_tensor =
       at::detail::empty_cpu({sf_size}, SF_DTYPE, /* pinned */ true, at::MemoryFormat::Contiguous);
 
-  tensorrt_llm::FP4QuantizationSFLayout layout =
-      is_sf_swizzled_layout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4
-                            : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout =
+      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
@@ -175,9 +176,9 @@ at::Tensor mxfp8_dequantize_host(at::Tensor value_e4m3, at::Tensor scale_ue8m08s
   int hidden_dim = data_shape[1];
   int groups_per_hidden_dim = hidden_dim / sf_vec_size;
 
-  tensorrt_llm::FP4QuantizationSFLayout layout =
-      is_sf_swizzled_layout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4
-                            : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout =
+      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
       float* float_ptr = float_tensor.data_ptr<float>() + ti * hidden_dim + group * sf_vec_size;

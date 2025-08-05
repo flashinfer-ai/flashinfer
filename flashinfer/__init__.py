@@ -52,10 +52,12 @@ from .fp4_quantization import (
     SfLayout,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
-    nvfp4_block_scale_interleave,
+    block_scale_interleave,
     nvfp4_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    mxfp4_quantize,
+    mxfp4_dequantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (

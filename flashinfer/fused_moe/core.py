@@ -30,7 +30,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from ..fp4_quantization import nvfp4_block_scale_interleave
+from ..fp4_quantization import block_scale_interleave
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
@@ -211,6 +211,10 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp4.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_stub.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -413,6 +417,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         output_dtype: torch.dtype,
         quant_scales: List[torch.Tensor],
         input_sf: Optional[torch.Tensor] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
         ep_size: int = 1,
@@ -492,6 +499,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             fc2_expert_biases,
             quant_scales,
             input_sf,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
             tp_size,
             tp_rank,
             ep_size,
@@ -518,6 +528,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         output_dtype: torch.dtype,
         quant_scales: List[torch.Tensor],
         input_sf: Optional[torch.Tensor] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
         ep_size: int = 1,
@@ -566,6 +579,9 @@ def cutlass_fused_moe(
     fc1_expert_biases: Optional[torch.Tensor] = None,
     fc2_expert_biases: Optional[torch.Tensor] = None,
     input_sf: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -705,8 +721,6 @@ def cutlass_fused_moe(
         )
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
-    if use_mxfp8_act_scaling:
-        raise NotImplementedError("mxfp8 not yet implemented for Blackwell.")
 
     num_rows = input.shape[0]
     if min_latency_mode:
@@ -733,6 +747,9 @@ def cutlass_fused_moe(
         output_dtype,
         quant_scales,
         input_sf,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         tp_size,
         tp_rank,
         ep_size,

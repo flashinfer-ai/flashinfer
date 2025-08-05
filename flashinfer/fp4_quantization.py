@@ -146,10 +146,10 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::nvfp4_block_scale_interleave_sm100",
+        "flashinfer::block_scale_interleave_sm100",
         mutates_args=("",),
     )
-    def nvfp4_block_scale_interleave_sm100(
+    def block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
@@ -160,12 +160,12 @@ def get_fp4_quantization_sm100_module():
         Returns:
             torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        return module.nvfp4_block_scale_interleave(
+        return module.block_scale_interleave(
             unswizzled_sf,
         )
 
-    @register_fake_op("flashinfer::nvfp4_block_scale_interleave_sm100")
-    def _fake_nvfp4_block_scale_interleave_sm100(
+    @register_fake_op("flashinfer::block_scale_interleave_sm100")
+    def _fake_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         return unswizzled_sf.new_empty(
@@ -225,7 +225,7 @@ def get_fp4_quantization_sm100_module():
     # Register the module
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
-        nvfp4_block_scale_interleave_sm100=nvfp4_block_scale_interleave_sm100,
+        block_scale_interleave_sm100=block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
     )
 
@@ -287,7 +287,7 @@ def fp4_quantize(
     return x_q, sf
 
 
-def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
+def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
@@ -306,7 +306,7 @@ def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     assert (
         unswizzled_sf.dtype == torch.uint8
     ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    return get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
+    return get_fp4_quantization_sm100_module().block_scale_interleave_sm100(
         unswizzled_sf,
     )
 
@@ -377,7 +377,7 @@ def shuffle_matrix_sf_a(
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
     # 128x4
-    return nvfp4_block_scale_interleave(w_shuffled)
+    return block_scale_interleave(w_shuffled)
 
 
 class SfLayout(Enum):
@@ -438,3 +438,20 @@ def nvfp4_quantize(
         )
 
     return a_fp4, a_sf
+
+
+def mxfp4_quantize(a):
+    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    a_fp4, a_sf = fp4_quantize(a.cuda(), a_global_sf.cuda(), 32, True, True)
+    return a_fp4, a_sf
+
+
+def mxfp4_dequantize(a_fp4, a_sf):
+    return e2m1_and_ufp8sf_scale_to_float(
+        a_fp4.cpu().view(torch.uint8),
+        a_sf.cpu().view(torch.uint8).reshape(-1),
+        torch.tensor([1.0], device=a_fp4.device),
+        32,
+        0,
+        True,
+    )

@@ -71,8 +71,8 @@ void trtllm_allreduce_fusion(
                               : nullptr;
     params.use_oneshot = use_oneshot;
     params.layout = layout_code.has_value()
-                        ? static_cast<FP4QuantizationSFLayout>(layout_code.value())
-                        : FP4QuantizationSFLayout::SWIZZLED;
+                        ? static_cast<QuantizationSFLayout>(layout_code.value())
+                        : QuantizationSFLayout::SWIZZLED;
     params.pattern = static_cast<AllReduceFusionPattern>(pattern_code);
     params.trigger_completion_at_end = trigger_completion_at_end;
     params.stream = at::cuda::getCurrentCUDAStream();

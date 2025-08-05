@@ -46,8 +46,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         candidate_active_expert_num = [8, 12, 16]
         # candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
-            comm.FP4QuantizationSFLayout.LINEAR,
-            comm.FP4QuantizationSFLayout.SWIZZLED,
+            comm.QuantizationSFLayout.LINEAR,
+            comm.QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
 
@@ -94,7 +94,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             ), "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
                             if (
                                 swizzled_layout_code
-                                == comm.FP4QuantizationSFLayout.SWIZZLED
+                                == comm.QuantizationSFLayout.SWIZZLED
                             ):
                                 padded_message_size = (
                                     comm.compute_fp4_swizzled_layout_sf_size(

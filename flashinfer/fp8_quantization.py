@@ -50,6 +50,7 @@ def get_mxfp8_quantization_sm100_module():
     def mxfp8_quantize_sm100(
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to MxFP8 format.
 
@@ -71,12 +72,14 @@ def get_mxfp8_quantization_sm100_module():
             return module.mxfp8_quantize(
                 input,
                 is_sf_swizzled_layout,
+                alignment,
             )
 
     @register_fake_op("flashinfer::mxfp8_quantize_sm100")
     def _fake_mxfp8_quantize_sm100(
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
         return (
@@ -127,6 +130,7 @@ def get_mxfp8_quantization_sm100_module():
 def mxfp8_quantize(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -148,6 +152,7 @@ def mxfp8_quantize(
     x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
         input,
         is_sf_swizzled_layout,
+        alignment,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     return x_q, sf

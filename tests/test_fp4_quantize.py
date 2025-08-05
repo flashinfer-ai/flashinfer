@@ -7,7 +7,7 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
 from flashinfer import (
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
-    nvfp4_block_scale_interleave,
+    block_scale_interleave,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -158,12 +158,12 @@ def test_scale_swizzling(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_block_scale_interleave(
+def test_block_scale_interleave(
     shape: tuple[int, int],
     seed: int,
     device: str,
 ) -> None:
-    """Test the nvfp4_block_scale_interleave function directly."""
+    """Test the block_scale_interleave function directly."""
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
@@ -178,7 +178,7 @@ def test_nvfp4_block_scale_interleave(
     unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
 
     # Test the swizzling function
-    swizzled_sf = nvfp4_block_scale_interleave(unswizzled_sf)
+    swizzled_sf = block_scale_interleave(unswizzled_sf)
 
     # Compare against the reference implementation
     ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)

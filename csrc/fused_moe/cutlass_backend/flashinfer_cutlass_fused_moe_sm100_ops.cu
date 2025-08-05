@@ -44,10 +44,10 @@ namespace torch_ext {
 
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;
 using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
 // Always use public header as it is just utility functions and types
-using TmaWarpSpecializedGroupedGemmInput =
-    tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using profiler_backend = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::GemmProfilerBackend;
 
 class FusedMoeRunner : public torch::CustomClassHolder {
@@ -60,15 +60,16 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       case c10::ScalarType::Float8_e4m3fn:
         // TODO We need an atomic FP8 reduction for the finalize fusions
         C10_THROW_ERROR_FORMATTED(NotImplementedError,
-                                  "Outputting " << torch::toString(output_type)
-                                                << " directly is not currently supported");
+            "Outputting " << torch::toString(output_type) << " directly is not currently supported");
         // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case c10::ScalarType::Half:
-        if constexpr (NeedQuant) {
-          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
-        } else {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
+        if constexpr (NeedQuant)
+        {
+            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
+        }
+        else
+        {
+            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
         }
 #ifdef ENABLE_BF16
       case c10::ScalarType::BFloat16:
@@ -89,12 +90,12 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 
   FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype,
                  c10::ScalarType output_dtype, bool use_deepseek_fp8_block_scale,
-                 bool use_w4a8_group_scaling, bool use_mxfp8_act_scaling) {
+                 bool use_w4_group_scaling, bool use_mxfp8_act_scaling) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mOutputDtype = output_dtype;
     mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
-    mUseW4A8GroupScaling = use_w4a8_group_scaling;
+    mUseW4GroupScaling = use_w4_group_scaling;
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mInnerDimMultiplier = 1;
 
@@ -139,12 +140,29 @@ class FusedMoeRunner : public torch::CustomClassHolder {
           mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, false>(mOutputDtype);
       }
     }
+
+    if (isWFP4A16Quant())
+    {
+        mInnerDimMultiplier = 2;
+        if (mActivationDtype == c10::ScalarType::Half)
+        {
+            mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
+        }
+#ifdef ENABLE_BF16
+        else if (mActivationDtype == c10::ScalarType::BFloat16)
+        {
+            mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
+        }
+#endif
+    }
+
+
 #endif
     if (isInt4Quant()) {
       mInnerDimMultiplier = 2;
       if (mActivationDtype == c10::ScalarType::Half) {
 #ifdef ENABLE_FP8
-        if (mUseW4A8GroupScaling) {
+        if (mUseW4GroupScaling) {
           mKernelRunner = std::make_unique<
               kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
         } else {
@@ -157,7 +175,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 #ifdef ENABLE_BF16
       else if (mActivationDtype == c10::ScalarType::BFloat16) {
 #ifdef ENABLE_FP8
-        if (mUseW4A8GroupScaling) {
+        if (mUseW4GroupScaling) {
           mKernelRunner =
               std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
                                                            __nv_bfloat16, __nv_bfloat16>>();
@@ -196,15 +214,17 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   void operator=(FusedMoeRunner const&) = delete;
 
   at::Tensor runMoe(
-      at::Tensor& output, at::Tensor const& input, at::Tensor const& token_selected_experts,
-      torch::optional<at::Tensor> const& token_final_scales, at::Tensor const& fc1_expert_weights,
-      torch::optional<at::Tensor> const& fc1_expert_biases, at::Tensor const& fc2_expert_weights,
-      torch::optional<at::Tensor> const& fc2_expert_biases,
-      torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales,
-      torch::optional<at::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
-      int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-      int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
+    at::Tensor& output, at::Tensor const& input, at::Tensor const& token_selected_experts,
+      torch::optional<torch::Tensor> const& token_final_scales, torch::Tensor const& fc1_expert_weights,
+      torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
+      torch::optional<torch::Tensor> const& fc2_expert_biases,
+      torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+      torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
+      torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
+      int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+      int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+{
     std::lock_guard<std::mutex> lock(mMutex);
     // Free the profile workspace to save memory
     freeProfileWorkspace();
@@ -280,7 +300,33 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-    auto activation_type = ActivationType::Swiglu;
+    ActivationType base_activation_type = ActivationType::Swiglu;
+    if (swiglu_alpha.has_value())
+    {
+        CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), at::ScalarType::Float);
+        TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
+            "swiglu_alpha must have num_experts_on_rank elements.");
+        base_activation_type = ActivationType::SwigluBias;
+    }
+    if (swiglu_beta.has_value())
+    {
+        CHECK_INPUT_AND_TYPE(swiglu_beta.value(), at::ScalarType::Float);
+        TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
+            "swiglu_beta must have num_experts_on_rank elements.");
+        base_activation_type = ActivationType::SwigluBias;
+    }
+    if (swiglu_limit.has_value())
+    {
+        CHECK_INPUT_AND_TYPE(swiglu_limit.value(), at::ScalarType::Float);
+        TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
+            "swiglu_limit must have num_experts_on_rank elements.");
+        base_activation_type = ActivationType::SwigluBias;
+    }
+    auto activation_params = ActivationParams(base_activation_type,
+        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+
 
     setRunnerProfiles(profile_ids);
 
@@ -291,7 +337,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        activation_type, parallelism_config, min_latency_mode);
+        base_activation_type, parallelism_config, min_latency_mode);
 
     auto const quant_params =
         getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
@@ -308,7 +354,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
             : nullptr,
         fc1_expert_weights.const_data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr,
-        activation_type, fc2_expert_weights.const_data_ptr(),
+        activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
         static_cast<int>(experts_per_token),
@@ -325,10 +371,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
             : nullptr,
         fc1_expert_weights.const_data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr,
-        activation_type, fc2_expert_weights.const_data_ptr(),
+        activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
         stream);
@@ -343,10 +389,12 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       torch::optional<at::Tensor> const& fc1_expert_biases, at::Tensor const& fc2_expert_weights,
       torch::optional<at::Tensor> const& fc2_expert_biases,
       torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales,
-      torch::optional<at::Tensor> const& input_sf, int64_t const tp_size, int64_t const tp_rank,
-      int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-      int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
+      torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
+      torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
+      int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+      int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+{
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Free the profile workspace to save memory
@@ -405,11 +453,33 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     int64_t num_rows = input.sizes()[0];
     int64_t hidden_size = fc2_expert_weights.sizes()[1];
     int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+
     int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
-    auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank,
-                                                            cluster_size, cluster_rank);
-    auto activation_type = ActivationType::Swiglu;
+    auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
+    ActivationType base_activation_type = ActivationType::Swiglu;
+    if (swiglu_alpha.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
+          "swiglu_alpha must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
+    }
+    if (swiglu_beta.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_beta.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
+          "swiglu_beta must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
+    }
+    if (swiglu_limit.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_limit.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
+          "swiglu_limit must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
+    }
+    auto activation_params = ActivationParams(base_activation_type,
+        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
     setRunnerProfiles(profile_ids);
 
@@ -435,7 +505,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        activation_type, parallelism_config, min_latency_mode);
+        base_activation_type, parallelism_config, min_latency_mode);
 
     auto const quant_params =
         getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
@@ -451,7 +521,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
             : nullptr,
         fc1_expert_weights.const_data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr,
-        activation_type, fc2_expert_weights.const_data_ptr(),
+        activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
         static_cast<int>(experts_per_token),
@@ -468,10 +538,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
             : nullptr,
         fc1_expert_weights.const_data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr,
-        activation_type, fc2_expert_weights.const_data_ptr(),
+        activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
         stream);
@@ -504,7 +574,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     int64_t const num_rows = input.sizes()[0];
     int64_t const hidden_size = fc2_expert_weights.sizes()[1];
     int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-    int64_t const group_size = isInt4Quant() ? 128 : -1;
+    int64_t const group_size_ = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
+    int64_t const group_size = isWFP4A16Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
     // Get specific profile configs according to the profile_id.
@@ -532,7 +603,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       bool const USE_BIAS = fc1_expert_biases.has_value() || fc2_expert_biases.has_value();
       bool const USE_LORA = false;
       auto activation_dtype =
-          mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
+          (mUseW4GroupScaling && !isWFP4A16Quant()) ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
       activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
@@ -583,7 +654,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   char* mProfileWorkspace = nullptr;
 
   bool mUseDeepSeekFP8BlockScaling = false;
-  bool mUseW4A8GroupScaling = false;
+  bool mUseW4GroupScaling = false;
   bool mUseMxfp8ActScaling = false;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
@@ -629,7 +700,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(
         num_rows, hidden_size, inter_size, num_experts, experts_per_token, activation_type,
         parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling, min_latency_mode,
-        mUseW4A8GroupScaling);
+        mUseW4GroupScaling);
     size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
     std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
@@ -781,8 +852,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
               fc1_weight_block.sizes()[2] * FP8_PER_INT32 *
                       TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
                   TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                      hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX) *
-                      TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX,
+                      hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX),
           "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
           "block_scale_vector_size)");
       TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank,
@@ -888,6 +958,16 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       return kernels::QuantParams::FP8BlockScaling(
           static_cast<float const*>(fc1_scales.data_ptr()),
           static_cast<float const*>(fc2_scales.data_ptr()));
+    } else if (isWFP4A16Quant()) {
+      TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for W4 quantization");
+      TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for W4A16 quantization");
+
+      auto& fc1_weight_scales = quant_scales.value()[0];
+      auto& fc2_weight_scales = quant_scales.value()[1];
+      int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
+      return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
+          static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
+          nullptr);
     } else if (isInt4Quant()) {
       TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for INT4 quantization");
       TORCH_CHECK(quant_scales.value().size() == 8,
@@ -900,7 +980,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       auto& fc2_weight_zeros = quant_scales.value()[5];
       auto& fc1_alpha = quant_scales.value()[6];
       auto& fc2_alpha = quant_scales.value()[7];
-      int group_size = 128;
+      int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
           static_cast<void const*>(fc2_weight_scales.data_ptr()),
@@ -927,6 +1007,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   bool isNvfp4Quant() const {
     return mWeightDtype == c10::ScalarType::Long &&
            mActivationDtype != c10::ScalarType::Float8_e4m3fn;  // FP8 activation does not use FP4
+  }
+
+  bool isWFP4A16Quant() const {
+    return mUseW4GroupScaling && mWeightDtype == c10::ScalarType::Byte;
   }
 
   bool isInt4Quant() const { return mWeightDtype == c10::ScalarType::QUInt4x2; }

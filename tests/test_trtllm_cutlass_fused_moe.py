@@ -18,12 +18,11 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-import flashinfer
 import flashinfer.fused_moe as fused_moe
-from flashinfer import fp4_quantize
+from flashinfer import fp4_quantize, mxfp4_quantize, mxfp8_quantize, mxfp8_dequantize_host, e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
 
 FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  
 FP8_DTYPE = torch.float8_e4m3fn
 
 
@@ -480,7 +479,6 @@ def test_moe_nvfp4(
         a_in_dtype, w1_d, w2_d, top_k, routing_weights, selected_experts
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
-
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
@@ -1025,6 +1023,125 @@ def test_moe_fp8_block_scaling(
             use_deepseek_fp8_block_scale=True,
             quant_scales=quant_scales,
         )
+
+
+def quant_mxfp4_batches(a, num_experts):
+    quant_a = []
+    sfs = []
+    for i in range(num_experts):
+        a_fp4, a_sf = mxfp4_quantize(a[i].cuda())
+        quant_a.append(a_fp4)
+        sfs.append(a_sf)
+
+    result_quant_a = torch.stack(quant_a)
+    result_sfs = torch.stack(sfs)
+
+    return result_quant_a, result_sfs
+
+
+def dequant_mxfp4_batches(
+    mat_fp4: torch.Tensor,
+    scale_tensor: torch.Tensor,
+):
+    num_batches = mat_fp4.size(0)
+
+    scale_tensor = scale_tensor.view(num_batches, -1)
+
+    return torch.stack([
+        mxfp4_dequantize(mat_fp4[b, :, :], scale_tensor[b, :])
+        for b in range(num_batches)
+    ])
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("otype", [torch.float16, torch.bfloat16])
+def test_moe_mxfp8_mxfp4(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+):
+    """
+    Test MoE with MXFP8 activations and MXFP4 weights.
+    Uses mxfp8_quantize for activations and fp4_quantize for weights.
+    """
+    # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    e = num_experts
+    m = batch_size
+    n = intermediate_size
+    k = hidden_size
+
+    x = torch.randn(m, k, dtype=otype).cuda()
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=otype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
+
+    mxfp8_x, mxfp8_x_sf = mxfp8_quantize(x, True, 32)
+
+    mxfp4_w1, mxfp4_w1_scale = quant_mxfp4_batches(w1, e)
+    mxfp4_w2, mxfp4_w2_scale = quant_mxfp4_batches(w2, e)
+
+    router_logits = torch.randn(m, e, dtype=otype).cuda() 
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    
+    fake_input_scale = torch.ones(e, device=x.device)
+
+    quant_scales = [
+        mxfp4_w1_scale.view(torch.int32),
+        fake_input_scale,
+        mxfp4_w2_scale.view(torch.int32),
+        fake_input_scale,
+    ]
+    
+    flash_output = torch.zeros_like(x)
+    
+    # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
+    _ = fused_moe.cutlass_fused_moe(
+        mxfp8_x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        mxfp4_w1.contiguous().view(torch.long),
+        mxfp4_w2.contiguous().view(torch.long),
+        otype,
+        quant_scales=quant_scales,
+        input_sf=mxfp8_x_sf,
+        use_mxfp8_act_scaling=True,
+        output=flash_output,
+    )
+    
+    dq_mxfp8_x = mxfp8_dequantize_host(
+        mxfp8_x.cpu().view(torch.uint8), 
+        mxfp8_x_sf.cpu().view(torch.uint8).reshape(-1), 
+        True
+    ).cuda().to(otype)
+
+    dq_mfxp4_w1 = dequant_mxfp4_batches(
+        mxfp4_w1.cpu().view(torch.uint8),
+        mxfp4_w1_scale.cpu().view(torch.uint8).reshape(-1),
+    ).cuda().to(otype)
+
+    dq_mfxp4_w2 = dequant_mxfp4_batches(
+        mxfp4_w2.cpu().view(torch.uint8),
+        mxfp4_w2_scale.cpu().view(torch.uint8).reshape(-1),
+    ).cuda().to(otype)
+
+    # Use original weights for reference computation
+    ref_output = compute_with_experts(
+        e, dq_mxfp8_x, dq_mfxp4_w1, dq_mfxp4_w2, selected_experts, routing_weights
+    )
+
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
 if __name__ == "__main__":

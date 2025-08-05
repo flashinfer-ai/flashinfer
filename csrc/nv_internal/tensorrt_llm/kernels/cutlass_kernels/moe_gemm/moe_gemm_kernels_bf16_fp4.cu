@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
-
-// Note update moe.py to match
-enum class ActivationType { Gelu = 0, Relu, Silu, Swiglu, Geglu, SwigluBias, Identity, InvalidType };
-
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+#ifdef ENABLE_BF16
+template class MoeGemmRunner<__nv_bfloat16, __nv_fp4_e2m1, __nv_bfloat16>;
+#endif
+} // namespace tensorrt_llm::kernels::cutlass_kernels

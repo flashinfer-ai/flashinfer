@@ -45,8 +45,8 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
             comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
         ]
         swizzled_layout_codes = [
-            comm.FP4QuantizationSFLayout.LINEAR,
-            comm.FP4QuantizationSFLayout.SWIZZLED,
+            comm.QuantizationSFLayout.LINEAR,
+            comm.QuantizationSFLayout.SWIZZLED,
         ]
         launch_with_pdls = [True, False]
         use_oneshots = [True, False, None]
@@ -122,7 +122,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     ), "hidden_dim must be divisible by SF_VEC_SIZE"
                                     if (
                                         swizzled_layout_code
-                                        == comm.FP4QuantizationSFLayout.SWIZZLED
+                                        == comm.QuantizationSFLayout.SWIZZLED
                                     ):
                                         # TODO(Yingyi): check this
                                         padded_message_size = (
