@@ -63,6 +63,7 @@ add_library(decode STATIC
             ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/decode.cuh)
 add_library(page STATIC
             ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/page.cuh)
+add_library(mma_ops STATIC ${FLASHINFER_INCLUDE_DIRS}/gpu_iface/mma_ops.hpp)
 
 set(CMAKE_HIP_FLAGS
     "${CMAKE_HIP_FLAGS} -O3 -g -D__HIP_PLATFORM_AMD__ -D__HIP_NO_HALF_OPERATORS__=0 -D__HIP_NO_HALF_CONVERSIONS__=0"
@@ -110,6 +111,12 @@ set_target_properties(
              HIP_SEPARABLE_COMPILATION ON
              LINKER_LANGUAGE HIP)
 
+set_target_properties(
+  mma_ops
+  PROPERTIES HIP_SOURCES_PROPERTY_FORMAT 1
+             HIP_SEPARABLE_COMPILATION ON
+             LINKER_LANGUAGE HIP)
+
 target_link_libraries(math PUBLIC hip::host hip::device)
 target_link_libraries(layout PUBLIC hip::host hip::device)
 target_link_libraries(pos_enc PUBLIC hip::host hip::device)
@@ -125,6 +132,8 @@ target_link_libraries(
          pos_enc
          layout
          math)
+
+target_link_libraries(mma_ops PUBLIC hip::host hip::device)
 
 message("CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -154,6 +163,12 @@ add_executable(test_batch_decode
 target_link_libraries(test_batch_decode PRIVATE decode "${TORCH_LIBRARIES}"
                                                 gtest gtest_main pthread)
 
+add_executable(test_mfma_fp32_16x16x16fp16
+               ${CMAKE_CURRNET_SOURCE_DIR}test_mfma_fp32_16x16x16fp16.cpp)
+target_link_libraries(
+  test_mfma_fp32_16x16x16fp16 PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
+                                      gtest_main pthread)
+
 if(HIP_FOUND)
   set_target_properties(test_math PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_pos_enc PROPERTIES HIP_SEPARABLE_COMPILATION ON)
@@ -163,6 +178,8 @@ if(HIP_FOUND)
                                                       ON)
   set_target_properties(test_batch_decode PROPERTIES HIP_SEPARABLE_COMPILATION
                                                      ON)
+  set_target_properties(test_mfma_fp32_16x16x16fp16
+                        PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 
 enable_testing()
@@ -172,3 +189,4 @@ add_test(NAME CascadeTest COMMAND test_cascade)
 add_test(NAME PageTest COMMAND test_page)
 add_test(NAME SingleDecodeTest COMMAND test_single_decode)
 add_test(NAME BatchDecodeTest COMMAND test_batch_decode)
+add_test(NAME test_mfma_fp32_16x16x16fp16 COMMAND test_mfma_fp32_16x16x16fp16)
