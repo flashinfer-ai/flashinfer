@@ -386,6 +386,7 @@ enum class FP4QuantizationSFLayout {
   //
   // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
   SWIZZLED,
+  SWIZZLED_128x4 = SWIZZLED,
   // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
   // kernels standard.
   LINEAR
