@@ -6,6 +6,7 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 
 pip install -e . -v
+pip install --upgrade nvidia-cudnn-cu12
 
 # run task_blackwell_utils_kernels.sh
 bash scripts/run_test_blackwell_utils_kernels.sh
