@@ -160,9 +160,8 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
 
-
 def compute_with_experts(
-    num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights, alpha=None, beta=None, limit=None
 ):
     results = torch.zeros_like(x)
     for expert_id in range(num_experts):
@@ -177,7 +176,17 @@ def compute_with_experts(
         w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
 
         expert_inputs = x[batch_idx]
-        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
+        if alpha is not None and limit is not None and beta is not None:
+            # SwiGLUBias
+            x1 = expert_inputs @ w1_expert.t()
+            x1 = x1.clamp_(min=None, max=limit)
+            x1_scaled = x1 * torch.sigmoid(alpha * x1)
+            x2 = expert_inputs @ w3_expert.t()
+            x2 = x2.clamp_(min=-limit, max=limit) + beta
+            
+            inter = x1_scaled * x2
+        else:
+            inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
         output = inter @ w2_expert.t()
         results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
     return results.view_as(x)
@@ -1059,6 +1068,7 @@ def dequant_mxfp4_batches(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)])
 def test_moe_mxfp8_mxfp4(
     batch_size,
     hidden_size,
@@ -1066,6 +1076,9 @@ def test_moe_mxfp8_mxfp4(
     top_k,
     intermediate_size,
     otype,
+    alpha,
+    beta,
+    limit,
 ):
     """
     Test MoE with MXFP8 activations and MXFP4 weights.
@@ -1106,6 +1119,15 @@ def test_moe_mxfp8_mxfp4(
     
     flash_output = torch.zeros_like(x)
     
+    if alpha is not None and limit is not None and beta is not None:
+        alpha_t = torch.ones(e, device=x.device) * alpha
+        limit_t = torch.ones(e, device=x.device) * limit
+        beta_t = torch.ones(e, device=x.device) * beta
+    else:
+        alpha_t = None
+        limit_t = None
+        beta_t = None
+
     # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
     _ = fused_moe.cutlass_fused_moe(
         mxfp8_x,
@@ -1114,6 +1136,9 @@ def test_moe_mxfp8_mxfp4(
         mxfp4_w1.contiguous().view(torch.long),
         mxfp4_w2.contiguous().view(torch.long),
         otype,
+        swiglu_alpha=alpha_t,
+        swiglu_limit=limit_t,
+        swiglu_beta=beta_t,
         quant_scales=quant_scales,
         input_sf=mxfp8_x_sf,
         use_mxfp8_act_scaling=True,
@@ -1138,7 +1163,7 @@ def test_moe_mxfp8_mxfp4(
 
     # Use original weights for reference computation
     ref_output = compute_with_experts(
-        e, dq_mxfp8_x, dq_mfxp4_w1, dq_mfxp4_w2, selected_experts, routing_weights
+        e, dq_mxfp8_x, dq_mfxp4_w1, dq_mfxp4_w2, selected_experts, routing_weights, alpha, beta, limit
     )
 
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
