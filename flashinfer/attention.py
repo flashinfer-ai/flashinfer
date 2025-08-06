@@ -74,14 +74,57 @@ class BatchAttention:
         page_size: int,
         causal: bool = False,
         sm_scale: float = None,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
         use_profiler: bool = False,
     ) -> None:
+        """Plan batch persistent attention on Paged KV-Cache with mixed prefill and decode batch.
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+        kv_len_arr : torch.Tensor
+            The kv length of each request, shape: ``[batch_size]``. Will be used in place of last_page_len.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
+        head_dim_vo : int
+            The dimension of the value/output heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        causal : bool
+            Whether to apply causal mask to the attention matrix.
+        sm_scale : float
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim)``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor, defaults torch.float16.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        use_profiler : bool
+            Whether to use the CTA-level profiler, defaults to ``False``.
+        """
+
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
-        self._logits_soft_cap = logits_soft_cap
 
         # get jit module
         get_module_args = (
@@ -93,6 +136,7 @@ class BatchAttention:
             head_dim_vo,
             PosEncodingMode["NONE"].value,
             logits_soft_cap > 0.0,
+            window_left >= 0,  # use_sliding_window
             use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
@@ -111,6 +155,8 @@ class BatchAttention:
         self._page_size = page_size
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
+        self._logits_soft_cap = logits_soft_cap
+        self._window_left = window_left
 
         # No addtional buf allocated for CUDA graph tensor
         # Allocate outside FlashInfer
@@ -137,6 +183,7 @@ class BatchAttention:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         logits_soft_cap: float = 0.0,
+        window_left: int = -1,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -146,7 +193,11 @@ class BatchAttention:
                 )
         if logits_soft_cap > 0.0 and self._logits_soft_cap <= 0.0:
             raise ValueError(
-                "logits_soft_cap used in kernel run but not provided in plan(). This will cause template deduction error."
+                "logits_soft_cap used in kernel run but not provided in plan(). This will cause the wrong template used."
+            )
+        if window_left >= 0 and self._window_left < 0:
+            raise ValueError(
+                "Sliding window attention used in kernel run but not provided in plan(). This will cause the wrong template used."
             )
 
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
@@ -162,6 +213,7 @@ class BatchAttention:
 
         # profiler_buffer is optional
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
+        window_left = window_left if window_left is not None else self._window_left
 
         self.module.run(
             self.float_workspace_buffer,
@@ -180,6 +232,7 @@ class BatchAttention:
             self._page_size,
             self._sm_scale,
             logits_soft_cap,
+            window_left,
             # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS
             *profiler_args,

@@ -35,7 +35,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
                     params.partial_indptr[work_idx], params.q_len[work_idx],
                     params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
                     params.kv_end[work_idx], params.kv_head_idx_arr[work_idx],
-                    params.len_kv_chunk[work_idx]);
+                    *params.len_kv_chunk);
 }
 
 template <typename KTraits>
@@ -269,7 +269,24 @@ struct BlockBatchPagedAttentionPersistent {
                   : kv_end) /
               CTA_TILE_KV -
           (kv_start / CTA_TILE_KV);
-
+      int window_tile_idx =
+          (CAUSAL ? min(kv_end, kv_len - q_len + ceil_div(packed_qo_start, gqa_group_size))
+                  : kv_end) /
+              CTA_TILE_KV -
+          (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      window_tile_idx = params.window_left > 0 ? window_tile_idx : 0;
+      // if ( blockIdx.x == 0 && blockIdx.y == 0) {
+      //   printf("kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d\n", kv_tile_idx,
+      //   mask_tile_idx, window_tile_idx);
+      // }
+      // int window_tile_idx = 0;
+      // if (params.window_left > 0) {
+      //   window_tile_idx =
+      //       ceil_div(min(kv_end, kv_len + ceil_div(packed_qo_start + cluster_tile_q,
+      //       gqa_group_size)),
+      //           CTA_TILE_KV) -
+      //               1 - (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      // }
       uint32_t block_iter_base = kv_indptr * block_size + kv_start;
       // last kv tile
       __syncthreads();
@@ -289,7 +306,8 @@ struct BlockBatchPagedAttentionPersistent {
 
       // loop with mask
       LOOP_SPLIT_MASK(
-          kv_tile_idx, kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0,
+          kv_tile_idx,
+          (kv_tile_idx >= mask_tile_idx || kv_tile_idx < window_tile_idx) && kv_tile_idx > 0,
           kv_tile_idx + 1 > NUM_STAGES, {
             prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                                      packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h,
@@ -298,7 +316,7 @@ struct BlockBatchPagedAttentionPersistent {
             __syncthreads();
 
             compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-            if constexpr (AttentionVariant::use_logits_soft_cap) {
+            if constexpr (AttentionVariant::UseLogitsSoftCap) {
               logits_transform<KTraits>(
                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
                   kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
@@ -306,8 +324,8 @@ struct BlockBatchPagedAttentionPersistent {
                   q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
             }
             if constexpr (WITH_MASK) {
-              logits_mask<KTraits>(
-                  params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+              logits_mask<KTraits>(  // work_idx is for window_left
+                  params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
                   kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
                                  NUM_MMA_KV * 16,
                   q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
@@ -336,18 +354,20 @@ struct BlockBatchPagedAttentionPersistent {
 #pragma unroll
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-        if constexpr (AttentionVariant::use_logits_soft_cap) {
+        if constexpr (AttentionVariant::UseLogitsSoftCap) {
           logits_transform<KTraits>(
               params, variant, /*batch_idx=*/0, qo_packed_idx_base,
               kv_start +
                   (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
               q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
         }
+        // if (kv_tile_idx < window_tile_idx) { // TODO: check why adding this leads to nan
         logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+            params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
             kv_start +
                 (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
+        // }
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
       }

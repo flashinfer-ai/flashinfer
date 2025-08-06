@@ -68,8 +68,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
                             std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
-                            int64_t page_size, double sm_scale,
-                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
+                            int64_t page_size, double sm_scale, double logits_soft_cap,
+                            int64_t window_left ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
@@ -111,7 +111,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       AttentionVariant, PersistentParams, [&] {
         PersistentParams params[2];
-
+        IdType* len_kv_chunk =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.len_kv_chunk_offset);
         for (int i = 0; i < 2; i++) {
           params[i].q = static_cast<DTypeQ*>(q.data_ptr());
           params[i].k = static_cast<DTypeKV*>(k_cache.data_ptr());
@@ -138,8 +139,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_head_idx_offset);
           params[i].work_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
-          params[i].len_kv_chunk =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].len_kv_chunk_offset);
+          params[i].len_kv_chunk = len_kv_chunk + i;
 
           params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =
@@ -172,6 +172,7 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
 
           params[i].sm_scale = sm_scale;
           params[i].logits_soft_cap = logits_soft_cap;
+          params[i].window_left = window_left;
           // NOTE(Wenxuan) directly using the additional_params_decl from generate_additional_params
           // will be problematic because of the params[i]
           ADDITIONAL_PARAMS_SETTER
