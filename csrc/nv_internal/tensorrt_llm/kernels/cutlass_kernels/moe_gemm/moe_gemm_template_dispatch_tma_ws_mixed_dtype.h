@@ -160,9 +160,9 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   // perform the best for mixed type gemms.
 
   constexpr int Ntile = (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 64 : 128;
-  constexpr int Ktile = (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 128 : 128 * PackedScalesNum / sizeof(T);
+  constexpr int Ktile =
+      (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 128 : 128 * PackedScalesNum / sizeof(T);
   TLLM_CHECK(sizeof(T) == (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 2 : 1);
-
 
   using _Ntile = Int<Ntile>;
   using _Ktile = Int<Ktile>;
@@ -249,11 +249,12 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
   GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
   inputs.num_experts = num_experts;
-  sm90_generic_mixed_moe_gemm_kernelLauncher<
-      T, WeightType, OutputType, tensorrt_llm::cutlass_extensions::EpilogueOpDefault,
-      Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
-      cutlass::epilogue::TmaWarpSpecializedCooperative,
-      cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
+  sm90_generic_mixed_moe_gemm_kernelLauncher<T, WeightType, OutputType,
+                                             tensorrt_llm::cutlass_extensions::EpilogueOpDefault,
+                                             Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>,
+                                             cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                             cutlass::epilogue::TmaWarpSpecializedCooperative,
+                                             cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>(
       inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);
 #endif
   return count;

@@ -81,7 +81,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
   // B matrix configuration
   using ElementB_ = typename TllmToCutlassTypeAdapter<WeightType>::type;
-  using ElementB = std::conditional_t<std::is_same_v<WeightType, cutlass::uint4b_t>, cutlass::int4b_t, ElementB_>;
+  using ElementB = std::conditional_t<std::is_same_v<WeightType, cutlass::uint4b_t>,
+                                      cutlass::int4b_t, ElementB_>;
   using LayoutB = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
   constexpr int AlignmentB =
       128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of B
@@ -100,8 +101,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   constexpr int group_size = use_wfp4a16 ? cutlass::gemm::collective::detail::mxfp4_group_size
                                          : cutlass::gemm::collective::detail::int4_group_size;
   constexpr int PackedScalesNum = get<2>(CTAShape{}) / group_size;
-  using ElementScale = std::conditional_t<use_wfp4a16, cutlass::float_ue8m0_t,
-      TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
+  using ElementScale =
+      std::conditional_t<use_wfp4a16, cutlass::float_ue8m0_t,
+                         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
   using LayoutScale = cutlass::layout::RowMajor;
 

@@ -5,9 +5,9 @@ import torch
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
 
 from flashinfer import (
+    block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
-    block_scale_interleave,
 )
 from flashinfer.utils import is_sm100a_supported
 

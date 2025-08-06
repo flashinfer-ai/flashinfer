@@ -47,7 +47,8 @@ namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;
 using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
 // Always use public header as it is just utility functions and types
-using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+using TmaWarpSpecializedGroupedGemmInput =
+    tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using profiler_backend = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::GemmProfilerBackend;
 
 class FusedMoeRunner : public torch::CustomClassHolder {
@@ -60,16 +61,15 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       case c10::ScalarType::Float8_e4m3fn:
         // TODO We need an atomic FP8 reduction for the finalize fusions
         C10_THROW_ERROR_FORMATTED(NotImplementedError,
-            "Outputting " << torch::toString(output_type) << " directly is not currently supported");
+                                  "Outputting " << torch::toString(output_type)
+                                                << " directly is not currently supported");
         // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case c10::ScalarType::Half:
-        if constexpr (NeedQuant)
-        {
-            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
-        }
-        else
-        {
-            return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
+        if constexpr (NeedQuant) {
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
+        } else {
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
         }
 #ifdef ENABLE_BF16
       case c10::ScalarType::BFloat16:
@@ -141,21 +141,18 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       }
     }
 
-    if (isWFP4A16Quant())
-    {
-        mInnerDimMultiplier = 2;
-        if (mActivationDtype == c10::ScalarType::Half)
-        {
-            mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
-        }
+    if (isWFP4A16Quant()) {
+      mInnerDimMultiplier = 2;
+      if (mActivationDtype == c10::ScalarType::Half) {
+        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
+      }
 #ifdef ENABLE_BF16
-        else if (mActivationDtype == c10::ScalarType::BFloat16)
-        {
-            mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
-        }
+      else if (mActivationDtype == c10::ScalarType::BFloat16) {
+        mKernelRunner =
+            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
+      }
 #endif
     }
-
 
 #endif
     if (isInt4Quant()) {
@@ -213,18 +210,22 @@ class FusedMoeRunner : public torch::CustomClassHolder {
   FusedMoeRunner(FusedMoeRunner const&) = delete;
   void operator=(FusedMoeRunner const&) = delete;
 
-  at::Tensor runMoe(
-    at::Tensor& output, at::Tensor const& input, at::Tensor const& token_selected_experts,
-      torch::optional<torch::Tensor> const& token_final_scales, torch::Tensor const& fc1_expert_weights,
-      torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
-      torch::optional<torch::Tensor> const& fc2_expert_biases,
-      torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
-      torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-      torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
-      int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-      int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
-{
+  at::Tensor runMoe(at::Tensor& output, at::Tensor const& input,
+                    at::Tensor const& token_selected_experts,
+                    torch::optional<torch::Tensor> const& token_final_scales,
+                    torch::Tensor const& fc1_expert_weights,
+                    torch::optional<torch::Tensor> const& fc1_expert_biases,
+                    torch::Tensor const& fc2_expert_weights,
+                    torch::optional<torch::Tensor> const& fc2_expert_biases,
+                    torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+                    torch::optional<torch::Tensor> const& input_sf,
+                    torch::optional<torch::Tensor> const& swiglu_alpha,
+                    torch::optional<torch::Tensor> const& swiglu_beta,
+                    torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size,
+                    int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+                    int64_t const cluster_size, int64_t const cluster_rank,
+                    bool const enable_alltoall, bool min_latency_mode,
+                    torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
     std::lock_guard<std::mutex> lock(mMutex);
     // Free the profile workspace to save memory
     freeProfileWorkspace();
@@ -301,32 +302,32 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
     ActivationType base_activation_type = ActivationType::Swiglu;
-    if (swiglu_alpha.has_value())
-    {
-        CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), at::ScalarType::Float);
-        TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
-            "swiglu_alpha must have num_experts_on_rank elements.");
-        base_activation_type = ActivationType::SwigluBias;
+    if (swiglu_alpha.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
+                  "swiglu_alpha must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
     }
-    if (swiglu_beta.has_value())
-    {
-        CHECK_INPUT_AND_TYPE(swiglu_beta.value(), at::ScalarType::Float);
-        TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
-            "swiglu_beta must have num_experts_on_rank elements.");
-        base_activation_type = ActivationType::SwigluBias;
+    if (swiglu_beta.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_beta.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
+                  "swiglu_beta must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
     }
-    if (swiglu_limit.has_value())
-    {
-        CHECK_INPUT_AND_TYPE(swiglu_limit.value(), at::ScalarType::Float);
-        TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
-            "swiglu_limit must have num_experts_on_rank elements.");
-        base_activation_type = ActivationType::SwigluBias;
+    if (swiglu_limit.has_value()) {
+      CHECK_INPUT_AND_TYPE(swiglu_limit.value(), at::ScalarType::Float);
+      TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
+                  "swiglu_limit must have num_experts_on_rank elements.");
+      base_activation_type = ActivationType::SwigluBias;
     }
-    auto activation_params = ActivationParams(base_activation_type,
-        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
-
+    auto activation_params = ActivationParams(
+        base_activation_type,
+        reinterpret_cast<float const*>(
+            swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(
+            swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(
+            swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
     setRunnerProfiles(profile_ids);
 
@@ -374,10 +375,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        stream);
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
     return output;
@@ -389,12 +390,13 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       torch::optional<at::Tensor> const& fc1_expert_biases, at::Tensor const& fc2_expert_weights,
       torch::optional<at::Tensor> const& fc2_expert_biases,
       torch::optional<c10::ArrayRef<at::Tensor>> const& quant_scales,
-      torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-      torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
-      int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-      int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-      torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
-{
+      torch::optional<torch::Tensor> const& input_sf,
+      torch::optional<torch::Tensor> const& swiglu_alpha,
+      torch::optional<torch::Tensor> const& swiglu_beta,
+      torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size,
+      int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+      int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall,
+      bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Free the profile workspace to save memory
@@ -461,25 +463,29 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     if (swiglu_alpha.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), at::ScalarType::Float);
       TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
-          "swiglu_alpha must have num_experts_on_rank elements.");
+                  "swiglu_alpha must have num_experts_on_rank elements.");
       base_activation_type = ActivationType::SwigluBias;
     }
     if (swiglu_beta.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_beta.value(), at::ScalarType::Float);
       TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
-          "swiglu_beta must have num_experts_on_rank elements.");
+                  "swiglu_beta must have num_experts_on_rank elements.");
       base_activation_type = ActivationType::SwigluBias;
     }
     if (swiglu_limit.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_limit.value(), at::ScalarType::Float);
       TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
-          "swiglu_limit must have num_experts_on_rank elements.");
+                  "swiglu_limit must have num_experts_on_rank elements.");
       base_activation_type = ActivationType::SwigluBias;
     }
-    auto activation_params = ActivationParams(base_activation_type,
-        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+    auto activation_params = ActivationParams(
+        base_activation_type,
+        reinterpret_cast<float const*>(
+            swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(
+            swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+        reinterpret_cast<float const*>(
+            swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
     setRunnerProfiles(profile_ids);
 
@@ -541,10 +547,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        stream);
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
     return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score,
@@ -574,8 +580,13 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     int64_t const num_rows = input.sizes()[0];
     int64_t const hidden_size = fc2_expert_weights.sizes()[1];
     int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-    int64_t const group_size_ = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
-    int64_t const group_size = isWFP4A16Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size : group_size_;
+    int64_t const group_size_ =
+        isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
+                      : -1;
+    int64_t const group_size =
+        isWFP4A16Quant()
+            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+            : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
     // Get specific profile configs according to the profile_id.
@@ -602,8 +613,9 @@ class FusedMoeRunner : public torch::CustomClassHolder {
 
       bool const USE_BIAS = fc1_expert_biases.has_value() || fc2_expert_biases.has_value();
       bool const USE_LORA = false;
-      auto activation_dtype =
-          (mUseW4GroupScaling && !isWFP4A16Quant()) ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
+      auto activation_dtype = (mUseW4GroupScaling && !isWFP4A16Quant())
+                                  ? at::ScalarType::Float8_e4m3fn
+                                  : mActivationDtype;
       activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
@@ -960,14 +972,16 @@ class FusedMoeRunner : public torch::CustomClassHolder {
           static_cast<float const*>(fc2_scales.data_ptr()));
     } else if (isWFP4A16Quant()) {
       TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for W4 quantization");
-      TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for W4A16 quantization");
+      TORCH_CHECK(quant_scales.value().size() == 2,
+                  "Expecting 2 quant scales for W4A16 quantization");
 
       auto& fc1_weight_scales = quant_scales.value()[0];
       auto& fc2_weight_scales = quant_scales.value()[1];
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
-      return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
-          static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
-          nullptr);
+      return kernels::QuantParams::GroupWise(group_size,
+                                             static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                                             static_cast<void const*>(fc2_weight_scales.data_ptr()),
+                                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     } else if (isInt4Quant()) {
       TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for INT4 quantization");
       TORCH_CHECK(quant_scales.value().size() == 8,

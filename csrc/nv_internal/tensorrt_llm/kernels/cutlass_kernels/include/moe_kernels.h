@@ -24,7 +24,6 @@
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
-#include "tensorrt_llm/common/NvInferRuntime.h"
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -32,6 +31,8 @@
 #include <optional>
 #include <random>
 #include <utility>
+
+#include "tensorrt_llm/common/NvInferRuntime.h"
 namespace tensorrt_llm::kernels {
 // Change to following declarations must sync with lora.h in public repo
 class LoraImpl;
@@ -84,62 +85,53 @@ struct LoraParams {
 };
 
 namespace cutlass_kernels {
-  static inline size_t pad_to_multiple_of_16(size_t const& input)
-  {
-      static constexpr int ALIGNMENT = 16;
-      return ALIGNMENT * ((input + ALIGNMENT - 1) / ALIGNMENT);
+static inline size_t pad_to_multiple_of_16(size_t const& input) {
+  static constexpr int ALIGNMENT = 16;
+  return ALIGNMENT * ((input + ALIGNMENT - 1) / ALIGNMENT);
+}
+
+class CubKeyValueSorter {
+ public:
+  CubKeyValueSorter();
+
+  CubKeyValueSorter(int const num_experts_per_node);
+
+  void updateNumExperts(int const num_experts_per_node);
+
+  static size_t getWorkspaceSize(size_t const num_key_value_pairs, int const num_experts_per_node);
+
+  void run(void* workspace, size_t const workspace_size, int const* keys_in, int* keys_out,
+           int const* values_in, int* values_out, size_t const num_key_value_pairs,
+           cudaStream_t stream);
+
+ private:
+  static int expertsToBits(int experts);
+  int num_experts_;
+  int num_bits_;
+};
+
+struct ActivationParams {
+  ActivationType activation_type;
+  float const* swiglu_alpha = nullptr;
+  float const* swiglu_beta = nullptr;
+  float const* swiglu_limit = nullptr;
+
+  explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
+    TLLM_CHECK_WITH_INFO(
+        activation_type != ActivationType::SwigluBias,
+        "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
   }
-  
-  class CubKeyValueSorter
-  {
-  public:
-      CubKeyValueSorter();
-  
-      CubKeyValueSorter(int const num_experts_per_node);
-  
-      void updateNumExperts(int const num_experts_per_node);
-  
-      static size_t getWorkspaceSize(size_t const num_key_value_pairs, int const num_experts_per_node);
-  
-      void run(void* workspace, size_t const workspace_size, int const* keys_in, int* keys_out, int const* values_in,
-          int* values_out, size_t const num_key_value_pairs, cudaStream_t stream);
-  
-  private:
-      static int expertsToBits(int experts);
-      int num_experts_;
-      int num_bits_;
-  };
-  
-  struct ActivationParams
-  {
-      ActivationType activation_type;
-      float const* swiglu_alpha = nullptr;
-      float const* swiglu_beta = nullptr;
-      float const* swiglu_limit = nullptr;
-  
-      explicit ActivationParams(ActivationType activation_type)
-          : activation_type(activation_type)
-      {
-          TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SwigluBias,
-              "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
-      }
-  
-      ActivationParams(
-          ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta, float const* swiglu_limit)
-          : activation_type(activation_type)
-          , swiglu_alpha(swiglu_alpha)
-          , swiglu_beta(swiglu_beta)
-          , swiglu_limit(swiglu_limit)
-      {
-      }
-  
-      // TODO Port everything properly and get rid of these implicit conversions
-      operator ActivationType() const
-      {
-          return activation_type;
-      }
-  };
-  
+
+  ActivationParams(ActivationType activation_type, float const* swiglu_alpha,
+                   float const* swiglu_beta, float const* swiglu_limit)
+      : activation_type(activation_type),
+        swiglu_alpha(swiglu_alpha),
+        swiglu_beta(swiglu_beta),
+        swiglu_limit(swiglu_limit) {}
+
+  // TODO Port everything properly and get rid of these implicit conversions
+  operator ActivationType() const { return activation_type; }
+};
 
 /**
  * \brief Describes what parallelism mode the MoE is using
@@ -535,16 +527,17 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
 
 #if defined(ENABLE_BF16)
-  static constexpr bool use_wfp4a16
-      = std::is_same_v<WeightType, __nv_fp4_e2m1> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+                                      (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
-  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+  static constexpr bool use_wfp4a16 =
+      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
 #endif
 
 #if defined(ENABLE_FP8)
   static constexpr bool use_fp8 =
-      (std::is_same_v<T, __nv_fp8_e4m3> ||
-       std::is_same_v<T, __nv_fp8_e5m2>)&&!std::is_same_v<WeightType, cutlass::uint4b_t>;
+      (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
+      !std::is_same_v<WeightType, cutlass::uint4b_t>;
   static constexpr bool use_w4afp8 =
       std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
   static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>,
@@ -642,10 +635,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
       TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat, QuantParams quant_params,
       int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
-      int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
-      float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
-      cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-      int* num_active_experts_per, int* active_expert_global_ids);
+      int64_t const inter_size, int const num_experts_per_node,
+      ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+      bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
+      bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids);
 
   static void gemm2(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,

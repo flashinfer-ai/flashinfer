@@ -246,7 +246,8 @@ struct TmaWarpSpecializedGroupedGemmInput {
 };
 
 constexpr bool isGatedActivation(ActivationType activation_type) {
-  return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu || activation_type == ActivationType::SwigluBias;
+  return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu ||
+         activation_type == ActivationType::SwigluBias;
 }
 
 template <typename T,                         /*The type used for activations/scales/compute*/
@@ -257,12 +258,13 @@ template <typename T,                         /*The type used for activations/sc
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
-  
+
 #if defined(ENABLE_BF16)
-  static constexpr bool use_wfp4a16
-      = std::is_same_v<WeightType, __nv_fp4_e2m1> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+                                      (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
-  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+  static constexpr bool use_wfp4a16 =
+      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
 #endif
 
 #if defined(ENABLE_FP8)
@@ -306,8 +308,11 @@ class MoeGemmRunner {
 
   [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
   [[nodiscard]] bool supportsTmaWarpSpecialized() const;
-  [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n, int gemm_k) const;
-  [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;
+  [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
+                                            ActivationType activation_type, int gemm_n,
+                                            int gemm_k) const;
+  [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n,
+                                                  int gemm_k) const;
 
   size_t getMaxWorkspaceSize(int num_experts) const;
 

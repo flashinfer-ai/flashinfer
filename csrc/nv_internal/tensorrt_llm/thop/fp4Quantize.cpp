@@ -39,26 +39,22 @@ namespace torch_ext {
 // self_fp4, self_block_scale_factors self_fp4: [M, K / 2], FLOAT4_E2M1X2 self_block_scale_factors:
 // ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-  std::optional<at::Tensor> const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout,
-                                                bool isSf8x4Layout) {
+                                                std::optional<at::Tensor> const& globalScale,
+                                                int64_t sfVecSize, bool sfUseUE8M0,
+                                                bool isSfSwizzledLayout, bool isSf8x4Layout) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
-  if (sfUseUE8M0)
-  {
-      TORCH_CHECK(sfVecSize == 32, "sfVecSize can only be 32, when sfUseUE8M0 is true");
-  }
-  else
-  {
-      TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfUseUE8M0 is false");
-      // CHECK_INPUT_AND_TYPE(globalScale.value(), torch::kFloat32);
-      TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16, when sfUseUE8M0 is false");
+  if (sfUseUE8M0) {
+    TORCH_CHECK(sfVecSize == 32, "sfVecSize can only be 32, when sfUseUE8M0 is true");
+  } else {
+    TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfUseUE8M0 is false");
+    // CHECK_INPUT_AND_TYPE(globalScale.value(), torch::kFloat32);
+    TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16, when sfUseUE8M0 is false");
   }
 
   float* globalScalePtr{nullptr};
-  if (globalScale.has_value())
-  {
-      globalScalePtr = globalScale->data_ptr<float>();
+  if (globalScale.has_value()) {
+    globalScalePtr = globalScale->data_ptr<float>();
   }
 
   auto const& inputShape = self.sizes();
@@ -78,10 +74,9 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   at::Tensor valueE2M1 =
       at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
 
-  int64_t SFSize =
-      isSfSwizzledLayout
-          ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize, isSf8x4Layout ? 8 : 128)
-          : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
+  int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(
+                                            m, k / sfVecSize, isSf8x4Layout ? 8 : 128)
+                                      : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
   at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
@@ -92,9 +87,10 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
                               : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-  #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                                     \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
-      globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
+  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
+      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       at::cuda::getCurrentCUDAStream(self.get_device()));
 

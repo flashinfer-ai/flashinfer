@@ -817,7 +817,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   std::optional<at::Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
     int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
-                                                                   intermediate_size / sf_vec_size);
+                                                                intermediate_size / sf_vec_size);
     gemm1_output_scale = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn,
                                                 hidden_states.device(), std::nullopt);
   }
@@ -877,7 +877,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     TORCH_CHECK(hidden_states_scale.value().dim() == 1, "hidden_states_scale must be 1D.");
     TORCH_CHECK(hidden_states_scale.value().sizes()[0] ==
                     tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens,
-                                                               args.hidden_size / sf_vec_size),
+                                                            args.hidden_size / sf_vec_size),
                 "hidden_states_scale has incorrect size");
   }
 

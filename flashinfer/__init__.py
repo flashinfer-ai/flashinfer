@@ -50,14 +50,14 @@ from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
     SfLayout,
+    block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
-    block_scale_interleave,
+    mxfp4_dequantize,
+    mxfp4_quantize,
     nvfp4_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
-    mxfp4_quantize,
-    mxfp4_dequantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (

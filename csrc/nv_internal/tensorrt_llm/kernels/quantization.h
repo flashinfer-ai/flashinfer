@@ -48,7 +48,7 @@ enum class BlockScaleQuantizationType {
 #define PadUpFn(X, Y) ((X + Y - 1) / (Y) * (Y))
 
 // totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-inline int64_t  computeSwizzledLayoutSFSize(int totalRow, int totalColumn, int rowSize = 128) {
+inline int64_t computeSwizzledLayoutSFSize(int totalRow, int totalColumn, int rowSize = 128) {
   int paddedRow = PadUpFn(totalRow, rowSize);
   int paddedColumn = PadUpFn(totalColumn, 4);
   return static_cast<int64_t>(paddedRow) * paddedColumn;
@@ -71,19 +71,21 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
                                 cudaStream_t stream = 0);
 
 template <typename T, int SF_VEC_SIZE>
-void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
-                           int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout,
-                           int multiProcessorCount, cudaStream_t stream = 0);
+void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
+                           int64_t* output, int32_t* SFOuput, bool useUE8M0,
+                           QuantizationSFLayout layout, int multiProcessorCount,
+                           cudaStream_t stream = 0);
 
-void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn,
-                                uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
+void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
+                                uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,
+                                cudaStream_t stream = 0);
 
 void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput,
                                        int multiProcessorCount, cudaStream_t stream = 0);
 
 template <typename T>
-void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output, int32_t* SFOuput,
-                             QuantizationSFLayout layout, int multiProcessorCount,
+void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
+                             int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount,
                              cudaStream_t stream = 0);
 
 }  // namespace kernels

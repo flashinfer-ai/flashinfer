@@ -178,8 +178,8 @@ at::Tensor BlockScaleInterleave(at::Tensor const& blockScale) {
           if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols)) {
             sf_ori = blockScalePtr[cIdx];
           }
-          int sf_index = computeSFIndex(rIdx, cIdx, rows, cols,
-                                        tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+          int sf_index =
+              computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
           interleavedBlockScalePtr[sf_index] = sf_ori;
         }
       }
@@ -224,8 +224,8 @@ at::Tensor BlockScaleInterleaveReverse(at::Tensor const& blockScale) {
     for (int eIdx = 0; eIdx < num_experts; eIdx++) {
       for (int rIdx = 0; rIdx < rows; ++rIdx) {
         for (int cIdx = 0; cIdx < cols; ++cIdx) {
-          int sf_index = computeSFIndex(rIdx, cIdx, rows, cols,
-                                        tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+          int sf_index =
+              computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
           identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
         }
       }
@@ -292,8 +292,8 @@ at::Tensor E2M1AndUFP8SFScaleToFloat(at::Tensor valueE2M1, at::Tensor scaleFP8SF
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
 at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8SF,
-  std::optional<at::Tensor> globalScale, int64_t sfVecSize, int64_t sfType,
-                                       bool isSfSwizzledLayout = true) {
+                                       std::optional<at::Tensor> globalScale, int64_t sfVecSize,
+                                       int64_t sfType, bool isSfSwizzledLayout = true) {
   CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
   CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
   auto packedShape = valueE2M1.sizes();
@@ -305,21 +305,19 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
 
   // CHECK_CPU_INPUT(globalScale, at::ScalarType::Float);
   float globalScaleVal{1.0f};
-  if (sfType == 1)
-  {
-      TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfType is 1.");
-      // CHECK_CPU_INPUT(globalScale.value(), at::kFloat32);
-      globalScaleVal = globalScale->data_ptr<float>()[0];
+  if (sfType == 1) {
+    TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfType is 1.");
+    // CHECK_CPU_INPUT(globalScale.value(), at::kFloat32);
+    globalScaleVal = globalScale->data_ptr<float>()[0];
   }
-
 
   int hiddenDim = packedShape[1] * 2;
   int packedFp4HiddenDim = hiddenDim / 2;
   int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-  tensorrt_llm::QuantizationSFLayout layout =
-      isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
-                         : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout = isSfSwizzledLayout
+                                                  ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                  : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
   for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx) {
     for (int group = 0; group < groupsPerHiddenDim; ++group) {
