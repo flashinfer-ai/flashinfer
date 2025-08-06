@@ -2761,8 +2761,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
+            # when input dtype is fp8, we need to use bf16 output
+            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
-                q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
+                q.shape[:-1] + v.shape[-1:], dtype=out_dtype, device=q.device
             )
         else:
             _check_shape_dtype_device(
@@ -2998,12 +3000,14 @@ def fmha_varlen(
     ) = plan_info
 
     if out is None:
+        # when input dtype is fp8, we need to use bf16 output
+        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
             head_dim_vo,
             device=q.device,
-            dtype=q.dtype,
+            dtype=out_dtype,
         )[max(max_qo_len, 128) :]
 
     if lse is None and return_lse:
@@ -3026,10 +3030,6 @@ def fmha_varlen(
         lse,
         mask_mode_code,
         sm_scale,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo,
         max_qo_len,
     )
 
