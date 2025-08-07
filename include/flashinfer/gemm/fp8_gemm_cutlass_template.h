@@ -196,53 +196,6 @@ template <typename T>
 std::vector<CutlassGemmConfig> CutlassFp8GemmRunner<T>::getConfigs() const {
   std::vector<CutlassGemmConfig> candidate_configs;
 
-#if 0
-    for (int cluster_m = 1; cluster_m <= 2; cluster_m++)
-    {
-        bool Is2SM = cluster_m == 2;
-        for (int cluster_n = 1; cluster_n <= 2; cluster_n++)
-        {
-            std::vector base = {// M=128
-                CutlassTileConfigSM100::CtaShape128x128x128B, CutlassTileConfigSM100::CtaShape128x256x128B};
-
-            if (Is2SM)
-            {
-                if (cluster_n == 1)
-                {
-                    base.push_back(CutlassTileConfigSM100::CtaShape128x64x128B);
-                    base.push_back(CutlassTileConfigSM100::CtaShape256x64x128B);
-                }
-
-                std::vector twosm = {// M=256
-                    CutlassTileConfigSM100::CtaShape256x128x128B, CutlassTileConfigSM100::CtaShape256x256x128B};
-                std::copy(twosm.begin(), twosm.end(), std::back_inserter(base));
-            }
-            else
-            {
-                if (cluster_n == 1)
-                {
-                    base.push_back(CutlassTileConfigSM100::CtaShape128x32x128B);
-                    base.push_back(CutlassTileConfigSM100::CtaShape128x16x128B);
-                }
-
-                std::vector onesm{CutlassTileConfigSM100::CtaShape64x64x128B,
-                    CutlassTileConfigSM100::CtaShape64x128x128B, CutlassTileConfigSM100::CtaShape64x256x128B,
-                    CutlassTileConfigSM100::CtaShape128x64x128B};
-                std::copy(onesm.begin(), onesm.end(), std::back_inserter(base));
-            }
-
-            constexpr std::array cluster_shapes
-                = {std::array{ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x2x1},
-                    std::array{ClusterShape::ClusterShape_2x1x1, ClusterShape::ClusterShape_2x2x1}};
-            auto cluster = cluster_shapes[cluster_m - 1][cluster_n - 1];
-            for (auto tile : base)
-            {
-                candidate_configs.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, cluster});
-            }
-        }
-    }
-#endif
-
   std::vector<CutlassGemmConfig> candidateConfigs;
 
   std::vector<CutlassTileConfigSM100> tilesSm100 = {
