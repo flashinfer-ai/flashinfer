@@ -3052,7 +3052,6 @@ def trtllm_batch_context_with_kv_cache(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
-    max_kv_len: int,
     bmm1_scale: float,
     bmm2_scale: float,
     batch_size: int,
@@ -3081,8 +3080,6 @@ def trtllm_batch_context_with_kv_cache(
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
     max_q_len : int
         max sequence length for query
-    max_kv_len : int
-        max sequence length for kv_cache
     bmm1_scale : float
         fused scale for bmm1 input.
     bmm2_scale : float
@@ -3178,6 +3175,9 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    page_size = k_cache.shape[3]
+    num_pages = block_tables.shape[1]
+    max_kv_len = num_pages * page_size
     run_func(
         out,
         out_scale_factor,

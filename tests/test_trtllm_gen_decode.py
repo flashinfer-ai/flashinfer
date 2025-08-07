@@ -276,7 +276,6 @@ def test_trtllm_batch_decode_fmha(
         workspace_buffer,
         block_tables,
         seq_lens_gpu,
-        max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
