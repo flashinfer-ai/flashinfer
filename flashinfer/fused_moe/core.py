@@ -36,13 +36,17 @@ from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
-from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
+from ..utils import (
+    _check_shape_dtype_device,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+    register_custom_op,
+    register_fake_op,
+)
 from .utils import (
     compute_swizzled_sf_shape,
     fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
-    get_shuffle_matrix_a_row_indices,
-    get_shuffle_matrix_sf_a_row_indices,
     last_positive_power_of_2,
 )
 
