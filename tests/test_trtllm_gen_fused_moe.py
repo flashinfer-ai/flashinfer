@@ -406,8 +406,12 @@ class FP4Moe(Moe):
             num_experts, hidden_size, intermediate_size // 16
         )  # fp8 scaling factors
 
-        if hasattr(self, "_cache_permute_indices"):
+        # only testing cached permute indices locally to reduce combinations
+        TEST_CACHED_PERMUTE_INDICES = False
+
+        if TEST_CACHED_PERMUTE_INDICES and hasattr(self, "_cache_permute_indices"):
             # Testing coverage for cached permute indices
+            # Using cached permute index calculation can speed up weights preprocessing
             gemm1_weights_fp4_shuffled = []
             gemm1_scales_fp4_shuffled = []
             gemm2_weights_fp4_shuffled = []
