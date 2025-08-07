@@ -17,6 +17,7 @@ limitations under the License.
 import math
 from abc import ABC, abstractmethod
 from enum import IntEnum
+from typing import Dict
 
 import nvtx
 import pytest
@@ -33,12 +34,17 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
+)
+from flashinfer.fused_moe.core import (
+    _maybe_get_cached_w2_permute_indices,
+    _maybe_get_cached_w3_w1_permute_indices,
 )
 
 
@@ -360,6 +366,19 @@ class FP4Moe(Moe):
         use_ue8m0 = False
         epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
 
+        # Calculate scaling factors that depend on weights
+        scale_c_fc1 = (
+            args_dequant.c_global_sf
+            * (1.0 / args.gemm1_scales_global)
+            * (1.0 / args.hidden_states_scale_global)
+        )
+        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+            1.0 / args.hidden_states_scale_global
+        )
+        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
+            1.0 / args.gemm2_scales_global
+        )
+
         # Quantize weights with linear layout for kernels
         _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
             gemm1_weights_orig, num_experts, use_ue8m0, False
@@ -386,6 +405,50 @@ class FP4Moe(Moe):
         ).reshape(
             num_experts, hidden_size, intermediate_size // 16
         )  # fp8 scaling factors
+
+        if hasattr(self, "_cache_permute_indices"):
+            # Testing coverage for cached permute indices
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                gemm1_weights_fp4, epilogue_tile_m
+            )
+            gemm1_weights_fp4_shuffled = gemm1_weights_fp4[
+                permute_indices.to(gemm1_weights_fp4.device)
+            ]
+
+            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+                gemm1_scales_linear_fp4, epilogue_tile_m, num_elts_per_sf=16
+            )
+            gemm1_scales_fp4_shuffled = nvfp4_block_scale_interleave(
+                gemm1_scales_linear_fp4[
+                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                ]
+            )
+
+            permute_indices = _maybe_get_cached_w2_permute_indices(
+                gemm2_weights_fp4, epilogue_tile_m
+            )
+            gemm2_weights_fp4_shuffled = gemm2_weights_fp4[
+                permute_indices.to(gemm2_weights_fp4.device)
+            ]
+
+            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+                gemm2_scales_linear_fp4, epilogue_tile_m, num_elts_per_sf=16
+            )
+            gemm2_scales_fp4_shuffled = nvfp4_block_scale_interleave(
+                gemm2_scales_linear_fp4[
+                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                ]
+            )
+
+            return {
+                "gemm1_weights_fp4_shuffled": gemm1_weights_fp4_shuffled,
+                "gemm1_scales_fp4_shuffled": gemm1_scales_fp4_shuffled,
+                "gemm2_weights_fp4_shuffled": gemm2_weights_fp4_shuffled,
+                "gemm2_scales_fp4_shuffled": gemm2_scales_fp4_shuffled,
+                "scale_c_fc1": scale_c_fc1,
+                "scale_gate_fc1": scale_gate_fc1,
+                "scale_c_fc2": scale_c_fc2,
+            }
 
         # Reorder rows of W1 and scales for fused gated activation
         gemm1_weights_fp4_interleaved = []
@@ -447,19 +510,6 @@ class FP4Moe(Moe):
             torch.stack(gemm2_scales_fp4_shuffled)
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, hidden_size, intermediate_size // 16)
-        )
-
-        # Calculate scaling factors that depend on weights
-        scale_c_fc1 = (
-            args_dequant.c_global_sf
-            * (1.0 / args.gemm1_scales_global)
-            * (1.0 / args.hidden_states_scale_global)
-        )
-        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
-            1.0 / args.hidden_states_scale_global
-        )
-        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
-            1.0 / args.gemm2_scales_global
         )
 
         return {
@@ -1628,6 +1678,12 @@ def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> 
     return tile_tokens_dim
 
 
+@pytest.fixture(scope="module")
+def cache_permute_indices():
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+    return _cache_permute_indices
+
+
 @pytest.mark.parametrize("num_tokens", [1, 1024])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 384])
@@ -1759,6 +1815,7 @@ def test_moe_quantization_classes(
     moe_impl,
     routing_config,
     weight_processing,
+    cache_permute_indices,
 ):
     """
     Test MoE implementations using separated quantization workflow.
@@ -1778,6 +1835,8 @@ def test_moe_quantization_classes(
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
         )
+
+    moe_impl._cache_permute_indices = cache_permute_indices
 
     seed = 0
     torch.random.manual_seed(seed)

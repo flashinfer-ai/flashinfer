@@ -18,7 +18,7 @@ import functools
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -41,6 +41,8 @@ from .utils import (
     compute_swizzled_sf_shape,
     fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
     last_positive_power_of_2,
 )
 
@@ -71,6 +73,56 @@ class WeightLayout(IntEnum):
     # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
     # where blockK is fixed at 128B
     BlockMajorK = 2
+
+
+def _maybe_get_cached_w3_w1_permute_indices(
+    _cache_permute_indices,
+    dst_w3_w1_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+        # Get permute indices and chain them together
+        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
+        if num_elts_per_sf is None:
+            permute1 = get_shuffle_matrix_a_row_indices(
+                dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m
+            )
+        else:
+            permute1 = get_shuffle_matrix_sf_a_row_indices(
+                dst_w3_w1_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            )
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+            dst_w3_w1_weight.device
+        )
+    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    return permute_indices
+
+
+def _maybe_get_cached_w2_permute_indices(
+    _cache_permute_indices,
+    dst_w2_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w2_weight.shape not in _cache_permute_indices:
+        if num_elts_per_sf is None:
+            permute_indices = get_shuffle_matrix_a_row_indices(
+                dst_w2_weight, epilogue_tile_m
+            ).to(dst_w2_weight.device)
+        else:
+            permute_indices = get_shuffle_matrix_sf_a_row_indices(
+                dst_w2_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            ).to(dst_w2_weight.device)
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
+    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+    return permute_indices
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
