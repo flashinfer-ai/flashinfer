@@ -408,43 +408,60 @@ class FP4Moe(Moe):
 
         if hasattr(self, "_cache_permute_indices"):
             # Testing coverage for cached permute indices
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices, gemm1_weights_fp4, epilogue_tile_m
-            )
-            gemm1_weights_fp4_shuffled = gemm1_weights_fp4[
-                permute_indices.to(gemm1_weights_fp4.device)
-            ]
+            gemm1_weights_fp4_shuffled = []
+            gemm1_scales_fp4_shuffled = []
+            gemm2_weights_fp4_shuffled = []
+            gemm2_scales_fp4_shuffled = []
+            for i in range(num_experts):
+                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices, gemm1_weights_fp4[i], epilogue_tile_m
+                )
+                gemm1_weights_fp4_shuffled.append(
+                    gemm1_weights_fp4[i][
+                        permute_indices.to(gemm1_weights_fp4.device)
+                    ].contiguous()
+                )
 
-            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_scales_linear_fp4,
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm1_scales_fp4_shuffled = nvfp4_block_scale_interleave(
-                gemm1_scales_linear_fp4[
-                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                ]
-            )
+                permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    gemm1_scales_linear_fp4[i],
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                gemm1_scales_fp4_shuffled.append(
+                    nvfp4_block_scale_interleave(
+                        gemm1_scales_linear_fp4[i][
+                            permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                        ].contiguous()
+                    )
+                )
 
-            permute_indices = _maybe_get_cached_w2_permute_indices(
-                self._cache_permute_indices, gemm2_weights_fp4, epilogue_tile_m
-            )
-            gemm2_weights_fp4_shuffled = gemm2_weights_fp4[
-                permute_indices.to(gemm2_weights_fp4.device)
-            ]
+                permute_indices = _maybe_get_cached_w2_permute_indices(
+                    self._cache_permute_indices, gemm2_weights_fp4[i], epilogue_tile_m
+                )
+                gemm2_weights_fp4_shuffled.append(
+                    gemm2_weights_fp4[i][
+                        permute_indices.to(gemm2_weights_fp4.device)
+                    ].contiguous()
+                )
 
-            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
-                self._cache_permute_indices,
-                gemm2_scales_linear_fp4,
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_fp4_shuffled = nvfp4_block_scale_interleave(
-                gemm2_scales_linear_fp4[
-                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                ]
-            )
+                permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+                    self._cache_permute_indices,
+                    gemm2_scales_linear_fp4[i],
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                gemm2_scales_fp4_shuffled.append(
+                    nvfp4_block_scale_interleave(
+                        gemm2_scales_linear_fp4[
+                            permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                        ].contiguous()
+                    )
+                )
+            gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+            gemm1_scales_fp4_shuffled = torch.stack(gemm1_scales_fp4_shuffled)
+            gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+            gemm2_scales_fp4_shuffled = torch.stack(gemm2_scales_fp4_shuffled)
 
             return {
                 "gemm1_weights_fp4_shuffled": gemm1_weights_fp4_shuffled,
