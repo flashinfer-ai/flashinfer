@@ -7,7 +7,7 @@ import functools
 import math
 import os
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -15,7 +15,7 @@ from flashinfer.comm.mapping import Mapping
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, sm100a_nvcc_flags
+from ..jit import gen_jit_spec
 from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer
 

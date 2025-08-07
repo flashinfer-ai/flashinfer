@@ -17,9 +17,8 @@ limitations under the License.
 import functools
 import logging
 from ctypes import c_void_p
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -824,7 +823,7 @@ def trtllm_allreduce_fusion(
 
     if use_oneshot is None:
         logging.warning(
-            f"use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
+            "use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
         )
         use_oneshot = token_num <= 128
 

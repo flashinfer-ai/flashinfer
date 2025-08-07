@@ -15,13 +15,10 @@ limitations under the License.
 """
 
 import ctypes
-import functools
 import hashlib
 import os
 import shutil
-import sys
 import time
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import filelock
 
@@ -131,8 +128,8 @@ def load_cubin(cubin_path, sha256) -> bytes:
             logger.warning(
                 f"sha256 mismatch (expected {sha256} actual {actual_sha}) for {cubin_path}"
             )
-    except:
-        pass
+    except Exception as e:
+        print(f"Failed to load cubin at {cubin_path} with sha256={sha256}: {e}")
     logger.info(f"Failed loading {cubin_path}")
     return b""
 

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional
+from typing import List
 
 import jinja2
 import torch
@@ -884,7 +884,7 @@ def gen_batch_attention_module(
     additional_scalar_names: List[str] = []
     additional_scalar_dtypes: List[str] = []
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
         uri,

@@ -100,9 +100,7 @@ def test_pod_with_paged_kv_cache(
 ):
     if causal and qo_len_p > kv_len_p:
         pytest.skip("Causal prefill with qo_len_p > kv_len_p is not supported")
-    return_lse = False
     # Prefill inputs
-    kv_layout_p = "NHD"
     q_p = torch.randn(
         qo_len_p, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
     )

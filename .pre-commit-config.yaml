@@ -35,18 +35,6 @@ repos:
       - id: remove-crlf
 
   # Formatters
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 24.8.0
-    hooks:
-      - id: black
-        exclude: flashinfer/tuning_configs/.*\.py
-
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-        args: ["--profile=black"] # <-- this one
-
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.1
     hooks:
@@ -59,3 +47,14 @@ repos:
       rev: ''  # Use the sha / tag you want to point at
       hooks:
       -   id: mypy
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.12.7
+    hooks:
+      # Run the linter.
+      - id: ruff-check
+      # Run the formatter.
+      - id: ruff-format
+        args: [ --check ]
+        types_or: [ python, pyi ]
