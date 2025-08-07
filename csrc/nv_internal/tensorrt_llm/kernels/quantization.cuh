@@ -917,6 +917,91 @@ cvt_fp8_to_fp4(
 #endif
 }
 
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(512, 4) quantize_with_block_size(
+#else
+quantize_with_block_size(
+#endif
+    int32_t numbatches, int32_t numRows, int32_t numCols, Type const* in, float const* SFScale,
+    uint32_t* out, uint32_t* SFout, FP4QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+  // The elements per thread.
+  static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
+                                             ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
+                                             : CVT_FP4_ELTS_PER_THREAD;
+
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
+  static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+
+  // Get the global scaling factor, which will be applied to the SF.
+  // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+  int numPaddedRows = numRows;
+  int numPaddedCols = numCols;
+  if (layout == FP4QuantizationSFLayout::SWIZZLED_128x4) {
+    // The number of padded rows considering 128x4 SF layout.
+    numPaddedRows = PadUpFn(numRows, 128);
+    numPaddedCols = PadUpFn(numCols, 4 * SF_VEC_SIZE);
+  } else if (layout == FP4QuantizationSFLayout::SWIZZLED_8x4) {
+    // The number of padded rows considering 8x4 SF layout.
+    numPaddedRows = PadUpFn(numRows, 8);
+    numPaddedCols = PadUpFn(numCols, 4 * SF_VEC_SIZE);
+  }
+
+  // The number of threads in the column dimension
+  int numColThreads = numCols / ELTS_PER_THREAD;
+  int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
+
+  asm volatile("griddepcontrol.wait;");
+  // Input tensor batch/row/col loops.
+  for (int rowIdx = blockIdx.x; rowIdx < numPaddedRows; rowIdx += gridDim.x) {
+    for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+      for (int colIdx = threadIdx.x; colIdx < numPaddedColThreads; colIdx += blockDim.x) {
+        std::optional<int> optionalBatchIdx = batchIdx;
+        std::optional<int> optionalNumRows = numRows;
+
+        // The SF output pointer.
+        auto sf_out =
+            cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF, SF_VEC_SIZE>(
+                optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout, layout);
+
+        // Set the SF padding to 0.
+        if (rowIdx >= numRows || colIdx >= numColThreads) {
+          if (sf_out != nullptr) {
+            sf_out[0] = 0x00;
+          }
+        } else {
+          int64_t inOffset =
+              static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+          PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+          // Get the output tensor offset as a packed vector.
+          int64_t outOffset = inOffset;
+
+          // Dispatch the quantization kernel.
+          if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+            reinterpret_cast<uint32_t*>(out)[outOffset] =
+                cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+          } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+            reinterpret_cast<uint64_t*>(out)[outOffset] =
+                cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal,
+                                                                          sf_out);
+          } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+            reinterpret_cast<uint64_t*>(out)[outOffset] =
+                cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+          }
+        }
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 __global__ void nvfp4_block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                                     uint8_t const* SFIn, uint8_t* SFOutput);
 }  // namespace kernels

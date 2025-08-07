@@ -25,7 +25,7 @@ import jinja2
 import torch
 import torch.nn.functional as F
 
-from .artifacts import ArtifactPath
+from .artifacts import ArtifactPath, MetaInfoHash
 from .autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -38,6 +38,7 @@ from .fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
+from .jit.cubin_loader import get_cubin
 
 CUDNN_AVAILABLE = False
 try:
@@ -302,6 +303,13 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
+    header_name = "KernelMetaInfo"
+    metainfo = get_cubin(
+        f"{ArtifactPath.TRTLLM_GEN_GEMM}/{header_name}",
+        MetaInfoHash.TRTLLM_GEN_GEMM,
+        ".h",
+    )
+    assert metainfo, f"{header_name}.h not found"
     return gen_jit_spec(
         "trtllm_gemm",
         [
@@ -313,6 +321,11 @@ def trtllm_gemm_gen_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CACHE_DIR / "cubins" / ArtifactPath.TRTLLM_GEN_GEMM,
+            jit_env.FLASHINFER_INCLUDE_DIR
+            / "flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+        ],
         extra_ldflags=["-lcuda"],
     )
 
@@ -1349,8 +1362,6 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
-    _check_cudnn_fp4_availability()
-
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
@@ -1397,21 +1408,26 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
-    # the fp4 cudnn graph will be shared for both mm and bmm, so here we need to get the 3d shape and stride including the batch dimension for both input and block scale tensors.
-    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    expanded_a_descale_shape, expanded_a_descale_stride = (
-        _expand_block_scale_tensor_shape(a_descale, batch)
-    )
-    expanded_b_descale_shape, expanded_b_descale_stride = (
-        _expand_block_scale_tensor_shape(b_descale, batch)
-    )
     workspace_buffer = _get_cache_buf(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     if backend == "cudnn":
+        _check_cudnn_fp4_availability()
+
+        # the fp4 cudnn graph will be shared for both mm and bmm, so
+        # here we need to get the 3d shape and stride including the
+        # batch dimension for both input and block scale tensors.
+        real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+        real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+        batch = real_a_shape[0]
+        expanded_a_descale_shape, expanded_a_descale_stride = (
+            _expand_block_scale_tensor_shape(a_descale, batch)
+        )
+        expanded_b_descale_shape, expanded_b_descale_stride = (
+            _expand_block_scale_tensor_shape(b_descale, batch)
+        )
+
         # build the fp4 cudnn graph
         graph = build_cudnn_gemm_block_scale_dequantize_graph(
             real_a_shape,
@@ -2167,11 +2183,10 @@ def group_deepgemm_fp8_nt_groupwise(
     like mixture of experts (MoE) where different tokens are routed to different experts.
 
     The operation can be conceptualized as:
-    ```
-    for i in range(num_groups):
-        row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
-        output[row_slice] = a[row_slice] @ b[i].T
-    ```
+
+    >>> for i in range(num_groups):
+    >>>    row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+    >>>    output[row_slice] = a[row_slice] @ b[i].T
 
     Currently only supported on NVIDIA Blackwell (SM100) architecture.
 
@@ -2294,10 +2309,9 @@ def batch_deepgemm_fp8_nt_groupwise(
     useful for scenarios like mixture of experts (MoE) where different tokens are routed to different experts.
 
     The operation can be conceptualized as:
-    ```
-    for i in range(num_groups):
-        output[i] = a[i][:masked_m[i]] @ b[i][:masked_m[i]].T
-    ```
+
+    >>> for i in range(num_groups):
+    >>>     output[i] = a[i][:masked_m[i]] @ b[i][:masked_m[i]].T
 
     Currently only supported on NVIDIA Blackwell (SM100) architecture.
 

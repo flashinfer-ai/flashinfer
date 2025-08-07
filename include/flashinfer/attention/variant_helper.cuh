@@ -51,6 +51,23 @@ namespace flashinfer {
     __VA_ARGS__                                                                                \
   }
 
+#define REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, ...)          \
+  template <typename Params, typename T_M>                                               \
+  __device__ __forceinline__ void update_m_d(const Params& params, uint32_t kv_tile_idx, \
+                                             uint32_t qo_head_idx, T_M& m, float& d,     \
+                                             float& scale) {                             \
+    __VA_ARGS__                                                                          \
+  }
+
+#define REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale,     \
+                                  ...)                                                             \
+  template <typename Params, typename T, typename T_M>                                             \
+  __device__ __forceinline__ T OutputTransform(const Params& params, T output, uint32_t batch_idx, \
+                                               uint32_t qo_idx, uint32_t qo_head_idx, T_M& m,      \
+                                               float& d, float scale) {                            \
+    __VA_ARGS__                                                                                    \
+  }
+
 struct AttentionVariantBase {
   constexpr static bool use_softmax = true;
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
@@ -58,6 +75,13 @@ struct AttentionVariantBase {
 
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                        { return true; })
+
+  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, { return; })
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    return output * d_rcp;
+  })
 };
 
 }  // namespace flashinfer

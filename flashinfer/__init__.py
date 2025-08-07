@@ -57,11 +57,13 @@ from .fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     RoutingMethodType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
