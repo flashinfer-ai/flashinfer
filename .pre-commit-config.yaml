@@ -54,3 +54,8 @@ repos:
         types_or: [c++, c, cuda]
         exclude: |
           (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
+
+  -   repo: https://github.com/pre-commit/mirrors-mypy
+      rev: ''  # Use the sha / tag you want to point at
+      hooks:
+      -   id: mypy

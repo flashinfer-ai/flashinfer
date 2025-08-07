@@ -4,7 +4,7 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
@@ -132,7 +132,7 @@ class JitSpec:
 
 def gen_jit_spec(
     name: str,
-    sources: List[Union[str, Path]],
+    sources: Sequence[Union[str, Path]],
     extra_cflags: Optional[List[str]] = None,
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags: Optional[List[str]] = None,
@@ -169,17 +169,18 @@ def gen_jit_spec(
         cflags += extra_cflags
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
-    if extra_include_paths is not None:
-        extra_include_paths = [Path(x) for x in extra_include_paths]
-    sources = [Path(x) for x in sources]
 
     spec = JitSpec(
         name=name,
-        sources=sources,
+        sources=[Path(x) for x in sources],
         extra_cflags=cflags,
         extra_cuda_cflags=cuda_cflags,
         extra_ldflags=extra_ldflags,
-        extra_include_dirs=extra_include_paths,
+        extra_include_dirs=(
+            [Path(x) for x in extra_include_paths]
+            if extra_include_paths is not None
+            else None
+        ),
         needs_device_linking=needs_device_linking,
     )
     spec.write_ninja()

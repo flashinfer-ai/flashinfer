@@ -80,7 +80,7 @@ def get_fmha_module(
             dtype_idx,
             head_dim_qk,
             head_dim_vo,
-            pos_encoding_mode,
+            pos_encoding_mode.value,
             use_sliding_window,
             use_logits_soft_cap,
         ).build_and_load()

@@ -356,7 +356,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
             module.fp4_gemm.default(
@@ -1758,7 +1760,9 @@ def get_trtllm_fp4_gemm_module():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             (
                 workspace_buffer,
@@ -1863,7 +1867,7 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: str = "MN",
+    scale_major_mode: Optional[Literal["MN", "K"]] = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,

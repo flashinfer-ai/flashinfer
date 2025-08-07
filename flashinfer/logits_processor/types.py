@@ -18,7 +18,7 @@ from __future__ import annotations  # python 3.7+
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Type
 
 import torch
 
@@ -94,7 +94,7 @@ class TaggedTensor:
     def __torch_function__(
         self,
         func: Any,
-        types: Tuple[type, ...],
+        types: Tuple[Type, ...],
         args: Tuple[Any, ...] = (),
         kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:

@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+from ctypes import c_void_p
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -417,7 +418,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     max_token_num: int,
     hidden_dim,
     group: Optional[ProcessGroup] = None,
-) -> List[int]:
+) -> List[List[int]]:
     """
     Parameters:
     - rank: the rank of the current process.
@@ -492,7 +493,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce(
-    workspace: List[int], group: Optional[ProcessGroup] = None
+    workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
     """
     Note:
@@ -518,7 +519,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     hidden_dim,
     use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
-) -> List[int]:
+) -> Tuple[List[List[int]], torch.Tensor]:
     """
     Parameters:
     - tp_rank: the rank of the current process.
@@ -564,7 +565,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
 
-    ipc_handles = list()
+    ipc_handles: List[List[int]] = list()
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
@@ -609,7 +610,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     cudart.cudaMemset(flag_ptr, 0, 5 * 4)
     # Set flag_ptr[3] = lamport_comm_size
     lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
-    cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
+    cudart.cudaMemcpy(
+        c_void_p(flag_ptr.value + 3 * 4), c_void_p(lamport_comm_size_bytes), 4
+    )
     print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
@@ -628,7 +631,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
-    workspace: List[int], group: Optional[ProcessGroup] = None
+    workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
     """
     Parameters:

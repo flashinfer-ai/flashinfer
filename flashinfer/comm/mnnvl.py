@@ -19,7 +19,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from cuda import cuda
@@ -132,8 +132,9 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
 
 
 if IS_BUILDING_DOCS:
+    # Mock classes for building docs
 
-    class MpiComm:
+    class MpiComm:  # type: ignore[no-redef]
         @classmethod
         def set_mpi_comm(cls, new_comm):
             pass
@@ -141,7 +142,7 @@ if IS_BUILDING_DOCS:
         def __getattr__(self, name):
             return None
 
-    class MnnvlMemory:
+    class MnnvlMemory:  # type: ignore[no-redef]
         initialized: bool = False
 
         current_mem_offset: int = 0
@@ -159,8 +160,8 @@ if IS_BUILDING_DOCS:
 
         dev_id: int = None
 
-        allocated_map = {}
-        address_refcnt = {}
+        allocated_map: Dict[int, Any] = {}
+        address_refcnt: Dict[int, Any] = {}
 
         def __init__(self, mapping: Mapping, size: int):
             pass
@@ -211,7 +212,7 @@ else:
     import pynvml
     from mpi4py import MPI
 
-    class MpiComm:
+    class MpiComm:  # type: ignore[no-redef]
         _comm: MPI.Intracomm = MPI.COMM_WORLD
 
         @classmethod
@@ -221,7 +222,7 @@ else:
         def __getattr__(self, name):
             return getattr(self._comm, name)
 
-    class MnnvlMemory:
+    class MnnvlMemory:  # type: ignore[no-redef]
         initialized: bool = False
 
         current_mem_offset: int = 0
@@ -239,8 +240,8 @@ else:
 
         dev_id: int = None
 
-        allocated_map = {}
-        address_refcnt = {}
+        allocated_map: Dict[int, Any] = {}
+        address_refcnt: Dict[int, Any] = {}
 
         def __init__(self, mapping: Mapping, size: int):
             self.mapping = mapping

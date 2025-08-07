@@ -2,6 +2,7 @@ import functools
 import gc
 import os
 import types
+from typing import Any, Dict
 
 import pytest
 import torch
@@ -53,7 +54,7 @@ TORCH_COMPILE_FNS = [
     flashinfer.sampling.chain_speculative_sampling,
 ]
 
-_TORCH_COMPILE_CACHE = dict()
+_TORCH_COMPILE_CACHE: Dict[str, Any] = dict()
 
 
 def _set_torch_compile_options():
@@ -141,7 +142,7 @@ def pytest_runtest_call(item):
 
 
 @functools.cache
-def get_device_properties(device: torch.device) -> dict:
+def get_device_properties(device: torch.device):
     return torch.cuda.get_device_properties(device)
 
 

@@ -308,7 +308,12 @@ class BatchMLAPagedAttentionWrapper:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        profiler_buffer: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -318,7 +323,12 @@ class BatchMLAPagedAttentionWrapper:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        profiler_buffer: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(

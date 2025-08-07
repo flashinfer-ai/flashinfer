@@ -2,7 +2,7 @@ import contextlib
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -10,14 +10,13 @@ from ..utils import ceil_div, round_up
 
 is_torch_compiling_flag = False
 
-aux_stream_name_list = ["Attention", "MoeShared", "MoeChunkingOverlap"]
 AuxStreamType = Enum(
     "AuxStreamType",
-    aux_stream_name_list,
+    ["Attention", "MoeShared", "MoeChunkingOverlap"],
 )
 EventType = Enum(
     "EventType",
-    ["Main", *aux_stream_name_list],
+    ["Main", "Attention", "MoeShared", "MoeChunkingOverlap"],
     start=0,
 )
 
@@ -215,7 +214,7 @@ def nearest_in_buckets(x: int, buckets: List[int]) -> int:
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
 
 
-def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     max_num_tokens = next_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
@@ -226,7 +225,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets)
 
 
-def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     max_num_tokens = last_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens

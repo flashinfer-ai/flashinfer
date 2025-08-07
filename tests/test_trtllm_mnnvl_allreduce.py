@@ -2,6 +2,7 @@
 import os
 import sys
 import traceback
+from typing import Tuple
 
 import pytest
 import torch
@@ -251,6 +252,7 @@ def test_mnnvl_allreduce_full(
             x = x_full[rank, :, :]
 
             # Compute reference output based on fusion mode
+            reference_output: Tuple[torch.Tensor, ...] = None
             if fusion:
                 # Fused case: AllReduce + Residual Add + RMS Norm
                 allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result

@@ -30,13 +30,13 @@ DRY_RUN = object()
 
 def compress_query(query: str) -> str:
     query = query.replace("\n", "")
-    query = re.sub("\s+", " ", query)
+    query = re.sub(r"\s+", " ", query)
     return query
 
 
 def post(url: str, body: Optional[Any] = None, auth: Optional[Tuple[str, str]] = None):
     logging.info(f"Requesting POST to {url} with {body}")
-    headers = {}
+    headers: Dict[Any, Any] = {}
     req = request.Request(url, headers=headers, method="POST")
     if auth is not None:
         auth_str = base64.b64encode(f"{auth[0]}:{auth[1]}".encode())
@@ -46,9 +46,8 @@ def post(url: str, body: Optional[Any] = None, auth: Optional[Tuple[str, str]] =
         body = ""
 
     req.add_header("Content-Type", "application/json; charset=utf-8")
-    data = json.dumps(body)
-    data = data.encode("utf-8")
-    req.add_header("Content-Length", len(data))
+    data = json.dumps(body).encode("utf-8")
+    req.add_header("Content-Length", str(len(data)))
 
     with request.urlopen(req, data) as response:
         return response.read()
@@ -119,9 +118,8 @@ class GitHubRepo:
         logging.info(f"Requesting {method} to {full_url} with {body}")
         req = request.Request(full_url, headers=self.headers(), method=method.upper())
         req.add_header("Content-Type", "application/json; charset=utf-8")
-        data = json.dumps(body)
-        data = data.encode("utf-8")
-        req.add_header("Content-Length", len(data))
+        data = json.dumps(body).encode("utf-8")
+        req.add_header("Content-Length", str(len(data)))
 
         try:
             with request.urlopen(req, data) as response:
@@ -206,12 +204,11 @@ def find_ccs(body: str) -> List[str]:
     matches = re.findall(r"(cc( @[-A-Za-z0-9]+)+)", body, flags=re.MULTILINE)
     matches = [full for full, last in matches]
 
-    reviewers = []
+    reviewers = set()
     for match in matches:
         if match.startswith("cc "):
             match = match.replace("cc ", "")
         users = [x.strip() for x in match.split("@")]
-        reviewers += users
+        reviewers.update(users)
 
-    reviewers = set(x for x in reviewers if x != "")
-    return list(reviewers)
+    return [x for x in reviewers if x != ""]
