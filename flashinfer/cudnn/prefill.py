@@ -143,11 +143,7 @@ if CUDNN_AVAILABLE:
             if q.dim() == 3:
                 h_qo, d_qk = q.shape[1], q.shape[2]
             elif q.dim() == 4:
-                h_qo, d_qk = (
-                    q.shape[1],
-                    q.shape[2],
-                    q.shape[3],
-                )
+                h_qo, d_qk = q.shape[2], q.shape[3]
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 

@@ -23,7 +23,7 @@ from .validators import CompileError, ValidityCheck, get_default_validity_checks
 
 
 class Compiler:
-    def __init__(self):
+    def __init__(self) -> None:
         self.fusion_rules: List[FusionRule] = []
         self.validity_checks: List[ValidityCheck] = []
         self._install_defaults()

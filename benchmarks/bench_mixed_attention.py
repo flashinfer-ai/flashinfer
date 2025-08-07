@@ -185,8 +185,8 @@ if __name__ == "__main__":
         full_kv_len = np.random.randint(2000, 16000, size=bsz)
         p_q_lens = []
         p_kv_lens = []
-        d_q_len = []
-        d_kv_len = []
+        d_q_lens = []
+        d_kv_lens = []
 
         for i in range(bsz):
             if i % stride == 0:

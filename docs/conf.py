@@ -2,6 +2,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
+from typing import Any, List
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -64,16 +65,12 @@ todo_include_todos = False
 
 html_theme = "furo"  # "sphinx_rtd_theme"
 
-templates_path = []
+templates_path: List[Any] = []
 
-html_static_path = []
+html_static_path = ["_static"]
 
 html_theme_options = {
     "logo_only": True,
-}
-
-html_static_path = ["_static"]
-html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }

@@ -583,7 +583,7 @@ class AutoTuner:
 
         generated_profiles: List[OptimizationProfile] = []
 
-        dynamic_dims = []
+        dynamic_dims: List[Tuple[Any, ...]] = []
 
         for spec in tuning_config.dynamic_tensor_specs:
             assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(
@@ -591,12 +591,14 @@ class AutoTuner:
             ), "The given dynamic dimension must provide a opt value generation function or a list of opt values"
             if inspect.isfunction(spec.gen_tuning_buckets):
                 opt_shapes = spec.gen_tuning_buckets(
-                    base_profile.shapes[spec.input_idx][spec.dim_idx].val
+                    base_profile.shapes[spec.input_idx][spec.dim_idx]._opt()
                 )
             else:
                 opt_shapes = spec.gen_tuning_buckets
-            opt_shapes_max = tuple(opt_shapes[1:]) + (float("inf"),)
-            opt_shapes_max = {v1: v2 for v1, v2 in zip(opt_shapes, opt_shapes_max)}
+            opt_shapes_max = {
+                v1: v2
+                for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
+            }
             dynamic_dims.append(
                 (spec.input_idx, spec.dim_idx, opt_shapes_max, opt_shapes)
             )
@@ -617,10 +619,12 @@ class AutoTuner:
                 )
 
             # Adjust the profile to satisfy the constraints
-            for spec in tuning_config.constraint_specs:
-                min_value = opt_value = max_value = spec.infer_shape(p.get_opt_shapes())
-                p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
-                    min_value, opt_value, max_value
+            for constraint_spec in tuning_config.constraint_specs:
+                min_value = opt_value = max_value = constraint_spec.infer_shape(
+                    p.get_opt_shapes()
+                )
+                p.shapes[constraint_spec.input_idx][constraint_spec.dim_idx] = (
+                    DynamicDim(min_value, opt_value, max_value)
                 )
             generated_profiles.append(p)
             logger.debug(f"[Autotuner]: generated profile: {p}")
@@ -651,8 +655,8 @@ class AutoTuner:
             )
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for spec in tuning_config.constraint_specs:
-            base_profile[spec.input_idx][spec.dim_idx] = -1
+        for constraint_spec in tuning_config.constraint_specs:
+            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
 
         return tuple(tuple(shape) for shape in base_profile)
 

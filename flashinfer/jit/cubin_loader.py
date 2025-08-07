@@ -52,7 +52,7 @@ def download_file(source, local_path, retries=3, delay=5, timeout=10, lock_timeo
     - bool: True if download or copy is successful, False otherwise.
     """
 
-    import requests
+    import requests  # type: ignore[import-untyped]
 
     lock_path = f"{local_path}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)

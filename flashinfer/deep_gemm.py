@@ -196,7 +196,7 @@ def transform_sf_into_required_layout(
 
     # (FP32, 1, 128) on Hopper: transform to TMA-aligned and MN-major
     if sf.dtype == torch.float and gran == (1, 128) and get_device_arch() == "90a":
-        raise NotImplemented
+        raise NotImplementedError
 
     # (FP32, 1, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
     if sf.dtype == torch.float and gran == (1, 128) and get_device_arch() == "100a":
@@ -213,7 +213,7 @@ def transform_sf_into_required_layout(
 
     # (FP32, 128, 128) on Hopper: no need to transform, check shape and whatever-major
     if sf.dtype == torch.float and gran == (128, 128) and get_device_arch() == "90a":
-        raise NotImplemented
+        raise NotImplementedError
 
     # (FP32, 128, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
     if sf.dtype == torch.float and gran == (128, 128) and get_device_arch() == "100a":
@@ -439,6 +439,7 @@ def get_best_configs(
     assert cd_dtype in (torch.bfloat16, torch.float)
 
     # `BLOCK_M` and `BLOCK_N` are selected according to MMA instructions
+    block_ms: Tuple[int, ...] = None
     if gemm_type == GemmType.GroupedContiguous:
         block_ms = (get_m_alignment_for_contiguous_layout(),)
     else:
@@ -651,10 +652,17 @@ def make_tma_a_desc(
 ) -> cbd.CUtensorMap:
     if num_groups > 1:
         assert major_type == MajorTypeAB.KMajor
+
+    gmem_inner_dim, gmem_outer_dim = (shape_k, shape_m * num_groups)[
+        :: major_type.shape_direction()
+    ]
+    smem_inner_dim, smem_outer_dim = (block_k, block_m)[:: major_type.shape_direction()]
     return make_tma_2d_desc(
         t,
-        *(shape_k, shape_m * num_groups)[:: major_type.shape_direction()],
-        *(block_k, block_m)[:: major_type.shape_direction()],
+        gmem_inner_dim,
+        gmem_outer_dim,
+        smem_inner_dim,
+        smem_outer_dim,
         outer_stride,
         swizzle_mode,
     )
@@ -673,12 +681,15 @@ def make_tma_b_desc(
 ) -> cbd.CUtensorMap:
     # `num_groups` is always applied into the outer dimensions
     io_shapes = (shape_k, shape_n)[:: major_type.shape_direction()]
-    io_shapes = (io_shapes[0], io_shapes[1] * num_groups)
+    gmem_inner_dim, gmem_outer_dim = (io_shapes[0], io_shapes[1] * num_groups)
+    smem_inner_dim, smem_outer_dim = (block_k, block_n)[:: major_type.shape_direction()]
 
     return make_tma_2d_desc(
         t,
-        *io_shapes,
-        *(block_k, block_n)[:: major_type.shape_direction()],
+        gmem_inner_dim,
+        gmem_outer_dim,
+        smem_inner_dim,
+        smem_outer_dim,
         outer_stride,
         swizzle_mode,
     )
@@ -1317,8 +1328,8 @@ def m_grouped_fp8_gemm_nt_masked_sm100(
 
 
 def m_grouped_fp8_gemm_nt_contiguous(
-    a: Tuple[torch.Tensor, torch.Tensor],
-    b: Tuple[torch.Tensor, torch.Tensor],
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    b_fp8: Tuple[torch.Tensor, torch.Tensor],
     d: torch.Tensor,
     m_indices: torch.Tensor,
     recipe: Optional[Tuple[int, int, int]] = None,
@@ -1328,15 +1339,15 @@ def m_grouped_fp8_gemm_nt_contiguous(
     compiled_dims = compiled_dims.lower()
 
     # NOTES: shape must be `[M, K] @ [G, N, K].mT`
-    major_a = get_major_type_ab(a[0])
-    major_b = get_major_type_ab(b[0])
+    major_a = get_major_type_ab(a_fp8[0])
+    major_b = get_major_type_ab(b_fp8[0])
     assert major_a == MajorTypeAB.KMajor
     if must_be_k_major():
         assert major_b == MajorTypeAB.KMajor
     assert m_indices.is_contiguous()
 
-    a, sfa = a
-    b, sfb = b
+    a, sfa = a_fp8
+    b, sfb = b_fp8
     m, k = a.shape
     num_groups, n, k_ = b.shape
     m_, n_ = d.shape
@@ -1376,8 +1387,8 @@ def m_grouped_fp8_gemm_nt_contiguous(
 
 
 def m_grouped_fp8_gemm_nt_masked(
-    a: Tuple[torch.Tensor, torch.Tensor],
-    b: Tuple[torch.Tensor, torch.Tensor],
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    b_fp8: Tuple[torch.Tensor, torch.Tensor],
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
@@ -1388,13 +1399,13 @@ def m_grouped_fp8_gemm_nt_masked(
     compiled_dims = compiled_dims.lower()
 
     # NOTES: shape must be `[G, M, K] @ [G, N, K].mT`
-    major_a = get_major_type_ab(a[0])
-    major_b = get_major_type_ab(b[0])
+    major_a = get_major_type_ab(a_fp8[0])
+    major_b = get_major_type_ab(b_fp8[0])
     assert major_a == major_b == MajorTypeAB.KMajor
     assert masked_m.is_contiguous()
 
-    a, sfa = a
-    b, sfb = b
+    a, sfa = a_fp8
+    b, sfb = b_fp8
     num_groups, m, k = a.shape
     num_groups_, n, k_ = b.shape
     num_groups__, m_, n_ = d.shape

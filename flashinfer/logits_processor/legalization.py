@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import List
+from typing import List, Literal
 
 from .op import Op
 from .processors import LogitsProcessor
@@ -92,7 +92,9 @@ def infer_initial_type(processors: List[LogitsProcessor]) -> TensorType:
     )
 
 
-def _get_supported_types(processor: LogitsProcessor) -> bool:
+def _get_supported_types(
+    processor: LogitsProcessor,
+) -> List[TensorType]:
     valid_types = []
     for tensor_type in [TensorType.LOGITS, TensorType.PROBS]:
         try:

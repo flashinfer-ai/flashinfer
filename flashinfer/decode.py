@@ -1791,6 +1791,18 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
 
 
 class TrtllmGenDecodeModule:
+    def __init__(self) -> None:
+        self._sm_count: Optional[int] = None
+        self._mod = trtllm_gen_fmha_module()
+        self._op = self._mod.build_and_load()
+        from flashinfer.jit.cubin_loader import (
+            setup_cubin_loader,
+            setup_metainfo_loader,
+        )
+
+        setup_cubin_loader(self._mod.get_library_path())
+        setup_metainfo_loader(self._mod.get_library_path())
+
     def _paged_run(
         self,
         query: torch.Tensor,
@@ -1835,18 +1847,6 @@ class TrtllmGenDecodeModule:
 
     def _plan(self, *args, **kwargs):
         pass
-
-    def __init__(self):
-        self._sm_count: Optional[int] = None
-        self._mod = trtllm_gen_fmha_module()
-        self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import (
-            setup_cubin_loader,
-            setup_metainfo_loader,
-        )
-
-        setup_cubin_loader(self._mod.get_library_path())
-        setup_metainfo_loader(self._mod.get_library_path())
 
 
 @functools.cache

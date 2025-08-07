@@ -16,8 +16,9 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -275,7 +276,9 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
-        runner_dict = dict()
+        runner_dict: Dict[
+            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool], Any
+        ] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -347,7 +350,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return range(self.fused_moe_runner.get_tactic_num())
+            return list(range(self.fused_moe_runner.get_tactic_num()))
 
         def forward(
             self,
@@ -758,7 +761,9 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     )
     import glob
 
-    debug_cubin_files = glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+    debug_cubin_files = [
+        Path(p) for p in glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+    ]
 
     return gen_jit_spec(
         "fused_moe_sm100",
