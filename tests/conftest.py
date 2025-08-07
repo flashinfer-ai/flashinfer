@@ -146,11 +146,13 @@ def get_device_properties(device: torch.device) -> dict:
 
 
 def clear_cuda_cache(device: torch.device) -> None:
-    if (
-        torch.cuda.memory_allocated()
-        or torch.cuda.memory_reserved()
-        > 0.8 * get_device_properties(device).total_memory
-    ):
+    total_memory = get_device_properties(device).total_memory
+    reserved_memory = torch.cuda.memory_reserved()
+
+    # FLASHINFER_TEST_MEMORY_THRESHOLD: threshold for PyTorch reserved memory usage (default: 0.9)
+    threshold = float(os.environ.get("FLASHINFER_TEST_MEMORY_THRESHOLD", "0.9"))
+
+    if reserved_memory > threshold * total_memory:
         gc.collect()
         torch.cuda.empty_cache()
 
