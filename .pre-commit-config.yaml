@@ -36,7 +36,7 @@ repos:
 
   # Formatters
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v19.1.1
+    rev: v20.1.8
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
@@ -44,17 +44,16 @@ repos:
           (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
-      rev: ''  # Use the sha / tag you want to point at
+      rev: 'v1.17.1'  # Use the sha / tag you want to point at
       hooks:
       -   id: mypy
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.12.7
+    rev: v0.12.8
     hooks:
       # Run the linter.
       - id: ruff-check
       # Run the formatter.
       - id: ruff-format
-        args: [ --check ]
         types_or: [ python, pyi ]

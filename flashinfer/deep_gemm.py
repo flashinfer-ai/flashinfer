@@ -334,6 +334,7 @@ def get_swizzle_mode(block_size: int, elem_size: int) -> int:
         if (block_size * elem_size) % mode_bytes == 0:
             return mode_bytes
     AssertionError("Invalid mode")
+    return 0
 
 
 def get_sf_aligned_block_sizes(block_m: int, block_n: int, ab_dtype: torch.dtype):
