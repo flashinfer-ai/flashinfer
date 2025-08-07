@@ -2592,7 +2592,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_indptr.dtype,
                 head_dim_qk,
                 head_dim_vo,
-                PosEncodingMode[pos_encoding_mode].value,
+                PosEncodingMode[pos_encoding_mode],
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
@@ -2969,7 +2969,7 @@ def fmha_varlen(
         torch.int32,
         q.shape[2],
         v.shape[2],
-        PosEncodingMode.NONE.value,
+        PosEncodingMode.NONE,
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
     )
