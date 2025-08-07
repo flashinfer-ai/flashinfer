@@ -40,6 +40,44 @@ namespace hip
 {
 
 #define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
+
+__device__ __forceinline__ void transpose_4x4_half_registers(uint32_t *R)
+{
+    // Calculate lane within 4-thread group
+    uint32_t lane_id = threadIdx.x % 64;
+    uint32_t lane_in_group = lane_id % 4;
+
+    // === ROUND 1: Exchange with neighbor (XOR with 1) ===
+    // T0↔T1, T2↔T3 partial exchange
+    uint32_t reg_idx = (lane_in_group >> 1) & 0x1;
+    uint32_t exchanged_val = __shfl_xor(R[reg_idx], 0x1);
+    uint32_t shift = (lane_in_group & 1) * 16;
+    uint32_t keep_mask = 0xFFFF0000 >> shift;
+    int right_shift_amount = 16 * (1 - (lane_in_group & 1));
+    int left_shift_amount = 16 * (lane_in_group & 1);
+    R[reg_idx] = (R[reg_idx] & keep_mask) |
+                 ((exchanged_val >> right_shift_amount) << left_shift_amount);
+
+    // === ROUND 2: Exchange with one hop (XOR with 2) ===
+    // T0↔T2, T1↔T3 exchange R[0] and R[1]
+    // Swap entire registers based on thread position
+    uint32_t is_top = 1 - reg_idx;
+    uint32_t temp0 = __shfl_xor(R[0], 0x2);
+    uint32_t temp1 = __shfl_xor(R[1], 0x2);
+
+    // Compute both possibilities and select
+    R[0] = R[0] * is_top + temp1 * reg_idx;
+    R[1] = temp0 * is_top + R[1] * reg_idx;
+
+    // === ROUND 3: Exchange with neighbor again (XOR with 1) ===
+    // T0↔T1, T2↔T3 exchange remaining parts
+
+    reg_idx = 1 - reg_idx;
+    exchanged_val = __shfl_xor(R[reg_idx], 0x1);
+    R[reg_idx] = (R[reg_idx] & keep_mask) |
+                 ((exchanged_val >> right_shift_amount) << left_shift_amount);
+}
+
 // Single unified load function for all fragment types
 /// @param R [in] pointer to the register file to load the fragment into
 /// @param smem_ptr [in] pointer to the shared memory to load the fragment from
@@ -103,6 +141,32 @@ amdgcn_mfma_fp32_16x16x16fp16(float *C, uint32_t *A, uint32_t *B)
     C[1] = C_fp32[1];
     C[2] = C_fp32[2];
     C[3] = C_fp32[3];
+}
+
+/// Loads a fragment from LDS to two 32bit registers and then transposes
+/// the registers for a group of four consecuitive threads.
+template <typename T>
+__device__ __forceinline__ void
+load_fragment_4x4_half_registers(uint32_t *R, const T *smem_ptr)
+{
+    static_assert(std::is_same_v<T, __half>(), "Only half type is supported");
+    // Each thread loads 4 __half values in two 32b registers.
+    load_fragment(R, smem_ptr);
+    // transposes the values in four adjacent threads. The function does the
+    // following layout transformation:
+    // Original data in registers for Threads 0-3 after fragment load
+    // T0 : a b c d
+    // T1 : e f g h
+    // T2 : i j k l
+    // T3 : m n o p
+    //
+    // After transposition:
+    // T0 : a e i m
+    // T1 : b f j n
+    // T2 : c g k o
+    // T3 : d h l p
+
+    transpose_4x4_half_registers(R);
 }
 
 // Rowsum operation using MMA

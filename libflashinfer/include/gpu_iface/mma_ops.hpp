@@ -44,6 +44,17 @@ load_fragment_transpose(uint32_t *R, const T *smem_ptr, uint32_t stride)
     detail::load_fragment_transpose<T>(R, smem_ptr, stride);
 }
 
+#if defined(PLATFORM_HIP_DEVICE) && defined(__gfx942__)
+template <typename T>
+__device__ __forceinline__ void
+load_fragment_transpose_4x4_half_registers(uint32_t *R, const T *smem_ptr)
+{
+    static_assert(std::is_same<T, int>::value,
+                  "Only __half is supported for the 4x4 register transpose");
+    detail::load_fragment_4x4_half_registers<half>(R, smem_ptr);
+}
+#endif
+
 /*!
  * \brief Wrapper of two mma m16n16k16 instructions for row major and column
  * major f16 matrix multiplication, accumulated in f32.
