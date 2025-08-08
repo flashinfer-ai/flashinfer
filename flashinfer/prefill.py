@@ -66,7 +66,7 @@ def get_fmha_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
-    pos_encoding_mode: PosEncodingMode,
+    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool = False,
@@ -79,7 +79,7 @@ def get_fmha_module(
             dtype_idx,
             head_dim_qk,
             head_dim_vo,
-            pos_encoding_mode.value,
+            pos_encoding_mode,
             use_sliding_window,
             use_logits_soft_cap,
         ).build_and_load()
