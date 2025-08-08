@@ -412,6 +412,10 @@ class FP4Moe(Moe):
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
         for i in range(num_experts):
+            # Calculate the permute indices for the following:
+            # 1. Reorder rows of W1 and scales for fused gated activation
+            # 2. Shuffle weights and scaling factors for transposed mma output
+            # for both w3_w1 and w2 weights and scale factors
             permute_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._cache_permute_indices,
                 gemm1_weights_fp4[i].view(torch.uint8),
