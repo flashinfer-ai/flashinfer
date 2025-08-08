@@ -1006,15 +1006,15 @@ def get_trtllm_moe_sm100_module():
 
         # workspace buffers required by trtllm-gen
         if topk_ids is None:
-            topk_ids = torch.zeros(
+            topk_ids = torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
             )
         if expert_weights is None:
-            expert_weights = torch.zeros(
+            expert_weights = torch.empty(
                 num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
             )
         if output is None:
-            output = torch.zeros(
+            output = torch.empty(
                 num_tokens,
                 hidden_size,
                 dtype=torch.bfloat16,
