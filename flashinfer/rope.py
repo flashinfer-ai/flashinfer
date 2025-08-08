@@ -1151,7 +1151,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
-def mla_rope_quantize(
+def mla_rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
@@ -1159,7 +1159,7 @@ def mla_rope_quantize(
     cos_sin_cache: torch.Tensor,
     pos_ids: torch.Tensor,
     is_neox: bool = True,
-    quantize_dtype: Optional[torch.dtype] = None,
+    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
     quant_scale_q: float = 1.0,
     quant_scale_kv: float = 1.0,
     q_rope_out: Optional[torch.Tensor] = None,
@@ -1170,14 +1170,21 @@ def mla_rope_quantize(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
-    # Infer quantize_dtype from output tensors or default to float8_e4m3fn
-    if quantize_dtype is None:
-        for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
-            if out is not None:
-                quantize_dtype = out.dtype
-                break
-        else:
-            quantize_dtype = torch.float8_e4m3fn
+    assert quantize_dtype in [torch.float8_e4m3fn, torch.float8_e5m2], (
+        "Only e4m3fn and e5m2 are now supported"
+    )
+    assert q_rope_out is None or q_rope_out.dtype == quantize_dtype, (
+        "q_rope_out data type mismatches with quantize dtype"
+    )
+    assert k_rope_out is None or k_rope_out.dtype == quantize_dtype, (
+        "q_rope_out data type mismatches with quantize dtype"
+    )
+    assert q_nope_out is None or q_nope_out.dtype == quantize_dtype, (
+        "q_rope_out data type mismatches with quantize dtype"
+    )
+    assert k_nope_out is None or k_nope_out.dtype == quantize_dtype, (
+        "q_rope_out data type mismatches with quantize dtype"
+    )
 
     # Allocate output tensors if not provided
     q_rope_out = (

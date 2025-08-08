@@ -360,7 +360,7 @@ def test_rope_cos_sin_cache(
 @pytest.mark.parametrize("seq_len", [1, 231, 512, 1027])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn])
-def test_mla_rope_quantize(
+def test_mla_rope_quantize_fp8(
     batch_size,
     seq_len,
     input_dtype,
@@ -369,13 +369,14 @@ def test_mla_rope_quantize(
     device = "cuda:0"
     num_qo_heads = 128
     nnz = batch_size * seq_len
-    q_in = torch.randn(nnz, num_qo_heads, 576, dtype=input_dtype, device=device)
-    k_in = torch.randn(nnz, 576, dtype=input_dtype, device=device)
+    head_size = 576
+    q_in = torch.randn(nnz, num_qo_heads, head_size, dtype=input_dtype, device=device)
+    k_in = torch.randn(nnz, head_size, dtype=input_dtype, device=device)
     pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
 
     # baseline
     rope_flashinfer = FlashInferRotaryEmbedding(
-        576,
+        head_size,
         64,
         4096,
         10000,
@@ -392,7 +393,7 @@ def test_mla_rope_quantize(
 
     q_out = torch.empty_like(q_in, dtype=quant_dtype)
     k_out = torch.empty_like(k_in, dtype=quant_dtype)
-    flashinfer.rope.mla_rope_quantize(
+    flashinfer.rope.mla_rope_quantize_fp8(
         q_in[..., :64],
         k_in[..., :64],
         q_in[..., 64:],
@@ -400,6 +401,7 @@ def test_mla_rope_quantize(
         rope_flashinfer.cos_sin_cache,
         pos_ids,
         is_neox=False,
+        quantize_dtype=quant_dtype,
         q_rope_out=q_out[..., :64],
         k_rope_out=k_out[..., :64],
         q_nope_out=q_out[..., 64:],
@@ -422,4 +424,4 @@ if __name__ == "__main__":
     # test_rope_cos_sin_cache(
     #     64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1
     # )
-    test_mla_rope_quantize(1, 1, torch.float16, torch.float8_e4m3fn)
+    test_mla_rope_quantize_fp8(1, 231, torch.float16, torch.float8_e4m3fn)
