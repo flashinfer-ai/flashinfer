@@ -162,7 +162,7 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
 #pragma unroll
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
-              o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
+              o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id >> 1) & 1];
         }
       }
     }
