@@ -106,7 +106,7 @@ def test_cudnn_prefill_deepseek(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # output = torch.zeros_like(q)
-    output, lse = flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
+    output, lse = flashinfer.cudnn.prefill.cudnn_batch_prefill_with_kv_cache(
         q,
         k_cache,
         v_cache,
