@@ -7,7 +7,11 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm64]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: [self-hosted, Linux, ARM64]
+            arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
