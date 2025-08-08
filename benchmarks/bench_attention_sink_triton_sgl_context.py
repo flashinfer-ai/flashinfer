@@ -469,6 +469,7 @@ def extend_attention_fwd(
         **extra_kargs,
     )
 
+
 def bench_extend_attention_sink_triton_sgl(
     batch_size, seq_len, head_qo_num, head_kv_num, head_dim, bench_with_sink
 ):
@@ -485,29 +486,43 @@ def bench_extend_attention_sink_triton_sgl(
     total_prefix_tokens = batch_size * prefill_len
 
     # Create query, key, value tensors for extension
-    q_extend = torch.randn(total_extend_tokens, head_qo_num, head_dim, dtype=dtype, device=device)
-    k_extend = torch.randn(total_extend_tokens, head_kv_num, head_dim, dtype=dtype, device=device)
-    v_extend = torch.randn(total_extend_tokens, head_kv_num, head_dim, dtype=dtype, device=device)
+    q_extend = torch.randn(
+        total_extend_tokens, head_qo_num, head_dim, dtype=dtype, device=device
+    )
+    k_extend = torch.randn(
+        total_extend_tokens, head_kv_num, head_dim, dtype=dtype, device=device
+    )
+    v_extend = torch.randn(
+        total_extend_tokens, head_kv_num, head_dim, dtype=dtype, device=device
+    )
     o_extend = torch.empty_like(q_extend)
 
     # Create key-value buffers for prefix
-    k_buffer = torch.randn(total_prefix_tokens, head_kv_num, head_dim, dtype=dtype, device=device)
-    v_buffer = torch.randn(total_prefix_tokens, head_kv_num, head_dim, dtype=dtype, device=device)
+    k_buffer = torch.randn(
+        total_prefix_tokens, head_kv_num, head_dim, dtype=dtype, device=device
+    )
+    v_buffer = torch.randn(
+        total_prefix_tokens, head_kv_num, head_dim, dtype=dtype, device=device
+    )
 
     # Create index pointers
-    qo_indptr = torch.arange(0, (batch_size + 1) * extend_len, extend_len, device=device).to(
-        torch.int32
-    )
-    kv_indptr = torch.arange(0, (batch_size + 1) * prefill_len, prefill_len, device=device).to(
-        torch.int32
-    )
+    qo_indptr = torch.arange(
+        0, (batch_size + 1) * extend_len, extend_len, device=device
+    ).to(torch.int32)
+    kv_indptr = torch.arange(
+        0, (batch_size + 1) * prefill_len, prefill_len, device=device
+    ).to(torch.int32)
     kv_indices = torch.arange(0, total_prefix_tokens, device=device).to(torch.int32)
 
     sm_scale = 1.0 / (head_dim**0.5)
     # sliding_window = 128  # From GPT-OSS config, skip for now
     sliding_window = -1
 
-    sink = torch.randn(head_qo_num, device=device, dtype=torch.float32) if bench_with_sink else None
+    sink = (
+        torch.randn(head_qo_num, device=device, dtype=torch.float32)
+        if bench_with_sink
+        else None
+    )
 
     # warmup
     for _ in range(5):
@@ -556,7 +571,10 @@ def bench_extend_attention_sink_triton_sgl(
     )
     ms = np.median(measurements)
     kv_cache_numel = k_buffer.numel() + v_buffer.numel()
-    io = q_extend.numel() * q_extend.element_size() + kv_cache_numel * k_buffer.element_size()
+    io = (
+        q_extend.numel() * q_extend.element_size()
+        + kv_cache_numel * k_buffer.element_size()
+    )
     print(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={head_qo_num}, num_kv_heads={head_kv_num}, head_dim={head_dim}"
     )

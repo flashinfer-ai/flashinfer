@@ -1,4 +1,5 @@
 # bench: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+# mypy: disable-error-code="no-redef"
 
 """
 Memory-efficient attention for decoding.
@@ -256,6 +257,7 @@ def _fwd_grouped_kernel_stage1(
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
 
+    # ruff: noqa: SIM300
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
     else:
@@ -733,7 +735,6 @@ def bench_decode_attention_sink_triton_sgl(
     torch.manual_seed(42)
     device = "cuda:0"
 
-    D_V = head_dim
     dtype = torch.bfloat16
     total_tokens = batch_size * seq_len
     device = torch.device("cuda")
