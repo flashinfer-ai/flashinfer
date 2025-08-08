@@ -21,7 +21,7 @@ def insert_runllm_widget(html_content):
 
 def process_html_files(build_dir):
     processed_count = 0
-    for root, dirs, files in os.walk(build_dir):
+    for root, _dirs, files in os.walk(build_dir):
         for file in files:
             if file.endswith(".html"):
                 file_path = os.path.join(root, file)

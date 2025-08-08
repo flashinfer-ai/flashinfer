@@ -16,9 +16,8 @@ limitations under the License.
 
 import functools
 from enum import Enum
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -303,9 +302,9 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
         AssertionError: If input dtype is not uint8.
     """
     # TODO(shuw): check input dtype is uint8
-    assert (
-        unswizzled_sf.dtype == torch.uint8
-    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert unswizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    )
     return get_fp4_quantization_sm100_module().block_scale_interleave_sm100(
         unswizzled_sf,
     )

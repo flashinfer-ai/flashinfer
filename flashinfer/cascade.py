@@ -15,8 +15,7 @@ limitations under the License.
 """
 
 import functools
-from functools import cache
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -92,7 +91,6 @@ def merge_state(
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    device = v_a.device
     s_a = s_a.to(torch.float32)
     s_b = s_b.to(torch.float32)
     v_merged = torch.empty_like(v_a)

@@ -89,9 +89,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )  # quant: fp16/bf16 -> fp4, reference: cpp/tensorrt_llm/thop/allreduceOp.cpp:L487
 
                             scale_out = None
-                            assert (
-                                HIDDEN_SIZE % SF_VEC_SIZE == 0
-                            ), "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            assert HIDDEN_SIZE % SF_VEC_SIZE == 0, (
+                                "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            )
                             if (
                                 swizzled_layout_code
                                 == comm.QuantizationSFLayout.SWIZZLED
@@ -439,9 +439,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

@@ -194,9 +194,9 @@ def test_block_scale_interleave(
     expected_shape = (padded_row, padded_col // sf_vec_size)
     expected_size = expected_shape[0] * expected_shape[1]
 
-    assert (
-        expected_size == swizzled_sf.shape[0]
-    ), f"Expected size {expected_size}, got {swizzled_sf.shape[0]}"
+    assert expected_size == swizzled_sf.shape[0], (
+        f"Expected size {expected_size}, got {swizzled_sf.shape[0]}"
+    )
     assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
     assert_equal(swizzled_sf.reshape(expected_shape), ref_swizzled_sf)
 
@@ -251,20 +251,20 @@ def test_e2m1_dequantization(
     x_float32 = x.to(torch.float32)
 
     # Step 3: Compare results
-    assert (
-        dequantized_tensor.shape == x.shape
-    ), f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
-    assert (
-        dequantized_tensor.dtype == torch.float32
-    ), f"Expected float32, got {dequantized_tensor.dtype}"
+    assert dequantized_tensor.shape == x.shape, (
+        f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
+    )
+    assert dequantized_tensor.dtype == torch.float32, (
+        f"Expected float32, got {dequantized_tensor.dtype}"
+    )
 
     # Check for invalid values
-    assert not torch.isnan(
-        dequantized_tensor
-    ).any(), "Dequantized tensor contains NaN values"
-    assert not torch.isinf(
-        dequantized_tensor
-    ).any(), "Dequantized tensor contains Inf values"
+    assert not torch.isnan(dequantized_tensor).any(), (
+        "Dequantized tensor contains NaN values"
+    )
+    assert not torch.isinf(dequantized_tensor).any(), (
+        "Dequantized tensor contains Inf values"
+    )
 
     # Compare with original - should be reasonably close since FP4 is designed to preserve important values
     torch.testing.assert_close(

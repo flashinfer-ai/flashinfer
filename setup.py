@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess
 from pathlib import Path
+from typing import List, Mapping
 
 import setuptools
 from setuptools.dist import Distribution
@@ -50,8 +51,8 @@ def generate_build_meta(aot_build_meta: dict) -> None:
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 
-ext_modules = []
-cmdclass = {}
+ext_modules: List[setuptools.Extension] = []
+cmdclass: Mapping[str, type[setuptools.Command]] = {}
 install_requires = [
     "numpy",
     "torch",
@@ -60,8 +61,6 @@ install_requires = [
     "cuda-python",
     "pynvml",
     "einops",
-    "nvidia-nvshmem-cu12",
-    "nvidia-cudnn-cu12",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
 generate_build_meta({})

@@ -61,9 +61,9 @@ def find_loaded_library(lib_name) -> Optional[str]:
     start = line.index("/")
     path = line[start:].strip()
     filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(
-        lib_name
-    ), f"Unexpected filename: {filename} for library {lib_name}"
+    assert filename.rpartition(".so")[0].startswith(lib_name), (
+        f"Unexpected filename: {filename} for library {lib_name}"
+    )
     return path
 
 

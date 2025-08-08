@@ -1,6 +1,5 @@
 import logging
 import multiprocessing as mp
-import os
 import socket
 from typing import Any
 
@@ -92,9 +91,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [8])

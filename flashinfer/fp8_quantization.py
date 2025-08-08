@@ -1,7 +1,6 @@
 import functools
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Tuple
 
 import torch
 

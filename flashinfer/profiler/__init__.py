@@ -19,7 +19,7 @@ import csv
 import json
 from collections import namedtuple
 from enum import Enum
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from tg4perfetto import TraceGenerator
@@ -64,7 +64,7 @@ def export_to_perfetto_trace(
 
     pid_map = {}
     tid_map = {}
-    track_map = {}
+    track_map: Dict[Tuple[int, int, int], Any] = {}
 
     for i in range(1, len(profiler_buffer_host)):
         if profiler_buffer_host[i] == 0:

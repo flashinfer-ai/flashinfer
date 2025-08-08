@@ -117,9 +117,9 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     )
 
                                     scale_out = None
-                                    assert (
-                                        hidden_dim % SF_VEC_SIZE == 0
-                                    ), "hidden_dim must be divisible by SF_VEC_SIZE"
+                                    assert hidden_dim % SF_VEC_SIZE == 0, (
+                                        "hidden_dim must be divisible by SF_VEC_SIZE"
+                                    )
                                     if (
                                         swizzled_layout_code
                                         == comm.QuantizationSFLayout.SWIZZLED
@@ -343,9 +343,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])

@@ -126,15 +126,15 @@ class TestLogitsPipeCompilation:
         similarity_compiled = torch.cosine_similarity(freq_compiled, probs)
         similarity_no_compile = torch.cosine_similarity(freq_no_compile, probs)
         assert similarity_compiled > 0.99, f"Compiled similarity: {similarity_compiled}"
-        assert (
-            similarity_no_compile > 0.99
-        ), f"Non-compiled similarity: {similarity_no_compile}"
+        assert similarity_no_compile > 0.99, (
+            f"Non-compiled similarity: {similarity_no_compile}"
+        )
 
         # check if compiled and non-compiled results are similar
         freq_similarity = torch.cosine_similarity(freq_compiled, freq_no_compile, dim=0)
-        assert (
-            freq_similarity > 0.99
-        ), f"Compiled vs non-compiled similarity: {freq_similarity}"
+        assert freq_similarity > 0.99, (
+            f"Compiled vs non-compiled similarity: {freq_similarity}"
+        )
 
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(
@@ -181,15 +181,15 @@ class TestLogitsPipeCompilation:
         similarity_compiled = torch.cosine_similarity(freq_compiled, probs)
         similarity_no_compile = torch.cosine_similarity(freq_no_compile, probs)
         assert similarity_compiled > 0.99, f"Compiled similarity: {similarity_compiled}"
-        assert (
-            similarity_no_compile > 0.99
-        ), f"Non-compiled similarity: {similarity_no_compile}"
+        assert similarity_no_compile > 0.99, (
+            f"Non-compiled similarity: {similarity_no_compile}"
+        )
 
         # check if compiled and non-compiled results are similar
         freq_similarity = torch.cosine_similarity(freq_compiled, freq_no_compile, dim=0)
-        assert (
-            freq_similarity > 0.99
-        ), f"Compiled vs non-compiled similarity: {freq_similarity}"
+        assert freq_similarity > 0.99, (
+            f"Compiled vs non-compiled similarity: {freq_similarity}"
+        )
 
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(
@@ -254,15 +254,15 @@ class TestLogitsPipeCompilation:
         similarity_no_compile = torch.cosine_similarity(freq_no_compile, masked_probs)
         # check if the sampled results follow given distribution
         assert similarity_compiled > 0.99, f"Compiled similarity: {similarity_compiled}"
-        assert (
-            similarity_no_compile > 0.99
-        ), f"Non-compiled similarity: {similarity_no_compile}"
+        assert similarity_no_compile > 0.99, (
+            f"Non-compiled similarity: {similarity_no_compile}"
+        )
 
         # check if compiled and non-compiled results are similar
         freq_similarity = torch.cosine_similarity(freq_compiled, freq_no_compile, dim=0)
-        assert (
-            freq_similarity > 0.99
-        ), f"Compiled vs non-compiled similarity: {freq_similarity}"
+        assert freq_similarity > 0.99, (
+            f"Compiled vs non-compiled similarity: {freq_similarity}"
+        )
 
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(
@@ -326,15 +326,15 @@ class TestLogitsPipeCompilation:
         similarity_compiled = torch.cosine_similarity(freq_compiled, masked_probs)
         similarity_no_compile = torch.cosine_similarity(freq_no_compile, masked_probs)
         assert similarity_compiled > 0.99, f"Compiled similarity: {similarity_compiled}"
-        assert (
-            similarity_no_compile > 0.99
-        ), f"Non-compiled similarity: {similarity_no_compile}"
+        assert similarity_no_compile > 0.99, (
+            f"Non-compiled similarity: {similarity_no_compile}"
+        )
 
         # check if compiled and non-compiled results are similar
         freq_similarity = torch.cosine_similarity(freq_compiled, freq_no_compile, dim=0)
-        assert (
-            freq_similarity > 0.99
-        ), f"Compiled vs non-compiled similarity: {freq_similarity}"
+        assert freq_similarity > 0.99, (
+            f"Compiled vs non-compiled similarity: {freq_similarity}"
+        )
 
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(
@@ -400,15 +400,15 @@ class TestLogitsPipeCompilation:
         similarity_compiled = torch.cosine_similarity(freq_compiled, masked_probs)
         similarity_no_compile = torch.cosine_similarity(freq_no_compile, masked_probs)
         assert similarity_compiled > 0.99, f"Compiled similarity: {similarity_compiled}"
-        assert (
-            similarity_no_compile > 0.99
-        ), f"Non-compiled similarity: {similarity_no_compile}"
+        assert similarity_no_compile > 0.99, (
+            f"Non-compiled similarity: {similarity_no_compile}"
+        )
 
         # check if compiled and non-compiled results are similar
         freq_similarity = torch.cosine_similarity(freq_compiled, freq_no_compile, dim=0)
-        assert (
-            freq_similarity > 0.99
-        ), f"Compiled vs non-compiled similarity: {freq_similarity}"
+        assert freq_similarity > 0.99, (
+            f"Compiled vs non-compiled similarity: {freq_similarity}"
+        )
 
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize(

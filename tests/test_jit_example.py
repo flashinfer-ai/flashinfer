@@ -5,7 +5,6 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.jit
 from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.jit.attention import (
     gen_customize_single_decode_module,

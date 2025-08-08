@@ -17,6 +17,7 @@ limitations under the License.
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
+from .op import Op
 from .types import TensorType
 
 
@@ -65,7 +66,7 @@ class LogitsProcessor(ABC):
         self.params = params
 
     @abstractmethod
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
 
@@ -119,7 +120,7 @@ class Temperature(LogitsProcessor):
         """
         super().__init__(**params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """
@@ -177,7 +178,7 @@ class Softmax(LogitsProcessor):
         """
         super().__init__(enable_pdl=enable_pdl, **params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """
@@ -254,7 +255,7 @@ class TopK(LogitsProcessor):
         """
         super().__init__(joint_topk_topp=joint_topk_topp, **params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """
@@ -306,7 +307,7 @@ class TopP(LogitsProcessor):
         """
         super().__init__(**params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """
@@ -354,7 +355,7 @@ class MinP(LogitsProcessor):
         """
         super().__init__(**params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """
@@ -434,7 +435,7 @@ class Sample(LogitsProcessor):
         """
         super().__init__(deterministic=deterministic, **params)
 
-    def legalize(self, input_type: TensorType) -> List["Op"]:
+    def legalize(self, input_type: TensorType) -> List[Op]:
         """
         Legalize the processor into a list of low-level operators.
         """

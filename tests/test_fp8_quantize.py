@@ -1,10 +1,7 @@
-import functools
-
 import pytest
 import torch
 
 from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
-from flashinfer.utils import is_sm100a_supported
 
 
 @pytest.mark.parametrize("m", [1, 1024])

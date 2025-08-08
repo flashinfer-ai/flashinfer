@@ -398,7 +398,6 @@ def test_batch_mla_varlen_page_attention(
         o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
         lse_ref = lse_ref.flatten(0, 1)
         o_i = o[q_rows_arr[i]]
-        lse_i = lse[q_rows_arr[i]]
         torch.testing.assert_close(o_i, o_ref, rtol=1e-3, atol=1e-3)
         # if kv_lens[i] != 0:
         #     torch.testing.assert_close(lse_i, lse_ref, rtol=1e-3, atol=1e-3)

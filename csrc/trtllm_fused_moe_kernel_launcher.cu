@@ -1062,7 +1062,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
     hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
   }
   int weight_scale_vec_size =
-      (num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
+      (local_num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
   TORCH_CHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32,
               "unsupported weight_scale_vec_size.");
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;

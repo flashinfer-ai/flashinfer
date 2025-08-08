@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import math
 from abc import ABC, abstractmethod
 from enum import IntEnum
+from typing import Literal
 
-import nvtx
 import pytest
 import torch
 from cuda.bindings import runtime
@@ -126,7 +125,7 @@ class CUDAGraphMoE:
             self.is_captured = True
         except Exception as e:
             self.cleanup()
-            raise RuntimeError(f"CUDA graph capture failed: {e}")
+            raise RuntimeError(f"CUDA graph capture failed: {e}") from e
 
     def launch(self, hidden_states_new):
         """Launch captured CUDA graph with new input."""
@@ -1136,7 +1135,7 @@ def check_accuracy(a, b, atol, rtol, percent):
     if mismatch_percent > 1 - percent:
         raise Exception(
             f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
-            f"(threshold: {1-percent:.4f})"
+            f"(threshold: {1 - percent:.4f})"
         )
 
 
@@ -1339,7 +1338,7 @@ def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
 # ====================================================================================
 
 
-def run_moe_dequant(args, quant_mode=["fp4", "dsFp8", "perTensorFp8"]):
+def run_moe_dequant(args, quant_mode: Literal["fp4", "dsFp8", "perTensorFp8"]):
     """Common dequantized MoE reference implementation."""
     # Permute
     total_num_padded_tokens = args.permute_info["permutedBufferSize"]
