@@ -379,33 +379,25 @@ inline std::string toString(trtllm::gen::MmaKind e) {
 
 inline std::string dumpOptions(GemmOptions const& options) {
   std::stringstream ss;
-  ss << "mAllReduceAlgo="
-     << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")"
-     << "," << std::endl;
-  ss << "mBiasType="
-     << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")"
-     << "," << std::endl;
+  ss << "mAllReduceAlgo=" << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo)
+     << ")" << "," << std::endl;
+  ss << "mBiasType=" << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")" << ","
+     << std::endl;
   ss << "mBlockK=" << options.mBlockK << "," << std::endl;
   ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
   ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
   ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
-  ss << "mDtypeAcc="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
+  ss << "mDtypeAcc=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
      << "," << std::endl;
-  ss << "mDtypeA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")"
+  ss << "mDtypeA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")" << ","
+     << std::endl;
+  ss << "mDtypeB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")" << ","
+     << std::endl;
+  ss << "mDtypeC=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")" << ","
+     << std::endl;
+  ss << "mDtypeMmaA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
      << "," << std::endl;
-  ss << "mDtypeB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")"
-     << "," << std::endl;
-  ss << "mDtypeC="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
+  ss << "mDtypeMmaB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
      << "," << std::endl;
   ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
   ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
@@ -422,16 +414,14 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mHoistLoadTaskInit=" << options.mHoistLoadTaskInit << "," << std::endl;
   ss << "mHoistMmaTaskTryWaits=" << options.mHoistMmaTaskTryWaits << "," << std::endl;
   ss << "mK=" << options.mK << "," << std::endl;
-  ss << "mKernelTraits={}"
-     << "," << std::endl;
-  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
-     << "," << std::endl;
-  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
-     << "," << std::endl;
+  ss << "mKernelTraits={}" << "," << std::endl;
+  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")" << ","
+     << std::endl;
+  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")" << ","
+     << std::endl;
   ss << "mM=" << options.mM << "," << std::endl;
   ss << "mMmaK=" << options.mMmaK << "," << std::endl;
-  ss << "mMmaKind="
-     << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
+  ss << "mMmaKind=" << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
      << "," << std::endl;
   ss << "mMmaM=" << options.mMmaM << "," << std::endl;
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
@@ -448,9 +438,8 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
   ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
   ss << "mSliceK=" << options.mSliceK << "," << std::endl;
-  ss << "mSplitK="
-     << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
-     << "," << std::endl;
+  ss << "mSplitK=" << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")" << ","
+     << std::endl;
   ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
   ss << "mTileM=" << options.mTileM << "," << std::endl;
   ss << "mTileN=" << options.mTileN << "," << std::endl;
@@ -465,18 +454,15 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
   ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
   ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
-  ss << "mSfLayoutA="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
+  ss << "mSfLayoutA=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutB="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
+  ss << "mSfLayoutB=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutC="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
+  ss << "mSfLayoutC=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
      << "," << std::endl;
   ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
-  ss << "mTileScheduler="
-     << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")" << std::endl;
+  ss << "mTileScheduler=" << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler)
+     << ")" << std::endl;
   return ss.str();
 }
 
