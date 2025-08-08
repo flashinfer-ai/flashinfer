@@ -19,11 +19,16 @@ from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
+# This version should be updated whenever the nvfp4_cutlass backend is changed,
+# such as when new kernels or configs are added. In such cases, the tuning configs
+# should also be updated. Currently, this process is manual, but it should be automated in the future.
+_nvfp4_cutlass_version = "0.1"
+
 
 def get_config_path(is_module: bool):
     dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    fi_ver = flashinfer_version.replace(".", "_")
-    config_name = f"v{fi_ver}_trtllm_fused_moe_{dev_name}"
+    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
+    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
     if is_module:
         return f"flashinfer.tuning_configs.{config_name}"
     else:
