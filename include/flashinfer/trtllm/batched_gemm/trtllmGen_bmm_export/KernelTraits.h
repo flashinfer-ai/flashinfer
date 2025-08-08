@@ -137,7 +137,7 @@ class MemAllocatorHelper {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind) {
+inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind) {
   if (mmaKind == tg::MmaKind::Auto) {
     throw std::runtime_error("mmaKind != tg::MmaKind::Auto");
   }
