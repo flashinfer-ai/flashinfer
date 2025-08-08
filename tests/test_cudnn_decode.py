@@ -98,7 +98,7 @@ def test_cudnn_decode(
         workspace_buffer_size, dtype=torch.int8, device=device
     )
 
-    output = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
+    output = flashinfer.cudnn.cudnn_batch_decode_with_kv_cache(
         q,
         k_cache,
         v_cache,
