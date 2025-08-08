@@ -74,14 +74,15 @@ def bench_trtllm_fmha_wrapper(
     max_seq_len,
     page_size,
     num_kv_heads,
+    head_dim,
     q_dtype,
     head_grp_size,
     kv_cache_dtype,
     window_left,
+    bench_with_sink,
 ):
     torch.manual_seed(42)
     device = "cuda:0"
-    head_dim = 128
     num_qo_heads = num_kv_heads * head_grp_size
     batch_size = batch_size
 
@@ -120,6 +121,12 @@ def bench_trtllm_fmha_wrapper(
 
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
 
+    sinks = (
+        torch.randn(num_qo_heads, device=device, dtype=torch.float32)
+        if bench_with_sink
+        else None
+    )
+
     # Compute kv_indptr as cumulative sum of blocks per sequence
     kv_indptr = (
         torch.cat(
@@ -137,7 +144,7 @@ def bench_trtllm_fmha_wrapper(
 
     # trtllm-gen
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, backend="trtllm-gen"
+        workspace_buffer, "HND", backend="trtllm-gen"
     )
     wrapper.plan(
         kv_indptr,
@@ -154,11 +161,11 @@ def bench_trtllm_fmha_wrapper(
     )
 
     # add one warmup here
-    wrapper.run(q, kv_cache)
+    wrapper.run(q, kv_cache, sinks=sinks)
     torch.cuda.synchronize()
 
     measurements = bench_gpu_time_with_cudagraph(
-        lambda: wrapper.run(q, kv_cache),
+        lambda: wrapper.run(q, kv_cache, sinks=sinks),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
     )
@@ -172,16 +179,51 @@ def bench_trtllm_fmha_wrapper(
 
 
 if __name__ == "__main__":
-    for batch_size in [4, 128, 256]:
-        for seq_len in [1024, 4096, 8192, 16384]:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark TRTLLM FMHA")
+    parser.add_argument(
+        "--head_dim", type=int, default=64, help="Dimension of each head"
+    )
+    parser.add_argument(
+        "--num_kv_heads", type=int, default=8, help="Number of key/value heads"
+    )
+    parser.add_argument(
+        "--page_size", type=int, default=16, help="Size of each page [16, 32, 64]"
+    )
+    parser.add_argument(
+        "--head_grp_size", type=int, default=8, help="Number of query heads"
+    )
+    parser.add_argument("--sink", action="store_true", help="Whether to test with sink")
+    parser.add_argument(
+        "--batch_sizes",
+        type=int,
+        nargs="+",
+        default=[4, 128, 256],
+        help="List of batch sizes to test",
+    )
+    parser.add_argument(
+        "--seq_lens",
+        type=int,
+        nargs="+",
+        default=[1024, 4096, 8192, 16384],
+        help="List of sequence lengths to test",
+    )
+
+    args = parser.parse_args()
+
+    for batch_size in args.batch_sizes:
+        for seq_len in args.seq_lens:
             bench_trtllm_fmha_wrapper(
                 kv_layout="HND",
                 batch_size=batch_size,
                 max_seq_len=seq_len,
-                page_size=16,
-                num_kv_heads=4,
+                page_size=args.page_size,
+                num_kv_heads=args.num_kv_heads,
+                head_dim=args.head_dim,
                 q_dtype="bf16",
-                head_grp_size=1,
+                head_grp_size=args.head_grp_size,
                 kv_cache_dtype="auto",
                 window_left=-1,
+                bench_with_sink=args.sink,
             )
