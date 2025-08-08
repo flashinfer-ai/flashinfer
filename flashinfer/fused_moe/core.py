@@ -329,7 +329,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = module.FusedMoeRunner(
+                runner = torch.classes.fused_moe_sm100.FusedMoeRunner(
                     x_dtype,
                     weight_dtype,
                     output_dtype,
@@ -337,6 +337,8 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
                     use_w4a8_group_scaling,
                     use_mxfp8_act_scaling,
                 )
+                MoERunner.runner_dict[instance_key] = runner
+
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
