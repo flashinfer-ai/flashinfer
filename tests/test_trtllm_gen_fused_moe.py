@@ -30,7 +30,6 @@ from flashinfer import (
     next_positive_power_of_2,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
-    shuffle_matrix_sf_a,
 )
 from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
 from flashinfer.fused_moe import (
