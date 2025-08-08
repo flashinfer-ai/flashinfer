@@ -266,7 +266,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 @functools.cache
 def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
-    module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+    gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
         class_name="FusedMoeRunner"
     )
 
@@ -329,14 +329,17 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = module.FusedMoeRunner(
-                    x_dtype,
-                    weight_dtype,
-                    output_dtype,
-                    use_deepseek_fp8_block_scale,
-                    use_w4a8_group_scaling,
-                    use_mxfp8_act_scaling,
+                MoERunner.runner_dict[instance_key] = (
+                    torch.classes.fused_moe_sm100.FusedMoeRunner(
+                        x_dtype,
+                        weight_dtype,
+                        output_dtype,
+                        use_deepseek_fp8_block_scale,
+                        use_w4a8_group_scaling,
+                        use_mxfp8_act_scaling,
+                    )
                 )
+
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
