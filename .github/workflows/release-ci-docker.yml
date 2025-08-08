@@ -5,7 +5,10 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm64]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Login to Docker Hub
@@ -20,3 +23,4 @@ jobs:
           file: docker/Dockerfile.ci_gpu
           push: true
           tags: flashinfer/flashinfer-ci:latest
+
