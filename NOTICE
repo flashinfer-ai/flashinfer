@@ -1,3 +1,8 @@
+FlashInfer
 Copyright 2025 NVIDIA
+Copyright 2023-2025 FlashInfer community (https://flashinfer.ai/)
 
-Copyright 2023-2025 Flashinfer community (https://flashinfer.ai/)
+-------------------------------------------------------------------------------------------------
+Some of the code in this project are adapted from other open-source projects with different
+licenses. This product also bundles some third-party components under other open source licenses.
+See licenses/ for text of these licenses.
