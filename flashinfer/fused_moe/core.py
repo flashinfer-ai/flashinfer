@@ -25,13 +25,11 @@ import torch
 from ..artifacts import ArtifactPath
 from ..autotuner import (
     AutoTuner,
-    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
-from ..fp4_quantization import nvfp4_block_scale_interleave
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
@@ -44,8 +42,6 @@ from ..utils import (
     register_fake_op,
 )
 from .utils import (
-    compute_swizzled_sf_shape,
-    fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
@@ -237,7 +233,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         )
 
     except Exception as e:
-        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
         "fused_moe_sm100",
@@ -389,15 +385,13 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
-                        x_dtype,
-                        weight_dtype,
-                        output_dtype,
-                        use_deepseek_fp8_block_scale,
-                        use_w4a8_group_scaling,
-                        use_mxfp8_act_scaling,
-                    )
+                MoERunner.runner_dict[instance_key] = module.FusedMoeRunner(
+                    x_dtype,
+                    weight_dtype,
+                    output_dtype,
+                    use_deepseek_fp8_block_scale,
+                    use_w4a8_group_scaling,
+                    use_mxfp8_act_scaling,
                 )
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
@@ -886,7 +880,6 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
     ) -> torch.Tensor:
-
         # Call the C++ function
         output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
@@ -964,7 +957,6 @@ def get_trtllm_moe_sm100_module():
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
     ) -> torch.Tensor:
-
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1056,9 +1048,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
-            assert (
-                topk_ids is not None
-            ), "either topk_ids or routing_logits must be provided."
+            assert topk_ids is not None, (
+                "either topk_ids or routing_logits must be provided."
+            )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
             routing_dtype = torch.bfloat16
         else:

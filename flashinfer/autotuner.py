@@ -160,7 +160,6 @@ class FakeTensor:
 
 
 class TunableRunner(ABC):
-
     @abstractmethod
     def get_valid_tactics(
         self, inputs: List[torch.Tensor], profile: OptimizationProfile
@@ -275,7 +274,7 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
                 stats_str += f"    - Success rate: {success_rate:.1f}%\n"
@@ -420,9 +419,9 @@ class AutoTuner:
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
-        assert all(
-            [isinstance(r, TunableRunner) for r in runners]
-        ), "All Given runners must be subclass of TunableRunner"
+        assert all([isinstance(r, TunableRunner) for r in runners]), (
+            "All Given runners must be subclass of TunableRunner"
+        )
 
         profiles = self._optimization_profiles(tuning_config, inputs)
         # Record the total configs to try
@@ -495,7 +494,6 @@ class AutoTuner:
         return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-
         # Handle None tensors for optional inputs and non-Tensor scalar values
         sizes = [
             input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
@@ -588,7 +586,9 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(
                 spec.gen_tuning_buckets, (list, tuple)
-            ), "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            ), (
+                "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            )
             if inspect.isfunction(spec.gen_tuning_buckets):
                 opt_shapes = spec.gen_tuning_buckets(
                     base_profile.shapes[spec.input_idx][spec.dim_idx]._opt()
@@ -607,7 +607,7 @@ class AutoTuner:
         dim_grids = itertools.product(*[d[-1] for d in dynamic_dims])
         for opt_point in dim_grids:
             p = copy.deepcopy(base_profile)
-            for pos, (input_idx, dim_idx, opt_shapes_max, opt_shapes) in enumerate(
+            for pos, (input_idx, dim_idx, opt_shapes_max, _opt_shapes) in enumerate(
                 dynamic_dims
             ):
                 opt_value = opt_point[pos]

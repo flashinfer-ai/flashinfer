@@ -1,9 +1,8 @@
 import numpy as np
 import torch
-import triton
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
 
 num_q_heads = 128
 num_kv_heads = 1
@@ -119,7 +118,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         f"batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
     )
     print(f"execution time: {ms} ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
     print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs/s")
 
 
