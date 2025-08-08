@@ -366,19 +366,6 @@ class FP4Moe(Moe):
         use_ue8m0 = False
         epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
 
-        # Calculate scaling factors that depend on weights
-        scale_c_fc1 = (
-            args_dequant.c_global_sf
-            * (1.0 / args.gemm1_scales_global)
-            * (1.0 / args.hidden_states_scale_global)
-        )
-        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
-            1.0 / args.hidden_states_scale_global
-        )
-        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
-            1.0 / args.gemm2_scales_global
-        )
-
         # Quantize weights with linear layout for kernels
         _, gemm1_scales_linear_fp4_bytes, _ = quant_fp4_batches(
             gemm1_weights_orig, num_experts, use_ue8m0, False
@@ -483,6 +470,19 @@ class FP4Moe(Moe):
             torch.stack(gemm2_scales_fp4_shuffled)
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, hidden_size, intermediate_size // 16)
+        )
+
+        # Calculate scaling factors that depend on weights
+        scale_c_fc1 = (
+            args_dequant.c_global_sf
+            * (1.0 / args.gemm1_scales_global)
+            * (1.0 / args.hidden_states_scale_global)
+        )
+        scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
+            1.0 / args.hidden_states_scale_global
+        )
+        scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
+            1.0 / args.gemm2_scales_global
         )
 
         return {
