@@ -326,10 +326,7 @@ RealComplexBijection = [
 
 #
 def is_complex(data_type):
-    for r, c in RealComplexBijection:
-        if data_type == c:
-            return True
-    return False
+    return any(data_type == c for _r, c in RealComplexBijection)
 
 
 def is_block_scaled(gemm_kind):
@@ -1251,7 +1248,6 @@ class MathInstruction:
         math_operation=MathOperation.multiply_add,
         element_scale_factor=None,
     ):
-
         self.instruction_shape = instruction_shape
         self.element_a = element_a
         self.element_b = element_b
@@ -1263,7 +1259,6 @@ class MathInstruction:
 
 #
 class TileDescription:
-
     def __init__(
         self,
         threadblock_shape,
@@ -1272,7 +1267,7 @@ class TileDescription:
         math_instruction,
         min_compute,
         max_compute,
-        cluster_shape=[1, 1, 1],
+        cluster_shape=(1, 1, 1),
         explicit_vector_sizes=None,
     ):
         self.threadblock_shape = threadblock_shape

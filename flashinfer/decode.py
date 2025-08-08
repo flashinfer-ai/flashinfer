@@ -21,9 +21,8 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_decode_with_kv_cache
+from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
-    cudnn_fmha_gen_module,
     gen_batch_decode_mla_module,
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -1192,10 +1191,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
-            stride_n = k_cache.stride(1)
         else:
             page_size = k_cache.shape[2]
-            stride_n = k_cache.stride(2)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -2051,9 +2048,9 @@ def trtllm_batch_decode_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert (
-                kv_cache.shape[1] == 2
-            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -2062,9 +2059,9 @@ def trtllm_batch_decode_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert (
-            query.dtype == torch.float8_e4m3fn
-        ), "query must be fp8 when out_dtype is nvfp4."
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16

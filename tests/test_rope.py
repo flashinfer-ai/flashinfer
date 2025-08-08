@@ -273,7 +273,6 @@ def test_rope_pos_ids(
 
 
 class FlashInferRotaryEmbedding(RotaryEmbedding):
-
     def forward_cuda(
         self,
         positions: torch.Tensor,

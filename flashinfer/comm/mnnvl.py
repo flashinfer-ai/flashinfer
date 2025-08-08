@@ -18,7 +18,6 @@ import logging
 import os
 import platform
 import sys
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -66,7 +65,6 @@ def create_tensor_from_cuda_memory(
 
     # Get element size in bytes
     element_size = torch.tensor([], dtype=dtype).element_size()
-    total_size_bytes = numel * element_size
 
     # Create DLPack capsule for contiguous memory (stride = element_size, num_segments = numel)
     capsule_wrapper = create_dlpack_capsule(
@@ -343,17 +341,17 @@ else:
             dev_id = int(dev)
             if MnnvlMemory.dev_id is None:
                 MnnvlMemory.dev_id = dev_id
-            assert (
-                dev_id == MnnvlMemory.dev_id
-            ), f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
+            assert dev_id == MnnvlMemory.dev_id, (
+                f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
+            )
             comm = MnnvlMemory.get_comm(mapping)
             comm_rank = comm.Get_rank()
             comm_size = comm.Get_size()
             all_rank_allocate_sizes = comm.allgather(size)
             assert len(all_rank_allocate_sizes) == comm_size
-            assert all(
-                x == size for x in all_rank_allocate_sizes
-            ), "Not all rank allocating same size."
+            assert all(x == size for x in all_rank_allocate_sizes), (
+                "Not all rank allocating same size."
+            )
             granularity = MnnvlMemory.get_allocation_granularity(dev_id)
             aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -497,7 +495,7 @@ else:
             # But it is not equivalent to MNNVL support.
             # May need better support check.
             arch = platform.machine().lower()
-            if not "aarch64" in arch:
+            if "aarch64" not in arch:
                 return False
             return MnnvlMemory.support_nvlink(True)
 
@@ -517,8 +515,6 @@ class McastDeviceMemory:
 
         primary_ctx = checkCudaErrors(cuda.cuDevicePrimaryCtxRetain(cu_device))
         checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
-
-        current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
 
         # Set CUDA device
         import cuda.cudart as cudart
@@ -540,9 +536,9 @@ class McastDeviceMemory:
         self.signal_pads_dev = 0  # std::vector<CUdeviceptr> mSignalPadsDev
         self.uc_ptrs_dev = 0
         self.mc_handle = 0  # CUmemGenericAllocationHandle mMcHandle
-        self.uc_handles: List[int] = (
-            []
-        )  # std::vector<CUmemGenericAllocationHandle> mUcHandles
+        self.uc_handles: List[
+            int
+        ] = []  # std::vector<CUmemGenericAllocationHandle> mUcHandles
 
         # Signal pad constants
         self.SIGNAL_PAD_ALIGNMENT = 16
@@ -581,8 +577,6 @@ class McastDeviceMemory:
                 raise RuntimeError(
                     "[McastDeviceMemory] Device does not support fabric handle."
                 )
-
-            current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
 
             self._alloc_mn_mcast_mem(buf_size)
         else:
@@ -685,7 +679,7 @@ class McastDeviceMemory:
     def get_unicast_ptr(self, rank: int) -> int:
         """Get the raw unicast pointer to a given rank"""
         if rank >= len(self.uc_ptrs):
-            raise ValueError(f"Rank {rank} out of range (0-{len(self.uc_ptrs)-1})")
+            raise ValueError(f"Rank {rank} out of range (0-{len(self.uc_ptrs) - 1})")
 
         data_ptr = self.uc_ptrs[rank]
         # Note: In C++, this would call tensorrt_llm::common::registerMcastDevMemBuffer
@@ -712,7 +706,6 @@ class McastDeviceMemory:
         # Verify CUDA context
         try:
             current_device = checkCudaErrors(cuda.cuCtxGetDevice())
-            current_context = checkCudaErrors(cuda.cuCtxGetCurrent())
 
             if int(current_device) != self.device_idx:
                 print(

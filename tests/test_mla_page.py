@@ -94,8 +94,7 @@ def test_append_mla_paged_kv_cache(kv_len, page_size):
         assert bool(
             torch.all(
                 ckv_cache[
-                    acc_padding_kv_len
-                    + kv_len[i] : acc_padding_kv_len
+                    acc_padding_kv_len + kv_len[i] : acc_padding_kv_len
                     + num_pages_per_req[i] * page_size
                 ]
                 == 0
@@ -104,8 +103,7 @@ def test_append_mla_paged_kv_cache(kv_len, page_size):
         assert bool(
             torch.all(
                 kpe_cache[
-                    acc_padding_kv_len
-                    + kv_len[i] : acc_padding_kv_len
+                    acc_padding_kv_len + kv_len[i] : acc_padding_kv_len
                     + num_pages_per_req[i] * page_size
                 ]
                 == 0

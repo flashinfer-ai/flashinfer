@@ -88,7 +88,6 @@ class Compiler:
                 window = ops[i : i + span]
 
                 if self._pattern_matches(window, rule.pattern) and rule.guard(window):
-
                     fused_op = rule.build(window)
                     ops[i : i + span] = [fused_op]
 
