@@ -1166,7 +1166,7 @@ def mla_rope_quantize(
     k_rope_out: Optional[torch.Tensor] = None,
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> None:
 
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
