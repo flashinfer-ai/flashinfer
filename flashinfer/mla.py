@@ -22,6 +22,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
+from .quantization import packbits, segment_packbits
 from .utils import MaskMode, _check_shape_dtype_device, determine_mla_backend
 
 
@@ -73,6 +74,29 @@ def get_mla_module():
 @functools.cache
 def get_batch_mla_module(backend, *args):
     return gen_batch_mla_module(backend, *args).build_and_load()
+
+
+def _compute_page_mask_indptr(
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    if len(qo_indptr) != len(paged_kv_indptr):
+        raise ValueError(
+            "The length of qo_indptr and paged_kv_indptr should be the same."
+        )
+    mask_indptr = torch.empty_like(qo_indptr)
+    mask_indptr[0] = 0
+    mask_indptr[1:] = torch.cumsum(
+        (qo_indptr[1:] - qo_indptr[:-1])
+        * (
+            (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
+            + paged_kv_last_page_len
+        ),
+        0,
+    )
+    return mask_indptr
 
 
 class BatchMLAPagedAttentionWrapper:
@@ -135,6 +159,7 @@ class BatchMLAPagedAttentionWrapper:
     ...     sm_scale,
     ...     q_nope.dtype,
     ...     ckv.dtype,
+            todo(yingyi): add mask example
     ... )
     >>> o = mla_wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
     >>> o.shape
@@ -149,6 +174,8 @@ class BatchMLAPagedAttentionWrapper:
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
+        custom_mask_buf: Optional[torch.Tensor] = None,
+        mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
@@ -178,6 +205,16 @@ class BatchMLAPagedAttentionWrapper:
             The user reserved buffer to store the ``kv_len_arr`` array, the size of the buffer
             should be ``[batch_size]``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
+        custom_mask_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the custom mask tensor, should be large enough to
+            store the maximum possible size of the packed custom mask tensor during the lifetime of
+            the wrapper. This argument is only effective when ``use_cuda_graph`` is set to ``True``
+            and the custom mask will be used in attention computation.
+        mask_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``mask_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True`` and the custom
+            mask will be used in attention computation.
         backend : str
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
@@ -206,6 +243,8 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
+        self._custom_mask_buf = custom_mask_buf
+        self._mask_indptr_buf = mask_indptr_buf
         if backend == "auto":
             self._backend = determine_mla_backend(self.device)
         else:
@@ -226,6 +265,8 @@ class BatchMLAPagedAttentionWrapper:
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
         use_profiler: bool = False,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan the MLA attention computation.
 
@@ -259,7 +300,39 @@ class BatchMLAPagedAttentionWrapper:
             The data type of the kv-cache tensor.
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
+        custom_mask : Optional[torch.Tensor]
+            The flattened boolean mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
+            The elements in the mask tensor should be either ``True`` or ``False``,
+            where ``False`` means the corresponding element in the attention matrix will be
+            masked out.
+
+            Please refer to the :ref:`mask layout <mask-layout>` for more details about flattened
+            layout of mask tensor.
+
+            When :attr:`custom_mask` is provided, and :attr:`packed_custom_mask` is not, the
+            function will pack the custom mask tensor into a 1D packed mask tensor, which introduces
+            additional overhead.
+        packed_custom_mask : Optional[torch.Tensor]
+            The 1D packed uint8 mask tensor, if provided, the :attr:`custom_mask` will be ignored.
+            The packed mask tensor is generated by :func:`flashinfer.quantization.packbits`.
         """
+
+        # todo(yingyi): review it
+        if custom_mask is not None or packed_custom_mask is not None:
+            mask_indptr = _compute_page_mask_indptr(
+                qo_indptr,
+                kv_indptr,
+                kv_len_arr,
+                page_size,
+            )
+        if packed_custom_mask is None and custom_mask is not None:
+            # create packed custom mask from custom mask
+            packed_custom_mask, mask_indptr = segment_packbits(
+                custom_mask.contiguous().view(-1),
+                mask_indptr,
+                bitorder="little",
+            )
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
@@ -279,11 +352,35 @@ class BatchMLAPagedAttentionWrapper:
             self._kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
             self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
             self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
+            if packed_custom_mask is not None:
+                if not torch.is_tensor(self._custom_mask_buf):
+                    raise ValueError(
+                        "custom_mask_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
+                    )
+                if not torch.is_tensor(self._mask_indptr_buf):
+                    raise ValueError(
+                        "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
+                    )
+                self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+                    packed_custom_mask,
+                    non_blocking=(packed_custom_mask.device == self.device),
+                )
+                # NOTE(Zihao): mask_indptr has the same length as qo_indptr
+                self._mask_indptr_buf.copy_(mask_indptr, non_blocking=True)
         else:
             self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
             self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=True)
             self._kv_indices_buf = kv_indices.to(self.device, non_blocking=True)
             self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
+            if packed_custom_mask is not None:
+                self._custom_mask_buf = packed_custom_mask.to(
+                    self.device, non_blocking=True
+                )
+                self._mask_indptr_buf = mask_indptr.to(self.device, non_blocking=True)
+            else:
+                self._custom_mask_buf = None
+                self._mask_indptr_buf = None
+
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
@@ -408,8 +505,13 @@ class BatchMLAPagedAttentionWrapper:
         num_heads = q_nope.shape[1]
         page_size = self._page_size
         sm_scale = self._sm_scale
-        causal = self._causal
-        mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+        if self._custom_mask_buf is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        else:
+            if self._causal:
+                mask_mode = MaskMode.CAUSAL.value
+            else:
+                mask_mode = MaskMode.NON_CAUSAL.value
         device = self.device
         if out is None:
             out = torch.empty_like(q_nope)
@@ -441,6 +543,8 @@ class BatchMLAPagedAttentionWrapper:
             num_heads,
             page_size,
             sm_scale,
+            self._custom_mask_buf,
+            self._mask_indptr_buf,
             *profiler_args,
         )
 
