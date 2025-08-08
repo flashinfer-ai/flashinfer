@@ -469,12 +469,15 @@ class FP4Moe(Moe):
                     .contiguous()
                 )
             )
+
+        # Stack weights for all experts
         gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
         gemm1_scales_fp4_shuffled = (
             torch.stack(gemm1_scales_fp4_shuffled)
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
         )
+
         gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
         gemm2_scales_fp4_shuffled = (
             torch.stack(gemm2_scales_fp4_shuffled)
