@@ -23,4 +23,3 @@ jobs:
           file: docker/Dockerfile.ci_gpu
           push: true
           tags: flashinfer/flashinfer-ci:latest
-
