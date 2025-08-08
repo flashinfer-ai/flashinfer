@@ -5,8 +5,12 @@ Memory-efficient attention for decoding.
 It supports page size = 1.
 """
 
+import torch
 import triton
 import triton.language as tl
+import numpy as np
+
+from flashinfer.testing.utils import bench_gpu_time
 
 _is_hip = False
 
@@ -721,3 +725,175 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
         )
+
+
+def bench_decode_attention_sink_triton_sgl(
+    batch_size, seq_len, head_qo_num, head_kv_num, head_dim, page_size, bench_with_sink
+):
+    torch.manual_seed(42)
+    device = "cuda:0"
+
+    D_V = head_dim
+    dtype = torch.bfloat16
+    total_tokens = batch_size * seq_len
+    device = torch.device("cuda")
+    sm_scale = 1.0 / (head_dim**0.5)
+    max_kv_splits = 8
+    num_kv_splits = torch.full((batch_size,), 4, dtype=torch.int32, device="cuda")
+
+    # q represents the new token being generated, one per batch
+    q = torch.randn(batch_size, head_qo_num, head_dim, dtype=dtype, device="cuda")
+
+    # k_buffer and v_buffer represent all previous tokens
+    k_buffer = torch.randn(
+        total_tokens, head_kv_num, head_dim, dtype=dtype, device="cuda"
+    )
+    v_buffer = torch.randn(
+        total_tokens, head_kv_num, head_dim, dtype=dtype, device="cuda"
+    )
+
+    o = torch.zeros(batch_size, head_qo_num, head_dim, dtype=dtype, device="cuda")
+
+    b_seq_len = torch.full((batch_size,), seq_len, device="cuda")
+
+    kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(b_seq_len, dim=0)
+    kv_indices = torch.arange(total_tokens, device="cuda")
+
+    attn_logits1 = torch.empty(
+        (batch_size, head_qo_num, max_kv_splits, head_dim),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    attn_lse1 = torch.empty(
+        (batch_size, head_qo_num, max_kv_splits, head_dim),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    sink = (
+        torch.randn(head_qo_num, device=device, dtype=torch.float32)
+        if bench_with_sink
+        else None
+    )
+
+    # warmup
+    for _ in range(5):
+        decode_attention_fwd_grouped(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits1,
+            attn_lse1,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap=0.0,
+            sinks=sink,
+        )
+
+    # benchmark
+    run_step = 500
+    for _ in range(run_step):
+        decode_attention_fwd_grouped(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits1,
+            attn_lse1,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap=0.0,
+            sinks=sink,
+        )
+    torch.cuda.synchronize()
+
+    measurements = bench_gpu_time(
+        lambda: decode_attention_fwd_grouped(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits1,
+            attn_lse1,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap=0.0,
+            sinks=sink,
+        ),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+    )
+    ms = np.median(measurements)
+    kv_cache_numel = k_buffer.numel() + v_buffer.numel()
+    io = q.numel() * q.element_size() + kv_cache_numel * k_buffer.element_size()
+    print(
+        f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={head_qo_num}, num_kv_heads={head_kv_num}, head_dim={head_dim}, page_size={page_size}"
+    )
+    print(f"execution time: {ms}ms")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
+
+
+# gpt oss
+# head_num = 64
+# head_dim = 64
+# head_kv_num = 8
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Benchmark SGLANG Decode Attention with Sink"
+    )
+    parser.add_argument(
+        "--head_dim", type=int, default=64, help="Dimension of each head"
+    )
+    parser.add_argument(
+        "--head_kv_num", type=int, default=8, help="Number of key/value heads"
+    )
+    parser.add_argument(
+        "--page_size", type=int, default=16, help="Size of each page [16, 32, 64]"
+    )
+    parser.add_argument(
+        "--head_qo_num",
+        type=int,
+        default=64,
+        help="Number of query heads",
+    )
+    parser.add_argument("--sink", action="store_true", help="Whether to test with sink")
+    parser.add_argument(
+        "--batch_sizes",
+        type=int,
+        nargs="+",
+        default=[4, 128, 256],
+        help="List of batch sizes to test",
+    )
+    parser.add_argument(
+        "--seq_lens",
+        type=int,
+        nargs="+",
+        default=[1024, 4096, 8192, 16384],
+        help="List of sequence lengths to test",
+    )
+
+    args = parser.parse_args()
+
+    for batch_size in args.batch_sizes:
+        for seq_len in args.seq_lens:
+            bench_decode_attention_sink_triton_sgl(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                head_qo_num=args.head_qo_num,
+                head_kv_num=args.head_kv_num,
+                head_dim=args.head_dim,
+                page_size=args.page_size,
+                bench_with_sink=args.sink,
+            )
