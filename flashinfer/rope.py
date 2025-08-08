@@ -1180,7 +1180,6 @@ def mla_rope_quantize(
         else:
             quantize_dtype = torch.float8_e4m3fn
 
-    print(quantize_dtype)
     # Allocate output tensors if not provided
     q_rope_out = (
         q_rope_out
