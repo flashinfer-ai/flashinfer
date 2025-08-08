@@ -145,7 +145,6 @@ def main() -> None:
             sweep["num_kv_heads"],
             sweep["num_qo_heads"],
         ):
-
             ms_old, ms_new, mem_MB, bw_old, bw_new = run_bench(
                 kv_lens,
                 qo_lens,

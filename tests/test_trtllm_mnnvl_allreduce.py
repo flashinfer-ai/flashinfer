@@ -1,16 +1,13 @@
 # Check torch version:
-import os
 import sys
-import traceback
+from typing import Tuple
 
 import pytest
 import torch
 from mpi4py import MPI  # Added MPI import
 
-import flashinfer.comm as comm
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import McastDeviceMemory, McastGPUBuffer
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
@@ -33,7 +30,6 @@ def row_linear_residual_norm_fusion_forward(
     max_num_elements_mnnvl: int,
     buffer_flags_mnnvl: torch.Tensor,
 ):
-
     x = x.cuda()
     residual = residual.cuda()
     norm_weight = norm_weight.cuda()
@@ -251,6 +247,7 @@ def test_mnnvl_allreduce_full(
             x = x_full[rank, :, :]
 
             # Compute reference output based on fusion mode
+            reference_output: Tuple[torch.Tensor, ...] = None
             if fusion:
                 # Fused case: AllReduce + Residual Add + RMS Norm
                 allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result

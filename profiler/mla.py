@@ -68,7 +68,7 @@ def profile_deepseek_mla_decode(
         (profiler_buffer_size,), dtype=torch.uint64, device="cuda"
     )
     # warmup run
-    o = wrapper.run(
+    _o = wrapper.run(
         q_nope, q_pe, ckv, kpe, return_lse=False, profiler_buffer=profiler_buffer
     )
     profiler_buffer.zero_()

@@ -152,9 +152,7 @@ def sink_attention_unified(
                 "bhd,blhd->bhl",
                 q.float(),
                 k.float(),
-            ).unsqueeze(
-                2
-            )  # Add seq_len=1 dimension
+            ).unsqueeze(2)  # Add seq_len=1 dimension
             * sm_scale
         )
 
@@ -232,9 +230,7 @@ def sink_attention_unified(
                     "qhd,khd->hqk",
                     q_i.float(),
                     k_i.float(),
-                ).unsqueeze(
-                    0
-                )  # Add batch dimension
+                ).unsqueeze(0)  # Add batch dimension
                 * sm_scale
             )
 

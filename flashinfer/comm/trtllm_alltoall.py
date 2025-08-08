@@ -313,9 +313,9 @@ class MnnvlMoe:
     def compute_target_rank_id(
         token_selected_experts: torch.Tensor, expert_count: int, ep_size: int
     ):
-        assert (
-            expert_count % ep_size == 0
-        ), "expert_count should be divisible by ep_size"
+        assert expert_count % ep_size == 0, (
+            "expert_count should be divisible by ep_size"
+        )
         expert_per_rank = expert_count // ep_size
         token_target_rank_ids = token_selected_experts // expert_per_rank
         return token_target_rank_ids

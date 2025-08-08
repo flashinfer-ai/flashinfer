@@ -84,12 +84,12 @@ def get_act_and_mul_module(act_func_name: str):
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
-    assert (
-        input.shape[:-1] == output.shape[:-1]
-    ), f"{input.shape[:-1]} != {output.shape[:-1]}"
-    assert (
-        input.shape[-1] == 2 * output.shape[-1]
-    ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
+    assert input.shape[:-1] == output.shape[:-1], (
+        f"{input.shape[:-1]} != {output.shape[:-1]}"
+    )
+    assert input.shape[-1] == 2 * output.shape[-1], (
+        f"{input.shape[-1]} != {2 * output.shape[-1]}"
+    )
 
 
 def silu_and_mul(

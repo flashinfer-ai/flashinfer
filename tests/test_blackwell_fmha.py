@@ -5,7 +5,6 @@ import torch
 from conftest import VARLEN_INDPTR_PARAMS
 
 import flashinfer
-import flashinfer.triton
 from flashinfer.utils import is_sm100a_supported
 
 

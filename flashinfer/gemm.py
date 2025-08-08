@@ -23,7 +23,6 @@ from typing import List, Literal, Optional, Tuple
 
 import jinja2
 import torch
-import torch.nn.functional as F
 
 from .artifacts import ArtifactPath, MetaInfoHash
 from .autotuner import (
@@ -181,7 +180,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.cu",
     ]
 
-    with open(jit_env.FLASHINFER_CSRC_DIR / f"fp4_gemm_cutlass.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
         cta_m_n_k_list = [
@@ -356,7 +355,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
             module.fp4_gemm.default(
@@ -378,10 +379,6 @@ def get_gemm_sm100_module_cutlass_fp4():
         workspace_buffer: torch.Tensor,
     ):
         tuner = AutoTuner.get()
-
-        m = a.shape[0]
-        n = b.shape[1]
-        k = a.shape[1]
 
         a_tensor_index = 0
         a_scale_tensor_index = 2
@@ -949,10 +946,10 @@ def _check_cudnn_fp4_availability():
                 f"cuDNN FP4 requires version 1.13+, found {version_str}. "
                 f"Upgrade: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
             )
-    except (ImportError, AttributeError, ValueError, IndexError):
+    except (ImportError, AttributeError, ValueError, IndexError) as e:
         raise RuntimeError(
             "Unable to determine cuDNN version. FP4 requires cuDNN 1.13+."
-        )
+        ) from e
 
     # Check cuDNN backend version for FP4 support (requires >= 91002)
     try:
@@ -962,10 +959,10 @@ def _check_cudnn_fp4_availability():
                 f"cuDNN FP4 requires backend version >= 91002, found {backend_version}. "
                 f"Please upgrade cuDNN backend."
             )
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError) as e:
         raise RuntimeError(
             "Unable to determine cuDNN backend version. FP4 requires backend >= 91002."
-        )
+        ) from e
 
 
 def _is_cublas_fp4_available_in_cudnn():
@@ -1413,9 +1410,9 @@ def mm_fp4(
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
     if block_size != 16:
-        raise ValueError(f"Only block_size = 16 is supported for FP4 GEMM operations.")
+        raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
-        raise ValueError(f"Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1758,7 +1755,9 @@ def get_trtllm_fp4_gemm_module():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             (
                 workspace_buffer,
@@ -1797,10 +1796,6 @@ def get_trtllm_fp4_gemm_module():
         workspace_buffer: torch.Tensor,
     ):
         tuner = AutoTuner.get()
-
-        m = a.shape[0]
-        n = b.shape[0]
-        k = a.shape[1] * 2
 
         a_tensor_index = 1
         a_scale_tensor_index = 3
@@ -1863,7 +1858,7 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: str = "MN",
+    scale_major_mode: Optional[Literal["MN", "K"]] = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,

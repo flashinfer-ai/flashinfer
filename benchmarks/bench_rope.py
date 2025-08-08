@@ -21,7 +21,6 @@ from flashinfer.testing.utils import bench_gpu_time
 
 
 class FlashInferRotaryEmbedding(nn.Module):
-
     def __init__(
         self,
         head_size: int,

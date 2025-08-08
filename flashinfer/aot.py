@@ -11,6 +11,7 @@ from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
+from .comm.nvshmem import gen_nvshmem_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
 from .fused_moe import gen_cutlass_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
@@ -380,6 +381,7 @@ def gen_all_modules(
         jit_specs += [
             gen_cascade_module(),
             gen_norm_module(),
+            gen_nvshmem_module(),
             gen_page_module(),
             gen_quantization_module(),
             gen_rope_module(),

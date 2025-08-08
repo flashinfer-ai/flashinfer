@@ -19,7 +19,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+import requests  # type: ignore[import-untyped]
 
 from .jit.core import logger
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY, get_cubin
