@@ -1277,7 +1277,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
         elif backend == "cudnn":
-            return flashinfer.cubnn.prefill.cudnn_batch_prefill_with_kv_cache(
+            return flashinfer.cudnn.prefill.cudnn_batch_prefill_with_kv_cache(
                 q,
                 k,
                 v,
