@@ -920,7 +920,9 @@ class UIDs(Enum):
     ALPHA_UID = 2
     BLOCK_DESCALE_A_UID = 3
     BLOCK_DESCALE_B_UID = 4
-    O_UID = 5
+    A_SCALE_UID = 5
+    B_SCALE_UID = 6
+    O_UID = 7
 
 
 def _check_cudnn_availability():
@@ -1118,7 +1120,7 @@ def execute_cudnn_gemm_fp4_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    if graph.get_workspace_size() > DEFAULT_WORKSPACE_SIZE:
+    if workspace_buffer.numel() < graph.get_workspace_size():
         workspace_buffer = torch.empty(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
@@ -1158,8 +1160,14 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         b_cudnn_tensor = graph.tensor(
             name="b", dim=b_shape, stride=b_stride, data_type=b_type
         )
-        scale_cudnn_tensor = graph.tensor(
-            name="scale",
+        a_scale_cudnn_tensor = graph.tensor(
+            name="a_scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        b_scale_cudnn_tensor = graph.tensor(
+            name="b_scale",
             dim=(1, 1, 1),
             stride=(1, 1, 1),
             data_type=cudnn.data_type.FLOAT,
@@ -1171,18 +1179,28 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
             compute_data_type=cudnn.data_type.FLOAT,
         )
         c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
-        c_final_cudnn_tensor = graph.mul(
-            name="scale_mul",
+        c_after_scale_a_cudnn_tensor = graph.mul(
+            name="scale_mul_a",
             a=c_cudnn_tensor,
-            b=scale_cudnn_tensor,
+            b=a_scale_cudnn_tensor,
             compute_data_type=cudnn.data_type.FLOAT,
         )
-        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+        c_after_scale_b_cudnn_tensor = graph.mul(
+            name="scale_mul_b",
+            a=c_after_scale_a_cudnn_tensor,
+            b=b_scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+
+        c_after_scale_b_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(
+            o_type
+        )
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-        scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
-        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+        a_scale_cudnn_tensor.set_uid(UIDs.A_SCALE_UID.value)
+        b_scale_cudnn_tensor.set_uid(UIDs.B_SCALE_UID.value)
+        c_after_scale_b_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
         graph.validate()
         graph.build_operation_graph()
@@ -1193,20 +1211,24 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         return graph
 
 
-def execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, alpha, c_final):
+def execute_cudnn_gemm_with_per_tensor_q_graph(
+    graph, a, b, a_scale, b_scale, c_final, workspace
+):
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
-        UIDs.ALPHA_UID.value: alpha,
+        UIDs.A_SCALE_UID.value: a_scale,
+        UIDs.B_SCALE_UID.value: b_scale,
         UIDs.O_UID.value: c_final,
     }
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(stream)
 
-    workspace = torch.empty(
-        graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-    )
+    if workspace.numel() < graph.get_workspace_size():
+        workspace = torch.empty(
+            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
+        )
 
     graph.execute(variant_pack, workspace, handle=cudnn_handle)
 
@@ -1225,18 +1247,15 @@ def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
 
 
 def _cudnn_gemm_fp8(
+    workspace: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    dq_scale: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
 ):
     _check_cudnn_availability()
-
-    if out is None:
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[2], dtype=torch_out_dtype, device=a.device
-        )
 
     graph = build_cudnn_gemm_with_per_tensor_q_graph(
         a.shape,
@@ -1249,7 +1268,9 @@ def _cudnn_gemm_fp8(
         a.device,
     )
 
-    execute_cudnn_gemm_with_per_tensor_q_graph(graph, a, b, dq_scale, out)
+    execute_cudnn_gemm_with_per_tensor_q_graph(
+        graph, a, b, a_scale, b_scale, out, workspace
+    )
     return out
 
 
@@ -1564,12 +1585,12 @@ def bmm_fp8(
             dtype=dtype,
         )
 
+    workspace_buffer = _get_cache_buf(
+        "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
+    )
     if backend == "cudnn":
-        return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype)
+        return _cudnn_gemm_fp8(workspace_buffer, A, B, A_scale, B_scale, out, dtype)
     elif backend == "cublas":
-        workspace_buffer = _get_cache_buf(
-            "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
-        )
         get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
 
