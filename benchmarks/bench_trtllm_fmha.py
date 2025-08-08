@@ -192,7 +192,10 @@ if __name__ == "__main__":
         "--page_size", type=int, default=16, help="Size of each page [16, 32, 64]"
     )
     parser.add_argument(
-        "--head_grp_size", type=int, default=8, help="Number of query heads per key-value head (group size)"
+        "--head_grp_size",
+        type=int,
+        default=8,
+        help="Number of query heads per key-value head (group size)",
     )
     parser.add_argument("--sink", action="store_true", help="Whether to test with sink")
     parser.add_argument(
