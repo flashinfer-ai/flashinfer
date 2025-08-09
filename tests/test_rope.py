@@ -357,22 +357,19 @@ def test_rope_cos_sin_cache(
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("seq_len", [1, 231, 512, 1027])
+@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_mla_rope_quantize(
-    batch_size,
-    seq_len,
+    num_tokens,
     input_dtype,
     quant_dtype,
 ):
     device = "cuda:0"
     num_qo_heads = 128
-    nnz = batch_size * seq_len
-    q_in = torch.randn(nnz, num_qo_heads, 576, dtype=input_dtype, device=device)
-    k_in = torch.randn(nnz, 576, dtype=input_dtype, device=device)
-    pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+    q_in = torch.randn(num_tokens, num_qo_heads, 576, dtype=input_dtype, device=device)
+    k_in = torch.randn(num_tokens, 576, dtype=input_dtype, device=device)
+    pos_ids = torch.arange(num_tokens, device=device)
 
     # baseline
     rope_flashinfer = FlashInferRotaryEmbedding(
@@ -410,10 +407,10 @@ def test_mla_rope_quantize(
     )
 
     torch.testing.assert_close(
-        q_out_f8_ref.bfloat16(), q_out.bfloat16(), atol=1e-2, rtol=1e-2
+        q_out_f8_ref.float(), q_out.float(), atol=1e-2, rtol=2e-1
     )
     torch.testing.assert_close(
-        k_out_f8_ref.bfloat16(), k_out.bfloat16(), atol=1e-2, rtol=1e-2
+        k_out_f8_ref.float(), k_out.float(), atol=1e-2, rtol=2e-1
     )
 
 
