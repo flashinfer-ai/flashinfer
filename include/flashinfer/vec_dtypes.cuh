@@ -116,6 +116,38 @@ struct vec_cast {
 };
 
 template <>
+struct vec_cast<__nv_fp8_e4m3, float> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(__nv_fp8_e4m3* dst, const float* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = __nv_fp8_e4m3(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((__nv_fp8x2_storage_t*)dst)[i] =
+            __nv_cvt_float2_to_fp8x2(((float2*)src)[i], __NV_SATFINITE, __NV_E4M3);
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<__nv_fp8_e5m2, float> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(__nv_fp8_e5m2* dst, const float* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = __nv_fp8_e5m2(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((__nv_fp8x2_storage_t*)dst)[i] =
+            __nv_cvt_float2_to_fp8x2(((float2*)src)[i], __NV_SATFINITE, __NV_E5M2);
+      }
+    }
+  }
+};
+
+template <>
 struct vec_cast<float, half> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(float* dst, const half* src) {
