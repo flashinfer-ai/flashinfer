@@ -24,7 +24,7 @@
 #include "trtllm/gen/CudaKernelLauncher.h"
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-#include "KernelMetaInfo.h"
+#include "flashinferMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
 #ifdef TLLM_GEN_BMM_CUBIN_PATH
@@ -509,7 +509,8 @@ BatchedGemmConfig const* BatchedGemmInterface::getBatchedGemmConfigs() const {
 
 size_t BatchedGemmInterface::getNumBatchedGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-  return tensorrt_llm::kernels::tllmGenBatchedGemmListLen;
+  return sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList) /
+         sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList[0]);
 #else
   return 0;
 #endif
