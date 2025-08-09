@@ -389,7 +389,7 @@ def test_mla_rope_quantize(
 
     q_out = torch.empty_like(q_in, dtype=quant_dtype)
     k_out = torch.empty_like(k_in, dtype=quant_dtype)
-    flashinfer.rope.mla_rope_quantize(
+    flashinfer.rope.mla_rope_quantize_fp8(
         q_in[..., :64],
         k_in[..., :64],
         q_in[..., 64:],
