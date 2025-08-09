@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .cudnn import (
+    cudnn_batch_prefill_with_kv_cache as cudnn_batch_prefill_with_kv_cache,
+)
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
