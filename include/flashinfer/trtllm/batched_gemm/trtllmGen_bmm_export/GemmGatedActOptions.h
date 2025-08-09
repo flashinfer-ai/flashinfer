@@ -91,11 +91,13 @@ inline std::string getActTypeName(ActType type) {
 
 struct GemmGatedActOptions : public gemm::GemmOptions {
   GemmGatedActOptions() = default;
-  GemmGatedActOptions(gemm::GemmOptions options, ActType actType)
-      : gemm::GemmOptions(options), mActType(actType) {}
+  GemmGatedActOptions(gemm::GemmOptions options, ActType actType, bool clampBeforeAct)
+      : gemm::GemmOptions(options), mActType(actType), mClampBeforeAct(clampBeforeAct) {}
 
   // Type of the gated activation.
   ActType mActType{ActType::SwiGlu};
+  // Clamp the dequantized values to the range [-limit, limit].
+  bool mClampBeforeAct{false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -156,8 +158,9 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 inline std::string dumpOptions(GemmGatedActOptions const& options) {
   std::stringstream ss;
   ss << gemm::dumpOptions(options) << ", ";
-  ss << "mActType=" << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")"
-     << std::endl;
+  ss << "mActType="
+     << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
+  ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
   return ss.str();
 }
 

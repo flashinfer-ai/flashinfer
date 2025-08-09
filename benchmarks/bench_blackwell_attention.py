@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_fmha_blackwell(
@@ -60,12 +61,13 @@ def bench_fmha_blackwell(
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    o = wrapper.run(q, k, v)
-    ms = do_bench(
+    _o = wrapper.run(q, k, v)
+    measurements = bench_gpu_time(
         lambda: wrapper.run(q, k, v),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
 
     def flops(ms):
         if causal:

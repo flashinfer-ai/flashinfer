@@ -1,10 +1,10 @@
 import argparse
-from typing import cast
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 @torch.inference_mode()
@@ -42,7 +42,8 @@ def main():
                     flashinfer.fused_add_rmsnorm(x, residual, weight, eps)
 
                 # Run benchmarking
-                latency_ms = cast(float, do_bench(fn))
+                measurements = bench_gpu_time(fn)
+                latency_ms = np.median(measurements)
                 throughput = (
                     x.numel() * x.element_size() * 2
                     + residual.numel() * residual.element_size() * 2
@@ -52,8 +53,8 @@ def main():
                     f"batch_size: {batch_size:3},",
                     f"hidden_size: {hidden_size:5},",
                     f"dtype: {dtype_str:8},",
-                    f"latency: {latency_ms*1e3:2.0f}us,",
-                    f"throughput: {throughput*1e-9:7.3f}GB/s",
+                    f"latency: {latency_ms * 1e3:2.0f}us,",
+                    f"throughput: {throughput * 1e-9:7.3f}GB/s",
                 )
 
         print("---")

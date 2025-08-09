@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
@@ -61,11 +62,12 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     )
     o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    ms = triton.testing.do_bench(
+    measurements = bench_gpu_time(
         lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
 
     io = sum([_.numel() * _.element_size() for _ in [q_nope, q_pe, ckv, kpe, o]])
     flops = 2 * batch_size * num_heads * (2 * head_dim_ckv + head_dim_kpe) * seq_len

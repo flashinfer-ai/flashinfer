@@ -41,7 +41,7 @@ def get_sm_count_constraint(major: int, minor: int) -> Tuple[int, int]:
 def get_cudevice(dev: torch.device) -> CUdevice:
     try:
         cu_dev = checkCudaErrors(driver.cuDeviceGet(dev.index))
-    except RuntimeError as e:
+    except RuntimeError:
         runtime.cudaInitDevice(dev.index, 0, 0)
         cu_dev = checkCudaErrors(driver.cuDeviceGet(dev.index))
     return cu_dev

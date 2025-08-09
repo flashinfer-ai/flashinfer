@@ -24,5 +24,6 @@
 namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout);
+                                                bool sfUseUE8M0, bool isSfSwizzledLayout,
+                                                bool isSf8x4Layout);
 }  // namespace torch_ext

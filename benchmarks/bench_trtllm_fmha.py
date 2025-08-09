@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
 
 page_size = 16
 num_kv_heads = 4
@@ -49,16 +49,14 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
     wrapper.run(q, kv_data)
     torch.cuda.synchronize()
 
-    ms = triton.testing.do_bench_cudagraph(
-        lambda: wrapper.run(q, kv_data),
-        rep=4,
-    )
+    measurements = bench_gpu_time(lambda: wrapper.run(q, kv_data))
+    ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     print(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
@@ -104,7 +102,6 @@ def bench_trtllm_fmha_wrapper(
     # Sequence lengths and block tables
     seq_lens = torch.full((batch_size,), max_seq_len)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
-
     blocks_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
 
     # Generate random but unique block IDs for all sequences
@@ -160,16 +157,18 @@ def bench_trtllm_fmha_wrapper(
     wrapper.run(q, kv_cache)
     torch.cuda.synchronize()
 
-    ms = triton.testing.do_bench_cudagraph(
+    measurements = bench_gpu_time_with_cudagraph(
         lambda: wrapper.run(q, kv_cache),
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
     io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 if __name__ == "__main__":

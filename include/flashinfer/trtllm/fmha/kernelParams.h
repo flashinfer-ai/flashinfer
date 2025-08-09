@@ -57,7 +57,8 @@ struct KernelParams {
   void* ptrO;
   // The output SF pointer (used for FP4 output).
   void* ptrSfO;
-  float const* _placeholder{nullptr};
+  // The attention sinks pointer (additional value per head in the denominator of the softmax).
+  float const* ptrAttentionSinks;
 
   // The cumulative sequence lengths for Q.
   int32_t const* ptrCumSeqLensQ;
@@ -313,6 +314,7 @@ struct KernelParams {
     int strideHeads = options.kvStrideHeads;
     int strideBatch = options.kvStrideBatch;
 
+    // The 3 strides (the other ones are 1 and 0).
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
 
@@ -643,6 +645,9 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
 
+    // Attention sink
+    params.ptrAttentionSinks = options.ptrAttentionSinks;
+
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
     int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
@@ -654,6 +659,7 @@ struct KernelParams {
 
     params.ptrScaleSfKv = options.kvSfScalePtr;
     params.ptrScaleSfO = options.oSfScalePtr;
+    params.mScaleSfO = options.mScaleSfO;
 
     params.mAttentionWindowSize = options.mAttentionWindowSize;
     if (isSlidingOrChunkedCausalMask(
@@ -687,7 +693,6 @@ struct KernelParams {
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = nullptr;
-
     return params;
   }
 };

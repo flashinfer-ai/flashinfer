@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_single_prefill(seq_len, num_heads, causal, head_dim):
@@ -27,12 +28,14 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                q, k, v, causal=causal, backend=backend
-            ),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+                    q, k, v, causal=causal, backend=backend
+                ),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
+            )
         )
         for backend in ["fa2", "fa3"]
     )
@@ -83,10 +86,12 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
         )
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: wrapper.run(q, k, v),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: wrapper.run(q, k, v),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
+            )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
     )
@@ -160,10 +165,12 @@ def bench_batch_paged_prefill(
         )
 
     sm80_ms, sm90_ms = (
-        triton.testing.do_bench(
-            lambda: wrapper.run(q, (k, v)),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: wrapper.run(q, (k, v)),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
+            )
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
     )
@@ -184,6 +191,12 @@ def bench_batch_paged_prefill(
 
 
 if __name__ == "__main__":
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability[0] != 9:
+        print(f"Current device capability: {device_capability}.")
+        print("Current benchmark targets capability (9, 0). Returning...")
+        exit()
+
     bench_batch_paged_prefill(1, 128, 32, 1024, True, 128)
     bench_batch_paged_prefill(1, 64, 32, 2048, True, 128)
     bench_batch_paged_prefill(1, 32, 32, 4096, True, 128)

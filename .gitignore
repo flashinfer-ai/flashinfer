@@ -7,12 +7,12 @@ compile_commands.json
 
 # Generated files
 csrc/generated/
+csrc/nv_internal/tensorrt_llm/cutlass_instantiations/
 docs/generated/
 flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 aot-ops/
-src/generated/
 csrc/aot_default_additional_params.h
 
 # DS_Store files

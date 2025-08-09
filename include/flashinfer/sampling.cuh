@@ -739,8 +739,8 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
                                          REDUCE_ALGORITHM>::TempStorage;
-  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling[];
-  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
+  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling_logit[];
+  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
 
   vec_t<DType, VEC_SIZE> logits_vec;
   DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};

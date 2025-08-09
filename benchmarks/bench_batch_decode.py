@@ -16,9 +16,9 @@ limitations under the License.
 
 import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 page_block_size = 16
 num_kv_heads = 4
@@ -67,14 +67,15 @@ def bench_batch_decode(
         q_data_type=q_dtype,
     )
 
-    ms = do_bench(lambda: wrapper.run(q, kv_data))
+    measurements = bench_gpu_time(lambda: wrapper.run(q, kv_data))
+    ms = np.median(measurements)
 
     io = q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     print(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_block_size={page_block_size}, q_dtype={q_dtype}, kv_dtype={kv_dtype}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 if __name__ == "__main__":

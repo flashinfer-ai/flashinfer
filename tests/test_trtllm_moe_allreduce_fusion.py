@@ -89,9 +89,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )  # quant: fp16/bf16 -> fp4, reference: cpp/tensorrt_llm/thop/allreduceOp.cpp:L487
 
                             scale_out = None
-                            assert (
-                                HIDDEN_SIZE % SF_VEC_SIZE == 0
-                            ), "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            assert HIDDEN_SIZE % SF_VEC_SIZE == 0, (
+                                "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            )
                             if (
                                 swizzled_layout_code
                                 == comm.FP4QuantizationSFLayout.SWIZZLED
@@ -120,6 +120,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                                 + SCALE_FACTOR_RANGE[0]
                             )
                             rms_eps = 1e-3
+                            scale_factor_float = scale_factor.item()
 
                             # init moe params
                             # [device_num_expert, m]
@@ -202,30 +203,65 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             ref_norm_out = rms_gamma.to(torch.float32) * hidden_states
 
                             # 5. Run kernel
-                            torch.cuda.synchronize()
+                            # warmup
+                            s = torch.cuda.Stream()
+                            s.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(s):
+                                for _ in range(3):  # Multiple warmup iterations
+                                    comm.trtllm_moe_allreduce_fusion(
+                                        world_size=world_size,
+                                        world_rank=rank,
+                                        token_num=token_num,
+                                        hidden_dim=HIDDEN_SIZE,
+                                        workspace_ptrs=workspace_tensor,
+                                        launch_with_pdl=launch_with_pdl,
+                                        residual_in=residual_in,
+                                        rms_gamma=rms_gamma,
+                                        rms_eps=rms_eps,
+                                        scale_factor=scale_factor_float,
+                                        moe_reduction_device_num_experts=active_expert_num,
+                                        moe_reduction_scale_input=moe_reduction_scale_input,
+                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+                                        moe_reduction_token_input=moe_reduction_token_input,
+                                        layout_code=swizzled_layout_code,
+                                        moe_allreduce_out=moe_allreduce_out,
+                                        residual_out=residual_out,
+                                        norm_out=norm_out,
+                                        quant_out=quant_out,
+                                        scale_out=scale_out,
+                                    )
+                            torch.cuda.current_stream().wait_stream(s)
+                            torch.cuda.synchronize()  # Ensure warmup is complete
 
-                            comm.trtllm_moe_allreduce_fusion(
-                                world_size=world_size,
-                                world_rank=rank,
-                                token_num=token_num,
-                                hidden_dim=HIDDEN_SIZE,
-                                workspace_ptrs=workspace_tensor,
-                                launch_with_pdl=launch_with_pdl,
-                                residual_in=residual_in,
-                                rms_gamma=rms_gamma,
-                                rms_eps=rms_eps,
-                                scale_factor=scale_factor,
-                                moe_reduction_device_num_experts=active_expert_num,
-                                moe_reduction_scale_input=moe_reduction_scale_input,
-                                moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
-                                moe_reduction_token_input=moe_reduction_token_input,
-                                layout_code=swizzled_layout_code,
-                                moe_allreduce_out=moe_allreduce_out,
-                                residual_out=residual_out,
-                                norm_out=norm_out,
-                                quant_out=quant_out,
-                                scale_out=scale_out,
-                            )
+                            # capture
+                            g = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(g):
+                                for _ in range(3):  # Multiple iterations in graph
+                                    comm.trtllm_moe_allreduce_fusion(
+                                        world_size=world_size,
+                                        world_rank=rank,
+                                        token_num=token_num,
+                                        hidden_dim=HIDDEN_SIZE,
+                                        workspace_ptrs=workspace_tensor,
+                                        launch_with_pdl=launch_with_pdl,
+                                        residual_in=residual_in,
+                                        rms_gamma=rms_gamma,
+                                        rms_eps=rms_eps,
+                                        scale_factor=scale_factor_float,
+                                        moe_reduction_device_num_experts=active_expert_num,
+                                        moe_reduction_scale_input=moe_reduction_scale_input,
+                                        moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+                                        moe_reduction_token_input=moe_reduction_token_input,
+                                        layout_code=swizzled_layout_code,
+                                        moe_allreduce_out=moe_allreduce_out,
+                                        residual_out=residual_out,
+                                        norm_out=norm_out,
+                                        quant_out=quant_out,
+                                        scale_out=scale_out,
+                                    )
+
+                            # replay
+                            g.replay()
 
                             # match shape
                             moe_allreduce_out = moe_allreduce_out.view(
@@ -403,9 +439,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -428,3 +464,7 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
         target_args=(),
     )
     print(f"moe allreduce fusion tp = {world_size}: OK")
+
+
+if __name__ == "__main__":
+    test_trtllm_moe_allreduce_fusion(2, torch.float16)

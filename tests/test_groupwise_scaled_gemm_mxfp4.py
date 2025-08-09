@@ -53,24 +53,19 @@ def swizzle_blockscale(
     Returns:
         torch.Tensor: Swizzled tensor with the same shape as input.
     """
-    assert (
-        unswizzled_sf.dtype == torch.uint8
-    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert unswizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    )
     assert unswizzled_sf.ndim == 3, f"Input must be 3D, got {unswizzled_sf.ndim}"
-    assert (
-        unswizzled_sf.shape[0] == b
-    ), f"Batch dimension must equal b, got {unswizzled_sf.shape[0]} != {b}"
+    assert unswizzled_sf.shape[0] == b, (
+        f"Batch dimension must equal b, got {unswizzled_sf.shape[0]} != {b}"
+    )
     padded_input_sf_chunked = [
         _pad_scale_factors(unswizzled_sf[i], m, n, sf_vec_size) for i in range(b)
     ]
     padded_input_sf = torch.stack(padded_input_sf_chunked)
-    out = torch.empty_like(padded_input_sf)
-    get_fp4_quantization_sm100_module().fp4_swizzle_blockscale_sm100(
-        padded_input_sf.flatten(0, 1),
-        out.flatten(0, 1),
-        out.shape[0],
-        out.shape[1],
-        out.shape[2],
+    out = get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
+        padded_input_sf
     )
     out = out.view(padded_input_sf.shape)
     return out

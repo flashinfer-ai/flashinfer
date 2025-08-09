@@ -46,10 +46,13 @@ packages = [
     "flashinfer.data.spdlog",
     "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
+    "flashinfer.fused_moe",
     "flashinfer.jit",
     "flashinfer.jit.attention",
+    "flashinfer.jit.cutlass_gemm",
     "flashinfer.testing",
     "flashinfer.triton",
+    "flashinfer.tuning_configs",
     "flashinfer.profiler",
     "flashinfer.triton.kernels",
     "flashinfer.comm",
@@ -131,4 +134,8 @@ ignore = [
     "B020",
     # Return te negated condition directly
     "SIM103",
+    # Function definition does not bind loop variable
+    "B023",
 ]
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

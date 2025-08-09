@@ -1,5 +1,8 @@
+import functools
+import gc
 import os
 import types
+from typing import Any, Dict
 
 import pytest
 import torch
@@ -51,7 +54,7 @@ TORCH_COMPILE_FNS = [
     flashinfer.sampling.chain_speculative_sampling,
 ]
 
-_TORCH_COMPILE_CACHE = dict()
+_TORCH_COMPILE_CACHE: Dict[str, Any] = dict()
 
 
 def _set_torch_compile_options():
@@ -136,6 +139,23 @@ def pytest_runtest_call(item):
             pytest.skip("Skipping due to OOM")
         else:
             raise
+
+
+@functools.cache
+def get_device_properties(device: torch.device):
+    return torch.cuda.get_device_properties(device)
+
+
+def clear_cuda_cache(device: torch.device) -> None:
+    total_memory = get_device_properties(device).total_memory
+    reserved_memory = torch.cuda.memory_reserved()
+
+    # FLASHINFER_TEST_MEMORY_THRESHOLD: threshold for PyTorch reserved memory usage (default: 0.9)
+    threshold = float(os.environ.get("FLASHINFER_TEST_MEMORY_THRESHOLD", "0.9"))
+
+    if reserved_memory > threshold * total_memory:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # collected from gsk8k trace in sglang

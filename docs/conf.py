@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Any, List
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -12,13 +13,16 @@ from pathlib import Path
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 root = Path(__file__).parents[1].resolve()
-sys.path.append(str(root))
+sys.path.insert(0, str(root))
 os.environ["BUILD_DOC"] = "1"
 autodoc_mock_imports = [
     "torch",
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    "numpy",
+    "einops",
+    "mpi4py",
 ]
 
 project = "FlashInfer"
@@ -60,16 +64,12 @@ todo_include_todos = False
 
 html_theme = "furo"  # "sphinx_rtd_theme"
 
-templates_path = []
+templates_path: List[Any] = []
 
-html_static_path = []
+html_static_path = ["_static"]
 
 html_theme_options = {
     "logo_only": True,
-}
-
-html_static_path = ["_static"]
-html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }

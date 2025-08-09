@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import math
 from abc import ABC, abstractmethod
 from enum import IntEnum
+from typing import Literal
 
-import nvtx
 import pytest
 import torch
 from cuda.bindings import runtime
@@ -126,7 +125,7 @@ class CUDAGraphMoE:
             self.is_captured = True
         except Exception as e:
             self.cleanup()
-            raise RuntimeError(f"CUDA graph capture failed: {e}")
+            raise RuntimeError(f"CUDA graph capture failed: {e}") from e
 
     def launch(self, hidden_states_new):
         """Launch captured CUDA graph with new input."""
@@ -178,27 +177,32 @@ class CUDAGraphMoE:
 
         # Call MoE kernel and return output tensor
         output = trtllm_fp4_block_scale_moe(
-            runtime_args["expert_logits"],
-            runtime_args["routing_bias"],
-            hidden_states_fp4,
-            hidden_states_scale_linear_fp4,
-            self.static_data["gemm1_weights_fp4_shuffled"],
-            self.static_data["gemm1_scales_fp4_shuffled"],
-            self.static_data["gemm2_weights_fp4_shuffled"],
-            self.static_data["gemm2_scales_fp4_shuffled"],
-            self.static_data["scale_c_fc1"],
-            self.static_data["scale_gate_fc1"],
-            self.static_data["scale_c_fc2"],
-            self.config["num_experts"],
-            self.config["top_k"],
-            self.config["n_groups"],
-            self.config["top_k_groups"],
-            self.config["intermediate_size"],
-            0,
-            self.config["num_experts"],
-            self.config["routed_scaling"],
-            self.config["tile_tokens_dim"],
-            self.config["routing_method_type"],
+            routing_logits=runtime_args["expert_logits"],
+            routing_bias=runtime_args["routing_bias"],
+            hidden_states=hidden_states_fp4,
+            hidden_states_scale=hidden_states_scale_linear_fp4,
+            gemm1_weights=self.static_data["gemm1_weights_fp4_shuffled"],
+            gemm1_weights_scale=self.static_data["gemm1_scales_fp4_shuffled"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=self.static_data["gemm2_weights_fp4_shuffled"],
+            gemm2_weights_scale=self.static_data["gemm2_scales_fp4_shuffled"],
+            gemm2_bias=None,
+            output1_scale_scalar=self.static_data["scale_c_fc1"],
+            output1_scale_gate_scalar=self.static_data["scale_gate_fc1"],
+            output2_scale_scalar=self.static_data["scale_c_fc2"],
+            num_experts=self.config["num_experts"],
+            top_k=self.config["top_k"],
+            n_group=self.config["n_groups"],
+            topk_group=self.config["top_k_groups"],
+            intermediate_size=self.config["intermediate_size"],
+            local_expert_offset=0,
+            local_num_experts=self.config["num_experts"],
+            routed_scaling_factor=self.config["routed_scaling"],
+            tile_tokens_dim=self.config["tile_tokens_dim"],
+            routing_method_type=self.config["routing_method_type"],
             do_finalize=True,
         )
         return output  # Extract tensor from tuple
@@ -1131,7 +1135,7 @@ def check_accuracy(a, b, atol, rtol, percent):
     if mismatch_percent > 1 - percent:
         raise Exception(
             f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
-            f"(threshold: {1-percent:.4f})"
+            f"(threshold: {1 - percent:.4f})"
         )
 
 
@@ -1334,7 +1338,7 @@ def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
 # ====================================================================================
 
 
-def run_moe_dequant(args, quant_mode=["fp4", "dsFp8", "perTensorFp8"]):
+def run_moe_dequant(args, quant_mode: Literal["fp4", "dsFp8", "perTensorFp8"]):
     """Common dequantized MoE reference implementation."""
     # Permute
     total_num_padded_tokens = args.permute_info["permutedBufferSize"]

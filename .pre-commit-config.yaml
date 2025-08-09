@@ -35,27 +35,25 @@ repos:
       - id: remove-crlf
 
   # Formatters
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 24.8.0
-    hooks:
-      - id: black
-
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-        args: ["--profile=black"] # <-- this one
-
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.1
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-          (?x)^(3rdparty/.* src/generated/.* flashinfer/jit/aot_config.py)$
+          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
 
-  - repo: https://github.com/cheshirekow/cmake-format-precommit
-    rev: v0.6.13
+  -   repo: https://github.com/pre-commit/mirrors-mypy
+      rev: 'v1.17.1'  # Use the sha / tag you want to point at
+      hooks:
+      -   id: mypy
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.12.8
     hooks:
-      - id: cmake-format
-        additional_dependencies: [pyyaml>=5.1]
+      # Run the linter.
+      - id: ruff-check
+      # Run the formatter.
+      - id: ruff-format
+        types_or: [ python, pyi ]

@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def run_bench(
@@ -69,7 +69,8 @@ def run_bench(
         kv_data_type=torch.bfloat16,
     )
     o = wrapper_old.run(q, kv_data)
-    ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
+    measurements = bench_gpu_time(lambda: wrapper_old.run(q, kv_data))
+    ms_old = np.median(measurements)
 
     if len(p_kv_lens) == 1:
         q_d = q[: d_q_indptr[-1]]
@@ -110,7 +111,7 @@ def run_bench(
         torch.testing.assert_close(
             o, o_pod, rtol=1e-3, atol=1e-3, msg="POD-Attention output mismatch!"
         )
-        ms_pod = do_bench(
+        measurements = bench_gpu_time(
             lambda: wrapper_pod.run(
                 q_p,
                 k_p,
@@ -121,7 +122,7 @@ def run_bench(
                 causal_d=causal,
             )
         )
-
+        ms_pod = np.median(measurements)
     print(f"Elapsed time (Batched Prefill): {ms_old:.2f} ms")
     if len(p_kv_lens) == 1:
         print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
@@ -184,8 +185,8 @@ if __name__ == "__main__":
         full_kv_len = np.random.randint(2000, 16000, size=bsz)
         p_q_lens = []
         p_kv_lens = []
-        d_q_len = []
-        d_kv_len = []
+        d_q_lens = []
+        d_kv_lens = []
 
         for i in range(bsz):
             if i % stride == 0:
@@ -212,8 +213,7 @@ if __name__ == "__main__":
     for idx, (p_q_lens, p_kv_lens, d_q_len, d_kv_len) in enumerate(
         zip(p_q_configs, p_kv_configs, d_q_len_configs, d_kv_len_configs)
     ):
-
-        print(f"===== Benchmark {idx+1}: (kv_len, qo_len) set =====")
+        print(f"===== Benchmark {idx + 1}: (kv_len, qo_len) set =====")
         run_bench(
             p_q_lens,
             p_kv_lens,
