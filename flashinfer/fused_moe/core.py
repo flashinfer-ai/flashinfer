@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ..artifacts import ArtifactPath
+from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
     AutoTuner,
     DynamicTensorSpec,
@@ -33,6 +33,7 @@ from ..autotuner import (
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 from .utils import (
@@ -752,14 +753,17 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    debug_cubin_path = (
-        jit_env.FLASHINFER_INCLUDE_DIR
-        / "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/cubins"
-    )
     import glob
 
+    include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+
+    metainfo = get_cubin(
+        f"{include_path}/flashinferMetaInfo", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
+    )
+    assert metainfo, "KernelMetaInfo.h not found"
+
     debug_cubin_files = [
-        Path(p) for p in glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+        Path(p) for p in glob.glob(str(f"{ArtifactPath.TRTLLM_GEN_BMM}/Bmm_*.cpp"))
     ]
 
     return gen_jit_spec(
@@ -790,6 +794,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
+            jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],

@@ -50,7 +50,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 class ArtifactPath:
     TRTLLM_GEN_FMHA: str = "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/batched_gemm-32110eb-a15c257/"
+        "80848c8aa91d7bb650b762e7d5fa98abb16ed982/batched_gemm-32110eb-5262bae/"
     )
     TRTLLM_GEN_GEMM: str = (
         "07a5f242a649533ff6885f87c42b2476a9e46233/gemm-c603ed2-434a6e1/"
@@ -62,6 +62,9 @@ class ArtifactPath:
 class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
         "0d124e546c8a2e9fa59499625e8a6d140a2465573d4a3944f9d29f29f73292fb"
+    )
+    TRTLLM_GEN_BMM: str = (
+        "23243b86451ba2a9c20e4456c14a86eb6c2204cd00a2972405f66643b677d01f"
     )
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
     TRTLLM_GEN_GEMM: str = (
@@ -75,6 +78,7 @@ def download_artifacts() -> bool:
     cubin_files = [
         (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_GEMM + "KernelMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
     ]
     for kernel in [
         ArtifactPath.TRTLLM_GEN_FMHA,
