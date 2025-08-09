@@ -1771,6 +1771,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
+                False,  # use_attention_sink
             )
 
             self._cached_module = get_batch_prefill_module(
@@ -2602,6 +2603,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
+                False,  # use_attention_sink
             )
             if self._backend == "cutlass":
                 self._cached_module = get_fmha_module(*get_module_args)
