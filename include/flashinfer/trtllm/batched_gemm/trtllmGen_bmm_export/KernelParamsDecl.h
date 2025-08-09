@@ -31,28 +31,53 @@ struct KernelParams {
 
   // NOTE: TMA out-of-bounds optimization for MoE padded tokens:
   //
-  // 1. 2D tensor [hidden, numPaddedTokens] with stride [1, hidden] at pointer p
-  // 2. Reshape to 3D: [hidden, tileN, numPaddedTokens] with stride [1, hidden, hidden]
-  // 3. Transform coordinates
-  // Originally:
+  // Originally the padded tokens is a 2D tensor [hiddenDim, ctaGridDimY * tileN] with stride [1,
+  // hiddenDim] and box size [tileM, tileN] at pointer p. We waste bandwidth bytes since we only
+  // want to load [0, batchEnd) out of the [0, tileN) box size: batchEnd is a runtime variable while
+  // box size needs to be fixed at compile time.
   //
-  //   Ptr (p               ) <-> Coord [:, 0               , ctaIdxY * tileN           ]
+  // To deal with this, we reshape the tensor to 3D: [hiddenDim, tileN, ctaGridDimY * tileN] with
+  // stride [1, hiddenDim, hiddenDim] and box size [tileM, tileN, 1]. For the original 2D
+  // tensor,
   //
-  // Equals
+  //   Offset Coords [ : , ctaIdxY * tileN ],
+  //   Box Sizes     [ : , tileN           ],
+  //   Coords Range  [ : , ctaIdxY * tileN : ctaIdxY * tileN + tileN],
   //
-  //   Ptr (p - tileN*hidden) <-> Coord [:, tileN           , ctaIdxY * tileN           ]
+  // while we only want load the range [ctaIdxY * tileN, ctaIdxY * tileN + batchEnd), 1 <= batchEnd
+  // <= tileN
   //
-  // Equals
+  // For the reshaped 3D tensor,
   //
-  //   Ptr (p - tileN*hidden) <-> Coord [:, tileN - batchEnd, ctaIdxY * tileN + batchEnd]
+  //   Offset Coords [ : , tileN - batchEnd ,
+  //                       ctaIdxY * tileN + batchEnd ],
+  //   Box Sizes     [ : , tileN            ,
+  //                       1                          ],
+  //   Coords Range  [ : , tileN - batchEnd : min(tileN, 2 * tileN - batchEnd),
+  //                       ctaIdxY * tileN + batchEnd : ctaIdx * tileN + batchEnd + 1],
   //
-  // In effect, we load exactly `batchEnd` tokens from same global address, reducing wasted traffic.
+  // while min(tileN, 2 * tileN - batchEnd) always evaluates to tileN. The unwanted tokens are
+  // essentially filtered out by utilizing the OOB feature of TMA. Since the 2nd and 3rd dimension
+  // has the same stride, we end up loading the following (adding the left and right end of the 2nd
+  // and 3rd dimension ranges):
+  //
+  //   Effective 2D Coords Range
+  //     [ : , tileN + ctaIdxY * tileN : tileN + ctaIdxY * tileN + batchEnd],
+  //
+  // This is exactly the same as the original range except for the offset tileN, thus we also need
+  // to offset the pointer in the opposite direction:
+  //
+  //     Ptr (p) -> Ptr (p - tileN * hiddenDim)
   //
   // Due to the restrictions of TMA unit, the above operations requires the TMA descriptor and the
   // underlying buffer be constructed differently:
   // - Requires valid buffer at (p - tileN * hidden) - needs prepending `tileN` tokens.
   // - TMA outermost dimension must be extended by `tileN` or loads will OOB in the rightmost side.
-
+  // The latter is because when batchEnd == tileN, the offset coords in the 3rd dimension becomes
+  // ctaIdxY * tileN + tileN. When ctaIdxY = ctaGridDimY - 1, it becomes ((ctaGridDimY - 1) * tileN
+  // + tileN = ctaGridDimY * tileN which is equal to the 3rd dimension size and will be filtered
+  // out. That's why we need to extend the tensor size by tileN.
+  //
   // TMA descriptor for A.
   // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
   // makeTmaShapeStrideAbc.
