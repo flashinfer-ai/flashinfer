@@ -11,8 +11,6 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
 
-from flashinfer import __version__ as flashinfer_version
-
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
 from flashinfer.tllm_utils import delay_kernel
