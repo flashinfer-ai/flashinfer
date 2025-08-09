@@ -25,13 +25,13 @@
 namespace torch_ext {
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
 inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
-                          tensorrt_llm::FP4QuantizationSFLayout layout, bool useUE8M0 = false) {
+                          tensorrt_llm::QuantizationSFLayout layout, bool useUE8M0 = false) {
   constexpr int kColumnGroup0Size = 4;
   constexpr int kRowGroup0Size = 32;
   constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
   // Swizzled layout is used as default layout.
-  if (layout == tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4) {
+  if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED) {
     // int paddedRow = PadUpFn(totalRow, 128);
     int paddedColumn = PadUpFn(totalColumn, 4);
 
@@ -51,7 +51,7 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
            rowGroupIdx * rowGroupStride;
   }
   // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
-  else if (layout == tensorrt_llm::FP4QuantizationSFLayout::LINEAR) {
+  else if (layout == tensorrt_llm::QuantizationSFLayout::LINEAR) {
     // no padding needed. totalColumn is multiple of kVecSize.
     return rowIdx * totalColumn + colIdx;
   } else {
@@ -64,7 +64,8 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
 // returns fp8_quantized and block_scale_factors.
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input,
-                                                  bool is_sf_swizzled_layout = true);
+                                                  bool is_sf_swizzled_layout = true,
+                                                  int64_t alignment = 32);
 
 // x_fp32: [M, K], fp32_quantized (on the host)
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
