@@ -1170,10 +1170,14 @@ def mla_rope_quantize_fp8(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
-    if quantize_dtype is not None:
-        assert quantize_dtype in [torch.float8_e4m3fn, torch.float8_e5m2], (
-            "Only e4m3fn and e5m2 are now supported"
-        )
+    # Infer quantize_dtype from output tensors or default to float8_e4m3fn
+    if quantize_dtype is None:
+        for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
+            if out is not None:
+                quantize_dtype = out.dtype
+                break
+        else:
+            quantize_dtype = torch.float8_e4m3fn
 
     # Allocate output tensors if not provided
     q_rope_out = (
