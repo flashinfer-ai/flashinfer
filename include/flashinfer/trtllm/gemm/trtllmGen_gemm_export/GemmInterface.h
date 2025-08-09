@@ -24,7 +24,7 @@
 #include "trtllm/gen/CudaKernelLauncher.h"
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-#include "KernelMetaInfo.h"
+#include "flashinferMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
@@ -309,7 +309,8 @@ GemmConfig const* GemmInterface::getGemmConfigs() const {
 
 size_t GemmInterface::getNumGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-  return tensorrt_llm::kernels::tllmGenGemmListLen;
+  return sizeof(tensorrt_llm::kernels::tllmGenGemmList) /
+         sizeof(tensorrt_llm::kernels::tllmGenGemmList[0]);
 #else
   return 0;
 #endif

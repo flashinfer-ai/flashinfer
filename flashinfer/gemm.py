@@ -302,9 +302,10 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
-    header_name = "KernelMetaInfo"
+    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    header_name = "flashinferMetaInfo"
     metainfo = get_cubin(
-        f"{ArtifactPath.TRTLLM_GEN_GEMM}/{header_name}",
+        f"{include_path}/{header_name}",
         MetaInfoHash.TRTLLM_GEN_GEMM,
         ".h",
     )
@@ -320,11 +321,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        extra_include_paths=[
-            jit_env.FLASHINFER_CACHE_DIR / "cubins" / ArtifactPath.TRTLLM_GEN_GEMM,
-            jit_env.FLASHINFER_INCLUDE_DIR
-            / "flashinfer/trtllm/gemm/trtllmGen_gemm_export",
-        ],
+        extra_include_paths=[jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path],
         extra_ldflags=["-lcuda"],
     )
 
