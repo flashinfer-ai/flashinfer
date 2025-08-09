@@ -798,6 +798,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         .int()
         .to(device)
     )
+
     # Because actual_seq_lens_kv is the same as actual_seq_lens_q, kv_indptr will become the same as qo_indptr
     kv_indptr = (
         torch.cat(
