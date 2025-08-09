@@ -57,6 +57,7 @@ from .utils import (
     canonicalize_torch_dtype,
     device_support_pdl,
     get_device_sm_count,
+    is_float8,
     register_custom_op,
     register_fake_op,
 )
@@ -1318,8 +1319,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module.run(*run_args)
         if v_scale is not None:
             # TODO(Zihao): fused into kernel
-            if out.itemsize == 1:
-                out = (out.to(float) * v_scale).to(out.dtype)
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
             else:
                 out *= v_scale
 

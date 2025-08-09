@@ -377,9 +377,13 @@ def test_trtllm_batch_decode_fmha(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
         )
-        # v_scale, o_scale is not supported in wrapper api yet.
+        # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output2 == output).all()
+        else:
+            torch.testing.assert_close(
+                output.float(), output2.float(), rtol=1e-1, atol=1e-1
+            )
 
 
 @pytest.mark.parametrize(
