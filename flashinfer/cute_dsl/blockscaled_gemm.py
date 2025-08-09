@@ -297,8 +297,9 @@ class MaskedScheduler:
                 (*self.params.cluster_shape_mn, Int32(1)),
             )
         )
-        print(self.params.problem_layout_ncluster_mnl)
-        print(cur_cluster_coord)
+        # todo(Yingyi): cleanups
+        # print(self.params.problem_layout_ncluster_mnl)
+        # print(cur_cluster_coord)
 
         return WorkTileInfo(cur_tile_coord, is_valid)
 
@@ -1199,9 +1200,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tile_sched = MaskedScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # todo(Yingyi): clean IR print
             work_tile = tile_sched.initial_work_tile_info()
-            # todo(Yingyi): clean IR print
 
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
@@ -1303,9 +1302,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                # todo(Yingyi): clean IR print
                 work_tile = tile_sched.get_current_work()
-                # todo(Yingyi): clean IR print
 
             #
             # Wait A/B buffer empty
@@ -1382,9 +1379,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tile_sched = MaskedScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # todo(Yingyi): clean IR print
             work_tile = tile_sched.initial_work_tile_info()
-            # todo(Yingyi): clean IR print
 
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
@@ -1511,9 +1506,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                # todo(Yingyi): clean IR print
                 work_tile = tile_sched.get_current_work()
-                # todo(Yingyi): clean IR print
 
             #
             # Wait for accumulator buffer empty
@@ -1579,9 +1572,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tile_sched = MaskedScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # todo(Yingyi): clean IR print
             work_tile = tile_sched.initial_work_tile_info()
-            # todo(Yingyi): clean IR print
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -1702,9 +1693,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                # todo(Yingyi): clean IR print
                 work_tile = tile_sched.get_current_work()
-                # todo(Yingyi): clean IR print
 
             #
             # Dealloc the tensor memory buffer
