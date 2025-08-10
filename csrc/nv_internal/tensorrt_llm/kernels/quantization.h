@@ -94,9 +94,9 @@ void invokeNVFP4BlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* 
                                             cudaStream_t stream = 0);
 
 template <typename T>
-void invokeMxFP8Quantization(int b, int m, int n, T const* input, int64_t* output, int32_t* SFOuput,
-                             FP4QuantizationSFLayout layout, int multiProcessorCount,
-                             cudaStream_t stream = 0);
+void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
+                             int32_t* SFOuput, FP4QuantizationSFLayout layout,
+                             int multiProcessorCount, cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
