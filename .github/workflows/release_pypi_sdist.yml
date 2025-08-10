@@ -12,6 +12,14 @@ jobs:
   build-and-upload:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate tag format
+        run: |
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[a-z0-9]+)?$ ]]; then
+            echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1)"
+            exit 1
+          fi
+          echo "✓ Tag format is valid: ${{ inputs.tag }}"
+
       - name: Check out tag
         uses: actions/checkout@v4
         with:
@@ -23,16 +31,101 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install build & upload tools
+      - name: Verify tag matches version.txt (CRITICAL)
+        run: |
+          # Extract version from tag (remove 'v' prefix)
+          TAG_VERSION="${{ inputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          
+          # Check version.txt FIRST - this is the source of truth
+          if [ ! -f "version.txt" ]; then
+            echo "Error: version.txt file not found!"
+            exit 1
+          fi
+          
+          VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+          
+          if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+            echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+            echo "  Tag version: $TAG_VERSION"
+            echo "  version.txt: $VERSION_TXT"
+            echo ""
+            echo "Please update version.txt to match the release version before creating a release."
+            echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+            exit 1
+          fi
+          
+          echo "✓ version.txt matches tag version: $VERSION_TXT"
+
+      - name: Verify tag matches package version
+        run: |
+          # Extract version from tag (remove 'v' prefix)
+          TAG_VERSION="${{ inputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          
+          # Extract version from setup.py or pyproject.toml
+          if [ -f "setup.py" ]; then
+            PACKAGE_VERSION=$(python -c "import re; content = open('setup.py').read(); match = re.search(r'version\s*=\s*[\"']([^\"']+)[\"']', content); print(match.group(1) if match else '')")
+          elif [ -f "pyproject.toml" ]; then
+            PACKAGE_VERSION=$(python -c "import tomllib; data = tomllib.load(open('pyproject.toml', 'rb')); print(data.get('project', {}).get('version', '') or data.get('tool', {}).get('poetry', {}).get('version', ''))")
+          else
+            echo "Warning: Could not find version file (setup.py or pyproject.toml)"
+            PACKAGE_VERSION=""
+          fi
+          
+          if [ -n "$PACKAGE_VERSION" ] && [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Error: Tag version ($TAG_VERSION) does not match package version ($PACKAGE_VERSION)"
+            exit 1
+          fi
+          echo "✓ Package version check passed: $TAG_VERSION"
+
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install build twine
+          pip install build twine wheel
 
       - name: Build sdist
-        run: python -m build --sdist
+        run: |
+          echo "Building source distribution..."
+          python -m build --sdist
+          echo "✓ Build completed"
+          ls -lh dist/
+
+      - name: Check sdist contents
+        run: |
+          echo "Verifying sdist contents..."
+          tar -tzf dist/*.tar.gz | head -20
+          echo "..."
+          echo "✓ Sdist archive created successfully"
+
+      - name: Store build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          retention-days: 7
+
+      - name: Test installation from sdist
+        run: |
+          echo "Testing installation from built sdist..."
+          python -m venv test-env
+          source test-env/bin/activate
+          pip install dist/*.tar.gz
+          python -c "import flashinfer; print(f'✓ Successfully imported flashinfer')"
+          deactivate
+          rm -rf test-env
+
+      - name: Check package with twine
+        run: |
+          echo "Running twine check..."
+          twine check dist/*
+          echo "✓ Package validation passed"
 
       - name: Upload to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload dist/*.tar.gz
+        run: |
+          echo "Uploading to PyPI..."
+          twine upload --verbose --non-interactive dist/*.tar.gz
+          echo "✓ Successfully uploaded to PyPI"
