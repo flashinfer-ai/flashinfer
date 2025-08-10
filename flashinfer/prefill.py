@@ -3118,6 +3118,7 @@ def trtllm_batch_context_with_kv_cache(
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
+        page_size = k_cache.shape[2]
     else:
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
@@ -3128,6 +3129,7 @@ def trtllm_batch_context_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+        page_size = k_cache.shape[3]
 
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
@@ -3181,7 +3183,6 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-    page_size = k_cache.shape[3]
     num_pages = block_tables.shape[1]
     max_kv_len = num_pages * page_size
     run_func(
