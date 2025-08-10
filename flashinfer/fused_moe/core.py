@@ -16,7 +16,6 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
