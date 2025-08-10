@@ -1897,7 +1897,7 @@ def get_trtllm_gen_decode_module(*args):
         block_tables: Optional[torch.Tensor] = None,
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
-        max_seq_len: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
@@ -1907,7 +1907,7 @@ def get_trtllm_gen_decode_module(*args):
         assert block_tables is not None
         assert kv_lens_buffer is not None
         assert page_size is not None
-        assert max_seq_len is not None
+        assert max_kv_len is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
@@ -1915,6 +1915,7 @@ def get_trtllm_gen_decode_module(*args):
             int_workspace_buffer,
             block_tables,
             kv_lens_buffer,
+            max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
