@@ -2,7 +2,6 @@ import pytest
 import torch
 
 from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
-from parameterized import parameterized
 import math
 
 
@@ -114,18 +113,10 @@ def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
         )
 
 
-@parameterized.expand(
-    list(
-        [
-            [1, 1024, torch.half, True],
-            [2, 512, torch.bfloat16, True],
-            [16, 512, torch.half, True],
-            [16, 512, torch.half, False],
-            [1024, 512, torch.half, False],
-            [1024, 512, torch.half, False],
-        ]
-    ),
-)
+@pytest.mark.parametrize("m", [1, 2, 16, 1024])
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).cpu().contiguous()
@@ -141,26 +132,15 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     mxfp8_quantize_check_accuracy(a_pt, a, 8, 0, 0.999)
 
 
-@parameterized.expand(
-    list(
-        [
-            [1, 1024, torch.half, True],
-            [2, 512, torch.bfloat16, True],
-            [16, 512, torch.half, True],
-            [16, 512, torch.half, False],
-            [1024, 512, torch.half, False],
-            [1024, 512, torch.half, False],
-        ]
-    ),
-)
+@pytest.mark.parametrize("m", [1, 2, 16, 1024])
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
 
-    # Quantize it on device.
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32)
-
-    # Dequantize it on host.
     a_pt = mxfp8_dequantize_host(
         a_fp8.cpu().view(torch.uint8),
         a_sf.cpu().view(torch.uint8),
@@ -168,7 +148,6 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
     )
 
     torch.cuda.synchronize()
-
     mxfp8_quantize_check_accuracy(
         a_pt.cpu().to(torch.float32), a.cpu().to(torch.float32), 8, 0, 0.999
     )
