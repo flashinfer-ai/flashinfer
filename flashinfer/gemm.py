@@ -23,7 +23,6 @@ from typing import List, Literal, Optional, Tuple
 
 import jinja2
 import torch
-import torch.nn.functional as F
 
 from .artifacts import ArtifactPath, MetaInfoHash
 from .autotuner import (
@@ -181,7 +180,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.cu",
     ]
 
-    with open(jit_env.FLASHINFER_CSRC_DIR / f"fp4_gemm_cutlass.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
         cta_m_n_k_list = [
@@ -477,7 +476,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
             module.fp4_gemm.default(
@@ -499,10 +500,6 @@ def get_gemm_sm100_module_cutlass_fp4():
         workspace_buffer: torch.Tensor,
     ):
         tuner = AutoTuner.get()
-
-        m = a.shape[0]
-        n = b.shape[1]
-        k = a.shape[1]
 
         a_tensor_index = 0
         a_scale_tensor_index = 2
@@ -1044,7 +1041,9 @@ class UIDs(Enum):
     ALPHA_UID = 2
     BLOCK_DESCALE_A_UID = 3
     BLOCK_DESCALE_B_UID = 4
-    O_UID = 5
+    A_SCALE_UID = 5
+    B_SCALE_UID = 6
+    O_UID = 7
 
 
 def _check_cudnn_availability():
@@ -1070,10 +1069,10 @@ def _check_cudnn_fp4_availability():
                 f"cuDNN FP4 requires version 1.13+, found {version_str}. "
                 f"Upgrade: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
             )
-    except (ImportError, AttributeError, ValueError, IndexError):
+    except (ImportError, AttributeError, ValueError, IndexError) as e:
         raise RuntimeError(
             "Unable to determine cuDNN version. FP4 requires cuDNN 1.13+."
-        )
+        ) from e
 
     # Check cuDNN backend version for FP4 support (requires >= 91002)
     try:
@@ -1083,10 +1082,10 @@ def _check_cudnn_fp4_availability():
                 f"cuDNN FP4 requires backend version >= 91002, found {backend_version}. "
                 f"Please upgrade cuDNN backend."
             )
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError) as e:
         raise RuntimeError(
             "Unable to determine cuDNN backend version. FP4 requires backend >= 91002."
-        )
+        ) from e
 
 
 def _is_cublas_fp4_available_in_cudnn():
@@ -1242,7 +1241,7 @@ def execute_cudnn_gemm_fp4_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    if graph.get_workspace_size() > DEFAULT_WORKSPACE_SIZE:
+    if workspace_buffer.numel() < graph.get_workspace_size():
         workspace_buffer = torch.empty(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
@@ -1282,8 +1281,14 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         b_cudnn_tensor = graph.tensor(
             name="b", dim=b_shape, stride=b_stride, data_type=b_type
         )
-        scale_cudnn_tensor = graph.tensor(
-            name="scale",
+        a_scale_cudnn_tensor = graph.tensor(
+            name="a_scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        b_scale_cudnn_tensor = graph.tensor(
+            name="b_scale",
             dim=(1, 1, 1),
             stride=(1, 1, 1),
             data_type=cudnn.data_type.FLOAT,
@@ -1295,18 +1300,28 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
             compute_data_type=cudnn.data_type.FLOAT,
         )
         c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
-        c_final_cudnn_tensor = graph.mul(
-            name="scale_mul",
+        c_after_scale_a_cudnn_tensor = graph.mul(
+            name="scale_mul_a",
             a=c_cudnn_tensor,
-            b=scale_cudnn_tensor,
+            b=a_scale_cudnn_tensor,
             compute_data_type=cudnn.data_type.FLOAT,
         )
-        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+        c_after_scale_b_cudnn_tensor = graph.mul(
+            name="scale_mul_b",
+            a=c_after_scale_a_cudnn_tensor,
+            b=b_scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+
+        c_after_scale_b_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(
+            o_type
+        )
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-        scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
-        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+        a_scale_cudnn_tensor.set_uid(UIDs.A_SCALE_UID.value)
+        b_scale_cudnn_tensor.set_uid(UIDs.B_SCALE_UID.value)
+        c_after_scale_b_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
         graph.validate()
         graph.build_operation_graph()
@@ -1318,20 +1333,21 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
 
 
 def execute_cudnn_gemm_with_per_tensor_q_graph(
-    graph, a, b, alpha, c_final, workspace_buffer
+    graph, a, b, a_scale, b_scale, c_final, workspace
 ):
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
-        UIDs.ALPHA_UID.value: alpha,
+        UIDs.A_SCALE_UID.value: a_scale,
+        UIDs.B_SCALE_UID.value: b_scale,
         UIDs.O_UID.value: c_final,
     }
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(stream)
 
-    if graph.get_workspace_size() > DEFAULT_WORKSPACE_SIZE:
-        workspace_buffer = torch.empty(
+    if workspace.numel() < graph.get_workspace_size():
+        workspace = torch.empty(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
 
@@ -1352,19 +1368,16 @@ def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
 
 
 def _cudnn_gemm_fp8(
+    workspace: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    dq_scale: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
     workspace_buffer: torch.Tensor,
 ):
     _check_cudnn_availability()
-
-    if out is None:
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[2], dtype=torch_out_dtype, device=a.device
-        )
 
     graph = build_cudnn_gemm_with_per_tensor_q_graph(
         a.shape,
@@ -1378,7 +1391,7 @@ def _cudnn_gemm_fp8(
     )
 
     execute_cudnn_gemm_with_per_tensor_q_graph(
-        graph, a, b, dq_scale, out, workspace_buffer
+        graph, a, b, a_scale, b_scale, out, workspace
     )
     return out
 
@@ -1540,9 +1553,9 @@ def mm_fp4(
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
     if block_size != 16:
-        raise ValueError(f"Only block_size = 16 is supported for FP4 GEMM operations.")
+        raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
-        raise ValueError(f"Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1698,7 +1711,7 @@ def bmm_fp8(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
     if backend == "cudnn":
-        return _cudnn_gemm_fp8(A, B, A_scale * B_scale, out, dtype, workspace_buffer)
+        return _cudnn_gemm_fp8(workspace_buffer, A, B, A_scale, B_scale, out, dtype)
     elif backend == "cublas":
         get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     elif backend == "cutlass":
@@ -1892,7 +1905,9 @@ def get_trtllm_fp4_gemm_module():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int,
+            *,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             (
                 workspace_buffer,
@@ -1931,10 +1946,6 @@ def get_trtllm_fp4_gemm_module():
         workspace_buffer: torch.Tensor,
     ):
         tuner = AutoTuner.get()
-
-        m = a.shape[0]
-        n = b.shape[0]
-        k = a.shape[1] * 2
 
         a_tensor_index = 1
         a_scale_tensor_index = 3
@@ -1997,7 +2008,7 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: str = "MN",
+    scale_major_mode: Optional[Literal["MN", "K"]] = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,

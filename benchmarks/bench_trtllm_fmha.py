@@ -56,7 +56,7 @@ def bench_trtllm_fmha(batch_size, seq_len, kv_cache_dtype):
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
@@ -168,7 +168,7 @@ def bench_trtllm_fmha_wrapper(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 if __name__ == "__main__":

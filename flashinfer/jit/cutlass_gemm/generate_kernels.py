@@ -1,7 +1,5 @@
-import argparse
 import enum
 import os
-import sys
 from itertools import product
 
 from .cutlass_library import *
@@ -109,7 +107,6 @@ CudaTypeName = {
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
 class TrtLlm_GemmLauncher:
-
     def __init__(
         self,
         gemm_kind,
@@ -250,16 +247,8 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 DataType.e4m3: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)",
             }
-            guard_act = (
-                guard_map[operation.act_type]
-                if operation.act_type in guard_map
-                else "1"
-            )
-            guard_weight = (
-                guard_map[operation.weight_type]
-                if operation.weight_type in guard_map
-                else "1"
-            )
+            guard_act = guard_map.get(operation.act_type, "1")
+            guard_weight = guard_map.get(operation.weight_type, "1")
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -325,7 +314,7 @@ namespace cutlass_kernels
 
 def clean_leftover_files(output_dir, generated_files):
     """Remove leftover generated files that weren't created in this run."""
-    for root, dirs, files in os.walk(output_dir):
+    for root, _dirs, files in os.walk(output_dir):
         for file in files:
             file_path = os.path.join(root, file)
             if file_path not in generated_files:
@@ -666,7 +655,6 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 
 
 def generate_sm120_grouped_gemm_operations(is_arch_enabled):
-
     if not is_arch_enabled:
         return []
     arch = 120
@@ -817,7 +805,6 @@ def generate_sm100_operations(is_arch_enabled):
 
 
 class GemmSm80LauncherConfig:
-
     def __init__(self, gemm_kind, arch, dtype, epi_tag, cta_shape, stage):
         self.gemm_kind = gemm_kind
         self.arch = arch

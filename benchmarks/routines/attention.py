@@ -1,4 +1,3 @@
-import argparse
 from collections import defaultdict
 
 import numpy as np
@@ -191,7 +190,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testBatchDecodeWithPagedKVCacheWrapper")
+        print("[INFO] Running testBatchDecodeWithPagedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
@@ -234,7 +233,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         )  # If 5, FA2 backend is not supported.
         if head_grp_size == 5:
             print(
-                f"[INFO] FA2 backend is not supported for this configuration. Skipping."
+                "[INFO] FA2 backend is not supported for this configuration. Skipping."
             )
             remove_fa2 = True
         if remove_fa2:
@@ -246,7 +245,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] FA2_TC backend does not support FP8. Skipping.")
+            print("[INFO] FA2_TC backend does not support FP8. Skipping.")
             remove_fa2_tc = True
         if remove_fa2_tc:
             backends.remove("fa2_tc")
@@ -257,13 +256,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
+            print("[INFO] cuDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
 
     if len(backends) == 0:
-        print(f"[ERROR] No backends to test. Exiting.")
+        print("[ERROR] No backends to test. Exiting.")
         return
 
     # Storage for timing results and outputs
@@ -418,7 +417,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 workspace_buffer,
                 "HND",
                 use_cuda_graph=is_cuda_graph_compatible,
-                use_tensor_cores=False if backend == "fa2" else True,
+                use_tensor_cores=(backend != "fa2"),
                 paged_kv_indptr_buffer=plan_kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
@@ -518,7 +517,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
+                        "[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
                     )
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
@@ -608,7 +607,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         dict: Dictionary containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testBatchPrefillWithPagedKVCacheWrapper")
+        print("[INFO] Running testBatchPrefillWithPagedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
@@ -646,7 +645,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "fa2" in backends:
         remove_fa2 = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            print(f"[INFO] FA2 backend does not support FP8. Skipping.")
+            print("[INFO] FA2 backend does not support FP8. Skipping.")
             remove_fa2 = True
         if remove_fa2:
             backends.remove("fa2")
@@ -666,7 +665,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] cuDNN backend does not support FP8. Skipping.")
+            print("[INFO] cuDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
@@ -677,28 +676,28 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] trtllm-gen backend does not support FP8. Skipping.")
+            print("[INFO] trtllm-gen backend does not support FP8. Skipping.")
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
 
     if "cutlass" in backends:
-        print(f"[INFO] CUTLASS backend does not support prefill. Skipping.")
+        print("[INFO] CUTLASS backend does not support prefill. Skipping.")
         remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
 
     if len(backends) == 0:
-        print(f"[ERROR] No backends to test. Exiting.")
+        print("[ERROR] No backends to test. Exiting.")
         return
 
     # Check for layer-specific constraints
     layer_not_supported = False
     if not ((head_dim_qk == 128 and head_dim_qk == head_dim_vo) or head_dim_qk == 192):
-        print(f"[ERROR] Head dimension must be 128 or 192")
+        print("[ERROR] Head dimension must be 128 or 192")
         layer_not_supported = True
     if layer_not_supported:
-        print(f"[ERROR] Layer not supported. Exiting.")
+        print("[ERROR] Layer not supported. Exiting.")
         return
 
     # Storage for timing results and outputs
@@ -955,7 +954,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
+                        "[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
                     )
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
@@ -1046,7 +1045,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         dict: Dictionary containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper")
+        print("[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
@@ -1085,7 +1084,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] CUDNN backend does not support FP8. Skipping.")
+            print("[INFO] CUDNN backend does not support FP8. Skipping.")
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
@@ -1096,28 +1095,28 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print(f"[INFO] CUTLASS backend does not support FP8. Skipping.")
+            print("[INFO] CUTLASS backend does not support FP8. Skipping.")
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
 
     if "trtllm-gen" in backends:
-        print(f"[INFO] trtllm-gen backend does not support ragged prefill. Skipping.")
+        print("[INFO] trtllm-gen backend does not support ragged prefill. Skipping.")
         remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
 
     if len(backends) == 0:
-        print(f"[ERROR] No backends to test. Exiting.")
+        print("[ERROR] No backends to test. Exiting.")
         return
 
     # Check for layer-specific constraints
     layer_not_supported = False
     if not ((head_dim_qk == 128 and head_dim_qk == head_dim_vo) or head_dim_qk == 192):
-        print(f"[ERROR] Head dimension must be 128 or 192")
+        print("[ERROR] Head dimension must be 128 or 192")
         layer_not_supported = True
     if layer_not_supported:
-        print(f"[ERROR] Layer not supported. Exiting.")
+        print("[ERROR] Layer not supported. Exiting.")
         return
 
     backend_times = {backend: [] for backend in backends}
@@ -1340,7 +1339,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
+                        "[VVERBOSE] Reference output is FP8. Converting to float32 for reference check."
                     )
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
@@ -1432,7 +1431,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testBatchMLAPagedAttentionWrapper")
+        print("[INFO] Running testBatchMLAPagedAttentionWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     # Basic setup
@@ -1582,8 +1581,6 @@ def testBatchMLAPagedAttentionWrapper(args):
         )
     if "trtllm-gen" in backends:
         ## Input preparation for flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla
-        query = torch.concat([q_pe, q_nope], dim=-1)
-        kv_cache = torch.concat([kpe_cache, ckv_cache], dim=-1)
         head_dim_ckv = head_dim_ckv
         head_dim_kpe = head_dim_kpe
         page_size = page_size

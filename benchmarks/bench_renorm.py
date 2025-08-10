@@ -49,7 +49,7 @@ def main():
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, p: {p}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, p: {p}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
     print("---")
@@ -75,7 +75,7 @@ def main():
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
     print("---")
@@ -100,7 +100,7 @@ def main():
                     io = (logits.numel() * logits.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
 

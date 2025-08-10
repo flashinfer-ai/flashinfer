@@ -1,6 +1,3 @@
-import pytest
-import torch
-
 import flashinfer.comm.nvshmem as nvshmem
 
 
