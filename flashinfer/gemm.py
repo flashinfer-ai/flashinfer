@@ -402,6 +402,7 @@ def get_gemm_sm100_module_cutlass_fp8():
         def forward(
             self,
             inputs: List[torch.Tensor],
+            *,
             tactic: int,
         ):
             a, b, alpha, out, workspace_buffer = inputs
