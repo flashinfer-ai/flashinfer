@@ -753,18 +753,12 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    import glob
-
     include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
 
     metainfo = get_cubin(
         f"{include_path}/flashinferMetaInfo", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
     )
     assert metainfo, "KernelMetaInfo.h not found"
-
-    debug_cubin_files = [
-        Path(p) for p in glob.glob(str(f"{ArtifactPath.TRTLLM_GEN_BMM}/Bmm_*.cpp"))
-    ]
 
     return gen_jit_spec(
         "fused_moe_sm100",
@@ -781,8 +775,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ]
-        + debug_cubin_files,
+        ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
