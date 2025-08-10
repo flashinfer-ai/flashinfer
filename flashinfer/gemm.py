@@ -226,7 +226,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         jit_env.FLASHINFER_CSRC_DIR / "fp8_gemm_cutlass.cu",
     ]
 
-    with open(jit_env.FLASHINFER_CSRC_DIR / f"fp8_gemm_cutlass.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fp8_gemm_cutlass.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
         cta_m_n_k_list = [
@@ -1351,7 +1351,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
 
-    graph.execute(variant_pack, workspace_buffer, handle=cudnn_handle)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
 
 
 def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
@@ -1375,7 +1375,6 @@ def _cudnn_gemm_fp8(
     b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
-    workspace_buffer: torch.Tensor,
 ):
     _check_cudnn_availability()
 
