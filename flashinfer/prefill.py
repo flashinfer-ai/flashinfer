@@ -22,7 +22,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .cudnn import (
+    cudnn_batch_prefill_with_kv_cache as cudnn_batch_prefill_with_kv_cache,
+)
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -67,7 +69,7 @@ def get_fmha_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
-    pos_encoding_mode: PosEncodingMode,
+    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool = False,
@@ -1313,7 +1315,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
-        jit_kwargs: Dict[str, Any] = {},
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1374,12 +1376,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
 
-        jit_kwargs : Dict[str, Any]
-            The keyword arguments to create the JIT module, defaults to an empty dictionary.
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
 
         if jit_args is not None:
+            if jit_kwargs is None:
+                jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
@@ -2240,7 +2244,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
-        jit_kwargs: Dict[str, Any] = {},
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2290,11 +2294,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
 
-        jit_kwargs : Dict[str, Any]
-            The keyword arguments to create the JIT module, defaults to an empty dictionary.
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
         if jit_args is not None:
+            if jit_kwargs is None:
+                jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
@@ -3116,9 +3122,9 @@ def trtllm_batch_context_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert (
-                kv_cache.shape[1] == 2
-            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -3127,9 +3133,9 @@ def trtllm_batch_context_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert (
-            query.dtype == torch.float8_e4m3fn
-        ), "query must be fp8 when out_dtype is nvfp4."
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16

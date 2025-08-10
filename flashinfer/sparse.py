@@ -971,13 +971,13 @@ class VariableBlockSparseAttentionWrapper:
         self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
 
         # Sanity check
-        assert (
-            num_qo_heads % num_kv_heads == 0
-        ), "num_qo_heads must be a multiple of num_kv_heads"
+        assert num_qo_heads % num_kv_heads == 0, (
+            "num_qo_heads must be a multiple of num_kv_heads"
+        )
         assert num_blocks_row * num_kv_heads + 1 == kv_indptr_host.shape[0]
-        assert (
-            kv_indptr_host[-1].item() == kv_indices_host.shape[0]
-        ), f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        assert kv_indptr_host[-1].item() == kv_indices_host.shape[0], (
+            f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        )
         assert num_kv_heads == block_mask_map.shape[0]
         assert num_kv_heads == block_row_sz.shape[0]
         assert num_kv_heads == block_col_sz.shape[0]

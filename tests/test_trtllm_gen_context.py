@@ -229,7 +229,6 @@ def test_trtllm_batch_prefill(
     o_dtype,
     kv_cache_dtype,
 ):
-
     # Set up test parameters
     seed = 0
     torch.manual_seed(seed)
@@ -269,7 +268,6 @@ def test_trtllm_batch_prefill(
 
     in_kv_lens = torch.randint(0, MAX_IN_KV_LEN, (batch_size,), dtype=torch.int)
     in_kv_lens[-1] = MAX_IN_KV_LEN
-    max_in_kv_len = torch.max(in_kv_lens).item()
     seq_lens = in_kv_lens + q_lens
     seq_lens_gpu = seq_lens.to(device)
     max_seq_len = torch.max(seq_lens).item()

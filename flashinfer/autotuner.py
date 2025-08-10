@@ -11,19 +11,22 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
 
-from flashinfer import __version__ as flashinfer_version
-
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
 from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
+# This version should be updated whenever the nvfp4_cutlass backend is changed,
+# such as when new kernels or configs are added. In such cases, the tuning configs
+# should also be updated. Currently, this process is manual, but it should be automated in the future.
+_nvfp4_cutlass_version = "0.1"
+
 
 def get_config_path(is_module: bool):
     dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    fi_ver = flashinfer_version.replace(".", "_")
-    config_name = f"v{fi_ver}_trtllm_fused_moe_{dev_name}"
+    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
+    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
     if is_module:
         return f"flashinfer.tuning_configs.{config_name}"
     else:
@@ -160,7 +163,6 @@ class FakeTensor:
 
 
 class TunableRunner(ABC):
-
     @abstractmethod
     def get_valid_tactics(
         self, inputs: List[torch.Tensor], profile: OptimizationProfile
@@ -275,7 +277,7 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
                 stats_str += f"    - Success rate: {success_rate:.1f}%\n"
@@ -420,9 +422,9 @@ class AutoTuner:
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
-        assert all(
-            [isinstance(r, TunableRunner) for r in runners]
-        ), "All Given runners must be subclass of TunableRunner"
+        assert all([isinstance(r, TunableRunner) for r in runners]), (
+            "All Given runners must be subclass of TunableRunner"
+        )
 
         profiles = self._optimization_profiles(tuning_config, inputs)
         # Record the total configs to try
@@ -495,7 +497,6 @@ class AutoTuner:
         return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-
         # Handle None tensors for optional inputs and non-Tensor scalar values
         sizes = [
             input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
@@ -583,20 +584,24 @@ class AutoTuner:
 
         generated_profiles: List[OptimizationProfile] = []
 
-        dynamic_dims = []
+        dynamic_dims: List[Tuple[Any, ...]] = []
 
         for spec in tuning_config.dynamic_tensor_specs:
             assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(
                 spec.gen_tuning_buckets, (list, tuple)
-            ), "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            ), (
+                "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            )
             if inspect.isfunction(spec.gen_tuning_buckets):
                 opt_shapes = spec.gen_tuning_buckets(
-                    base_profile.shapes[spec.input_idx][spec.dim_idx].val
+                    base_profile.shapes[spec.input_idx][spec.dim_idx]._opt()
                 )
             else:
                 opt_shapes = spec.gen_tuning_buckets
-            opt_shapes_max = tuple(opt_shapes[1:]) + (float("inf"),)
-            opt_shapes_max = {v1: v2 for v1, v2 in zip(opt_shapes, opt_shapes_max)}
+            opt_shapes_max = {
+                v1: v2
+                for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
+            }
             dynamic_dims.append(
                 (spec.input_idx, spec.dim_idx, opt_shapes_max, opt_shapes)
             )
@@ -605,7 +610,7 @@ class AutoTuner:
         dim_grids = itertools.product(*[d[-1] for d in dynamic_dims])
         for opt_point in dim_grids:
             p = copy.deepcopy(base_profile)
-            for pos, (input_idx, dim_idx, opt_shapes_max, opt_shapes) in enumerate(
+            for pos, (input_idx, dim_idx, opt_shapes_max, _opt_shapes) in enumerate(
                 dynamic_dims
             ):
                 opt_value = opt_point[pos]
@@ -617,10 +622,12 @@ class AutoTuner:
                 )
 
             # Adjust the profile to satisfy the constraints
-            for spec in tuning_config.constraint_specs:
-                min_value = opt_value = max_value = spec.infer_shape(p.get_opt_shapes())
-                p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
-                    min_value, opt_value, max_value
+            for constraint_spec in tuning_config.constraint_specs:
+                min_value = opt_value = max_value = constraint_spec.infer_shape(
+                    p.get_opt_shapes()
+                )
+                p.shapes[constraint_spec.input_idx][constraint_spec.dim_idx] = (
+                    DynamicDim(min_value, opt_value, max_value)
                 )
             generated_profiles.append(p)
             logger.debug(f"[Autotuner]: generated profile: {p}")
@@ -651,8 +658,8 @@ class AutoTuner:
             )
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for spec in tuning_config.constraint_specs:
-            base_profile[spec.input_idx][spec.dim_idx] = -1
+        for constraint_spec in tuning_config.constraint_specs:
+            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
 
         return tuple(tuple(shape) for shape in base_profile)
 

@@ -1,7 +1,6 @@
 import functools
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -50,13 +49,14 @@ def get_mxfp8_quantization_sm100_module():
     def mxfp8_quantize_sm100(
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to MxFP8 format.
 
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+            alignment (int, optional): sfVecSize. Defaults to 32. Note that alignment is not used in the host kernel.
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
                 - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -71,6 +71,7 @@ def get_mxfp8_quantization_sm100_module():
             return module.mxfp8_quantize(
                 input,
                 is_sf_swizzled_layout,
+                alignment,
             )
 
     @register_fake_op("flashinfer::mxfp8_quantize_sm100")
@@ -127,6 +128,7 @@ def get_mxfp8_quantization_sm100_module():
 def mxfp8_quantize(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -136,7 +138,7 @@ def mxfp8_quantize(
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+        alignment (int, optional): sfVecSize. Defaults to 32.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -148,8 +150,8 @@ def mxfp8_quantize(
     x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
         input,
         is_sf_swizzled_layout,
+        alignment,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     return x_q, sf
 
 
