@@ -494,7 +494,6 @@ def test_trtllm_batch_decode_mla(
         qk_rope_head_dim=qk_rope_head_dim,
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
-        max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
