@@ -36,15 +36,15 @@ jobs:
           # Extract version from tag (remove 'v' prefix)
           TAG_VERSION="${{ inputs.tag }}"
           TAG_VERSION="${TAG_VERSION#v}"
-          
+
           # Check version.txt FIRST - this is the source of truth
           if [ ! -f "version.txt" ]; then
             echo "Error: version.txt file not found!"
             exit 1
           fi
-          
+
           VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
-          
+
           if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
             echo "❌ CRITICAL ERROR: version.txt does not match tag!"
             echo "  Tag version: $TAG_VERSION"
@@ -54,7 +54,7 @@ jobs:
             echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
             exit 1
           fi
-          
+
           echo "✓ version.txt matches tag version: $VERSION_TXT"
 
       - name: Verify tag matches package version
@@ -62,7 +62,7 @@ jobs:
           # Extract version from tag (remove 'v' prefix)
           TAG_VERSION="${{ inputs.tag }}"
           TAG_VERSION="${TAG_VERSION#v}"
-          
+
           # Extract version from setup.py or pyproject.toml
           if [ -f "setup.py" ]; then
             PACKAGE_VERSION=$(python -c "import re; content = open('setup.py').read(); match = re.search(r'version\s*=\s*[\"']([^\"']+)[\"']', content); print(match.group(1) if match else '')")
@@ -72,7 +72,7 @@ jobs:
             echo "Warning: Could not find version file (setup.py or pyproject.toml)"
             PACKAGE_VERSION=""
           fi
-          
+
           if [ -n "$PACKAGE_VERSION" ] && [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
             echo "Error: Tag version ($TAG_VERSION) does not match package version ($PACKAGE_VERSION)"
             exit 1
