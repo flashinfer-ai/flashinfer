@@ -274,6 +274,7 @@ def test_trtllm_batch_decode_fmha(
         workspace_buffer,
         block_tables,
         seq_lens_gpu,
+        max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
@@ -578,17 +579,3 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
-
-
-if __name__ == "__main__":
-    test_trtllm_batch_decode_fmha(
-        kv_layout="HND",
-        batch_size=4,
-        page_size=32,
-        num_kv_heads=2,
-        head_grp_size=4,
-        window_left=-1,
-        q_dtype="half",
-        o_dtype="half",
-        kv_cache_dtype="half",
-    )
