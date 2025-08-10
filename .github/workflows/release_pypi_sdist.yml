@@ -57,28 +57,6 @@ jobs:
 
           echo "✓ version.txt matches tag version: $VERSION_TXT"
 
-      - name: Verify tag matches package version
-        run: |
-          # Extract version from tag (remove 'v' prefix)
-          TAG_VERSION="${{ inputs.tag }}"
-          TAG_VERSION="${TAG_VERSION#v}"
-
-          # Extract version from setup.py or pyproject.toml
-          if [ -f "setup.py" ]; then
-            PACKAGE_VERSION=$(python -c "import re; content = open('setup.py').read(); match = re.search(r'version\s*=\s*[\"']([^\"']+)[\"']', content); print(match.group(1) if match else '')")
-          elif [ -f "pyproject.toml" ]; then
-            PACKAGE_VERSION=$(python -c "import tomllib; data = tomllib.load(open('pyproject.toml', 'rb')); print(data.get('project', {}).get('version', '') or data.get('tool', {}).get('poetry', {}).get('version', ''))")
-          else
-            echo "Warning: Could not find version file (setup.py or pyproject.toml)"
-            PACKAGE_VERSION=""
-          fi
-
-          if [ -n "$PACKAGE_VERSION" ] && [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
-            echo "Error: Tag version ($TAG_VERSION) does not match package version ($PACKAGE_VERSION)"
-            exit 1
-          fi
-          echo "✓ Package version check passed: $TAG_VERSION"
-
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip

@@ -58,7 +58,7 @@ install_requires = [
     "torch",
     "ninja",
     "requests",
-    "cuda-python",
+    "cuda-python<=12.9",
     "pynvml",
     "einops",
     "nvidia-cudnn-frontend>=1.13.0",
