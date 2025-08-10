@@ -78,5 +78,5 @@ Related APIs
 FlashInfer exposes several APIs to facilitate the recursive attention computation:
 
 - :ref:`api-merge-states` defines the operators to merge attention states.
-- :ref:`apiprefill` and :ref:`apidecode` defines operators that returns attention states (APIs
+- :ref:`apiattention` defines operators that returns attention states (APIs
   with suffix ``_return_lse`` returns both attention output :math:`v` and score :math:`s`).

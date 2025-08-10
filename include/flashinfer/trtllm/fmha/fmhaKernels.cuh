@@ -31,6 +31,18 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
+#ifdef TLLM_GEN_FMHA_CUBIN_PATH
+static const std::string tllm_gen_fmha_cubin_path = std::string(TLLM_GEN_FMHA_CUBIN_PATH);
+#else
+static_assert(false, "TLLM_GEN_FMHA_CUBIN_PATH macro is not defined when compiling");
+#endif
+
+#ifdef TLLM_GEN_FMHA_METAINFO_HASH
+static const std::string tllm_gen_fmha_metainfo_hash = std::string(TLLM_GEN_FMHA_METAINFO_HASH);
+#else
+static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when compiling");
+#endif
+
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 std::string getMetaInfo(const std::string& name, const std::string& sha256,
@@ -234,14 +246,6 @@ class TllmGenFmhaKernel {
     }
   }
 
-  static std::string getCubinPath() {
-    const char* env_hash = std::getenv("FLASHINFER_CUBIN_ARTIFACTORY_HASH");
-    std::string hash =
-        env_hash ? std::string(env_hash) : "e3ecc5f8e43f96e6ac6012b718b0ce7e4c84cb86";
-    std::string cubin_path = hash + "/fmha/trtllm-gen/";
-    return cubin_path;
-  }
-
  private:
   // Is it MLA generation kernel ?
   inline bool isMlaGenKernel(RunnerParams const& params) const {
@@ -397,11 +401,19 @@ class TllmGenFmhaKernel {
                            clusterDimX);
   }
 
-  // Compute the seqLenPerCtaKv for selecting the MLA generation kernel.
-  int computeSeqLenPerCtaKv(RunnerParams const& params) const {
+  // Determine if we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+  bool useSwapsMmaAbMlaGenKernel(RunnerParams const& params) const {
+    // Use the SwapsMmaAbForGeneration kernel for MLA generation when the following conditions are
+    // met:
+    // 1. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned
+    // later).
+    // 2. The numCtas (after splitting the heads across multiple CTAs) <=
+    // params.mMultiProcessorCount.
+
     // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
     // Here we assume the stepKv is 256.
     int const maxNumCtasPerSeqKv = flashinfer::ceil_div(params.mMaxSeqLenKv, 256);
+    ;
     // The number of Ctas.
     int const numCtas = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ *
                                              divUp(params.mNumHeadsQPerKv, 16));
@@ -410,8 +422,8 @@ class TllmGenFmhaKernel {
         std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
     // Compute the seqLenPerCtaKv.
     int const seqLenPerCtaKv = flashinfer::ceil_div(params.mMaxSeqLenKv, numCtasPerSeqKv);
-    // Return the seqLenPerCtaKv.
-    return seqLenPerCtaKv;
+    // Whether we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+    return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
   std::pair<uint64_t, std::string> hashFromRunnerParams(
@@ -424,10 +436,12 @@ class TllmGenFmhaKernel {
       // following conditions are met:
       // 1. The number of headsQPerKv is <= 32.
       // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned
-      // later).
+      // later) and
+      //    the numCtas (after splitting the heads across multiple CTAs) <=
+      //    params.mMultiProcessorCount.
 
       // Check the conditions.
-      if (params.mNumHeadsQPerKv <= 32 || computeSeqLenPerCtaKv(params) <= 1024) {
+      if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params)) {
         kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       } else {
         // Otherwise, we use the high-throughput kernel.
@@ -529,7 +543,7 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path = TllmGenFmhaKernel::getCubinPath() + kernelMeta.mFuncName;
+      std::string cubin_path = tllm_gen_fmha_cubin_path + kernelMeta.mFuncName;
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
@@ -583,9 +597,8 @@ class TllmFmhaKernelFactory {
     std::lock_guard<std::mutex> lg(s_mutex);
 
     if (!metainfo_loaded) {
-      std::string metainfo_raw =
-          getMetaInfo(TllmGenFmhaKernel::getCubinPath() + "flashInferMetaInfo",
-                      "fca653ee285cf41e2ed43e2ef155471e2192383ce775e6b6fde8d079d83b861f", ".h");
+      std::string metainfo_raw = getMetaInfo(tllm_gen_fmha_cubin_path + "flashInferMetaInfo",
+                                             tllm_gen_fmha_metainfo_hash, ".h");
       metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
       metainfo_loaded = true;
     }

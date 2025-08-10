@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+import random
+import time
 from typing import Tuple
 
+import numpy as np
 import torch
 from einops import rearrange, reduce, repeat
 
@@ -206,3 +210,534 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
             x_scale = rearrange(x_scale, "s0 s1 s2 -> s0 s2 s1 1 1 1")
         out = rearrange(x * x_scale, "s0 s1 s2 t0 t1 t2 -> (s0 t0) (s1 t1) (s2 t2)")
     return out
+
+
+def set_seed(random_seed):
+    """
+    Set random seed for reproducibility during testing.
+
+    Args:
+        random_seed (int): Random seed to set.
+
+    Returns:
+        None
+    """
+    torch.manual_seed(random_seed)
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(random_seed)
+        torch.cuda.manual_seed_all(random_seed)
+
+
+def sleep_after_kernel_run(execution_time):
+    """
+    Sleep after kernel run. Dynamically adjust sleep time up to 1 sec based on execution time.
+
+    Args:
+        execution_time (float): Kernel execution time in milliseconds.
+
+    Returns:
+        None
+    """
+    if not math.isinf(execution_time):
+        sleep_time = np.min([execution_time / 200, 1.0])
+    else:
+        sleep_time = 0.01
+    time.sleep(sleep_time)
+    return
+
+
+def attention_flops(
+    batch_size,
+    qo_seqlen,
+    kv_seqlen,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    causal,
+):
+    """
+    Calculate FLOPs for a given attention layer. Assumes all sequence lengths are the same within the batch
+
+    Args:
+        batch_size (int): Batch size.
+        qo_seqlen (int): Sequence length of the query. Assumed same within the batch.
+        kv_seqlen (int): Sequence length of the key and value. Assumed same within the batch.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking.
+
+    Returns:
+        total_flops (int): Total FLOPs for the layer.
+    """
+    if causal:
+        bmm1_flops = (
+            batch_size
+            * (2 * kv_seqlen - qo_seqlen)
+            * qo_seqlen
+            * num_qo_heads
+            * head_dim_qk
+        )
+        bmm2_flops = (
+            batch_size
+            * (2 * kv_seqlen - qo_seqlen)
+            * qo_seqlen
+            * num_qo_heads
+            * head_dim_vo
+        )
+    else:
+        bmm1_flops = 2 * batch_size * qo_seqlen * kv_seqlen * num_qo_heads * head_dim_qk
+        bmm2_flops = 2 * batch_size * qo_seqlen * kv_seqlen * num_qo_heads * head_dim_vo
+    total_flops = bmm1_flops + bmm2_flops
+    return total_flops
+
+
+def attention_flops_with_actual_seq_lens(
+    actual_seq_lens_q,
+    actual_seq_lens_kv,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    causal,
+):
+    """
+    Calculate FLOPs for a given attention layer with actual sequence lengths where
+    actual sequence lengths are provided as 1D tensors.
+
+    Args:
+        actual_seq_lens_q (torch.Tensor): Array of actual sequence lengths of the query.
+        actual_seq_lens_kv (torch.Tensor): Array of actual sequence lengths of the key and value.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        causal (bool): Whether to use causal masking.
+        Note: Causal must be false for decode as this function assumes qo_seqlen == kv_seqlen.
+
+    Returns:
+        total_flops (int): Total FLOPs for the layer.
+    """
+    if causal:
+        bmm1_flops = (
+            torch.dot(
+                2 * actual_seq_lens_kv.to(torch.float32)
+                - actual_seq_lens_q.to(torch.float32),
+                actual_seq_lens_q.to(torch.float32),
+            )
+            * num_qo_heads
+            * head_dim_qk
+        )
+        bmm2_flops = (
+            torch.dot(
+                2 * actual_seq_lens_kv.to(torch.float32)
+                - actual_seq_lens_q.to(torch.float32),
+                actual_seq_lens_q.to(torch.float32),
+            )
+            * num_qo_heads
+            * head_dim_vo
+        )
+
+    else:
+        bmm1_flops = (
+            2
+            * torch.dot(
+                actual_seq_lens_kv.to(torch.float32),
+                actual_seq_lens_q.to(torch.float32),
+            )
+            * num_qo_heads
+            * head_dim_qk
+        )
+        bmm2_flops = (
+            2
+            * torch.dot(
+                actual_seq_lens_kv.to(torch.float32),
+                actual_seq_lens_q.to(torch.float32),
+            )
+            * num_qo_heads
+            * head_dim_vo
+        )
+
+    total_flops = bmm1_flops + bmm2_flops
+    return total_flops
+
+
+def attention_tflops_per_sec(
+    batch_size,
+    qo_seqlen,
+    kv_seqlen,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    causal,
+    time,
+):
+    """
+    Calculate TFLOPS per second for a given attention layer. Assumes all sequence lengths are the same within the batch.
+
+    Args:
+        batch_size (int): Batch size.
+        qo_seqlen (int): Sequence length of the query.
+        kv_seqlen (int): Sequence length of the key and value.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        causal (bool): Whether to use causal masking.
+        time (float): Execution time in milliseconds.
+
+    Returns:
+        tflops_per_sec (float): TFLOPS per second for the layer.
+    """
+    f = attention_flops(
+        batch_size,
+        qo_seqlen,
+        kv_seqlen,
+        head_dim_qk,
+        head_dim_vo,
+        num_qo_heads,
+        causal,
+    )
+    return f / time / 1e9 if not math.isnan(time) else 0.0
+
+
+def attention_tflops_per_sec_with_actual_seq_lens(
+    actual_seq_lens_q,
+    actual_seq_lens_kv,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    causal,
+    time,
+):
+    """
+    Calculate TFLOPS per second for a given attention layer with actual sequence lengths.
+    Does not assume all sequence lengths are the same within the batch.
+
+    Args:
+        actual_seq_lens_q (torch.Tensor): Array of actual sequence lengths of the query.
+        actual_seq_lens_kv (torch.Tensor): Array of actual sequence lengths of the key and value.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        causal (bool): Whether to use causal masking.
+        time (float): Execution time in milliseconds.
+
+    Returns:
+        tflops_per_sec (float): TFLOPS per second for the layer.
+    """
+    f = attention_flops_with_actual_seq_lens(
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        head_dim_qk,
+        head_dim_vo,
+        num_qo_heads,
+        causal,
+    )
+    return f.item() / time / 1e9 if not math.isnan(time) else 0.0
+
+
+def attention_tb_per_sec(
+    batch_size,
+    qo_seqlen,
+    kv_seqlen,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    num_kv_heads,
+    time,
+    q_dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
+    o_dtype=torch.bfloat16,
+):
+    """
+    Calculate TB per second perf achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
+
+    Args:
+        batch_size (int): Batch size.
+        qo_seqlen (int): Sequence length of the query.
+        kv_seqlen (int): Sequence length of the key and value.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        num_kv_heads (int): Number of key and value heads.
+        time (float): Execution time in milliseconds.
+        q_dtype (torch.dtype): Data type of the query.
+        kv_dtype (torch.dtype): Data type of the key and value.
+        o_dtype (torch.dtype): Data type of the output.
+
+    Returns:
+        tb_per_sec (float): TB per second for the layer.
+    """
+    q_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_qk * q_dtype.itemsize
+    k_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_qk * kv_dtype.itemsize
+    v_bytes = batch_size * kv_seqlen * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+    o_bytes = batch_size * qo_seqlen * num_qo_heads * head_dim_vo * o_dtype.itemsize
+    total_bytes = q_bytes + k_bytes + v_bytes + o_bytes
+
+    time_in_sec = time / 1e3
+    bytes_in_tb = total_bytes / 1e12  # TB not TiB
+    return bytes_in_tb / time_in_sec if not math.isnan(time) else 0.0
+
+
+def attention_tb_per_sec_with_actual_seq_lens(
+    actual_seq_lens_q,
+    actual_seq_lens_kv,
+    head_dim_qk,
+    head_dim_vo,
+    num_qo_heads,
+    num_kv_heads,
+    time,
+    q_dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
+    o_dtype=torch.bfloat16,
+):
+    """
+    Calculate TB per second perf achieved for a given attention layer with actual sequence lengths.
+    Does not assume all sequence lengths are the same within the batch.
+
+    Args:
+        actual_seq_lens_q (torch.Tensor): Array of actual sequence lengths of the query.
+        actual_seq_lens_kv (torch.Tensor): Array of actual sequence lengths of the key and value.
+        head_dim_qk (int): Head dimension of the query and key.
+        head_dim_vo (int): Head dimension of the value.
+        num_qo_heads (int): Number of query heads.
+        num_kv_heads (int): Number of key and value heads.
+        time (float): Execution time in milliseconds.
+        q_dtype (torch.dtype): Data type of the query.
+        kv_dtype (torch.dtype): Data type of the key and value.
+        o_dtype (torch.dtype): Data type of the output.
+
+    Returns:
+        tb_per_sec (float): TB per second for the layer.
+    """
+    q_bytes = (
+        torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_qk * q_dtype.itemsize
+    )
+    k_bytes = (
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * kv_dtype.itemsize
+    )
+    v_bytes = (
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+    )
+    o_bytes = (
+        torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_vo * o_dtype.itemsize
+    )
+
+    total_bytes = (q_bytes + k_bytes + v_bytes + o_bytes).item()
+
+    time_in_sec = time / 1e3
+    bytes_in_tb = total_bytes / 1e12  # TB not TiB
+    return bytes_in_tb / time_in_sec if not math.isnan(time) else 0.0
+
+
+def bench_gpu_time(
+    fn,
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
+    l2_flush: bool = True,
+    l2_flush_size_mb: int = 256,
+    l2_flush_device: str = "cuda",
+    sleep_after_run: bool = False,
+):
+    """
+    Benchmark kernel execution time without using CUDA graphs.
+    Measures kernel launch latency + actual kernel execution time for fn().
+    Can flush L2 cache and sleep after the run.
+
+    Number of dry run and actual run iterations can be set by iteration count or time:
+    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
+    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+
+    Returns an array of measured times so that the caller can compute statistics.
+
+    Args:
+        fn: Function to benchmark.
+        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
+        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
+        dry_run_time_ms: Time to run the dry run in milliseconds.
+        repeat_time_ms: Time to run the repeat in milliseconds.
+        l2_flush: Whether to flush L2 cache.
+        l2_flush_size_mb: Size of the L2 cache to flush.
+        l2_flush_device: Device that needs to flush L2 cache.
+        sleep_after_run: Whether to sleep after the run. Sleep time is dynamically set.
+
+    Returns:
+        measured_times: List of measured times.
+    """
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    if l2_flush:
+        l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
+        buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
+
+    ## Estimate kernel execution time by running the kernel 5 times
+    measurement_iters = 5
+    torch.cuda.synchronize()
+    fn()  # Call once to exclude initial overhead
+    torch.cuda.synchronize()
+    start_event.record()
+    for _ in range(measurement_iters):
+        if l2_flush:
+            buffer.zero_()
+        fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
+
+    ## Set dry run and repeat iterations
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / estimated_kernel_execution_time))
+    if repeat_iters is None:
+        repeat_iters = max(1, int(repeat_time_ms / estimated_kernel_execution_time))
+
+    # Dry runs
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if l2_flush:
+            buffer.zero_()
+        fn()
+    torch.cuda.synchronize()
+
+    # Actual run
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    torch.cuda.synchronize()
+    for iter_idx in range(repeat_iters):
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        fn()
+        end_events[iter_idx].record()
+
+        if sleep_after_run:
+            sleep_after_kernel_run(estimated_kernel_execution_time)
+
+    # Synchronize once outside of the loop to avoid synchronization overhead
+    torch.cuda.synchronize()
+    measured_times = []
+    for iter_idx in range(repeat_iters):
+        measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
+    return measured_times
+
+
+def bench_gpu_time_with_cudagraph(
+    fn,
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
+    num_iters_within_graph: int = 10,
+    l2_flush: bool = True,
+    l2_flush_size_mb: int = 256,
+    l2_flush_device: str = "cuda",
+    sleep_after_run: bool = False,
+):
+    """
+    Benchmark GPU time using by constructing CUDA graphs with kernel launch and then replaying the graph.
+    Increasing the number of iterations within graph can amortize kernel launch latency to help
+    obtain measurements close to GPU kernel time of fn().
+    Can flush L2 cache and sleep after the run.
+
+    Number of dry run and actual run iterations can be set by iteration count or time:
+    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
+    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+
+    Returns an array of measured times so that the caller can compute statistics.
+
+    Uses PyTorch's API to construt and use CUDA Graphs.
+    Also see PyTorch's post on CUDA Graphs: https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
+
+    Args:
+        fn: Function to benchmark.
+        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
+        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
+        dry_run_time_ms: Time to run the dry run in milliseconds.
+        repeat_time_ms: Time to run the repeat in milliseconds.
+        num_iters_within_graph: Number of iterations to run within the graph.
+        l2_flush: Whether to flush L2 cache.
+        l2_flush_size_mb: Size of the L2 cache to flush.
+        l2_flush_device: Device that needs to flush L2 cache.
+        sleep_after_run: Whether to sleep after the run. Sleep time is dynamically set.
+
+    Returns:
+        measured_times: List of measured times.
+    """
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    if l2_flush:
+        l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
+        buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
+
+    # Warmup run
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+
+    # Capture kernel in graph
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(num_iters_within_graph):
+            fn()
+    torch.cuda.synchronize()
+
+    ## Estimate kernel execution time by running the kernel 5 times
+    measurement_iters = 5
+    start_event.record()
+    for _ in range(measurement_iters):
+        if l2_flush:
+            buffer.zero_()
+        g.replay()
+    end_event.record()
+    torch.cuda.synchronize()
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
+
+    ## Set dry run and repeat iterations
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / estimated_kernel_execution_time))
+    if repeat_iters is None:
+        repeat_iters = max(1, int(repeat_time_ms / estimated_kernel_execution_time))
+
+    # Dry run
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if l2_flush:
+            buffer.zero_()
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Actual run
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
+    torch.cuda.synchronize()
+    for iter_idx in range(repeat_iters):
+        if l2_flush:
+            buffer.zero_()
+        start_events[iter_idx].record()
+        g.replay()
+        end_events[iter_idx].record()
+
+        if sleep_after_run:
+            sleep_after_kernel_run(estimated_kernel_execution_time)
+
+    # Synchronize once outside of the loop to avoid synchronization overhead
+    torch.cuda.synchronize()
+    measured_times = []
+    for iter_idx in range(repeat_iters):
+        measured_times.append(
+            start_events[iter_idx].elapsed_time(end_events[iter_idx])
+            / num_iters_within_graph
+        )
+    return measured_times

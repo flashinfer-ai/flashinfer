@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
+import torch.version
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
-from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
+from .comm.nvshmem import gen_nvshmem_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
-from .fused_moe import gen_fused_moe_sm100_module
+from .fused_moe import gen_cutlass_fused_moe_sm100_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -42,11 +43,15 @@ def gen_fa2(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_attention_sink: bool,
 ) -> List[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return []
     if dtype_qo.itemsize == 1:
         return []  # fp8 tensor cores not supported in fa2
+
+    # TODO: support for AoT sink attention.
+
     return [
         gen_single_prefill_module(
             backend="fa2",
@@ -105,6 +110,7 @@ def gen_fa3(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_attention_sink: bool,
 ) -> List[JitSpec]:
     if dtype_q != dtype_kv:
         return []  # fa3 template do not support mixed precision
@@ -115,6 +121,8 @@ def gen_fa3(
     if dtype_kv.itemsize == 1:
         if head_dim_qk == 192 or head_dim_qk == 64:
             return []  # (192, 128) & (64, 64) not supported for fp8 yet.
+
+    # TODO: support for AoT sink attention.
 
     return [
         gen_single_prefill_module(
@@ -155,6 +163,7 @@ def gen_attention(
     has_sm90: bool,
     has_sm100: bool,
     add_gemma: bool,
+    add_oai_oss: bool,
 ) -> List[JitSpec]:
     head_dim_ckv = 512
     head_dim_kpe = 64
@@ -181,6 +190,7 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            use_attention_sink=False,
         )
 
     # FA3 MHA / MQA / GQA
@@ -206,6 +216,7 @@ def gen_attention(
                 head_dim_vo=head_dim_vo,
                 use_sliding_window=use_sliding_window,
                 use_logits_soft_cap=use_logits_soft_cap,
+                use_attention_sink=False,
             )
 
     # Gemma
@@ -226,6 +237,7 @@ def gen_attention(
                 head_dim_vo=256,
                 use_sliding_window=use_sliding_window,
                 use_logits_soft_cap=use_logits_soft_cap,
+                use_attention_sink=False,
             )
         if has_sm90:
             for (
@@ -245,7 +257,29 @@ def gen_attention(
                     head_dim_vo=256,
                     use_sliding_window=use_sliding_window,
                     use_logits_soft_cap=use_logits_soft_cap,
+                    use_attention_sink=False,
                 )
+
+    # OAI OSS
+    if add_oai_oss:
+        for (
+            dtype_qo,
+            dtype_kv,
+            use_sliding_window,
+        ) in product(
+            f16_dtype_,
+            f16_dtype_ + f8_dtype_,
+            [True],
+        ):
+            jit_specs += gen_fa2(
+                dtype_qo=dtype_qo,
+                dtype_kv=dtype_kv,
+                head_dim_qk=64,
+                head_dim_vo=64,
+                use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=False,
+                use_attention_sink=True,
+            )
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
@@ -301,7 +335,12 @@ def gen_all_modules(
     use_logits_soft_cap_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    add_comm: bool,
     add_gemma: bool,
+    add_oai_oss: bool,
+    add_moe: bool,
+    add_act: bool,
+    add_misc: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
 
@@ -315,27 +354,41 @@ def gen_all_modules(
         has_sm90,
         has_sm100,
         add_gemma,
+        add_oai_oss,
     )
-    for act_name in act_func_def_str:
-        jit_specs.append(gen_act_and_mul_module(act_name))
-    jit_specs.append(gen_gemm_module())
-    if has_sm90:
-        jit_specs.append(gen_gemm_sm90_module())
-    if has_sm100:
-        jit_specs.append(gen_fused_moe_sm100_module())
-        jit_specs.append(gen_fp4_quantization_sm100_module())
-        jit_specs.append(gen_gemm_sm100_module())
-        jit_specs.append(gen_trtllm_comm_module())
 
-    jit_specs += [
-        gen_cascade_module(),
-        gen_vllm_comm_module(),
-        gen_norm_module(),
-        gen_page_module(),
-        gen_quantization_module(),
-        gen_rope_module(),
-        gen_sampling_module(),
-    ]
+    if add_act:
+        for act_name in act_func_def_str:
+            jit_specs.append(gen_act_and_mul_module(act_name))
+
+    if add_moe:
+        jit_specs.append(gen_gemm_module())
+        if has_sm90:
+            jit_specs.append(gen_gemm_sm90_module())
+        if has_sm100:
+            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
+            jit_specs.append(gen_fp4_quantization_sm100_module())
+            jit_specs.append(gen_gemm_sm100_module())
+
+    if add_comm:
+        from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
+
+        if has_sm100:
+            jit_specs.append(gen_trtllm_comm_module())
+        jit_specs.append(gen_vllm_comm_module())
+
+    if add_misc:
+        jit_specs += [
+            gen_cascade_module(),
+            gen_norm_module(),
+            gen_nvshmem_module(),
+            gen_page_module(),
+            gen_quantization_module(),
+            gen_rope_module(),
+            gen_sampling_module(),
+        ]
+    if has_sm90:
+        jit_specs.append(get_trtllm_utils_spec())
 
     # dedup
     names = set()
@@ -422,9 +475,34 @@ def main():
         help="Use logits soft cap",
     )
     parser.add_argument(
+        "--add-comm",
+        type=parse_bool,
+        help="Add communication kernels (trtllm_comm, vllm_comm)",
+    )
+    parser.add_argument(
         "--add-gemma",
         type=parse_bool,
         help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)",
+    )
+    parser.add_argument(
+        "--add-oai-oss",
+        type=parse_bool,
+        help="Add kernels for OAI OSS Model (head_dim=64, use_sliding_window)",
+    )
+    parser.add_argument(
+        "--add-moe",
+        type=parse_bool,
+        help="Add MoE kernels",
+    )
+    parser.add_argument(
+        "--add-act",
+        type=parse_bool,
+        help="Add activation kernels",
+    )
+    parser.add_argument(
+        "--add-misc",
+        type=parse_bool,
+        help="Add miscellaneous kernels",
     )
     args = parser.parse_args()
 
@@ -459,7 +537,12 @@ def main():
         False,
         # True,
     ]
+    add_comm = False
     add_gemma = True
+    add_oai_oss = True
+    add_moe = False
+    add_act = True
+    add_misc = True
 
     # Override
     if args.out_dir:
@@ -478,19 +561,33 @@ def main():
         use_sliding_window_ = [parse_bool(s) for s in args.use_sliding_window]
     if args.use_logits_soft_cap:
         use_logits_soft_cap_ = [parse_bool(s) for s in args.use_logits_soft_cap]
+    if args.add_comm is not None:
+        add_comm = bool(args.add_comm)
     if args.add_gemma is not None:
         add_gemma = bool(args.add_gemma)
+    if args.add_oai_oss is not None:
+        add_oai_oss = bool(args.add_oai_oss)
+    if args.add_moe is not None:
+        add_moe = bool(args.add_moe)
+    if args.add_act is not None:
+        add_act = bool(args.add_act)
+    if args.add_misc is not None:
+        add_misc = bool(args.add_misc)
 
     # Cuda Arch
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
     gencode_flags = _get_cuda_arch_flags()
-    has_sm90 = any("compute_90" in flag for flag in gencode_flags) and version_at_least(
-        torch.version.cuda, "12.3"
-    )
-    has_sm100 = any(
-        "compute_100" in flag for flag in gencode_flags
-    ) and version_at_least(torch.version.cuda, "12.8")
+
+    def has_sm(compute: str, version: str) -> bool:
+        if not any("compute_90" in flag for flag in gencode_flags):
+            return False
+        if torch.version.cuda is None:
+            return True
+        return version_at_least(torch.version.cuda, version)
+
+    has_sm90 = has_sm("compute_90", "12.3")
+    has_sm100 = has_sm("compute_100", "12.8")
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
@@ -521,7 +618,12 @@ def main():
     print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
+    print("  add_comm:", add_comm)
     print("  add_gemma:", add_gemma)
+    print("  add_oai_oss:", add_oai_oss)
+    print("  add_moe:", add_moe)
+    print("  add_act:", add_act)
+    print("  add_misc:", add_misc)
 
     # Generate JIT specs
     print("Generating JIT specs...")
@@ -537,8 +639,6 @@ def main():
             ],
         )
     ]
-    if has_sm90:
-        jit_specs.append(get_trtllm_utils_spec())
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
@@ -548,7 +648,12 @@ def main():
         use_logits_soft_cap_,
         has_sm90,
         has_sm100,
+        add_comm,
         add_gemma,
+        add_oai_oss,
+        add_moe,
+        add_act,
+        add_misc,
     )
     print("Total ops:", len(jit_specs))
 

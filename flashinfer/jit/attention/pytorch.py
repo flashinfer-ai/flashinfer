@@ -15,11 +15,12 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional
+from typing import List
 
 import jinja2
 import torch
 
+from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
 from ..utils import (
@@ -395,6 +396,7 @@ def get_batch_attention_uri(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
     use_profiler: bool,
 ) -> str:
     return (
@@ -405,6 +407,7 @@ def get_batch_attention_uri(
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
+        f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
         f"use_profiler_{str(use_profiler).lower()}"
     )
 
@@ -746,78 +749,6 @@ def gen_batch_decode_module(
     )
 
 
-class TrtllmGenPrefillModule:
-    def _paged_run(
-        self,
-        query: torch.Tensor,
-        kv_cache: torch.Tensor,
-        workspace_buffer: torch.Tensor,
-        num_kv_heads: int,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-        block_size: int,
-        max_seq_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
-        batch_size: int,
-        sum_seq_q: int,
-        sum_seq_kv: int,
-        cum_seq_lens_q: torch.Tensor,
-        cum_seq_lens_kv: torch.Tensor,
-        window_left: int = -1,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if out is None:
-            out = torch.empty_like(query)
-        self._op.trtllm_paged_attention_context(
-            out,
-            query,
-            kv_cache,
-            workspace_buffer,
-            num_kv_heads,
-            block_tables,
-            seq_lens,
-            block_size,
-            max_seq_len,
-            bmm1_scale,
-            bmm2_scale,
-            batch_size,
-            window_left,
-            sum_seq_q,
-            sum_seq_kv,
-            cum_seq_lens_q,
-            cum_seq_lens_kv,
-        )
-        return out
-
-    def _ragged_run(self, *args, **kwargs):
-        raise NotImplementedError("trtllm-gen doesn't support ragged run")
-
-    def _plan(self, *args, **kwargs):
-        pass
-
-    def __init__(self):
-        self._mod = trtllm_fmha_gen_module()
-        self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import setup_cubin_loader
-
-        setup_cubin_loader(self._mod.get_library_path())
-
-    def build_and_load(self):
-        # NOTE(Siyuan): WAR to mimic JIT behavior.
-        class _Patch:
-            def __init__(self, func):
-                self._func = func
-
-            def default(self, *args, **kwargs):
-                return self._func(*args, **kwargs)
-
-        self.plan = _Patch(self._plan)
-        self.paged_run = _Patch(self._paged_run)
-        self.ragged_run = _Patch(self._ragged_run)
-        return self
-
-
 def gen_batch_prefill_module(
     backend: str,
     dtype_q: torch.dtype,
@@ -849,9 +780,6 @@ def gen_batch_prefill_module(
     # this is used for fp8 tensor core computation
     # KV-only quant is not influenced by this flag
     fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
-
-    if backend == "trtllm-gen":
-        return TrtllmGenPrefillModule()
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
@@ -936,6 +864,7 @@ def gen_batch_attention_module(
     head_dim_qk: int,
     head_dim_vo: int,
     pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
     use_profiler: bool,
 ):
     uri = get_batch_attention_uri(
@@ -946,15 +875,16 @@ def gen_batch_attention_module(
         head_dim_qk,
         head_dim_vo,
         pos_encoding_mode,
+        use_logits_soft_cap,
         use_profiler,
     )
 
-    additional_tensor_names = []
-    additional_tensor_dtypes = []
-    additional_scalar_names = []
-    additional_scalar_dtypes = []
-    variant_name = f"StandardAttention"
-    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    additional_tensor_names: List[str] = []
+    additional_tensor_dtypes: List[str] = []
+    additional_scalar_names: List[str] = []
+    additional_scalar_dtypes: List[str] = []
+    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
+    variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
         uri,
@@ -971,6 +901,7 @@ def gen_batch_attention_module(
         variant_name,
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
     )
 
@@ -1556,7 +1487,7 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def trtllm_fmha_gen_module():
+def trtllm_gen_fmha_module():
     return gen_jit_spec(
         "fmha_gen",
         [
@@ -1564,17 +1495,10 @@ def trtllm_fmha_gen_module():
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
-    )
-
-
-def trtllm_mla_gen_module():
-    return gen_jit_spec(
-        "mla_gen",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mla_kernel_launcher.cu",
+        extra_cuda_cflags=[
+            f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
+            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -1593,6 +1517,7 @@ def gen_customize_batch_attention_module(
     variant_name: str,
     variant_decl: str,
     pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
     use_profiler: bool = False,
 ):
     kwargs = {
@@ -1605,6 +1530,7 @@ def gen_customize_batch_attention_module(
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
@@ -1615,7 +1541,6 @@ def gen_customize_batch_attention_module(
             additional_scalar_dtypes,
         )
     )
-
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
     ) as f:
@@ -1673,4 +1598,7 @@ def cudnn_fmha_gen_module():
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
+        ],
     )

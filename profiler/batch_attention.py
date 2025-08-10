@@ -98,7 +98,7 @@ def profile_persistent_batch_attention(
 
     wrapper.run(q, kv_data, profiler_buffer=profiler_buffer)
 
-    trace_name = f"batch_attention.perfetto-trace"
+    trace_name = "batch_attention.perfetto-trace"
     events = ["prefill", "decode", "reduction"]
     export_to_perfetto_trace(profiler_buffer, events, trace_name)
 

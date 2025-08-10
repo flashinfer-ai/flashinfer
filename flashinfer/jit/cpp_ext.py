@@ -58,10 +58,10 @@ def generate_ninja_build_for_op(
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
-        for dir in extra_include_dirs:
-            common_cflags.append(f"-I{dir.resolve()}")
-    for dir in system_includes:
-        common_cflags.append(f"-isystem {dir}")
+        for extra_dir in extra_include_dirs:
+            common_cflags.append(f"-I{extra_dir.resolve()}")
+    for sys_dir in system_includes:
+        common_cflags.append(f"-isystem {sys_dir}")
 
     cflags = [
         "$common_cflags",
@@ -86,12 +86,12 @@ def generate_ninja_build_for_op(
     ldflags = [
         "-shared",
         "-L$torch_home/lib",
+        "-L$cuda_home/lib64",
         "-lc10",
         "-lc10_cuda",
         "-ltorch_cpu",
         "-ltorch_cuda",
         "-ltorch",
-        "-L$cuda_home/lib64",
         "-lcudart",
     ]
 

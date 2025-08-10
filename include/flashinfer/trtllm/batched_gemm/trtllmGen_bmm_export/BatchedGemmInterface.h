@@ -27,6 +27,12 @@
 #include "KernelMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
+#ifdef TLLM_GEN_BMM_CUBIN_PATH
+static const std::string tllm_gen_bmm_cubin_path = std::string(TLLM_GEN_BMM_CUBIN_PATH);
+#else
+static_assert(false, "TLLM_GEN_BMM_CUBIN_PATH macro is not defined when compiling");
+#endif
+
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 }
@@ -243,11 +249,48 @@ struct BatchedGemmData {
     // Shape is [B].
     float const* mPtrScaleGate{nullptr};
 
+    // The clamp limit for the accumulator before applying the activation.
+    // Shape is [B].
+    // Clamp is INF if nullptr.
+    // When the input is FP8 or NVFP4, the clamp has to be scaled by limit' = limit / dequantAb.
+    // If applied on SwiGlu, it will be:
+    //
+    //   x_glu    = x_glu.clamp(min=None, max=limit)
+    //   x_linear = x_linear.clamp(min=-limit, max=limit)
+    //
+    // The given clamp limit applies to the dequantized values, so the order of operations would
+    // look something like this:
+    //
+    // x0 = x0 * dqAb
+    // x0 = clamp(x0, none, limit)
+    // x0 = x0 * sigmoid(alpha * x0)
+    // x1 = dqAb * x1
+    // x1 = clamp(x1, -limit, limit)
+    // out = qC * (x1 + beta) * x0
+    //
+    // Given that the dqAb and qC are combined into scaleC, we can bring the dqAb into the clamp
+    // limit and apply the clamping prior to dequantization:
+    //
+    // x0 = clamp(x0, none, limit / dqAb)
+    // x0 = x0 * dqAb
+    // x0 = x0 * sigmoid(alpha * x0)
+    // x1 = clamp(x1, -limit / dqAb, limit / dqAb)
+    // scaleC = dqAb * qC
+    // beta' = beta / dqAb
+    // out = scaleC * (x1 + beta') * x0
+    //
+    // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
+    //
+    float const* mPtrClampLimit{nullptr};
+
     // The alpha and beta for SwiGlu.
     // gatedActivation <- (x0 + beta) * activation(x1, alpha)
     // Shape is [B].
     // Alpha is 1.f if nullptr.
     // Beta is 0.f if nullptr.
+    // The formula:
+    //
+    //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) + (x_linear + beta)
     float const* mPtrSwiGluAlpha{nullptr};
     float const* mPtrSwiGluBeta{nullptr};
 
@@ -623,15 +666,16 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
   auto const numCtaZ = options.mNumSlicesForSplitK;
   mNumCtas = numCtaX * numCtaY * numCtaZ;
 
-  auto kernelParams = KernelParams::setKernelParams(
+  auto kernelParams = KernelParamsSetup::setKernelParams(
       options, batchM, batchedGemmData.mInputBuffers.mPtrA, batchedGemmData.mInputBuffers.mPtrB,
       batchedGemmData.mOutputBuffers.mPtrC, batchedGemmData.mInputBuffers.mPtrSfA,
       batchedGemmData.mInputBuffers.mPtrSfB, batchedGemmData.mInputBuffers.mPtrPerTokenSfA,
       batchedGemmData.mInputBuffers.mPtrPerTokenSfB, batchedGemmData.mInputBuffers.mPtrBias,
       batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
-      batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
-      batchedGemmData.mInputBuffers.mPtrSwiGluBeta, batchedGemmData.mInputBuffers.mPtrRouteMap,
-      dPtrRowMax, dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+      batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
+      batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
+      batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
+      batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
       batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
       batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
       batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
@@ -645,17 +689,15 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "39b7e49bfedde88ea29bfdc2547cbba659f2b236";
-    const std::string cubin_path = pipeline_hash + "/" + std::string("batched_gemm-") +
-                                   TLLM_GEN_COMMIT + "-" + TLLM_GEN_BATCHED_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
     if (!fname_cubin.empty()) {
       fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
     }
-    fname_cubin = cubin_path + fname_cubin;
+    fname_cubin = tllm_gen_bmm_cubin_path + fname_cubin;
     std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };
+
   if (moduleCache.has_value()) {
     ModuleCache& moduleCacheRef = moduleCache.value().get();
 

@@ -34,7 +34,6 @@ class DeepseekV2RMSNorm(nn.Module):
 
 
 class DeepseekV2AttentionVanilla(nn.Module):
-
     def __init__(self):
         super().__init__()
 
@@ -99,7 +98,6 @@ class DeepseekV2AttentionVanilla(nn.Module):
         compressed_kv_normed_cache: torch.Tensor,
         k_pe_cache: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         bsz, q_len, _ = hidden_states.size()
         if q_len != 1:
             raise ValueError(
@@ -178,7 +176,6 @@ class DeepseekV2AttentionVanilla(nn.Module):
 
 
 class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
-
     def __init__(self, mla_vanilla: DeepseekV2AttentionVanilla):
         super().__init__()
 
@@ -251,13 +248,13 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
         use_flashinfer_kernel: bool,
         convert_float16: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         c_Q = torch.matmul(hidden_states, self.W_DQ)
         # c_Q ~ [bsz, q_lora_rank:1536]
         c_Q = self.q_a_layernorm(c_Q)
 
         q_pe = torch.matmul(
-            c_Q, self.W_QR  # c_Q ~ [bsz, q_lora_rank~1536]
+            c_Q,
+            self.W_QR,  # c_Q ~ [bsz, q_lora_rank~1536]
         )  # W_QR ~ [1536, 128*64]
         # q_pe ~ [bsz, 128, 64]
         q_pe = q_pe.reshape(bsz, self.num_heads, self.qk_rope_head_dim)
@@ -396,7 +393,6 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 
 
 if __name__ == "__main__":
-
     dev_id = 0
 
     torch.manual_seed(666)

@@ -18,6 +18,12 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+#include "flashinfer/exception.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The attention mask types.
@@ -211,10 +217,20 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
+  // Attention sink
+  float const* ptrAttentionSinks{nullptr};
   // The output buffer.
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
+
+  // KV-Cache strides
+  // The stride between different keys/vals.
+  int kvStrideKeysValues;
+  // The stride between different heads.
+  int kvStrideHeads;
+  // The stride between different batches.
+  int kvStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;
@@ -255,6 +271,8 @@ struct TllmGenFmhaRunnerParams {
   int mSfStartTokenIdx;
   // The SF scale for Kv.
   float mScaleSfKv;
+  // The SF scale for output.
+  float mScaleSfO;
   // The cuda stream.
   cudaStream_t stream;
 
@@ -276,12 +294,17 @@ struct TllmGenFmhaRunnerParams {
         mMaskType = TrtllmGenAttentionMaskType::Custom;
         break;
       default:
-        // TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
-        //     static_cast<int>(maskType));
-        printf("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
-               static_cast<int>(maskType));
+        FLASHINFER_ERROR("Invalid attention mask type");
     }
     return *this;
+  }
+
+  TllmGenFmhaRunnerParams() {
+    // NOTE(Zihao): all fields are POD types, so we can use memset to initialize them to zero
+    static_assert(std::is_standard_layout<TllmGenFmhaRunnerParams>::value,
+                  "TllmGenFmhaRunnerParams must be a POD type (standard layout) for memset to be "
+                  "safe.");
+    memset(this, 0, sizeof(TllmGenFmhaRunnerParams));
   }
 };
 

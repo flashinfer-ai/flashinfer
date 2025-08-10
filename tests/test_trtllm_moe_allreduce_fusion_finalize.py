@@ -1,12 +1,11 @@
 import multiprocessing as mp
 import socket
-from typing import Any, Optional, Tuple, Union
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-from torch import nn
 
 import flashinfer.comm as comm
 
@@ -34,7 +33,6 @@ def _run_correctness_worker(
     expanded_idx_to_permuted_idx,
     residual,
 ):
-
     def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
         y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
         if weight is not None:
@@ -91,10 +89,6 @@ def _run_correctness_worker(
 
                     # make clone
                     fc2_output_clone = fc2_output.clone()
-                    scale_clone = scale.clone()
-                    expanded_idx_to_permuted_idx_clone = (
-                        expanded_idx_to_permuted_idx.clone()
-                    )
                     norm_weight = torch.randn(
                         (HIDDEN_SIZE,), dtype=dtype, device=device
                     )
@@ -104,21 +98,51 @@ def _run_correctness_worker(
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
-                    comm.trtllm_moe_finalize_allreduce_fusion(
-                        allreduce_in=fc2_output,
-                        residual_in=residual,
-                        norm_weight=norm_weight,
-                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                        workspace_ptrs=workspace_tensor,
-                        launch_with_pdl=launch_with_pdl,
-                        world_rank=rank,
-                        world_size=world_size,
-                        eps=eps,
-                        shared_expert_output=shared_expert_output,
-                        expert_scale_factor=scale,
-                        norm_out=norm_out,
-                        residual_out=residual_out,
-                    )
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    # warmup
+                    with torch.cuda.stream(s):
+                        for _ in range(test_loop):
+                            comm.trtllm_moe_finalize_allreduce_fusion(
+                                allreduce_in=fc2_output,
+                                residual_in=residual,
+                                norm_weight=norm_weight,
+                                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                                workspace_ptrs=workspace_tensor,
+                                launch_with_pdl=launch_with_pdl,
+                                world_rank=rank,
+                                world_size=world_size,
+                                eps=eps,
+                                shared_expert_output=shared_expert_output,
+                                expert_scale_factor=scale,
+                                norm_out=norm_out,
+                                residual_out=residual_out,
+                            )
+                    torch.cuda.current_stream().wait_stream(s)
+
+                    # capture
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        for _ in range(test_loop):
+                            comm.trtllm_moe_finalize_allreduce_fusion(
+                                allreduce_in=fc2_output,
+                                residual_in=residual,
+                                norm_weight=norm_weight,
+                                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                                workspace_ptrs=workspace_tensor,
+                                launch_with_pdl=launch_with_pdl,
+                                world_rank=rank,
+                                world_size=world_size,
+                                eps=eps,
+                                shared_expert_output=shared_expert_output,
+                                expert_scale_factor=scale,
+                                norm_out=norm_out,
+                                residual_out=residual_out,
+                            )
+
+                    # replay
+                    g.replay()
+
                     torch.cuda.synchronize()
 
                     # == Calculate reference output ==
@@ -242,9 +266,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

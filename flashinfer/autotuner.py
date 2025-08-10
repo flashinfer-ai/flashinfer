@@ -1,7 +1,9 @@
 import contextlib
 import copy
+import importlib
 import inspect
 import itertools
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -15,49 +17,100 @@ from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
+# This version should be updated whenever the nvfp4_cutlass backend is changed,
+# such as when new kernels or configs are added. In such cases, the tuning configs
+# should also be updated. Currently, this process is manual, but it should be automated in the future.
+_nvfp4_cutlass_version = "0.1"
 
-@dataclass(kw_only=True)
+
+def get_config_path(is_module: bool):
+    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
+    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
+    if is_module:
+        return f"flashinfer.tuning_configs.{config_name}"
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "tuning_configs",
+            config_name + ".py",
+        )
+
+
+@dataclass(slots=True, unsafe_hash=True)
+class DynamicTensorSpec:
+    """
+    A specification for a dynamic tensor dimension.
+    Args:
+        input_idx: The index of the input tensor.
+        dim_idx: The index of the dimension to tune.
+        gen_tuning_buckets: A tuple of values to try or a function generating values.
+        map_to_tuning_buckets: A function to map dimensions to valid values during inference.
+    """
+
+    input_idx: int
+    dim_idx: int
+    gen_tuning_buckets: Union[Tuple[int], Callable]
+    map_to_tuning_buckets: Callable
+
+
+@dataclass(slots=True, unsafe_hash=True)
+class ConstraintSpec:
+    """
+    A specification for a constraint on a tensor dimension.
+    Args:
+        input_idx: The index of the input tensor.
+        dim_idx: The index of the dimension to constrain.
+        infer_shape: A function to infer the shape of the dimension.
+    """
+
+    input_idx: int
+    dim_idx: int
+    infer_shape: Callable
+
+
+@dataclass(kw_only=True, unsafe_hash=True)
 class TuningConfig:
     """Configuration for autotuning.
 
     This class specifies all the tuning configurations for a single tuning process.
     Args:
-        dynamic_tensors (Tuple[Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]]):
-            how different tensor dimensions should be tuned to optimize performance. It allows
-            defining which input tensor dimensions are dynamic and how they should be tuned
-            by providing shape generators and rounding rules.
-
-            A tuple specifying tuning rules:
-            - First level key: Input tensor index (0-based)
-            - Second level key: Dimension index to tune (0-based)
-            - Value: Tuple of (shape_generator, round_rule) where:
-                - shape_generator: List of values to try or function generating values
-                - round_rule: Function to round dimensions to valid values during inference
+        dynamic_tensor_specs (Tuple[DynamicTensorSpec]): Specifications for how different tensor dimensions
+            should be tuned to optimize performance. Each spec defines:
+            - Which input tensor dimension is dynamic
+            - How to generate tuning values
+            - How to map dimensions to valid values during inference
 
             Example:
                 >>> config = TuningConfig(
-                ...     dynamic_tensors=(
-                ...         (0, 1, ((32, 64, 128), lambda x: ((x + 31) // 32) * 32)),
+                ...     dynamic_tensor_specs=(
+                ...         DynamicTensorSpec(
+                ...             input_idx=0,
+                ...             dim_idx=1,
+                ...             gen_tuning_buckets=(32, 64, 128),
+                ...             map_to_tuning_buckets=lambda x: ((x + 31) // 32) * 32
+                ...         ),
                 ...     )
                 ... )
-        constraints (Tuple[Tuple[int, int, Callable]]):
-            A tuple specifying constraints on the dimensions:
-            - First level key: Input tensor index (0-based)
-            - Second level key: Dimension index to constrain (0-based)
-            - Value: Function to apply to the dimension
+        constraint_specs (Tuple[ConstraintSpec]): Specifications for constraints on tensor dimensions.
+            Each spec defines:
+            - Which input tensor dimension is constrained
+            - How to infer the shape of the dimension based on other dimensions
 
             Example:
-            >>> config = TuningConfig(
-                ...     constraints=(
-                ...         (1, 2, lambda shapes: shapes[0][0] * 2),  # constrained dimension index and constraint function
+                >>> config = TuningConfig(
+                ...     constraint_specs=(
+                ...         ConstraintSpec(
+                ...             input_idx=1,
+                ...             dim_idx=2,
+                ...             infer_shape=lambda shapes: shapes[0][0] * 2
+                ...         ),
                 ...     )
                 ... )
     """
 
-    dynamic_tensors: Tuple[
-        Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]
-    ] = ()
-    constraints: Tuple[Tuple[int, int, Callable]] = ()
+    dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
+    constraint_specs: Tuple[ConstraintSpec, ...] = ()
 
 
 @dataclass(unsafe_hash=True)
@@ -110,9 +163,10 @@ class FakeTensor:
 
 
 class TunableRunner(ABC):
-
     @abstractmethod
-    def get_valid_tactics(self, inputs: List[FakeTensor]) -> List[int]:
+    def get_valid_tactics(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> List[int]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -161,105 +215,8 @@ class TunableRunner(ABC):
         """
         raise NotImplementedError
 
-    @lru_cache(maxsize=1000)
-    def find_nearest_profile(
-        self,
-        shapes: Tuple[torch.Size],
-        dynamic_tensors: Tuple[
-            Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]
-        ],
-        constraints: Tuple[Tuple[int, int, Callable]],
-    ) -> Tuple:
-        """Find the nearest optimization profile for given inputs
-        User can define their own nearest profile generation method to reduce the host overhead.
-
-        Args:
-            shapes: Tuple of input tensor shapes
-            dynamic_tensors: Tuple of dynamic tensor dimensions
-            constraints: Tuple of constraints
-
-        Return:
-            Tuple: A tuple containing:
-                - attributes: Tuple of runner attributes, sorted.
-                - profile: Tuple of input tensor shapes
-        """
-        base_profile = OptimizationProfile([[StaticDim(x) for x in s] for s in shapes])
-
-        for input_idx, dim_idx, (_, shape_round_rule) in dynamic_tensors:
-            dim_val = base_profile.shapes[input_idx][dim_idx].val
-            nearest_opt_shape = shape_round_rule(dim_val)
-            base_profile.shapes[input_idx][dim_idx] = StaticDim(nearest_opt_shape)
-
-        # Adjust the profile to satisfy the constraints
-        for input_idx, dim_idx, constraint in constraints:
-            min_value = 0
-            max_value = base_profile.shapes[input_idx][dim_idx].val
-            base_profile.shapes[input_idx][dim_idx] = DynamicDim(
-                min_value, constraint(base_profile.get_opt_shapes()), max_value
-            )
-
-        return base_profile.get_opt_shapes()
-
-    def get_cache_key(
-        self,
-        custom_op: str,
-        input_shapes: Tuple[torch.Size],
-        tuning_config: TuningConfig,
-    ) -> Tuple:
-        """Generate a cache key for the given custom operation, runner, inputs, and profile.
-
-        Args:
-            custom_op (str): Name of the custom operation
-            runner (TunableRunner): Runner implementation
-            profile (OptimizationProfile): Optimization profile
-
-        Returns:
-            Tuple[str, str, Tuple, Tuple]: A tuple containing:
-                - custom_op: Operation name
-                - runner_key: Runner class name
-                - attribute_key: Tuple of runner attributes
-                - profile_key: Profile hash key
-        """
-        nearest_profile = self.find_nearest_profile(
-            shapes=input_shapes,
-            dynamic_tensors=tuning_config.dynamic_tensors,
-            constraints=tuning_config.constraints,
-        )
-        return (
-            self.get_cache_key_general(custom_op),
-            self.get_cache_key_specifc(nearest_profile),
-        )
-
-    def get_cache_key_general(self, custom_op: str) -> Tuple:
-        """Generate the general part of cache key.
-        Args:
-            custom_op: Operation name
-
-        Return:
-            Tuple: A tuple containing:
-                - custom_op: Operation name
-                - runner_key: Runner class name
-        """
-        return custom_op, self.__class__.__name__
-
-    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
-        """Generate the specific part of cache key.
-        User can define their own cache key assembly method to reduce the host overhead.
-        Args:
-            profile: Tuple of input tensor shapes
-
-        Return:
-            Tuple: A tuple containing:
-                - attributes: Tuple of runner attributes, sorted.
-                - profile: Tuple of input tensor shapes
-        """
-        attributes = {
-            k: v
-            for k, v in self.__dict__.items()
-            if not callable(v) and not k.startswith("_")
-        }
-        attribute_key = tuple(attributes[key] for key in sorted(attributes.keys()))
-        return attribute_key, profile
+    def __hash__(self):
+        return hash(tuple(self.__dict__.values()))
 
 
 @contextlib.contextmanager
@@ -320,12 +277,31 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
                 stats_str += f"    - Success rate: {success_rate:.1f}%\n"
 
         return stats_str
+
+
+@lru_cache(maxsize=None)
+def load_from_file(key):
+    module_name = get_config_path(is_module=True)
+    try:
+        module = importlib.import_module(module_name)
+        best_configs = module.best_configs
+    except (ImportError, AttributeError):
+        best_configs = None
+    if best_configs is not None:
+        k = str((key[0], key[1], key[3]))
+        if k in best_configs:
+            logger.info(f"[Autotuner]: Loading configs for {k} from file.")
+            return True, best_configs[k][0], best_configs[k][1], None
+    logger.info(
+        f"[Autotuner]: Loading configs for {key} from file failed; Using default configs instead."
+    )
+    return False, 0, -1, None
 
 
 class AutoTuner:
@@ -379,9 +355,16 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
-            cache_key = r.get_cache_key(custom_op, input_shapes, tuning_config)
-
-            if cache_key in self.profiling_cache:
+            cache_key = AutoTuner._get_cache_key(
+                custom_op, r, input_shapes, tuning_config
+            )
+            if (
+                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                and not self.is_tuning_mode
+            ):
+                output = load_from_file(cache_key)
+                return output
+            elif cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
@@ -415,7 +398,8 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
-        input_shapes = tuple(t.shape for t in inputs)
+
+        input_shapes = tuple(self._get_input_sizes(inputs))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -429,42 +413,35 @@ class AutoTuner:
             # Record the cache miss config.
             # Expect no cache miss in inference. Thus, any cache miss should be recorded.
             if not is_cache_hit:
-                self.stats.cache_misses += 1
-                if custom_op not in self.stats.cache_miss_config_collection:
-                    self.stats.cache_miss_config_collection[custom_op] = set()
-                self.stats.cache_miss_config_collection[custom_op].add(input_shapes)
-
                 logger.debug(
                     f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                 )
-                assert (
-                    runner == runners[0] and tactic == -1
-                ), f"Should use fallback runner {runners[0]} and tactic {-1}, but got runner {runner} and tactic {tactic}"
+                logger.debug(
+                    f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
+                )
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
-        assert all(
-            [isinstance(r, TunableRunner) for r in runners]
-        ), "All Given runners must be subclass of TunableRunner"
-
-        profiles = self._optimization_profiles(
-            tuning_config.dynamic_tensors, tuning_config.constraints, inputs
+        assert all([isinstance(r, TunableRunner) for r in runners]), (
+            "All Given runners must be subclass of TunableRunner"
         )
+
+        profiles = self._optimization_profiles(tuning_config, inputs)
         # Record the total configs to try
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
-            is_cache_hit, runner, tactic, _ = self.search_cache(
+            is_cache_hit, runner_id, tactic, _ = self.search_cache(
                 custom_op, runners, p.get_opt_shapes(), tuning_config
             )
             if not is_cache_hit:
                 min_time = float("inf")
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                runner, tactic = None, None
-                for runner_id, r in enumerate(runners):
+                runner_id, tactic = None, None
+                for r_id, r in enumerate(runners):
                     # TODO: use FakeTensor here.
-                    valid_tactics = r.get_valid_tactics(tensors)
+                    valid_tactics = r.get_valid_tactics(tensors, p)
                     runner_arg_names = {
                         p.name for p in inspect.signature(r.forward).parameters.values()
                     }
@@ -476,16 +453,18 @@ class AutoTuner:
                                 r, tensors, tac, **kwargs
                             )
                         except Exception as e:
+                            shapes = self._get_input_sizes(tensors)
+
                             logger.error(
-                                f"[Autotuner]: Failed when profiling {r} {tac}, shapes={[t.size() for t in tensors]}. Error occurred: {e}"
+                                f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                             )
 
                             # Record the failed profiling combinations
                             if custom_op not in self.stats.failed_profiling_count:
                                 self.stats.failed_profiling_count[custom_op] = set()
                             self.stats.failed_profiling_count[custom_op].add(
-                                r.get_cache_key(
-                                    custom_op, p.get_opt_shapes(), tuning_config
+                                AutoTuner._get_cache_key(
+                                    custom_op, r, p.get_opt_shapes(), tuning_config
                                 )
                             )
 
@@ -494,11 +473,11 @@ class AutoTuner:
                             time_measured = float("inf")
                         if time_measured < min_time:
                             min_time = time_measured
-                            runner, tactic = r, tac
-                if runner is not None:
+                            runner_id, tactic = r_id, tac
+                if runner_id is not None:
                     # At least one valid (runner, tactic) pair is found
-                    cache_key = runner.get_cache_key(
-                        custom_op, p.get_opt_shapes(), tuning_config
+                    cache_key = AutoTuner._get_cache_key(
+                        custom_op, runners[runner_id], p.get_opt_shapes(), tuning_config
                     )
                     # inspect call stack
                     self.profiling_cache[cache_key] = (runner_id, tactic, p)
@@ -506,7 +485,7 @@ class AutoTuner:
                         self.stats.tuned_op_successful_configs.get(custom_op, 0) + 1
                     )
                     logger.debug(
-                        f"[Autotuner]: profiling chosen runner: {runner} {tactic} for {cache_key}"
+                        f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                     )
 
         # Get the best runner and tactic from cache
@@ -516,6 +495,15 @@ class AutoTuner:
         )
 
         return runners[runner_id], tactic
+
+    def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
+        # Handle None tensors for optional inputs and non-Tensor scalar values
+        sizes = [
+            input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
+            for input in inputs
+        ]
+
+        return sizes
 
     def _profile_single_kernel(
         self, runner: TunableRunner, inputs: List[torch.Tensor], tactic: int, **kwargs
@@ -544,7 +532,7 @@ class AutoTuner:
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
         # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
         # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs)  # TODO(shuw): delay_kernel
+        delay_kernel(self.stream_delay_micro_secs)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -555,25 +543,21 @@ class AutoTuner:
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
+
+        shapes = self._get_input_sizes(inputs)
         logger.debug(
-            f"[Autotuner]: profiling {runner} {tactic}, shapes={[t.size() for t in inputs]}, avg_time {avg_time}"
+            f"[Autotuner]: profiling {runner} {tactic}, shapes={shapes}, avg_time {avg_time}"
         )
 
         return avg_time
 
     def _optimization_profiles(
-        self,
-        dynamic_tensors: Tuple[
-            Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]
-        ],
-        constraints: Tuple[Tuple[int, int, Callable]],
-        inputs: List[torch.Tensor],
+        self, tuning_config: TuningConfig, inputs: List[torch.Tensor]
     ) -> List[OptimizationProfile]:
         """Generate optimization profiles for autotuning.
 
         Args:
-            dynamic_tensors (Tuple[Tuple[int, int, Tuple[Union[Tuple[int], Callable], Callable]]]): Tuple specifying which dimensions to tune
-            constraints (Tuple[Tuple[int, int, Callable]]): Tuple specifying constraints on the dimensions
+            tuning_config (TuningConfig): Tuning configuration
             inputs (List[torch.Tensor]): List of input tensors
 
         Returns:
@@ -581,53 +565,118 @@ class AutoTuner:
 
         Note:
             This method performs a cartesian product of all possible dimension
-            combinations specified in dynamic_tensors.
+            combinations specified in dynamic_tensor_specs.
         """
         # every dimension created from the concrete input tensor shape
         # generate some dynamic dimension description based on the dynamic_tensors
+
+        # Zero handles the case where a TRTLLM op has optional or scalar inputs.
         base_profile = OptimizationProfile(
-            [[StaticDim(x) for x in t.size()] for t in inputs]
+            [
+                (
+                    [StaticDim(x) for x in t.size()]
+                    if isinstance(t, torch.Tensor)
+                    else [StaticDim(0)]
+                )
+                for t in inputs
+            ]
         )
 
         generated_profiles: List[OptimizationProfile] = []
 
-        dynamic_dims = []
+        dynamic_dims: List[Tuple[Any, ...]] = []
 
-        for input_idx, dim_idx, (shape_generater, shape_round_rule) in dynamic_tensors:
-            assert inspect.isfunction(shape_generater) or isinstance(
-                shape_generater, (list, tuple)
-            ), "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if inspect.isfunction(shape_generater):
-                opt_shapes = shape_generater(
-                    base_profile.shapes[input_idx][dim_idx].val
+        for spec in tuning_config.dynamic_tensor_specs:
+            assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(
+                spec.gen_tuning_buckets, (list, tuple)
+            ), (
+                "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            )
+            if inspect.isfunction(spec.gen_tuning_buckets):
+                opt_shapes = spec.gen_tuning_buckets(
+                    base_profile.shapes[spec.input_idx][spec.dim_idx]._opt()
                 )
             else:
-                opt_shapes = shape_generater
-            dynamic_dims.append((input_idx, dim_idx, opt_shapes))
+                opt_shapes = spec.gen_tuning_buckets
+            opt_shapes_max = {
+                v1: v2
+                for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
+            }
+            dynamic_dims.append(
+                (spec.input_idx, spec.dim_idx, opt_shapes_max, opt_shapes)
+            )
 
         # grid search, do cartesian product for all the dynamic axis
         dim_grids = itertools.product(*[d[-1] for d in dynamic_dims])
         for opt_point in dim_grids:
             p = copy.deepcopy(base_profile)
-            for pos, (input_idx, dim_idx, _) in enumerate(dynamic_dims):
+            for pos, (input_idx, dim_idx, opt_shapes_max, _opt_shapes) in enumerate(
+                dynamic_dims
+            ):
                 opt_value = opt_point[pos]
                 # TODO: fix me, how to set the min and max?
-                min_value = 0
-                max_value = base_profile.shapes[input_idx][dim_idx].val
+                min_value = opt_value
+                max_value = opt_shapes_max[opt_value]
                 p.shapes[input_idx][dim_idx] = DynamicDim(
                     min_value, opt_value, max_value
                 )
 
             # Adjust the profile to satisfy the constraints
-            for input_idx, dim_idx, constraint in constraints:
-                min_value = 0
-                max_value = base_profile.shapes[input_idx][dim_idx].val
-                p.shapes[input_idx][dim_idx] = DynamicDim(
-                    min_value, constraint(p.get_opt_shapes()), max_value
+            for constraint_spec in tuning_config.constraint_specs:
+                min_value = opt_value = max_value = constraint_spec.infer_shape(
+                    p.get_opt_shapes()
+                )
+                p.shapes[constraint_spec.input_idx][constraint_spec.dim_idx] = (
+                    DynamicDim(min_value, opt_value, max_value)
                 )
             generated_profiles.append(p)
             logger.debug(f"[Autotuner]: generated profile: {p}")
         return generated_profiles
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def _find_nearest_profile(
+        cls, shapes: Tuple[torch.Size], tuning_config: TuningConfig
+    ) -> Tuple:
+        """Find the nearest optimization profile for given inputs
+        User can define their own nearest profile generation method to reduce the host overhead.
+
+        Args:
+            shapes: Tuple of input tensor shapes
+            tuning_config: Tuning configuration
+
+        Return:
+            Tuple: A tuple containing:
+                - attributes: Tuple of runner attributes, sorted.
+                - profile: Tuple of input tensor shapes
+        """
+        base_profile = list(list(shape) for shape in shapes)
+
+        for spec in tuning_config.dynamic_tensor_specs:
+            base_profile[spec.input_idx][spec.dim_idx] = spec.map_to_tuning_buckets(
+                base_profile[spec.input_idx][spec.dim_idx]
+            )
+
+        # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
+        for constraint_spec in tuning_config.constraint_specs:
+            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
+
+        return tuple(tuple(shape) for shape in base_profile)
+
+    @classmethod
+    def _get_cache_key(
+        cls,
+        custom_op: str,
+        runner: TunableRunner,
+        input_shapes: Tuple[torch.Size],
+        tuning_config: TuningConfig,
+    ) -> Tuple:
+        return (
+            custom_op,
+            runner.__class__.__name__,
+            hash(runner),
+            cls._find_nearest_profile(input_shapes, tuning_config),
+        )
 
     def _create_tensor_like(
         self, origin_tensor: torch.Tensor, dims: List[Dim]

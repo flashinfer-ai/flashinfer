@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
     group_deepgemm_fp8_nt_groupwise,
 )
-from flashinfer.testing.utils import quantize_fp8
+from flashinfer.testing.utils import bench_gpu_time, quantize_fp8
 
 
 def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):
@@ -48,14 +48,14 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
     out = torch.empty(batch_size * m, n, device="cuda", dtype=out_dtype)
 
     # Benchmark the DeepGEMM function
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: group_deepgemm_fp8_nt_groupwise(
             a_fp8, b_fp8, a_scale, b_scale, m_indices, out=out, out_dtype=out_dtype
         ),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
-
+    ms = np.median(measurements)
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
     memory_bandwidth_per_second = (
         sum(
@@ -91,7 +91,7 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
     out = torch.empty((batch_size, m, n), device="cuda", dtype=out_dtype)
 
     # Benchmark the DeepGEMM function
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: batch_deepgemm_fp8_nt_groupwise(
             a_fp8,
             b_fp8,
@@ -102,9 +102,10 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
             out=out,
             out_dtype=out_dtype,
         ),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
 
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
     memory_bandwidth_per_second = (
@@ -129,14 +130,15 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
 if __name__ == "__main__":
     print("=== DeepGEMM Grouped FP8 GEMM Benchmark ===\n")
 
-    for batch_size in [1, 4, 8]:
-        for m in [128, 256]:
-            for n in [4096]:
-                for k in [4096]:
-                    if m * batch_size <= 16384:  # Limit total problem size
-                        bench_deepgemm_grouped_fp8_blackwell(
-                            batch_size, m, n, k, torch.float8_e4m3fn, torch.bfloat16
-                        )
+    for batch_size in [1, 4, 8, 64, 128, 256]:
+        for m in [128, 256, 1024, 8192, 16384]:
+            for n, k in [(128, 512), (512, 128), (4096, 7168), (7168, 2048)]:
+                if m // batch_size < 128:
+                    continue
+                if m * batch_size <= 16384:  # Limit total problem size
+                    bench_deepgemm_grouped_fp8_blackwell(
+                        batch_size, m, n, k, torch.float8_e4m3fn, torch.bfloat16
+                    )
 
     for batch_size in [1, 4, 8, 64, 128, 256]:
         for m in [128, 256, 1024, 8192, 16384]:
