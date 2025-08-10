@@ -32,7 +32,7 @@ namespace torch_ext {
 // alignment: sfVecSize
 // returns
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout,
-                                                  int64_t alignment) {
+                                                  int64_t alignment, bool enable_pdl = false) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
 
@@ -73,7 +73,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
       1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                       \
       reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                 \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
-      at::cuda::getCurrentCUDAStream(input.get_device()));
+      at::cuda::getCurrentCUDAStream(input.get_device()), enable_pdl);
 
   if (input.scalar_type() == at::ScalarType::Half) {
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)

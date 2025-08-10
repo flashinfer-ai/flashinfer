@@ -259,7 +259,8 @@ void buildMinLatencyActiveExpertMaps(int* num_active_experts_per_node,
                                      int const experts_per_token, int const start_expert,
                                      int const end_expert, int const num_experts_per_node,
                                      int const cluster_rank, int const cluster_size,
-                                     int const num_experts_smem, cudaStream_t const stream) {
+                                     int const num_experts_smem, cudaStream_t const stream,
+                                     bool enable_pdl = false) {
   TLLM_CHECK_WITH_INFO(num_experts_per_node == (end_expert - start_expert),
                        "num_experts_per_node must be equal to end_expert - start_expert");
 
@@ -277,7 +278,7 @@ void buildMinLatencyActiveExpertMaps(int* num_active_experts_per_node,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, buildMinLatencyActiveExpertMapsKernel<threads>,
@@ -380,7 +381,7 @@ bool fusedBuildExpertMapsSortFirstTokenDispatch(
     int const* token_selected_experts, int* permuted_row_to_unpermuted_row,
     int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
     int64_t const num_tokens, int const num_experts_per_node, int const experts_per_token,
-    int const start_expert, int const end_expert, cudaStream_t stream) {
+    int const start_expert, int const end_expert, cudaStream_t stream, bool enable_pdl = false) {
   TLLM_CHECK_WITH_INFO(num_experts_per_node == (end_expert - start_expert),
                        "num_experts_per_node must be equal to end_expert - start_expert");
   int const threads = BLOCK_SIZE;
@@ -397,7 +398,7 @@ bool fusedBuildExpertMapsSortFirstTokenDispatch(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
 
@@ -589,7 +590,7 @@ void blockExpertPrefixSum(int const* token_selected_experts, int* blocked_expert
                           int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
                           int64_t const num_experts_per_node, int64_t const num_experts_per_token,
                           int64_t const num_tokens_per_block, int64_t const num_blocks_per_seq,
-                          int const start_expert_id, cudaStream_t stream) {
+                          int const start_expert_id, cudaStream_t stream, bool enable_pdl = false) {
   dim3 const blocks(num_experts_per_node, num_blocks_per_seq);
   dim3 const threads(num_tokens_per_block);
 
@@ -600,7 +601,7 @@ void blockExpertPrefixSum(int const* token_selected_experts, int* blocked_expert
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
 
@@ -705,7 +706,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
 void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert_counts_cumsum,
                            int64_t* expert_first_token_offset, int64_t const num_experts_per_node,
                            int64_t const num_tokens_per_block, int64_t const num_blocks_per_seq,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, bool enable_pdl = false) {
   int64_t const num_elements = num_experts_per_node * num_blocks_per_seq;
 
   cudaLaunchConfig_t config;
@@ -715,7 +716,7 @@ void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
 
@@ -785,7 +786,7 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
                           int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
                           int* unpermuted_row_to_permuted_row, int64_t const num_tokens,
                           int64_t const num_experts_per_node, int64_t const num_tokens_per_block,
-                          int64_t const num_blocks_per_seq, cudaStream_t stream) {
+                          int64_t const num_blocks_per_seq, cudaStream_t stream, bool enable_pdl = false) {
   dim3 const blocks(num_experts_per_node, num_blocks_per_seq);
   dim3 const threads(num_tokens_per_block);
 
@@ -796,7 +797,7 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
 
@@ -842,25 +843,25 @@ void threeStepBuildExpertMapsSortFirstToken(
     int64_t* expert_first_token_offset, int* blocked_expert_counts,
     int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
     int64_t const num_experts_per_node, int64_t const num_experts_per_token,
-    int const start_expert_id, cudaStream_t stream) {
+    int const start_expert_id, cudaStream_t stream, bool enable_pdl = false) {
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
                        num_tokens, num_experts_per_node, num_experts_per_token,
-                       num_tokens_per_block, num_blocks_per_seq, start_expert_id, stream);
+                       num_tokens_per_block, num_blocks_per_seq, start_expert_id, stream, enable_pdl);
   sync_check_cuda_error(stream);
 
   globalExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
                         expert_first_token_offset, num_experts_per_node, num_tokens_per_block,
-                        num_blocks_per_seq, stream);
+                        num_blocks_per_seq, stream, enable_pdl);
   sync_check_cuda_error(stream);
 
   mergeExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
                        blocked_row_to_unpermuted_row, permuted_token_selected_experts,
                        permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
-                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, stream);
+                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, stream, enable_pdl);
 }
 
 // ============================== Infer GEMM sizes =================================
@@ -1624,7 +1625,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
                                    int64_t* expert_first_token_offset,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
-                                   void const* prequant_scales, cudaStream_t stream) {
+                                   void const* prequant_scales, cudaStream_t stream, bool enable_pdl = false) {
 #ifdef ENABLE_FP4
   TLLM_CHECK_WITH_INFO(
       (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) ||
@@ -1699,7 +1700,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales,
@@ -1910,7 +1911,8 @@ void finalizeMoeRoutingKernelLauncher(
     int const* permuted_row_to_unpermuted_row, int const* token_selected_experts,
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const cols,
     int64_t const experts_per_token, int64_t const num_experts_per_node,
-    MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream) {
+    MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream,
+    bool enable_pdl = false) {
   // Only add bias on rank 0 for tensor parallelism
   bool const is_rank_0 = parallelism_config.tp_rank == 0;
   ScaleBiasType const* bias_ptr = is_rank_0 ? bias : nullptr;
@@ -1921,7 +1923,7 @@ void finalizeMoeRoutingKernelLauncher(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
 
@@ -2231,7 +2233,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   int64_t inter_size, int64_t expanded_num_tokens, ActivationType activation_type,
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, bool enable_pdl = false) {
 #ifdef ENABLE_FP4
   constexpr int64_t min_num_tokens_alignment =
       std::is_same_v<T, __nv_fp4_e2m1> ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
@@ -2294,7 +2296,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
@@ -2842,7 +2844,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
       output, static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant,
       fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
       inter_size, expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale,
-      nullptr, stream);
+      nullptr, stream, enable_pdl);
 
   sync_check_cuda_error(stream);
 }
@@ -2874,7 +2876,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
       static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
       unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
       token_selected_experts, expert_first_token_offset, num_rows, hidden_size, k,
-      num_experts_per_node, parallelism_config, enable_alltoall, stream);
+      num_experts_per_node, parallelism_config, enable_alltoall, stream, enable_pdl);
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
@@ -3005,7 +3007,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
         bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
         expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale,
-        fc2_fp4_act_flat, stream);
+        fc2_fp4_act_flat, stream, enable_pdl);
 
     sync_check_cuda_error(stream);
   } else if (use_fp8) {
@@ -3233,7 +3235,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                       static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr,
                       static_cast<ScaleBiasType const*>(fc2_lora), false, expert_first_token_offset,
                       num_experts_per_node, hidden_size, expanded_num_rows,
-                      ActivationType::Identity, {}, false, nullptr, stream);
+                      ActivationType::Identity, {}, false, nullptr, stream, enable_pdl);
     sync_check_cuda_error(stream);
   }
 
@@ -3253,7 +3255,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         static_cast<T const*>(gemm_output), final_output, fc2_expert_biases,
         unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
         token_selected_experts, expert_first_token_offset, num_rows, hidden_size, k,
-        num_experts_per_node, parallelism_config, enable_alltoall, stream);
+       num_experts_per_node, parallelism_config, enable_alltoall, stream, enable_pdl);
   }
   sync_check_cuda_error(stream);
 }
@@ -3485,7 +3487,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
     bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
     bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-    MoeMinLatencyParams& min_latency_params, cudaStream_t stream) {
+    MoeMinLatencyParams& min_latency_params, cudaStream_t stream, bool enable_pdl = false) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value;
   static constexpr bool fp8_scales_required = std::is_same<WeightType, __nv_fp8_e4m3>::value ||
@@ -3624,14 +3626,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         min_latency_params.active_expert_global_ids, expert_first_token_offset_,
         token_selected_experts, token_final_scales, num_rows, experts_per_token, start_expert,
         end_expert, num_experts_per_node, parallelism_config.cluster_rank,
-        parallelism_config.cluster_size, full_num_experts, stream);
+        parallelism_config.cluster_size, full_num_experts, stream, enable_pdl);
     sync_check_cuda_error(stream);
 
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, inter_size,
         num_experts_per_node, input_activations_void, input_sf, final_output, fc1_expert_weights,
         fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases, min_latency_mode,
-        min_latency_params, use_lora, start_expert, parallelism_config, stream);
+        min_latency_params, use_lora, start_expert, parallelism_config, stream, enable_pdl);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner,
@@ -3677,7 +3679,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
           token_selected_experts, permuted_token_selected_experts_, permuted_row_to_unpermuted_row_,
           unpermuted_row_to_permuted_row, expert_first_token_offset_, blocked_expert_counts_,
           blocked_expert_counts_cumsum_, blocked_row_to_unpermuted_row_, num_rows,
-          num_experts_per_node, experts_per_token, start_expert, stream);
+          num_experts_per_node, experts_per_token, start_expert, stream, enable_pdl);
     }
 
     sync_check_cuda_error(stream);
@@ -3708,7 +3710,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size,
         experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
         expert_first_token_offset_, fc1_fp4_act_scale_, input_sf,
-        use_w4afp8 ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+        use_w4afp8 ? quant_params.groupwise.fc1.act_scales : nullptr, stream, enable_pdl);
     auto const* gemm1_input = gemm1_input_expand;
 
     sync_check_cuda_error(stream);
@@ -3717,7 +3719,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, inter_size,
         num_experts_per_node, input_activations_void, input_sf, final_output, fc1_expert_weights,
         fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases, min_latency_mode,
-        min_latency_params, use_lora, start_expert, parallelism_config, stream);
+        min_latency_params, use_lora, start_expert, parallelism_config, stream, enable_pdl);
 
     if (use_lora) {
       bool all_token_without_lora = setupLoraWorkspace(
@@ -3789,7 +3791,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
         QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
         UnfusedGemmOutputType* gemm1_output, UnfusedGemmOutputType* gemm2_output,
-        cudaStream_t stream) {
+        cudaStream_t stream, bool enable_pdl = false) {
   // Always nullptr
   layout_info1.ptr_c = nullptr;
   layout_info1.stride_c = nullptr;
@@ -3828,7 +3830,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, kernel_instance, expert_first_token_offset, layout_info1,
@@ -3855,7 +3857,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
         UnfusedGemmOutputType* output1, UnfusedGemmOutputType* output2,
         int const* num_active_experts_per, int const* active_expert_global_ids, int start_expert,
-        cudaStream_t stream) {
+        cudaStream_t stream, bool enable_pdl = false) {
   TLLM_CHECK_WITH_INFO(!use_w4afp8, "W4AFP8 is not supported in low latency mode");
 
   // Always nullptr
@@ -3890,7 +3892,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(
@@ -3919,9 +3921,13 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
                                   int start_expert, MOEParallelismConfig parallelism_config,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, bool enable_pdl = false) {
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
+
+  // Set enable_pdl for both GEMM inputs
+  gemm1_tma_ws_input.enable_pdl = enable_pdl;
+  gemm2_tma_ws_input.enable_pdl = enable_pdl;
   if (!moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_) &&
       !moe_gemm_runner_.isTmaWarpSpecialized(*gemm2_config_)) {
     return std::make_pair(gemm1_tma_ws_input, gemm2_tma_ws_input);
@@ -3954,7 +3960,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         quant_params, nullptr, nullptr, reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
         reinterpret_cast<UnfusedGemmOutputType*>(fc2_result_),
         min_latency_params.num_active_experts_per_node, min_latency_params.active_expert_global_ids,
-        start_expert, stream);
+        start_expert, stream, enable_pdl);
   } else {
     auto gemm1_input = use_prequant_scale_kernel ? smoothed_act_ : permuted_data_;
 
@@ -4010,7 +4016,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         quant_params.fp8.dequant_fc2, fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params,
         fc1_expert_biases, fc2_expert_biases,
         reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
-        reinterpret_cast<UnfusedGemmOutputType*>(fc2_result_), stream);
+        reinterpret_cast<UnfusedGemmOutputType*>(fc2_result_), stream, enable_pdl);
   }
 }
 
@@ -4362,7 +4368,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 }
 
 void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_char,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, bool enable_pdl) {
   auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 #define GET_WS_PTR_BASE(type, name)                                                   \
   auto* name##_base =                                                                 \
@@ -4419,7 +4425,7 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
           token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
           unpermuted_row_to_permuted_row, expert_first_token_offset, blocked_expert_counts,
           blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
-          mNumExpertsPerNode, mK, start_expert_id, stream);
+          mNumExpertsPerNode, mK, start_expert_id, stream, enable_pdl);
       sync_check_cuda_error(stream);
     }
   }
@@ -4483,7 +4489,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
 }
 
 void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr_char,
-                                             void const* expert_weights, cudaStream_t stream) {
+                                             void const* expert_weights, cudaStream_t stream, bool enable_pdl) {
   if (mSM < 90) {
     return;
   }
@@ -4522,12 +4528,14 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
   TmaWarpSpecializedGroupedGemmInput dummy_tma_ws_input;
   dummy_tma_ws_input.configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
                                         workspaces.at("gemm_workspace").first, mScalingType);
+  dummy_tma_ws_input.enable_pdl = enable_pdl;  // Set enable_pdl for dummy input
   tma_ws_input_workspace += tma_ws_size;
 
   size_t num_expanded_tokens = num_tokens * mK;
   for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++) {
     mTmaInputCache[i].configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
                                          workspaces.at("gemm_workspace").first, mScalingType);
+    mTmaInputCache[i].enable_pdl = enable_pdl;  // Set enable_pdl for the profiler
     tma_ws_input_workspace += tma_ws_size;
 
     int64_t* expert_first_token_offset =
@@ -4593,7 +4601,7 @@ void GemmProfilerBackend::prepare(int num_tokens, char* workspace_ptr_char,
 
   prepareRouting(num_tokens, workspace_ptr_char, stream);
   prepareQuantParams(num_tokens, workspace_ptr_char, stream);
-  prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights, stream);
+  prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights, stream, false);
 }
 
 size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {

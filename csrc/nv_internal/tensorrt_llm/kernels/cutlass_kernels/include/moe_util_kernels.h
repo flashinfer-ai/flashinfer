@@ -55,7 +55,7 @@ void threeStepBuildExpertMapsSortFirstToken(
     int64_t* expert_first_token_offset, int* blocked_expert_counts,
     int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
     int64_t const num_experts_per_node, int64_t const num_experts_per_token,
-    int const start_expert_id, cudaStream_t stream);
+    int const start_expert_id, cudaStream_t stream, bool enable_pdl = false);
 
 template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
@@ -68,7 +68,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
                                    int64_t* expert_first_token_offset,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
-                                   void const* prequant_scales, cudaStream_t stream);
+                                   void const* prequant_scales, cudaStream_t stream, bool enable_pdl = false);
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(
@@ -77,7 +77,7 @@ void finalizeMoeRoutingKernelLauncher(
     int const* permuted_row_to_unpermuted_row, int const* token_selected_experts,
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const cols,
     int64_t const experts_per_token, int64_t const num_experts_per_node,
-    MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream);
+    MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream, bool enable_pdl = false);
 
 }  // namespace cutlass_kernels
 }  // namespace tensorrt_llm::kernels

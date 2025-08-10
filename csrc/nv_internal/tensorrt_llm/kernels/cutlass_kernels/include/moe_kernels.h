@@ -392,7 +392,7 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-                      cudaStream_t stream) = 0;
+                      cudaStream_t stream, bool enable_pdl = false) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -558,7 +558,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
               bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
               bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params, cudaStream_t stream, bool enable_pdl = false) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(
@@ -731,7 +731,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                                 ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                 MoeMinLatencyParams& min_latency_params, bool use_lora,
                                 int start_expert, MOEParallelismConfig parallelism_config,
-                                cudaStream_t stream);
+                                cudaStream_t stream, bool enable_pdl = false);
 
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecialized(
@@ -744,7 +744,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
       ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
-      UnfusedGemmOutputType* gemm2_output, cudaStream_t stream);
+      UnfusedGemmOutputType* gemm2_output, cudaStream_t stream, bool enable_pdl = false);
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedLowLatency(
       TmaWarpSpecializedGroupedGemmInput layout_info1,
@@ -757,7 +757,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
       UnfusedGemmOutputType* output1, UnfusedGemmOutputType* output2,
       int const* num_active_experts_per, int const* active_expert_global_ids, int start_expert,
-      cudaStream_t stream);
+      cudaStream_t stream, bool enable_pdl = false);
   std::map<std::string, std::pair<size_t, size_t>> getWorkspaceDeviceBufferSizes(
       int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
       int const num_experts_per_node, int const experts_per_token, ActivationType activation_type,
@@ -962,10 +962,10 @@ struct GemmProfilerBackend {
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
-  void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
+  void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream, bool enable_pdl = false);
   void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
   void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
-                          cudaStream_t stream);
+                          cudaStream_t stream, bool enable_pdl = false);
 };
 
 // Populates a buffer with random values for use with MOE benchmarking

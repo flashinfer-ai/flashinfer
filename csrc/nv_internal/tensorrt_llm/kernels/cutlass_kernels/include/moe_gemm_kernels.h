@@ -226,6 +226,9 @@ struct TmaWarpSpecializedGroupedGemmInput {
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
 
+  // Whether to enable PDL (Programmatic Dependent Launch).
+  bool enable_pdl = false;
+
   static std::array<size_t, 17> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);

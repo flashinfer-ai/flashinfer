@@ -48,8 +48,7 @@ int getEnvMmhaBlocksPerSequence();
 
 int getEnvMmhaKernelBlockSize();
 
-// Whether PDL is enabled.
-bool getEnvEnablePDL();
+
 
 bool getEnvUseUCXKvCache();
 

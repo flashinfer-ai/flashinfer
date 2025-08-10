@@ -275,6 +275,8 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfO;
   // The cuda stream.
   cudaStream_t stream;
+  // Whether to enable PDL (Programmatic Dependent Launch).
+  bool enable_pdl = false;
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {

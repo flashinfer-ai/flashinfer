@@ -189,18 +189,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen() {
   return useTileSizeKv64;
 }
 
-bool getEnvEnablePDL() {
-  static std::once_flag flag;
-  static bool enablePDL = false;
 
-  std::call_once(flag, [&]() {
-    if (getSMVersion() >= 90) {
-      // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-      enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
-    }
-  });
-  return enablePDL;
-}
 
 bool getEnvUseUCXKvCache() {
   static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");

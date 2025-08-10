@@ -41,7 +41,7 @@ namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 at::Tensor const& globalScale, int64_t sfVecSize,
                                                 bool sfUseUE8M0, bool isSfSwizzledLayout,
-                                                bool isSf8x4Layout) {
+                                                bool isSf8x4Layout, bool enable_pdl = false) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   CHECK_INPUT_TYPE(globalScale, c10::ScalarType::Float);
@@ -88,7 +88,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
       m, k, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(),                  \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      at::cuda::getCurrentCUDAStream(self.get_device()));
+      at::cuda::getCurrentCUDAStream(self.get_device()), enable_pdl);
 
   if (sfUseUE8M0) {
     if (self.scalar_type() == at::ScalarType::Half) {

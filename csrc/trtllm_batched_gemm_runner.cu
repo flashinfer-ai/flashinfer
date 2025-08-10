@@ -158,7 +158,7 @@ void TrtllmGenBatchedGemmRunner::run(
     float const* ptrClampLimit, void* c, void* outSfC, int32_t const* routeMap,
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-    CUstream stream, int device, int32_t configIndex) {
+    CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData;
@@ -239,7 +239,7 @@ void TrtllmGenBatchedGemmRunner::run(
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-              tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenBatchedGemmModuleCache);
+              enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
 
   TORCH_CHECK(err == 0,
               "Error occurred when running GEMM!"
@@ -251,7 +251,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
                                      std::vector<int32_t> const& batchedTokens, void const* a,
                                      void const* sfA, void const* b, void const* sfB, void* c,
                                      void* outSfC, void* workspace, CUstream stream, int device,
-                                     int32_t configIndex) {
+                                     int32_t configIndex, bool enable_pdl) {
   // Dispatch with block scaling factors and with static batching.
   run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0,
       a, sfA, b, sfB,
@@ -260,7 +260,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr, c, outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
+      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -269,7 +269,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
                                      float const* ptrBias, float const* ptrAlpha,
                                      float const* ptrBeta, float const* ptrClampLimit, void* c,
                                      void* outSfC, void* workspace, CUstream stream, int device,
-                                     int32_t configIndex) {
+                                     int32_t configIndex, bool enable_pdl) {
   // Dispatch with block scaling factors and with static batching.
   run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0,
       a, sfA, b, sfB,
@@ -278,14 +278,14 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
+      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
                                      std::vector<int32_t> const& batchedTokens, void const* a,
                                      void const* b, float const* scaleC, float const* scaleGateC,
                                      void* c, void* workspace, CUstream stream, int device,
-                                     int32_t configIndex) {
+                                     int32_t configIndex, bool enable_pdl) {
   // Dispatch with block scaling factors and with static batching.
   run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0,
       a,
@@ -295,7 +295,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* outSfC */ nullptr,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
+      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
 }
 
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
