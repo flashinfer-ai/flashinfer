@@ -2092,7 +2092,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
 
         self._cached_module.paged_run(*run_args)
-
+        if v_scale is not None:
+            # TODO(Zihao): fused into kernel
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
+            else:
+                out *= v_scale
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
