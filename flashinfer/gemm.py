@@ -403,7 +403,8 @@ def get_gemm_sm100_module_cutlass_fp8():
             self,
             inputs: List[torch.Tensor],
             *,
-            tactic: int,
+            tactic: int = -1,
+            do_preparation: bool = False,
         ):
             a, b, alpha, out, workspace_buffer = inputs
             module.fp8_gemm.default(a, b, alpha, out, workspace_buffer, tactic)
