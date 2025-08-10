@@ -2,7 +2,6 @@ import pytest
 import torch
 
 from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
-import math
 
 
 @pytest.mark.parametrize("m", [1, 1024])
@@ -49,52 +48,6 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device):
             )
 
     check_accuracy(a_pt, a, 8, 0, 0.999)
-
-
-def _dequant_fp8(input, scale, transpose_scale, block_m, block_n):
-    input = input.to(torch.float)
-    scale = scale.to(torch.float)
-    if transpose_scale:
-        scale = scale.t()
-    output = torch.zeros_like(input)
-    m, n = input.shape
-    m_tile = 128 if block_m else 1
-    n_tile = 128 if block_n else 1
-
-    if m_tile == 1:
-        assert n % 16 == 0, "n must be divisible by 16"
-        total_blocks = math.ceil(n / 128)
-        for block in range(total_blocks):
-            # Calculate start position in 2D array
-            start_col = block * 128
-            end_col = min(start_col + 128, n)
-            output[:, start_col:end_col] = input[:, start_col:end_col] * scale[
-                :, block
-            ].view(-1, 1)
-
-    elif n_tile == 1:
-        assert m % 16 == 0, "m must be divisible by 16"
-        total_blocks = math.ceil(m / 128)
-        for block in range(total_blocks):
-            # Calculate start position in 2D array
-            start_row = block * 128
-            end_row = min(start_row + 128, m)
-            output[start_row:end_row, :] = input[start_row:end_row, :] * scale[block, :]
-    else:
-        assert n % 16 == 0, "n must be divisible by 16"
-        assert m % 16 == 0, "m must be divisible by 16"
-        n_blocks = math.ceil(n / 128)
-        m_blocks = math.ceil(m / 128)
-        for i in range(n_blocks):
-            for j in range(m_blocks):
-                start_row = j * 128
-                end_row = min(start_row + 128, m)
-                start_col = i * 128
-                end_col = min(start_col + 128, n)
-                output[start_row:end_row, start_col:end_col] = (
-                    input[start_row:end_row, start_col:end_col] * scale[j, i]
-                )
-    return output
 
 
 def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
