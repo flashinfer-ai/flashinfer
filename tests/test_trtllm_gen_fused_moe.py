@@ -16,7 +16,7 @@ limitations under the License.
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Dict, Literal
+from typing import Dict
 
 import pytest
 import torch
@@ -317,13 +317,7 @@ class FP4Moe(Moe):
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP4 format and compute global scale factors."""
         num_experts = gemm1_weights.shape[0]
-        use_ue8m0 = self.is_mxfp4
         # Compute global scale factor for hidden states (offline calibration)
-        fp4_global_scale = calculate_fp4_global_scale_factor(
-            hidden_states_sample,
-            use_ue8m0,
-        )
-
         if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
             # nvfp4 hidden states
             hidden_states_scale_global = calculate_fp4_global_scale_factor(
@@ -336,12 +330,12 @@ class FP4Moe(Moe):
 
         # Quantize the weights for FC1
         gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = (
-            quant_fp4_batches(gemm1_weights, num_experts, use_ue8m0, True)
+            quant_fp4_batches(gemm1_weights, num_experts, self.is_mxfp4, True)
         )
 
         # Quantize the weights for FC2
         gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = (
-            quant_fp4_batches(gemm2_weights, num_experts, use_ue8m0, True)
+            quant_fp4_batches(gemm2_weights, num_experts, self.is_mxfp4, True)
         )
 
         return {
