@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import logging
-from ctypes import c_void_p
+from ctypes import c_void_p, cast
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
@@ -610,7 +610,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # Set flag_ptr[3] = lamport_comm_size
     lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
     cudart.cudaMemcpy(
-        c_void_p(flag_ptr.value + 3 * 4), c_void_p(lamport_comm_size_bytes), 4
+        c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
     print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace
@@ -822,9 +822,6 @@ def trtllm_allreduce_fusion(
     """
 
     if use_oneshot is None:
-        logging.warning(
-            "use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
-        )
         use_oneshot = token_num <= 128
 
     if not use_oneshot:

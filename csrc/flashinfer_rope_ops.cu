@@ -39,6 +39,12 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
                                       at::Tensor pos_ids, bool interleave);
 
+void mla_rope_quantize(at::Tensor q_rope_in, at::Tensor k_rope_in, at::Tensor q_nope_in,
+                       at::Tensor k_nope_in, at::Tensor q_rope_out, at::Tensor k_rope_out,
+                       at::Tensor q_nope_out, at::Tensor k_nope_out, at::Tensor cos_sin_cache,
+                       at::Tensor pos_ids, double quant_scale_q, double quant_scale_kv,
+                       bool interleave);
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Apply RoPE"
   m.def("apply_rope", apply_rope);
@@ -50,4 +56,6 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("apply_llama31_rope_pos_ids", apply_llama31_rope_pos_ids);
   // "Apply RoPE with positional ids and cosine/sine cache"
   m.def("apply_rope_pos_ids_cos_sin_cache", apply_rope_pos_ids_cos_sin_cache);
+  // "MLA RoPE Quantize"
+  m.def("mla_rope_quantize", mla_rope_quantize);
 }

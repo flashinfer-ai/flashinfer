@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .cudnn import (
+    cudnn_batch_prefill_with_kv_cache as cudnn_batch_prefill_with_kv_cache,
+)
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -66,7 +69,7 @@ def get_fmha_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
-    pos_encoding_mode: PosEncodingMode,
+    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool = False,
@@ -79,7 +82,7 @@ def get_fmha_module(
             dtype_idx,
             head_dim_qk,
             head_dim_vo,
-            pos_encoding_mode.value,
+            pos_encoding_mode,
             use_sliding_window,
             use_logits_soft_cap,
         ).build_and_load()
@@ -2089,7 +2092,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
 
         self._cached_module.paged_run(*run_args)
-
+        if v_scale is not None:
+            # TODO(Zihao): fused into kernel
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
+            else:
+                out *= v_scale
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)

@@ -18,6 +18,8 @@
 
 #include <ATen/cuda/EmptyTensor.h>
 
+#include <cstdint>
+
 #include "cutlass/numeric_types.h"
 #include "pytorch_extension_utils.h"
 #include "tensorrt_llm/thop/thUtils.h"

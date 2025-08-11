@@ -56,7 +56,7 @@ def get_mxfp8_quantization_sm100_module():
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+            alignment (int, optional): sfVecSize. Defaults to 32. Note that alignment is not used in the host kernel.
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
                 - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -139,7 +139,7 @@ def mxfp8_quantize(
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+        alignment (int, optional): sfVecSize. Defaults to 32.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -153,7 +153,6 @@ def mxfp8_quantize(
         is_sf_swizzled_layout,
         alignment,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     return x_q, sf
 
 

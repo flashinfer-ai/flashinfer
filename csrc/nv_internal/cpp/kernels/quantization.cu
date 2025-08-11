@@ -163,7 +163,7 @@ INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// FP4 Quantization
+// FP4/MXFP8 Quantization
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale,
