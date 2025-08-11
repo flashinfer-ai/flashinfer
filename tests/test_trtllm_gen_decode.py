@@ -274,7 +274,7 @@ def test_trtllm_batch_decode_fmha(
         workspace_buffer,
         block_tables,
         seq_lens_gpu,
-        max_seq_len,
+        # max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
@@ -433,7 +433,7 @@ def test_trtllm_batch_decode_mla(
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = MAX_SEQ_LEN
-    max_seq_len = max(seq_lens)
+    # max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size

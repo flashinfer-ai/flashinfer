@@ -1282,7 +1282,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._block_tables,
                     self._kv_lens_buffer,
                     page_size,
-                    self._max_kv_len,
+                    # self._max_kv_len,
                     sinks,
                 ]
 
@@ -1809,7 +1809,7 @@ class TrtllmGenDecodeModule:
         workspace_buffer: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
-        max_seq_len: int,
+        # max_seq_len: int,
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
         window_left: int = -1,
@@ -1831,7 +1831,7 @@ class TrtllmGenDecodeModule:
             workspace_buffer,
             block_tables,
             seq_lens,
-            max_seq_len,
+            block_tables.shape[1] * k_cache.shape[3],  # max_seq_len
             bmm1_scale,
             bmm2_scale,
             -1,  # o_sf_scale
@@ -1898,7 +1898,7 @@ def get_trtllm_gen_decode_module(*args):
         block_tables: Optional[torch.Tensor] = None,
         kv_lens_buffer: Optional[torch.Tensor] = None,
         page_size: Optional[int] = None,
-        max_kv_len: Optional[int] = None,
+        # max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
@@ -1908,7 +1908,7 @@ def get_trtllm_gen_decode_module(*args):
         assert block_tables is not None
         assert kv_lens_buffer is not None
         assert page_size is not None
-        assert max_kv_len is not None
+        # assert max_kv_len is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
@@ -1916,7 +1916,7 @@ def get_trtllm_gen_decode_module(*args):
             int_workspace_buffer,
             block_tables,
             kv_lens_buffer,
-            max_kv_len,
+            # max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
@@ -1980,7 +1980,7 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    max_seq_len: int,
+    # max_seq_len: int,
     bmm1_scale: float,
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
@@ -2008,9 +2008,6 @@ def trtllm_batch_decode_with_kv_cache(
 
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
-
-    max_seq_len : int
-        max sequence length for kv_cache
 
     bmm1_scale : float
         fused scale for bmm1 input.
@@ -2117,7 +2114,7 @@ def trtllm_batch_decode_with_kv_cache(
         workspace_buffer,
         block_tables,
         seq_lens,
-        max_seq_len,
+        block_tables.shape[1] * k_cache.shape[3],  # max_seq_len
         bmm1_scale,
         bmm2_scale,
         o_sf_scale or -1.0,
