@@ -151,6 +151,8 @@ void trtllm_paged_attention_launcher(
     runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
         static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
     runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
+    zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
+                                 /*enable_pdl=*/true, stream);
   }
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
