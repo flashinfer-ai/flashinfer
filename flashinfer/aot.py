@@ -12,8 +12,8 @@ from torch.utils.cpp_extension import _get_cuda_arch_flags
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
 from .comm.nvshmem import gen_nvshmem_module
-from .fp4_quantization import gen_fp4_quantization_sm100_module
-from .fused_moe import gen_cutlass_fused_moe_sm100_module
+from .fp4_quantization import gen_fp4_quantization_module
+from .fused_moe import gen_cutlass_fused_moe_module
 from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -366,8 +366,8 @@ def gen_all_modules(
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
         if has_sm100:
-            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
-            jit_specs.append(gen_fp4_quantization_sm100_module())
+            jit_specs.append(gen_cutlass_fused_moe_module())
+            jit_specs.append(gen_fp4_quantization_module())
             jit_specs.append(gen_gemm_sm100_module())
 
     if add_comm:

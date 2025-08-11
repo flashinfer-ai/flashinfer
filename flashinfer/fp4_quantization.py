@@ -23,7 +23,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags
+from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags
 from .utils import (
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
@@ -61,9 +61,21 @@ def _pad_scale_factors(
         ).contiguous()
 
 
-def gen_fp4_quantization_sm100_module() -> JitSpec:
+@functools.cache
+def get_device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    suffix = "a" if major >= 9 else ""
+    return f"{major * 10 + minor}{suffix}"
+
+
+def gen_fp4_quantization_module() -> JitSpec:
+    if get_device_arch() == "100a":
+        nvcc_flags = sm100a_nvcc_flags
+    else:
+        nvcc_flags = sm90a_nvcc_flags
+
     return gen_jit_spec(
-        "fp4_quantization_sm100",
+        "fp4_quantization",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
@@ -74,7 +86,7 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
@@ -91,14 +103,14 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
 
 
 @functools.cache
-def get_fp4_quantization_sm100_module():
-    module = gen_fp4_quantization_sm100_module().build_and_load()
+def get_fp4_quantization_module():
+    module = gen_fp4_quantization_module().build_and_load()
 
     @register_custom_op(
-        "flashinfer::fp4_quantize_sm100",
+        "flashinfer::fp4_quantize",
         mutates_args=(""),
     )
-    def fp4_quantize_sm100(
+    def fp4_quantize(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
@@ -130,8 +142,8 @@ def get_fp4_quantization_sm100_module():
             is_sf_8x4_layout,
         )
 
-    @register_fake_op("flashinfer::fp4_quantize_sm100")
-    def _fake_fp4_quantize_sm100(
+    @register_fake_op("flashinfer::fp4_quantize")
+    def _fake_fp4_quantize(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
@@ -145,10 +157,10 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::block_scale_interleave_sm100",
+        "flashinfer::block_scale_interleave",
         mutates_args=("",),
     )
-    def block_scale_interleave_sm100(
+    def block_scale_interleave(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
@@ -163,8 +175,8 @@ def get_fp4_quantization_sm100_module():
             unswizzled_sf,
         )
 
-    @register_fake_op("flashinfer::block_scale_interleave_sm100")
-    def _fake_block_scale_interleave_sm100(
+    @register_fake_op("flashinfer::block_scale_interleave")
+    def _fake_block_scale_interleave(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         return unswizzled_sf.new_empty(
@@ -172,10 +184,10 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
+        "flashinfer::e2m1_and_ufp8sf_scale_to_float",
         mutates_args=(""),
     )
-    def e2m1_and_ufp8sf_scale_to_float_sm100(
+    def e2m1_and_ufp8sf_scale_to_float(
         e2m1_tensor: torch.Tensor,
         ufp8_scale_tensor: torch.Tensor,
         global_scale_tensor: Optional[torch.Tensor] = None,
@@ -208,8 +220,8 @@ def get_fp4_quantization_sm100_module():
             is_sf_swizzled_layout,
         )
 
-    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
-    def _fake_e2m1_and_ufp8sf_scale_to_float_sm100(
+    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float")
+    def _fake_e2m1_and_ufp8sf_scale_to_float(
         e2m1_tensor: torch.Tensor,
         ufp8_scale_tensor: torch.Tensor,
         global_scale_tensor: Optional[torch.Tensor] = None,
@@ -223,9 +235,9 @@ def get_fp4_quantization_sm100_module():
 
     # Register the module
     return SimpleNamespace(
-        fp4_quantize_sm100=fp4_quantize_sm100,
-        block_scale_interleave_sm100=block_scale_interleave_sm100,
-        e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
+        fp4_quantize=fp4_quantize,
+        block_scale_interleave=block_scale_interleave,
+        e2m1_and_ufp8sf_scale_to_float=e2m1_and_ufp8sf_scale_to_float,
     )
 
 
@@ -270,7 +282,7 @@ def fp4_quantize(
         input = input.transpose(-2, -1)
 
     assert input.shape[-1] % sf_vec_size == 0
-    x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
+    x_q, sf = get_fp4_quantization_module().fp4_quantize(
         input,
         global_scale,
         sf_vec_size,
@@ -305,7 +317,7 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     assert unswizzled_sf.dtype == torch.uint8, (
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
     )
-    return get_fp4_quantization_sm100_module().block_scale_interleave_sm100(
+    return get_fp4_quantization_module().block_scale_interleave(
         unswizzled_sf,
     )
 
@@ -336,7 +348,7 @@ def e2m1_and_ufp8sf_scale_to_float(
 
     """
 
-    return get_fp4_quantization_sm100_module().e2m1_and_ufp8sf_scale_to_float_sm100(
+    return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float(
         e2m1_tensor,
         ufp8_scale_tensor,
         global_scale_tensor,

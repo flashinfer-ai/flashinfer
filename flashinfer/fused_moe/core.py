@@ -32,7 +32,7 @@ from ..autotuner import (
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
 from .utils import (
@@ -114,10 +114,22 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
-def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
+def get_device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    suffix = "a" if major >= 9 else ""
+    return f"{major * 10 + minor}{suffix}"
+
+
+def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
     output_dir = (
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
     )
+
+    print(f"get_device_arch(): {get_device_arch()}")
+    if get_device_arch() == "100a":
+        nvcc_flags = sm100a_nvcc_flags
+    else:
+        nvcc_flags = sm90a_nvcc_flags
 
     required_kernels_sm100 = [
         # M128 kernels
@@ -180,7 +192,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
@@ -233,7 +245,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
@@ -269,8 +281,8 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 
 @functools.cache
-def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
-    module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+def get_cutlass_fused_moe_module(use_fast_build: bool = False):
+    module = gen_cutlass_fused_moe_module(use_fast_build).build_and_load(
         class_name="FusedMoeRunner"
     )
 
@@ -399,10 +411,10 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
     @register_custom_op(
-        "flashinfer::cutlass_fused_moe_sm100",
+        "flashinfer::cutlass_fused_moe",
         mutates_args=(""),
     )
-    def cutlass_fused_moe_sm100(
+    def cutlass_fused_moe(
         output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
@@ -512,8 +524,8 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
 
         return result if min_latency_mode else [result]
 
-    @register_fake_op("flashinfer::cutlass_fused_moe_sm100")
-    def _fake_cutlass_fused_moe_sm100(
+    @register_fake_op("flashinfer::cutlass_fused_moe")
+    def _fake_cutlass_fused_moe(
         output: torch.Tensor,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,
@@ -560,7 +572,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fused_moe_sm100=cutlass_fused_moe_sm100,
+        cutlass_fused_moe=cutlass_fused_moe,
     )
 
 
@@ -732,7 +744,7 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_sm100_module().cutlass_fused_moe_sm100(
+    return get_cutlass_fused_moe_module().cutlass_fused_moe(
         output,
         input,
         token_selected_experts,
