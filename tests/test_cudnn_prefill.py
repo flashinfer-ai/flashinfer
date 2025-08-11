@@ -80,46 +80,6 @@ def test_cudnn_prefill(
         (2 * page_size * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1),
     )
 
-    # Now initialize the page tables
-    block_tables = torch.tensor(
-        [
-            [k + i * num_pages_per_seq for k in range(num_pages_per_seq)]
-            for i in range(batch_size)
-        ],
-        dtype=torch.int,
-        device=device,
-    )
-
-    # Initialize scale
-    scale = float(1.0 / (head_dim**0.5))
-
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-
-    output, lse = flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
-        q,
-        k_cache,
-        v_cache,
-        scale,
-        workspace_buffer,
-        max_token_per_sequence=s_qo,
-        max_sequence_kv=s_kv,
-        actual_seq_lens_q=actual_seq_lens_q,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
-        causal=causal,
-        return_lse=return_lse,
-        is_cuda_graph_compatible=is_cuda_graph_compatible,
-        batch_offsets_q=q_indptr,
-        batch_offsets_o=q_indptr,
-    )
-
-    qo_indptr = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
-        ]
-    ).int()
-
     kv_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
@@ -146,6 +106,53 @@ def test_cudnn_prefill(
         actual_seq_lens_kv.flatten() % page_size == 0,
         torch.full((batch_size,), page_size, device=device),
         actual_seq_lens_kv.flatten() % page_size,
+    ).int()
+
+    # Now initialize the page tables
+    block_tables = torch.tensor(
+        [
+            [k + i * num_pages_per_seq for k in range(num_pages_per_seq)]
+            for i in range(batch_size)
+        ],
+        dtype=torch.int,
+        device=device,
+    )
+
+    # Initialize scale
+    scale = float(1.0 / (head_dim**0.5))
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    wrapper_cudnn = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="cudnn"
+    )
+    wrapper_cudnn.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        causal=causal,
+        q_data_type=torch.bfloat16,
+        seq_lens=actual_seq_lens_kv,
+        seq_lens_q=actual_seq_lens_q,
+        sm_scale=scale,
+        max_token_per_sequence=s_qo,
+        max_sequence_kv=s_kv,
+        block_tables=block_tables,
+    )
+
+    output = wrapper_cudnn.run(q, (k_cache, v_cache))
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
     ).int()
 
     # Workspace buffer
