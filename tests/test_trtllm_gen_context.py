@@ -191,7 +191,6 @@ def test_trtllm_batch_context_wrapper(
         block_tables=block_tables,
         seq_lens=seq_lens,
         max_q_len=qo_len,
-        max_kv_len=kv_len,
         bmm1_scale=q_scale / math.sqrt(head_dim),
         bmm2_scale=1,
         batch_size=batch_size,
@@ -381,7 +380,6 @@ def test_trtllm_batch_prefill(
         block_tables,
         seq_lens_gpu,
         max_q_len,
-        max_seq_len,
         q_scale * k_scale * sm_scale,  # bmm1_scale
         v_scale / o_scale,  # bmm2_scale
         batch_size,
