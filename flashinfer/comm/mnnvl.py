@@ -517,7 +517,7 @@ class McastDeviceMemory:
         checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
 
         # Set CUDA device
-        import cuda.cudart as cudart
+        import cuda.bindings.runtime as cudart
 
         checkCudaErrors(cudart.cudaSetDevice(device_idx))
 

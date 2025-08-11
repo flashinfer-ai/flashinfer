@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import cuda.bindings.driver as driver
-import cuda.bindings.runtime as runtime
-import cuda.cudart as cudart
-import cuda.nvrtc as nvrtc
+from cuda.bindings import driver, nvrtc, runtime
 
 
 def _cudaGetErrorEnum(error):
@@ -25,7 +22,7 @@ def _cudaGetErrorEnum(error):
         err, name = driver.cuGetErrorName(error)
         return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
     elif isinstance(error, runtime.cudaError_t):
-        return cudart.cudaGetErrorName(error)[1]
+        return runtime.cudaGetErrorName(error)[1]
     elif isinstance(error, nvrtc.nvrtcResult):
         return nvrtc.nvrtcGetErrorString(error)[1]
     else:
