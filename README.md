@@ -45,7 +45,7 @@ Using our PyTorch API is the easiest way to get started:
 
 ### Install from PIP
 
-We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
+FlashInfer is available as a Python package for Linux on PyPI. You can install it with the following command:
 
 ```bash
 pip install flashinfer-python
