@@ -26,6 +26,7 @@ if has_cuda_cudart():
 else:
     # cuda-python >= 13.0 (no cuda.cudart, use runtime as cudart)
     from cuda.bindings import driver, nvrtc, runtime
+
     cudart = runtime  # Alias runtime as cudart for compatibility
 
 

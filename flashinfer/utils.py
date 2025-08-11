@@ -424,7 +424,8 @@ def has_cuda_cudart() -> bool:
     """
     try:
         import cuda
-        return hasattr(cuda, 'cudart')
+
+        return hasattr(cuda, "cudart")
     except ImportError:
         return False
 
