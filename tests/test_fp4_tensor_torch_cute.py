@@ -3,6 +3,8 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_ptr
 
+from flashinfer.utils import is_cute_dsl_available
+
 
 @cute.kernel
 def copy_torch_fp4_tensor_kernel(a_ptr: cute.Pointer, b_ptr: cute.Pointer):
@@ -19,7 +21,10 @@ def copy_torch_fp4_tensor(a_ptr: cute.Pointer, b_ptr: cute.Pointer):
     copy_torch_fp4_tensor_kernel(a_ptr, b_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1))
 
 
-if __name__ == "__main__":
+def test_fp4_tensor_torch_cute():
+    if not is_cute_dsl_available():
+        pytest.skip("cute-dsl is not available")
+
     a = torch.randint(
         0, 128, size=(3, 4), dtype=torch.uint8, device=torch.device("cuda:0")
     )
