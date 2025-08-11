@@ -1823,9 +1823,7 @@ class TrtllmGenDecodeModule:
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
-            query.unsqueeze(
-                1
-            ),  # [B, 1, H, D], no MTP here so second dim is 1 # todo(Yingyi): add MTP??
+            query,  # [B, S, H, D], w/ MTP here so second dim is S
             k_cache,
             v_cache,
             workspace_buffer,
@@ -1994,7 +1992,7 @@ def trtllm_batch_decode_with_kv_cache(
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim]
+        query tensor with shape [batch_size, q_len_per_request, num_heads, head_dim]
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
@@ -2111,7 +2109,7 @@ def trtllm_batch_decode_with_kv_cache(
     run_func(
         out,
         out_scale_factor,
-        query.unsqueeze(1),  # [B, 1, H, D], no MTP here so second dim is 1
+        query,
         k_cache,
         v_cache,
         workspace_buffer,
