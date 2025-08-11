@@ -518,7 +518,7 @@ class McastDeviceMemory:
 
         # Set CUDA device
         # Check if cuda.cudart is available and import accordingly
-        from ..utils import has_cuda_cudart
+        from flashinfer.utils import has_cuda_cudart
 
         if has_cuda_cudart():
             # cuda-python <= 12.9

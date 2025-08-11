@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .utils import has_cuda_cudart
+from flashinfer.utils import has_cuda_cudart
 
 # Check if cuda.cudart module is available and import accordingly
 if has_cuda_cudart():
