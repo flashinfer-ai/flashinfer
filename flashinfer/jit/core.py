@@ -31,10 +31,14 @@ class FlashInferJITLogger(logging.Logger):
         self.addHandler(logging.FileHandler(log_path))
         # set the format of the log
         self.handlers[0].setFormatter(
-            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(filename)s - %(message)s"
+            )
         )
         self.handlers[1].setFormatter(
-            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(filename)s - %(message)s"
+            )
         )
 
     def info(self, msg):
