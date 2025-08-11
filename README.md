@@ -48,20 +48,6 @@ Using our PyTorch API is the easiest way to get started:
 We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
 
 ```bash
-# For CUDA 12.6 & torch 2.6
-pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6
-# For other CUDA & torch versions, check https://docs.flashinfer.ai/installation.html
-```
-
-To try the latest features from the main branch, use our nightly-built wheels:
-
-```bash
-pip install flashinfer-python -i https://flashinfer.ai/whl/nightly/cu126/torch2.6
-```
-
-For a JIT version (compiling every kernel from scratch, [NVCC](https://developer.nvidia.com/cuda-downloads) is required), install from [PyPI](https://pypi.org/project/flashinfer-python/):
-
-```bash
 pip install flashinfer-python
 ```
 
