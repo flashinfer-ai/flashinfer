@@ -238,7 +238,7 @@ def test_trtllm_batch_decode_fmha(
 
     sm_scale = float(1.0 / (head_dim**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # Compute kv_indptr as cumulative sum of blocks per sequence
     kv_indptr = torch.cat(
@@ -511,7 +511,7 @@ def test_trtllm_batch_decode_mla(
     sm_scale = scale / (
         (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
-    workspace_buffer_ref = torch.empty(
+    workspace_buffer_ref = torch.zeros(
         128 * 1024 * 1024, dtype=torch.int8, device=device
     )
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
