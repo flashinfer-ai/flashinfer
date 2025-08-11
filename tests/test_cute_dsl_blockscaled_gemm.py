@@ -511,7 +511,7 @@ def test_blockscaled_gemm_python_interface(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
 
-    # Create tensors on GPU first to initialize CUDA context before plan
+    # Create tensors on GPU first to initialize CUDA context before compile
     # 1. Create torch tensors using size fp32 and cast to torch_dtype
     def create_torch_tensor(l, mode0, mode1, is_mode0_major, cutlass_dtype, device):
         """
@@ -571,7 +571,7 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
-    wrapper.plan(
+    wrapper.compile(
         m=m,
         n=n,
         k=k,
