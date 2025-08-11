@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -87,13 +88,21 @@ class JitSpec:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
     def get_library_path(self) -> Path:
-        if self.aot_path.exists():
+        if self.is_aot:
             return self.aot_path
         return self.jit_library_path
 
     @property
     def aot_path(self) -> Path:
         return jit_env.FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
+
+    @property
+    def is_aot(self) -> bool:
+        return self.aot_path.exists()
+
+    @property
+    def lock_path(self) -> Path:
+        return get_tmpdir() / f"{self.name}.lock"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
@@ -109,18 +118,14 @@ class JitSpec:
         )
         write_if_different(ninja_path, content)
 
-    def build(self, verbose: bool) -> None:
-        tmpdir = get_tmpdir()
-        with FileLock(tmpdir / f"{self.name}.lock", thread_local=False):
+    def build(self, verbose: bool, need_lock: bool = True) -> None:
+        lock = (
+            FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
+        )
+        with lock:
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
-    def build_and_load(self, class_name: str = None):
-        if self.aot_path.exists():
-            so_path = self.aot_path
-        else:
-            so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose)
+    def load(self, so_path: Path, class_name: str = None):
         load_class = class_name is not None
         loader = torch.classes if load_class else torch.ops
         loader.load_library(so_path)
@@ -128,6 +133,20 @@ class JitSpec:
             cls = torch._C._get_custom_class_python_wrapper(self.name, class_name)
             return cls
         return getattr(loader, self.name)
+
+    def build_and_load(self, class_name: str = None):
+        if self.is_aot:
+            return self.load(self.aot_path, class_name)
+
+        # Guard both build and load with the same lock to avoid race condition
+        # where another process is building the library and removes the .so file.
+        with FileLock(self.lock_path, thread_local=False):
+            so_path = self.jit_library_path
+            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+            self.build(verbose, need_lock=False)
+            result = self.load(so_path, class_name)
+
+        return result
 
 
 def gen_jit_spec(
