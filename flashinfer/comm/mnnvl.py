@@ -518,7 +518,9 @@ class McastDeviceMemory:
 
         # Set CUDA device
         # Check if cuda.cudart is available and import accordingly
-        if hasattr(cuda, 'cudart'):
+        from ..utils import has_cuda_cudart
+
+        if has_cuda_cudart():
             # cuda-python <= 12.9
             import cuda.cudart as cudart
         else:
