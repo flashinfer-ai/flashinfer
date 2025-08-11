@@ -139,7 +139,6 @@ class BatchAttention:
         logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
         q_rope_offset: Optional[torch.Tensor] = None,
-        k_rope_offset: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
             if self._use_profiler:
@@ -183,7 +182,6 @@ class BatchAttention:
             self._sm_scale,
             logits_soft_cap,
             q_rope_offset,
-            k_rope_offset,
             # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS
             *profiler_args,
