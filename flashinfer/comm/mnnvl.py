@@ -517,7 +517,13 @@ class McastDeviceMemory:
         checkCudaErrors(cuda.cuCtxSetCurrent(primary_ctx))
 
         # Set CUDA device
-        import cuda.bindings.runtime as cudart
+        # Check if cuda.cudart is available and import accordingly
+        if hasattr(cuda, 'cudart'):
+            # cuda-python <= 12.9
+            import cuda.cudart as cudart
+        else:
+            # cuda-python >= 13.0
+            import cuda.bindings.runtime as cudart
 
         checkCudaErrors(cudart.cudaSetDevice(device_idx))
 
