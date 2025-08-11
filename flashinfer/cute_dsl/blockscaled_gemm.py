@@ -40,7 +40,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
@@ -51,8 +51,6 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-
-from .dlpack_utils import create_dlpack_capsule
 
 
 class MaskedSchedulerParams:
@@ -70,9 +68,9 @@ class MaskedSchedulerParams:
             raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
 
         gc = cute.zipped_divide(c, tiler=c_tiler)
-        print("--------------------------------")
-        print(c.shape)
-        print("--------------------------------")
+        # print("--------------------------------")
+        # print(c.shape)
+        # print("--------------------------------")
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.masked_m = masked_m
         self.c = c
@@ -83,10 +81,10 @@ class MaskedSchedulerParams:
         self.cluster_shape_mn = cluster_shape_mnk[:2]
         self._loc = loc
 
-        print("==================================")
-        print(self.problem_shape_ntile_mnl)
-        print(self.cluster_shape_mn)
-        print("==================================")
+        # print("==================================")
+        # print(self.problem_shape_ntile_mnl)
+        # print(self.cluster_shape_mn)
+        # print("==================================")
 
         self.problem_layout_ncluster_mnl = cute.make_layout(
             cute.ceil_div(
@@ -819,7 +817,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             max_active_clusters,
         )
 
-        print(grid)  # todo(Yingyi): cleanup
+        # print(grid)  # todo(Yingyi): cleanup
 
         self.buffer_align_bytes = 1024
 
@@ -2733,19 +2731,6 @@ class MaskedBatchedMatmulCuteDSL:
         if self._compiled_masked_bmm is None:
             raise RuntimeError("MaskedBatchedMatmulCuteDSL: Not planned")
 
-        a_tensor = from_dlpack(a_tensor_gpu, assumed_align=16)
-        b_tensor = from_dlpack(b_tensor_gpu, assumed_align=16)
-        # todo(Yingyi): leading dim?
-        sfa_tensor = from_dlpack(sfa_tensor_gpu, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
-
         def dtype(cutlass_dtype):
             """
             Return the corresponding torch.dtype per the given DSL type
@@ -2775,6 +2760,86 @@ class MaskedBatchedMatmulCuteDSL:
                 dtype=dtype(self._c_dtype),
                 device="cuda",
             )
+
+        # fp4 or fp8 torch tensor to cute tensor
+        a_ptr = make_ptr(
+            self._ab_dtype,
+            a_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        b_ptr = make_ptr(
+            self._ab_dtype,
+            b_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        c_ptr = make_ptr(
+            self._c_dtype,
+            c_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        a_tensor_layout = (self._l, self._m, self._k)
+        b_tensor_layout = (self._l, self._n, self._k)
+        c_tensor_layout = (self._l, self._m, self._n)
+
+        # if self._ab_dtype == cutlass.Float4E2M1FN:
+        #     a_tensor_layout = (self._l, self._m, self._k * 2)
+        #     b_tensor_layout = (self._l, self._n, self._k * 2)
+
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout(
+                a_tensor_layout,
+                order=(2, 1, 0) if self._a_major == "k" else (1, 2, 0),
+            ),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                b_tensor_layout,
+                order=(2, 1, 0) if self._b_major == "k" else (1, 2, 0),
+            ),
+        )
+        a_tensor = cute.recast_tensor(a_tensor, self._ab_dtype)  # todo: should recast?
+        b_tensor = cute.recast_tensor(b_tensor, self._ab_dtype)
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_ordered_layout(
+                c_tensor_layout,
+                order=(2, 1, 0) if self._c_major == "m" else (1, 2, 0),
+            ),
+        )
+        c_tensor = cute.recast_tensor(c_tensor, self._c_dtype)
+
+        a_tensor.mark_compact_shape_dynamic(
+            mode=1 if self._a_major == "k" else 0,
+            stride_order=(2, 0, 1) if self._a_major == "k" else (2, 1, 0),
+            divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
+        )
+        b_tensor.mark_compact_shape_dynamic(
+            mode=1 if self._b_major == "k" else 0,
+            stride_order=(2, 0, 1) if self._b_major == "k" else (2, 1, 0),
+            divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
+        )
+        c_tensor.mark_compact_shape_dynamic(
+            mode=1 if self._c_major == "n" else 0,
+            stride_order=(2, 0, 1) if self._c_major == "n" else (2, 1, 0),
+            divisibility=2 if self._c_dtype == cutlass.Float4E2M1FN else 1,
+        )
+
+        # todo(Yingyi): should follow cutedsl example tests/test_fp4_tensor_torch_cute.py
+        sfa_tensor = from_dlpack(sfa_tensor_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+        sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
+
         c_tensor = from_dlpack(c_tensor_gpu, assumed_align=16)
         masked_m_tensor = from_dlpack(
             masked_m_tensor_gpu, assumed_align=1

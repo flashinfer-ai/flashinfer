@@ -535,9 +535,9 @@ def test_blockscaled_gemm_python_interface(
             cutlass.Float32: torch.float32,
             cutlass.BFloat16: torch.bfloat16,
             cutlass.Float16: torch.float16,
-            cutlass.Float8E5M2: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e5m2,
-            cutlass.Float8E4M3FN: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e4m3fn,
-            cutlass.Float8E4M3B11FNUZ: torch.int8,  # todo(Yingyi): to be fixed torch.float8_e4m3fnuz,
+            cutlass.Float8E5M2: torch.int8,  # todo(Yingyi): removed after 2.8?
+            cutlass.Float8E4M3FN: torch.int8,
+            cutlass.Float8E4M3B11FNUZ: torch.int8,
             cutlass.Float4E2M1FN: torch.int8,
         }
         shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
@@ -689,5 +689,20 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+    )
+
+    test_blockscaled_gemm_python_interface(
+        args.mnkl,
+        args.ab_dtype,
+        args.sf_dtype,
+        args.sf_vec_size,
+        args.c_dtype,
+        args.a_major,
+        args.b_major,
+        args.c_major,
+        args.mma_tiler_mn,
+        args.cluster_shape_mn,
+        args.tolerance,
+        args.iterations,
     )
     print("PASS")
