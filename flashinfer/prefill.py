@@ -56,6 +56,8 @@ from .utils import (
     is_sm100a_supported,
     register_custom_op,
     register_fake_op,
+    ceil_div,
+    round_up,
 )
 
 
@@ -3216,18 +3218,21 @@ def trtllm_batch_context_with_kv_cache(
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
 
-        fp4_out_shape = query.shape[:-1] + (math.ceil(query.shape[-1] / 2),)
-
-        fp4_out_scale_shape = (
-            math.ceil(query.shape[0] / 128) * 128,
-            math.ceil(query.shape[1] * query.shape[2] / o_sf_vec_size / 4) * 4,
-        )
+        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
 
         if isinstance(out, FP4Tensor):
+            fp4_out_scale_shape = (
+                out.scale.shape[0],
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
         elif out is None:
+            fp4_out_scale_shape = (
+                round_up(query.shape[0], 128),
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
             )
@@ -3236,9 +3241,9 @@ def trtllm_batch_context_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        # Use uint8 as the container dtype to compliant with next fp4 gemm.
         _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
 
-        # Use uint8 as the container dtype to compliant with next fp4 gemm.
         _check_shape_dtype_device(
             out_scale_factor,
             fp4_out_scale_shape,
@@ -3246,6 +3251,18 @@ def trtllm_batch_context_with_kv_cache(
             query.device,
             "out_scale_factor",
         )
+
+        # Check o_sf_start_index is valid
+        if (
+            o_sf_start_index < 0
+            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+        ):
+            raise ValueError(
+                f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+            )
+
     elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
         assert o_sf_scale is None
         assert o_sf_vec_size is None

@@ -5,7 +5,7 @@ import torch
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 import flashinfer
-from flashinfer.utils import FP4Tensor
+from flashinfer.utils import FP4Tensor, ceil_div, round_up
 
 DTYPE_MAP = {
     "half": torch.float16,
@@ -162,11 +162,13 @@ def create_output(q, o_dtype, create_out_tensor):
 
     if create_out_tensor:
         if o_dtype == "nvfp4":
-            fp4_out_shape = q.shape[:-1] + (math.ceil(q.shape[-1] / 2),)
+            fp4_out_shape = q.shape[:-1] + (ceil_div(q.shape[-1], 2),)
+
+            extra_size = torch.randint(0, 256, (1,)).item()
 
             fp4_out_scale_shape = (
-                math.ceil(q.shape[0] / 128) * 128,
-                math.ceil(q.shape[1] * q.shape[2] / o_sf_vec_size / 4) * 4,
+                round_up(q.shape[0] + extra_size, 128),
+                round_up(q.shape[1] * q.shape[2] // o_sf_vec_size, 4),
             )
 
             out_scale_factor = torch.empty(
