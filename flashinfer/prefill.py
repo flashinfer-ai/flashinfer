@@ -2316,8 +2316,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        # For FA3 backend with large sequences, we need a larger integer workspace buffer
+        # The default 8MB is insufficient for sequences >= 16384
+        int_workspace_size = 32 * 1024 * 1024 if backend in ["fa3", "auto"] else 8 * 1024 * 1024
         self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+            (int_workspace_size,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -2379,6 +2382,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+
+        self._kv_lens_buffer = torch.empty(
+            (32768,), dtype=torch.int32, device=self.device
+        )
+        # For FA3 backend with large sequences, we need a larger integer workspace buffer
+        # The default 8MB is insufficient for sequences >= 16384
+        int_workspace_size = 32 * 1024 * 1024 if backend in ["fa3", "auto"] else 8 * 1024 * 1024
+        self._int_workspace_buffer = torch.empty(
+            (int_workspace_size,), dtype=torch.uint8, device=self.device
+        )
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
 
     def plan(
         self,
