@@ -422,12 +422,9 @@ def has_cuda_cudart() -> bool:
     Returns:
         True if cuda.cudart exists, False otherwise
     """
-    try:
-        import cuda
+    import importlib.util
 
-        return hasattr(cuda, "cudart")
-    except ImportError:
-        return False
+    return importlib.util.find_spec("cuda.cudart") is not None
 
 
 def is_sm90a_supported(device: torch.device) -> bool:
