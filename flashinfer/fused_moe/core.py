@@ -236,7 +236,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe_cutlass_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
@@ -322,7 +322,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 @functools.cache
 def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
-    gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+    FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
         class_name="FusedMoeRunner"
     )
 
@@ -386,7 +386,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
+                    FusedMoeRunner(
                         x_dtype,
                         weight_dtype,
                         output_dtype,
