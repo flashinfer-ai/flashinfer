@@ -57,9 +57,13 @@ struct Signal {
   alignas(128) FlagType peer_counter[2][kMaxBlocks][8];
 };
 
-struct __align__(16) RankData { void* ptrs[8]; };
+struct __align__(16) RankData { 
+  void* ptrs[8]; 
+};
 
-struct __align__(16) RankSignals { Signal* signals[8]; };
+struct __align__(16) RankSignals { 
+  Signal* signals[8]; 
+};
 
 // like std::array, but aligned
 template <typename T, int sz>
