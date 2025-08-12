@@ -113,10 +113,9 @@ load_fragment_transpose(uint32_t *R, const T *smem_ptr, uint32_t stride)
 }
 
 // MMA operation for FP16 inputs with FP32 accumulator
-// MMA operation for FP16 inputs with FP32 accumulator
 template <typename T, mma::MMAMode mma_mode = mma::MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void
-amdgcn_mfma_fp32_16x16x16fp16(float *C, uint32_t *A, uint32_t *B)
+mma_sync_m16n16k16_row_col_f16f16f32(float *C, uint32_t *A, uint32_t *B)
 {
     // Ensure T is either __half or __hip_bfloat16
     static_assert(std::is_same_v<T, __half> ||

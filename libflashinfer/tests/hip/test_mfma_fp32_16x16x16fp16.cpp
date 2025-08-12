@@ -81,7 +81,7 @@ __global__ void test_mfma_kernel(const __half *A, const __half *B, float *C)
     flashinfer::gpu_iface::mma::load_fragment_transpose<__half>(b_reg,
                                                                 &B[b_idx], LDB);
 
-    flashinfer::gpu_iface::mma::amdgcn_mfma_fp32_16x16x16fp16<__half>(
+    flashinfer::gpu_iface::mma::mma_sync_m16n16k16_row_col_f16f16f32<__half>(
         c_reg, a_reg, b_reg);
 
     for (int i = 0; i < 4; ++i) {
