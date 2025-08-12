@@ -58,7 +58,7 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
-  void* __restrict__ ptrs[8];
+  void* ptrs[8];
 };
 
 struct __align__(16) RankSignals {
