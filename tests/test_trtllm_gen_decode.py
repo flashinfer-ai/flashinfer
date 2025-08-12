@@ -598,7 +598,7 @@ def test_trtllm_batch_decode_mla(
 
 
 if __name__ == "__main__":
-    for batch_size in [4, 128, 256]:
+    for batch_size in [256, 128, 4]:
         for page_size in [16, 32, 64]:
             for num_kv_heads in [2, 4]:
                 for head_grp_size in [1, 5, 8]:
@@ -621,6 +621,9 @@ if __name__ == "__main__":
                                 q_dtype=q_dtype,
                                 o_dtype=o_dtype,
                                 kv_cache_dtype=kv_cache_dtype,
+                            )
+                            print(
+                                f"finished fmha test for batch_size={batch_size}, page_size={page_size}, num_kv_heads={num_kv_heads}, head_grp_size={head_grp_size}, window_left={window_left}, q_dtype={q_dtype}, o_dtype={o_dtype}, kv_cache_dtype={kv_cache_dtype}"
                             )
     for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
         for dtype in [torch.float8_e4m3fn, torch.bfloat16]:

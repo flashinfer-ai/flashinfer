@@ -48,6 +48,34 @@ cudaError_t zero_gmem_semaphore_launcher(T* semaphore, int size, bool enable_pdl
   return cudaSuccess;
 }
 
+template <typename T>
+__global__ void check_zero_gmem_semaphore(T* semaphore, int size) {
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    if (semaphore[i] != 0) {
+      semaphore[i] = 0;
+    }
+  }
+}
+
+template <typename T>
+cudaError_t check_zero_gmem_semaphore_launcher(T* semaphore, int size, bool enable_pdl,
+                                               cudaStream_t stream) {
+  cudaLaunchConfig_t config = {0};
+  config.gridDim = 1;
+  config.blockDim = 128;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, check_zero_gmem_semaphore<T>, semaphore, size));
+
+  return cudaSuccess;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_SEMAPHORE_UTILS_CUH

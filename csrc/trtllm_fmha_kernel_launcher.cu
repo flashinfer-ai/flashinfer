@@ -146,13 +146,18 @@ void trtllm_paged_attention_launcher(
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = use_multi_block;
 
-    size_t num_semaphores =
-        round_up(batch_size * num_qo_heads, 8);  // align multiCtasKvScratchPtr to 16 bytes
+    size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
+    size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
+    size_t num_semaphores = round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB
+    // size_t num_semaphores =
+    //     round_up(batch_size * num_qo_heads, 8);  // align multiCtasKvScratchPtr to 16 bytes
     runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
         static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
     runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
     // zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
     //                              /*enable_pdl=*/true, stream);
+    // check_zero_gmem_semaphore_launcher(runner_params.multiCtasKvCounterPtr, num_semaphores,
+    //                                    /*enable_pdl=*/true, stream);
   }
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
