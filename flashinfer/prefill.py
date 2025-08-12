@@ -2096,12 +2096,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 lse=lse,
             )
         else:
-            if self._backend == "cudnn":
-                assert self._plan_info is not None, "plan info is not initialized"
+            # trtllm-gen does not need plan info
+            if self._backend == "trtllm-gen" and self._plan_info is None:
+                plan_info: List[int] = []
+            else:
+                plan_info = self._plan_info
+            assert plan_info is not None, "plan info is not initialized"
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                self._plan_info,
+                plan_info,
                 q,
                 k_cache,
                 v_cache,
