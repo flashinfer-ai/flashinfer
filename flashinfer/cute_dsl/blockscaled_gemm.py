@@ -2460,6 +2460,7 @@ class MaskedBatchedMatmulCuteDSL:
         use_cuda_graph: bool = False, whether to use cuda graph
         """
         self._use_cuda_graph = use_cuda_graph
+        self._compiled_masked_bmm = None
 
     # todo(Yingyi): should we use static layout and have a compile phase?
     # todo(Yingyi): use dynamic layout since no optimizations for static layout was implemented
@@ -2793,14 +2794,14 @@ class MaskedBatchedMatmulCuteDSL:
             a_ptr,
             layout=cute.make_ordered_layout(
                 a_tensor_layout,
-                order=(2, 1, 0) if self._a_major == "k" else (1, 2, 0),
+                order=(2, 1, 0) if self._a_major == "m" else (1, 2, 0),
             ),
         )
         b_tensor = cute.make_tensor(
             b_ptr,
             layout=cute.make_ordered_layout(
                 b_tensor_layout,
-                order=(2, 1, 0) if self._b_major == "k" else (1, 2, 0),
+                order=(2, 1, 0) if self._b_major == "n" else (1, 2, 0),
             ),
         )
         a_tensor = cute.recast_tensor(a_tensor, self._ab_dtype)  # todo: should recast?
@@ -2814,21 +2815,22 @@ class MaskedBatchedMatmulCuteDSL:
         )
         c_tensor = cute.recast_tensor(c_tensor, self._c_dtype)
 
-        a_tensor.mark_compact_shape_dynamic(
-            mode=1 if self._a_major == "k" else 0,
-            stride_order=(2, 0, 1) if self._a_major == "k" else (2, 1, 0),
-            divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
-        )
-        b_tensor.mark_compact_shape_dynamic(
-            mode=1 if self._b_major == "k" else 0,
-            stride_order=(2, 0, 1) if self._b_major == "k" else (2, 1, 0),
-            divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
-        )
-        c_tensor.mark_compact_shape_dynamic(
-            mode=1 if self._c_major == "n" else 0,
-            stride_order=(2, 0, 1) if self._c_major == "n" else (2, 1, 0),
-            divisibility=2 if self._c_dtype == cutlass.Float4E2M1FN else 1,
-        )
+        # no longer needed since we use cute.make_tensor() above
+        # a_tensor.mark_compact_shape_dynamic(
+        #     mode=1 if self._a_major == "k" else 0,
+        #     stride_order=(2, 0, 1) if self._a_major == "k" else (2, 1, 0),
+        #     divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
+        # )
+        # b_tensor.mark_compact_shape_dynamic(
+        #     mode=1 if self._b_major == "k" else 0,
+        #     stride_order=(2, 0, 1) if self._b_major == "k" else (2, 1, 0),
+        #     divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
+        # )
+        # c_tensor.mark_compact_shape_dynamic(
+        #     mode=1 if self._c_major == "n" else 0,
+        #     stride_order=(2, 0, 1) if self._c_major == "n" else (2, 1, 0),
+        #     divisibility=2 if self._c_dtype == cutlass.Float4E2M1FN else 1,
+        # )
 
         # todo(Yingyi): should follow cutedsl example tests/test_fp4_tensor_torch_cute.py
         sfa_tensor = from_dlpack(sfa_tensor_gpu, assumed_align=16).mark_layout_dynamic(
