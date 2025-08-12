@@ -64,9 +64,8 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
 // alignment: sfVecSize
 // returns fp8_quantized and block_scale_factors.
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input,
-                                                  bool is_sf_swizzled_layout = true,
-                                                  int64_t alignment = 32);
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool is_sf_swizzled_layout,
+                                                  int64_t alignment, bool enable_pdl);
 
 // x_fp32: [M, K], fp32_quantized (on the host)
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in

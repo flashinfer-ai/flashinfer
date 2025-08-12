@@ -32,7 +32,7 @@ namespace torch_ext {
 // alignment: sfVecSize
 // returns
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout,
-                                                  int64_t alignment, bool enable_pdl = false) {
+                                                  int64_t alignment, bool enable_pdl) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
 

@@ -76,14 +76,15 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Quantization(int m, int n, T const* input, float const* globalScale, int64_t* output,
                            int32_t* SFOuput, bool useUE8M0, FP4QuantizationSFLayout layout,
-                           int multiProcessorCount, bool enable_pdl, cudaStream_t stream = 0);
+                           int multiProcessorCount, bool enable_pdl = false,
+                           cudaStream_t stream = 0);
 
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeBatchedFP4Quantization(
     int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
     int32_t* SFOuput, bool useUE8M0, int multiProcessorCount,
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED_128x4, bool enable_pdl,
-    cudaStream_t stream = 0);
+    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED_128x4,
+    bool enable_pdl = false, cudaStream_t stream = 0);
 
 void invokeNVFP4BlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
                                      uint8_t const* SFIn, uint8_t* SFOutput,
@@ -96,7 +97,8 @@ void invokeNVFP4BlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* 
 template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
                              int32_t* SFOuput, FP4QuantizationSFLayout layout,
-                             int multiProcessorCount, bool enable_pdl, cudaStream_t stream = 0);
+                             int multiProcessorCount, bool enable_pdl = false,
+                             cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
