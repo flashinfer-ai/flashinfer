@@ -2426,7 +2426,7 @@ class MaskedBatchedMatmulCuteDSL:
     Use example:
 
     wrapper = MaskedBatchedMatmulCuteDSL(False)
-    wrapper.plan(
+    wrapper.compile(
         m=1500, # matrix A shape
         n=2048, # matrix B shape
         k=2048, # matrix A/B shape
@@ -2461,9 +2461,9 @@ class MaskedBatchedMatmulCuteDSL:
         """
         self._use_cuda_graph = use_cuda_graph
 
-    # todo(Yingyi): should we use static layout and have a plan phase?
+    # todo(Yingyi): should we use static layout and have a compile phase?
     # todo(Yingyi): use dynamic layout since no optimizations for static layout was implemented
-    def plan(
+    def compile(
         self,
         m: int,
         n: int,
@@ -2480,7 +2480,7 @@ class MaskedBatchedMatmulCuteDSL:
         cluster_shape_mn: Tuple[int, int] = (1, 1),
     ):
         """
-        Plan the masked batched matmul
+        Compile the masked batched matmul
         m: int, # matrix A shape
         n: int, # matrix B shape
         k: int, # matrix A/B shape
@@ -2697,7 +2697,7 @@ class MaskedBatchedMatmulCuteDSL:
             current_stream,
         )
 
-        # Compute the result: skip in plan()
+        # Compute the result: skip in compile()
         # compiled_masked_bmm(
         #     a_tensor,
         #     b_tensor,
@@ -2722,15 +2722,15 @@ class MaskedBatchedMatmulCuteDSL:
     ):
         """
         Run the masked batched matmul
-        a_tensor_gpu: torch.Tensor of shape (l, m, k), with planned layout (row major if a_major == "k", column major if a_major == "m")
-        b_tensor_gpu: torch.Tensor of shape (l, n, k), with planned layout (row major if b_major == "k", column major if b_major == "n")
-        sfa_tensor_gpu: torch.Tensor of shape (l, m, k/sf_vec_size), with planned layout (row major if a_major == "k", column major if a_major == "m")
-        sfb_tensor_gpu: torch.Tensor of shape (l, n, k/sf_vec_size), with planned layout (row major if b_major == "k", column major if b_major == "n")
+        a_tensor_gpu: torch.Tensor of shape (l, m, k), with compiled layout (row major if a_major == "k", column major if a_major == "m")
+        b_tensor_gpu: torch.Tensor of shape (l, n, k), with compiled layout (row major if b_major == "k", column major if b_major == "n")
+        sfa_tensor_gpu: torch.Tensor of shape (l, m, k/sf_vec_size), with compiled layout (row major if a_major == "k", column major if a_major == "m")
+        sfb_tensor_gpu: torch.Tensor of shape (l, n, k/sf_vec_size), with compiled layout (row major if b_major == "k", column major if b_major == "n")
         c_tensor_gpu: Optional[torch.Tensor],
         masked_m_tensor_gpu: torch.Tensor,
         """
         if self._compiled_masked_bmm is None:
-            raise RuntimeError("MaskedBatchedMatmulCuteDSL: Not planned")
+            raise RuntimeError("MaskedBatchedMatmulCuteDSL: Not compiled")
 
         def dtype(cutlass_dtype):
             """
