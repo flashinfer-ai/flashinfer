@@ -571,29 +571,42 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
-    wrapper.compile(
-        m=m,
-        n=n,
-        k=k,
-        l=l,
-        a_major=a_major,
-        b_major=b_major,
-        c_major=c_major,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        sf_vec_size=sf_vec_size,
-        c_dtype=c_dtype,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-    )
+    # wrapper.compile(
+    #     m=m,
+    #     n=n,
+    #     k=k,
+    #     l=l,
+    #     a_major=a_major,
+    #     b_major=b_major,
+    #     c_major=c_major,
+    #     ab_dtype=ab_dtype,
+    #     sf_dtype=sf_dtype,
+    #     sf_vec_size=sf_vec_size,
+    #     c_dtype=c_dtype,
+    #     mma_tiler_mn=mma_tiler_mn,
+    #     cluster_shape_mn=cluster_shape_mn,
+    # )
     for _ in range(iterations):
         c = wrapper.run(
-            a_tensor_gpu,
-            b_tensor_gpu,
-            sfa_tensor_gpu,
-            sfb_tensor_gpu,
-            c_tensor_gpu,
-            masked_m_tensor_gpu,
+            m=m,
+            n=n,
+            k=k,
+            l=l,
+            a_major=a_major,
+            b_major=b_major,
+            c_major=c_major,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            c_dtype=c_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            a_tensor_gpu=a_tensor_gpu,
+            b_tensor_gpu=b_tensor_gpu,
+            sfa_tensor_gpu=sfa_tensor_gpu,
+            sfb_tensor_gpu=sfb_tensor_gpu,
+            c_tensor_gpu=c_tensor_gpu,
+            masked_m_tensor_gpu=masked_m_tensor_gpu,
         )
         torch.cuda.synchronize()  # todo(Yingyi): must enabled, otherwise illegal memory access, should be removed later
     print("PASS")
