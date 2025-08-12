@@ -808,12 +808,18 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+    # fetch the "flashinferMetaInfo.h" from "include" sub-directory in cache
+    # "flashinferMetaInfo.h" contains the `tllmGenBatchedGemmList` as the list
+    # of available kernels for runtime and is linked duing compiling
     include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+    header_name = "flashinferMetaInfo"
 
+    # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
-        f"{include_path}/flashinferMetaInfo", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
+        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
     )
-    assert metainfo, "KernelMetaInfo.h not found"
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
 
     return gen_jit_spec(
         "fused_moe_sm100",
@@ -842,6 +848,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
+            # link "include" sub-directory in cache
             jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
