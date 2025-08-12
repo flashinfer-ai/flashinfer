@@ -568,24 +568,11 @@ def test_blockscaled_gemm_python_interface(
     c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", c_dtype, "cuda")
     _, _, sfa_tensor_gpu = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
     _, _, sfb_tensor_gpu = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
+    print("sfa_tensor_gpu shape: ", sfa_tensor_gpu.shape)
+    print("sfb_tensor_gpu shape: ", sfb_tensor_gpu.shape)
     masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
-    # wrapper.compile(
-    #     m=m,
-    #     n=n,
-    #     k=k,
-    #     l=l,
-    #     a_major=a_major,
-    #     b_major=b_major,
-    #     c_major=c_major,
-    #     ab_dtype=ab_dtype,
-    #     sf_dtype=sf_dtype,
-    #     sf_vec_size=sf_vec_size,
-    #     c_dtype=c_dtype,
-    #     mma_tiler_mn=mma_tiler_mn,
-    #     cluster_shape_mn=cluster_shape_mn,
-    # )
     for _ in range(iterations):
         c = wrapper.run(
             m=m,

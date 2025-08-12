@@ -2712,17 +2712,103 @@ class MaskedBatchedMatmulCuteDSL:
         print("============compiled_masked_bmm============")
 
     @cute.jit
-    def convert_to_cute_tensor(
+    def run_cute_ptr(
         self,
-        a_tensor_gpu: torch.Tensor,
-        b_tensor_gpu: torch.Tensor,
-        sfa_tensor_gpu: torch.Tensor,
-        sfb_tensor_gpu: torch.Tensor,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        sfa_ptr: cute.Pointer,
+        sfb_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        masked_mptr: cute.Pointer,
+        current_stream: cuda.CUstream,
     ):
-        """
-        Convert the torch tensor to cute tensor
-        """
-        pass
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout(
+                (self._m, self._k, self._l),
+                order=(2, 1, 0) if self._a_major == "m" else (1, 2, 0),
+            ),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                (self._n, self._k, self._l),
+                order=(2, 1, 0) if self._b_major == "n" else (1, 2, 0),
+            ),
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_ordered_layout(
+                (self._m, self._n, self._l),
+                order=(2, 1, 0) if self._c_major == "m" else (1, 2, 0),
+            ),
+        )
+
+        # calculate sf_tensor shape and order
+        def ceil_div(a, b):
+            return (a + b - 1) // b
+
+        sf_k = ceil_div(self._k, self._sf_vec_size)
+        ref_shape_a = (self._l, self._m, sf_k)
+        ref_shape_b = (self._l, self._n, sf_k)
+
+        atom_m = (32, 4)
+        atom_k = 4
+        mma_shape_a = (
+            self._l,
+            ceil_div(self._m, atom_m[0] * atom_m[1]),
+            ceil_div(sf_k, atom_k),
+            atom_m[0],
+            atom_m[1],
+            atom_k,
+        )
+        mma_shape_b = (
+            self._l,
+            ceil_div(self._n, atom_m[0] * atom_m[1]),
+            ceil_div(sf_k, atom_k),
+            atom_m[0],
+            atom_m[1],
+            atom_k,
+        )
+        # ref_permute_order = (1, 2, 0)
+        mma_permute_order = (3, 4, 1, 5, 2, 0)
+
+        sfa_tensor = cute.make_tensor(
+            sfa_ptr,
+            layout=cute.make_ordered_layout(
+                mma_shape_a,
+                order=mma_permute_order,
+            ),
+        )
+        sfb_tensor = cute.make_tensor(
+            sfb_ptr,
+            layout=cute.make_ordered_layout(
+                mma_shape_b,
+                order=mma_permute_order,
+            ),
+        )
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
+
+        masked_m_tensor = cute.make_tensor(
+            masked_mptr,
+            layout=cute.make_ordered_layout((self._l,), order=(0,)),
+        )
+
+        Sm100BlockScaledPersistentDenseGemmKernel(
+            sf_vec_size=self._sf_vec_size,
+            mma_tiler_mn=self._mma_tiler_mn,
+            cluster_shape_mn=self._cluster_shape_mn,
+        )(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            masked_m_tensor,
+            self._max_active_clusters,
+            current_stream,
+        )
 
     def run(
         self,
@@ -2793,7 +2879,7 @@ class MaskedBatchedMatmulCuteDSL:
         # Compute max active clusters on current device
         hardware_info = cutlass.utils.HardwareInfo()
         print(hardware_info)
-        max_active_clusters = hardware_info.get_max_active_clusters(
+        self._max_active_clusters = hardware_info.get_max_active_clusters(
             self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
 
@@ -2846,117 +2932,35 @@ class MaskedBatchedMatmulCuteDSL:
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
+        masked_m_ptr = make_ptr(
+            cutlass.Int32,
+            masked_m_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        sfa_ptr = make_ptr(
+            self._sf_dtype,
+            sfa_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        sfb_ptr = make_ptr(
+            self._sf_dtype,
+            sfb_tensor_gpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         # todo(Yingyi): might add cute.assume() for shape alignment?
-        a_tensor = cute.make_tensor(
-            a_ptr,
-            layout=cute.make_ordered_layout(
-                (self._m, self._k, self._l),
-                order=(2, 1, 0) if self._a_major == "m" else (1, 2, 0),
-            ),
-        )
-        b_tensor = cute.make_tensor(
-            b_ptr,
-            layout=cute.make_ordered_layout(
-                (self._n, self._k, self._l),
-                order=(2, 1, 0) if self._b_major == "n" else (1, 2, 0),
-            ),
-        )
-        a_tensor = cute.recast_tensor(a_tensor, self._ab_dtype)  # todo: should recast?
-        b_tensor = cute.recast_tensor(b_tensor, self._ab_dtype)
-        c_tensor = cute.make_tensor(
-            c_ptr,
-            layout=cute.make_ordered_layout(
-                (self._m, self._n, self._l),
-                order=(2, 1, 0) if self._c_major == "m" else (1, 2, 0),
-            ),
-        )
-        c_tensor = cute.recast_tensor(c_tensor, self._c_dtype)
-
-        # no longer needed since we use cute.make_tensor() above
-        # a_tensor.mark_compact_shape_dynamic(
-        #     mode=1 if self._a_major == "k" else 0,
-        #     stride_order=(2, 0, 1) if self._a_major == "k" else (2, 1, 0),
-        #     divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
-        # )
-        # b_tensor.mark_compact_shape_dynamic(
-        #     mode=1 if self._b_major == "k" else 0,
-        #     stride_order=(2, 0, 1) if self._b_major == "k" else (2, 1, 0),
-        #     divisibility=2 if self._ab_dtype == cutlass.Float4E2M1FN else 1,
-        # )
-        # c_tensor.mark_compact_shape_dynamic(
-        #     mode=1 if self._c_major == "n" else 0,
-        #     stride_order=(2, 0, 1) if self._c_major == "n" else (2, 1, 0),
-        #     divisibility=2 if self._c_dtype == cutlass.Float4E2M1FN else 1,
-        # )
-
-        # todo(Yingyi): should follow cutedsl example tests/test_fp4_tensor_torch_cute.py
-        sfa_tensor = from_dlpack(sfa_tensor_gpu, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        sfb_tensor = from_dlpack(sfb_tensor_gpu, assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
-
-        c_tensor = from_dlpack(c_tensor_gpu, assumed_align=16)
-        masked_m_tensor = from_dlpack(
-            masked_m_tensor_gpu, assumed_align=1
-        ).mark_layout_dynamic(leading_dim=0)
-
-        # print("a_tensor_gpu shape: ", a_tensor_gpu.shape)
-        # print("a_tensor_gpu stride: ", a_tensor_gpu.stride())
-        # print("a_tensor shape: ", a_tensor.shape)
-        # print("a_tensor stride: ", a_tensor.stride)
-
-        # print("b_tensor_gpu shape: ", b_tensor_gpu.shape)
-        # print("b_tensor_gpu stride: ", b_tensor_gpu.stride())
-        # print("b_tensor shape: ", b_tensor.shape)
-        # print("b_tensor stride: ", b_tensor.stride)
-
-        # print("c_tensor_gpu shape: ", c_tensor_gpu.shape)
-        # print("c_tensor_gpu stride: ", c_tensor_gpu.stride())
-        # print("c_tensor shape: ", c_tensor.shape)
-        # print("c_tensor stride: ", c_tensor.stride)
-
-        # print("sfa_tensor_gpu shape: ", sfa_tensor_gpu.shape)
-        # print("sfa_tensor_gpu stride: ", sfa_tensor_gpu.stride())
-        # print("sfa_tensor shape: ", sfa_tensor.shape)
-        # print("sfa_tensor stride: ", sfa_tensor.stride)
-
-        # print("sfb_tensor_gpu shape: ", sfb_tensor_gpu.shape)
-        # print("sfb_tensor_gpu stride: ", sfb_tensor_gpu.stride())
-        # print("sfb_tensor shape: ", sfb_tensor.shape)
-        # print("sfb_tensor stride: ", sfb_tensor.stride)
-
         current_stream = cutlass_torch.default_stream()
 
-        masked_bmm = Sm100BlockScaledPersistentDenseGemmKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-        compiled_masked_bmm = cute.compile(
-            masked_bmm,
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            c_tensor,
-            masked_m_tensor,
-            max_active_clusters,
+        self.run_cute_ptr(
+            a_ptr,
+            b_ptr,
+            sfa_ptr,
+            sfb_ptr,
+            c_ptr,
+            masked_m_ptr,
             current_stream,
         )
-        compiled_masked_bmm(
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            c_tensor,
-            masked_m_tensor,
-            current_stream,
-        )
-        torch.cuda.synchronize()
 
-        # return c_tensor_gpu
+        return c_tensor_gpu
