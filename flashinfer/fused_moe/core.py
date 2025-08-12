@@ -808,9 +808,9 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    # fetch the "flashinferMetaInfo.h" from "include" sub-directory in cache
-    # "flashinferMetaInfo.h" contains the `tllmGenBatchedGemmList` as the list
-    # of available kernels for runtime and is linked duing compiling
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenBatchedGemmList` as the list of available kernels
+    # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
     include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
     header_name = "flashinferMetaInfo"
 
