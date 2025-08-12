@@ -14,10 +14,10 @@ from .cascade import gen_cascade_module
 from .comm.nvshmem import gen_nvshmem_module
 from .fp4_quantization import gen_fp4_quantization_sm100_module
 from .fused_moe import gen_cutlass_fused_moe_sm100_module
-from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
+from .gemm import gen_gemm_module, gen_gemm_sm100_module, gen_gemm_sm90_module
 from .jit import (
+    build_jit_specs,
+    env as jit_env,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
@@ -25,6 +25,7 @@ from .jit import (
     gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
+    JitSpec,
 )
 from .mla import gen_mla_module
 from .norm import gen_norm_module
