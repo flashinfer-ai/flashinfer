@@ -2710,6 +2710,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._compiled_masked_bmm = compiled_masked_bmm
         print("============compiled_masked_bmm============")
 
+    @cute.jit
     def run(
         self,
         a_tensor_gpu: torch.Tensor,
