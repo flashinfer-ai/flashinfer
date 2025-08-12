@@ -96,6 +96,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   TORCH_CHECK(num_experts % 4 == 0,
               "Routing kernel expects that num_experts must be divisible by 4");
   TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+  TORCH_CHECK(local_num_experts + local_expert_offset <= num_experts,
+              "num_experts must be greater or equal to local_num_experts + local_expert_offset");
 
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs args;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
