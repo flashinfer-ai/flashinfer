@@ -349,9 +349,9 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
-    # fetch the "flashinferMetaInfo.h" from "include" sub-directory in cache
-    # "flashinferMetaInfo.h" contains the `tllmGenGemmList` as the list
-    # of available kernels for runtime and is linked duing compiling
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenGemmList` as the list of available kernels online.
+    # It is included when compiling `trtllm_gemm_runner.cu`.
     include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
     header_name = "flashinferMetaInfo"
 
