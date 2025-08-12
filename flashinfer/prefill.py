@@ -2096,7 +2096,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 lse=lse,
             )
         else:
-            assert self._plan_info is not None, "plan info is not initialized"
+            if self._backend == "cudnn":
+                assert self._plan_info is not None, "plan info is not initialized"
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
