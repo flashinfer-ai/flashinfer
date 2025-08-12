@@ -167,12 +167,17 @@ target_link_libraries(
   test_mfma_fp32_16x16x16fp16 PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
                                       gtest_main pthread)
 
+add_executable(test_rowsum ${CMAKE_CURRENT_SOURCE_DIR}/test_rowsum.cpp)
+target_link_libraries(test_rowsum PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
+                                          gtest_main pthread)
+
 add_executable(
   test_transpose_4x4_half_registers
   ${CMAKE_CURRENT_SOURCE_DIR}/test_transpose_4x4_half_registers.cpp)
 target_link_libraries(
   test_transpose_4x4_half_registers PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
                                             gtest_main pthread)
+
 if(HIP_FOUND)
   set_target_properties(test_math PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_pos_enc PROPERTIES HIP_SEPARABLE_COMPILATION ON)
@@ -186,6 +191,7 @@ if(HIP_FOUND)
                         PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_transpose_4x4_half_registers
                         PROPERTIES HIP_SEPARABLE_COMPILATION ON)
+  set_target_properties(test_rowsum PROPERTIES HIP_SEPARABLE_COMPILATION ON)
 endif()
 
 enable_testing()
@@ -198,3 +204,4 @@ add_test(NAME BatchDecodeTest COMMAND test_batch_decode)
 add_test(NAME test_mfma_fp32_16x16x16fp16 COMMAND test_mfma_fp32_16x16x16fp16)
 add_test(NAME test_transpose_4x4_half_registers
          COMMAND test_transpose_4x4_half_registers)
+add_test(NAME test_rowsum COMMAND test_rowsum)

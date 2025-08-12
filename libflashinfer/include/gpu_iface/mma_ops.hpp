@@ -76,6 +76,12 @@ amdgcn_mfma_fp32_16x16x16fp16(float *C, uint32_t *A, uint32_t *B)
 #endif
 }
 
+template <typename DType>
+__device__ __forceinline__ void m16k16_rowsum_f16f16f32(float *d, DType *s)
+{
+    detail::m16k16_rowsum_f16f16f32<DType>(d, s);
+}
+
 // /*!
 //  * \brief Use mma instructions to compute rowsum.
 //  */
