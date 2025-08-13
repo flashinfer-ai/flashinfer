@@ -2477,21 +2477,21 @@ class MaskedBatchedMatmulCuteDSL:
             a_ptr,
             layout=cute.make_ordered_layout(
                 (self._m, self._k, self._l),
-                order=(2, 1, 0) if self._a_major == "m" else (1, 2, 0),
+                order=(0, 1, 2) if self._a_major == "m" else (1, 0, 2),
             ),
         )
         b_tensor = cute.make_tensor(
             b_ptr,
             layout=cute.make_ordered_layout(
                 (self._n, self._k, self._l),
-                order=(2, 1, 0) if self._b_major == "n" else (1, 2, 0),
+                order=(0, 1, 2) if self._b_major == "n" else (1, 0, 2),
             ),
         )
         c_tensor = cute.make_tensor(
             c_ptr,
             layout=cute.make_ordered_layout(
                 (self._m, self._n, self._l),
-                order=(2, 1, 0) if self._c_major == "m" else (1, 2, 0),
+                order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
         )
 
@@ -2500,8 +2500,8 @@ class MaskedBatchedMatmulCuteDSL:
             return (a + b - 1) // b
 
         sf_k = ceil_div(self._k, self._sf_vec_size)
-        ref_shape_a = (self._l, self._m, sf_k)
-        ref_shape_b = (self._l, self._n, sf_k)
+        # ref_shape_a = (self._l, self._m, sf_k)
+        # ref_shape_b = (self._l, self._n, sf_k)
 
         atom_m = (32, 4)
         atom_k = 4
@@ -2538,6 +2538,12 @@ class MaskedBatchedMatmulCuteDSL:
                 order=mma_permute_order,
             ),
         )
+        # print all leading dims
+        # print(f"a_tensor leading dims: {a_tensor.leading_dim}")
+        # print(f"b_tensor leading dims: {b_tensor.leading_dim}")
+        # print(f"c_tensor leading dims: {c_tensor.leading_dim}")
+        # print(f"sfa_tensor leading dims: {sfa_tensor.leading_dim}")
+        # print(f"sfb_tensor leading dims: {sfb_tensor.leading_dim}")
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
 

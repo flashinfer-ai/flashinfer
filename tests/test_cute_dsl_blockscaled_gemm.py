@@ -448,7 +448,8 @@ def test_blockscaled_gemm(
 
 
 # todo(Yingyi): complete this test for target python interface
-@pytest.mark.parametrize("mnkl", [(1024, 2048, 2048, 100)])
+@pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
+@pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
 @pytest.mark.parametrize(
     "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
     [
@@ -478,7 +479,8 @@ def test_blockscaled_gemm(
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
 def test_blockscaled_gemm_python_interface(
-    mnkl: Tuple[int, int, int, int],
+    lm: Tuple[int, int],
+    kn: Tuple[int, int],
     ab_dtype: cutlass.dtype,
     sf_dtype: cutlass.dtype,
     sf_vec_size: int,
@@ -491,7 +493,8 @@ def test_blockscaled_gemm_python_interface(
     tolerance: float,
     iterations: int,
 ):
-    m, n, k, l = mnkl
+    l, m = lm
+    k, n = kn
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
         ab_dtype,
         sf_dtype,
@@ -616,10 +619,16 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--mnkl",
+        "--lm",
         type=parse_comma_separated_ints,
-        default=((512, 256, 256, 1)),
-        help="mnkl dimensions (comma-separated)",
+        default=((100, 1024)),
+        help="lm dimensions (comma-separated)",
+    )
+    parser.add_argument(
+        "--kn",
+        type=parse_comma_separated_ints,
+        default=((2048, 2048)),
+        help="kn dimensions (comma-separated)",
     )
     parser.add_argument(
         "--mma_tiler_mn",
@@ -673,26 +682,9 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    # run(
-    #     args.mnkl,
-    #     args.ab_dtype,
-    #     args.sf_dtype,
-    #     args.sf_vec_size,
-    #     args.c_dtype,
-    #     args.a_major,
-    #     args.b_major,
-    #     args.c_major,
-    #     args.mma_tiler_mn,
-    #     args.cluster_shape_mn,
-    #     args.tolerance,
-    #     args.warmup_iterations,
-    #     args.iterations,
-    #     args.skip_ref_check,
-    #     args.use_cold_l2,
-    # )
-
     test_blockscaled_gemm_python_interface(
-        args.mnkl,
+        args.lm,
+        args.kn,
         args.ab_dtype,
         args.sf_dtype,
         args.sf_vec_size,
