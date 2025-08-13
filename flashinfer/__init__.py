@@ -53,6 +53,7 @@ from .fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
+    mxfp4_dequantize_host,
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,

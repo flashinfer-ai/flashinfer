@@ -31,7 +31,7 @@ from flashinfer import (
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
-from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
+from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
@@ -418,7 +418,7 @@ class FP4Moe(Moe):
                 num_elts_per_sf=16,
             )
             gemm1_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
+                block_scale_interleave(
                     gemm1_scales_linear_fp4[i]
                     .view(torch.uint8)[
                         permute_sf_indices.to(gemm1_scales_linear_fp4.device)
@@ -445,7 +445,7 @@ class FP4Moe(Moe):
                 num_elts_per_sf=16,
             )
             gemm2_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
+                block_scale_interleave(
                     gemm2_scales_linear_fp4[i]
                     .view(torch.uint8)[
                         permute_sf_indices.to(gemm2_scales_linear_fp4.device)

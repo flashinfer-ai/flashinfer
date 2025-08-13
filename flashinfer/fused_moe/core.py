@@ -170,70 +170,31 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
-def get_device_arch():
-    major, minor = torch.cuda.get_device_capability()
-    suffix = "a" if major >= 9 else ""
-    return f"{major * 10 + minor}{suffix}"
-
-
 def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
     output_dir = (
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
     )
 
-    print(f"get_device_arch(): {get_device_arch()}")
-    if get_device_arch() == "100a":
-        nvcc_flags = sm100a_nvcc_flags
-    else:
-        nvcc_flags = sm90a_nvcc_flags
+    # Deive Arch
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
 
-    required_kernels_sm100 = [
-        # M128 kernels
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_BS_group2.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group2.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group3.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group4.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group5.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group6.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group7.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M128_group8.generated.cu",
-        # M256 kernels
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_BS_group2.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_group2.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M256_group3.generated.cu",
-        # M64 kernels
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group2.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group3.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group4.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm100_M64_group5.generated.cu",
+    nvcc_flags = [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
-    required_kernels_sm80 = [
-        # M128 kernels
-        "cutlass_kernel_file_gemm_grouped_sm80_M128_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm80_M128_group1.generated.cu",
-        # M16 kernels
-        "cutlass_kernel_file_gemm_grouped_sm80_M16_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm80_M16_group1.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm80_M16_group2.generated.cu",
-        # M32 kernels
-        "cutlass_kernel_file_gemm_grouped_sm80_M32_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm80_M32_group1.generated.cu",
-        # M64 kernels
-        "cutlass_kernel_file_gemm_grouped_sm80_M64_group0.generated.cu",
-        "cutlass_kernel_file_gemm_grouped_sm80_M64_group1.generated.cu",
-    ]
-    group_gemm_sm100_dir = output_dir / "gemm_grouped/100"
-    group_gemm_sm80_dir = output_dir / "gemm_grouped/80"
+    if device_arch == "100":
+        nvcc_flags += sm100a_nvcc_flags + [
+            "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+            "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
+        ]
+    else:
+        nvcc_flags += sm90a_nvcc_flags + [
+            "-DCOMPILE_HOPPER_TMA_GEMMS",
+            "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
+        ]
 
     try:
         # Create output directory if it doesn't exist
@@ -241,7 +202,7 @@ def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
 
         generate_gemm_operations(
             output_dir,
-            "100;100-real",
+            f"{device_arch};{device_arch}-real",
         )
 
     except Exception as e:
@@ -287,8 +248,7 @@ def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             # Add all generated kernels
-            *(group_gemm_sm100_dir / kernel for kernel in required_kernels_sm100),
-            *(group_gemm_sm80_dir / kernel for kernel in required_kernels_sm80),
+            *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
@@ -301,16 +261,7 @@ def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
         ],
-        extra_cuda_cflags=nvcc_flags
-        + [
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-            "-DENABLE_FP4",
-            "-DCOMPILE_BLACKWELL_TMA_GEMMS",
-            "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
-            "-DCOMPILE_HOPPER_TMA_GEMMS",
-            "-DUSING_OSS_CUTLASS_MOE_GEMM",
-        ],
+        extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
@@ -372,7 +323,7 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
             cluster_rank: int,
             enable_alltoall: bool,
             use_deepseek_fp8_block_scale: bool,
-            use_w4a8_group_scaling: bool,
+            use_w4_group_scaling: bool,
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
         ):
@@ -388,7 +339,7 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
             self.cluster_rank = cluster_rank
             self.enable_alltoall = enable_alltoall
             self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
-            self.use_w4a8_group_scaling = use_w4a8_group_scaling
+            self.use_w4_group_scaling = use_w4_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.min_latency_mode = min_latency_mode
             instance_key = (
@@ -396,18 +347,18 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
                 weight_dtype,
                 output_dtype,
                 use_deepseek_fp8_block_scale,
-                use_w4a8_group_scaling,
+                use_w4_group_scaling,
                 use_mxfp8_act_scaling,
             )
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
+                    torch.classes.fused_moe.FusedMoeRunner(
                         x_dtype,
                         weight_dtype,
                         output_dtype,
                         use_deepseek_fp8_block_scale,
-                        use_w4a8_group_scaling,
+                        use_w4_group_scaling,
                         use_mxfp8_act_scaling,
                     )
                 )
@@ -496,7 +447,7 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
         cluster_rank: int = 0,
         enable_alltoall: bool = False,
         use_deepseek_fp8_block_scale: bool = False,
-        use_w4a8_group_scaling: bool = False,
+        use_w4_group_scaling: bool = False,
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
@@ -518,7 +469,7 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
             cluster_rank=cluster_rank,
             enable_alltoall=enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_w4_group_scaling=use_w4_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
         )
@@ -607,7 +558,7 @@ def get_cutlass_fused_moe_module(use_fast_build: bool = False):
         cluster_rank: int = 0,
         enable_alltoall: bool = False,
         use_deepseek_fp8_block_scale: bool = False,
-        use_w4a8_group_scaling: bool = False,
+        use_w4_group_scaling: bool = False,
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
@@ -659,7 +610,7 @@ def cutlass_fused_moe(
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
@@ -746,7 +697,7 @@ def cutlass_fused_moe(
     use_deepseek_fp8_block_scale : bool = False
         Whether to use FP8 block scaling. Defaults to False.
 
-    use_w4a8_group_scaling : bool = False
+    use_w4_group_scaling : bool = False
         Whether to use W4A8 group scaling. Defaults to False.
 
     use_mxfp8_act_scaling : bool = False
@@ -782,10 +733,6 @@ def cutlass_fused_moe(
     if use_deepseek_fp8_block_scale:
         raise NotImplementedError(
             "DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell."
-        )
-    if use_w4a8_group_scaling:
-        raise NotImplementedError(
-            "W4A8 Group Scaling is not yet implemented for Blackwell."
         )
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
@@ -826,7 +773,7 @@ def cutlass_fused_moe(
         cluster_rank,
         enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_w4_group_scaling=use_w4_group_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,

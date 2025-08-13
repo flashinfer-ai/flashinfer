@@ -8,6 +8,8 @@ from flashinfer import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
+    mxfp4_quantize,
+    mxfp4_dequantize,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -273,6 +275,20 @@ def test_e2m1_dequantization(
         rtol=0.3,
         atol=0.5,  # Reasonable tolerance for FP4 quantization
         msg="Quantize -> dequantize roundtrip failed",
+    )
+
+
+def test_mxfp4_quantize_roundtrip():
+    x = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16) / 10
+
+    quant_a, sfs = mxfp4_quantize(x)
+    dq_a = mxfp4_dequantize(quant_a, sfs)
+
+    print("x: ", x)
+    print("dq_a: ", dq_a)
+
+    torch.testing.assert_close(
+        dq_a, x, rtol=0.3, atol=0.5, msg="Quantize -> dequantize mxfp4 roundtrip failed"
     )
 
 

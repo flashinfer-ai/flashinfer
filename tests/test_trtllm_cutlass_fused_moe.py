@@ -17,6 +17,7 @@ limitations under the License.
 import pytest
 import torch
 from torch.nn import functional as F
+from flashinfer.utils import get_device_arch
 
 import flashinfer.fused_moe as fused_moe
 from flashinfer import (
@@ -25,6 +26,7 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp8_dequantize_host,
     mxfp8_quantize,
+    mxfp4_dequantize_host,
 )
 
 FLOAT4_E2M1_MAX = 6.0
@@ -360,6 +362,9 @@ def test_moe_fp8(
     [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
 )
 @pytest.mark.parametrize("quantized_input", [False, True])
+@pytest.mark.skipif(
+    get_device_arch() != "100a", reason="NVFP4 is only supported on SM100a"
+)
 def test_moe_nvfp4(
     batch_size,
     hidden_size,
@@ -933,6 +938,9 @@ def dequantize_block(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.skipif(
+    get_device_arch() != "100a", reason="FP8 block scaling is only supported on SM100a"
+)
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -1083,6 +1091,9 @@ def dequant_mxfp4_batches(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+@pytest.mark.skipif(
+    get_device_arch() != "100a", reason="MXFP8xMXFP4 is only supported on SM100a"
+)
 def test_moe_mxfp8_mxfp4(
     batch_size,
     hidden_size,
@@ -1203,6 +1214,18 @@ def test_moe_mxfp8_mxfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
+def dequant_mxfp4_batches_host(
+    mat_fp4: torch.Tensor,
+    scale_tensor: torch.Tensor,
+):
+    return torch.stack(
+        [
+            mxfp4_dequantize_host(mat_fp4[b, :, :], scale_tensor[b, :, :])
+            for b in range(mat_fp4.size(0))
+        ]
+    )
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -1210,6 +1233,9 @@ def test_moe_mxfp8_mxfp4(
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
+)
+@pytest.mark.skipif(
+    get_device_arch() != "90a", reason="BF16xMXFP4 is only supported on SM90a"
 )
 def test_moe_bf16_mxfp4(
     batch_size,
@@ -1238,23 +1264,18 @@ def test_moe_bf16_mxfp4(
     k = hidden_size
 
     x = torch.randn(m, k, dtype=torch.bfloat16).cuda()
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=torch.bfloat16) / 10
-    w2 = torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 10
+    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (e, k, n // 2), device="cuda", dtype=torch.uint8)
 
-    mxfp4_w1, mxfp4_w1_scale = quant_mxfp4_batches(w1, e)
-    mxfp4_w2, mxfp4_w2_scale = quant_mxfp4_batches(w2, e)
+    w1_scale = torch.randint(
+        118, 123, (e, 2 * n, k // 32), device="cuda", dtype=torch.uint8
+    )
+    w2_scale = torch.randint(
+        118, 123, (e, k, n // 32), device="cuda", dtype=torch.uint8
+    )
 
     router_logits = torch.randn(m, e, dtype=torch.bfloat16).cuda()
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
-
-    fake_input_scale = torch.ones(e, device=x.device)
-
-    quant_scales = [
-        mxfp4_w1_scale.view(torch.int32),
-        fake_input_scale,
-        mxfp4_w2_scale.view(torch.int32),
-        fake_input_scale,
-    ]
 
     flash_output = torch.zeros_like(x)
 
@@ -1267,34 +1288,43 @@ def test_moe_bf16_mxfp4(
         limit_t = None
         beta_t = None
 
-    # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
+    pad_size = hidden_size - x.shape[1]
+    x_pad = torch.nn.functional.pad(x, (0, pad_size))
+
+    quant_scales = [
+        w1_scale.view(torch.int32),
+        w2_scale.view(torch.int32),
+    ]
+
+    # Call cutlass_fused_moe with BF16 activations and MXFP4 weights
     _ = fused_moe.cutlass_fused_moe(
-        x,
+        x_pad,
         selected_experts.to(torch.int),
         routing_weights,
-        mxfp4_w1.contiguous().view(torch.long),
-        mxfp4_w2.contiguous().view(torch.long),
+        w1.contiguous().view(torch.uint8),
+        w2.contiguous().view(torch.uint8),
         torch.bfloat16,
         swiglu_alpha=alpha_t,
         swiglu_limit=limit_t,
         swiglu_beta=beta_t,
         quant_scales=quant_scales,
+        use_w4_group_scaling=True,
         output=flash_output,
     )
 
     dq_mfxp4_w1 = (
-        dequant_mxfp4_batches(
-            mxfp4_w1.cpu().view(torch.uint8),
-            mxfp4_w1_scale.cpu().view(torch.uint8).reshape(-1),
+        dequant_mxfp4_batches_host(
+            w1.cpu(),
+            w1_scale.cpu(),
         )
         .cuda()
         .to(torch.bfloat16)
     )
 
     dq_mfxp4_w2 = (
-        dequant_mxfp4_batches(
-            mxfp4_w2.cpu().view(torch.uint8),
-            mxfp4_w2_scale.cpu().view(torch.uint8).reshape(-1),
+        dequant_mxfp4_batches_host(
+            w2.cpu(),
+            w2_scale.cpu(),
         )
         .cuda()
         .to(torch.bfloat16)

@@ -59,12 +59,12 @@ def clear_cache_dir():
         shutil.rmtree(jit_env.FLASHINFER_JIT_DIR)
 
 
-sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"]
-sm100a_nvcc_flags = [
-    "-gencode=arch=compute_100a,code=sm_100a",
+common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
 ]
+sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
+sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 
 
 @dataclasses.dataclass

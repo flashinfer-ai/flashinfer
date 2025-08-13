@@ -29,6 +29,7 @@ from .utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
+    get_device_arch,
 )
 
 
@@ -61,18 +62,21 @@ def _pad_scale_factors(
         ).contiguous()
 
 
-@functools.cache
-def get_device_arch():
-    major, minor = torch.cuda.get_device_capability()
-    suffix = "a" if major >= 9 else ""
-    return f"{major * 10 + minor}{suffix}"
-
-
 def gen_fp4_quantization_module() -> JitSpec:
+    nvcc_flags = [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+    ]
+
     if get_device_arch() == "100a":
-        nvcc_flags = sm100a_nvcc_flags
+        nvcc_flags += sm100a_nvcc_flags
+    elif get_device_arch() == "90a":
+        nvcc_flags += sm90a_nvcc_flags
     else:
-        nvcc_flags = sm90a_nvcc_flags
+        raise NotImplementedError(
+            f"Unsupported device architecture: {torch.cuda.get_device_capability()}"
+        )
 
     return gen_jit_spec(
         "fp4_quantization",
@@ -86,14 +90,11 @@ def gen_fp4_quantization_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=nvcc_flags
-        + [
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-        ],
+        extra_cuda_cflags=nvcc_flags,
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -154,6 +155,31 @@ def get_fp4_quantization_module():
         return (
             input.new_empty([m, k // 2], dtype=torch.int64),  # FLOAT4_E2M1X2
             input.new_empty([m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+        )
+
+    @register_custom_op(
+        "flashinfer::mxfp4_dequantize_host",
+        mutates_args=(""),
+    )
+    def mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        return module.mxfp4_dequantize_host(
+            weight,
+            scale,
+            group_size,
+        )
+
+    @register_fake_op("flashinfer::mxfp4_dequantize_host")
+    def _fake_mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        return weight.new_empty(
+            [weight.shape[0], weight.shape[1] * 2], dtype=torch.float32
         )
 
     @register_custom_op(
@@ -238,6 +264,7 @@ def get_fp4_quantization_module():
         fp4_quantize=fp4_quantize,
         block_scale_interleave=block_scale_interleave,
         e2m1_and_ufp8sf_scale_to_float=e2m1_and_ufp8sf_scale_to_float,
+        mxfp4_dequantize_host=mxfp4_dequantize_host,
     )
 
 
@@ -273,6 +300,13 @@ def fp4_quantize(
             - FP8 input when FP8 is not enabled
             - sf_vec_size other than 16 or 32
     """
+
+    # check to make sure device is supported
+    if get_device_arch() != "100a":
+        raise NotImplementedError(
+            f"Unsupported device architecture: {get_device_arch()}"
+        )
+
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
@@ -313,6 +347,11 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     Raises:
         AssertionError: If input dtype is not uint8.
     """
+    if get_device_arch() != "100a":
+        raise NotImplementedError(
+            f"Unsupported device architecture: {get_device_arch()}"
+        )
+
     # TODO(shuw): check input dtype is uint8
     assert unswizzled_sf.dtype == torch.uint8, (
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
@@ -347,6 +386,10 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
+    if get_device_arch() != "100a":
+        raise NotImplementedError(
+            f"Unsupported device architecture: {get_device_arch()}"
+        )
 
     return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float(
         e2m1_tensor,
@@ -419,6 +462,12 @@ def nvfp4_quantize(
             - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
+
+    if get_device_arch() != "100a":
+        raise NotImplementedError(
+            f"Unsupported device architecture: {get_device_arch()}"
+        )
+
     if do_shuffle:
         # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
         assert sfLayout == SfLayout.layout_128x4
@@ -465,4 +514,16 @@ def mxfp4_dequantize(a_fp4, a_sf):
         32,
         0,
         True,
+    )
+
+
+def mxfp4_dequantize_host(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    return get_fp4_quantization_module().mxfp4_dequantize_host(
+        weight,
+        scale,
+        group_size,
     )

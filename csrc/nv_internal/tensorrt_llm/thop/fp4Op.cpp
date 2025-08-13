@@ -349,10 +349,62 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
   return floatTensor;
 }
 
+at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t group_size) {
+  // weight (n, k / 2)
+  // scale (n, k / group_size)
+
+  CHECK_CPU_INPUT(weight, FLOAT4_E2M1X2);
+  CHECK_CPU_INPUT(scale, SF_DTYPE);
+  TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+  TORCH_CHECK(scale.is_contiguous(), "scale must be contiguous");
+  TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
+  TORCH_CHECK(weight.dtype() == at::ScalarType::Byte, "Weight must be a packed int8 tensor");
+  TORCH_CHECK(scale.dtype() == at::ScalarType::Byte, "Scale must be a int8 tensor");
+
+  TORCH_CHECK(weight.size(0) == scale.size(0),
+              "weight and scale must have the same number of rows");
+  TORCH_CHECK(weight.size(1) * 2 == scale.size(1) * group_size,
+              "weight and scale must have the same number of columns");
+
+  uint8_t* weight_packed_ptr = weight.data_ptr<uint8_t>();
+  __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(scale.data_ptr<uint8_t>());
+
+  int const n = weight.size(0);
+  int const k = weight.size(1) * 2;
+
+  at::Tensor dequant_weight =
+      at::empty({n, k}, at::dtype(at::ScalarType::Float).device(at::kCPU).requires_grad(false));
+  float* dequant_weight_ptr = dequant_weight.data_ptr<float>();
+
+  float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+                     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
+  for (int packed_idx = 0; packed_idx < weight.numel(); ++packed_idx) {
+    int8_t weight_packed_data = weight_packed_ptr[packed_idx];
+
+    uint8_t weight_low_ = weight_packed_data & 0xF;
+    uint8_t weight_high_ = (weight_packed_data & 0xF0) >> 4;
+
+    float weight_low = fp4_lut[weight_low_];
+    float weight_high = fp4_lut[weight_high_];
+
+    int scale_n_idx = packed_idx / (k / 2);
+    int scale_k_idx = ((packed_idx * 2) % k) / group_size;
+
+    float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale.size(1) + scale_k_idx]);
+
+    dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
+    dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;
+  }
+
+  return dequant_weight;
+}
+
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("block_scale_interleave", &torch_ext::BlockScaleInterleave);
   m.def("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
   m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
+  m.def("mxfp4_dequantize_host", &torch_ext::mxfp4_dequantize_host);
 }

@@ -7,7 +7,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
-from .utils import register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op, get_device_arch
 
 
 def gen_mxfp8_quantization_sm100_module() -> JitSpec:
@@ -26,10 +26,12 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -145,6 +147,11 @@ def mxfp8_quantize(
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
+    if get_device_arch() != "100a":
+        raise NotImplementedError(
+            f"Unsupported device architecture: {get_device_arch()}"
+        )
+
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0

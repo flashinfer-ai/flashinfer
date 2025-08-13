@@ -417,6 +417,13 @@ def version_at_least(version: str, base_version: str) -> bool:
     return pkg_version.parse(version) >= pkg_version.parse(base_version)
 
 
+@functools.cache
+def get_device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    suffix = "a" if major >= 9 else ""
+    return f"{major * 10 + minor}{suffix}"
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")

@@ -37,8 +37,8 @@
 #include "cutlass/util/tensor_view_io.h"
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/epilogue_helpers.h"
+#include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 #include "cutlass_extensions/gemm_configs.h"
-#include "internal_cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -183,7 +183,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   hw_info.device_id = 0;
   hw_info.sm_count = sm_count_;
 
-  assert(group_size == int(inputs.groupwise_quant_group_size));
   if (workspace_size != nullptr) {
     const Args args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -200,6 +199,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
     return;
   }
 
+  assert(group_size == int(inputs.groupwise_quant_group_size));
   arguments = Args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
