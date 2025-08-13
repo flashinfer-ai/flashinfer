@@ -189,8 +189,6 @@ bool getEnvUseTileSizeKv64ForTrtllmGen() {
   return useTileSizeKv64;
 }
 
-
-
 bool getEnvUseUCXKvCache() {
   static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
   return useUCXKVCache;

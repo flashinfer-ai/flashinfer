@@ -48,8 +48,6 @@ int getEnvMmhaBlocksPerSequence();
 
 int getEnvMmhaKernelBlockSize();
 
-
-
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();

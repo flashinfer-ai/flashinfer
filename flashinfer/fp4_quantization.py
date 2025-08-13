@@ -401,7 +401,12 @@ class SfLayout(Enum):
 
 
 def nvfp4_quantize(
-    a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False, sf_vec_size=16, enable_pdl=None
+    a,
+    a_global_sf,
+    sfLayout=SfLayout.layout_128x4,
+    do_shuffle=False,
+    sf_vec_size=16,
+    enable_pdl=None,
 ):
     """
     Quantize input tensor to NVFP4 format.
