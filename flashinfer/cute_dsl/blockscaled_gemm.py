@@ -2462,255 +2462,6 @@ class MaskedBatchedMatmulCuteDSL:
         self._use_cuda_graph = use_cuda_graph
         self._compiled_masked_bmm = None
 
-    # todo(Yingyi): should we use static layout and have a compile phase?
-    # todo(Yingyi): use dynamic layout since no optimizations for static layout was implemented
-    def compile(
-        self,
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        c_major: str,
-        ab_dtype: torch.dtype,
-        sf_dtype: torch.dtype,
-        c_dtype: torch.dtype,
-        sf_vec_size: int = 16,
-        mma_tiler_mn: Tuple[int, int] = (128, 128),
-        cluster_shape_mn: Tuple[int, int] = (1, 1),
-    ):
-        """
-        Compile the masked batched matmul
-        m: int, # matrix A shape
-        n: int, # matrix B shape
-        k: int, # matrix A/B shape
-        l: int, # batch size
-        a_major: str, # ["k", "m"]. row major or column major
-        b_major: str, # ["k", "n"]. row major or column major
-        c_major: str, # ["n", "m"]. row major or column major
-        ab_dtype: data type of A and B
-        sf_dtype: data type of scale factor
-        c_dtype: data type of C
-        sf_vec_size: vector size of scale factor
-        mma_tiler_mn: (M, N) shape of MMA instruction tiler
-        cluster_shape_mn: (ClusterM, ClusterN) shape of CTA cluster
-        """
-        if not torch.cuda.is_available():
-            raise RuntimeError("GPU is required.")
-
-        # Check if the gemm can be implemented
-        # Skip unsupported testcase
-        if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-            ab_dtype,
-            sf_dtype,
-            sf_vec_size,
-            c_dtype,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m,
-            n,
-            k,
-            l,
-            a_major,
-            b_major,
-            c_major,
-        ):
-            raise TypeError(
-                f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
-            )
-
-        # todo(Yingyi): add cuda graph support?
-
-        self._m = m
-        self._n = n
-        self._k = k
-        self._l = l
-        self._a_major = a_major
-        self._b_major = b_major
-        self._c_major = c_major
-        self._ab_dtype = ab_dtype
-        self._sf_dtype = sf_dtype
-        self._c_dtype = c_dtype
-        self._sf_vec_size = sf_vec_size
-        self._mma_tiler_mn = mma_tiler_mn
-        self._cluster_shape_mn = cluster_shape_mn
-
-        # Compute max active clusters on current device
-        hardware_info = cutlass.utils.HardwareInfo()
-        print(hardware_info)
-        max_active_clusters = hardware_info.get_max_active_clusters(
-            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
-        )
-
-        # Create tensor A/B/C
-        a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
-        b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
-        c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
-
-        a_tensor, a_torch = cutlass_torch.cute_tensor_like(
-            a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        b_tensor, b_torch = cutlass_torch.cute_tensor_like(
-            b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        c_tensor, c_torch = cutlass_torch.cute_tensor_like(
-            c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-
-        masked_m_tensor_torch = torch.full((l,), m, dtype=torch.int32, device="cuda")
-        masked_m_tensor = from_dlpack(
-            masked_m_tensor_torch, assumed_align=1
-        ).mark_layout_dynamic(leading_dim=0)
-
-        # Mark tensor to be byte aligned
-        a_tensor.mark_compact_shape_dynamic(
-            mode=1 if a_major == "k" else 0,
-            stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
-        )
-        b_tensor.mark_compact_shape_dynamic(
-            mode=1 if b_major == "k" else 0,
-            stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
-        )
-        c_tensor.mark_compact_shape_dynamic(
-            mode=1 if c_major == "n" else 0,
-            stride_order=(2, 0, 1) if c_major == "n" else (2, 1, 0),
-            divisibility=2 if c_dtype == cutlass.Float4E2M1FN else 1,
-        )
-
-        # Create scale factor tensor SFA/SFB
-        # todo(Yingyi): cleanup, SF should be passed in as a tensor
-        def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
-            def ceil_div(a, b):
-                return (a + b - 1) // b
-
-            sf_k = ceil_div(k, sf_vec_size)
-            ref_shape = (l, mn, sf_k)
-
-            atom_m = (32, 4)
-            atom_k = 4
-            mma_shape = (
-                l,
-                ceil_div(mn, atom_m[0] * atom_m[1]),
-                ceil_div(sf_k, atom_k),
-                atom_m[0],
-                atom_m[1],
-                atom_k,
-            )
-
-            ref_permute_order = (1, 2, 0)
-            mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-            # Create f32 ref torch tensor (cpu)
-            ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-                ref_shape,
-                torch.float32,
-                permute_order=ref_permute_order,
-                init_type=cutlass_torch.TensorInitType.RANDOM,
-                init_config=cutlass_torch.RandomInitConfig(
-                    min_val=1,
-                    max_val=3,
-                ),
-            )
-
-            # Create f32 cute torch tensor (cpu)
-            cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-                mma_shape,
-                torch.float32,
-                permute_order=mma_permute_order,
-                init_type=cutlass_torch.TensorInitType.RANDOM,
-                init_config=cutlass_torch.RandomInitConfig(
-                    min_val=0,
-                    max_val=1,
-                ),
-            )
-
-            # convert ref f32 tensor to cute f32 tensor
-            cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-                from_dlpack(ref_f32_torch_tensor_cpu),
-                from_dlpack(cute_f32_torch_tensor_cpu),
-            )
-            cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
-
-            # reshape makes memory contiguous
-            ref_f32_torch_tensor_cpu = (
-                ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-                .unsqueeze(-1)
-                .expand(l, mn, sf_k, sf_vec_size)
-                .reshape(l, mn, sf_k * sf_vec_size)
-                .permute(*ref_permute_order)
-            )
-            # prune to mkl for reference check.
-            ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
-
-            # Create dtype cute torch tensor (cpu)
-            cute_tensor, cute_torch_tensor = cutlass_torch.cute_tensor_like(
-                cute_f32_torch_tensor_cpu,
-                dtype,
-                is_dynamic_layout=True,
-                assumed_align=16,
-            )
-
-            # Convert f32 cute tensor to dtype cute tensor
-            cute_tensor = cutlass_torch.convert_cute_tensor(
-                cute_f32_torch_tensor,
-                cute_tensor,
-                dtype,
-                is_dynamic_layout=True,
-            )
-            return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
-
-        sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-            l, m, k, sf_vec_size, sf_dtype
-        )
-        sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-            l, n, k, sf_vec_size, sf_dtype
-        )
-        # Initialize Stream
-        current_stream = cutlass_torch.default_stream()
-
-        print("a_tensor: ", a_tensor)
-        print("b_tensor: ", b_tensor)
-        print("c_tensor: ", c_tensor)
-        print("sfa_tensor: ", sfa_tensor)
-        print("sfb_tensor: ", sfb_tensor)
-        print("masked_m_tensor: ", masked_m_tensor)
-
-        # Configure gemm kernel
-        masked_bmm = Sm100BlockScaledPersistentDenseGemmKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-
-        # Compile gemm kernel
-        compiled_masked_bmm = cute.compile(
-            masked_bmm,
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            c_tensor,
-            masked_m_tensor,
-            max_active_clusters,
-            current_stream,
-        )
-
-        # Compute the result: skip in compile()
-        # compiled_masked_bmm(
-        #     a_tensor,
-        #     b_tensor,
-        #     sfa_tensor,
-        #     sfb_tensor,
-        #     c_tensor,
-        #     masked_m_tensor,
-        #     current_stream,
-        # )
-        self._compiled_masked_bmm = compiled_masked_bmm
-        print("============compiled_masked_bmm============")
-
     @cute.jit
     def run_cute_ptr(
         self,
@@ -2834,12 +2585,25 @@ class MaskedBatchedMatmulCuteDSL:
     ):
         """
         Run the masked batched matmul
+        m: int, # matrix A shape
+        n: int, # matrix B shape
+        k: int, # matrix A/B shape
+        l: int, # batch size
+        a_major: str, # ["k", "m"]. row major or column major
+        b_major: str, # ["k", "n"]. row major or column major
+        c_major: str, # ["n", "m"]. row major or column major
+        ab_dtype: cutlass data type of A and B. [cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float8E5M2]
+        sf_dtype: data type of scale factor [cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN]
+        c_dtype: data type of C [cutlass.Float16, cutlass.BFloat16, cutlass.Float32, cutlass.Float8E4M3FN, cutlass.Float8E5M2]
         a_tensor_gpu: torch.Tensor of shape (l, m, k), with compiled layout (row major if a_major == "k", column major if a_major == "m")
         b_tensor_gpu: torch.Tensor of shape (l, n, k), with compiled layout (row major if b_major == "k", column major if b_major == "n")
         sfa_tensor_gpu: torch.Tensor of shape (l, m, k/sf_vec_size), with compiled layout (row major if a_major == "k", column major if a_major == "m")
         sfb_tensor_gpu: torch.Tensor of shape (l, n, k/sf_vec_size), with compiled layout (row major if b_major == "k", column major if b_major == "n")
-        c_tensor_gpu: Optional[torch.Tensor],
-        masked_m_tensor_gpu: torch.Tensor,
+        masked_m_tensor_gpu: torch.Tensor
+        c_tensor_gpu: Optional[torch.Tensor], result torch tensor
+        sf_vec_size: vector size of scale factor, default 16. [16, 32]
+        mma_tiler_mn: (M, N) shape of MMA instruction tiler, default (128, 128)
+        cluster_shape_mn: (ClusterM, ClusterN) shape of CTA cluster, default (1, 1)
         """
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,

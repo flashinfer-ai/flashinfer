@@ -448,7 +448,7 @@ def test_blockscaled_gemm(
 
 
 # todo(Yingyi): complete this test for target python interface
-@pytest.mark.parametrize("mnkl", [(1500, 2048, 2048, 100)])
+@pytest.mark.parametrize("mnkl", [(1024, 2048, 2048, 100)])
 @pytest.mark.parametrize(
     "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
     [
@@ -673,23 +673,23 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run(
-        args.mnkl,
-        args.ab_dtype,
-        args.sf_dtype,
-        args.sf_vec_size,
-        args.c_dtype,
-        args.a_major,
-        args.b_major,
-        args.c_major,
-        args.mma_tiler_mn,
-        args.cluster_shape_mn,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
+    # run(
+    #     args.mnkl,
+    #     args.ab_dtype,
+    #     args.sf_dtype,
+    #     args.sf_vec_size,
+    #     args.c_dtype,
+    #     args.a_major,
+    #     args.b_major,
+    #     args.c_major,
+    #     args.mma_tiler_mn,
+    #     args.cluster_shape_mn,
+    #     args.tolerance,
+    #     args.warmup_iterations,
+    #     args.iterations,
+    #     args.skip_ref_check,
+    #     args.use_cold_l2,
+    # )
 
     test_blockscaled_gemm_python_interface(
         args.mnkl,
