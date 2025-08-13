@@ -16,29 +16,32 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from ..artifacts import ArtifactPath
 from ..autotuner import (
     AutoTuner,
-    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
-from ..fp4_quantization import nvfp4_block_scale_interleave
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
-from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
+from ..utils import (
+    _check_shape_dtype_device,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+    register_custom_op,
+    register_fake_op,
+)
 from .utils import (
-    compute_swizzled_sf_shape,
-    fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
@@ -70,6 +73,56 @@ class WeightLayout(IntEnum):
     # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
     # where blockK is fixed at 128B
     BlockMajorK = 2
+
+
+def _maybe_get_cached_w3_w1_permute_indices(
+    _cache_permute_indices,
+    dst_w3_w1_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+        # Get permute indices and chain them together
+        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
+        if num_elts_per_sf is None:
+            permute1 = get_shuffle_matrix_a_row_indices(
+                dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m
+            )
+        else:
+            permute1 = get_shuffle_matrix_sf_a_row_indices(
+                dst_w3_w1_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            )
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+            dst_w3_w1_weight.device
+        )
+    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    return permute_indices
+
+
+def _maybe_get_cached_w2_permute_indices(
+    _cache_permute_indices,
+    dst_w2_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w2_weight.shape not in _cache_permute_indices:
+        if num_elts_per_sf is None:
+            permute_indices = get_shuffle_matrix_a_row_indices(
+                dst_w2_weight, epilogue_tile_m
+            ).to(dst_w2_weight.device)
+        else:
+            permute_indices = get_shuffle_matrix_sf_a_row_indices(
+                dst_w2_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            ).to(dst_w2_weight.device)
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
+    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+    return permute_indices
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -180,10 +233,10 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         )
 
     except Exception as e:
-        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe_cutlass_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
@@ -269,13 +322,15 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 @functools.cache
 def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
-    module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+    FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
         class_name="FusedMoeRunner"
     )
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
-        runner_dict = dict()
+        runner_dict: Dict[
+            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool], Any
+        ] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -330,16 +385,15 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
-                        x_dtype,
-                        weight_dtype,
-                        output_dtype,
-                        use_deepseek_fp8_block_scale,
-                        use_w4a8_group_scaling,
-                        use_mxfp8_act_scaling,
-                    )
+                MoERunner.runner_dict[instance_key] = FusedMoeRunner(
+                    x_dtype,
+                    weight_dtype,
+                    output_dtype,
+                    use_deepseek_fp8_block_scale,
+                    use_w4a8_group_scaling,
+                    use_mxfp8_act_scaling,
                 )
+
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
@@ -347,7 +401,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return range(self.fused_moe_runner.get_tactic_num())
+            return list(range(self.fused_moe_runner.get_tactic_num()))
 
         def forward(
             self,
@@ -758,10 +812,12 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     )
     import glob
 
-    debug_cubin_files = glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+    debug_cubin_files = [
+        Path(p) for p in glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
+    ]
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe_trtllm_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
@@ -825,7 +881,6 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
     ) -> torch.Tensor:
-
         # Call the C++ function
         output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
@@ -903,7 +958,6 @@ def get_trtllm_moe_sm100_module():
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
     ) -> torch.Tensor:
-
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -995,9 +1049,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
-            assert (
-                topk_ids is not None
-            ), "either topk_ids or routing_logits must be provided."
+            assert topk_ids is not None, (
+                "either topk_ids or routing_logits must be provided."
+            )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
             routing_dtype = torch.bfloat16
         else:
@@ -1009,15 +1063,15 @@ def get_trtllm_moe_sm100_module():
 
         # workspace buffers required by trtllm-gen
         if topk_ids is None:
-            topk_ids = torch.zeros(
+            topk_ids = torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
             )
         if expert_weights is None:
-            expert_weights = torch.zeros(
+            expert_weights = torch.empty(
                 num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
             )
         if output is None:
-            output = torch.zeros(
+            output = torch.empty(
                 num_tokens,
                 hidden_size,
                 dtype=torch.bfloat16,

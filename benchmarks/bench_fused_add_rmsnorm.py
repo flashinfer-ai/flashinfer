@@ -1,5 +1,4 @@
 import argparse
-from typing import cast
 
 import numpy as np
 import torch
@@ -54,8 +53,8 @@ def main():
                     f"batch_size: {batch_size:3},",
                     f"hidden_size: {hidden_size:5},",
                     f"dtype: {dtype_str:8},",
-                    f"latency: {latency_ms*1e3:2.0f}us,",
-                    f"throughput: {throughput*1e-9:7.3f}GB/s",
+                    f"latency: {latency_ms * 1e3:2.0f}us,",
+                    f"throughput: {throughput * 1e-9:7.3f}GB/s",
                 )
 
         print("---")

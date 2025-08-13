@@ -18,6 +18,8 @@
 
 #include <ATen/cuda/EmptyTensor.h>
 
+#include <cstdint>
+
 #include "cutlass/numeric_types.h"
 #include "pytorch_extension_utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -27,8 +29,10 @@ namespace torch_ext {
 // input: [M, K], fp32/fp16/bf16/fp8_quantized
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
 // linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
+// alignment: sfVecSize
 // returns
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout) {
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout,
+                                                  int64_t alignment) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
 
@@ -43,17 +47,18 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
   auto const k = inputShape[rank - 1];
   int32_t const sfVecSize = 32;
   TORCH_CHECK(k % sfVecSize == 0);
+  auto const padded_k = ((k + alignment - 1) / alignment) * alignment;
 
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-  outputShape[rank - 1] = k;
+  outputShape[rank - 1] = padded_k;
 
   at::Tensor valueFP8 =
       at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, input.device(),
                              /* stride */ std::nullopt);
 
   int64_t SFSize = isSfSwizzledLayout
-                       ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)
-                       : tensorrt_llm::computeFP4LinearLayoutSFSize(m, k / sfVecSize);
+                       ? tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, padded_k / sfVecSize)
+                       : tensorrt_llm::computeFP4LinearLayoutSFSize(m, padded_k / sfVecSize);
 
   at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, input.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
@@ -65,7 +70,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
 
 #define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                \
   tensorrt_llm::kernels::invokeMxFP8Quantization<T>(                                   \
-      1, m, k, reinterpret_cast<T*>(input.data_ptr()),                                 \
+      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                       \
       reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                 \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
       at::cuda::getCurrentCUDAStream(input.get_device()));

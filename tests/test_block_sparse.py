@@ -257,7 +257,7 @@ def test_variable_block_sparse_attention_wrapper(
             q_data_type=dtype,
         )
 
-        o = wrapper.run(q, k, v)  # [num_qo_heads, qo_len, head_dim]
+        o: torch.Tensor = wrapper.run(q, k, v)  # [num_qo_heads, qo_len, head_dim]
         o = o.reshape(num_kv_heads, -1, *o.shape[-2:])
         q = q.reshape(num_kv_heads, -1, *q.shape[-2:])
         for kv_head_idx in range(num_kv_heads):

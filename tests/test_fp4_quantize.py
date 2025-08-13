@@ -2,7 +2,7 @@ import functools
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
+from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 from flashinfer import (
     e2m1_and_ufp8sf_scale_to_float,
@@ -88,30 +88,47 @@ def unswizzle_sf(
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("sf_use_ue8m0", [False, True])
+@pytest.mark.parametrize("is_swizzled", [False, True])
 @torch.inference_mode()
 def test_fp4_quantization(
     dtype: torch.dtype,
     shape: tuple[int, int],
     seed: int,
     device: str,
+    sf_use_ue8m0: bool,
+    is_swizzled: bool,
 ) -> None:
     if not is_sm100a_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
+    sf_vec_size = 32 if sf_use_ue8m0 else 16
     x = torch.randn((m, n), dtype=dtype)
     tensor_amax = torch.abs(x).max().to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
-    out, out_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False)
-    assert n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible"
-    scale_ans = recover_swizzled_scales(
-        out_scale.reshape(-1, n // BLOCK_SIZE).view(torch.float8_e4m3fn),
-        m,
-        n,
-        BLOCK_SIZE,
+    if sf_use_ue8m0:
+        global_scale = torch.tensor(1.0, dtype=torch.float32)
+    else:
+        global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    out_ref, scale_ref = ref_fp4_quant(x, global_scale, sf_vec_size, sf_use_ue8m0)
+    out, out_scale = fp4_quantize(
+        x, global_scale, sf_vec_size, sf_use_ue8m0, is_swizzled
     )
+    assert n % sf_vec_size == 0, f"cols needs to be {sf_vec_size} divisible"
+    if sf_use_ue8m0:
+        out_scale = (out_scale.to(torch.int32) << 23).view(torch.float32)
+    else:
+        out_scale = out_scale.view(torch.float8_e4m3fn).to(torch.float32)
+    if is_swizzled:
+        scale_ans = recover_swizzled_scales(
+            out_scale.reshape(-1, n // sf_vec_size),
+            m,
+            n,
+            sf_vec_size,
+        )
+    else:
+        scale_ans = out_scale
     out_ans = cast_from_fp4(out).reshape(m, n)
     torch.testing.assert_close(out_ans, out_ref, rtol=1e0, atol=1e-1)
     torch.testing.assert_close(scale_ans, scale_ref, rtol=1e-1, atol=1e-1)
@@ -194,9 +211,9 @@ def test_nvfp4_block_scale_interleave(
     expected_shape = (padded_row, padded_col // sf_vec_size)
     expected_size = expected_shape[0] * expected_shape[1]
 
-    assert (
-        expected_size == swizzled_sf.shape[0]
-    ), f"Expected size {expected_size}, got {swizzled_sf.shape[0]}"
+    assert expected_size == swizzled_sf.shape[0], (
+        f"Expected size {expected_size}, got {swizzled_sf.shape[0]}"
+    )
     assert_equal = functools.partial(torch.testing.assert_close, rtol=0, atol=0)
     assert_equal(swizzled_sf.reshape(expected_shape), ref_swizzled_sf)
 
@@ -251,20 +268,20 @@ def test_e2m1_dequantization(
     x_float32 = x.to(torch.float32)
 
     # Step 3: Compare results
-    assert (
-        dequantized_tensor.shape == x.shape
-    ), f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
-    assert (
-        dequantized_tensor.dtype == torch.float32
-    ), f"Expected float32, got {dequantized_tensor.dtype}"
+    assert dequantized_tensor.shape == x.shape, (
+        f"Shape mismatch: expected {x.shape}, got {dequantized_tensor.shape}"
+    )
+    assert dequantized_tensor.dtype == torch.float32, (
+        f"Expected float32, got {dequantized_tensor.dtype}"
+    )
 
     # Check for invalid values
-    assert not torch.isnan(
-        dequantized_tensor
-    ).any(), "Dequantized tensor contains NaN values"
-    assert not torch.isinf(
-        dequantized_tensor
-    ).any(), "Dequantized tensor contains Inf values"
+    assert not torch.isnan(dequantized_tensor).any(), (
+        "Dequantized tensor contains NaN values"
+    )
+    assert not torch.isinf(dequantized_tensor).any(), (
+        "Dequantized tensor contains Inf values"
+    )
 
     # Compare with original - should be reasonably close since FP4 is designed to preserve important values
     torch.testing.assert_close(

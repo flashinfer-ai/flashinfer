@@ -58,10 +58,10 @@ def generate_ninja_build_for_op(
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
-        for dir in extra_include_dirs:
-            common_cflags.append(f"-I{dir.resolve()}")
-    for dir in system_includes:
-        common_cflags.append(f"-isystem {dir}")
+        for extra_dir in extra_include_dirs:
+            common_cflags.append(f"-I{extra_dir.resolve()}")
+    for sys_dir in system_includes:
+        common_cflags.append(f"-isystem {sys_dir}")
 
     cflags = [
         "$common_cflags",

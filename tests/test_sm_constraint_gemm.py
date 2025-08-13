@@ -88,7 +88,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     torch_vs_triton_persistent = torch.allclose(
         c_torch.to(out_dtype), c_persistent.to(out_dtype), atol=torch_atol
     )
-    if torch_vs_triton_persistent == False:
+    if not torch_vs_triton_persistent:
         print_all_on_failure(
             a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor, out_dtype
         )
@@ -100,7 +100,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
         torch_vs_triton_descriptor = torch.allclose(
             c_torch.to(out_dtype), c_descriptor.to(out_dtype), atol=torch_atol
         )
-        if torch_vs_triton_descriptor == False:
+        if not torch_vs_triton_descriptor:
             print_all_on_failure(
                 a,
                 b,
@@ -119,7 +119,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     naive_vs_persistent = torch.allclose(
         c_naive.to(out_dtype), c_persistent.to(out_dtype), atol=triton_atol
     )
-    if naive_vs_persistent == False:
+    if not naive_vs_persistent:
         print_all_on_failure(
             a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor, out_dtype
         )
@@ -133,7 +133,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
         naive_vs_descriptor = torch.allclose(
             c_naive.to(out_dtype), c_descriptor.to(out_dtype), atol=descriptor_atol
         )
-        if naive_vs_descriptor == False:
+        if not naive_vs_descriptor:
             print_all_on_failure(
                 a,
                 b,

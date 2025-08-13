@@ -134,4 +134,8 @@ ignore = [
     "B020",
     # Return te negated condition directly
     "SIM103",
+    # Function definition does not bind loop variable
+    "B023",
 ]
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

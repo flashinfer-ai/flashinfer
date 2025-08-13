@@ -1,10 +1,9 @@
 import math
 
-import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
+from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 import flashinfer
 from flashinfer.utils import FP4Tensor
@@ -73,7 +72,7 @@ def reference_paged_attention(
 
         # Gather K and V from kv_cache
         current_pos = 0
-        for block_idx, block_id in enumerate(blocks):
+        for block_id in blocks:
             # Calculate how many tokens we can take from this block
             remaining_tokens = seq_len - current_pos
             tokens_to_take = min(page_size, remaining_tokens)
@@ -134,7 +133,6 @@ def test_trtllm_batch_decode_fmha(
     o_dtype,
     kv_cache_dtype,
 ):
-
     # Set up test parameters
     seed = 0
     torch.manual_seed(seed)
@@ -330,7 +328,7 @@ def test_trtllm_batch_decode_fmha(
 
     if o_dtype == "nvfp4":
         output = cast_from_fp4(output)
-        output_ref, out_scale_factor_ref = ref_nvfp4_quant(output_ref, o_sf_scale, 16)
+        output_ref, out_scale_factor_ref = ref_fp4_quant(output_ref, o_sf_scale, 16)
         out_scale_factor = recover_swizzled_scales(
             out_scale_factor,
             output.shape[0],
@@ -379,9 +377,13 @@ def test_trtllm_batch_decode_fmha(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
         )
-        # v_scale, o_scale is not supported in wrapper api yet.
+        # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output2 == output).all()
+        else:
+            torch.testing.assert_close(
+                output.float(), output2.float(), rtol=1e-1, atol=1e-1
+            )
 
 
 @pytest.mark.parametrize(
@@ -412,7 +414,6 @@ def test_trtllm_batch_decode_mla(
 
     # Deepseek attention config (decode-MLA)
     num_q_heads = 128
-    num_kv_heads = 1
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
     kv_lora_rank = 512
