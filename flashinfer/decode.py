@@ -593,7 +593,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> max_num_pages = 128
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
-    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -658,7 +658,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        float_workspace_buffer : torch.Tensor
+        float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
@@ -2000,7 +2000,7 @@ def trtllm_batch_decode_with_kv_cache(
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
 
-    workspace_buffer : torch.Tensor
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
     block_tables : torch.Tensor
@@ -2198,7 +2198,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
     qk_rope_head_dim: qk_rope_head_dim, must be 64

@@ -8,6 +8,8 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 import flashinfer
 from flashinfer.utils import FP4Tensor
 
+global_workspace_buffer = None
+
 
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
@@ -235,7 +237,12 @@ def test_trtllm_batch_decode_fmha(
 
     sm_scale = float(1.0 / (head_dim**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+        )
+    workspace_buffer = global_workspace_buffer
 
     # Compute kv_indptr as cumulative sum of blocks per sequence
     kv_indptr = torch.cat(
@@ -469,7 +476,12 @@ def test_trtllm_batch_decode_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+        )
+    workspace_buffer = global_workspace_buffer
 
     bmm1_log2_scale_tensor = (
         torch.tensor(

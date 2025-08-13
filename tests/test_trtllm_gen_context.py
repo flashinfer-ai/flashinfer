@@ -7,6 +7,8 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 import flashinfer
 from flashinfer.utils import FP4Tensor
 
+global_workspace_buffer = None
+
 
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
@@ -97,7 +99,12 @@ def test_trtllm_batch_context_wrapper(
     kv_last_page_len_cpu = torch.full(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            256 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+        )
+    workspace_buffer = global_workspace_buffer
 
     # reference
     q_indptr_gpu = q_indptr_cpu.to(device)
@@ -337,7 +344,13 @@ def test_trtllm_batch_prefill(
     o_sf_vec_size = 16 if o_dtype == "nvfp4" else None
     sm_scale = float(1.0 / (head_dim**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+        )
+    workspace_buffer = global_workspace_buffer
+
     q_indptr = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
