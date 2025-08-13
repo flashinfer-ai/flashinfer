@@ -114,7 +114,7 @@ def load_cubin(cubin_path, sha256) -> bytes:
 
     Return None on failure.
     """
-    logger.info(f"Loading from {cubin_path}")
+    logger.debug(f"Loading from {cubin_path}")
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
@@ -128,9 +128,8 @@ def load_cubin(cubin_path, sha256) -> bytes:
             logger.warning(
                 f"sha256 mismatch (expected {sha256} actual {actual_sha}) for {cubin_path}"
             )
-    except Exception as e:
-        print(f"Failed to load cubin at {cubin_path} with sha256={sha256}: {e}")
-    logger.info(f"Failed loading {cubin_path}")
+    except Exception:
+        pass
     return b""
 
 
