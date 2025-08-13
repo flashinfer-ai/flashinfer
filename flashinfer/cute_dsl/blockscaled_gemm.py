@@ -26,7 +26,6 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -42,12 +41,10 @@ from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import (
-    Boolean,
     Int32,
     Integer,
     dsl_user_op,
     extract_mlir_values,
-    min,
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
@@ -885,7 +882,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
-            smem=self.shared_storage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
         )
         return
@@ -1192,7 +1189,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1232,7 +1228,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
+                for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):  # noqa: B007
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1401,7 +1397,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_block in range(k_block_cnt):
+                for k_block in range(k_block_cnt):  # noqa: B007
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(
@@ -1568,7 +1564,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -2144,9 +2139,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         is_valid = True
         # Skip invalid mma tile shape
-        if not mma_tiler_mn[0] in [128, 256]:
+        if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [128, 256]:
+        if mma_tiler_mn[1] not in [128, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
