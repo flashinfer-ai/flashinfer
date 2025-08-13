@@ -860,7 +860,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache
-            jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],

@@ -375,7 +375,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path],
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_ldflags=["-lcuda"],
     )
 
