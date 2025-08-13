@@ -16,13 +16,12 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from ..artifacts import ArtifactPath
+from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
     AutoTuner,
     DynamicTensorSpec,
@@ -33,6 +32,7 @@ from ..autotuner import (
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import (
     _check_shape_dtype_device,
@@ -819,15 +819,18 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    debug_cubin_path = (
-        jit_env.FLASHINFER_INCLUDE_DIR
-        / "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/cubins"
-    )
-    import glob
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenBatchedGemmList` as the list of available kernels
+    # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
+    include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+    header_name = "flashinferMetaInfo"
 
-    debug_cubin_files = [
-        Path(p) for p in glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
-    ]
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
+    )
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
 
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
@@ -844,8 +847,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ]
-        + debug_cubin_files,
+        ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
@@ -857,6 +859,8 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
+            # link "include" sub-directory in cache
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
