@@ -280,6 +280,8 @@ def fp4_quantize(
         input = input.transpose(-2, -1)
 
     assert input.shape[-1] % sf_vec_size == 0
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
         global_scale,

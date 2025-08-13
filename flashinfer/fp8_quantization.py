@@ -156,6 +156,8 @@ def mxfp8_quantize(
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
         input,
         is_sf_swizzled_layout,

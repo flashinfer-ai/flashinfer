@@ -36,6 +36,7 @@ from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import (
     _check_shape_dtype_device,
+    device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
@@ -484,8 +485,10 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
-        enable_pdl: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
 
@@ -641,7 +644,7 @@ def cutlass_fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -770,6 +773,8 @@ def cutlass_fused_moe(
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
     if use_mxfp8_act_scaling:
         raise NotImplementedError("mxfp8 not yet implemented for Blackwell.")
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
 
     num_rows = input.shape[0]
     if min_latency_mode:
