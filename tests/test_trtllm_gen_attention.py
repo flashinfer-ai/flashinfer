@@ -2,7 +2,7 @@ import math
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
+from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 import flashinfer
 from flashinfer.utils import FP4Tensor
@@ -198,7 +198,7 @@ def unpack_compare_nvfp4(
     sf_atol=2e-1,
     rmse_tol=0.3,
 ):
-    output_ref, out_scale_factor_ref = ref_nvfp4_quant(
+    output_ref, out_scale_factor_ref = ref_fp4_quant(
         output_ref, o_sf_scale, o_sf_vec_size
     )
 

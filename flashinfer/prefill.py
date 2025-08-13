@@ -2101,7 +2101,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
-                plan_info,
+                self._plan_info,
                 q,
                 k_cache,
                 v_cache,
