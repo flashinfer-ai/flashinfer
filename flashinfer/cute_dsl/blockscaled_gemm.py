@@ -2702,3 +2702,91 @@ class MaskedBatchedMatmulCuteDSL:
         )
 
         return c_tensor_gpu
+
+
+def _dtype_to_cutlass_dtype(dtype: str) -> cutlass.dtype:
+    dtype_map = {
+        'float16': cutlass.Float16,
+        'bfloat16': cutlass.BFloat16,
+        'float32': cutlass.Float32,
+        'float8_e5m2': cutlass.Float8E5M2,
+        'float8_e4m3fn': cutlass.Float8E4M3FN,
+        'float8_e8m0fnu': cutlass.Float8E8M0FNU,
+        'float4_e2m1fn': cutlass.Float4E2M1FN,
+    }
+    return dtype_map[dtype]
+
+
+def grouped_gemm_nt_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    *,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    sf_vec_size: int,
+    **kwargs,
+):
+    """
+    Executes a masked, batched matrix multiplication (GEMM) with scale factors.
+
+    Args:
+        lhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the left-hand side input tensor (A) and its scale factor tensor (SFA).
+            - A should be in (m, k, l) order, but physically (l, m, k)
+            - SFA should be in (m32, m4, rm, k4, rk, l) order, but physically (l, rm, rk, m32, m4, k4)
+        rhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the right-hand side input tensor (B) and its scale factor tensor (SFB).
+            - B should be in (n, k, l) order, but physically (l, n, k)
+            - SFB should be in (n32, n4, rn, k4, rk, l) order, but physically (l, rn, rk, n32, n4, k4)
+        out (torch.Tensor): Output tensor to store the result, with shape (l, m, n).
+        masked_m (torch.Tensor): 1D tensor of shape (l,) specifying the valid row count for each batch (used for masking).
+        ab_dtype (str): Data type for A and B matrices. Supported: "float4_e2m1fn", "float8_e4m3fn", "float8_e5m2".
+        sf_dtype (str): Data type for scale factors. Supported: "float8_e8m0fnu", "float8_e4m3fn".
+        c_dtype (str): Data type for output matrix C. Supported: "float16", "bfloat16", "float32", "float8_e4m3fn", "float8_e5m2".
+        sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
+        mma_tiler_mn (Tuple[int, int], optional): Shape of the MMA tiler (M, N). Default: (128, 128).
+        cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
+
+    Notes:
+        - Legends of the input tensors:
+            * `l` is the batch size, `m/n` is the number of rows, and `k` is the number of columns.
+            * `m/n32`, `m/n4`, `k4` are constant values 32, 4, 4 respectively.
+            * `m32 * m4 * rm` should be same as `m`, `n32 * n4 * rn` should be same as `n`.
+            * `k4 * rk` should be same as `k * sf_vec_size`. `rk` is the number of rows of the scale factor tensor.
+        - The function applies masking per batch using masked_m.
+        - The result is written to c_tensor.
+    """
+    a_torch, sfa_torch = lhs
+    b_torch, sfb_torch = rhs
+    c_torch = out
+
+    m, k, l = a_torch.shape
+    n, _, _ = b_torch.shape
+
+    mma_tiler_mn = kwargs.get('mma_tiler_mm', (128, 128))
+    cluster_shape_mn = kwargs.get('cluster_shape_mm', (1, 1))
+
+    # TODO(kaixih@nvidia): do we need `use_cuda_graph`?
+    wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
+    wrapper.run(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major='k',
+        b_major='k',
+        c_major='n',
+        ab_dtype=_dtype_to_cutlass_dtype(ab_dtype),
+        sf_dtype=_dtype_to_cutlass_dtype(sf_dtype),
+        sf_vec_size=sf_vec_size,
+        c_dtype=_dtype_to_cutlass_dtype(c_dtype),
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        a_tensor_gpu=a_torch,
+        b_tensor_gpu=b_torch,
+        sfa_tensor_gpu=sfa_torch,
+        sfb_tensor_gpu=sfb_torch,
+        c_tensor_gpu=c_torch,
+        masked_m_tensor_gpu=masked_m,
+    )
