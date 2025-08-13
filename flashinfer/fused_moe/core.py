@@ -593,6 +593,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -947,6 +948,7 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1031,6 +1033,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1174,6 +1177,8 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
+        enable_pdl: Optional[bool],
+        output: Optional[torch.Tensor],
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1360,6 +1365,7 @@ def trtllm_fp4_block_scale_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
@@ -1440,6 +1446,7 @@ def trtllm_fp4_block_scale_moe(
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
+        enable_pdl,
         output,
     )
 
