@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_nvfp4_quant
+from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 import flashinfer
 from flashinfer.utils import FP4Tensor
@@ -335,7 +335,7 @@ def test_trtllm_batch_decode_fmha(
 
     if o_dtype == "nvfp4":
         output = cast_from_fp4(output)
-        output_ref, out_scale_factor_ref = ref_nvfp4_quant(output_ref, o_sf_scale, 16)
+        output_ref, out_scale_factor_ref = ref_fp4_quant(output_ref, o_sf_scale, 16)
         out_scale_factor = recover_swizzled_scales(
             out_scale_factor,
             output.shape[0],

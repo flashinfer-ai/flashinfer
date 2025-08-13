@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import math
 import os
+import importlib.util
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -663,3 +664,10 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+def is_cute_dsl_available() -> bool:
+    return (
+        importlib.util.find_spec("cutlass") is not None
+        and importlib.util.find_spec("cutlass.cute") is not None
+    )
