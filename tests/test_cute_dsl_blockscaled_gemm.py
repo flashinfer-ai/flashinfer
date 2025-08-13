@@ -20,20 +20,11 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
 )
 from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
 
-
-def quant_fp4(a):
-    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
-    sf_vec_size = 16
-
-    a_fp4, a_sf = fp4_quantize(
-        a.cuda(),
-        a_global_sf.cuda(),
-        sf_vec_size,
-        sf_use_ue8m0=False,
-        is_sf_swizzled_layout=True,
-    )
-    return a_fp4, a_sf, a_global_sf
-
+"""
+This is the test file for MaskedBatchedMatmulCuteDSL kernel.
+`test_blockscaled_gemm` is from cutlass example with CuteDSL interface. Please skip it.
+`test_blockscaled_gemm_python_interface` is the python interface test. For pytorch DLFW, refer to this.
+"""
 
 def run(
     mnkl: Tuple[int, int, int, int],
@@ -514,8 +505,7 @@ def test_blockscaled_gemm_python_interface(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
 
-    # Create tensors on GPU first to initialize CUDA context before compile
-    # 1. Create torch tensors using size fp32 and cast to torch_dtype
+    # not used for now
     def create_torch_tensor(l, mode0, mode1, is_mode0_major, cutlass_dtype, device):
         """
         Create a torch tensor with specified shape and dtype for testing. Optionally permute it.
@@ -564,16 +554,33 @@ def test_blockscaled_gemm_python_interface(
 
         return dtype_torch_tensor
 
-    # create helper tensors for testing
-    # todo(Yingyi): use int8 and 1/2 shape for fp4？
-    a_tensor_gpu = create_torch_tensor(l, m, k, a_major == "m", ab_dtype, "cuda")
-    b_tensor_gpu = create_torch_tensor(l, n, k, b_major == "n", ab_dtype, "cuda")
-    c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", c_dtype, "cuda")
-    _, _, sfa_tensor_gpu = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
-    _, _, sfb_tensor_gpu = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
-    print("sfa_tensor_gpu shape: ", sfa_tensor_gpu.shape)
-    print("sfb_tensor_gpu shape: ", sfb_tensor_gpu.shape)
-    masked_m_tensor_gpu = torch.full((l,), m, dtype=torch.int32, device="cuda")
+    # a_tensor_gpu = create_torch_tensor(l, m, k, a_major == "m", ab_dtype, "cuda")
+    # b_tensor_gpu = create_torch_tensor(l, n, k, b_major == "n", ab_dtype, "cuda")
+    # c_tensor_gpu = create_torch_tensor(l, m, n, c_major == "m", c_dtype, "cuda")
+
+    a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
+    b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
+    c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
+    a_tensor, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+    )
+    b_tensor, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+    )
+    c_tensor, c_torch = cutlass_torch.cute_tensor_like(
+        c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
+    )
+
+    sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, sf_dtype
+    )
+    sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, sf_dtype
+    )
+    print("sfa_torch shape: ", sfa_torch.shape)
+    print("sfb_torch shape: ", sfb_torch.shape)
+    # todo(Yingyi): add masked_m_tensor (not full)
+    masked_m_tensor = torch.full((l,), m, dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     for _ in range(iterations):
@@ -591,17 +598,51 @@ def test_blockscaled_gemm_python_interface(
             c_dtype=c_dtype,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            a_tensor_gpu=a_tensor_gpu,
-            b_tensor_gpu=b_tensor_gpu,
-            sfa_tensor_gpu=sfa_tensor_gpu,
-            sfb_tensor_gpu=sfb_tensor_gpu,
-            c_tensor_gpu=c_tensor_gpu,
-            masked_m_tensor_gpu=masked_m_tensor_gpu,
+            a_tensor_gpu=a_torch,
+            b_tensor_gpu=b_torch,
+            sfa_tensor_gpu=sfa_torch,
+            sfb_tensor_gpu=sfb_torch,
+            c_tensor_gpu=c_torch,
+            masked_m_tensor_gpu=masked_m_tensor,
         )
-        torch.cuda.synchronize()  # todo(Yingyi): must enabled, otherwise illegal memory access, should be removed later
-    print("PASS")
+        torch.cuda.synchronize()
 
-    # todo(Yingyi): add reference check
+    # compute ref output
+    res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
+    res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
+    ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
+
+    # Convert c back to f32 for comparison.
+    c_ref_device = c_ref.cuda()
+    cute.testing.convert(
+        c_tensor,
+        from_dlpack(c_ref_device, assumed_align=16).mark_layout_dynamic(
+            leading_dim=(1 if c_major == "n" else 0)
+        ),
+    )
+    c_ref = c_ref_device.cpu()
+
+    if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
+        torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
+    elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
+        # Convert ref : f32 -> f8 -> f32
+        ref_f8_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(
+            1, 2, 0
+        )
+        ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(
+            leading_dim=1
+        )
+        ref_f8.element_type = c_dtype
+        ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
+        ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
+            leading_dim=1
+        )
+        cute.testing.convert(ref_tensor, ref_f8)
+        cute.testing.convert(ref_f8, ref_tensor)
+        ref = ref_device.cpu()
+        torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
+
+    print("PASS")
 
 
 if __name__ == "__main__":
@@ -673,8 +714,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
+    if len(args.lm) != 2:
+        parser.error("--lm must contain exactly 2 values")
+    if len(args.kn) != 2:
+        parser.error("--kn must contain exactly 2 values")
 
     if len(args.mma_tiler_mn) != 2:
         parser.error("--mma_tiler_mn must contain exactly 2 values")
