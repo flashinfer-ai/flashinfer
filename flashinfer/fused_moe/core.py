@@ -1082,6 +1082,8 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset: int,
             routed_scaling_factor: Optional[float],
             routing_method_type: int,
+            enable_pdl: bool,
+            do_finalize: bool,
             tactic: int = -1,
             do_preparation: bool = False,
         ):
@@ -1154,7 +1156,8 @@ def get_trtllm_moe_sm100_module():
                 routed_scaling_factor,
                 tile_tokens_dim,
                 routing_method_type,
-                True,  # do_finalize
+                enable_pdl,
+                do_finalize,
                 output,
                 tactic,
             )
@@ -1476,6 +1479,8 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset=local_expert_offset,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
+            enable_pdl=enable_pdl,
+            do_finalize=do_finalize,
         )
 
         # Call the C++ function for block scale MoE
@@ -1547,8 +1552,9 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
-        enable_pdl: Optional[bool] = None,
-        output: Optional[torch.Tensor] = None,
+        enable_pdl: bool,
+        tune_max_num_tokens: int,
+        output: Optional[torch.Tensor],
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1789,6 +1795,7 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    print(f"in trtllm_fp4_block_scale_moe, tune_max_num_tokens={tune_max_num_tokens}")
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
