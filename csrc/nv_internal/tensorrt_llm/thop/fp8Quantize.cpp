@@ -32,7 +32,7 @@ namespace torch_ext {
 // alignment: sfVecSize
 // returns
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout,
-                                                  int64_t alignment) {
+                                                  int64_t alignment, bool enable_pdl) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
 
@@ -68,11 +68,11 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
   auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4
                                          : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                \
-  tensorrt_llm::kernels::invokeMxFP8Quantization<T>(                                   \
-      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                       \
-      reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                 \
-      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
+#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                            \
+  tensorrt_llm::kernels::invokeMxFP8Quantization<T>(                                               \
+      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                                   \
+      reinterpret_cast<int64_t*>(valueFP8.data_ptr()),                                             \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, enable_pdl, \
       at::cuda::getCurrentCUDAStream(input.get_device()));
 
   if (input.scalar_type() == at::ScalarType::Half) {
