@@ -1,3 +1,4 @@
+import pytest
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -48,5 +49,5 @@ def test_fp4_tensor_torch_cute():
     )
     copy_torch_fp4_tensor(a_ptr, b_ptr)
     torch.testing.assert_close(a, b)
-    print(f"\n[INFO] Results verified successfully!")
+    print("Results verified successfully!")
     print(f"Result: \n{b_view}")
