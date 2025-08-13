@@ -26,6 +26,7 @@ This is the test file for MaskedBatchedMatmulCuteDSL kernel.
 `test_blockscaled_gemm_python_interface` is the python interface test. For pytorch DLFW, refer to this.
 """
 
+
 def run(
     mnkl: Tuple[int, int, int, int],
     ab_dtype: Type[cutlass.Numeric],
@@ -577,10 +578,7 @@ def test_blockscaled_gemm_python_interface(
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
         l, n, k, sf_vec_size, sf_dtype
     )
-    print("sfa_torch shape: ", sfa_torch.shape)
-    print("sfb_torch shape: ", sfb_torch.shape)
-    # todo(Yingyi): add masked_m_tensor (not full)
-    masked_m_tensor = torch.full((l,), m, dtype=torch.int32, device="cuda")
+    masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     for _ in range(iterations):
@@ -623,7 +621,13 @@ def test_blockscaled_gemm_python_interface(
     c_ref = c_ref_device.cpu()
 
     if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
-        torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
+        for i in range(l):
+            torch.testing.assert_close(
+                c_ref[: masked_m_tensor[i].item(), :, i],
+                ref[: masked_m_tensor[i].item(), :, i],
+                atol=tolerance,
+                rtol=1e-02,
+            )
     elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
         # Convert ref : f32 -> f8 -> f32
         ref_f8_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(
@@ -640,7 +644,13 @@ def test_blockscaled_gemm_python_interface(
         cute.testing.convert(ref_tensor, ref_f8)
         cute.testing.convert(ref_f8, ref_tensor)
         ref = ref_device.cpu()
-        torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
+        for i in range(l):
+            torch.testing.assert_close(
+                c_ref[: masked_m_tensor[i].item(), :, i],
+                ref[: masked_m_tensor[i].item(), :, i],
+                atol=tolerance,
+                rtol=1e-02,
+            )
 
     print("PASS")
 

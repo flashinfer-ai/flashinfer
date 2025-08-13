@@ -68,9 +68,6 @@ class MaskedSchedulerParams:
             raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
 
         gc = cute.zipped_divide(c, tiler=c_tiler)
-        # print("--------------------------------")
-        # print(c.shape)
-        # print("--------------------------------")
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.masked_m = masked_m
         self.c = c
@@ -80,11 +77,6 @@ class MaskedSchedulerParams:
         self._cluster_shape_mnk = cluster_shape_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
         self._loc = loc
-
-        # print("==================================")
-        # print(self.problem_shape_ntile_mnl)
-        # print(self.cluster_shape_mn)
-        # print("==================================")
 
         self.problem_layout_ncluster_mnl = cute.make_layout(
             cute.ceil_div(
@@ -295,9 +287,6 @@ class MaskedScheduler:
                 (*self.params.cluster_shape_mn, Int32(1)),
             )
         )
-        # todo(Yingyi): cleanups
-        # print(self.params.problem_layout_ncluster_mnl)
-        # print(cur_cluster_coord)
 
         return WorkTileInfo(cur_tile_coord, is_valid)
 
@@ -817,8 +806,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             max_active_clusters,
         )
 
-        # print(grid)  # todo(Yingyi): cleanup
-
         self.buffer_align_bytes = 1024
 
         # Define shared storage for kernel
@@ -1213,13 +1200,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
-                # if tidx % 32 == 0:
-                #     cute.printf(
-                #         "%d %d %d",
-                #         mma_tile_coord_mnl[0],
-                #         mma_tile_coord_mnl[1],
-                #         mma_tile_coord_mnl[2],
-                #     )
 
                 #
                 # Slice to per mma tile index
@@ -2538,12 +2518,6 @@ class MaskedBatchedMatmulCuteDSL:
                 order=mma_permute_order,
             ),
         )
-        # print all leading dims
-        # print(f"a_tensor leading dims: {a_tensor.leading_dim}")
-        # print(f"b_tensor leading dims: {b_tensor.leading_dim}")
-        # print(f"c_tensor leading dims: {c_tensor.leading_dim}")
-        # print(f"sfa_tensor leading dims: {sfa_tensor.leading_dim}")
-        # print(f"sfb_tensor leading dims: {sfb_tensor.leading_dim}")
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfa_tensor)
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
 
@@ -2648,7 +2622,6 @@ class MaskedBatchedMatmulCuteDSL:
 
         # Compute max active clusters on current device
         hardware_info = cutlass.utils.HardwareInfo()
-        print(hardware_info)
         self._max_active_clusters = hardware_info.get_max_active_clusters(
             self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
