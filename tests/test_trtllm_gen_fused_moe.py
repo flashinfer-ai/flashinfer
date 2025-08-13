@@ -357,19 +357,11 @@ class FP4Moe(Moe):
                 hidden_states, is_swizzling
             )
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
-                -1
-            )
-            print(
-                f"hidden_states.shape: {hidden_states_quant.shape}, dtype: {hidden_states_quant.dtype}"
-            )
-            print(
-                f"hidden_states_scale.shape: {hidden_states_scale.shape}, dtype: {hidden_states_scale.dtype}"
+                *hidden_states.shape[:-1], -1
             )
             return {
                 "hidden_states": hidden_states_quant,
-                "hidden_states_scale": hidden_states_scale.view(
-                    torch.float8_e4m3fn
-                ).reshape(-1),
+                "hidden_states_scale": hidden_states_scale,
             }
         elif self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
             """Quantize hidden states to NvFP4 format using pre-computed global scale."""
@@ -380,12 +372,13 @@ class FP4Moe(Moe):
             ) = quant_fp4(
                 hidden_states, hidden_states_scale_global, False, is_swizzling
             )
+            hidden_states_scale_fp4_bytes = hidden_states_scale_fp4_bytes.view(
+                torch.float8_e4m3fn
+            ).reshape(*hidden_states.shape[:-1], -1)
 
             return {
                 "hidden_states": hidden_states_fp4_bytes,
-                "hidden_states_scale": hidden_states_scale_fp4_bytes.view(
-                    torch.float8_e4m3fn
-                ).reshape(-1),
+                "hidden_states_scale": hidden_states_scale_fp4_bytes,
             }
         else:  # bf16
             return {
@@ -1742,9 +1735,9 @@ def cache_permute_indices():
 @pytest.mark.parametrize(
     "moe_impl",
     [
-        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4 x NvFP4"),
-        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4 x MxFP8"),
-        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4 x Bf16"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
         pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
     ],
