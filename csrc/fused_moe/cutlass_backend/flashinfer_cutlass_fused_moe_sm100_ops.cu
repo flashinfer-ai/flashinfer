@@ -494,7 +494,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
                       int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
                       bool const enable_alltoall, bool const min_latency_mode,
                       int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation,
-                      bool enable_pdl = false) {
+                      bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // TODO: support profiling under fp8 block scaling in the future
@@ -563,7 +563,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-    mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, stream);
+    mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, enable_pdl,
+                           stream);
   }
 
  private:

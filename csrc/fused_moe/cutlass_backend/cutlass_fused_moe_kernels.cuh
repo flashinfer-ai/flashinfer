@@ -2824,7 +2824,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
     float const* const fc2_fp8_quant, int64_t const num_rows, int64_t const expanded_num_rows,
     int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-    ActivationType fc1_activation_type, QuantParams& quant_params, cudaStream_t stream) {
+    ActivationType fc1_activation_type, QuantParams& quant_params, bool enable_pdl,
+    cudaStream_t stream) {
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
 
   int shape_n = is_gated_activation ? inter_size * 2 : inter_size;
@@ -2854,12 +2855,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     OutputType* const final_output, int64_t const* const expert_first_token_offset,
     WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
     float const* const unpermuted_final_scales, int const* const unpermuted_row_to_permuted_row,
-
     int const* const permuted_row_to_unpermuted_row, int const* const token_selected_experts,
     int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
     int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
     int64_t const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-    bool const enable_alltoall, QuantParams& quant_params, cudaStream_t stream) {
+    bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
   int shape_n = hidden_size;
   int shape_k = inter_size;
 
@@ -2920,13 +2920,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
   if (fp8_blockscale_gemm_runner) {
     TLLM_CHECK(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
                         expert_first_token_offset, fc1_expert_weights, fc1_expert_biases,
                         fc2_fp8_quant, num_rows, expanded_num_rows, hidden_size, inter_size,
-                        num_experts_per_node, fc1_activation_type, quant_params, stream);
+                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
+                        stream);
     return;
   }
 
@@ -3152,7 +3153,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora, cudaStream_t stream,
     MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -3164,12 +3165,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   }
 
   if (fp8_blockscale_gemm_runner) {
-    Self::BlockScaleFC2(
-        *fp8_blockscale_gemm_runner, input, gemm_output, final_output, expert_first_token_offset,
-        fc2_expert_weights, fc2_expert_biases, unpermuted_final_scales,
-        unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
-        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
-        num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params, stream);
+    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
+                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
+                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
+                        permuted_row_to_unpermuted_row, token_selected_experts,
+                        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, inter_size,
+                        num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
+                        enable_pdl, stream);
     return;
   }
 
@@ -3631,7 +3633,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, inter_size,
         num_experts_per_node, input_activations_void, input_sf, final_output, fc1_expert_weights,
         fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases, min_latency_mode,
-        min_latency_params, use_lora, start_expert, parallelism_config, stream, enable_pdl);
+        min_latency_params, use_lora, start_expert, parallelism_config, enable_pdl, stream);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner,
@@ -3643,7 +3645,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
                 stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids);
+                min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
 
     auto gemm2_input =
@@ -3658,7 +3660,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         expanded_num_rows, hidden_size, inter_size, num_experts_per_node, experts_per_token,
         alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream, parallelism_config,
         enable_alltoall, *gemm2_config_, true, min_latency_params.num_active_experts_per_node,
-        min_latency_params.active_expert_global_ids);
+        min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
@@ -3717,7 +3719,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, inter_size,
         num_experts_per_node, input_activations_void, input_sf, final_output, fc1_expert_weights,
         fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases, min_latency_mode,
-        min_latency_params, use_lora, start_expert, parallelism_config, stream, enable_pdl);
+        min_latency_params, use_lora, start_expert, parallelism_config, enable_pdl, stream);
 
     if (use_lora) {
       bool all_token_without_lora = setupLoraWorkspace(
@@ -3748,7 +3750,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
                 hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
-                nullptr);
+                nullptr, enable_pdl);
     sync_check_cuda_error(stream);
 
     if (use_lora) {
@@ -3769,7 +3771,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
                 hidden_size, inter_size, num_experts_per_node, experts_per_token,
                 alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream, parallelism_config,
-                enable_alltoall, *gemm2_config_, false, nullptr, nullptr);
+                enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
     sync_check_cuda_error(stream);
   }
 }
@@ -4574,7 +4576,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
                 input, weights_sel, weights_sel, mQuantParams.fp8.dequant_fc1,
                 mQuantParams.fp8.dequant_fc2, fp4_act_scale_flat, fp4_act_scale_flat, mQuantParams,
                 nullptr, nullptr, intermediate, intermediate, num_active_experts_per_node,
-                active_expert_global_ids, 0, stream);
+                active_expert_global_ids, 0, enable_pdl, stream);
       } else {
         std::tie(gemm1_tma_ws_input, gemm2_tma_ws_input) =
             mInterface->computeStridesTmaWarpSpecializedDispatch(
@@ -4583,7 +4585,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
                 mExpertInterSize, mNumExpertsPerNode, input, input, weights_sel, weights_sel,
                 mQuantParams.fp8.dequant_fc1, mQuantParams.fp8.dequant_fc2, fp4_act_scale_flat,
                 fp4_act_scale_flat, mQuantParams, nullptr, nullptr, intermediate, intermediate,
-                stream);
+                enable_pdl, stream);
       }
       sync_check_cuda_error(stream);
     }
@@ -4616,7 +4618,7 @@ size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {
 
 void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tactic,
                                       char* workspace_ptr_char, void const* expert_weights,
-                                      cudaStream_t const& stream) {
+                                      bool enable_pdl, cudaStream_t const& stream) {
   int64_t expanded_num_tokens = original_num_tokens * mK;
   int64_t num_experts_per_node = mNumExpertsPerNode;
 
@@ -4669,72 +4671,29 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
 
   mInterface->is_profiler = true;
   if (mGemmToProfile == GemmToProfile::GEMM_1) {
-    mInterface->gemm1(input,                                             //
-                      output,                                            //
-                      intermediate,                                      //
-                      expert_first_token_offset,                         //
-                      tma_ws_input_template,                             //
-                      weights_sel,                                       //
-                      bias,                                              //
-                      expert_first_token_offset + num_experts_per_node,  //
-                      mQuantParams.wo.fc1_weight_scales,                 //
-                      mQuantParams.fp8.dequant_fc1,                      //
+    mInterface->gemm1(input, output, intermediate, expert_first_token_offset, tma_ws_input_template,
+                      weights_sel, bias, expert_first_token_offset + num_experts_per_node,
+                      mQuantParams.wo.fc1_weight_scales, mQuantParams.fp8.dequant_fc1,
                       mQuantParams.fp8_mxfp4.fc2.act_global_scale
                           ? mQuantParams.fp8_mxfp4.fc2.act_global_scale
-                          : mQuantParams.fp8.quant_fc2,        //
-                      fp4_act_scale_flat,                      //
-                      fp4_act_scale_flat,                      //
-                      mQuantParams,                            //
-                      original_num_tokens,                     //
-                      expanded_num_tokens,                     //
-                      mExpertHiddenSize,                       //
-                      mExpertInterSize,                        //
-                      num_experts_per_node,                    //
-                      mActivationType,                         //
-                      alpha_scale_ptr_array,                   //
-                      !mUseLora,                               //
-                      /*use_deepseek_fp8_block_scale=*/false,  //
-                      stream,                                  //
-                      tactic,                                  //
-                      mMinLatencyMode,                         //
-                      num_active_experts_per_node,             //
-                      active_expert_global_ids);               //
+                          : mQuantParams.fp8.quant_fc2,
+                      fp4_act_scale_flat, fp4_act_scale_flat, mQuantParams, original_num_tokens,
+                      expanded_num_tokens, mExpertHiddenSize, mExpertInterSize,
+                      num_experts_per_node, mActivationType, alpha_scale_ptr_array, !mUseLora,
+                      /*use_deepseek_fp8_block_scale=*/false, stream, tactic, mMinLatencyMode,
+                      num_active_experts_per_node, active_expert_global_ids, enable_pdl);
   } else {
     TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
-    mInterface->gemm2(input,                                           //
-                      intermediate,                                    //
-                      output,                                          //
-                      expert_first_token_offset,                       //
-                      tma_ws_input_template,                           //
-                      weights_sel,                                     //
-                      bias,                                            //
-                      mQuantParams.wo.fc2_weight_scales,               //
-                      mQuantParams.fp8.dequant_fc2,                    //
-                      fp4_act_scale_flat,                              //
-                      mQuantParams,                                    //
-                      token_topk_unpermuted_scales,                    //
-                      token_topk_permuted_scales,                      //
-                      unpermuted_row_to_permuted_row,                  //
-                      permuted_row_to_unpermuted_row,                  //
-                      token_selected_experts,                          //
-                      expert_first_token_offset + mNumExpertsPerNode,  //
-                      original_num_tokens,                             //
-                      expanded_num_tokens,                             //
-                      mExpertHiddenSize,                               //
-                      mExpertInterSize,                                //
-                      num_experts_per_node,                            //
-                      mK,                                              //
-                      alpha_scale_ptr_array,                           //
-                      false,                                           //
-                      nullptr,                                         //
-                      /*use_deepseek_fp8_block_scale=*/false,          //
-                      stream,                                          //
-                      mParallelismConfig,                              //
-                      mEnableAlltoall,                                 //
-                      tactic,                                          //
-                      mMinLatencyMode,                                 //
-                      num_active_experts_per_node,                     //
-                      active_expert_global_ids);                       //
+    mInterface->gemm2(
+        input, intermediate, output, expert_first_token_offset, tma_ws_input_template, weights_sel,
+        bias, mQuantParams.wo.fc2_weight_scales, mQuantParams.fp8.dequant_fc2, fp4_act_scale_flat,
+        mQuantParams, token_topk_unpermuted_scales, token_topk_permuted_scales,
+        unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
+        expert_first_token_offset + mNumExpertsPerNode, original_num_tokens, expanded_num_tokens,
+        mExpertHiddenSize, mExpertInterSize, num_experts_per_node, mK, alpha_scale_ptr_array, false,
+        nullptr,
+        /*use_deepseek_fp8_block_scale=*/false, stream, mParallelismConfig, mEnableAlltoall, tactic,
+        mMinLatencyMode, num_active_experts_per_node, active_expert_global_ids, enable_pdl);
   }
   mInterface->is_profiler = false;
 

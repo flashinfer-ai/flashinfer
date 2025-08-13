@@ -78,22 +78,23 @@ class TrtllmGenBatchedGemmRunner {
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-           CUstream stream, int device, int32_t configIndex, bool enable_pdl = false);
+           CUstream stream, int device, int32_t configIndex, bool enable_pdl);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            void const* a, void const* sfA, void const* b, void const* sfB, void* c, void* outSfC,
-           void* workspace, CUstream stream, int device, int32_t configIndex, bool enable_pdl = false);
+           void* workspace, CUstream stream, int device, int32_t configIndex, bool enable_pdl);
 
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            void const* a, void const* sfA, void const* b, void const* sfB, float const* bias,
            float const* swiGluAlpha, float const* swiGluBeta, float const* clampLimit, void* c,
-           void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex, bool enable_pdl = false);
+           void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex,
+           bool enable_pdl);
 
   // FP8 per-tensor scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c,
-           void* workspace, CUstream stream, int device, int32_t configIndex, bool enable_pdl = false);
+           void* workspace, CUstream stream, int device, int32_t configIndex, bool enable_pdl);
 
   // Get the list of configs that passed the validation based on the constructor options
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const {

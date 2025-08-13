@@ -359,6 +359,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             use_w4a8_group_scaling: bool,
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
+            enable_pdl: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -375,6 +376,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             self.use_w4a8_group_scaling = use_w4a8_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.min_latency_mode = min_latency_mode
+            self.enable_pdl = enable_pdl
             instance_key = (
                 x_dtype,
                 weight_dtype,
@@ -437,6 +439,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
                 gemm_idx,
                 tactic,
                 do_preparation,
+                self.enable_pdl,
             )
 
         @classmethod
@@ -481,6 +484,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
+        enable_pdl: bool = False,
     ) -> List[torch.Tensor]:
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
@@ -502,6 +506,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
@@ -557,6 +562,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             enable_alltoall,
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
+            enable_pdl,
         )
 
         return result if min_latency_mode else [result]
@@ -635,6 +641,7 @@ def cutlass_fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -801,6 +808,7 @@ def cutlass_fused_moe(
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
+        enable_pdl=enable_pdl,
     )
 
 
