@@ -215,7 +215,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-                 int device, cudaStream_t stream, int32_t configIndex) {
+                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
@@ -223,7 +223,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
               expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
               ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
               ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex);
+              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -300,7 +300,7 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
-                 cudaStream_t stream, int32_t configIndex) {
+                 cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(
@@ -310,7 +310,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
       /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, ptrBias,
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
-      ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device, configIndex);
+      ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device, configIndex,
+      enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -483,7 +484,7 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
 }
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
-                 cudaStream_t stream, int64_t configIndex) {
+                 cudaStream_t stream, int64_t configIndex, bool enable_pdl) {
   // Setup all operation data
   moe::dev::activation::Data activationData;
   moe::dev::finalize::Data finalizeData;
@@ -504,7 +505,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                     workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
                     workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
                     workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config);
+                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -524,7 +525,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
              workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
              workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-             config.gemm2Config);
+             config.gemm2Config, enable_pdl);
 
   // Run finalize
   if (args.do_finalize) {

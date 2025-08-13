@@ -146,7 +146,7 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -184,7 +184,7 @@ class Runner {
            int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
-           int32_t configIndex);
+           int32_t configIndex, bool enable_pdl);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -319,7 +319,7 @@ class Runner {
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
-           cudaStream_t stream, int64_t configIndex);
+           cudaStream_t stream, int64_t configIndex, bool enable_pdl);
 
   [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(MoERunnerArgs const& args,
                                                                      int64_t configIndex) const;

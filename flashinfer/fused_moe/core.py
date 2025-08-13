@@ -895,7 +895,10 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function
         output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
@@ -917,6 +920,7 @@ def get_trtllm_moe_sm100_module():
             use_routing_scales_on_input,
             tile_tokens_dim,
             routing_method_type,
+            enable_pdl,
         )
         return output
 
@@ -972,7 +976,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -995,6 +1002,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             use_shuffled_weight,
             weight_layout,
+            enable_pdl,
         )
 
         return output
@@ -1061,6 +1069,7 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
+        enable_pdl: Optional[bool] = None,
         output: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
@@ -1085,6 +1094,8 @@ def get_trtllm_moe_sm100_module():
             expert_weights = torch.empty(
                 num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
             )
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         if output is None:
             output = torch.empty(
                 num_tokens,
@@ -1124,6 +1135,7 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim,
             routing_method_type,
             do_finalize,
+            enable_pdl,
             output,
         )
 
@@ -1193,6 +1205,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     use_routing_scales_on_input: bool,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -1240,6 +1253,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input,
         tile_tokens_dim,
         routing_method_type,
+        enable_pdl,
     )
 
 
@@ -1264,6 +1278,7 @@ def trtllm_fp8_block_scale_moe(
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1311,6 +1326,7 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
+        enable_pdl,
     )
 
 
@@ -1454,6 +1470,7 @@ def trtllm_fp4_block_scale_routed_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
@@ -1536,5 +1553,6 @@ def trtllm_fp4_block_scale_routed_moe(
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
+        enable_pdl,
         output,
     )
