@@ -225,7 +225,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
                     int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
                     int64_t const cluster_size, int64_t const cluster_rank,
                     bool const enable_alltoall, bool min_latency_mode,
-                    torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
+                    torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
     // Free the profile workspace to save memory
     freeProfileWorkspace();
@@ -362,7 +362,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
         false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        stream);
+        enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.const_data_ptr(), input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
@@ -375,10 +375,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #endif
 
     return output;
@@ -396,7 +396,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size,
       int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
       int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall,
-      bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids) {
+      bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+      bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Free the profile workspace to save memory
@@ -534,7 +535,7 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
         false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        stream);
+        enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.const_data_ptr(), input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
@@ -547,10 +548,10 @@ class FusedMoeRunner : public torch::CustomClassHolder {
         activation_params, fc2_expert_weights.const_data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr,
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #endif
 
     return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score,
@@ -569,7 +570,8 @@ class FusedMoeRunner : public torch::CustomClassHolder {
                       int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
                       int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
                       bool const enable_alltoall, bool const min_latency_mode,
-                      int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation) {
+                      int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation,
+                      bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // TODO: support profiling under fp8 block scaling in the future
@@ -641,11 +643,12 @@ class FusedMoeRunner : public torch::CustomClassHolder {
       TORCH_CHECK(cu_malloc_status == cudaSuccess,
                   "Can't allocate profile workspace for MoE GEMM profile.");
 
-      mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
+      mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, enable_pdl, stream);
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-    mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, stream);
+    mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, expert_weights_ptr, enable_pdl,
+                           stream);
   }
 
  private:

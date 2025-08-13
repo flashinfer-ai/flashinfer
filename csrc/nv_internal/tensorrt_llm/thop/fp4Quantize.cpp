@@ -41,7 +41,8 @@ namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 std::optional<at::Tensor> const& globalScale,
                                                 int64_t sfVecSize, bool sfUseUE8M0,
-                                                bool isSfSwizzledLayout, bool isSf8x4Layout) {
+                                                bool isSfSwizzledLayout, bool isSf8x4Layout,
+                                                bool enable_pdl) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   if (sfUseUE8M0) {
@@ -84,7 +85,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
   auto layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
-  layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+  layout = isSfSwizzledLayout ? (isSf8x4Layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4
+                                               : tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4)
                               : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
@@ -92,7 +94,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      at::cuda::getCurrentCUDAStream(self.get_device()));
+      enable_pdl, at::cuda::getCurrentCUDAStream(self.get_device()));
 
   if (sfUseUE8M0) {
     if (self.scalar_type() == at::ScalarType::Half) {

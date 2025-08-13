@@ -663,6 +663,38 @@ inline __device__ __host__ int64_t get_sf_out_offset_128x4(std::optional<int> ba
   return SFOffset;
 }
 
+inline __device__ __host__ int64_t get_sf_out_offset_8x4(std::optional<int> batchIdx, int mIdx,
+                                                         int kIdx, std::optional<int> numRows,
+                                                         int numCols) {
+  // SF layout [numMTiles, numKTiles, 8 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, innerMIdx, innerKIdx]
+
+  // batched tensor
+  // SF layout [numBTiles, numMTiles, numKTiles, 8 (mTile), 4(kTile)]
+  // --> index [bTileIdx, mTileIdx, kTileIdx, innerMIdx, innerKIdx]
+  const int32_t mTile = 8;
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % mTile);
+  int64_t mStride = 4 * innerKStride;
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = mTile * mStride;
+
+  int32_t numKTiles = (numCols + 4 - 1) / 4;
+  int32_t mTileIdx = mIdx / mTile;
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  int32_t numMTiles = (numRows.value_or(0) + 8 - 1) / 8;
+  int64_t bTileStride = numMTiles * mTileStride;
+
+  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
+                     kTileIdx * kTileStride + innerMIdx * mStride + innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
 template <class SFType, int CVT_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                 int colVecIdx, std::optional<int> numRows,
@@ -676,13 +708,16 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
   // TODO: stage through smem for packed STG.32
   // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_NUM_THREADS_PER_SF == 0) {
-    if (layout == QuantizationSFLayout::SWIZZLED) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+        layout == QuantizationSFLayout::SWIZZLED_8x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
       int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
       int32_t mIdx = rowIdx;
 
-      auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
+      auto SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
+                          ? get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs)
+                          : get_sf_out_offset_8x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else if (layout == QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
@@ -728,7 +763,8 @@ quantize_with_block_size(
   float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
   // Is it swizzled layout?
-  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
+  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                            layout == QuantizationSFLayout::SWIZZLED_8x4;
 
   // The number of padded rows considering 128x4 SF layout.
   int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, 128) : numRows;

@@ -106,7 +106,8 @@ int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
   constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
   // Swizzled layout is used as default layout.
-  if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED) {
+  if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4 ||
+      layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4) {
     // int paddedRow = PadUpFn(totalRow, 128);
     int paddedColumn = PadUpFn(totalColumn, 4);
 
@@ -178,8 +179,8 @@ at::Tensor BlockScaleInterleave(at::Tensor const& blockScale) {
           if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols)) {
             sf_ori = blockScalePtr[cIdx];
           }
-          int sf_index =
-              computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+          int sf_index = computeSFIndex(rIdx, cIdx, rows, cols,
+                                        tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4);
           interleavedBlockScalePtr[sf_index] = sf_ori;
         }
       }
@@ -224,8 +225,8 @@ at::Tensor BlockScaleInterleaveReverse(at::Tensor const& blockScale) {
     for (int eIdx = 0; eIdx < num_experts; eIdx++) {
       for (int rIdx = 0; rIdx < rows; ++rIdx) {
         for (int cIdx = 0; cIdx < cols; ++cIdx) {
-          int sf_index =
-              computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::QuantizationSFLayout::SWIZZLED);
+          int sf_index = computeSFIndex(rIdx, cIdx, rows, cols,
+                                        tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4);
           identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
         }
       }
@@ -267,7 +268,7 @@ at::Tensor E2M1AndUFP8SFScaleToFloat(at::Tensor valueE2M1, at::Tensor scaleFP8SF
       uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
       uint8_t fp8Scale =
           scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim,
-                                       tensorrt_llm::QuantizationSFLayout::SWIZZLED)];
+                                       tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4)];
       int scale = fp8Scale;
       if (sfType == 0) {
         scale -= 127;
@@ -315,9 +316,9 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
   int packedFp4HiddenDim = hiddenDim / 2;
   int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-  tensorrt_llm::QuantizationSFLayout layout = isSfSwizzledLayout
-                                                  ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
-                                                  : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout =
+      isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                         : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
   for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx) {
     for (int group = 0; group < groupsPerHiddenDim; ++group) {

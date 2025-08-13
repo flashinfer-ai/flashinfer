@@ -349,12 +349,19 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
-    header_name = "KernelMetaInfo"
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenGemmList` as the list of available kernels online.
+    # It is included when compiling `trtllm_gemm_runner.cu`.
+    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    header_name = "flashinferMetaInfo"
+
+    # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
-        f"{ArtifactPath.TRTLLM_GEN_GEMM}/{header_name}",
+        f"{include_path}/{header_name}",
         MetaInfoHash.TRTLLM_GEN_GEMM,
         ".h",
     )
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
     return gen_jit_spec(
         "trtllm_gemm",
@@ -367,11 +374,8 @@ def trtllm_gemm_gen_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        extra_include_paths=[
-            jit_env.FLASHINFER_CACHE_DIR / "cubins" / ArtifactPath.TRTLLM_GEN_GEMM,
-            jit_env.FLASHINFER_INCLUDE_DIR
-            / "flashinfer/trtllm/gemm/trtllmGen_gemm_export",
-        ],
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_ldflags=["-lcuda"],
     )
 
@@ -2155,7 +2159,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
-def group_gemm_mxfp4_nt_groupwise(
+def group_gemm_mxfp8_mxfp4_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k // 2)
     a_scale: torch.Tensor,  # (cum_m_padded, k // 32)
@@ -2287,6 +2291,10 @@ def group_gemm_mxfp4_nt_groupwise(
         swap_ab,
     )
     return out
+
+
+# NOTE(Zihao): keep the old name for backward compatibility
+group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
 def pad_indptr_to_multiple_of_4(

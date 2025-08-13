@@ -23,7 +23,7 @@ import time
 import filelock
 
 from .core import logger
-from .env import FLASHINFER_CACHE_DIR
+from .env import FLASHINFER_CUBIN_DIR
 
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
@@ -114,7 +114,7 @@ def load_cubin(cubin_path, sha256) -> bytes:
 
     Return None on failure.
     """
-    logger.info(f"Loading from {cubin_path}")
+    logger.debug(f"Loading from {cubin_path}")
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
@@ -128,9 +128,8 @@ def load_cubin(cubin_path, sha256) -> bytes:
             logger.warning(
                 f"sha256 mismatch (expected {sha256} actual {actual_sha}) for {cubin_path}"
             )
-    except Exception as e:
-        print(f"Failed to load cubin at {cubin_path} with sha256={sha256}: {e}")
-    logger.info(f"Failed loading {cubin_path}")
+    except Exception:
+        pass
     return b""
 
 
@@ -145,7 +144,7 @@ def get_cubin(name, sha256, file_extension=".cubin"):
     None on failure.
     """
     cubin_fname = name + file_extension
-    cubin_path = FLASHINFER_CACHE_DIR / "cubins" / cubin_fname
+    cubin_path = FLASHINFER_CUBIN_DIR / cubin_fname
     cubin = load_cubin(cubin_path, sha256)
     if cubin:
         return cubin

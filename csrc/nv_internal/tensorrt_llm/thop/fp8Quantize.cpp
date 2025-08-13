@@ -31,7 +31,7 @@ namespace torch_ext {
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwizzledLayout,
-                                                  int64_t alignment) {
+                                                  int64_t alignment, bool enable_pdl) {
   CHECK_TH_CUDA(input);
   CHECK_CONTIGUOUS(input);
 
@@ -66,14 +66,14 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool isSfSwi
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+  auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                                          : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                \
-  tensorrt_llm::kernels::invokeMxFP8Quantization(                                      \
-      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                       \
-      reinterpret_cast<int64_t*>(valMxFP8.data_ptr()),                                 \
-      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
+#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                            \
+  tensorrt_llm::kernels::invokeMxFP8Quantization(                                                  \
+      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                                   \
+      reinterpret_cast<int64_t*>(valMxFP8.data_ptr()),                                             \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, enable_pdl, \
       at::cuda::getCurrentCUDAStream(input.get_device()));
 
   if (input.scalar_type() == at::ScalarType::Half) {
@@ -130,9 +130,9 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize_host(at::Tensor x_fp32,
   at::Tensor scale_tensor =
       at::detail::empty_cpu({sf_size}, SF_DTYPE, /* pinned */ true, at::MemoryFormat::Contiguous);
 
-  tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout
-                                                  ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
-                                                  : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout =
+      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
@@ -181,9 +181,9 @@ at::Tensor mxfp8_dequantize_host(at::Tensor value_e4m3, at::Tensor scale_ue8m08s
   int hidden_dim = data_shape[1];
   int groups_per_hidden_dim = hidden_dim / sf_vec_size;
 
-  tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout
-                                                  ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
-                                                  : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  tensorrt_llm::QuantizationSFLayout layout =
+      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
+                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
       float* float_ptr = float_tensor.data_ptr<float>() + ti * hidden_dim + group * sf_vec_size;
