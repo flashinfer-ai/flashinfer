@@ -2159,7 +2159,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
-def group_gemm_mxfp4_nt_groupwise(
+def group_gemm_mxfp8_mxfp4_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k // 2)
     a_scale: torch.Tensor,  # (cum_m_padded, k // 32)
@@ -2291,6 +2291,10 @@ def group_gemm_mxfp4_nt_groupwise(
         swap_ab,
     )
     return out
+
+
+# NOTE(Zihao): keep the old name for backward compatibility
+group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
 def pad_indptr_to_multiple_of_4(
