@@ -67,6 +67,7 @@ def test_blockscaled_gemm_python_interface(
     tolerance: float,
     iterations: int,
 ):
+    torch.manual_seed(42)
     l, m = lm
     k, n = kn
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
