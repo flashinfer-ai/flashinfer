@@ -16,6 +16,8 @@ DTYPE_MAP = {
 
 GPU_DEVICE = "cuda:0"
 
+global_workspace_buffer = None
+
 
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
@@ -288,9 +290,12 @@ def test_trtllm_batch_prefill(
         q, o_dtype, create_out_tensor
     )
 
-    workspace_buffer = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
-    )
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer = global_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
@@ -444,9 +449,12 @@ def test_trtllm_batch_decode(
         q, o_dtype, create_out_tensor
     )
 
-    workspace_buffer = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
-    )
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer = global_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(

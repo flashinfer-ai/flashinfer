@@ -5,6 +5,8 @@ import torch
 
 import flashinfer
 
+global_workspace_buffer = None
+
 
 @pytest.mark.parametrize(
     "batch_size",
@@ -89,7 +91,12 @@ def test_trtllm_batch_decode_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    global global_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_workspace_buffer
 
     bmm1_log2_scale_tensor = (
         torch.tensor(
