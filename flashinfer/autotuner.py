@@ -387,7 +387,7 @@ class AutoTuner:
                 custom_op, r, input_shapes, tuning_config
             )
             if (
-                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                os.environ["FLASHINFER_AUTOTUNER_LOAD_FROM_FILE"] == "1"
                 and not self.is_tuning_mode
             ):
                 output = load_from_file(cache_key)

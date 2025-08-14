@@ -25,14 +25,14 @@ import warnings
 
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
-FLASHINFER_BASE_DIR = pathlib.Path(
-    os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
-)
+FLASHINFER_BASE_DIR = pathlib.Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
-FLASHINFER_CUBIN_DIR = pathlib.Path(
-    os.getenv("FLASHINFER_CUBIN_DIR", (FLASHINFER_CACHE_DIR / "cubins").as_posix())
-)
+
+if "FLASHINFER_CUBIN_DIR" in os.environ and os.environ["FLASHINFER_CUBIN_DIR"]:
+    FLASHINFER_CUBIN_DIR = pathlib.Path(os.environ["FLASHINFER_CUBIN_DIR"])
+else:
+    FLASHINFER_CUBIN_DIR = FLASHINFER_CACHE_DIR / "cubins"
 
 
 def _get_workspace_dir_name() -> pathlib.Path:

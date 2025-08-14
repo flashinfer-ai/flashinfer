@@ -16,7 +16,7 @@ def gen_nvshmem_module() -> JitSpec:
     ldflags = (
         [f"-L{lib_dir}" for lib_dir in lib_dirs]
         + ["-lnvshmem_device"]
-        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
+        + shlex.split(os.environ["NVSHMEM_LDFLAGS"])
     )
 
     return gen_jit_spec(
