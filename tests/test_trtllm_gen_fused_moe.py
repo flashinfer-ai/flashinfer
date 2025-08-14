@@ -709,6 +709,7 @@ class FP8BlockScaleMoe(Moe):
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
         tile_tokens_dim = kwargs["tile_tokens_dim"]
+        enable_pdl = kwargs.get("enable_pdl")
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_orig.to(torch.float8_e4m3fn)
@@ -738,6 +739,7 @@ class FP8BlockScaleMoe(Moe):
             routing_method_type,
             use_shuffled_weight=static_data["use_shuffled_weight"],
             weight_layout=static_data["weight_layout"],
+            enable_pdl=enable_pdl,
         )
 
         return output.to(torch.float)
@@ -2040,6 +2042,7 @@ def test_moe_quantization_classes(
         routing_method_type=routing_method_type,
         tile_tokens_dim=tile_tokens_dim,
         weight_processing=weight_processing,
+        enable_pdl=True,
     )
 
     # Compare outputs using moe_impl-specific tolerances

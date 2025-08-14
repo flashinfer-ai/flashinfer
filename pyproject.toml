@@ -39,6 +39,7 @@ skip = [
 [tool.setuptools]
 packages = [
     "flashinfer",
+    "flashinfer.cute_dsl",
     "flashinfer.data",
     "flashinfer.data.aot",
     "flashinfer.data.csrc",

@@ -13,36 +13,41 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.cute_dsl.blockscaled_gemm import (
-    MaskedBatchedMatmulCuteDSL,  # python interface
-)
-from flashinfer.cute_dsl.blockscaled_gemm import (
+    create_scale_factor_tensor,
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
+    grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
 )
-from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
+from flashinfer.cute_dsl.utils import (
+    get_cutlass_dtype,
+    is_cute_dsl_available,
+)
 
 
 # todo(Yingyi): complete this test for target python interface
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
 @pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
 @pytest.mark.parametrize(
     "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
     [
-        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float16, 16),
-        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 16),
-        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, cutlass.Float32, 16),
-        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float16, 16),
-        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.BFloat16, 16),
-        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float32, 16),
-        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
-        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
-        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
-        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
-        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
-        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.BFloat16, 32),
-        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float16, 32),
-        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float32, 32),
-        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, 32),
-        (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, cutlass.Float8E5M2, 32),
+        ("float4_e2m1fn", "float8_e8m0fnu", "float16", 16),
+        ("float4_e2m1fn", "float8_e8m0fnu", "bfloat16", 16),
+        ("float4_e2m1fn", "float8_e8m0fnu", "float32", 16),
+        ("float4_e2m1fn", "float8_e4m3fn", "float16", 16),
+        ("float4_e2m1fn", "float8_e4m3fn", "bfloat16", 16),
+        ("float4_e2m1fn", "float8_e4m3fn", "float32", 16),
+        ("float8_e4m3fn", "float8_e8m0fnu", "bfloat16", 32),
+        ("float8_e4m3fn", "float8_e8m0fnu", "float16", 32),
+        ("float8_e4m3fn", "float8_e8m0fnu", "float32", 32),
+        ("float8_e4m3fn", "float8_e8m0fnu", "float8_e4m3fn", 32),
+        ("float8_e4m3fn", "float8_e8m0fnu", "float8_e5m2", 32),
+        ("float8_e5m2", "float8_e8m0fnu", "bfloat16", 32),
+        ("float8_e5m2", "float8_e8m0fnu", "float16", 32),
+        ("float8_e5m2", "float8_e8m0fnu", "float32", 32),
+        ("float8_e5m2", "float8_e8m0fnu", "float8_e4m3fn", 32),
+        ("float8_e5m2", "float8_e8m0fnu", "float8_e5m2", 32),
     ],
 )
 @pytest.mark.parametrize("a_major", ["k"])
@@ -71,10 +76,10 @@ def test_blockscaled_gemm_python_interface(
     l, m = lm
     k, n = kn
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-        ab_dtype,
-        sf_dtype,
+        get_cutlass_dtype(ab_dtype),
+        get_cutlass_dtype(sf_dtype),
         sf_vec_size,
-        c_dtype,
+        get_cutlass_dtype(c_dtype),
         mma_tiler_mn,
         cluster_shape_mn,
         m,
@@ -87,6 +92,12 @@ def test_blockscaled_gemm_python_interface(
     ):
         pytest.skip(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+        )
+
+    if not (a_major == "k" and b_major == "k" and c_major == "n"):
+        # not supported since we try to align deepgemm for now
+        pytest.skip(
+            f"Skip non deepgemm-like cases {a_major}, {b_major}, {c_major}. Might be added later"
         )
 
     # not used for now
@@ -134,46 +145,62 @@ def test_blockscaled_gemm_python_interface(
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
+    c_ref_clone = c_ref.clone()
+
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
-        a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     b_tensor, b_torch = cutlass_torch.cute_tensor_like(
-        b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
-        c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
+        c_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    c_tensor_clone, c_torch_clone = cutlass_torch.cute_tensor_like(
+        c_ref_clone,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
 
+    # for deepgemm-like python interface
+    a_torch_clone = a_torch.clone()
+    b_torch_clone = b_torch.clone()
+
+    if ab_dtype == "float4_e2m1fn":
+        a_torch_clone = a_torch_clone[:, : a_torch_clone.shape[1] // 2, :]
+        b_torch_clone = b_torch_clone[:, : b_torch_clone.shape[1] // 2, :]
+
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-        l, m, k, sf_vec_size, sf_dtype
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, sf_dtype
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
-    wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     for _ in range(iterations):
-        wrapper.run(
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
+        # deepgemm-like python interface: fp4 packed, for DLFW integration
+        grouped_gemm_nt_masked(
+            (a_torch_clone, sfa_torch),
+            (b_torch_clone, sfb_torch),
+            c_torch_clone,
+            masked_m_tensor,
             ab_dtype=ab_dtype,
             sf_dtype=sf_dtype,
-            sf_vec_size=sf_vec_size,
             c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            a_tensor_gpu=a_torch,
-            b_tensor_gpu=b_torch,
-            sfa_tensor_gpu=sfa_torch,
-            sfb_tensor_gpu=sfb_torch,
-            c_tensor_gpu=c_torch,
-            masked_m_tensor_gpu=masked_m_tensor,
         )
         torch.cuda.synchronize()
 
@@ -184,23 +211,32 @@ def test_blockscaled_gemm_python_interface(
 
     # Convert c back to f32 for comparison.
     c_ref_device = c_ref.cuda()
+    c_ref_device_clone = c_ref_clone.cuda()
     cute.testing.convert(
         c_tensor,
         from_dlpack(c_ref_device, assumed_align=16).mark_layout_dynamic(
             leading_dim=(1 if c_major == "n" else 0)
         ),
     )
+    cute.testing.convert(
+        c_tensor_clone,
+        from_dlpack(c_ref_device_clone, assumed_align=16).mark_layout_dynamic(
+            leading_dim=(1 if c_major == "n" else 0)
+        ),
+    )
     c_ref = c_ref_device.cpu()
+    c_ref_clone = c_ref_device_clone.cpu()
 
-    if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
+    if c_dtype in ("float32", "float16", "bfloat16"):
         for i in range(l):
+            # skip testing c_ref & ref
             torch.testing.assert_close(
-                c_ref[: masked_m_tensor[i].item(), :, i],
+                c_ref_clone[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],
                 atol=tolerance,
                 rtol=1e-02,
             )
-    elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
+    elif c_dtype in ("float8_e5m2", "float8_e4m3fn"):
         # Convert ref : f32 -> f8 -> f32
         ref_f8_ = torch.empty(*(l, m, n), dtype=torch.uint8, device="cuda").permute(
             1, 2, 0
@@ -208,7 +244,7 @@ def test_blockscaled_gemm_python_interface(
         ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(
             leading_dim=1
         )
-        ref_f8.element_type = c_dtype
+        ref_f8.element_type = get_cutlass_dtype(c_dtype)
         ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
         ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
             leading_dim=1
@@ -217,11 +253,10 @@ def test_blockscaled_gemm_python_interface(
         cute.testing.convert(ref_f8, ref_tensor)
         ref = ref_device.cpu()
         for i in range(l):
+            # skip testing c_ref & ref
             torch.testing.assert_close(
-                c_ref[: masked_m_tensor[i].item(), :, i],
+                c_ref_clone[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],
                 atol=tolerance,
                 rtol=1e-02,
             )
-
-    print("PASS")

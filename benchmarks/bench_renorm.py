@@ -36,7 +36,7 @@ def main():
                 gumbel_distribution(0.1),
                 gumbel_distribution(1),
             ]:
-                for p in [0.1, 0.5, 0.9]:
+                for p in [0.1, 0.5, 0.9, 1.0]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
                     measurements = bench_gpu_time(

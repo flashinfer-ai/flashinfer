@@ -4,7 +4,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from flashinfer.utils import is_cute_dsl_available
+from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
 
 @cute.kernel

@@ -388,7 +388,7 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
