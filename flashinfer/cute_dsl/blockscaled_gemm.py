@@ -50,6 +50,7 @@ from cutlass.cutlass_dsl import (
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.utils import get_cutlass_dtype
 
+
 class MaskedSchedulerParams:
     def __init__(
         self,
