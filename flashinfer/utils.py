@@ -27,7 +27,9 @@ from torch.torch_version import __version__ as torch_version
 
 from .jit import gen_jit_spec, env as jit_env
 
-IS_BUILDING_DOCS = os.environ["FLASHINFER_BUILDING_DOCS"] == "1"
+from . import env as env_cfg
+
+IS_BUILDING_DOCS = env_cfg.FLASHINFER_BUILDING_DOCS == "1"
 
 
 class PosEncodingMode(Enum):

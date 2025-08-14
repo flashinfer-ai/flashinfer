@@ -25,8 +25,10 @@ import filelock
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
 
-if "FLASHINFER_CUBINS_REPOSITORY" in os.environ and os.environ["FLASHINFER_CUBINS_REPOSITORY"]:
-    FLASHINFER_CUBINS_REPOSITORY = os.environ["FLASHINFER_CUBINS_REPOSITORY"]
+from .. import env as env_cfg
+
+if env_cfg.FLASHINFER_CUBINS_REPOSITORY:
+    FLASHINFER_CUBINS_REPOSITORY = env_cfg.FLASHINFER_CUBINS_REPOSITORY
 else:
     FLASHINFER_CUBINS_REPOSITORY = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/"
 
@@ -116,7 +118,7 @@ def load_cubin(cubin_path, sha256) -> bytes:
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
-            if "FLASHINFER_CUBIN_CHECKSUM_DISABLED" in os.environ and os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] == "1":
+            if env_cfg.FLASHINFER_CUBIN_CHECKSUM_DISABLED == "1":
                 return cubin
             m = hashlib.sha256()
             m.update(cubin)

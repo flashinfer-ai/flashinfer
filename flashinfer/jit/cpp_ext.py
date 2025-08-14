@@ -20,6 +20,7 @@ from torch.utils.cpp_extension import (
 )
 
 from . import env as jit_env
+from .. import env as env_cfg
 
 
 @functools.cache
@@ -89,8 +90,8 @@ def generate_ninja_build_for_op(
         cflags += extra_cflags
 
     cuda_cflags: List[str] = []
-    if "CC" in os.environ and os.environ["CC"]:
-        cuda_cflags += ["-ccbin", os.environ["CC"]]
+    if env_cfg.CC:
+        cuda_cflags += ["-ccbin", env_cfg.CC]
     cuda_cflags += [
         "$common_cflags",
         "--compiler-options=-fPIC",
@@ -118,24 +119,24 @@ def generate_ninja_build_for_op(
         "-lcudart",
     ]
 
-    if "FLASHINFER_EXTRA_LDFLAGS" in os.environ and os.environ["FLASHINFER_EXTRA_LDFLAGS"]:
+    if env_cfg.FLASHINFER_EXTRA_LDFLAGS:
         try:
             import shlex
 
-            ldflags += shlex.split(os.environ["FLASHINFER_EXTRA_LDFLAGS"])
+            ldflags += shlex.split(env_cfg.FLASHINFER_EXTRA_LDFLAGS)
         except ValueError as e:
             print(
                 f"Warning: Could not parse FLASHINFER_EXTRA_LDFLAGS with shlex: {e}. Falling back to simple split.",
                 file=sys.stderr,
             )
-            ldflags += os.environ["FLASHINFER_EXTRA_LDFLAGS"].split()
+            ldflags += env_cfg.FLASHINFER_EXTRA_LDFLAGS.split()
 
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
-    cxx = os.environ["CXX"]
+    cxx = env_cfg.CXX
     cuda_home = CUDA_HOME or "/usr/local/cuda"
-    nvcc = os.environ["PYTORCH_NVCC"]
+    nvcc = env_cfg.PYTORCH_NVCC
 
     lines = [
         "ninja_required_version = 1.3",
