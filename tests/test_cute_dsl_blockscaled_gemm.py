@@ -50,9 +50,9 @@ from flashinfer.cute_dsl.utils import (
         ("float8_e5m2", "float8_e8m0fnu", "float8_e5m2", 32),
     ],
 )
-@pytest.mark.parametrize("a_major", ["k"])
-@pytest.mark.parametrize("b_major", ["k"])
-@pytest.mark.parametrize("c_major", ["n"])
+@pytest.mark.parametrize("a_major", ["k", "m"])
+@pytest.mark.parametrize("b_major", ["k", "n"])
+@pytest.mark.parametrize("c_major", ["n", "m"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
@@ -167,7 +167,6 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
     for _ in range(iterations):
-        assert a_major == "k" and b_major == "k" and c_major == "n"
         grouped_gemm_nt_masked(
             (a_torch, sfa_torch),
             (b_torch, sfb_torch),
