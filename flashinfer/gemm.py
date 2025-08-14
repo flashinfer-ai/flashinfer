@@ -406,9 +406,9 @@ def get_gemm_sm100_module_cutlass_fp8():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ):
             a, b, alpha, out, workspace_buffer = inputs
             module.fp8_gemm.default(a, b, alpha, out, workspace_buffer, tactic)
@@ -433,8 +433,8 @@ def get_gemm_sm100_module_cutlass_fp8():
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    a_tensor_index,
-                    -2,
+                    (a_tensor_index,),
+                    (-2,),
                     get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2,
                 ),
@@ -482,9 +482,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
             module.fp4_gemm.default(
@@ -517,8 +517,8 @@ def get_gemm_sm100_module_cutlass_fp4():
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    a_tensor_index,
-                    0,
+                    (a_tensor_index,),
+                    (0,),
                     get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2,
                 ),
@@ -1910,9 +1910,9 @@ def get_trtllm_fp4_gemm_module():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ):
             (
                 workspace_buffer,
@@ -1962,8 +1962,8 @@ def get_trtllm_fp4_gemm_module():
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    a_tensor_index,
-                    0,
+                    (a_tensor_index,),
+                    (0,),
                     get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2,
                 ),
