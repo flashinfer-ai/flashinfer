@@ -2735,6 +2735,9 @@ def grouped_gemm_nt_masked(
         sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
         mma_tiler_mn (Tuple[int, int], optional): Shape of the MMA tiler (M, N). Default: (128, 128).
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
+        is_packed (bool, optional): Whether the input tensors are packed.
+                                    Default: True (if True, we have int8 tensors for fp4, shaped as (l, m, k/2) or (l, n, k/2), otherwise, we have int8 tensors for fp8, shaped as (l, m, k) or (l, n, k)).
+                                    Note: this is only used for fp4.
 
     Notes:
         - Legends of the input tensors:
@@ -2745,6 +2748,8 @@ def grouped_gemm_nt_masked(
         - The function applies masking per batch using masked_m.
         - The result is written to c_tensor.
     """
+
+    is_packed = kwargs.get("is_packed", True)
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
     c_torch = out
@@ -2752,7 +2757,7 @@ def grouped_gemm_nt_masked(
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
 
-    if ab_dtype == "float4_e2m1fn":
+    if ab_dtype == "float4_e2m1fn" and is_packed:
         # todo(yingyi): update mnk based on a_major and b_major, and support more major.
         # Note: only support deepgemm-like shape for now
         k = k * 2

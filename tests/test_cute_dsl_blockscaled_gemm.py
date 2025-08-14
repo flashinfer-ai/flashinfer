@@ -15,7 +15,6 @@ from cutlass.cute.runtime import from_dlpack
 from flashinfer.cute_dsl.blockscaled_gemm import (
     create_scale_factor_tensor,
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
-    MaskedBatchedMatmulCuteDSL,  # python wrapper interface
     grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
 )
 from flashinfer.cute_dsl.utils import (
@@ -175,10 +174,11 @@ def test_blockscaled_gemm_python_interface(
 
     # for deepgemm-like python interface
     a_torch_clone = a_torch.clone()
-    a_torch_clone = a_torch_clone[: a_torch_clone.shape[0] // 2, :, :]
     b_torch_clone = b_torch.clone()
-    b_torch_clone = b_torch_clone[: b_torch_clone.shape[0] // 2, :, :]
-    # c_torch_clone = c_torch.clone()
+
+    if ab_dtype == "float4_e2m1fn":
+        a_torch_clone = a_torch_clone[:, : a_torch_clone.shape[1] // 2, :]
+        b_torch_clone = b_torch_clone[:, : b_torch_clone.shape[1] // 2, :]
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
         l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
@@ -188,32 +188,23 @@ def test_blockscaled_gemm_python_interface(
     )
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
-    wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     for _ in range(iterations):
-        wrapper.run(
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
-            ab_dtype=get_cutlass_dtype(ab_dtype),
-            sf_dtype=get_cutlass_dtype(sf_dtype),
+        # deepgemm-like python interface: fp4 not packed, not for DLFW integration
+        grouped_gemm_nt_masked(
+            (a_torch, sfa_torch),
+            (b_torch, sfb_torch),
+            c_torch,
+            masked_m_tensor,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
             sf_vec_size=sf_vec_size,
-            c_dtype=get_cutlass_dtype(c_dtype),
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            a_tensor_gpu=a_torch,
-            b_tensor_gpu=b_torch,
-            sfa_tensor_gpu=sfa_torch,
-            sfb_tensor_gpu=sfb_torch,
-            c_tensor_gpu=c_torch,
-            masked_m_tensor_gpu=masked_m_tensor,
+            is_packed=False,
         )
 
-        # deepgemm-like python interface
-        assert a_major == "k" and b_major == "k" and c_major == "n"
+        # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
             (a_torch_clone, sfa_torch),
             (b_torch_clone, sfb_torch),
@@ -225,6 +216,7 @@ def test_blockscaled_gemm_python_interface(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            is_packed=True,
         )
         torch.cuda.synchronize()
 
@@ -235,13 +227,21 @@ def test_blockscaled_gemm_python_interface(
 
     # Convert c back to f32 for comparison.
     c_ref_device = c_ref.cuda()
+    c_ref_device_clone = c_ref_clone.cuda()
     cute.testing.convert(
         c_tensor,
         from_dlpack(c_ref_device, assumed_align=16).mark_layout_dynamic(
             leading_dim=(1 if c_major == "n" else 0)
         ),
     )
+    cute.testing.convert(
+        c_tensor_clone,
+        from_dlpack(c_ref_device_clone, assumed_align=16).mark_layout_dynamic(
+            leading_dim=(1 if c_major == "n" else 0)
+        ),
+    )
     c_ref = c_ref_device.cpu()
+    c_ref_clone = c_ref_device_clone.cpu()
 
     if c_dtype in ("float32", "float16", "bfloat16"):
         for i in range(l):
@@ -292,9 +292,9 @@ if __name__ == "__main__":
     test_blockscaled_gemm_python_interface(
         lm=(1, 1024),
         kn=(7168, 4096),
-        ab_dtype="float4_e2m1fn",
+        ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
-        sf_vec_size=16,
+        sf_vec_size=32,
         c_dtype="float16",
         a_major="k",
         b_major="k",
