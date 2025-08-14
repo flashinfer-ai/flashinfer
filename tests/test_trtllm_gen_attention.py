@@ -174,9 +174,11 @@ def create_output(q, o_dtype, create_out_tensor):
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=q.device
             )
-            extra_size = fp4_out_scale_shape[0] - q.shape[0]
+            rounded_extra_size = fp4_out_scale_shape[0] - q.shape[0]
             o_sf_start_index = (
-                torch.randint(0, extra_size, (1,)).item() if extra_size > 0 else 0
+                torch.randint(0, rounded_extra_size, (1,)).item()
+                if rounded_extra_size > 0
+                else 0
             )
             out_data = torch.empty(fp4_out_shape, dtype=torch.uint8, device=q.device)
             out = FP4Tensor(out_data, out_scale_factor, o_sf_start_index)
