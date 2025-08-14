@@ -1795,7 +1795,6 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-    print(f"in trtllm_fp4_block_scale_moe, tune_max_num_tokens={tune_max_num_tokens}")
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
