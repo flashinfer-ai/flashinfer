@@ -286,21 +286,3 @@ def test_blockscaled_gemm_python_interface(
                 atol=tolerance,
                 rtol=1e-02,
             )
-
-
-if __name__ == "__main__":
-    test_blockscaled_gemm_python_interface(
-        lm=(1, 1024),
-        kn=(7168, 4096),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float8_e8m0fnu",
-        sf_vec_size=32,
-        c_dtype="float16",
-        a_major="k",
-        b_major="k",
-        c_major="n",
-        mma_tiler_mn=(128, 128),
-        cluster_shape_mn=(1, 1),
-        tolerance=1e-01,
-        iterations=3,
-    )
