@@ -1170,7 +1170,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
@@ -1181,7 +1181,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers[:5],
                     ),
