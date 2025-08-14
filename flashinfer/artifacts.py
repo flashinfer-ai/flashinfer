@@ -50,10 +50,10 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 class ArtifactPath:
     TRTLLM_GEN_FMHA: str = "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/batched_gemm-32110eb-a15c257/"
+        "5d347c6234c9f0e7f1ab6519ea933183b48216ed/batched_gemm-32110eb-5262bae/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "07a5f242a649533ff6885f87c42b2476a9e46233/gemm-c603ed2-434a6e1/"
+        "5d347c6234c9f0e7f1ab6519ea933183b48216ed/gemm-32110eb-434a6e1/"
     )
     CUDNN_SDPA: str = "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
     DEEPGEMM: str = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
@@ -63,9 +63,12 @@ class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
         "0d124e546c8a2e9fa59499625e8a6d140a2465573d4a3944f9d29f29f73292fb"
     )
+    TRTLLM_GEN_BMM: str = (
+        "aae02e5703ee0ce696c4b3a1f2a32936fcc960dcb69fdef52b6d0f8a7b673000"
+    )
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
     TRTLLM_GEN_GEMM: str = (
-        "50c5627324003c822efbdd1d368b1e569f4f67f4bb0a2fbb7397cd56c6d14c2a"
+        "a00ef9d834cb66c724ec7c72337bc955dc53070a65a6f68b34f852d144fa6ea3"
     )
 
 
@@ -74,7 +77,8 @@ def download_artifacts() -> bool:
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
     cubin_files = [
         (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
-        (ArtifactPath.TRTLLM_GEN_GEMM + "KernelMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
     ]
     for kernel in [
         ArtifactPath.TRTLLM_GEN_FMHA,

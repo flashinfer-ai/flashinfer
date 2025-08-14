@@ -822,9 +822,6 @@ def trtllm_allreduce_fusion(
     """
 
     if use_oneshot is None:
-        logging.warning(
-            "use_oneshot is not specified. It would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode."
-        )
         use_oneshot = token_num <= 128
 
     if not use_oneshot:

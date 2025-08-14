@@ -83,6 +83,11 @@ size_t dispatchGemmClusterShapeSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
                                                _2SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
                                                      workspacePtr, workspaceBytes, stream);
       break;
+    case ClusterShape::ClusterShape_1x4x1:
+      return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _4, _1>,
+                                               _1SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
+                                                     workspacePtr, workspaceBytes, stream);
+      break;
     default:
       throw std::runtime_error("invalid config for fp8 gemm");
       break;
@@ -205,9 +210,8 @@ std::vector<CutlassGemmConfig> CutlassFp8GemmRunner<T>::getConfigs() const {
   };
 
   std::vector<ClusterShape> clusterShapes = {
-      ClusterShape::ClusterShape_1x1x1,
-      ClusterShape::ClusterShape_1x2x1,
-      ClusterShape::ClusterShape_2x1x1,
+      ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x2x1,
+      ClusterShape::ClusterShape_1x4x1, ClusterShape::ClusterShape_2x1x1,
       ClusterShape::ClusterShape_2x2x1,
   };
   for (auto const& tile_config : tilesSm100) {
