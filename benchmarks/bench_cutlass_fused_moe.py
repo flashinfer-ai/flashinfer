@@ -84,7 +84,6 @@ def bench_cutlass_fused_moe(
     n = intermediate_size
     k = hidden_size
     otype = torch.bfloat16
-    wtype = torch.float8_e4m3fn
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=otype) / 10
     w1_cutlass = torch.cat((w1[:, n:, :], w1[:, :n, :]), dim=1).contiguous()
 

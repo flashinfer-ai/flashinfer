@@ -329,7 +329,6 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
     logits_soft_cap,
     return_lse,
 ):
-
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
@@ -461,7 +460,6 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
     logits_soft_cap,
     return_lse,
 ):
-
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
     num_pages_per_seq = (kv_len + page_size - 1) // page_size

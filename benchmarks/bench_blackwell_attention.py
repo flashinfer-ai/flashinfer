@@ -61,7 +61,7 @@ def bench_fmha_blackwell(
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    o = wrapper.run(q, k, v)
+    _o = wrapper.run(q, k, v)
     measurements = bench_gpu_time(
         lambda: wrapper.run(q, k, v),
         dry_run_time_ms=100,

@@ -342,6 +342,129 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
   }
 }
 
+template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
+          typename QuantType>
+__global__ void MLARopeQuantizeKernel(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
+    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
+    float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_heads, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_nope_in_stride, size_t k_rope_out_stride,
+    size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+  constexpr uint32_t rotary_dim = 64;
+
+  vec_t<float, vec_size> cos, sin;
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    const int half_rotary_dim = rotary_dim / 2;
+    // 1. if interleave:
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
+    if (tx * vec_size < rotary_dim) {
+      int sin_offset = rotary_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+      }
+      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
+    }
+
+    if (by < num_heads) {
+      // Query RoPE, 64 dim
+      // allocate (num_heads,) blocks on blockDim.y
+      uint32_t q_head_idx = by;
+      DType* q_rope_in_ptr =
+          q_rope_in + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/0, q_rope_in_stride_n,
+                                           q_rope_in_stride_h);
+      QuantType* q_rope_out_ptr =
+          q_rope_out + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/0, q_rope_out_stride_n,
+                                            q_rope_out_stride_h);
+      vec_t<float, vec_size> q_rope_vec;
+      if constexpr (interleave) {
+        q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            q_rope_in_ptr, cos, sin, rotary_dim);
+      } else {
+        q_rope_vec =
+            vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rotary_dim);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+      }
+      q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
+    } else if (by == num_heads) {
+      // k/v RoPE, 64 dim
+      // allocate (1,) blocks on blockDim.y
+      DType* k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/0,
+                                                              k_rope_in_stride, k_rope_in_stride);
+      QuantType* k_rope_out_ptr =
+          k_rope_out + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/0, k_rope_out_stride,
+                                            k_rope_out_stride);
+      vec_t<float, vec_size> k_rope_vec;
+      if constexpr (interleave) {
+        k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            k_rope_in_ptr, cos, sin, rotary_dim);
+      } else {
+        k_rope_vec =
+            vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rotary_dim);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
+      }
+      k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
+    } else if (by <= num_heads + 8) {
+      // K/v Non-RoPE part, 512 dim
+      // allocate (8,) blocks on blockDim.y
+      uint32_t chunk_idx = (by - num_heads - 1);
+      DType* k_nope_in_ptr =
+          k_nope_in + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/64 * chunk_idx,
+                                           k_nope_in_stride, k_nope_in_stride);
+      QuantType* k_nope_out_ptr =
+          k_nope_out + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/64 * chunk_idx,
+                                            k_nope_out_stride, k_nope_out_stride);
+      vec_t<float, vec_size> k_nope_vec;
+      k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
+      }
+      k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
+    } else {
+      // Query Non-RoPE part, 512 dim
+      // allocate (num_heads * 8,) blocks on blockDim.y
+      uint32_t q_head_idx = (by - num_heads - 8 - 1) / 8;
+      uint32_t chunk_idx = (by - num_heads - 8 - 1) % 8;
+      DType* q_nope_in_ptr =
+          q_nope_in + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/64 * chunk_idx,
+                                           q_nope_in_stride_n, q_nope_in_stride_h);
+      QuantType* q_nope_out_ptr =
+          q_nope_out + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/64 * chunk_idx,
+                                            q_nope_out_stride_n, q_nope_out_stride_h);
+      vec_t<float, vec_size> q_nope_vec;
+      q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        q_nope_vec[i] = q_nope_vec[i] * quant_scale_q;
+      }
+      q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
+    }
+  }
+}
+
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
@@ -573,6 +696,66 @@ __global__ void BatchQKApplyRotaryKernel(
     const bool INTERLEAVE = false;                       \
     __VA_ARGS__                                          \
   }
+
+template <typename DType, typename IdType, typename QuantType>
+cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
+                            QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
+                            QuantType* k_nope_out, float* cos_sin_cache, IdType* pos_ids,
+                            uint32_t nnz, uint32_t num_heads, size_t q_rope_in_stride_n,
+                            size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
+                            size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+                            size_t q_rope_out_stride_h, size_t q_nope_out_stride_n,
+                            size_t q_nope_out_stride_h, size_t k_rope_in_stride,
+                            size_t k_nope_in_stride, size_t k_rope_out_stride,
+                            size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv,
+                            bool interleave, cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+    constexpr uint32_t rotary_dim = 64;
+    constexpr uint32_t vec_size = 16 / sizeof(DType);
+    constexpr uint32_t bdx = rotary_dim / vec_size;
+    uint32_t num_threads = 128U;
+    uint32_t bdy = num_threads / bdx;
+    uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+
+    void* args[] = {(void*)&q_rope_in,
+                    (void*)&k_rope_in,
+                    (void*)&q_nope_in,
+                    (void*)&k_nope_in,
+                    (void*)&q_rope_out,
+                    (void*)&k_rope_out,
+                    (void*)&q_nope_out,
+                    (void*)&k_nope_out,
+                    (void*)&cos_sin_cache,
+                    (void*)&pos_ids,
+                    (void*)&nnz,
+                    (void*)&num_heads,
+                    (void*)&q_rope_in_stride_n,
+                    (void*)&q_rope_in_stride_h,
+                    (void*)&q_nope_in_stride_n,
+                    (void*)&q_nope_in_stride_h,
+                    (void*)&q_rope_out_stride_n,
+                    (void*)&q_rope_out_stride_h,
+                    (void*)&q_nope_out_stride_n,
+                    (void*)&q_nope_out_stride_h,
+                    (void*)&k_rope_in_stride,
+                    (void*)&k_nope_in_stride,
+                    (void*)&k_rope_out_stride,
+                    (void*)&k_nope_out_stride,
+                    (void*)&quant_scale_q,
+                    (void*)&quant_scale_kv};
+    auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
+    dim3 nblks(nblks_x, num_heads + 8 + 1 + num_heads * 8);
+    dim3 nthrs(bdx, bdy);
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  });
+
+  return cudaSuccess;
+}
 
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(

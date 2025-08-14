@@ -313,7 +313,6 @@ def get_sampling_module():
         maybe_top_p_arr: Optional[torch.Tensor],
         top_p_val: float,
     ) -> torch.Tensor:
-        device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
@@ -343,7 +342,6 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
     ) -> torch.Tensor:
-        device = probs.device
         probs = probs.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         renorm_probs = torch.empty_like(probs)
@@ -371,7 +369,6 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
     ) -> torch.Tensor:
-        device = logits.device
         logits = logits.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)

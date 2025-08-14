@@ -213,8 +213,7 @@ if __name__ == "__main__":
     for idx, (p_q_lens, p_kv_lens, d_q_len, d_kv_len) in enumerate(
         zip(p_q_configs, p_kv_configs, d_q_len_configs, d_kv_len_configs)
     ):
-
-        print(f"===== Benchmark {idx+1}: (kv_len, qo_len) set =====")
+        print(f"===== Benchmark {idx + 1}: (kv_len, qo_len) set =====")
         run_bench(
             p_q_lens,
             p_kv_lens,

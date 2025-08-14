@@ -160,9 +160,9 @@ def test_moe_alltoall_multi_rank_single_gpu(
     """Test MOE alltoall communication with multiple ranks on single GPU."""
     torch.cuda.set_device(0)
     max_world_size = 8
-    assert (
-        world_size <= max_world_size
-    ), f"should run with world_size at most {max_world_size}"
+    assert world_size <= max_world_size, (
+        f"should run with world_size at most {max_world_size}"
+    )
 
     # SM count is now set up globally in the fixture
 
@@ -219,9 +219,9 @@ def test_moe_alltoall_multi_rank_single_gpu(
             padded_sorted_local_target_rank_ids, return_counts=True
         )
         local_send_counts = local_send_counts.to(torch.int32)
-        assert (
-            unique_target_rank_ids.numel() == world_size
-        ), "unique_target_rank_ids must be equal to world_size"
+        assert unique_target_rank_ids.numel() == world_size, (
+            "unique_target_rank_ids must be equal to world_size"
+        )
         local_send_counts -= 1  # remove padding
         local_send_cumsum = torch.cumsum(local_send_counts, dim=0).to(torch.int32)
         send_ids_all_ranks.append(local_send_id)

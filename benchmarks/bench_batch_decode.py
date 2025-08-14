@@ -75,7 +75,7 @@ def bench_batch_decode(
         f"batch_size={batch_size}, seq_len={seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_block_size={page_block_size}, q_dtype={q_dtype}, kv_dtype={kv_dtype}"
     )
     print(f"execution time: {ms}ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024 :.2f} GB/s")
+    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
 
 
 if __name__ == "__main__":

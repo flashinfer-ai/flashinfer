@@ -133,7 +133,7 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    'AOT-Build-Import': {
+    'AOT-Build-Import-x86-64': {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT')
       } catch (Throwable ex) {
@@ -145,6 +145,24 @@ stage('Unittest') {
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
           run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'AOT-Build-Import-aarch64': {
+      try {
+        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          // retry if we are currently at last build
+          // mark the current stage as success
+          // and try again via on demand node
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          run_unittest_CPU_AOT_COMPILE('ARM-LARGE')
         } else {
           echo 'Exit since it is not last build'
           throw ex

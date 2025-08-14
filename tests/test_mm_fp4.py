@@ -5,11 +5,8 @@ import torch.nn.functional as F
 from flashinfer import (
     SfLayout,
     autotune,
-    fp4_quantize,
     mm_fp4,
     nvfp4_quantize,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
 )
 
 
@@ -21,7 +18,6 @@ from flashinfer import (
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
-    sf_vec_size = 16
     if backend == "trtllm" and res_dtype == torch.float16:
         print("Skipping test for trtllm fp4 with float16")
         return

@@ -16,30 +16,33 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from ..artifacts import ArtifactPath
+from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
     AutoTuner,
-    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
-from ..fp4_quantization import nvfp4_block_scale_interleave
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
+from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
-from ..utils import _check_shape_dtype_device, register_custom_op, register_fake_op
+from ..utils import (
+    _check_shape_dtype_device,
+    device_support_pdl,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+    register_custom_op,
+    register_fake_op,
+)
 from .utils import (
-    compute_swizzled_sf_shape,
-    fp4_scale_infer_shape,
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
@@ -71,6 +74,56 @@ class WeightLayout(IntEnum):
     # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
     # where blockK is fixed at 128B
     BlockMajorK = 2
+
+
+def _maybe_get_cached_w3_w1_permute_indices(
+    _cache_permute_indices,
+    dst_w3_w1_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+        # Get permute indices and chain them together
+        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
+        if num_elts_per_sf is None:
+            permute1 = get_shuffle_matrix_a_row_indices(
+                dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m
+            )
+        else:
+            permute1 = get_shuffle_matrix_sf_a_row_indices(
+                dst_w3_w1_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            )
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+            dst_w3_w1_weight.device
+        )
+    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    return permute_indices
+
+
+def _maybe_get_cached_w2_permute_indices(
+    _cache_permute_indices,
+    dst_w2_weight: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Union[None, int] = None,
+) -> torch.Tensor:
+    if dst_w2_weight.shape not in _cache_permute_indices:
+        if num_elts_per_sf is None:
+            permute_indices = get_shuffle_matrix_a_row_indices(
+                dst_w2_weight, epilogue_tile_m
+            ).to(dst_w2_weight.device)
+        else:
+            permute_indices = get_shuffle_matrix_sf_a_row_indices(
+                dst_w2_weight,
+                epilogue_tile_m=epilogue_tile_m,
+                num_elts_per_sf=num_elts_per_sf,
+            ).to(dst_w2_weight.device)
+        # Memoize permute indices as recompute is **very** costly
+        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
+    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+    return permute_indices
 
 
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
@@ -181,10 +234,10 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         )
 
     except Exception as e:
-        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}")
+        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe_cutlass_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
@@ -270,7 +323,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 @functools.cache
 def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
-    module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
+    FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load(
         class_name="FusedMoeRunner"
     )
 
@@ -307,6 +360,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             use_w4a8_group_scaling: bool,
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
+            enable_pdl: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -323,6 +377,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             self.use_w4a8_group_scaling = use_w4a8_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.min_latency_mode = min_latency_mode
+            self.enable_pdl = enable_pdl
             instance_key = (
                 x_dtype,
                 weight_dtype,
@@ -333,16 +388,15 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = (
-                    torch.classes.fused_moe_sm100.FusedMoeRunner(
-                        x_dtype,
-                        weight_dtype,
-                        output_dtype,
-                        use_deepseek_fp8_block_scale,
-                        use_w4a8_group_scaling,
-                        use_mxfp8_act_scaling,
-                    )
+                MoERunner.runner_dict[instance_key] = FusedMoeRunner(
+                    x_dtype,
+                    weight_dtype,
+                    output_dtype,
+                    use_deepseek_fp8_block_scale,
+                    use_w4a8_group_scaling,
+                    use_mxfp8_act_scaling,
                 )
+
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_valid_tactics(
@@ -384,6 +438,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
                 gemm_idx,
                 tactic,
                 do_preparation,
+                self.enable_pdl,
             )
 
         @classmethod
@@ -428,7 +483,10 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
+        enable_pdl: Optional[bool] = None,
     ) -> List[torch.Tensor]:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
 
@@ -449,6 +507,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
@@ -504,6 +563,7 @@ def get_cutlass_fused_moe_sm100_module(use_fast_build: bool = False):
             enable_alltoall,
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
+            enable_pdl,
         )
 
         return result if min_latency_mode else [result]
@@ -582,6 +642,7 @@ def cutlass_fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -710,6 +771,8 @@ def cutlass_fused_moe(
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
     if use_mxfp8_act_scaling:
         raise NotImplementedError("mxfp8 not yet implemented for Blackwell.")
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
 
     num_rows = input.shape[0]
     if min_latency_mode:
@@ -748,6 +811,7 @@ def cutlass_fused_moe(
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -755,18 +819,21 @@ def cutlass_fused_moe(
 
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
-    debug_cubin_path = (
-        jit_env.FLASHINFER_INCLUDE_DIR
-        / "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/cubins"
-    )
-    import glob
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenBatchedGemmList` as the list of available kernels
+    # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
+    include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+    header_name = "flashinferMetaInfo"
 
-    debug_cubin_files = [
-        Path(p) for p in glob.glob(str(debug_cubin_path / "Bmm_*.cpp"))
-    ]
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
+    )
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
 
     return gen_jit_spec(
-        "fused_moe_sm100",
+        "fused_moe_trtllm_sm100",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
@@ -780,8 +847,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ]
-        + debug_cubin_files,
+        ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_ENABLE_CUDA",
@@ -793,6 +859,8 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         + sm100a_nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
+            # link "include" sub-directory in cache
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
@@ -829,8 +897,10 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function
         output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
@@ -852,6 +922,7 @@ def get_trtllm_moe_sm100_module():
             use_routing_scales_on_input,
             tile_tokens_dim,
             routing_method_type,
+            enable_pdl,
         )
         return output
 
@@ -907,8 +978,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -931,6 +1004,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             use_shuffled_weight,
             weight_layout,
+            enable_pdl,
         )
 
         return output
@@ -997,12 +1071,13 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
+        enable_pdl: Optional[bool] = None,
         output: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
-            assert (
-                topk_ids is not None
-            ), "either topk_ids or routing_logits must be provided."
+            assert topk_ids is not None, (
+                "either topk_ids or routing_logits must be provided."
+            )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
             routing_dtype = torch.bfloat16
         else:
@@ -1014,15 +1089,17 @@ def get_trtllm_moe_sm100_module():
 
         # workspace buffers required by trtllm-gen
         if topk_ids is None:
-            topk_ids = torch.zeros(
+            topk_ids = torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
             )
         if expert_weights is None:
-            expert_weights = torch.zeros(
+            expert_weights = torch.empty(
                 num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
             )
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
         if output is None:
-            output = torch.zeros(
+            output = torch.empty(
                 num_tokens,
                 hidden_size,
                 dtype=torch.bfloat16,
@@ -1060,6 +1137,7 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim,
             routing_method_type,
             do_finalize,
+            enable_pdl,
             output,
         )
 
@@ -1129,6 +1207,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     use_routing_scales_on_input: bool,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -1176,6 +1255,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input,
         tile_tokens_dim,
         routing_method_type,
+        enable_pdl,
     )
 
 
@@ -1200,6 +1280,7 @@ def trtllm_fp8_block_scale_moe(
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1247,6 +1328,7 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
+        enable_pdl,
     )
 
 
@@ -1390,6 +1472,7 @@ def trtllm_fp4_block_scale_routed_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
@@ -1472,5 +1555,6 @@ def trtllm_fp4_block_scale_routed_moe(
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
+        enable_pdl,
         output,
     )

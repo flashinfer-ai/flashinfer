@@ -51,12 +51,14 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
     out_dtype = (
         out_dtype
         if out_dtype
-        else dtype if dtype != torch.float8_e4m3fn else torch.bfloat16
+        else dtype
+        if dtype != torch.float8_e4m3fn
+        else torch.bfloat16
     )
 
-    assert (
-        c is None or c.dtype == out_dtype
-    ), "Incompatible dtypes between c and out_dtype"
+    assert c is None or c.dtype == out_dtype, (
+        "Incompatible dtypes between c and out_dtype"
+    )
 
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
@@ -132,12 +134,14 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
     out_dtype = (
         out_dtype
         if out_dtype
-        else dtype if dtype != torch.float8_e4m3fn else torch.bfloat16
+        else dtype
+        if dtype != torch.float8_e4m3fn
+        else torch.bfloat16
     )
 
-    assert (
-        c is None or c.dtype == out_dtype
-    ), "Incompatible dtypes between c and out_dtype"
+    assert c is None or c.dtype == out_dtype, (
+        "Incompatible dtypes between c and out_dtype"
+    )
 
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=out_dtype) if c is None else c
@@ -221,7 +225,9 @@ def gemm_descriptor_persistent(
     out_dtype = (
         out_dtype
         if out_dtype
-        else dtype if dtype != torch.float8_e4m3fn else torch.bfloat16
+        else dtype
+        if dtype != torch.float8_e4m3fn
+        else torch.bfloat16
     )
 
     # check on TMA tensor map swizzling granularity

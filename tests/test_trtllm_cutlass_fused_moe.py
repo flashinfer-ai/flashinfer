@@ -18,7 +18,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-import flashinfer
 import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
 
@@ -510,7 +509,6 @@ def test_moe_expert_parallel(
 
     # Create input tensors
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
-    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
 
     # Create weight tensors - each GPU will have one expert
     w31_weight = (
@@ -606,7 +604,6 @@ def test_moe_tensor_parallel(
     top_k = 2
     # Create input tensors
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
-    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
 
     # Create weight tensors
     w31_weight = (
@@ -712,7 +709,6 @@ def test_moe_tensor_expert_parallel(
     """
     torch.manual_seed(42)
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
-    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
     w31_weight = (
         torch.randn(
             num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
@@ -815,7 +811,6 @@ def per_block_cast_to_fp8(
     x: torch.Tensor, block_size_n: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
-    old_shape = x.shape
     m, n = x.shape
     x_padded = torch.zeros(
         (ceil_div(m, 128) * 128, ceil_div(n, block_size_n) * block_size_n),
@@ -835,7 +830,7 @@ def per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=torch.float8_e4m3f
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch."""
     assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot " "be divisible by `group_size`"
+        "the last dimension of `x` cannot be divisible by `group_size`"
     )
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -891,9 +886,7 @@ def dequantize_block(
         scales = scales.view(batch_size, num_blocks, 1).expand(-1, -1, 128)
         scales = scales[:, :, : hidden_size % 128] if hidden_size % 128 != 0 else scales
     else:  # For weight tensors [..., in_dim, out_dim]
-        *dims, in_dim, out_dim = x_quant.shape
-        num_blocks_in = (in_dim + 127) // 128
-        num_blocks_out = (out_dim + 127) // 128
+        *_dims, in_dim, out_dim = x_quant.shape
 
         # Transform both dimensions
         scales = transform_dim(scales, -1)  # Last dim
@@ -932,11 +925,9 @@ def test_moe_fp8_block_scaling(
         Only support bf16 for hidden_states
     """
     torch.manual_seed(42)
-    block_size = 128
     otype = torch.bfloat16
 
     x = torch.randn(batch_size, hidden_size, dtype=otype).cuda()
-    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
 
     w31_weight = (
         torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda()
@@ -956,7 +947,7 @@ def test_moe_fp8_block_scaling(
     routing_weights = F.softmax(routing_weights, dim=1)
 
     # Run reference implementation (no quantization)
-    ref_output = compute_with_experts(
+    _ref_output = compute_with_experts(
         num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
     )
 
@@ -995,7 +986,7 @@ def test_moe_fp8_block_scaling(
     w2_dequant = dequantize_block(w2_quant, w2_scales, w2_weight.dtype, w2_weight.shape)
 
     # Run reference implementation with dequantized tensors
-    ref_output = compute_with_experts(
+    _ref_output = compute_with_experts(
         num_experts,
         x_dequant,
         w31_dequant,

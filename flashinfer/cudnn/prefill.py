@@ -1,4 +1,3 @@
-import functools
 from enum import Enum
 from typing import Optional
 
@@ -10,7 +9,7 @@ try:
     import cudnn
 
     CUDNN_AVAILABLE = True
-except Exception as e:
+except Exception:
     cudnn = None
     CUDNN_AVAILABLE = False
 
@@ -73,7 +72,6 @@ def _sdpa_prefill_key_fn(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ):
-
     graph_b = actual_seq_lens_q.shape[0]
 
     if q.dim() == 3:
@@ -160,9 +158,9 @@ if CUDNN_AVAILABLE:
                 cudnn_q.set_ragged_offset(ragged_q)
 
             if v_cache.dim() == 3:
-                assert (
-                    block_tables is None
-                ), "block_tables needs 4 dimensions of kv cache"
+                assert block_tables is None, (
+                    "block_tables needs 4 dimensions of kv cache"
+                )
                 h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
             elif v_cache.dim() == 4:
                 h_kv, d_vo = (
@@ -171,10 +169,6 @@ if CUDNN_AVAILABLE:
                 )
             else:
                 raise ValueError(f"Invalid kv cache tensor shape: {k_cache.shape}")
-
-            page_size = None
-            if block_tables is not None:
-                page_size = k_cache.shape[2]
 
             if k_cache.dim() == 3:
                 cudnn_k_cache = g.tensor(
@@ -202,7 +196,6 @@ if CUDNN_AVAILABLE:
                     cudnn_v_cache.set_ragged_offset(ragged_v)
 
             elif k_cache.dim() == 4:
-
                 cudnn_k_cache = g.tensor(
                     name="k_cache",
                     dim=k_cache.shape,
@@ -286,18 +279,14 @@ if CUDNN_AVAILABLE:
                 [graph_b, h_qo, graph_s_qo, d_vo]
             ).set_stride(
                 [graph_s_qo * d_vo * h_qo, d_vo, d_vo * h_qo, 1]
-            ).set_data_type(
-                cudnn.data_type.BFLOAT16
-            )
+            ).set_data_type(cudnn.data_type.BFLOAT16)
 
             if return_lse:
                 Stats.set_uid(UIDs.STATS_UID.value).set_output(
                     return_lse
                 ).set_data_type(cudnn.data_type.FLOAT).set_dim(
                     [graph_b, h_qo, graph_s_qo, 1]
-                ).set_stride(
-                    [graph_s_qo * h_qo, 1, h_qo, 1]
-                )
+                ).set_stride([graph_s_qo * h_qo, 1, h_qo, 1])
 
             tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
             if return_lse:
@@ -333,7 +322,6 @@ def _batch_prefill_with_kv_cache(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-
     graph, tensors = _build_prefill_graph(
         q=q,
         k_cache=k_cache,
@@ -463,9 +451,9 @@ def cudnn_batch_prefill_with_kv_cache(
         h_qo, d_qk = q.shape[1], q.shape[3]
 
     if v_cache.dim() == 3:
-        h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
+        d_vo = v_cache.shape[2]
     elif v_cache.dim() == 4:
-        h_kv, d_vo = v_cache.shape[1], v_cache.shape[3]
+        d_vo = v_cache.shape[3]
 
     if return_lse:
         if lse is None:
@@ -509,12 +497,13 @@ def cudnn_batch_prefill_with_kv_cache(
             lse=lse,
         )
     else:
-
         assert return_lse, "Currently only supports return_lse = True"
 
         assert (d_qk == 192 and block_tables is None) or (
             d_qk == 128 and block_tables is not None
-        ), "Currently only supports if d_qk = 192 and block_tables is None or d_qk = 128 and block_tables is not None"
+        ), (
+            "Currently only supports if d_qk = 192 and block_tables is None or d_qk = 128 and block_tables is not None"
+        )
 
         if max_sequence_kv is None:
             max_sequence_kv = max_token_per_sequence

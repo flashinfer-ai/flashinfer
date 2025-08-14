@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import math
 import os
+import importlib.util
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -23,6 +25,8 @@ import torch
 import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+
+from .jit import gen_jit_spec, env as jit_env
 
 IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
@@ -205,6 +209,7 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
         )
 
 
+@functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
@@ -609,9 +614,9 @@ def get_shuffle_matrix_a_row_indices(
     - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
     - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
     """
-    assert (
-        input_tensor.dim() == 2
-    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    assert input_tensor.dim() == 2, (
+        f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    )
 
     # M, K from the input
     M, K = input_tensor.shape
@@ -620,9 +625,9 @@ def get_shuffle_matrix_a_row_indices(
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
     row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert (
-        M % shuffle_block_size == 0
-    ), f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
+    assert M % shuffle_block_size == 0, (
+        f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
+    )
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -644,13 +649,12 @@ def get_shuffle_matrix_a_row_indices(
 def get_shuffle_matrix_sf_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
 ) -> torch.Tensor:
-
     assert input_tensor.dtype == torch.uint8
     assert num_elts_per_sf == 16
 
-    assert (
-        input_tensor.dim() == 2
-    ), f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    assert input_tensor.dim() == 2, (
+        f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
+    )
 
     # M, K from the input
     M, K = input_tensor.shape
@@ -660,3 +664,10 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+def is_cute_dsl_available() -> bool:
+    return (
+        importlib.util.find_spec("cutlass") is not None
+        and importlib.util.find_spec("cutlass.cute") is not None
+    )

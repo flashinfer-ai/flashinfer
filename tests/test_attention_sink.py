@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import math
-from typing import Optional
 
 import pytest
 import torch
@@ -567,6 +566,7 @@ def test_attention_sink_incremental_generation(
 
     sink = torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5
 
+    k_accumulated = v_accumulated = None
     # Simulate incremental generation process
     for step in range(num_generation_steps):
         current_kv_len = initial_seq_len + step
@@ -1232,8 +1232,8 @@ def test_attention_sink_varlen(
 
     print(
         f"Variable length test passed: {description}, batch_size={batch_size}, "
-        f"qo_lens={[qo_indptr[i+1]-qo_indptr[i] for i in range(batch_size)]}, "
-        f"kv_lens={[kv_indptr[i+1]-kv_indptr[i] for i in range(batch_size)]}, "
+        f"qo_lens={[qo_indptr[i + 1] - qo_indptr[i] for i in range(batch_size)]}, "
+        f"kv_lens={[kv_indptr[i + 1] - kv_indptr[i] for i in range(batch_size)]}, "
         f"causal={causal}"
     )
 

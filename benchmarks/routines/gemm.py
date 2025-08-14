@@ -1,4 +1,3 @@
-import argparse
 from collections import defaultdict
 
 import numpy as np
@@ -172,7 +171,7 @@ def testGemmFp8NtGroupwise(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testGemmFp8NtGroupwise")
+        print("[INFO] Running testGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -195,7 +194,7 @@ def testGemmFp8NtGroupwise(args):
 
     if "trtllm" in backends:
         remove_trtllm = True
-        print(f"[INFO] trtllm backend testing not supported yet")
+        print("[INFO] trtllm backend testing not supported yet")
         if remove_trtllm:
             backends.remove("trtllm")
 
@@ -366,7 +365,7 @@ def testGroupGemmFp8NtGroupwise(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testGroupGemmFp8NtGroupwise")
+        print("[INFO] Running testGroupGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -544,7 +543,7 @@ def testBmmFp8(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testBmmFp8")
+        print("[INFO] Running testBmmFp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -652,7 +651,7 @@ def testBmmFp8(args):
         if run_refcheck and has_reference_output:
             if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 print(
-                    f"[INFO] Reference output is FP8. Converting to float32 for reference check."
+                    "[INFO] Reference output is FP8. Converting to float32 for reference check."
                 )
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
@@ -724,7 +723,7 @@ def testMmFp4(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print(f"[INFO] Running testMmFp4")
+        print("[INFO] Running testMmFp4")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -750,27 +749,27 @@ def testMmFp4(args):
     if "trtllm" in backends:
         remove_trtllm = False
         if res_dtype == torch.float16:
-            print(f"[INFO] trtllm backend does not suppot float16 output")
+            print("[INFO] trtllm backend does not suppot float16 output")
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
     if "cutlass" in backends:
         remove_cutlass = False
         if not use_128x4_sf_layout:
-            print(f"[INFO] cutlass backend does not suppot use_128x4_sf_layout=False")
+            print("[INFO] cutlass backend does not suppot use_128x4_sf_layout=False")
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
     if "cudnn" in backends:
         remove_cudnn = False
         if not use_128x4_sf_layout:
-            print(f"[INFO] cudnn backend does not suppot use_128x4_sf_layout=False")
+            print("[INFO] cudnn backend does not suppot use_128x4_sf_layout=False")
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
 
     if len(backends) == 0:
-        print(f"[ERROR] No backends to test. Exiting.")
+        print("[ERROR] No backends to test. Exiting.")
         return
 
     input = torch.randn([m, k], device=device, dtype=torch.bfloat16)

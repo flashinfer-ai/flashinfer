@@ -21,9 +21,8 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_decode_with_kv_cache
+from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
-    cudnn_fmha_gen_module,
     gen_batch_decode_mla_module,
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -58,6 +57,7 @@ from .utils import (
     canonicalize_torch_dtype,
     device_support_pdl,
     get_device_sm_count,
+    is_float8,
     register_custom_op,
     register_fake_op,
 )
@@ -593,7 +593,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> max_num_pages = 128
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
-    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -658,7 +658,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        float_workspace_buffer : torch.Tensor
+        float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
@@ -1192,10 +1192,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
-            stride_n = k_cache.stride(1)
         else:
             page_size = k_cache.shape[2]
-            stride_n = k_cache.stride(2)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -1290,6 +1288,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cached_module.paged_run(*run_args)
         else:
+            # trtllm-gen does not need plan info
+            if self._backend == "trtllm-gen" and self._plan_info is None:
+                plan_info: List[int] = []
+            else:
+                plan_info = self._plan_info
+            assert plan_info is not None, "plan info is not initialized"
+
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1321,8 +1326,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module.run(*run_args)
         if v_scale is not None:
             # TODO(Zihao): fused into kernel
-            if out.itemsize == 1:
-                out = (out.to(float) * v_scale).to(out.dtype)
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
             else:
                 out *= v_scale
 
@@ -2002,7 +2007,7 @@ def trtllm_batch_decode_with_kv_cache(
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
 
-    workspace_buffer : torch.Tensor
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
     block_tables : torch.Tensor
@@ -2051,9 +2056,9 @@ def trtllm_batch_decode_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert (
-                kv_cache.shape[1] == 2
-            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -2062,9 +2067,9 @@ def trtllm_batch_decode_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert (
-            query.dtype == torch.float8_e4m3fn
-        ), "query must be fp8 when out_dtype is nvfp4."
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
@@ -2200,7 +2205,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
     qk_rope_head_dim: qk_rope_head_dim, must be 64

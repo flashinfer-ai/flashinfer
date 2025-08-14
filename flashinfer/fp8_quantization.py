@@ -1,14 +1,13 @@
 import functools
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
-from .utils import register_custom_op, register_fake_op
+from .utils import device_support_pdl, register_custom_op, register_fake_op
 
 
 def gen_mxfp8_quantization_sm100_module() -> JitSpec:
@@ -50,13 +49,17 @@ def get_mxfp8_quantization_sm100_module():
     def mxfp8_quantize_sm100(
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to MxFP8 format.
 
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+            alignment (int, optional): sfVecSize. Defaults to 32. Note that alignment is not used in the host kernel.
+            enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+                If None, automatically detects based on device capability. Defaults to None.
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
                 - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -68,9 +71,13 @@ def get_mxfp8_quantization_sm100_module():
                 is_sf_swizzled_layout,
             )
         else:
+            if enable_pdl is None:
+                enable_pdl = device_support_pdl(input.device)
             return module.mxfp8_quantize(
                 input,
                 is_sf_swizzled_layout,
+                alignment,
+                enable_pdl,
             )
 
     @register_fake_op("flashinfer::mxfp8_quantize_sm100")
@@ -127,6 +134,8 @@ def get_mxfp8_quantization_sm100_module():
 def mxfp8_quantize(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -136,7 +145,9 @@ def mxfp8_quantize(
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-
+        alignment (int, optional): sfVecSize. Defaults to 32.
+        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+            If None, automatically detects based on device capability. Defaults to None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -145,11 +156,14 @@ def mxfp8_quantize(
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
         input,
         is_sf_swizzled_layout,
+        alignment,
+        enable_pdl,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     return x_q, sf
 
 

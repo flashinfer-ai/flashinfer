@@ -127,7 +127,7 @@ class GitHubRepo:
         except error.HTTPError as e:
             msg = str(e)
             error_data = e.read().decode()
-            raise RuntimeError(f"Error response: {msg}\n{error_data}")
+            raise RuntimeError(f"Error response: {msg}\n{error_data}") from e
 
         logging.info(f"Got response from {full_url}: {content}")
         try:

@@ -1,4 +1,3 @@
-import functools
 from enum import Enum
 from typing import Optional
 
@@ -112,8 +111,6 @@ if CUDNN_AVAILABLE:
             assert s_qo == 1, "q must have a sequence length of 1"
             assert k_cache.dim() == 4, "k_cache must have 4 dimensions"
 
-            h_kv = k_cache.shape[1]
-            s_kv = max_sequence_kv
             d_vo = v_cache.shape[3]
 
             cudnn_q = g.tensor(
@@ -214,7 +211,6 @@ def _batch_decode_with_kv_cache(
     batch_offsets_v: Optional[torch.Tensor] = None,
     out: torch.Tensor,
 ) -> torch.Tensor:
-
     graph, tensors = _build_decode_graph(
         q=q,
         k_cache=k_cache,

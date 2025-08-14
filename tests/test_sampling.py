@@ -532,18 +532,6 @@ def test_chain_speculative_sampling(
                     assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
 
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
-        batch_indices = torch.arange(batch_size, device=normalized_draft_prob.device)[
-            :, None
-        ]
-        probs_indicies = torch.arange(
-            num_speculate_tokens, device=normalized_draft_prob.device
-        )
-        selected_draft_probs = normalized_draft_prob[
-            batch_indices, probs_indicies, draft_token_ids
-        ]
-        selected_target_probs = target_onehot_prob[
-            batch_indices, probs_indicies, draft_token_ids
-        ]
 
 
 if __name__ == "__main__":

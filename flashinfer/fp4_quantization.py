@@ -16,9 +16,8 @@ limitations under the License.
 
 import functools
 from enum import Enum
-from functools import cache
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -26,6 +25,7 @@ from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import (
+    device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
@@ -106,6 +106,7 @@ def get_fp4_quantization_sm100_module():
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
+        enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
@@ -116,12 +117,16 @@ def get_fp4_quantization_sm100_module():
             sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
             is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
             is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
+            enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+                If None, automatically detects based on device capability. Defaults to None.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
                 - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
                 - Scale factors tensor with shape determined by layout and sf_vec_size
         """
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
         return module.fp4_quantize(
             input,
             global_scale,
@@ -129,6 +134,7 @@ def get_fp4_quantization_sm100_module():
             sf_use_ue8m0,
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
+            enable_pdl,
         )
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
@@ -237,6 +243,7 @@ def fp4_quantize(
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -250,6 +257,8 @@ def fp4_quantize(
         sf_use_ue8m0 (bool, optional): Whether to use UE8M0 format for scale factors. Defaults to False.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
         is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
+        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+            If None, automatically detects based on device capability. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -271,6 +280,8 @@ def fp4_quantize(
         input = input.transpose(-2, -1)
 
     assert input.shape[-1] % sf_vec_size == 0
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
         global_scale,
@@ -278,6 +289,7 @@ def fp4_quantize(
         sf_use_ue8m0,
         is_sf_swizzled_layout,
         is_sf_8x4_layout,
+        enable_pdl,
     )
     sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     if is_column_major:
@@ -303,9 +315,9 @@ def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
         AssertionError: If input dtype is not uint8.
     """
     # TODO(shuw): check input dtype is uint8
-    assert (
-        unswizzled_sf.dtype == torch.uint8
-    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert unswizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    )
     return get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
         unswizzled_sf,
     )
@@ -391,7 +403,12 @@ class SfLayout(Enum):
 
 
 def nvfp4_quantize(
-    a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False, sf_vec_size=16
+    a,
+    a_global_sf,
+    sfLayout=SfLayout.layout_128x4,
+    do_shuffle=False,
+    sf_vec_size=16,
+    enable_pdl=None,
 ):
     """
     Quantize input tensor to NVFP4 format.
@@ -402,6 +419,8 @@ def nvfp4_quantize(
         sfLayout (SfLayout, optional): Scale factor layout. Defaults to SfLayout.layout_128x4.
         do_shuffle (bool, optional): Whether to shuffle the scale factors. Defaults to False. Only TRTLLM backend needs to shuffle the tensor B scale factors.
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
+            If None, automatically detects based on device capability. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -418,6 +437,7 @@ def nvfp4_quantize(
             sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
             is_sf_8x4_layout=False,
+            enable_pdl=enable_pdl,
         )
 
         epilogue_tile_m = 128
@@ -435,6 +455,7 @@ def nvfp4_quantize(
             sf_use_ue8m0=False,
             is_sf_swizzled_layout=True,
             is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
+            enable_pdl=enable_pdl,
         )
 
     return a_fp4, a_sf
