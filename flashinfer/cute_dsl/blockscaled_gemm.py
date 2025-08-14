@@ -48,7 +48,7 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-
+from flashinfer.utils import get_cutlass_dtype
 
 class MaskedSchedulerParams:
     def __init__(
@@ -2704,19 +2704,6 @@ class MaskedBatchedMatmulCuteDSL:
         return c_tensor_gpu
 
 
-def _dtype_to_cutlass_dtype(dtype: str) -> cutlass.dtype:
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float32": cutlass.Float32,
-        "float8_e5m2": cutlass.Float8E5M2,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
-        "float4_e2m1fn": cutlass.Float4E2M1FN,
-    }
-    return dtype_map[dtype]
-
-
 def grouped_gemm_nt_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -2777,10 +2764,10 @@ def grouped_gemm_nt_masked(
         a_major="k",
         b_major="k",
         c_major="n",
-        ab_dtype=_dtype_to_cutlass_dtype(ab_dtype),
-        sf_dtype=_dtype_to_cutlass_dtype(sf_dtype),
+        ab_dtype=get_cutlass_dtype(ab_dtype),
+        sf_dtype=get_cutlass_dtype(sf_dtype),
         sf_vec_size=sf_vec_size,
-        c_dtype=_dtype_to_cutlass_dtype(c_dtype),
+        c_dtype=get_cutlass_dtype(c_dtype),
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         a_tensor_gpu=a_torch,

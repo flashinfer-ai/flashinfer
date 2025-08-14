@@ -12,15 +12,15 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from flashinfer.cute_dsl.blockscaled_gemm import (
-    _dtype_to_cutlass_dtype,
-    grouped_gemm_nt_masked,
-)
+from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 from flashinfer.cute_dsl.blockscaled_gemm import (
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
 )
 from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
-from flashinfer.utils import is_cute_dsl_available
+from flashinfer.utils import (
+    get_cutlass_dtype,
+    is_cute_dsl_available,
+)
 
 
 # todo(Yingyi): complete this test for target python interface
@@ -76,10 +76,10 @@ def test_blockscaled_gemm_python_interface(
     l, m = lm
     k, n = kn
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-        _dtype_to_cutlass_dtype(ab_dtype),
-        _dtype_to_cutlass_dtype(sf_dtype),
+        get_cutlass_dtype(ab_dtype),
+        get_cutlass_dtype(sf_dtype),
         sf_vec_size,
-        _dtype_to_cutlass_dtype(c_dtype),
+        get_cutlass_dtype(c_dtype),
         mma_tiler_mn,
         cluster_shape_mn,
         m,
@@ -141,28 +141,28 @@ def test_blockscaled_gemm_python_interface(
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref,
-        _dtype_to_cutlass_dtype(ab_dtype),
+        get_cutlass_dtype(ab_dtype),
         is_dynamic_layout=True,
         assumed_align=16,
     )
     b_tensor, b_torch = cutlass_torch.cute_tensor_like(
         b_ref,
-        _dtype_to_cutlass_dtype(ab_dtype),
+        get_cutlass_dtype(ab_dtype),
         is_dynamic_layout=True,
         assumed_align=16,
     )
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
         c_ref,
-        _dtype_to_cutlass_dtype(c_dtype),
+        get_cutlass_dtype(c_dtype),
         is_dynamic_layout=True,
         assumed_align=16,
     )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-        l, m, k, sf_vec_size, _dtype_to_cutlass_dtype(sf_dtype)
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, _dtype_to_cutlass_dtype(sf_dtype)
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
@@ -213,7 +213,7 @@ def test_blockscaled_gemm_python_interface(
         ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(
             leading_dim=1
         )
-        ref_f8.element_type = _dtype_to_cutlass_dtype(c_dtype)
+        ref_f8.element_type = get_cutlass_dtype(c_dtype)
         ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
         ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
             leading_dim=1
