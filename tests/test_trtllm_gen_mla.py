@@ -17,6 +17,7 @@ global_workspace_buffer = None
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("q_len_per_request", [1, 2])
 @pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
@@ -24,6 +25,7 @@ def test_trtllm_batch_decode_mla(
     page_size: int,
     q_len_per_request: int,
     dynamic_scale: bool,
+    enable_pdl: bool,
 ):
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
@@ -128,6 +130,7 @@ def test_trtllm_batch_decode_mla(
         bmm2_scale=1.0,
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
+        enable_pdl=enable_pdl,
     )
 
     # Run reference attention and align output
