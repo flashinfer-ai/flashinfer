@@ -1568,9 +1568,62 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   temp_storage.max_val = 0;
   vec_t<float, VEC_SIZE> probs_vec;
 
-  float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
-                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
-                                                                                  temp_storage);
+  // Shared scalar to broadcast row sum for fast path
+  __shared__ float s_row_sum;
+
+  // Fast-path: when p >= 1.0 (e.g., p == 1.0), perform simple sum and normalization
+  if (p >= 1.0f) {
+    // Stage A: per-thread float accumulation over assigned lanes (vectorized)
+    float thread_sum = 0.0f;
+    const uint32_t num_iters = ceil_div(d, BLOCK_THREADS * VEC_SIZE);
+    for (uint32_t i = 0; i < num_iters; ++i) {
+      probs_vec.fill(0.0f);
+      const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+      if (base_idx < d) {
+        probs_vec.cast_load(probs + row_idx * d + base_idx);
+      }
+      #pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        const uint32_t idx = base_idx + j;
+        if (idx < d) thread_sum += probs_vec[j];
+      }
+    }
+
+    // Block reduce (float)
+    float row_sum = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum(thread_sum);
+    // Broadcast via shared
+    if (tx == 0) s_row_sum = row_sum;
+    __syncthreads();
+    row_sum = s_row_sum;
+
+    // Guard against zero sum
+    const float denom = (row_sum <= 1e-8f) ? 1.0f : row_sum;
+    const float normalizer = math::ptx_rcp(denom);
+
+    // Stage B: normalize and store
+    for (uint32_t i = 0; i < num_iters; ++i) {
+      probs_vec.fill(0.0f);
+      const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+      if (base_idx < d) {
+        probs_vec.cast_load(probs + row_idx * d + base_idx);
+      }
+      #pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        const uint32_t idx = base_idx + j;
+        float v = probs_vec[j];
+        probs_vec[j] = (idx < d) ? (v * normalizer) : 0.0f;
+      }
+      if (base_idx < d) {
+        probs_vec.cast_store(renormed_prob + row_idx * d + base_idx);
+      }
+    }
+    return; // Exit after fast-path processing
+  }
+
+  // Original Top-P renormalization logic
+  temp_storage.max_val = 0;
+  float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM, RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
+      probs, row_idx, d, temp_storage);
 
   double low = 0, high = max_val;
   float min_gt_low, max_le_high;
