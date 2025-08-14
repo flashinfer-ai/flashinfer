@@ -17,11 +17,9 @@ limitations under the License.
 import functools
 import math
 import os
-import importlib.util
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
-import cutlass
 import torch
 import torch.version
 from torch.torch_version import TorchVersion
@@ -667,21 +665,3 @@ def get_shuffle_matrix_sf_a_row_indices(
     return row_indices
 
 
-def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float32": cutlass.Float32,
-        "float8_e5m2": cutlass.Float8E5M2,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
-        "float4_e2m1fn": cutlass.Float4E2M1FN,
-    }
-    return dtype_map[dtype]
-
-
-def is_cute_dsl_available() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )

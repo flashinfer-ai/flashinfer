@@ -17,7 +17,7 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
 )
 from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
-from flashinfer.utils import (
+from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     is_cute_dsl_available,
 )

@@ -48,7 +48,7 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from flashinfer.utils import get_cutlass_dtype
+from flashinfer.cute_dsl.utils import get_cutlass_dtype
 
 
 class MaskedSchedulerParams:
