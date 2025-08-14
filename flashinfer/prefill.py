@@ -3241,6 +3241,8 @@ def trtllm_batch_context_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        assert isinstance(out, torch.Tensor)
+
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
         _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
 
