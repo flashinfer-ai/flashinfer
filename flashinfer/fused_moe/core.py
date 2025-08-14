@@ -1121,9 +1121,9 @@ def get_trtllm_moe_sm100_module():
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
             )
-            assert (
-                hidden_states_scale is None
-                or hidden_states_scale.shape[0] == num_tokens
+            assert hidden_states_scale is None or (
+                hidden_states_scale.dim() == 2
+                and hidden_states_scale.shape[0] == num_tokens
             ), "hidden_states_scale's first dimension must be batch size"
 
             # TODO(siyuan): support fp8
