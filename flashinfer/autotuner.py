@@ -387,6 +387,7 @@ class AutoTuner:
                 custom_op, r, input_shapes, tuning_config
             )
             from . import env as env_cfg
+
             if (
                 env_cfg.FLASHINFER_AUTOTUNER_LOAD_FROM_FILE == "1"
                 and not self.is_tuning_mode

@@ -19,7 +19,7 @@ import json
 import os
 import pathlib
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class EnvConfig:
@@ -30,7 +30,7 @@ class EnvConfig:
 
     def __getattr__(self, name: str) -> Any:
         """Enable attribute-style access to environment variables."""
-        if name.startswith('_'):
+        if name.startswith("_"):
             # Private attributes use normal Python attribute access
             return object.__getattribute__(self, name)
         if name in self._env_dict:
@@ -66,115 +66,115 @@ DEFAULT_CONFIG = {
             "FLASHINFER_WORKSPACE_BASE": {
                 "description": "Base directory for FlashInfer workspace.",
                 "default": "~",
-                "type": "path"
+                "type": "path",
             }
         },
         "cubin": {
             "FLASHINFER_CUBIN_DIR": {
                 "description": "Directory for compiled CUDA binaries. Defaults to <CACHE_DIR>/cubins.",
                 "default": None,
-                "type": "path"
+                "type": "path",
             },
             "FLASHINFER_CUBIN_CHECKSUM_DISABLED": {
-                "description": "Disable checksum verification (\"1\" = disabled, \"0\" = enabled).",
+                "description": 'Disable checksum verification ("1" = disabled, "0" = enabled).',
                 "default": "0",
-                "type": "string_boolean"
+                "type": "string_boolean",
             },
             "FLASHINFER_CUBINS_REPOSITORY": {
                 "description": "Repository URL for downloading prebuilt cubins.",
                 "default": None,
-                "type": "url"
-            }
+                "type": "url",
+            },
         },
         "autotuner": {
             "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE": {
-                "description": "Load autotuner config from file (\"1\" = enabled, \"0\" = disabled).",
+                "description": 'Load autotuner config from file ("1" = enabled, "0" = disabled).',
                 "default": "0",
-                "type": "string_boolean"
+                "type": "string_boolean",
             }
         },
         "logging": {
             "FLASHINFER_JIT_VERBOSE": {
-                "description": "Enable verbose JIT compilation logging (\"1\" = enabled, \"0\" = disabled).",
+                "description": 'Enable verbose JIT compilation logging ("1" = enabled, "0" = disabled).',
                 "default": "0",
-                "type": "string_boolean"
+                "type": "string_boolean",
             }
         },
         "build": {
             "FLASHINFER_EXTRA_LDFLAGS": {
                 "description": "Extra linker flags for compilation (space-separated).",
                 "default": None,
-                "type": "string"
+                "type": "string",
             },
             "FLASHINFER_BUILDING_DOCS": {
-                "description": "Documentation building mode (\"1\" = docs build, \"0\" = normal).",
+                "description": 'Documentation building mode ("1" = docs build, "0" = normal).',
                 "default": "0",
-                "type": "string_boolean"
-            }
+                "type": "string_boolean",
+            },
         },
         "nvshmem": {
             "NVSHMEM_INCLUDE_PATH": {
                 "description": "Include paths for NVSHMEM headers.",
                 "default": None,
                 "type": "path_list",
-                "separator": ":"
+                "separator": ":",
             },
             "NVSHMEM_LIBRARY_PATH": {
                 "description": "Library paths for NVSHMEM.",
                 "default": None,
                 "type": "path_list",
-                "separator": ":"
+                "separator": ":",
             },
             "NVSHMEM_LDFLAGS": {
                 "description": "Additional linker flags for NVSHMEM (space-separated).",
                 "default": "",
-                "type": "string"
-            }
+                "type": "string",
+            },
         },
         "toolchain": {
             "CC": {
                 "description": "C compiler executable.",
                 "default": None,
-                "type": "string"
+                "type": "string",
             },
             "CXX": {
                 "description": "C++ compiler executable.",
                 "default": "c++",
-                "type": "string"
+                "type": "string",
             },
             "PYTORCH_NVCC": {
                 "description": "Path to NVCC for PyTorch CUDA extensions.",
                 "default": "$cuda_home/bin/nvcc",
-                "type": "path"
-            }
+                "type": "path",
+            },
         },
         "cuda": {
             "CUDA_LIB_PATH": {
                 "description": "Path to CUDA library directory.",
                 "default": "/usr/local/cuda/targets/x86_64-linux/lib/",
-                "type": "path"
+                "type": "path",
             },
             "TORCH_CUDA_ARCH_LIST": {
-                "description": "CUDA architectures for compilation (e.g., \"7.5,8.0,8.6\").",
+                "description": 'CUDA architectures for compilation (e.g., "7.5,8.0,8.6").',
                 "default": None,
-                "type": "string"
-            }
+                "type": "string",
+            },
         },
         "trtllm": {
             "TRTLLM_FORCE_MNNVL_AR": {
-                "description": "Force TensorRT-LLM MNNVL AR mode (\"1\" = enabled, \"0\" = disabled).",
+                "description": 'Force TensorRT-LLM MNNVL AR mode ("1" = enabled, "0" = disabled).',
                 "default": "0",
-                "type": "string_boolean"
+                "type": "string_boolean",
             }
-        }
+        },
     },
     "type_definitions": {
         "string": "UTF-8 string value.",
         "url": "String containing a valid URL.",
         "path": "Filesystem path (expanded for ~ and env vars).",
         "path_list": "List of filesystem paths joined by the specified separator.",
-        "string_boolean": "String '0' (false) or '1' (true)."
-    }
+        "string_boolean": "String '0' (false) or '1' (true).",
+    },
 }
 
 
@@ -207,7 +207,9 @@ def _extract_env_values(config: Dict) -> Dict[str, Any]:
                                 if value == "~":
                                     value = str(pathlib.Path.home())
                                 elif "$cuda_home" in value:
-                                    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+                                    cuda_home = os.environ.get(
+                                        "CUDA_HOME", "/usr/local/cuda"
+                                    )
                                     value = value.replace("$cuda_home", cuda_home)
                             env_dict[var_name] = value
 
@@ -254,7 +256,10 @@ def initialize_env_config():
             with open(cached_config_path, "w") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2)
         except (IOError, OSError) as e:
-            print(f"Warning: Could not create default config at {cached_config_path}: {e}", file=sys.stderr)
+            print(
+                f"Warning: Could not create default config at {cached_config_path}: {e}",
+                file=sys.stderr,
+            )
 
     # Attempt to load existing configuration
     config = None
@@ -262,7 +267,10 @@ def initialize_env_config():
         with open(cached_config_path, "r") as f:
             config = json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        print(f"Warning: Failed to load config from {cached_config_path}: {e}", file=sys.stderr)
+        print(
+            f"Warning: Failed to load config from {cached_config_path}: {e}",
+            file=sys.stderr,
+        )
         config = DEFAULT_CONFIG
 
     if config is None:

@@ -5,7 +5,6 @@ MNNVL (Multi-Node NVLink) communication operations for FlashInfer.
 
 import functools
 import math
-import os
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -157,6 +156,7 @@ def get_allreduce_mnnvl_workspace(
         - int: Maximum number of elements that can fit in buffer
     """
     from .. import env as env_cfg
+
     force_mn = env_cfg.TRTLLM_FORCE_MNNVL_AR == "1"
 
     # buffer shape: [3, 2, buffer_tokens, hidden_dim]

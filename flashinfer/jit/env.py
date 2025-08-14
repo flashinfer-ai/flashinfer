@@ -72,7 +72,9 @@ SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
 
 def get_nvshmem_include_dirs():
     if env_cfg.NVSHMEM_INCLUDE_PATH:
-        return [pathlib.Path(p) for p in env_cfg.NVSHMEM_INCLUDE_PATH.split(os.pathsep) if p]
+        return [
+            pathlib.Path(p) for p in env_cfg.NVSHMEM_INCLUDE_PATH.split(os.pathsep) if p
+        ]
 
     import nvidia.nvshmem
 
@@ -82,7 +84,9 @@ def get_nvshmem_include_dirs():
 
 def get_nvshmem_lib_dirs():
     if env_cfg.NVSHMEM_LIBRARY_PATH:
-        return [pathlib.Path(p) for p in env_cfg.NVSHMEM_LIBRARY_PATH.split(os.pathsep) if p]
+        return [
+            pathlib.Path(p) for p in env_cfg.NVSHMEM_LIBRARY_PATH.split(os.pathsep) if p
+        ]
 
     import nvidia.nvshmem
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 # Load environment variables from ~/.config/flashinfer.json
 from . import env
+
 env.initialize_env_config()
 
 try:
