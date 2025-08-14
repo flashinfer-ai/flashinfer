@@ -299,8 +299,6 @@ def fp4_quantize(
             - FP8 input when FP8 is not enabled
             - sf_vec_size other than 16 or 32
     """
-
-    # check to make sure device is supported
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
