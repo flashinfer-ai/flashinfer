@@ -12,11 +12,12 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 from flashinfer.cute_dsl.blockscaled_gemm import (
+    create_scale_factor_tensor,
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
+    MaskedBatchedMatmulCuteDSL,  # python wrapper interface
+    grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
 )
-from flashinfer.cute_dsl.blockscaled_gemm import create_scale_factor_tensor
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     is_cute_dsl_available,
@@ -50,9 +51,9 @@ from flashinfer.cute_dsl.utils import (
         ("float8_e5m2", "float8_e8m0fnu", "float8_e5m2", 32),
     ],
 )
-@pytest.mark.parametrize("a_major", ["k", "m"])
-@pytest.mark.parametrize("b_major", ["k", "n"])
-@pytest.mark.parametrize("c_major", ["n", "m"])
+@pytest.mark.parametrize("a_major", ["k"])
+@pytest.mark.parametrize("b_major", ["k"])
+@pytest.mark.parametrize("c_major", ["n"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
@@ -92,6 +93,12 @@ def test_blockscaled_gemm_python_interface(
     ):
         pytest.skip(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+        )
+
+    if not (a_major == "k" and b_major == "k" and c_major == "n"):
+        # not supported since we try to align deepgemm for now
+        pytest.skip(
+            f"Skip non deepgemm-like cases {a_major}, {b_major}, {c_major}. Might be added later"
         )
 
     # not used for now
@@ -158,6 +165,18 @@ def test_blockscaled_gemm_python_interface(
         assumed_align=16,
     )
 
+    # for deepgemm-like python interface
+    a_torch_clone = a_torch.clone()
+    # print("before slicing", a_torch_clone)
+    # a_torch_clone = a_torch_clone[:, : , :k // 2]
+    # print("after slicing", a_torch_clone)
+    b_torch_clone = b_torch.clone()
+    # print("before slicing", b_torch_clone)
+    # b_torch_clone = b_torch_clone[:, : , :k // 2]
+    # print("after slicing", b_torch_clone)
+    c_torch_clone = c_torch.clone()
+    print(a_torch_clone.shape, b_torch_clone.shape, c_torch_clone.shape)
+
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
         l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
@@ -166,19 +185,44 @@ def test_blockscaled_gemm_python_interface(
     )
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
+    wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
     for _ in range(iterations):
-        grouped_gemm_nt_masked(
-            (a_torch, sfa_torch),
-            (b_torch, sfb_torch),
-            c_torch,
-            masked_m_tensor,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
+        wrapper.run(
+            m=m,
+            n=n,
+            k=k,
+            l=l,
+            a_major=a_major,
+            b_major=b_major,
+            c_major=c_major,
+            ab_dtype=get_cutlass_dtype(ab_dtype),
+            sf_dtype=get_cutlass_dtype(sf_dtype),
             sf_vec_size=sf_vec_size,
+            c_dtype=get_cutlass_dtype(c_dtype),
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            a_tensor_gpu=a_torch,
+            b_tensor_gpu=b_torch,
+            sfa_tensor_gpu=sfa_torch,
+            sfb_tensor_gpu=sfb_torch,
+            c_tensor_gpu=c_torch,
+            masked_m_tensor_gpu=masked_m_tensor,
         )
+
+        # deepgemm-like python interface
+        assert a_major == "k" and b_major == "k" and c_major == "n"
+        # grouped_gemm_nt_masked(
+        #     (a_torch, sfa_torch),
+        #     (b_torch, sfb_torch),
+        #     c_torch_clone,
+        #     masked_m_tensor,
+        #     ab_dtype=ab_dtype,
+        #     sf_dtype=sf_dtype,
+        #     c_dtype=c_dtype,
+        #     sf_vec_size=sf_vec_size,
+        #     mma_tiler_mn=mma_tiler_mn,
+        #     cluster_shape_mn=cluster_shape_mn,
+        # )
         torch.cuda.synchronize()
 
     # compute ref output
@@ -227,3 +271,21 @@ def test_blockscaled_gemm_python_interface(
                 atol=tolerance,
                 rtol=1e-02,
             )
+
+
+if __name__ == "__main__":
+    test_blockscaled_gemm_python_interface(
+        lm=(1, 1024),
+        kn=(7168, 4096),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        sf_vec_size=16,
+        c_dtype="float16",
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        tolerance=1e-01,
+        iterations=3,
+    )

@@ -2753,7 +2753,9 @@ def grouped_gemm_nt_masked(
     n, _, _ = b_torch.shape
 
     if ab_dtype == "float4_e2m1fn":
-        k = k * 2  # todo(yingyi): update mnk based on a_major and b_major
+        # todo(yingyi): update mnk based on a_major and b_major, and support more major.
+        # Note: only support deepgemm-like shape for now
+        k = k * 2
 
     mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
     cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
