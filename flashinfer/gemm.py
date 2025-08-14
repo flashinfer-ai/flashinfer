@@ -86,7 +86,7 @@ def gen_gemm_module() -> JitSpec:
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
-    # torch library for bmm_fp8
+    # auto-tuned cublas fp8 gemm runner
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
             def get_valid_tactics(
@@ -94,6 +94,7 @@ def get_gemm_module():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
+                # cublas has heuristic for fp8 gemm, so we only need to use the default tactic
                 return [0]
 
             def forward(
@@ -1413,6 +1414,7 @@ def _cudnn_gemm_fp8_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
+            # cudnn has heuristic for fp8 gemm, so we only need to use the default tactic
             return [0]
 
         def forward(
