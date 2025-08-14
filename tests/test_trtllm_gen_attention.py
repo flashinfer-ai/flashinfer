@@ -239,6 +239,7 @@ def unpack_compare_nvfp4(
         ("fp8", "fp8", "nvfp4"),
     ],
 )
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -249,6 +250,7 @@ def test_trtllm_batch_prefill(
     q_dtype,
     o_dtype,
     kv_dtype,
+    enable_pdl,
 ):
     # Set up test parameters
     torch.manual_seed(0)
@@ -340,6 +342,7 @@ def test_trtllm_batch_prefill(
         out_dtype=DTYPE_MAP[o_dtype],
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        enable_pdl=enable_pdl,
     )
 
     if o_dtype == "nvfp4":
@@ -372,6 +375,7 @@ def test_trtllm_batch_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -399,6 +403,7 @@ def test_trtllm_batch_prefill(
         ("fp8", "fp8", "nvfp4"),
     ],
 )
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -409,6 +414,7 @@ def test_trtllm_batch_decode(
     q_dtype,
     o_dtype,
     kv_dtype,
+    enable_pdl,
 ):
     # Set up test parameters
     torch.manual_seed(0)
@@ -493,6 +499,7 @@ def test_trtllm_batch_decode(
         out_dtype=DTYPE_MAP[o_dtype],
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        enable_pdl=enable_pdl,
     )
 
     if o_dtype == "nvfp4":
@@ -525,6 +532,7 @@ def test_trtllm_batch_decode(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:

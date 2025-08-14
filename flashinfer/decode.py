@@ -1820,6 +1820,7 @@ class TrtllmGenDecodeModule:
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
         window_left: int = -1,
+        enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1827,6 +1828,7 @@ class TrtllmGenDecodeModule:
             out = torch.empty_like(query)
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -1846,6 +1848,7 @@ class TrtllmGenDecodeModule:
             0,  # o_sf_start_index
             window_left,
             self._sm_count,
+            enable_pdl,
             sinks,
         )
         return out
@@ -1916,6 +1919,7 @@ def get_trtllm_gen_decode_module(*args):
         assert kv_lens_buffer is not None
         assert page_size is not None
         assert max_kv_len is not None
+        assert enable_pdl is not None
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
@@ -1927,6 +1931,7 @@ def get_trtllm_gen_decode_module(*args):
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
+            enable_pdl,
             out=o,
             sinks=sinks,
         )
@@ -1996,6 +2001,7 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2044,11 +2050,16 @@ def trtllm_batch_decode_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
 
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
     """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -2132,6 +2143,7 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_start_index,
         window_left,
         sm_count,
+        enable_pdl,
         sinks,
     )
 
@@ -2200,6 +2212,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -2237,6 +2250,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
@@ -2293,6 +2307,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         0,  # o_sf_start_index
         -1,  # window_left
         sm_count,
+        enable_pdl,
         sinks,
     )
     return out
