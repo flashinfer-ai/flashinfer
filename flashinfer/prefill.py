@@ -186,6 +186,7 @@ def get_trtllm_gen_prefill_module():
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
+        enable_pdl: bool,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -214,6 +215,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
+            enable_pdl,
             sinks,
         )
         return out
@@ -546,6 +548,7 @@ def get_batch_prefill_module(backend, *args):
             assert batch_size is not None
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
+            assert enable_pdl is not None
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
                 paged_k_cache,
@@ -560,6 +563,7 @@ def get_batch_prefill_module(backend, *args):
                 batch_size,
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
+                enable_pdl,
                 window_left,
                 out=o,
                 sinks=sinks,
@@ -3134,6 +3138,7 @@ def trtllm_batch_context_with_kv_cache(
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -3183,6 +3188,9 @@ def trtllm_batch_context_with_kv_cache(
     out: Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
     """
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -3270,6 +3278,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
+        enable_pdl,
         sinks,
     )
     return (
