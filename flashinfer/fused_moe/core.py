@@ -1178,7 +1178,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        output: Optional[torch.Tensor] = None
+        output: Optional[torch.Tensor] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
