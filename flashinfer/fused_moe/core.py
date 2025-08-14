@@ -171,31 +171,39 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
-def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
-    output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
-    )
-
-    # Deive Arch
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
-
-    nvcc_flags = [
+def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = sm100a_nvcc_flags + [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
-    if device_arch == "100":
-        nvcc_flags += sm100a_nvcc_flags + [
-            "-DCOMPILE_BLACKWELL_TMA_GEMMS",
-            "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
-        ]
-    else:
-        nvcc_flags += sm90a_nvcc_flags + [
-            "-DCOMPILE_HOPPER_TMA_GEMMS",
-            "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
-        ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = sm90a_nvcc_flags + [
+        "-DCOMPILE_HOPPER_TMA_GEMMS",
+        "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
+
+
+def gen_cutlass_fused_moe_module(
+    nvcc_flags: List[str], device_arch: str, use_fast_build: bool = False
+) -> JitSpec:
+    """
+    Generate a JitSpec for the cutlass fused moe module.
+    """
+    output_dir = (
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
+    )
 
     try:
         # Create output directory if it doesn't exist
@@ -289,10 +297,17 @@ def gen_cutlass_fused_moe_module(use_fast_build: bool = False) -> JitSpec:
 
 
 @functools.cache
-def get_cutlass_fused_moe_module(use_fast_build: bool = False):
-    FusedMoeRunner = gen_cutlass_fused_moe_module(use_fast_build).build_and_load(
-        class_name="FusedMoeRunner"
-    )
+def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
+    if backend == "100":
+        FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
+            use_fast_build
+        ).build_and_load(class_name="FusedMoeRunner")
+    elif backend == "90":
+        FusedMoeRunner = gen_cutlass_fused_moe_sm90_module(
+            use_fast_build
+        ).build_and_load(class_name="FusedMoeRunner")
+    else:
+        raise ValueError(f"Invalid backend: {backend}")
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
@@ -678,6 +693,15 @@ def cutlass_fused_moe(
     input_sf : Optional[torch.Tensor]
         Input scaling factor for quantization.
 
+    swiglu_alpha : Optional[torch.Tensor]
+        Swiglu alpha for swiglu activation.
+
+    swiglu_beta : Optional[torch.Tensor]
+        Swiglu beta for swiglu activation.
+
+    swiglu_limit : Optional[torch.Tensor]
+        Swiglu limit for swiglu activation.
+
     tp_size : int = 1
         Tensor parallelism size. Defaults to 1.
 
@@ -761,7 +785,10 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module().cutlass_fused_moe(
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+
+    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
         output,
         input,
         token_selected_experts,
