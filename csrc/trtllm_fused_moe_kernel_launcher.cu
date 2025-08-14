@@ -1058,7 +1058,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
     std::optional<int64_t> n_group, std::optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts,
     std::optional<double> routed_scaling_factor, int64_t tile_tokens_dim,
-    int64_t routing_method_type, bool do_finalize, bool enable_pdl, at::Tensor& output, int64_t config_index) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, at::Tensor& output,
+    int64_t config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
   int const num_tokens = hidden_states.sizes()[0];
