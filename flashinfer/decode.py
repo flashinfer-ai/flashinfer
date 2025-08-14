@@ -2052,7 +2052,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-        Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
 
     Returns
     -------
