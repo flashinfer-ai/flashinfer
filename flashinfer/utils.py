@@ -663,5 +663,3 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
-
-
