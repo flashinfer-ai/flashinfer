@@ -143,7 +143,7 @@ class JitSpec:
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+            verbose = os.environ["FLASHINFER_JIT_VERBOSE"] == "1"
             self.build(verbose, need_lock=False)
             result = self.load(so_path, class_name)
 
@@ -160,7 +160,7 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+    verbose = os.environ["FLASHINFER_JIT_VERBOSE"] == "1"
 
     cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [

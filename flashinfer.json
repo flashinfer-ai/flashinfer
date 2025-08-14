@@ -1,0 +1,116 @@
+{
+  "environment_variables": {
+    "workspace": {
+      "FLASHINFER_WORKSPACE_BASE": {
+        "description": "Base directory for FlashInfer workspace.",
+        "default": "~",
+        "type": "path"
+      }
+    },
+    "cubin": {
+      "FLASHINFER_CUBIN_DIR": {
+        "description": "Absolute path to directory for reading/writing compiled CUDA binaries (cubin). If unset, defaults to `<FLASHINFER_CACHE_DIR>/cubins`.",
+        "default": null,
+        "type": "path"
+      },
+      "FLASHINFER_CUBIN_CHECKSUM_DISABLED": {
+        "description": "Disable checksum verification for cubin files (\"1\" = disabled, \"0\" = enabled).",
+        "default": "0",
+        "type": "string_boolean"
+      },
+      "FLASHINFER_CUBINS_REPOSITORY": {
+        "description": "Repository URL used to download prebuilt cubins (if supported).",
+        "default": null,
+        "type": "url"
+      }
+    },
+    "autotuner": {
+      "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE": {
+        "description": "Load autotuner configuration from a file (\"1\" = enabled, \"0\" = disabled).",
+        "default": "0",
+        "type": "string_boolean"
+      }
+    },
+    "logging": {
+      "FLASHINFER_JIT_VERBOSE": {
+        "description": "Enable verbose logging during JIT compilation (\"1\" = enabled, \"0\" = disabled).",
+        "default": "0",
+        "type": "string_boolean"
+      }
+    },
+    "build": {
+      "FLASHINFER_EXTRA_LDFLAGS": {
+        "description": "Extra linker flags appended during compilation (space-separated).",
+        "default": null,
+        "type": "string"
+      },
+      "FLASHINFER_BUILDING_DOCS": {
+        "description": "Documentation-building mode toggle (\"1\" = docs build, \"0\" = normal).",
+        "default": "0",
+        "type": "string_boolean"
+      }
+    },
+    "nvshmem": {
+      "NVSHMEM_INCLUDE_PATH": {
+        "description": "Include search paths for NVSHMEM headers.",
+        "default": null,
+        "type": "path_list",
+        "separator": ":"
+      },
+      "NVSHMEM_LIBRARY_PATH": {
+        "description": "Library search paths for NVSHMEM.",
+        "default": null,
+        "type": "path_list",
+        "separator": ":"
+      },
+      "NVSHMEM_LDFLAGS": {
+        "description": "Additional linker flags for NVSHMEM (space-separated).",
+        "default": "",
+        "type": "string"
+      }
+    },
+    "toolchain": {
+      "CC": {
+        "description": "C compiler executable (e.g., gcc, clang).",
+        "default": null,
+        "type": "string"
+      },
+      "CXX": {
+        "description": "C++ compiler executable.",
+        "default": "c++",
+        "type": "string"
+      },
+      "PYTORCH_NVCC": {
+        "description": "Path to NVCC used by PyTorch CUDA extensions.",
+        "default": "$cuda_home/bin/nvcc",
+        "type": "path"
+      }
+    },
+    "cuda": {
+      "CUDA_LIB_PATH": {
+        "description": "Path to CUDA library directory used at link/runtime.",
+        "default": "/usr/local/cuda/targets/x86_64-linux/lib/",
+        "type": "path"
+      },
+      "TORCH_CUDA_ARCH_LIST": {
+        "description": "Comma-separated list of CUDA architectures for compilation (e.g., \"7.5,8.0,8.6,9.0+PTX\"). If unset, PyTorch defaults apply.",
+        "default": null,
+        "type": "string"
+      }
+    },
+    "trtllm": {
+      "TRTLLM_FORCE_MNNVL_AR": {
+        "description": "Force TensorRT-LLM MNNVL AR mode (\"1\" = enabled, \"0\" = disabled).",
+        "default": "0",
+        "type": "string_boolean"
+      }
+    }
+  },
+  "type_definitions": {
+    "string": "UTF-8 string value.",
+    "url": "String containing a valid URL.",
+    "path": "Filesystem path (expanded for ~ and env vars).",
+    "path_list": "List of filesystem paths joined by the specified 'separator' (default ':').",
+    "string_boolean": "String '0' (false) or '1' (true)."
+  }
+}
