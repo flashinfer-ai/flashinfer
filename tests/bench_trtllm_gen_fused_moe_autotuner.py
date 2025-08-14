@@ -176,8 +176,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
     print(
         f"num tokens: {num_tokens}, num experts: {num_experts}, hidden size: {hidden_size}, intermediate size: {intermediate_size}, top k: {top_k}"
     )
-    print(f"No autotune: {ms:.3f} ms")
-    print(f"Autotune: {ms_tuned:.3f} ms")
+    print(f"No autotune: {ms:.3f} ms; with autotune: {ms_tuned:.3f} ms")
 
 
 if __name__ == "__main__":
@@ -199,7 +198,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--top-k", type=int, default=4, help="Top-k experts per token")
     parser.add_argument(
-        "--warmups", type=int, default=10, help="Number of warmup iterations"
+        "--warmups", type=int, default=100, help="Number of warmup iterations"
     )
     parser.add_argument(
         "--iterations", type=int, default=100, help="Number of benchmark iterations"

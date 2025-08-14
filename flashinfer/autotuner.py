@@ -219,11 +219,10 @@ class TunableRunner(ABC):
     @abstractmethod
     def forward(
         self,
-        /,  # tensors are position only
         inputs: List[torch.Tensor],
-        *,  # all others are keyword args only
         tactic: int = -1,
         do_preparation: bool = False,
+        **kwargs,  # all others are keyword args only
     ) -> Any:
         """Forward pass for tunable runners.
 
