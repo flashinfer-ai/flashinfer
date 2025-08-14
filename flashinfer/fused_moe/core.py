@@ -1236,6 +1236,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input: Whether to use routing scales on input
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
 
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
@@ -1308,7 +1309,7 @@ def trtllm_fp8_block_scale_moe(
         routed_scaling_factor: Scaling factor for routing
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
-
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -1411,7 +1412,7 @@ def trtllm_fp4_block_scale_moe(
         do_finalize (bool): Whether to finalize the output (default: False)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
-
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
