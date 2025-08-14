@@ -49,7 +49,7 @@ output_column_dict = {
         "top_k",
         "n_group",
         "topk_group",
-        "routing_method_type",
+        "routing_method",
         "use_shuffled_weight",
         "weight_layout",
         "use_routing_scales_on_input",

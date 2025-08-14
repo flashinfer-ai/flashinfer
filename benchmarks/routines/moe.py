@@ -11,8 +11,9 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
+    convert_to_block_layout,
 )
-from flashinfer import fp4_quantize
+from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.testing.utils import (
     bench_gpu_time,
     bench_gpu_time_with_cudagraph,
@@ -116,12 +117,19 @@ def parse_moe_args(line, parser):
         help="Tile dimension for tokens.",
     )
     parser.add_argument(
-        "--routing_method_type",
-        type=int,
+        "--routing_method",
+        type=str,
         required=False,
-        default=2,
-        choices=[1, 2, 3, 4],
-        help="Type of routing method: 1=Renormalize, 2=DeepSeekV3, 3=Llama4, 4=RenormalizeNaive. Note: method 0 (Default) is not implemented.",
+        default="deepseek_v3",
+        choices=[
+            "renormalize",
+            "deepseek_v3",
+            "llama4",
+            "renormalize_naive",
+        ],
+        help=(
+            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive."
+        ),
     )
     parser.add_argument(
         "--use_shuffled_weight",
@@ -134,8 +142,8 @@ def parse_moe_args(line, parser):
         type=int,
         required=False,
         default=0,
-        choices=[0, 1],
-        help="Weight layout: 0=MajorK, 1=BlockMajorK.",
+        choices=[0, 1, 2],
+        help="Weight layout: 0=MajorK, 1=MajorMn, 2=BlockMajorK.",
     )
     parser.add_argument(
         "--use_routing_bias",
@@ -209,12 +217,21 @@ def parse_moe_args(line, parser):
     )
 
     args = parser.parse_args(line)
+
+    # Normalize routing method (map string to internal int expected by kernels)
+    name_to_type = {
+        "renormalize": 1,
+        "deepseek_v3": 2,
+        "llama4": 3,
+        "renormalize_naive": 4,
+    }
+    args.routing_method_type = name_to_type[args.routing_method]
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
 
 
-def create_test_data(
+def create_trtllm_moe_test_data(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -224,13 +241,18 @@ def create_test_data(
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     device: torch.device,
-    moe_kernel_type: str = "fp8_per_tensor",  # New parameter to specify which MOE kernel
+    moe_kernel_type: str = "fp8_per_tensor",
 ):
     """
-    Create test data for MOE benchmarking.
+    Create test data for TensorRT-LLM fused MoE benchmarking (trtllm_*_moe APIs).
+
+    This helper prepares inputs for the TensorRT-LLM fused MoE kernels exposed via
+    flashinfer.fused_moe (e.g., trtllm_fp4_block_scale_moe, trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe). It is NOT used for CUTLASS MoE benchmarks,
+    which construct their own inputs specific to the CUTLASS path.
 
     Returns:
-        Tuple of tensors needed for MOE computation
+        Tuple of tensors needed for trtllm fused MoE computation
     """
     # Create routing logits - dtype depends on both routing method AND MOE kernel type
     # Different MOE kernels have different routing_logits dtype requirements:
@@ -342,7 +364,6 @@ def calculate_moe_tflops(
     num_experts: int,
     top_k: int,
     time_ms: float,
-    precision_factor: float = 1.0,
 ) -> float:
     """
     Calculate TFLOPS for MOE operation.
@@ -354,11 +375,6 @@ def calculate_moe_tflops(
     
     For each token, we only compute for top_k experts.
     
-    Args:
-        precision_factor: Factor to account for reduced computational cost of quantized operations
-                         1.0 = FP32/BF16 (full precision)
-                         0.5 = FP8 (roughly half the computational cost)
-                         0.25 = FP4 (roughly quarter the computational cost)
     """
     # FLOPS per token per expert (base calculation)
     flops_per_token_per_expert = (
@@ -366,9 +382,7 @@ def calculate_moe_tflops(
         2 * intermediate_size * hidden_size         # Second GEMM
     )
     
-    # Apply precision factor to account for quantized operations
-    effective_flops = flops_per_token_per_expert * precision_factor
-    total_flops = num_tokens * top_k * effective_flops
+    total_flops = num_tokens * top_k * flops_per_token_per_expert
     tflops = total_flops / (time_ms * 1e-3) / 1e12  # Convert to TFLOPS
     return tflops
 
@@ -385,6 +399,7 @@ def calculate_moe_bandwidth(
     input_format: Optional[str] = None,
     weight_format: Optional[str] = None,
     routing_logits_dtype: Optional[torch.dtype] = torch.float32,
+    active_experts: Optional[int] = None,
 ) -> float:
     """
     Calculate memory bandwidth for MOE operation in TB/sec.
@@ -409,16 +424,23 @@ def calculate_moe_bandwidth(
     # Note: routing logits dtype depends on kernel; pass in when known, default float32; None means excluded
     routing_logits_bytes = 0 if routing_logits_dtype is None else routing_logits_dtype.itemsize
     input_bytes = (
+        # Count hidden states once; kernels typically reuse inputs for multiple experts
         num_tokens * hidden_size * input_bytes_per_element +
         num_tokens * num_experts * routing_logits_bytes
     )
     
-    # Weight memory (only for top_k experts per token)
+    # Weight memory (reuse weights across tokens by grouping tokens per expert)
+    # Assume each active expert's weights are read once per run.
     weight_bytes_per_expert = (
         2 * intermediate_size * hidden_size * weight_bytes_per_element +  # gemm1
         hidden_size * intermediate_size * weight_bytes_per_element        # gemm2
     )
-    weight_bytes = num_tokens * top_k * weight_bytes_per_expert
+    if active_experts is not None:
+        num_active_experts = active_experts
+    else:
+        # CUTLASS MoE does not support active_experts, so we return -1
+        return -1
+    weight_bytes = num_active_experts * weight_bytes_per_expert
     
     # Output memory (typically full precision)
     output_bytes = num_tokens * hidden_size * input_dtype.itemsize
@@ -447,7 +469,7 @@ def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
 
 def testTrtllmFp4BlockScaleMoe(args):
     """
-    Test trtllm_fp4_block_scale_moe API.
+    Test trtllm_fp4_block_scale_moe API (TensorRT-LLM fused MoE).
 
     This test:
     1. Creates quantized FP4 weights and scales
@@ -490,7 +512,7 @@ def testTrtllmFp4BlockScaleMoe(args):
               f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}")
 
     # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_test_data(
+    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_trtllm_moe_test_data(
         num_tokens, hidden_size, intermediate_size, num_experts,
         routing_method_type, args.use_routing_bias, input_dtype, weight_dtype, device,
         moe_kernel_type="fp4_block_scale"
@@ -523,6 +545,16 @@ def testTrtllmFp4BlockScaleMoe(args):
     hidden_states_scale_linear_fp4 = hidden_states_scale_fp4_bytes.view(
         torch.float8_e4m3fn
     ).reshape(-1)
+    # Ensure expected vector size (16 elements per hidden value for NvFP4)
+    expected_scale_elems = (num_tokens * hidden_size) // 16
+    if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Adjusting FP4 hidden_states_scale from {hidden_states_scale_linear_fp4.numel()} to {expected_scale_elems} elements"
+            )
+        hidden_states_scale_linear_fp4 = torch.ones(
+            expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
+        )
     
     # Prepare weights for kernel 
     # For FP4 weights, keep them as uint8 (packed format) - don't convert to float8_e4m3fn
@@ -616,10 +648,9 @@ def testTrtllmFp4BlockScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
-    # FP4 has roughly 1/4 the computational cost of full precision
     tflops = calculate_moe_tflops(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k, 
-        median_time, precision_factor=0.25
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k,
+        median_time
     )
     tb_per_sec = calculate_moe_bandwidth(
         num_tokens,
@@ -654,7 +685,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
-        cur_res["routing_method_type"] = routing_method_type
+        cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
         cur_res["input_dtype"] = input_dtype
@@ -666,7 +697,7 @@ def testTrtllmFp4BlockScaleMoe(args):
 
 def testCutlassFusedMoe(args):
     """
-    Benchmark cutlass_fused_moe with variants mirroring tests in tests/test_trtllm_cutlass_fused_moe.py
+    Benchmark cutlass_fused_moe (CUTLASS MoE) with variants mirroring tests in tests/test_trtllm_cutlass_fused_moe.py
     Variants:
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
@@ -910,9 +941,8 @@ def testCutlassFusedMoe(args):
 
     median_time = np.median(times)
     std_time = np.std(times)
-    precision_factor = 1.0 if variant == "base" else (0.5 if variant == "fp8" else 0.25)
     tflops = calculate_moe_tflops(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time, precision_factor
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time
     )
     tb_per_sec = calculate_moe_bandwidth(
         num_tokens,
@@ -930,6 +960,7 @@ def testCutlassFusedMoe(args):
         ),
         weight_format=("fp8" if variant == "fp8" else ("fp4" if variant == "nvfp4" else None)),
         routing_logits_dtype=router_logits.dtype,
+        active_experts=int(selected_experts.unique().numel()),
     )
 
     backend = f"cutlass_fused_moe_{variant}"
@@ -952,7 +983,7 @@ def testCutlassFusedMoe(args):
         # Routing method/weight layout not applicable; leave defaults
         cur_res["n_group"] = None
         cur_res["topk_group"] = None
-        cur_res["routing_method_type"] = None
+        cur_res["routing_method"] = None
         cur_res["use_shuffled_weight"] = False
         cur_res["weight_layout"] = 0
         cur_res["use_routing_scales_on_input"] = False
@@ -965,7 +996,7 @@ def testCutlassFusedMoe(args):
 
 def testTrtllmFp8BlockScaleMoe(args):
     """
-    Test trtllm_fp8_block_scale_moe API.
+    Test trtllm_fp8_block_scale_moe API (TensorRT-LLM fused MoE).
 
     This test:
     1. Creates quantized FP8 weights and block scales
@@ -1008,7 +1039,7 @@ def testTrtllmFp8BlockScaleMoe(args):
               f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}")
 
     # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_test_data(
+    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_trtllm_moe_test_data(
         num_tokens, hidden_size, intermediate_size, num_experts,
         routing_method_type, args.use_routing_bias, input_dtype, weight_dtype, device,
         moe_kernel_type="fp8_block_scale"
@@ -1018,8 +1049,32 @@ def testTrtllmFp8BlockScaleMoe(args):
     # Quantize to FP8
     gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
     gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
+
+    # Optionally shuffle weights and convert to BlockMajorK layout to match kernel expectation
+    if use_shuffled_weight:
+        # This tile size follows test implementations
+        epilogue_tile_m = 64
+
+        gemm1_weights_fp8_shuffled = []
+        gemm2_weights_fp8_shuffled = []
+        for i in range(num_experts):
+            tmp_w1 = shuffle_matrix_a(gemm1_weights_fp8[i].view(torch.uint8), epilogue_tile_m)
+            tmp_w2 = shuffle_matrix_a(gemm2_weights_fp8[i].view(torch.uint8), epilogue_tile_m)
+            if weight_layout == WeightLayout.BlockMajorK:
+                block_k = 128
+                tmp_w1 = convert_to_block_layout(tmp_w1, block_k)
+                tmp_w2 = convert_to_block_layout(tmp_w2, block_k)
+            gemm1_weights_fp8_shuffled.append(tmp_w1)
+            gemm2_weights_fp8_shuffled.append(tmp_w2)
+
+        kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(torch.float8_e4m3fn)
+        kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn)
+    else:
+        kernel_gemm1_weights = gemm1_weights_fp8
+        kernel_gemm2_weights = gemm2_weights_fp8
     
     # Create block scale tensors for hidden states and weights (use float32 for scales)
+    # TensorRT-LLM FP8 block-scale expects hidden_states_scale shape [hidden_size // 128, num_tokens]
     hidden_states_scale = 2.0 * torch.ones(
         (hidden_size // 128, num_tokens), device=device, dtype=torch.float32
     )
@@ -1038,6 +1093,23 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
+    # Match test heuristic for tile_tokens_dim when using BlockMajorK
+    if use_shuffled_weight and weight_layout == WeightLayout.BlockMajorK:
+        def _next_pow2(x: int) -> int:
+            x = max(1, x)
+            x -= 1
+            x |= x >> 1
+            x |= x >> 2
+            x |= x >> 4
+            x |= x >> 8
+            x |= x >> 16
+            return x + 1
+        tokens_per_expert = max(1, (num_tokens * top_k) // max(local_num_experts, 1))
+        suggested_tile = min(max(_next_pow2(tokens_per_expert), 8), 64)
+        if suggested_tile != tile_tokens_dim and args.verbose >= 1:
+            print(f"[INFO] Overriding tile_tokens_dim {tile_tokens_dim} -> {suggested_tile} for BlockMajorK")
+        tile_tokens_dim = suggested_tile
+
     def run_fp8_block_moe():
         # Quantize hidden states to FP8 for block scale MOE
         hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
@@ -1048,9 +1120,9 @@ def testTrtllmFp8BlockScaleMoe(args):
             routing_bias=routing_bias,
             hidden_states=hidden_states_fp8,
             hidden_states_scale=hidden_states_scale,
-            gemm1_weights=gemm1_weights_fp8,
+            gemm1_weights=kernel_gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
-            gemm2_weights=gemm2_weights_fp8,
+            gemm2_weights=kernel_gemm2_weights,
             gemm2_weights_scale=gemm2_weights_scale,
             num_experts=num_experts,
             top_k=top_k,
@@ -1064,6 +1136,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
+            enable_pdl=True,
         )
 
     # Benchmark timing
@@ -1092,10 +1165,9 @@ def testTrtllmFp8BlockScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
-    # FP8 has roughly 1/2 the computational cost of full precision
     tflops = calculate_moe_tflops(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k, 
-        median_time, precision_factor=0.5
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k,
+        median_time
     )
     tb_per_sec = calculate_moe_bandwidth(
         num_tokens,
@@ -1130,7 +1202,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
-        cur_res["routing_method_type"] = routing_method_type
+        cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
         cur_res["input_dtype"] = input_dtype
@@ -1142,7 +1214,7 @@ def testTrtllmFp8BlockScaleMoe(args):
 
 def testTrtllmFp8PerTensorScaleMoe(args):
     """
-    Test trtllm_fp8_per_tensor_scale_moe API.
+    Test trtllm_fp8_per_tensor_scale_moe API (TensorRT-LLM fused MoE).
 
     This test:
     1. Creates quantized FP8 weights and per-tensor scales
@@ -1184,7 +1256,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
               f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}")
 
     # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_test_data(
+    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = create_trtllm_moe_test_data(
         num_tokens, hidden_size, intermediate_size, num_experts,
         routing_method_type, args.use_routing_bias, input_dtype, weight_dtype, device,
         moe_kernel_type="fp8_per_tensor"
@@ -1260,10 +1332,9 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     # Compute performance metrics
     median_time = np.median(times)
     std_time = np.std(times)
-    # FP8 has roughly 1/2 the computational cost of full precision
     tflops = calculate_moe_tflops(
         num_tokens, hidden_size, intermediate_size, num_experts, top_k, 
-        median_time, precision_factor=0.5
+        median_time
     )
     tb_per_sec = calculate_moe_bandwidth(
         num_tokens,
@@ -1298,7 +1369,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
-        cur_res["routing_method_type"] = routing_method_type
+        cur_res["routing_method"] = args.routing_method
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype

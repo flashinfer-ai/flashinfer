@@ -105,7 +105,7 @@ python3 flashinfer_benchmark.py \
     --refcheck \
     -vv
 
-# MOE FP4 Block Scale
+# MOE FP4 Block Scale (DeepSeekV3 routing)
 python3 flashinfer_benchmark.py \
     --routine trtllm_fp4_block_scale_moe \
     --num_tokens 1024 \
@@ -117,7 +117,7 @@ python3 flashinfer_benchmark.py \
     --topk_group 4 \
     --routed_scaling_factor 2.5 \
     --use_routing_bias \
-    --routing_method_type 2 \
+    --routing_method deepseek_v3 \
     --use_shuffled_weight \
     --verbose
 
@@ -133,19 +133,19 @@ python3 flashinfer_benchmark.py \
     --topk_group 4 \
     --routed_scaling_factor 2.5 \
     --use_routing_bias \
-    --routing_method_type 2 \
+    --routing_method deepseek_v3 \
     --use_shuffled_weight \
     --verbose
 
-# MOE FP8 Block Scale with default routing 
+# MOE FP8 Block Scale with Renormalize routing (no groups)
 python3 flashinfer_benchmark.py \
     --routine trtllm_fp8_block_scale_moe \
     --num_tokens 1024 \
     --hidden_size 1024 \
     --intermediate_size 1024 \
     --num_experts 128 \
-    --top_k 8 \
-    --routing_method_type 0 \
+    --top_k 1 \
+    --routing_method renormalize \
     --verbose
 
 # MOE FP8 Per-Tensor Scale
@@ -160,7 +160,7 @@ python3 flashinfer_benchmark.py \
     --topk_group 4 \
     --routed_scaling_factor 2.5 \
     --use_routing_bias \
-    --routing_method_type 2 \
+    --routing_method deepseek_v3 \
     --use_routing_scales_on_input \
     --verbose
 ```
@@ -232,31 +232,31 @@ The output CSV will contain detailed metrics including:
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--num_tokens`           | Number of input tokens                                                                                     |
 | `--hidden_size`          | Hidden dimension size                                                                                      |
-| `--intermediate_size`    | Intermediate dimension size (FF layer dimension)                                                          |
+| `--intermediate_size`    | Intermediate dimension size (FF layer dimension)                                                           |
 | `--num_experts`          | Total number of experts                                                                                    |
 | `--top_k`                | Number of experts to route to per token                                                                    |
-| `--n_group`              | Number of expert groups (for DeepSeek routing). Default: 1                                                |
-| `--topk_group`           | Number of groups to consider for top-k routing. Default: 1                                                |
-| `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                  |
-| `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                |
-| `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                     |
-| `--tile_tokens_dim`      | Tile dimension for tokens. Default: 8                                                                     |
-| `--routing_method_type`  | Type of routing method: 1=Renormalize, 2=DeepSeekV3, 3=Llama4, 4=RenormalizeNaive. Default: 2. **Note: method 0 (Default) is not implemented** |
+| `--n_group`              | Number of expert groups (for DeepSeek routing). Default: 1                                                 |
+| `--topk_group`           | Number of groups to consider for top-k routing. Default: 1                                                 |
+| `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
+| `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
+| `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |
+| `--tile_tokens_dim`      | Tile dimension for tokens. Default: 8                                                                      |
+| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
 | `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
-| `--weight_layout`        | Weight layout: 0=MajorK, 1=BlockMajorK. Default: 0                                                        |
+| `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
 | `--use_routing_bias`     | Whether to use routing bias                                                                                |
-| `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                      |
-| `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                   |
-| `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                         |
+| `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
+| `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
+| `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
 
 ### MOE Routing Method Compatibility
 
-| Routing Method | Value | Requirements | Compatible MOE Types |
-|----------------|-------|--------------|---------------------|
-| **DeepSeekV3** | 2 | `top_k <= 8`, `topk_group <= 4`, requires `--n_group`, `--topk_group`, `--routed_scaling_factor`, `--use_routing_bias` | FP4, FP8 Block Scale |
-| **Renormalize** | 1 | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | All MOE types |
-| **Llama4** | 3 | `top_k == 1`, requires `--routed_scaling_factor`, `--use_routing_bias`, `--use_routing_scales_on_input`. Do NOT use `--n_group` or `--topk_group` | FP8 Per-Tensor |
-| **RenormalizeNaive** | 4 | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | FP4 primarily |
+| Routing Method         | Requirements | Compatible MOE Types |
+|------------------------|--------------|---------------------|
+| **deepseek_v3**        | `top_k <= 8`, `topk_group <= 4`, requires `--n_group`, `--topk_group`, `--routed_scaling_factor`, `--use_routing_bias` | FP4, FP8 Block Scale |
+| **renormalize**        | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | All MOE types |
+| **llama4**             | `top_k == 1`, requires `--routed_scaling_factor`, `--use_routing_bias`, `--use_routing_scales_on_input`. Do NOT use `--n_group` or `--topk_group` | FP8 Per-Tensor |
+| **renormalize_naive**  | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | FP4 primarily |
 
 ⚠️ **Important**: 
 - Group parameters (`--n_group`, `--topk_group`) are ONLY used with DeepSeekV3 routing method. Using them with other routing methods will cause the error: "Routing kernel with groups implies DeepSeekV3 routing method."
