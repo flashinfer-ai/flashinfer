@@ -27,7 +27,9 @@ from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
 from .mapping import Mapping
 
-IS_BUILDING_DOCS = os.environ["FLASHINFER_BUILDING_DOCS"] == "1"
+from .. import env as env_cfg
+
+IS_BUILDING_DOCS = env_cfg.FLASHINFER_BUILDING_DOCS == "1"
 
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9

@@ -25,12 +25,14 @@ import warnings
 
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
-FLASHINFER_BASE_DIR = pathlib.Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
+from .. import env as env_cfg
+
+FLASHINFER_BASE_DIR = pathlib.Path(env_cfg.FLASHINFER_WORKSPACE_BASE)
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 
-if "FLASHINFER_CUBIN_DIR" in os.environ and os.environ["FLASHINFER_CUBIN_DIR"]:
-    FLASHINFER_CUBIN_DIR = pathlib.Path(os.environ["FLASHINFER_CUBIN_DIR"])
+if env_cfg.FLASHINFER_CUBIN_DIR:
+    FLASHINFER_CUBIN_DIR = pathlib.Path(env_cfg.FLASHINFER_CUBIN_DIR)
 else:
     FLASHINFER_CUBIN_DIR = FLASHINFER_CACHE_DIR / "cubins"
 
@@ -69,9 +71,8 @@ SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
 
 
 def get_nvshmem_include_dirs():
-    paths = os.environ.get("NVSHMEM_INCLUDE_PATH")
-    if paths is not None:
-        return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
+    if env_cfg.NVSHMEM_INCLUDE_PATH:
+        return [pathlib.Path(p) for p in env_cfg.NVSHMEM_INCLUDE_PATH.split(os.pathsep) if p]
 
     import nvidia.nvshmem
 
@@ -80,9 +81,8 @@ def get_nvshmem_include_dirs():
 
 
 def get_nvshmem_lib_dirs():
-    paths = os.environ.get("NVSHMEM_LIBRARY_PATH")
-    if paths is not None:
-        return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
+    if env_cfg.NVSHMEM_LIBRARY_PATH:
+        return [pathlib.Path(p) for p in env_cfg.NVSHMEM_LIBRARY_PATH.split(os.pathsep) if p]
 
     import nvidia.nvshmem
 

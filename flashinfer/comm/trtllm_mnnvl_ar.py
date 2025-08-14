@@ -156,7 +156,8 @@ def get_allreduce_mnnvl_workspace(
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """
-    force_mn = os.environ["TRTLLM_FORCE_MNNVL_AR"] == "1"
+    from .. import env as env_cfg
+    force_mn = env_cfg.TRTLLM_FORCE_MNNVL_AR == "1"
 
     # buffer shape: [3, 2, buffer_tokens, hidden_dim]
     stride = 3 * 2 * dtype.itemsize
