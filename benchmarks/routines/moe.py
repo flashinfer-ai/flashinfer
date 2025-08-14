@@ -10,6 +10,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    cutlass_fused_moe,
 )
 from flashinfer import fp4_quantize
 from flashinfer.testing.utils import (
@@ -40,6 +41,8 @@ def run_moe_test(args):
         return testTrtllmFp8BlockScaleMoe(args)
     elif args.routine == "trtllm_fp8_per_tensor_scale_moe":
         return testTrtllmFp8PerTensorScaleMoe(args)
+    elif args.routine == "cutlass_fused_moe":
+        return testCutlassFusedMoe(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -159,6 +162,50 @@ def parse_moe_args(line, parser):
         required=False,
         default="bfloat16",
         help="Data type of the weights (before quantization).",
+    )
+
+    # CUTLASS fused MoE specific
+    parser.add_argument(
+        "--cutlass_variant",
+        type=str,
+        required=False,
+        default="base",
+        choices=["base", "fp8", "nvfp4"],
+        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+    )
+    parser.add_argument(
+        "--quantized_input",
+        action="store_true",
+        default=False,
+        help="Quantize input activations (only used for nvfp4).",
+    )
+    parser.add_argument(
+        "--tp_size",
+        type=int,
+        required=False,
+        default=1,
+        help="Tensor parallel size for cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--tp_rank",
+        type=int,
+        required=False,
+        default=0,
+        help="Tensor parallel rank for cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--ep_size",
+        type=int,
+        required=False,
+        default=1,
+        help="Expert parallel size for cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--ep_rank",
+        type=int,
+        required=False,
+        default=0,
+        help="Expert parallel rank for cutlass_fused_moe.",
     )
 
     args = parser.parse_args(line)
@@ -335,30 +382,32 @@ def calculate_moe_bandwidth(
     time_ms: float,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
-    is_fp4: bool = False,
+    input_format: Optional[str] = None,
+    weight_format: Optional[str] = None,
+    routing_logits_dtype: Optional[torch.dtype] = torch.float32,
 ) -> float:
     """
     Calculate memory bandwidth for MOE operation in TB/sec.
     
     Args:
-        is_fp4: If True, treat weights as FP4 (0.5 bytes per element)
+        input_format: Override for input representation ("fp8" or "fp4"); None uses dtype.itemsize
+        weight_format: Override for weight representation ("fp8" or "fp4"); None uses dtype.itemsize
+        routing_logits_dtype: Dtype for routing logits memory accounting (default float32)
     """
     # Get effective byte sizes
-    def get_dtype_bytes(dtype, is_fp4_override=False):
-        if is_fp4_override:
-            return 0.5  # FP4 uses 4 bits = 0.5 bytes per element
-        elif dtype == torch.float8_e4m3fn:
-            return 1.0  # FP8 uses 1 byte per element
-        else:
-            return dtype.itemsize  # Standard PyTorch dtypes
+    def get_effective_bytes(dtype: torch.dtype, fmt: Optional[str]) -> float:
+        if fmt == "fp4":
+            return 0.5
+        if fmt == "fp8":
+            return 1.0
+        return dtype.itemsize
     
-    input_bytes_per_element = get_dtype_bytes(input_dtype, is_fp4)
-    weight_bytes_per_element = get_dtype_bytes(weight_dtype, is_fp4)
+    input_bytes_per_element = get_effective_bytes(input_dtype, input_format)
+    weight_bytes_per_element = get_effective_bytes(weight_dtype, weight_format)
     
     # Input memory: hidden states + routing logits
-    # Note: routing logits dtype depends on both routing method and MOE kernel type
-    # For simplicity, assume float32 for routing logits (4 bytes) as it's the most common case
-    routing_logits_bytes = torch.float32.itemsize
+    # Note: routing logits dtype depends on kernel; pass in when known, default float32; None means excluded
+    routing_logits_bytes = 0 if routing_logits_dtype is None else routing_logits_dtype.itemsize
     input_bytes = (
         num_tokens * hidden_size * input_bytes_per_element +
         num_tokens * num_experts * routing_logits_bytes
@@ -377,6 +426,23 @@ def calculate_moe_bandwidth(
     total_bytes = input_bytes + weight_bytes + output_bytes
     tb_per_sec = total_bytes / (time_ms * 1e-3) / 1e12  # Convert to TB/sec
     return tb_per_sec
+
+
+def _compute_routing(router_logits: torch.Tensor, top_k: int):
+    routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.float()
+    return routing_weights, selected_experts
+
+
+def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    x_max = x.abs().max().float().clamp(min=1e-6)
+    scale = x_max / fp8_max
+    inv_scale = 1.0 / scale
+    out = (x.float() * inv_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return out, scale.view((1,))
 
 
 def testTrtllmFp4BlockScaleMoe(args):
@@ -556,8 +622,17 @@ def testTrtllmFp4BlockScaleMoe(args):
         median_time, precision_factor=0.25
     )
     tb_per_sec = calculate_moe_bandwidth(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k,
-        median_time, input_dtype, weight_dtype, is_fp4=True
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        weight_dtype,
+        input_format="fp4",
+        weight_format="fp4",
+        routing_logits_dtype=routing_logits.dtype,
     )
 
     backend = "trtllm_fp4_block_scale"
@@ -586,6 +661,305 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         res.append(cur_res)
     
+    return res
+
+
+def testCutlassFusedMoe(args):
+    """
+    Benchmark cutlass_fused_moe with variants mirroring tests in tests/test_trtllm_cutlass_fused_moe.py
+    Variants:
+      - base: no quantization
+      - fp8: per-tensor fp8 for weights and activation scale
+      - nvfp4: FP4 block-scale weights, optional quantized input
+    Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testCutlassFusedMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    # Shapes
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    tp_size = getattr(args, "tp_size", 1)
+    tp_rank = getattr(args, "tp_rank", 0)
+    ep_size = getattr(args, "ep_size", 1)
+    ep_rank = getattr(args, "ep_rank", 0)
+    is_cuda_graph_compatible = not args.no_cuda_graph
+
+    # Create base tensors
+    torch.manual_seed(args.random_seed)
+    x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device)
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=input_dtype, device=device)
+        / 10
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=input_dtype, device=device)
+        / 10
+    )
+
+    # Routing
+    router_logits = torch.randn(num_tokens, num_experts, dtype=input_dtype, device=device)
+    routing_weights, selected_experts = _compute_routing(router_logits, top_k)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] x.shape = {x.shape}")
+        print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
+        print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
+
+    # Build local weights per EP/TP like tests do
+    experts_per_rank = num_experts // max(ep_size, 1)
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+    w31_ep = w31_weight[expert_start:expert_end, :]
+    w2_ep = w2_weight[expert_start:expert_end, :]
+
+    def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
+        if tp_size <= 1:
+            return w31_ep_tensor, w2_ep_tensor
+        # Split w31 into w3 and w1 along intermediate dim
+        w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
+        shard = intermediate_size // tp_size
+        start = tp_rank * shard
+        end = start + shard
+        w3_local = w3_weight[:, start:end, :]
+        w1_local = w1_weight[:, start:end, :]
+        w31_local = torch.cat([w3_local, w1_local], dim=1)
+        w2_local = w2_ep_tensor[:, :, start:end]
+        return w31_local.contiguous(), w2_local.contiguous()
+
+    w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
+
+    # Prepare variant-specific inputs (outside of the timed/captured region)
+    variant = getattr(args, "cutlass_variant", "base")
+    out = torch.empty_like(x)
+
+    if variant == "base":
+        def run_cutlass():
+            return cutlass_fused_moe(
+                x,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_local,
+                w2_local,
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=None,
+                output=out,
+            )
+
+    elif variant == "fp8":
+        # Per-tensor FP8 for weights and activation scale
+        w31_weight_fp8 = torch.empty_like(w31_local, dtype=torch.float8_e4m3fn)
+        w2_weight_fp8 = torch.empty_like(w2_local, dtype=torch.float8_e4m3fn)
+        local_num_experts = w31_local.shape[0]
+        w31_scales = torch.empty(local_num_experts, 2, dtype=input_dtype, device=device)
+        w2_scales = torch.empty(local_num_experts, 1, dtype=input_dtype, device=device)
+
+        # Quantize weights per expert
+        for expert_id in range(local_num_experts):
+            w31_expert = w31_local[expert_id]
+            w2_expert = w2_local[expert_id]
+            w31_q, s31 = _dynamic_per_tensor_fp8_quant(w31_expert)
+            w2_q, s2 = _dynamic_per_tensor_fp8_quant(w2_expert)
+            w31_weight_fp8[expert_id].copy_(w31_q)
+            w2_weight_fp8[expert_id].copy_(w2_q)
+            # Store the same scalar twice to mimic test layout (avoid torch.tensor())
+            w31_scales[expert_id, 0] = s31.to(dtype=input_dtype, device=device)
+            w31_scales[expert_id, 1] = s31.to(dtype=input_dtype, device=device)
+            w2_scales[expert_id, 0] = s2.to(dtype=input_dtype, device=device)
+
+        x_quant, hidden_states_scale = _dynamic_per_tensor_fp8_quant(x)
+        hidden_states_scale_scalar = hidden_states_scale[0].to(device)
+
+        # Note: follow tests quant_scales format
+        # [w1_scales * hidden_states_scale, 1.0, 1.0 * w2_scales, hidden_states_scale]
+        w1_scales = w31_scales[:, 1]
+        one_const = torch.ones((), device=device)
+        quant_scales = [
+            (w1_scales * hidden_states_scale_scalar).float().squeeze(),
+            one_const,
+            w2_scales.squeeze().float(),
+            hidden_states_scale_scalar,
+        ]
+
+        def run_cutlass():
+            return cutlass_fused_moe(
+                x_quant,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_weight_fp8,
+                w2_weight_fp8,
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                output=out,
+            )
+
+    elif variant == "nvfp4":
+        # NVFP4: FP4 block-scale weights, optional quantized input
+        FLOAT4_E2M1_MAX = 6.0
+        FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+        def round_up(x_val, y):
+            return (x_val + y - 1) // y * y
+
+        e = w31_local.shape[0]
+        n = w2_local.shape[2]  # local intermediate size after TP
+        k = hidden_size
+        quant_blocksize = 16
+
+        # Weight quantization buffers
+        w1_q = torch.empty((e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+        w2_q = torch.empty((e, k, n // 2), device=device, dtype=torch.uint8)
+        w1_blockscale = torch.empty(
+            (e, round_up(2 * n, 128), round_up(k // quant_blocksize, 4)),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        w2_blockscale = torch.empty(
+            (e, round_up(k, 128), round_up(n // quant_blocksize, 4)),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        w1_gs = torch.empty((e,), device=device, dtype=torch.float32)
+        w2_gs = torch.empty((e,), device=device, dtype=torch.float32)
+
+        # Quantize from local shards
+        for expert in range(e):
+            w1_src = w31_local[expert]
+            # w31 layout is [2n, k]; w2 layout is [k, n]
+            w2_src = w2_local[expert].contiguous()  # [hidden_size, n]
+            w1_amax = torch.abs(w1_src).max().to(torch.float32)
+            w2_amax = torch.abs(w2_src).max().to(torch.float32)
+            w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+            w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+            w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1_src, w1_gs[expert])
+            w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2_src, w2_gs[expert])
+
+        a1_gs = torch.ones((), device=device, dtype=torch.float32)
+        a2_gs = torch.ones((), device=device, dtype=torch.float32)
+
+        hidden_states = x
+        input_sf = None
+        if getattr(args, "quantized_input", False):
+            hidden_states, input_sf = fp4_quantize(x, a1_gs)
+
+        quant_scales = [
+            a1_gs,
+            w1_blockscale.view(torch.int32),
+            1.0 / (a1_gs * w1_gs),
+            a2_gs,
+            w2_blockscale.view(torch.int32),
+            1.0 / (a2_gs * w2_gs),
+        ]
+
+        def run_cutlass():
+            return cutlass_fused_moe(
+                hidden_states,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w1_q.contiguous().view(torch.long),
+                w2_q.contiguous().view(torch.long),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                input_sf=input_sf,
+                output=out,
+            )
+    else:
+        raise ValueError(f"Unknown cutlass_variant: {variant}")
+
+    # Measure
+    if is_cuda_graph_compatible:
+        times = bench_gpu_time_with_cudagraph(
+            fn=run_cutlass,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            num_iters_within_graph=20,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=False,
+        )
+    else:
+        times = bench_gpu_time(
+            fn=run_cutlass,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=False,
+        )
+
+    median_time = np.median(times)
+    std_time = np.std(times)
+    precision_factor = 1.0 if variant == "base" else (0.5 if variant == "fp8" else 0.25)
+    tflops = calculate_moe_tflops(
+        num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time, precision_factor
+    )
+    tb_per_sec = calculate_moe_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        input_dtype,
+        input_format=(
+            "fp8"
+            if variant == "fp8"
+            else ("fp4" if (variant == "nvfp4" and getattr(args, "quantized_input", False)) else None)
+        ),
+        weight_format=("fp8" if variant == "fp8" else ("fp4" if variant == "nvfp4" else None)),
+        routing_logits_dtype=router_logits.dtype,
+    )
+
+    backend = f"cutlass_fused_moe_{variant}"
+    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+    res = []
+    if args.output_path is not None:
+        cur_res = defaultdict(str)
+        cur_res["routine"] = args.routine
+        cur_res["median_time"] = median_time
+        cur_res["std_time"] = std_time
+        cur_res["tflops"] = tflops
+        cur_res["tb_per_sec"] = tb_per_sec
+        cur_res["backend"] = backend
+        cur_res["num_tokens"] = num_tokens
+        cur_res["hidden_size"] = hidden_size
+        cur_res["intermediate_size"] = intermediate_size
+        cur_res["num_experts"] = num_experts
+        cur_res["top_k"] = top_k
+        # Routing method/weight layout not applicable; leave defaults
+        cur_res["n_group"] = None
+        cur_res["topk_group"] = None
+        cur_res["routing_method_type"] = None
+        cur_res["use_shuffled_weight"] = False
+        cur_res["weight_layout"] = 0
+        cur_res["use_routing_scales_on_input"] = False
+        cur_res["input_dtype"] = input_dtype
+        cur_res["weight_dtype"] = input_dtype
+        res.append(cur_res)
+
     return res
 
 
@@ -724,8 +1098,17 @@ def testTrtllmFp8BlockScaleMoe(args):
         median_time, precision_factor=0.5
     )
     tb_per_sec = calculate_moe_bandwidth(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k,
-        median_time, input_dtype, weight_dtype, is_fp4=False
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        weight_dtype,
+        input_format="fp8",
+        weight_format="fp8",
+        routing_logits_dtype=routing_logits.dtype,
     )
 
     backend = "trtllm_fp8_block_scale"
@@ -883,8 +1266,17 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         median_time, precision_factor=0.5
     )
     tb_per_sec = calculate_moe_bandwidth(
-        num_tokens, hidden_size, intermediate_size, num_experts, top_k,
-        median_time, input_dtype, weight_dtype, is_fp4=False
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        weight_dtype,
+        input_format="fp8",
+        weight_format="fp8",
+        routing_logits_dtype=routing_logits.dtype,
     )
 
     backend = "trtllm_fp8_per_tensor_scale"

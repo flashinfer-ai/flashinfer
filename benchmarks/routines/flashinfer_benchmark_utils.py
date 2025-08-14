@@ -89,6 +89,7 @@ benchmark_apis = {
         "trtllm_fp4_block_scale_moe",
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
+        "cutlass_fused_moe",
     ],
 }
 
