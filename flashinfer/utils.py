@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import math
 import os
+import importlib.util
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 

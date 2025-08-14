@@ -15,7 +15,6 @@
 # Code imported from TensorRT-LLM/tensorrt_llm/_mnnvl_utils.py
 import ctypes
 import logging
-import os
 import platform
 import sys
 from typing import Any, Dict, List, Optional

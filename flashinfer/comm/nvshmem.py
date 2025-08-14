@@ -1,6 +1,5 @@
 import ctypes
 import functools
-import os
 import shlex
 from typing import Sequence
 

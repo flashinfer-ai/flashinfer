@@ -1,6 +1,5 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
-import os
 import subprocess
 import sys
 import sysconfig
