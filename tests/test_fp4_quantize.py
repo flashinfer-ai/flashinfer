@@ -301,11 +301,12 @@ def test_mxfp4_quantize_roundtrip():
     quant_a, sfs = mxfp4_quantize(x)
     dq_a = mxfp4_dequantize(quant_a, sfs)
 
-    print("x: ", x)
-    print("dq_a: ", dq_a)
-
     torch.testing.assert_close(
-        dq_a, x, rtol=0.3, atol=0.5, msg="Quantize -> dequantize mxfp4 roundtrip failed"
+        dq_a.cpu().to(torch.float32),
+        x.cpu().to(torch.float32),
+        rtol=0.3,
+        atol=0.5,
+        msg="Quantize -> dequantize mxfp4 roundtrip failed",
     )
 
 

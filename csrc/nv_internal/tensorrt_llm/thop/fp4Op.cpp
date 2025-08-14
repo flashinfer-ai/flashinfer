@@ -404,8 +404,8 @@ at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t gr
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("block_scale_interleave", &torch_ext::BlockScaleInterleave);
-  m.def("block_scale_interleave_reverse", &torch_ext::BlockScaleInterleaveReverse);
-  m.def("e2m1_and_ufp8sf_scale_to_float", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
+  m.def("block_scale_interleave_sm100", &torch_ext::BlockScaleInterleave);
+  m.def("block_scale_interleave_reverse_sm100", &torch_ext::BlockScaleInterleaveReverse);
+  m.def("e2m1_and_ufp8sf_scale_to_float_sm100", &torch_ext::E2M1AndUFP8SFScaleToFloatV2);
   m.def("mxfp4_dequantize_host", &torch_ext::mxfp4_dequantize_host);
 }

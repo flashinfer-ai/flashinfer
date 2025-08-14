@@ -30,7 +30,6 @@ from .utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    get_device_arch,
 )
 
 
@@ -99,10 +98,10 @@ def get_fp4_quantization_module():
     module = gen_fp4_quantization_module().build_and_load()
 
     @register_custom_op(
-        "flashinfer::fp4_quantize",
+        "flashinfer::fp4_quantize_sm100",
         mutates_args=(""),
     )
-    def fp4_quantize(
+    def fp4_quantize_sm100(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
@@ -130,7 +129,7 @@ def get_fp4_quantization_module():
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        return module.fp4_quantize(
+        return module.fp4_quantize_sm100(
             input,
             global_scale,
             sf_vec_size,
@@ -140,7 +139,7 @@ def get_fp4_quantization_module():
             enable_pdl,
         )
 
-    @register_fake_op("flashinfer::fp4_quantize")
+    @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
@@ -180,10 +179,10 @@ def get_fp4_quantization_module():
         )
 
     @register_custom_op(
-        "flashinfer::block_scale_interleave",
+        "flashinfer::block_scale_interleave_sm100",
         mutates_args=("",),
     )
-    def block_scale_interleave(
+    def block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
@@ -194,12 +193,12 @@ def get_fp4_quantization_module():
         Returns:
             torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        return module.block_scale_interleave(
+        return module.block_scale_interleave_sm100(
             unswizzled_sf,
         )
 
-    @register_fake_op("flashinfer::block_scale_interleave")
-    def _fake_block_scale_interleave(
+    @register_fake_op("flashinfer::block_scale_interleave_sm100")
+    def _fake_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         return unswizzled_sf.new_empty(
@@ -207,10 +206,10 @@ def get_fp4_quantization_module():
         )
 
     @register_custom_op(
-        "flashinfer::e2m1_and_ufp8sf_scale_to_float",
+        "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
         mutates_args=(""),
     )
-    def e2m1_and_ufp8sf_scale_to_float(
+    def e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor: torch.Tensor,
         ufp8_scale_tensor: torch.Tensor,
         global_scale_tensor: Optional[torch.Tensor] = None,
@@ -234,7 +233,7 @@ def get_fp4_quantization_module():
         Returns:
             torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
         """
-        return module.e2m1_and_ufp8sf_scale_to_float(
+        return module.e2m1_and_ufp8sf_scale_to_float_sm100(
             e2m1_tensor.cpu(),
             ufp8_scale_tensor.cpu().reshape(-1),
             global_scale_tensor.cpu(),
@@ -243,8 +242,8 @@ def get_fp4_quantization_module():
             is_sf_swizzled_layout,
         )
 
-    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float")
-    def _fake_e2m1_and_ufp8sf_scale_to_float(
+    @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
+    def _fake_e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor: torch.Tensor,
         ufp8_scale_tensor: torch.Tensor,
         global_scale_tensor: Optional[torch.Tensor] = None,
@@ -258,9 +257,9 @@ def get_fp4_quantization_module():
 
     # Register the module
     return SimpleNamespace(
-        fp4_quantize=fp4_quantize,
-        block_scale_interleave=block_scale_interleave,
-        e2m1_and_ufp8sf_scale_to_float=e2m1_and_ufp8sf_scale_to_float,
+        fp4_quantize_sm100=fp4_quantize_sm100,
+        block_scale_interleave_sm100=block_scale_interleave_sm100,
+        e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
     )
 
@@ -302,11 +301,6 @@ def fp4_quantize(
     """
 
     # check to make sure device is supported
-    if get_device_arch() != "100a":
-        raise NotImplementedError(
-            f"Unsupported device architecture: {get_device_arch()}"
-        )
-
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
@@ -318,7 +312,7 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_fp4_quantization_module().fp4_quantize(
+    x_q, sf = get_fp4_quantization_module().fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,
@@ -350,16 +344,11 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     Raises:
         AssertionError: If input dtype is not uint8.
     """
-    if get_device_arch() != "100a":
-        raise NotImplementedError(
-            f"Unsupported device architecture: {get_device_arch()}"
-        )
-
     # TODO(shuw): check input dtype is uint8
     assert unswizzled_sf.dtype == torch.uint8, (
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
     )
-    return get_fp4_quantization_module().block_scale_interleave(
+    return get_fp4_quantization_module().block_scale_interleave_sm100(
         unswizzled_sf,
     )
 
@@ -393,12 +382,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-    if get_device_arch() != "100a":
-        raise NotImplementedError(
-            f"Unsupported device architecture: {get_device_arch()}"
-        )
-
-    return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float(
+    return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor,
         ufp8_scale_tensor,
         global_scale_tensor,
@@ -476,11 +460,6 @@ def nvfp4_quantize(
             - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
-
-    if get_device_arch() != "100a":
-        raise NotImplementedError(
-            f"Unsupported device architecture: {get_device_arch()}"
-        )
 
     if do_shuffle:
         # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
