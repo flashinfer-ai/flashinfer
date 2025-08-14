@@ -9,7 +9,6 @@ from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
 from .utils import (
     device_support_pdl,
-    get_device_arch,
     register_custom_op,
     register_fake_op,
 )
@@ -161,11 +160,6 @@ def mxfp8_quantize(
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
-    if get_device_arch() != "100a":
-        raise NotImplementedError(
-            f"Unsupported device architecture: {get_device_arch()}"
-        )
-
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0

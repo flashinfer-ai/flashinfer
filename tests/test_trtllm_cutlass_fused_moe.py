@@ -17,7 +17,6 @@ limitations under the License.
 import pytest
 import torch
 from torch.nn import functional as F
-from flashinfer.utils import get_device_arch
 
 import flashinfer.fused_moe as fused_moe
 from flashinfer import (
@@ -363,7 +362,8 @@ def test_moe_fp8(
 )
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.skipif(
-    get_device_arch() != "100a", reason="NVFP4 is only supported on SM100a"
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="NVFP4 is only supported on SM100",
 )
 def test_moe_nvfp4(
     batch_size,
@@ -939,7 +939,8 @@ def dequantize_block(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
-    get_device_arch() != "100a", reason="FP8 block scaling is only supported on SM100a"
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="FP8 block scaling is only supported on SM100",
 )
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
@@ -1092,7 +1093,8 @@ def dequant_mxfp4_batches(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    get_device_arch() != "100a", reason="MXFP8xMXFP4 is only supported on SM100a"
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="MXFP8xMXFP4 is only supported on SM100",
 )
 def test_moe_mxfp8_mxfp4(
     batch_size,
@@ -1235,7 +1237,8 @@ def dequant_mxfp4_batches_host(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    get_device_arch() != "90a", reason="BF16xMXFP4 is only supported on SM90a"
+    torch.cuda.get_device_capability()[0] != 9,
+    reason="BF16xMXFP4 is only supported on SM90",
 )
 def test_moe_bf16_mxfp4(
     batch_size,
