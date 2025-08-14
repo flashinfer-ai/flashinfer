@@ -2722,10 +2722,10 @@ def grouped_gemm_nt_masked(
 
     Args:
         lhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the left-hand side input tensor (A) and its scale factor tensor (SFA).
-            - A should be in (m, k, l) order, but physically (l, m, k)
+            - A should be in (m, k, l) order, but physically (l, m, k). For fp4 tensor with 8-bit storage, we expect the shape to be (m, k/2, l).
             - SFA should be in (m32, m4, rm, k4, rk, l) order, but physically (l, rm, rk, m32, m4, k4)
         rhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the right-hand side input tensor (B) and its scale factor tensor (SFB).
-            - B should be in (n, k, l) order, but physically (l, n, k)
+            - B should be in (n, k, l) order, but physically (l, n, k). For fp4 tensor with 8-bit storage, we expect the shape to be (n, k/2, l).
             - SFB should be in (n32, n4, rn, k4, rk, l) order, but physically (l, rn, rk, n32, n4, k4)
         out (torch.Tensor): Output tensor to store the result, with shape (l, m, n).
         masked_m (torch.Tensor): 1D tensor of shape (l,) specifying the valid row count for each batch (used for masking).
@@ -2745,12 +2745,18 @@ def grouped_gemm_nt_masked(
         - The function applies masking per batch using masked_m.
         - The result is written to c_tensor.
     """
+
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
     c_torch = out
 
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
+
+    if ab_dtype == "float4_e2m1fn":
+        # todo(yingyi): update mnk based on a_major and b_major, and support more major.
+        # Note: only support deepgemm-like shape for now
+        k = k * 2
 
     mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
     cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
