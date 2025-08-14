@@ -1539,6 +1539,7 @@ struct RenormTempStorage {
   struct {
     float max_val;
     float min_val;
+    float row_sum;
     union {
       struct {
         float values[2];
@@ -1565,11 +1566,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       uint8_t smem_renorm[];
   auto& temp_storage =
       reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-  temp_storage.max_val = 0;
   vec_t<float, VEC_SIZE> probs_vec;
-
-  // Shared scalar to broadcast row sum for fast path
-  __shared__ float s_row_sum;
 
   // Fast-path: when p >= 1.0 (e.g., p == 1.0), perform simple sum and normalization
   if (p >= 1.0f) {
@@ -1592,9 +1589,9 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     // Block reduce (float)
     float row_sum = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum(thread_sum);
     // Broadcast via shared
-    if (tx == 0) s_row_sum = row_sum;
+    if (tx == 0) temp_storage.row_sum = row_sum;
     __syncthreads();
-    row_sum = s_row_sum;
+    row_sum = temp_storage.row_sum;
 
     // Guard against zero sum
     const float denom = (row_sum <= 1e-8f) ? 1.0f : row_sum;
