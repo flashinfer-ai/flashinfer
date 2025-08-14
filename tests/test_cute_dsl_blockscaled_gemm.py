@@ -24,7 +24,9 @@ from flashinfer.utils import is_cute_dsl_available
 
 
 # todo(Yingyi): complete this test for target python interface
-@pytest.mark.skipif(not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`")
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
 @pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
 @pytest.mark.parametrize(
@@ -138,13 +140,22 @@ def test_blockscaled_gemm_python_interface(
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
-        a_ref, _dtype_to_cutlass_dtype(ab_dtype), is_dynamic_layout=True, assumed_align=16
+        a_ref,
+        _dtype_to_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     b_tensor, b_torch = cutlass_torch.cute_tensor_like(
-        b_ref, _dtype_to_cutlass_dtype(ab_dtype), is_dynamic_layout=True, assumed_align=16
+        b_ref,
+        _dtype_to_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
-        c_ref, _dtype_to_cutlass_dtype(c_dtype), is_dynamic_layout=True, assumed_align=16
+        c_ref,
+        _dtype_to_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
@@ -156,7 +167,7 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
     for _ in range(iterations):
-        assert (a_major == 'k' and b_major == 'k' and c_major == 'n')
+        assert a_major == "k" and b_major == "k" and c_major == "n"
         grouped_gemm_nt_masked(
             (a_torch, sfa_torch),
             (b_torch, sfb_torch),

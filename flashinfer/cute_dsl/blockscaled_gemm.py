@@ -2706,13 +2706,13 @@ class MaskedBatchedMatmulCuteDSL:
 
 def _dtype_to_cutlass_dtype(dtype: str) -> cutlass.dtype:
     dtype_map = {
-        'float16': cutlass.Float16,
-        'bfloat16': cutlass.BFloat16,
-        'float32': cutlass.Float32,
-        'float8_e5m2': cutlass.Float8E5M2,
-        'float8_e4m3fn': cutlass.Float8E4M3FN,
-        'float8_e8m0fnu': cutlass.Float8E8M0FNU,
-        'float4_e2m1fn': cutlass.Float4E2M1FN,
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+        "float32": cutlass.Float32,
+        "float8_e5m2": cutlass.Float8E5M2,
+        "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
+        "float4_e2m1fn": cutlass.Float4E2M1FN,
     }
     return dtype_map[dtype]
 
@@ -2764,8 +2764,8 @@ def grouped_gemm_nt_masked(
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
 
-    mma_tiler_mn = kwargs.get('mma_tiler_mm', (128, 128))
-    cluster_shape_mn = kwargs.get('cluster_shape_mm', (1, 1))
+    mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
+    cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
 
     # TODO(kaixih@nvidia): do we need `use_cuda_graph`?
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
@@ -2774,9 +2774,9 @@ def grouped_gemm_nt_masked(
         n=n,
         k=k,
         l=l,
-        a_major='k',
-        b_major='k',
-        c_major='n',
+        a_major="k",
+        b_major="k",
+        c_major="n",
         ab_dtype=_dtype_to_cutlass_dtype(ab_dtype),
         sf_dtype=_dtype_to_cutlass_dtype(sf_dtype),
         sf_vec_size=sf_vec_size,
