@@ -189,21 +189,6 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
 
     for _ in range(iterations):
-        # deepgemm-like python interface: fp4 not packed, not for DLFW integration
-        grouped_gemm_nt_masked(
-            (a_torch, sfa_torch),
-            (b_torch, sfb_torch),
-            c_torch,
-            masked_m_tensor,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            is_packed=False,
-        )
-
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
             (a_torch_clone, sfa_torch),
@@ -216,7 +201,6 @@ def test_blockscaled_gemm_python_interface(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            is_packed=True,
         )
         torch.cuda.synchronize()
 
@@ -245,12 +229,7 @@ def test_blockscaled_gemm_python_interface(
 
     if c_dtype in ("float32", "float16", "bfloat16"):
         for i in range(l):
-            torch.testing.assert_close(
-                c_ref[: masked_m_tensor[i].item(), :, i],
-                ref[: masked_m_tensor[i].item(), :, i],
-                atol=tolerance,
-                rtol=1e-02,
-            )
+            # skip testing c_ref & ref
             torch.testing.assert_close(
                 c_ref_clone[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],
@@ -274,12 +253,7 @@ def test_blockscaled_gemm_python_interface(
         cute.testing.convert(ref_f8, ref_tensor)
         ref = ref_device.cpu()
         for i in range(l):
-            torch.testing.assert_close(
-                c_ref[: masked_m_tensor[i].item(), :, i],
-                ref[: masked_m_tensor[i].item(), :, i],
-                atol=tolerance,
-                rtol=1e-02,
-            )
+            # skip testing c_ref & ref
             torch.testing.assert_close(
                 c_ref_clone[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],

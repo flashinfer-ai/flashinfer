@@ -2722,10 +2722,10 @@ def grouped_gemm_nt_masked(
 
     Args:
         lhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the left-hand side input tensor (A) and its scale factor tensor (SFA).
-            - A should be in (m, k, l) order, but physically (l, m, k)
+            - A should be in (m, k, l) order, but physically (l, m, k). For fp4 tensor with 8-bit storage, we expect the shape to be (m, k/2, l).
             - SFA should be in (m32, m4, rm, k4, rk, l) order, but physically (l, rm, rk, m32, m4, k4)
         rhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the right-hand side input tensor (B) and its scale factor tensor (SFB).
-            - B should be in (n, k, l) order, but physically (l, n, k)
+            - B should be in (n, k, l) order, but physically (l, n, k). For fp4 tensor with 8-bit storage, we expect the shape to be (n, k/2, l).
             - SFB should be in (n32, n4, rn, k4, rk, l) order, but physically (l, rn, rk, n32, n4, k4)
         out (torch.Tensor): Output tensor to store the result, with shape (l, m, n).
         masked_m (torch.Tensor): 1D tensor of shape (l,) specifying the valid row count for each batch (used for masking).
@@ -2735,9 +2735,6 @@ def grouped_gemm_nt_masked(
         sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
         mma_tiler_mn (Tuple[int, int], optional): Shape of the MMA tiler (M, N). Default: (128, 128).
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
-        is_packed (bool, optional): Whether the input tensors are packed.
-                                    Default: True (if True, we have int8 tensors for fp4, shaped as (l, m, k/2) or (l, n, k/2), otherwise, we have int8 tensors for fp8, shaped as (l, m, k) or (l, n, k)).
-                                    Note: this is only used for fp4.
 
     Notes:
         - Legends of the input tensors:
@@ -2749,7 +2746,6 @@ def grouped_gemm_nt_masked(
         - The result is written to c_tensor.
     """
 
-    is_packed = kwargs.get("is_packed", True)
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
     c_torch = out
@@ -2757,7 +2753,7 @@ def grouped_gemm_nt_masked(
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
 
-    if ab_dtype == "float4_e2m1fn" and is_packed:
+    if ab_dtype == "float4_e2m1fn":
         # todo(yingyi): update mnk based on a_major and b_major, and support more major.
         # Note: only support deepgemm-like shape for now
         k = k * 2
