@@ -1579,7 +1579,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       if (base_idx < d) {
         probs_vec.cast_load(probs + row_idx * d + base_idx);
       }
-      #pragma unroll
+#pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const uint32_t idx = base_idx + j;
         if (idx < d) thread_sum += probs_vec[j];
@@ -1587,7 +1587,9 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     }
 
     // Block reduce (float)
-    float row_sum = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum(thread_sum);
+    float row_sum =
+        BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+            .Sum(thread_sum);
     // Broadcast via shared
     if (tx == 0) temp_storage.row_sum = row_sum;
     __syncthreads();
@@ -1604,7 +1606,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       if (base_idx < d) {
         probs_vec.cast_load(probs + row_idx * d + base_idx);
       }
-      #pragma unroll
+#pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const uint32_t idx = base_idx + j;
         float v = probs_vec[j];
@@ -1614,13 +1616,14 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
         probs_vec.cast_store(renormed_prob + row_idx * d + base_idx);
       }
     }
-    return; // Exit after fast-path processing
+    return;  // Exit after fast-path processing
   }
 
   // Original Top-P renormalization logic
   temp_storage.max_val = 0;
-  float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM, RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
-      probs, row_idx, d, temp_storage);
+  float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
+                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
+                                                                                  temp_storage);
 
   double low = 0, high = max_val;
   float min_gt_low, max_le_high;
