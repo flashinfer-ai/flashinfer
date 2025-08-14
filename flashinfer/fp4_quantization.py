@@ -129,7 +129,7 @@ def get_fp4_quantization_module():
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        return module.fp4_quantize_sm100(
+        return module.fp4_quantize(
             input,
             global_scale,
             sf_vec_size,
@@ -140,7 +140,7 @@ def get_fp4_quantization_module():
         )
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
-    def _fake_fp4_quantize(
+    def _fake_fp4_quantize_sm100(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,

@@ -144,6 +144,4 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 }
 }  // namespace torch_ext
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("fp4_quantize_sm100", &torch_ext::fp4_quantize);
-}
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) { m.def("fp4_quantize", &torch_ext::fp4_quantize); }
