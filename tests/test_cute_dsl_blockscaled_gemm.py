@@ -157,6 +157,35 @@ def test_blockscaled_gemm_python_interface(
         is_dynamic_layout=True,
         assumed_align=16,
     )
+    c_tensor_clone, c_torch_clone = cutlass_torch.cute_tensor_like(
+        c_ref_clone,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    # for deepgemm-like python interface
+    a_torch_clone = a_torch.clone()
+    b_torch_clone = b_torch.clone()
+
+    if ab_dtype == "float4_e2m1fn":
+        m, k, l = a_torch_clone.shape
+        n, k, l = b_torch_clone.shape
+        # slice into half after flatten
+        half_len_a = a_torch_clone.numel() // 2
+        half_len_b = b_torch_clone.numel() // 2
+        a_torch_clone = (
+            a_torch_clone.permute(2, 0, 1)
+            .flatten()[:half_len_a]
+            .reshape(l, m, k // 2)
+            .permute(1, 2, 0)
+        )
+        b_torch_clone = (
+            b_torch_clone.permute(2, 0, 1)
+            .flatten()[:half_len_b]
+            .reshape(l, n, k // 2)
+            .permute(1, 2, 0)
+        )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
         l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
