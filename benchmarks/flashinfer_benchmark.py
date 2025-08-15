@@ -63,7 +63,9 @@ def parse_args(line=sys.argv[1:]):
         "-R",
         type=str,
         required=True,
-        choices=list(benchmark_apis["attention"]) + list(benchmark_apis["gemm"]) + list(benchmark_apis["moe"]),
+        choices=list(benchmark_apis["attention"])
+        + list(benchmark_apis["gemm"])
+        + list(benchmark_apis["moe"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
