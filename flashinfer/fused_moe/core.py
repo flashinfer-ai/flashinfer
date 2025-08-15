@@ -1115,14 +1115,28 @@ def get_trtllm_moe_sm100_module():
                 # FP8 operations
                 if self.use_deepseek_fp8:
                     print(
-                        routing_logits,
-                        kwargs["routing_bias"],
-                        hidden_states,
-                        hidden_states_scale,
-                        kwargs["gemm1_weights"],
-                        kwargs["gemm1_weights_scale"],
-                        kwargs["gemm2_weights"],
-                        kwargs["gemm2_weights_scale"],
+                        (routing_logits.shape, routing_logits.dtype),
+                        (kwargs["routing_bias"].shape, kwargs["routing_bias"].dtype)
+                        if kwargs["routing_bias"] is not None
+                        else None,
+                        (hidden_states.shape, hidden_states.dtype),
+                        (hidden_states_scale.shape, hidden_states_scale.dtype)
+                        if hidden_states_scale is not None
+                        else None,
+                        (kwargs["gemm1_weights"].shape, kwargs["gemm1_weights"].dtype),
+                        (
+                            kwargs["gemm1_weights_scale"].shape,
+                            kwargs["gemm1_weights_scale"].dtype,
+                        )
+                        if kwargs["gemm1_weights_scale"] is not None
+                        else None,
+                        (kwargs["gemm2_weights"].shape, kwargs["gemm2_weights"].dtype),
+                        (
+                            kwargs["gemm2_weights_scale"].shape,
+                            kwargs["gemm2_weights_scale"].dtype,
+                        )
+                        if kwargs["gemm2_weights_scale"] is not None
+                        else None,
                         self.num_experts,
                         self.top_k,
                         kwargs["n_group"],
