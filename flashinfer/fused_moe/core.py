@@ -1153,11 +1153,19 @@ def get_trtllm_moe_sm100_module():
                         tactic,
                     )
                     # FP8 block scale
+                    current_num_tokens = inputs[1].shape[0]
+                    current_hidden_size = inputs[1].shape[1]
+                    current_hidden_states_scale = torch.full(
+                        (current_hidden_size // 128, current_num_tokens),
+                        2.0,
+                        dtype=torch.float,
+                        device=inputs[1].device,
+                    )
                     return moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
-                        hidden_states_scale,
+                        current_hidden_states_scale,
                         kwargs["gemm1_weights"],
                         kwargs["gemm1_weights_scale"],
                         kwargs["gemm2_weights"],
