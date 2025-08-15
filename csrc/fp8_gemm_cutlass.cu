@@ -59,8 +59,8 @@ CutlassGemmConfig getFp8GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
-             at::Tensor const& scale, int64_t m, int64_t n, int64_t k, int64_t b,
-             CutlassGemmConfig const& gemmConfig, at::Tensor workspace_buffer) {
+             at::Tensor const& scale_a, at::Tensor const& scale_b, int64_t m, int64_t n, int64_t k,
+             int64_t b, CutlassGemmConfig const& gemmConfig, at::Tensor workspace_buffer) {
   CutlassFp8GemmRunner<T> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k);
@@ -70,8 +70,9 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(reinterpret_cast<__nv_fp8_e4m3 const*>(mat1.const_data_ptr()),
                     reinterpret_cast<__nv_fp8_e4m3 const*>(mat2.const_data_ptr()),
-                    reinterpret_cast<float const*>(scale.const_data_ptr()), out.data_ptr(), m, n, k,
-                    b, gemmConfig, reinterpret_cast<char*>(workspace), required_workspace_size,
+                    reinterpret_cast<float const*>(scale_a.const_data_ptr()),
+                    reinterpret_cast<float const*>(scale_b.const_data_ptr()), out.data_ptr(), m, n,
+                    k, b, gemmConfig, reinterpret_cast<char*>(workspace), required_workspace_size,
                     at::cuda::getCurrentCUDAStream(mat1.get_device()));
   };
 
@@ -85,10 +86,13 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
   }
 }
 
-at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale,
-                        at::Tensor out, at::Tensor workspace_buffer, int64_t tactic) {
+at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale_a,
+                        at::Tensor const& scale_b, at::Tensor out, at::Tensor workspace_buffer,
+                        int64_t tactic) {
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
+  CHECK_INPUT(scale_a);
+  CHECK_INPUT(scale_b);
 
   int mat2_k_scale = 1;
 
@@ -135,10 +139,11 @@ at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
   switch (out.scalar_type()) {
     case at::ScalarType::Half:
-      runGemm<half>(out, mat1, mat2, scale, m, n, k, b, config, workspace_buffer);
+      runGemm<half>(out, mat1, mat2, scale_a, scale_b, m, n, k, b, config, workspace_buffer);
       break;
     case at::ScalarType::BFloat16:
-      runGemm<__nv_bfloat16>(out, mat1, mat2, scale, m, n, k, b, config, workspace_buffer);
+      runGemm<__nv_bfloat16>(out, mat1, mat2, scale_a, scale_b, m, n, k, b, config,
+                             workspace_buffer);
       break;
     default:
       TORCH_CHECK(false, "out_dtype must be one of fp16/bf16.");
@@ -148,9 +153,10 @@ at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
 }  // namespace
 
-at::Tensor fp8_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale,
-                    at::Tensor out, at::Tensor workspace_buffer, int64_t tactic) {
-  return fp8_bmm_impl(mat1, mat2, scale, out, workspace_buffer, tactic);
+at::Tensor fp8_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale_a,
+                    at::Tensor const& scale_b, at::Tensor out, at::Tensor workspace_buffer,
+                    int64_t tactic) {
+  return fp8_bmm_impl(mat1, mat2, scale_a, scale_b, out, workspace_buffer, tactic);
 }
 
 int64_t fp8_gemm_tactic_num() {

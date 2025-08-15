@@ -23,9 +23,12 @@
 #include "cutlass/arch/arch.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/numeric_conversion.h"
 #include "flashinfer/arch_condition.h"
 #include "flashinfer/cutlass_utils.cuh"
 
@@ -68,9 +71,10 @@ struct SMTypeAdapter<_2SM> {
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_,
           typename ClusterShape_, typename XSM_>
 size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B,
-                                         float const* alpha, T* D, int m, int n, int k, int b,
-                                         CutlassGemmConfig config, char* workspacePtr,
-                                         size_t const workspaceBytes, cudaStream_t stream) {
+                                         float const* scale_a, float const* scale_b, T* D, int m,
+                                         int n, int k, int b, CutlassGemmConfig config,
+                                         char* workspacePtr, size_t const workspaceBytes,
+                                         cudaStream_t stream) {
   using namespace cute;
 
   // A matrix configuration
@@ -124,10 +128,23 @@ size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 c
   using MainloopSchedule = typename SMTypeAdapter<XSM_>::MainloopSchedule;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
+  using CustomEVT = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::multiplies, ElementD, float,
+          cutlass::FloatRoundStyle::round_to_nearest>,        // scale_a * scale_b * acc
+      cutlass::epilogue::fusion::Sm90ScalarBroadcast<float>,  // scale_a
+      cutlass::epilogue::fusion::Sm90EVT<
+          cutlass::epilogue::fusion::Sm90Compute<
+              cutlass::multiplies, float, float,
+              cutlass::FloatRoundStyle::round_to_nearest>,        // scale_b * acc
+          cutlass::epilogue::fusion::Sm90ScalarBroadcast<float>,  // scale_b
+          cutlass::epilogue::fusion::Sm90AccFetch                 // acc
+          >>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
       ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
-      EpilogueSchedule>::CollectiveOp;
+      EpilogueSchedule, CustomEVT>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
@@ -168,11 +185,15 @@ size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 c
                                       reinterpret_cast<ElementOutput*>(D),
                                       stride_D}};
 
-  auto& fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha = 0.F;
-  fusion_args.beta = 0.F;
-  fusion_args.alpha_ptr = alpha;
-  fusion_args.beta_ptr = nullptr;
+  arguments.epilogue.thread = {
+      {{0.F}, {scale_a}},  // scale_a
+      {
+          {{0.F}, {scale_b}},  // scale_b
+          {},                  // acc
+          {}                   // multiplies
+      },
+      {}  // multiplies
+  };
 
   Gemm gemm;
 
@@ -210,8 +231,8 @@ size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 c
   template size_t genericFp8GemmKernelLauncherSm100<                                               \
       RET_TYPE, cutlass::arch::Sm100, TILE_M, TILE_N, TILE_K,                                      \
       cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>, SM_TYPE>(              \
-      __nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* alpha, RET_TYPE* D, int m,      \
-      int n, int k, int b, CutlassGemmConfig config, char* workspacePtr,                           \
+      __nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* scale_a, float const* scale_b,  \
+      RET_TYPE* D, int m, int n, int k, int b, CutlassGemmConfig config, char* workspacePtr,       \
       size_t const workspaceBytes, cudaStream_t stream);
 
 #endif  // FLASHINFER_FP8_GEMM_TEMPLATE_SM100_H_
