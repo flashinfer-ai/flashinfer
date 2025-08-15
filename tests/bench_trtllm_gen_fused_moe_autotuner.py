@@ -258,12 +258,12 @@ def bench_trtllm_gen_fused_moe_autotuner(
             w2_scale,
             num_experts,
             top_k,
-            None,  # n_group
-            None,  # topk_group
+            0,  # n_group
+            0,  # topk_group
             intermediate_size,
             0,  # local_expert_offset
             num_experts,
-            None,  # routed_scaling_factor
+            1.0,  # routed_scaling_factor
             tile_tokens_dim,
             RoutingMethodType.RenormalizeNaive,
             use_shuffled_weight=True,
@@ -305,12 +305,12 @@ def bench_trtllm_gen_fused_moe_autotuner(
             output2_scale_scalar,
             num_experts,
             top_k,
-            None,  # n_group
-            None,  # topk_group
+            0,  # n_group
+            0,  # topk_group
             intermediate_size,
             0,  # local_expert_offset
             num_experts,
-            None,  # routed_scaling_factor
+            1.0,  # routed_scaling_factor
             False,  # use_routing_scales_on_input
             tile_tokens_dim,
             RoutingMethodType.RenormalizeNaive,
