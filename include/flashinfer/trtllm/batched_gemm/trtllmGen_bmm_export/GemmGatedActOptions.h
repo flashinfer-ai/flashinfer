@@ -158,8 +158,8 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 inline std::string dumpOptions(GemmGatedActOptions const& options) {
   std::stringstream ss;
   ss << gemm::dumpOptions(options) << ", ";
-  ss << "mActType="
-     << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
+  ss << "mActType=" << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << "),"
+     << std::endl;
   ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
   return ss.str();
 }
