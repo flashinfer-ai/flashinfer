@@ -149,22 +149,6 @@ python3 flashinfer_benchmark.py \
     --routing_method renormalize \
     --verbose
 
-# MOE FP8 Per-Tensor Scale
-python3 flashinfer_benchmark.py \
-    --routine trtllm_fp8_per_tensor_scale_moe \
-    --num_tokens 1024 \
-    --hidden_size 1024 \
-    --intermediate_size 1024 \
-    --num_experts 128 \
-    --top_k 8 \
-    --n_group 8 \
-    --topk_group 4 \
-    --routed_scaling_factor 2.5 \
-    --use_routing_bias \
-    --routing_method deepseek_v3 \
-    --use_routing_scales_on_input \
-    --verbose
-
 # CUTLASS Fused MoE (base variant)
 python3 flashinfer_benchmark.py \
     --routine cutlass_fused_moe \
