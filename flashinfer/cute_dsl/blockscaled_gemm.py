@@ -2740,8 +2740,9 @@ def grouped_gemm_nt_masked(
         - Legends of the input tensors:
             * `l` is the batch size, `m/n` is the number of rows, and `k` is the number of columns.
             * `m/n32`, `m/n4`, `k4` are constant values 32, 4, 4 respectively.
-            * `m32 * m4 * rm` should be same as `m`, `n32 * n4 * rn` should be same as `n`.
-            * `k4 * rk` should be same as `k * sf_vec_size`. `rk` is the number of rows of the scale factor tensor.
+            * `m32 * m4 * rm` should be same as `M`, which is `m` padded up to the nearest multiple of 128.
+            * `n32 * n4 * rn` should be same as `N`, which is `n` padded up to the nearest multiple of 128.
+            * `k4 * rk` should be same as `K`, which is `k / sf_vec_size` padded up to the nearest multiple of 4.
         - The function applies masking per batch using masked_m.
         - The result is written to c_tensor.
     """
