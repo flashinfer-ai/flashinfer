@@ -1269,7 +1269,6 @@ def get_trtllm_moe_sm100_module():
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-        # Create dynamic tensors like FP4 does
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1284,7 +1283,6 @@ def get_trtllm_moe_sm100_module():
             num_tokens, top_k, dtype=torch.bfloat16, device=hidden_states.device
         )
 
-        # Deduce dtypes like FP4 does
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
         dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
 
@@ -1306,7 +1304,6 @@ def get_trtllm_moe_sm100_module():
             [moe_runner],
             MoERunner.tuning_config_no_hidden_states_scales,  # FP8 per-tensor doesn't use hidden_states_scale
             inputs,
-            # Pass all parameters through kwargs like FP4 does
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             output1_scales_scalar=output1_scales_scalar,
@@ -1413,7 +1410,6 @@ def get_trtllm_moe_sm100_module():
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-        # Create dynamic tensors like FP4 does
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1428,7 +1424,6 @@ def get_trtllm_moe_sm100_module():
             num_tokens, top_k, dtype=torch.bfloat16, device=hidden_states.device
         )
 
-        # Deduce dtypes like FP4 does - but use deepseek_fp8 to distinguish block scale
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
         dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
 
@@ -1457,7 +1452,6 @@ def get_trtllm_moe_sm100_module():
             [moe_runner],
             MoERunner.tuning_config_with_hidden_states_scales,  # FP8 block-scale uses hidden_states_scale
             inputs,
-            # Pass all parameters through kwargs like FP4 does
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
