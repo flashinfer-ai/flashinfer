@@ -54,10 +54,11 @@ def generate_cumsum_lens(lens):
     )
 
 
-def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
+def create_query_tensor(q_lens, q_len_per_req, num_qo_heads, head_dim, q_dtype):
     q = torch.randn(
         torch.sum(q_lens).item(),
         num_qo_heads,
+        q_len_per_req,
         head_dim,
         dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
         device=GPU_DEVICE,
@@ -396,6 +397,7 @@ def test_trtllm_batch_prefill(
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
@@ -417,6 +419,7 @@ def test_trtllm_batch_prefill(
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
+    q_len_per_req,
     page_size,
     num_kv_heads,
     head_grp_size,
@@ -439,7 +442,7 @@ def test_trtllm_batch_decode(
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q, q_scale, ref_q = create_query_tensor(q_lens, q_len_per_req, num_qo_heads, head_dim, q_dtype)
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
