@@ -1168,21 +1168,6 @@ def get_trtllm_moe_sm100_module():
                     ),
                 ),
             )
-            # FP8-specific tuning config refinement
-            cls.tuning_config_fp8 = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        (
-                            0,
-                            1,
-                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
-                        (0, 0),  # Modify dimension 0 (num_tokens) for both
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                        cls.fp8_tensor_initializers,
-                    ),
-                )
-            )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
