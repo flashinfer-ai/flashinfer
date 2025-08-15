@@ -1114,52 +1114,14 @@ def get_trtllm_moe_sm100_module():
             ):
                 # FP8 operations
                 if self.use_deepseek_fp8:
-                    print(
-                        (routing_logits.shape, routing_logits.dtype),
-                        (kwargs["routing_bias"].shape, kwargs["routing_bias"].dtype)
-                        if kwargs["routing_bias"] is not None
-                        else None,
-                        (hidden_states.shape, hidden_states.dtype),
-                        (hidden_states_scale.shape, hidden_states_scale.dtype)
-                        if hidden_states_scale is not None
-                        else None,
-                        (kwargs["gemm1_weights"].shape, kwargs["gemm1_weights"].dtype),
-                        (
-                            kwargs["gemm1_weights_scale"].shape,
-                            kwargs["gemm1_weights_scale"].dtype,
-                        )
-                        if kwargs["gemm1_weights_scale"] is not None
-                        else None,
-                        (kwargs["gemm2_weights"].shape, kwargs["gemm2_weights"].dtype),
-                        (
-                            kwargs["gemm2_weights_scale"].shape,
-                            kwargs["gemm2_weights_scale"].dtype,
-                        )
-                        if kwargs["gemm2_weights_scale"] is not None
-                        else None,
-                        self.num_experts,
-                        self.top_k,
-                        kwargs["n_group"],
-                        kwargs["topk_group"],
-                        self.intermediate_size,
-                        kwargs["local_expert_offset"],
-                        kwargs["local_num_experts"],
-                        kwargs["routed_scaling_factor"],
-                        tile_tokens_dim,
-                        kwargs["routing_method_type"],
-                        kwargs["use_shuffled_weight"],
-                        kwargs["weight_layout"],
-                        kwargs["enable_pdl"],
-                        tactic,
-                    )
                     # FP8 block scale
-                    current_num_tokens = inputs[1].shape[0]
-                    current_hidden_size = inputs[1].shape[1]
+                    current_num_tokens = hidden_states.shape[0]
+                    current_hidden_size = hidden_states.shape[1]
                     current_hidden_states_scale = torch.full(
                         (current_hidden_size // 128, current_num_tokens),
                         2.0,
                         dtype=torch.float,
-                        device=inputs[1].device,
+                        device=hidden_states.device,
                     )
                     return moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
