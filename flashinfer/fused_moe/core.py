@@ -1200,20 +1200,28 @@ def get_trtllm_moe_sm100_module():
 
         # Create FP8 per-tensor TunableRunner similar to FP4
         class FP8PerTensorMoERunner(TunableRunner):
+            # Custom tensor initializers for FP8 tensors
+            fp8_tensor_initializers = [
+                lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device, dtype=torch.float
+                ).to(dtype),  # routing_logits
+                lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device, dtype=torch.float
+                ).to(dtype),  # hidden_states
+            ]
+
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
                     # Both routing_logits and hidden_states need num_tokens dimension modified
                     DynamicTensorSpec(
-                        (0,),  # Apply to inputs[0] (routing_logits)
-                        (0,),  # Modify dimension 0 (num_tokens)
+                        (
+                            0,
+                            1,
+                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
+                        (0, 0),  # Modify dimension 0 (num_tokens) for both
                         get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                    ),
-                    DynamicTensorSpec(
-                        (1,),  # Apply to inputs[1] (hidden_states)
-                        (0,),  # Modify dimension 0 (num_tokens)
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        fp8_tensor_initializers,
                     ),
                 )
             )
@@ -1359,20 +1367,28 @@ def get_trtllm_moe_sm100_module():
 
         # Create FP8 block-scale TunableRunner similar to FP4
         class FP8BlockScaleMoERunner(TunableRunner):
+            # Custom tensor initializers for FP8 tensors
+            fp8_tensor_initializers = [
+                lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device, dtype=torch.float
+                ).to(dtype),  # routing_logits
+                lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device, dtype=torch.float
+                ).to(dtype),  # hidden_states
+            ]
+
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
                     # Both routing_logits and hidden_states need num_tokens dimension modified
                     DynamicTensorSpec(
-                        (0,),  # Apply to inputs[0] (routing_logits)
-                        (0,),  # Modify dimension 0 (num_tokens)
+                        (
+                            0,
+                            1,
+                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
+                        (0, 0),  # Modify dimension 0 (num_tokens) for both
                         get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                    ),
-                    DynamicTensorSpec(
-                        (1,),  # Apply to inputs[1] (hidden_states)
-                        (0,),  # Modify dimension 0 (num_tokens)
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        fp8_tensor_initializers,
                     ),
                 )
             )
