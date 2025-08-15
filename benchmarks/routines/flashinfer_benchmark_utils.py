@@ -12,6 +12,7 @@ output_column_dict = {
         "tb_per_sec",
     ],
     "attention": [
+        "backend",
         "page_size",
         "batch_size",
         "s_qo",
@@ -55,7 +56,6 @@ output_column_dict = {
         "weight_dtype",
     ],
     "general": [
-        "backend",
         "refcheck",
         "no_cuda_graph",
         "allow_output_mismatch",
