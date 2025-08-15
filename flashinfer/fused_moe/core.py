@@ -1070,36 +1070,6 @@ def get_trtllm_moe_sm100_module():
             self.weight_layout = weight_layout
             self.enable_pdl = enable_pdl
 
-        def __hash__(self):
-            """Make MoERunner hashable for autotuner caching.
-
-            Following original pattern - all attributes are hashable types.
-            """
-            return hash(
-                (
-                    self.top_k,
-                    self.num_experts,
-                    self.dtype_act,
-                    self.dtype_weights,
-                    self.use_deepseek_fp8,
-                    self.hidden_size,
-                    self.intermediate_size,
-                    self.tile_tokens_dim,
-                    self.fp8_mode,
-                    # FP8-specific hashable attributes
-                    self.n_group,
-                    self.topk_group,
-                    self.local_expert_offset,
-                    self.local_num_experts,
-                    self.routed_scaling_factor,
-                    self.use_routing_scales_on_input,
-                    self.routing_method_type,
-                    self.use_shuffled_weight,
-                    self.weight_layout,
-                    self.enable_pdl,
-                )
-            )
-
         def get_tile_tokens_dim(self, num_tokens: int, top_k: int):
             # Factor to account for the imbalance of the experts.
             # factor equals to the
