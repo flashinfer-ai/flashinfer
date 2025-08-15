@@ -62,8 +62,8 @@ void trtllm_moe_allreduce_fusion(
         params.rms_eps = static_cast<float>(rms_eps);
         params.scale_factor = static_cast<float>(scale_factor);
         params.layout = layout_code.has_value()
-                            ? static_cast<FP4QuantizationSFLayout>(layout_code.value())
-                            : FP4QuantizationSFLayout::SWIZZLED;
+                            ? static_cast<QuantizationSFLayout>(layout_code.value())
+                            : QuantizationSFLayout::SWIZZLED_128x4;
         params.stream = stream;
 
         params.moe_reduction_device_num_experts = moe_reduction_device_num_experts;

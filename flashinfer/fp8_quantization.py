@@ -7,7 +7,11 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags
-from .utils import device_support_pdl, register_custom_op, register_fake_op
+from .utils import (
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 def gen_mxfp8_quantization_sm100_module() -> JitSpec:
@@ -26,10 +30,12 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -84,6 +90,7 @@ def get_mxfp8_quantization_sm100_module():
     def _fake_mxfp8_quantize_sm100(
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
+        alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
         return (

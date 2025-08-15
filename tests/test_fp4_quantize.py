@@ -5,9 +5,11 @@ import torch
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 from flashinfer import (
+    block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
-    nvfp4_block_scale_interleave,
+    mxfp4_quantize,
+    mxfp4_dequantize,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -175,12 +177,12 @@ def test_scale_swizzling(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_block_scale_interleave(
+def test_block_scale_interleave(
     shape: tuple[int, int],
     seed: int,
     device: str,
 ) -> None:
-    """Test the nvfp4_block_scale_interleave function directly."""
+    """Test the block_scale_interleave function directly."""
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
@@ -195,7 +197,7 @@ def test_nvfp4_block_scale_interleave(
     unswizzled_sf = torch.randint(0, 256, scale_shape, dtype=torch.uint8, device=device)
 
     # Test the swizzling function
-    swizzled_sf = nvfp4_block_scale_interleave(unswizzled_sf)
+    swizzled_sf = block_scale_interleave(unswizzled_sf)
 
     # Compare against the reference implementation
     ref_swizzled_sf = swizzle_sf(unswizzled_sf, m, n, sf_vec_size)
@@ -290,6 +292,21 @@ def test_e2m1_dequantization(
         rtol=0.3,
         atol=0.5,  # Reasonable tolerance for FP4 quantization
         msg="Quantize -> dequantize roundtrip failed",
+    )
+
+
+def test_mxfp4_quantize_roundtrip():
+    x = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16) / 10
+
+    quant_a, sfs = mxfp4_quantize(x)
+    dq_a = mxfp4_dequantize(quant_a, sfs)
+
+    torch.testing.assert_close(
+        dq_a.cpu().to(torch.float32),
+        x.cpu().to(torch.float32),
+        rtol=0.3,
+        atol=0.5,
+        msg="Quantize -> dequantize mxfp4 roundtrip failed",
     )
 
 
