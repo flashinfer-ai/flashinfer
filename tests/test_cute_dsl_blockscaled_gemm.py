@@ -145,7 +145,6 @@ def test_blockscaled_gemm_python_interface(
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
-    c_ref_clone = c_ref.clone()
 
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref,
@@ -165,20 +164,26 @@ def test_blockscaled_gemm_python_interface(
         is_dynamic_layout=True,
         assumed_align=16,
     )
-    c_tensor_clone, c_torch_clone = cutlass_torch.cute_tensor_like(
-        c_ref_clone,
-        get_cutlass_dtype(c_dtype),
-        is_dynamic_layout=True,
-        assumed_align=16,
-    )
 
     # for deepgemm-like python interface
-    a_torch_clone = a_torch.clone()
-    b_torch_clone = b_torch.clone()
-
     if ab_dtype == "float4_e2m1fn":
-        a_torch_clone = a_torch_clone[:, : a_torch_clone.shape[1] // 2, :]
-        b_torch_clone = b_torch_clone[:, : b_torch_clone.shape[1] // 2, :]
+        m, k, l = a_torch.shape
+        n, k, l = b_torch.shape
+        # slice into half after flatten
+        half_len_a = a_torch.numel() // 2
+        half_len_b = b_torch.numel() // 2
+        a_torch = (
+            a_torch.permute(2, 0, 1)
+            .flatten()[:half_len_a]
+            .reshape(l, m, k // 2)
+            .permute(1, 2, 0)
+        )
+        b_torch = (
+            b_torch.permute(2, 0, 1)
+            .flatten()[:half_len_b]
+            .reshape(l, n, k // 2)
+            .permute(1, 2, 0)
+        )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
         l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
@@ -191,9 +196,9 @@ def test_blockscaled_gemm_python_interface(
     for _ in range(iterations):
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
-            (a_torch_clone, sfa_torch),
-            (b_torch_clone, sfb_torch),
-            c_torch_clone,
+            (a_torch, sfa_torch),
+            (b_torch, sfb_torch),
+            c_torch,
             masked_m_tensor,
             ab_dtype=ab_dtype,
             sf_dtype=sf_dtype,
@@ -211,27 +216,19 @@ def test_blockscaled_gemm_python_interface(
 
     # Convert c back to f32 for comparison.
     c_ref_device = c_ref.cuda()
-    c_ref_device_clone = c_ref_clone.cuda()
     cute.testing.convert(
         c_tensor,
         from_dlpack(c_ref_device, assumed_align=16).mark_layout_dynamic(
             leading_dim=(1 if c_major == "n" else 0)
         ),
     )
-    cute.testing.convert(
-        c_tensor_clone,
-        from_dlpack(c_ref_device_clone, assumed_align=16).mark_layout_dynamic(
-            leading_dim=(1 if c_major == "n" else 0)
-        ),
-    )
     c_ref = c_ref_device.cpu()
-    c_ref_clone = c_ref_device_clone.cpu()
 
     if c_dtype in ("float32", "float16", "bfloat16"):
         for i in range(l):
             # skip testing c_ref & ref
             torch.testing.assert_close(
-                c_ref_clone[: masked_m_tensor[i].item(), :, i],
+                c_ref[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],
                 atol=tolerance,
                 rtol=1e-02,
@@ -255,7 +252,7 @@ def test_blockscaled_gemm_python_interface(
         for i in range(l):
             # skip testing c_ref & ref
             torch.testing.assert_close(
-                c_ref_clone[: masked_m_tensor[i].item(), :, i],
+                c_ref[: masked_m_tensor[i].item(), :, i],
                 ref[: masked_m_tensor[i].item(), :, i],
                 atol=tolerance,
                 rtol=1e-02,
