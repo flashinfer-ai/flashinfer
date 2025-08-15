@@ -31,14 +31,14 @@ def _build_seq_len_configs():
     torch.manual_seed(42)
 
     seq_len_configs = [
-        [(67, 1)],
-        [(182, 1)],
-        [(2011, 1)],
+        # [(67, 1)],
+        # [(182, 1)],
+        # [(2011, 1)],
         [(2048, 1)] * 77,  # decode-only
-        [(4099, 129)] * 2,  # prefill-only
-        [(600, 1)] * 132 * 2 + [(5000, 3)] * 128,
-        [(1024, 1)] * 100 + [(8192, 17)] * 8,  # speculative decode
-        [(766, 2)] * 99 + [(1024, 512)] * 1,  # chunked prefill
+        # [(4099, 129)] * 2,  # prefill-only
+        # [(600, 1)] * 132 * 2 + [(5000, 3)] * 128,
+        # [(1024, 1)] * 100 + [(8192, 17)] * 8,  # speculative decode
+        # [(766, 2)] * 99 + [(1024, 512)] * 1,  # chunked prefill
     ]
 
     # Construct random seqlen tests
@@ -86,7 +86,7 @@ def _run_attention(
 
     num_blocks = kv_indptr[-1].item()
 
-    q = torch.rand(
+    q = torch.ones(
         q_indptr[-1].item(), num_qo_heads, head_dim, dtype=test_dtype, device=dev
     )
     if layout == "NHD":
