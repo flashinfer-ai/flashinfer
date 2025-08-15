@@ -1703,6 +1703,7 @@ def bmm_fp8(
 
     backend: Literal["cudnn", "cublas", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"cublas"``.
+        ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
     -------
