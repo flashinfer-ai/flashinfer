@@ -1193,10 +1193,78 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 1024,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        # Call the C++ function
+
+        # Create FP8 per-tensor TunableRunner similar to FP4
+        class FP8PerTensorMoERunner(TunableRunner):
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        (0,),
+                        (0,),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                )
+            )
+
+            def get_valid_tactics(self, inputs, profile):
+                # For FP8 per-tensor, we'll use the trtllm_get_valid_moe_configs function
+                num_tokens = inputs[0].shape[0]
+                hidden_size = inputs[0].shape[1]
+                return moe_op.trtllm_get_valid_moe_configs(
+                    tile_tokens_dim,
+                    5,
+                    5,
+                    False,  # dtype_act=E4m3, dtype_weights=E4m3, useDeepSeekFp8=False
+                    top_k,
+                    hidden_size,
+                    intermediate_size,
+                    local_num_experts,
+                    num_tokens,
+                )
+
+            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                return moe_op.trtllm_fp8_per_tensor_scale_moe(
+                    inputs[0],  # routing_logits
+                    routing_bias,
+                    inputs[1],  # hidden_states
+                    gemm1_weights,
+                    output1_scales_scalar,
+                    output1_scales_gate_scalar,
+                    gemm2_weights,
+                    output2_scales_scalar,
+                    num_experts,
+                    top_k,
+                    n_group,
+                    topk_group,
+                    intermediate_size,
+                    local_expert_offset,
+                    local_num_experts,
+                    routed_scaling_factor,
+                    use_routing_scales_on_input,
+                    tile_tokens_dim,
+                    routing_method_type,
+                    enable_pdl,
+                    tactic,
+                )
+
+        # Use AutoTuner to select the best tactic
+        tuner = AutoTuner.get()
+        fp8_runner = FP8PerTensorMoERunner()
+        inputs = [routing_logits, hidden_states]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_fp8_per_tensor_scale_moe",
+            [fp8_runner],
+            FP8PerTensorMoERunner.tuning_config,
+            inputs,
+        )
+
+        # Call the C++ function with the selected tactic
         output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
@@ -1218,6 +1286,7 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim,
             routing_method_type,
             enable_pdl,
+            tactic,
         )
         return output
 
@@ -1243,6 +1312,7 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 1024,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1275,9 +1345,78 @@ def get_trtllm_moe_sm100_module():
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 1024,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+
+        # Create FP8 block-scale TunableRunner similar to FP4
+        class FP8BlockScaleMoERunner(TunableRunner):
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        (0,),
+                        (0,),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                )
+            )
+
+            def get_valid_tactics(self, inputs, profile):
+                # For FP8 block-scale, we'll use the trtllm_get_valid_moe_configs function
+                num_tokens = inputs[0].shape[0]
+                hidden_size = inputs[0].shape[1]
+                return moe_op.trtllm_get_valid_moe_configs(
+                    tile_tokens_dim,
+                    5,
+                    5,
+                    True,  # dtype_act=E4m3, dtype_weights=E4m3, useDeepSeekFp8=True
+                    top_k,
+                    hidden_size,
+                    intermediate_size,
+                    local_num_experts,
+                    num_tokens,
+                )
+
+            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                return moe_op.trtllm_fp8_block_scale_moe(
+                    inputs[0],  # routing_logits
+                    routing_bias,
+                    inputs[1],  # hidden_states
+                    hidden_states_scale,
+                    gemm1_weights,
+                    gemm1_weights_scale,
+                    gemm2_weights,
+                    gemm2_weights_scale,
+                    num_experts,
+                    top_k,
+                    n_group,
+                    topk_group,
+                    intermediate_size,
+                    local_expert_offset,
+                    local_num_experts,
+                    routed_scaling_factor,
+                    tile_tokens_dim,
+                    routing_method_type,
+                    use_shuffled_weight,
+                    weight_layout,
+                    enable_pdl,
+                    tactic,
+                )
+
+        # Use AutoTuner to select the best tactic
+        tuner = AutoTuner.get()
+        fp8_runner = FP8BlockScaleMoERunner()
+        inputs = [routing_logits, hidden_states]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_fp8_block_scale_moe",
+            [fp8_runner],
+            FP8BlockScaleMoERunner.tuning_config,
+            inputs,
+        )
+
         # Call the C++ function for block scale MoE
         output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1301,6 +1440,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight,
             weight_layout,
             enable_pdl,
+            tactic,
         )
 
         return output
@@ -1328,6 +1468,7 @@ def get_trtllm_moe_sm100_module():
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 1024,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1569,6 +1710,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 1024,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -1592,6 +1734,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input: Whether to use routing scales on input
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
+        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 1024)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
 
     Returns:
@@ -1618,6 +1761,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         tile_tokens_dim,
         routing_method_type,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 
@@ -1643,6 +1787,7 @@ def trtllm_fp8_block_scale_moe(
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 1024,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1665,6 +1810,9 @@ def trtllm_fp8_block_scale_moe(
         routed_scaling_factor: Scaling factor for routing
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
+        use_shuffled_weight: Whether to use shuffled weight layout (default: False)
+        weight_layout: Weight layout format (default: 0)
+        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 1024)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
@@ -1691,6 +1839,7 @@ def trtllm_fp8_block_scale_moe(
         use_shuffled_weight,
         weight_layout,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 

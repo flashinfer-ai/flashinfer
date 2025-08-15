@@ -50,7 +50,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor,
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, bool enable_pdl) {
+    int64_t const routing_method_type, bool enable_pdl, int64_t config_index) {
   auto device = hidden_states.device();
 
   static const std::tuple<int, int> device_props = [&device] {
@@ -272,9 +272,12 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /*useShuffledMatrixA*/ true);
 
-  auto const moeConfigIndex =
-      moe_runner.getDefaultValidConfigIndex(args.top_k, args.hidden_size, args.intermediate_size,
-                                            args.local_num_experts, args.num_tokens);
+  int64_t moeConfigIndex = config_index;
+  if (moeConfigIndex == -1) {
+    moeConfigIndex =
+        moe_runner.getDefaultValidConfigIndex(args.top_k, args.hidden_size, args.intermediate_size,
+                                              args.local_num_experts, args.num_tokens);
+  }
 
   auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
   at::Tensor workspace_fc1 = at::detail::empty_cuda(
@@ -296,7 +299,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
     at::Tensor output2_scales_scalar, int64_t num_experts, int64_t top_k, int64_t n_group,
     int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
     int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
+    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl, int64_t config_index) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -305,7 +308,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
         routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
-        enable_pdl);
+        enable_pdl, config_index);
   } else {
     TORCH_CHECK(false, "Unsupported input type: ", dtype);
   }
@@ -596,7 +599,7 @@ at::Tensor trtllm_fp8_block_scale_moe(
     int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-    int64_t weight_layout, bool enable_pdl) {
+    int64_t weight_layout, bool enable_pdl, int64_t config_index) {
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
@@ -614,11 +617,14 @@ at::Tensor trtllm_fp8_block_scale_moe(
         static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
-    auto const num_tokens = hidden_states.sizes()[0];
-    auto const hidden_size = hidden_states.sizes()[1];
+    int64_t moeConfigIndex = config_index;
+    if (moeConfigIndex == -1) {
+      auto const num_tokens = hidden_states.sizes()[0];
+      auto const hidden_size = hidden_states.sizes()[1];
 
-    int64_t moeConfigIndex = mRunner->getDefaultValidConfigIndex(
-        top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+      moeConfigIndex = mRunner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                           local_num_experts, num_tokens);
+    }
 
     return trtllm_fp8_block_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,

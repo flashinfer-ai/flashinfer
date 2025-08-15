@@ -5,8 +5,16 @@ from flashinfer import (
     fp4_quantize,
     mxfp8_quantize,
     next_positive_power_of_2,
+    RoutingMethodType,
+    shuffle_matrix_a,
+    reorder_rows_for_gated_act_gemm,
 )
-from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+from flashinfer.fused_moe import (
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+    WeightLayout,
+)
 from flashinfer.autotuner import autotune
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import device_support_pdl
@@ -69,9 +77,23 @@ def bench_trtllm_gen_fused_moe_autotuner(
             num_tokens, -1
         )
         hidden_states_global_scale = 1.0
-    else:  # MxFP4xBf16
+    elif quant_mode == "MxFP4xBf16":
         hidden_states_scale = None
         hidden_states_global_scale = 1.0
+    elif quant_mode == "FP8_block_scale":
+        # FP8 block scale: no pre-quantization of hidden states needed
+        hidden_states_scale = None
+        hidden_states_global_scale = None
+    elif quant_mode == "FP8_per_tensor_scale":
+        # FP8 per-tensor: quantize hidden states with global scale
+        hidden_states_scale_factor = 448.0 / hidden_states.float().abs().max()
+        hidden_states = (hidden_states * hidden_states_scale_factor).to(
+            torch.float8_e4m3fn
+        )
+        hidden_states_scale = None
+        hidden_states_global_scale = hidden_states_scale_factor
+    else:
+        raise ValueError(f"Invalid quantization mode: {quant_mode}")
 
     w13 = torch.randn(
         num_experts, intermediate_size * 2, hidden_size, device=device
@@ -100,7 +122,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
         )
         w13_global_scale = 1.0 / 448.0 / 6.0
         w2_global_scale = 1.0 / 448.0 / 6.0
-    else:
+    elif quant_mode == "MxFP4xBf16" or quant_mode == "MxFP4xMxFP8":
         w13, w13_scale = fp4_quantize(
             w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
         )
@@ -115,49 +137,187 @@ def bench_trtllm_gen_fused_moe_autotuner(
         )
         w13_global_scale = 1.0
         w2_global_scale = 1.0
+    elif quant_mode == "FP8_block_scale":
+        # FP8 block scale: quantize weights to FP8 with block scales
+        w13 = w13.to(torch.float8_e4m3fn)
+        w13_scale = 2 * torch.rand(
+            (num_experts, intermediate_size * 2 // 128, hidden_size // 128),
+            device=device,
+        ).to(torch.float)
+        w2 = w2.to(torch.float8_e4m3fn)
+        w2_scale = 2 * torch.rand(
+            (num_experts, hidden_size // 128, intermediate_size // 128), device=device
+        ).to(torch.float)
+        w13_global_scale = None
+        w2_global_scale = None
+    elif quant_mode == "FP8_per_tensor_scale":
+        # FP8 per-tensor: quantize weights to FP8 with global scales
+        w13_scale_factor = 448.0 / w13.float().abs().max()
+        w13 = (w13 * w13_scale_factor).to(torch.float8_e4m3fn)
+        w13_scale = None
+        w13_global_scale = w13_scale_factor
+
+        w2_scale_factor = 448.0 / w2.float().abs().max()
+        w2 = (w2 * w2_scale_factor).to(torch.float8_e4m3fn)
+        w2_scale = None
+        w2_global_scale = w2_scale_factor
+    else:
+        raise ValueError(f"Invalid quantization mode: {quant_mode}")
+
     bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
     bias2 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
 
     tile_tokens_dim = get_tile_tokens_dim(num_tokens, num_experts, top_k)
-    output1_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
-    )
-    output1_scale_gate_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
-    )
-    output2_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w2_global_scale] * num_experts, device=device
-    )
-    fn = lambda: trtllm_fp4_block_scale_moe(
-        routing_logits,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        w13,
-        w13_scale,
-        bias13,
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
-        w2,
-        w2_scale,
-        bias2,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        tile_tokens_dim,
-        1,
-        True,
-        enable_pdl,
-    )
+
+    # Handle scaling factors for different quantization modes
+    if quant_mode in ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]:
+        output1_scale_scalar = torch.tensor(
+            [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        )
+        output1_scale_gate_scalar = torch.tensor(
+            [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        )
+        output2_scale_scalar = torch.tensor(
+            [hidden_states_global_scale * w2_global_scale] * num_experts, device=device
+        )
+    elif quant_mode == "FP8_per_tensor_scale":
+        # FP8 per-tensor uses global scale factors
+        output1_scale_scalar = torch.tensor(
+            [1.0 / w13_global_scale / hidden_states_global_scale] * num_experts,
+            device=device,
+        )
+        output1_scale_gate_scalar = torch.tensor(
+            [1.0 / w13_global_scale / hidden_states_global_scale] * num_experts,
+            device=device,
+        )
+        output2_scale_scalar = torch.tensor(
+            [1.0 / w2_global_scale] * num_experts, device=device
+        )
+    else:
+        # FP8 block scale doesn't use these scaling factors
+        output1_scale_scalar = None
+        output1_scale_gate_scalar = None
+        output2_scale_scalar = None
+    if quant_mode in ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]:
+        fn = lambda: trtllm_fp4_block_scale_moe(
+            routing_logits,
+            None,  # routing_bias
+            hidden_states,
+            hidden_states_scale,
+            w13,
+            w13_scale,
+            bias13,
+            None,  # gemm1_alpha
+            None,  # gemm1_beta
+            None,  # gemm1_clamp_limit
+            w2,
+            w2_scale,
+            bias2,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            tile_tokens_dim,
+            1,
+            True,
+            enable_pdl,
+        )
+    elif quant_mode == "FP8_block_scale":
+        # Prepare weights for FP8 block scale kernel
+        epilogue_tile_m = 64
+        w13_shuffled = []
+        w2_shuffled = []
+        for i in range(num_experts):
+            w13_shuffled.append(
+                shuffle_matrix_a(w13[i].view(torch.uint8), epilogue_tile_m)
+            )
+            w2_shuffled.append(
+                shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m)
+            )
+        w13_kernel = torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
+        w2_kernel = torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
+
+        fn = lambda: trtllm_fp8_block_scale_moe(
+            routing_logits,
+            None,  # routing_bias
+            hidden_states.to(torch.float8_e4m3fn),
+            2.0
+            * torch.ones(
+                (hidden_size // 128, num_tokens), device=device, dtype=torch.float
+            ),
+            w13_kernel,
+            w13_scale,
+            w2_kernel,
+            w2_scale,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            tile_tokens_dim,
+            RoutingMethodType.RenormalizeNaive,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK,
+            enable_pdl=enable_pdl,
+            tune_max_num_tokens=1024,
+        )
+    elif quant_mode == "FP8_per_tensor_scale":
+        # Prepare weights for FP8 per-tensor kernel
+        epilogue_tile_m = 128
+
+        # Reorder rows of W1 for fused gated activation
+        w13_interleaved = []
+        for i in range(num_experts):
+            w13_interleaved.append(reorder_rows_for_gated_act_gemm(w13[i].clone()))
+        w13_interleaved = torch.stack(w13_interleaved)
+
+        # Shuffle weights for transposed mma output
+        w13_shuffled = []
+        w2_shuffled = []
+        for i in range(num_experts):
+            w13_shuffled.append(
+                shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
+            )
+            w2_shuffled.append(
+                shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m)
+            )
+        w13_kernel = torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
+        w2_kernel = torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
+
+        fn = lambda: trtllm_fp8_per_tensor_scale_moe(
+            routing_logits,
+            None,  # routing_bias
+            hidden_states,
+            w13_kernel,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            w2_kernel,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            False,  # use_routing_scales_on_input
+            tile_tokens_dim,
+            RoutingMethodType.RenormalizeNaive,
+            tune_max_num_tokens=1024,
+        )
+    else:
+        raise ValueError(f"Invalid quantization mode: {quant_mode}")
 
     def bench(do_autotune):
         # warmup
@@ -185,7 +345,13 @@ if __name__ == "__main__":
         "--quant-mode",
         type=str,
         default="NvFP4xNvFP4",
-        choices=["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+        choices=[
+            "NvFP4xNvFP4",
+            "MxFP4xMxFP8",
+            "MxFP4xBf16",
+            "FP8_block_scale",
+            "FP8_per_tensor_scale",
+        ],
         help="Quantization mode",
     )
     parser.add_argument("--num-tokens", type=int, default=512, help="Number of tokens")
