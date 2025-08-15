@@ -1235,6 +1235,16 @@ def get_trtllm_moe_sm100_module():
                 )
 
             def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                # Debug: print shapes and parameters during autotuning
+                if do_preparation:
+                    print("[DEBUG] FP8PerTensor preparation:")
+                    print(f"  routing_logits: {inputs[0].shape}")
+                    print(f"  hidden_states: {inputs[1].shape}")
+                    print(f"  num_experts: {num_experts}")
+                    print(f"  top_k: {top_k}")
+                    print(
+                        f"  routing_bias: {routing_bias.shape if routing_bias is not None else None}"
+                    )
                 return moe_op.trtllm_fp8_per_tensor_scale_moe(
                     inputs[0],  # routing_logits
                     routing_bias,
@@ -1394,6 +1404,16 @@ def get_trtllm_moe_sm100_module():
                 )
 
             def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                # Debug: print shapes and parameters during autotuning
+                if do_preparation:
+                    print("[DEBUG] FP8BlockScale preparation:")
+                    print(f"  routing_logits: {inputs[0].shape}")
+                    print(f"  hidden_states: {inputs[1].shape}")
+                    print(f"  num_experts: {num_experts}")
+                    print(
+                        f"  routing_bias: {routing_bias.shape if routing_bias is not None else None}"
+                    )
+
                 # Create hidden_states_scale dynamically based on current input shapes
                 current_num_tokens = inputs[1].shape[0]
                 current_hidden_size = inputs[1].shape[1]
