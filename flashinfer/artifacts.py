@@ -48,7 +48,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 
 
 class ArtifactPath:
-    TRTLLM_GEN_FMHA: str = "85756bb4c98571b902095e944fc27bda1fcec3e4/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "5d347c6234c9f0e7f1ab6519ea933183b48216ed/batched_gemm-32110eb-5262bae/"
     )
@@ -61,7 +61,7 @@ class ArtifactPath:
 
 class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
-        "24db1b729f7cb86d3f4dc4fbb7de479c5a854cd03ffbf75dc356bffcde48700c"
+        "0d124e546c8a2e9fa59499625e8a6d140a2465573d4a3944f9d29f29f73292fb"
     )
     TRTLLM_GEN_BMM: str = (
         "aae02e5703ee0ce696c4b3a1f2a32936fcc960dcb69fdef52b6d0f8a7b673000"

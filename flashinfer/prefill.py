@@ -44,7 +44,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    check_shape_dtype_device,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -2034,7 +2034,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                check_shape_dtype_device(
+                _check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
@@ -2043,7 +2043,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            check_shape_dtype_device(
+            _check_shape_dtype_device(
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
 
@@ -2833,7 +2833,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                check_shape_dtype_device(
+                _check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
@@ -2841,7 +2841,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            check_shape_dtype_device(
+            _check_shape_dtype_device(
                 out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
             )
         if self._backend == "cutlass":
@@ -3244,9 +3244,9 @@ def trtllm_batch_context_with_kv_cache(
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
-        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
 
-        check_shape_dtype_device(
+        _check_shape_dtype_device(
             out_scale_factor,
             fp4_out_scale_shape,
             torch.float8_e4m3fn,
@@ -3271,13 +3271,8 @@ def trtllm_batch_context_with_kv_cache(
         out_scale_factor = None
         o_sf_start_index = 0
         out_dtype = out_dtype or query.dtype
-        assert out_dtype in (
-            query.dtype,
-            torch.float16,
-            torch.bfloat16,
-        )
         out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
-        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
