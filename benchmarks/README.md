@@ -25,6 +25,7 @@ Currently supports testing:
 - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
 - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
 - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+- `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
 
 Support surface will expand to other operations such as MLA or non-attention operations in the future.
 ## Quick Start
@@ -163,6 +164,83 @@ python3 flashinfer_benchmark.py \
     --routing_method deepseek_v3 \
     --use_routing_scales_on_input \
     --verbose
+
+# CUTLASS Fused MoE (base variant)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (fp8 variant)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant fp8 \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (nvfp4 weights; optional quantized input)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant nvfp4 \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (nvfp4 weights with quantized input)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant nvfp4 \
+    --quantized_input \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE with Expert Parallel (EP)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 8 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --ep_size 4 \
+    --ep_rank 0 \
+    --verbose
+
+# CUTLASS Fused MoE with Tensor Parallel (TP)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --tp_size 2 \
+    --tp_rank 0 \
+    --verbose
 ```
 
 ### Batch Testing
@@ -183,6 +261,8 @@ The output CSV will contain detailed metrics including:
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--routine`              | Test routine to run: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4`, `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe` |
+|                          |                                                                                                             |
+|                          | Also: `cutlass_fused_moe` (CUTLASS fused MoE; variants: base, fp8, nvfp4)                                   |
 | `--num_iters`            | Number of iterations for performance measurement                                                           |
 | `--dry_run_iters`        | Number of warmup iterations                                                                                |
 | `--no_cuda_graph`        | Disable CUDA graph to execute kernels outside of the graph.                                                |
@@ -248,6 +328,12 @@ The output CSV will contain detailed metrics including:
 | `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
 | `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
 | `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
+| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale)                   |
+| `--quantized_input`      | For `nvfp4` only: quantize input activations to FP4                                                         |
+| `--tp_size`              | Tensor-parallel world size                                                                                  |
+| `--tp_rank`              | Tensor-parallel rank                                                                                        |
+| `--ep_size`              | Expert-parallel world size                                                                                  |
+| `--ep_rank`              | Expert-parallel rank                                                                                        |
 
 ### MOE Routing Method Compatibility
 
@@ -262,6 +348,7 @@ The output CSV will contain detailed metrics including:
 - Group parameters (`--n_group`, `--topk_group`) are ONLY used with DeepSeekV3 routing method. Using them with other routing methods will cause the error: "Routing kernel with groups implies DeepSeekV3 routing method."
 - Different MOE kernel implementations have different `top_k` constraints. FP8 MOE kernels (both Block Scale and Per-Tensor) have stricter limits than FP4 for non-DeepSeekV3 routing methods.
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
+- CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
 ## Tester Attention Backend Support Matrix
 The following support surface applies to attention operations in `flashinfer_benchmark.py`
