@@ -1191,6 +1191,25 @@ def get_trtllm_moe_sm100_module():
             self.context = context
             super().__init__()
 
+        def __hash__(self):
+            """Make FP8MoERunner hashable for autotuner caching.
+
+            Only hash the mode and essential context parameters that affect kernel selection.
+            """
+            # Convert context dict to a hashable representation
+            # Only include parameters that affect kernel selection
+            hashable_items = [
+                ("mode", self.mode),
+                ("num_experts", self.context.get("num_experts")),
+                ("top_k", self.context.get("top_k")),
+                ("intermediate_size", self.context.get("intermediate_size")),
+                ("local_num_experts", self.context.get("local_num_experts")),
+                ("tile_tokens_dim", self.context.get("tile_tokens_dim")),
+                ("routing_method_type", self.context.get("routing_method_type")),
+                ("enable_pdl", self.context.get("enable_pdl")),
+            ]
+            return hash(tuple(sorted(hashable_items)))
+
         @classmethod
         @functools.lru_cache(maxsize=None)
         def refine_tuning_config(cls, tune_max_num_tokens: int):
