@@ -40,6 +40,21 @@ output_column_dict = {
         "mma_sm",
         "use_128x4_sf_layout",
     ],
+    "moe": [
+        "num_tokens",
+        "hidden_size",
+        "intermediate_size",
+        "num_experts",
+        "top_k",
+        "n_group",
+        "topk_group",
+        "routing_method",
+        "use_shuffled_weight",
+        "weight_layout",
+        "use_routing_scales_on_input",
+        "input_dtype",
+        "weight_dtype",
+    ],
     "general": [
         "refcheck",
         "no_cuda_graph",
@@ -52,6 +67,7 @@ full_output_columns = (
     output_column_dict["perf"]
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
+    + output_column_dict["moe"]
     + output_column_dict["general"]
 )
 
@@ -67,6 +83,12 @@ benchmark_apis = {
         "group_gemm_fp8_nt_groupwise",
         "bmm_fp8",
         "mm_fp4",
+    ],
+    "moe": [
+        "trtllm_fp4_block_scale_moe",
+        "trtllm_fp8_block_scale_moe",
+        "trtllm_fp8_per_tensor_scale_moe",
+        "cutlass_fused_moe",
     ],
 }
 

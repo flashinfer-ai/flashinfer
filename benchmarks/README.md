@@ -22,6 +22,10 @@ Currently supports testing:
 - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
 - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
 - `mm_fp4` - Maxtrix multiplication with NVFP4 inputs.
+- `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
+- `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
+- `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+- `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
 
 Support surface will expand to other operations such as MLA or non-attention operations in the future.
 ## Quick Start
@@ -101,6 +105,126 @@ python3 flashinfer_benchmark.py \
     --scale_major_mode K \
     --refcheck \
     -vv
+
+# MOE FP4 Block Scale (DeepSeekV3 routing)
+python3 flashinfer_benchmark.py \
+    --routine trtllm_fp4_block_scale_moe \
+    --num_tokens 1024 \
+    --hidden_size 1024 \
+    --intermediate_size 1024 \
+    --num_experts 128 \
+    --top_k 8 \
+    --n_group 8 \
+    --topk_group 4 \
+    --routed_scaling_factor 2.5 \
+    --use_routing_bias \
+    --routing_method deepseek_v3 \
+    --use_shuffled_weight \
+    --verbose
+
+# MOE FP8 Block Scale with DeepSeekV3 routing
+python3 flashinfer_benchmark.py \
+    --routine trtllm_fp8_block_scale_moe \
+    --num_tokens 1024 \
+    --hidden_size 1024 \
+    --intermediate_size 1024 \
+    --num_experts 128 \
+    --top_k 8 \
+    --n_group 8 \
+    --topk_group 4 \
+    --routed_scaling_factor 2.5 \
+    --use_routing_bias \
+    --routing_method deepseek_v3 \
+    --use_shuffled_weight \
+    --verbose
+
+# MOE FP8 Block Scale with Renormalize routing (no groups)
+python3 flashinfer_benchmark.py \
+    --routine trtllm_fp8_block_scale_moe \
+    --num_tokens 1024 \
+    --hidden_size 1024 \
+    --intermediate_size 1024 \
+    --num_experts 128 \
+    --top_k 1 \
+    --routing_method renormalize \
+    --verbose
+
+# CUTLASS Fused MoE (base variant)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (fp8 variant)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant fp8 \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (nvfp4 weights; optional quantized input)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant nvfp4 \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE (nvfp4 weights with quantized input)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant nvfp4 \
+    --quantized_input \
+    --input_dtype float16 \
+    --verbose
+
+# CUTLASS Fused MoE with Expert Parallel (EP)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 8 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --ep_size 4 \
+    --ep_rank 0 \
+    --verbose
+
+# CUTLASS Fused MoE with Tensor Parallel (TP)
+python3 flashinfer_benchmark.py \
+    --routine cutlass_fused_moe \
+    --num_tokens 32 \
+    --hidden_size 128 \
+    --intermediate_size 128 \
+    --num_experts 2 \
+    --top_k 2 \
+    --cutlass_variant base \
+    --input_dtype float16 \
+    --tp_size 2 \
+    --tp_rank 0 \
+    --verbose
 ```
 
 ### Batch Testing
@@ -120,7 +244,9 @@ The output CSV will contain detailed metrics including:
 ### General Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--routine`              | Test routine to run: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4` |
+| `--routine`              | Test routine to run: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4`, `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe` |
+|                          |                                                                                                             |
+|                          | Also: `cutlass_fused_moe` (CUTLASS fused MoE; variants: base, fp8, nvfp4)                                   |
 | `--num_iters`            | Number of iterations for performance measurement                                                           |
 | `--dry_run_iters`        | Number of warmup iterations                                                                                |
 | `--no_cuda_graph`        | Disable CUDA graph to execute kernels outside of the graph.                                                |
@@ -164,6 +290,49 @@ The output CSV will contain detailed metrics including:
 | `--input_dtype`          | Data type for input matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                 |
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
+
+### MOE Flags
+| Flag                     | Description                                                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+| `--num_tokens`           | Number of input tokens                                                                                     |
+| `--hidden_size`          | Hidden dimension size                                                                                      |
+| `--intermediate_size`    | Intermediate dimension size (FF layer dimension)                                                           |
+| `--num_experts`          | Total number of experts                                                                                    |
+| `--top_k`                | Number of experts to route to per token                                                                    |
+| `--n_group`              | Number of expert groups (for DeepSeek routing). Default: 1                                                 |
+| `--topk_group`           | Number of groups to consider for top-k routing. Default: 1                                                 |
+| `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
+| `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
+| `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |
+| `--tile_tokens_dim`      | Tile dimension for tokens. Default: 8                                                                      |
+| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
+| `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
+| `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
+| `--use_routing_bias`     | Whether to use routing bias                                                                                |
+| `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
+| `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
+| `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
+| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale)                   |
+| `--quantized_input`      | For `nvfp4` only: quantize input activations to FP4                                                         |
+| `--tp_size`              | Tensor-parallel world size                                                                                  |
+| `--tp_rank`              | Tensor-parallel rank                                                                                        |
+| `--ep_size`              | Expert-parallel world size                                                                                  |
+| `--ep_rank`              | Expert-parallel rank                                                                                        |
+
+### MOE Routing Method Compatibility
+
+| Routing Method         | Requirements | Compatible MOE Types |
+|------------------------|--------------|---------------------|
+| **deepseek_v3**        | `top_k <= 8`, `topk_group <= 4`, requires `--n_group`, `--topk_group`, `--routed_scaling_factor`, `--use_routing_bias` | FP4, FP8 Block Scale |
+| **renormalize**        | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | All MOE types |
+| **llama4**             | `top_k == 1`, requires `--routed_scaling_factor`, `--use_routing_bias`, `--use_routing_scales_on_input`. Do NOT use `--n_group` or `--topk_group` | FP8 Per-Tensor |
+| **renormalize_naive**  | `top_k == 1` for FP8 Block Scale, `top_k <= 8` for FP4. Do NOT use `--n_group` or `--topk_group` | FP4 primarily |
+
+Notes:
+- Group parameters (`--n_group`, `--topk_group`) are ONLY used with DeepSeekV3 routing method. Using them with other routing methods will cause the error: "Routing kernel with groups implies DeepSeekV3 routing method."
+- Different MOE kernel implementations have different `top_k` constraints. FP8 MOE kernels (both Block Scale and Per-Tensor) have stricter limits than FP4 for non-DeepSeekV3 routing methods.
+- FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
+- CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
 ## Tester Attention Backend Support Matrix
 The following support surface applies to attention operations in `flashinfer_benchmark.py`
