@@ -1202,9 +1202,16 @@ def get_trtllm_moe_sm100_module():
         class FP8PerTensorMoERunner(TunableRunner):
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
+                    # Both routing_logits and hidden_states need num_tokens dimension modified
                     DynamicTensorSpec(
-                        (0,),
-                        (0,),
+                        (0,),  # Modify dimension 0 (num_tokens)
+                        (0,),  # Apply to inputs[0] (routing_logits)
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                    DynamicTensorSpec(
+                        (0,),  # Modify dimension 0 (num_tokens)
+                        (1,),  # Apply to inputs[1] (hidden_states)
                         get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                     ),
@@ -1354,9 +1361,16 @@ def get_trtllm_moe_sm100_module():
         class FP8BlockScaleMoERunner(TunableRunner):
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
+                    # Both routing_logits and hidden_states need num_tokens dimension modified
                     DynamicTensorSpec(
-                        (0,),
-                        (0,),
+                        (0,),  # Modify dimension 0 (num_tokens)
+                        (0,),  # Apply to inputs[0] (routing_logits)
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                    ),
+                    DynamicTensorSpec(
+                        (0,),  # Modify dimension 0 (num_tokens)
+                        (1,),  # Apply to inputs[1] (hidden_states)
                         get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                     ),
