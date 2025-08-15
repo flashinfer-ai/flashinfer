@@ -1116,7 +1116,7 @@ def get_trtllm_moe_sm100_module():
                 if self.use_deepseek_fp8:
                     # FP8 block scale
                     moe_op.trtllm_fp8_block_scale_moe(
-                        routing_logits.to(torch.bfloat16),
+                        routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
                         hidden_states_scale,
