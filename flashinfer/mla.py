@@ -235,11 +235,11 @@ class BatchMLAPagedAttentionWrapper:
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
             For decoding attention, the length of each query is 1, and the content
             of the tensor should be ``[0, 1, 2, ..., batch_size]``.
-        kv_indptr : torch.Tensor
+        kv_indptr : torch.Tensor(int32)
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
-        kv_indices : torch.Tensor
+        kv_indices : torch.Tensor(int32)
             The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]`` or larger.
-        kv_len_arr : torch.Tensor
+        kv_len_arr : torch.Tensor(int32)
             The query length of each request, shape: ``[batch_size]``.
         num_heads : int
             The number of heads in query/output tensor.
@@ -260,6 +260,19 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+        if kv_len_arr.dtype != torch.int32:
+            raise ValueError(
+                f"Expected kv_len_arr.dtype == torch.int32, got {kv_len_arr.dtype}"
+            )
+        if kv_indptr.dtype != torch.int32:
+            raise ValueError(
+                f"Expected kv_indptr.dtype == torch.int32, got {kv_indptr.dtype}"
+            )
+        if qo_indptr.dtype != torch.int32:
+            raise ValueError(
+                f"Expected qo_indptr.dtype == torch.int32, got {qo_indptr.dtype}"
+            )
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
