@@ -436,7 +436,9 @@ def test_trtllm_batch_decode(
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor(q_lens, q_len_per_req, num_qo_heads, head_dim, q_dtype)
+    q, q_scale, ref_q = create_query_tensor(
+        q_lens, num_qo_heads, head_dim, q_dtype, q_len_per_req=q_len_per_req
+    )
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
