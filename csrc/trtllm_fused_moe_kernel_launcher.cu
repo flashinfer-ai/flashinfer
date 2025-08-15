@@ -1127,63 +1127,13 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
       config_index, enable_pdl, output);
 }
 
-inline btg::Dtype get_dtype(int64_t const dtype) {
-  switch (dtype) {
-    case 0:
-      return btg::Dtype::Bfloat16;
-    case 1:
-      return btg::Dtype::Bool;
-    case 2:
-      return btg::Dtype::E2m1;
-    case 3:
-      return btg::Dtype::E2m3;
-    case 4:
-      return btg::Dtype::E3m2;
-    case 5:
-      return btg::Dtype::E4m3;
-    case 6:
-      return btg::Dtype::E5m2;
-    case 7:
-      return btg::Dtype::Fp16;
-    case 8:
-      return btg::Dtype::Fp32;
-    case 9:
-      return btg::Dtype::Int8;
-    case 10:
-      return btg::Dtype::Int32;
-    case 11:
-      return btg::Dtype::Int64;
-    case 12:
-      return btg::Dtype::MxE2m1;
-    case 13:
-      return btg::Dtype::MxE4m3;
-    case 14:
-      return btg::Dtype::UE8m0;
-    case 15:
-      return btg::Dtype::UInt8;
-    case 16:
-      return btg::Dtype::UInt16;
-    case 17:
-      return btg::Dtype::UInt32;
-    case 18:
-      return btg::Dtype::UInt64;
-    case 19:
-      return btg::Dtype::UInt128;
-    case 20:
-      return btg::Dtype::Void;
-    default:
-      TORCH_CHECK(false, "Invalid trtllm-gen dtype");
-  }
-  return btg::Dtype::E2m1;
-}
-
 int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t const dtype_act_,
                                        int64_t const dtype_weights_, bool const useDeepSeekFp8,
                                        int64_t const top_k, int64_t const hidden_size,
                                        int64_t const intermediate_size,
                                        int64_t const num_local_experts, int64_t const num_tokens) {
-  auto dtype_act = get_dtype(dtype_act_);
-  auto dtype_weights = get_dtype(dtype_weights_);
+  auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
       tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);
@@ -1195,8 +1145,8 @@ std::vector<int64_t> trtllm_get_valid_moe_configs(
     int64_t const tile_tokens_dim, int64_t const dtype_act_, int64_t const dtype_weights_,
     bool const useDeepSeekFp8, int64_t const top_k, int64_t const hidden_size,
     int64_t const intermediate_size, int64_t const num_local_experts, int64_t const num_tokens) {
-  auto dtype_act = get_dtype(dtype_act_);
-  auto dtype_weights = get_dtype(dtype_weights_);
+  auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
       tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);

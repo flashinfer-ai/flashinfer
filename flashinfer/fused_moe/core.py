@@ -66,29 +66,41 @@ class RoutingMethodType(IntEnum):
     Unspecified = 5
 
 
-# NOTE(siyuan): Need to keep this in sync with the counterpart defined in include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h
 class DtypeTrtllmGen(IntEnum):
-    Bfloat16 = (0,)
-    Bool = (1,)
-    E2m1 = (2,)
-    E2m3 = (3,)
-    E3m2 = (4,)
-    E4m3 = (5,)
-    E5m2 = (6,)
-    Fp16 = (7,)
-    Fp32 = (8,)
-    Int8 = (9,)
-    Int32 = (10,)
-    Int64 = (11,)
-    MxE2m1 = (12,)
-    MxE4m3 = (13,)
-    UE8m0 = (14,)
-    UInt8 = (15,)
-    UInt16 = (16,)
-    UInt32 = (17,)
-    UInt64 = (18,)
-    UInt128 = (19,)
-    Void = (20,)
+    def __new__(cls, block_format_bit, signed_bit, integer_bit, num_bits, uid):
+        value = (
+            (block_format_bit << 24)
+            | (signed_bit << 20)
+            | (integer_bit << 16)
+            | (num_bits << 8)
+            | uid
+        )
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        return obj
+
+    # keep the values in sync with include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h
+    Bfloat16 = (0, 1, 0, 16, 0)
+    Bool = (0, 0, 1, 1, 1)
+    E2m1 = (1, 1, 0, 4, 2)
+    E2m3 = (1, 1, 0, 6, 3)
+    E3m2 = (1, 1, 0, 6, 4)
+    E4m3 = (0, 1, 0, 8, 5)
+    E5m2 = (0, 1, 0, 8, 6)
+    Fp16 = (0, 1, 0, 16, 7)
+    Fp32 = (0, 1, 0, 32, 8)
+    Int8 = (0, 1, 1, 8, 9)
+    Int32 = (0, 1, 1, 32, 10)
+    Int64 = (0, 1, 1, 64, 11)
+    MxE2m1 = (1, 1, 0, 4, 12)
+    MxE4m3 = (1, 1, 0, 8, 13)
+    UE8m0 = (0, 0, 0, 8, 14)
+    UInt8 = (0, 0, 1, 8, 15)
+    UInt16 = (0, 0, 1, 16, 16)
+    UInt32 = (0, 0, 1, 32, 17)
+    UInt64 = (0, 0, 1, 64, 18)
+    UInt128 = (0, 0, 1, 128, 19)
+    Void = (0, 1, 0, 0, 20)
 
 
 def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:

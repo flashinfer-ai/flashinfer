@@ -184,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quant-mode",
         type=str,
-        default="NvFP4xNvFP4",
+        default="MxFP4xMxFP8",
         choices=["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
         help="Quantization mode",
     )
