@@ -1394,11 +1394,21 @@ def get_trtllm_moe_sm100_module():
                 )
 
             def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+                # Create hidden_states_scale dynamically based on current input shapes
+                current_num_tokens = inputs[1].shape[0]
+                current_hidden_size = inputs[1].shape[1]
+                current_hidden_states_scale = torch.full(
+                    (current_hidden_size // 128, current_num_tokens),
+                    2.0,
+                    dtype=torch.float,
+                    device=inputs[1].device,
+                )
+
                 return moe_op.trtllm_fp8_block_scale_moe(
                     inputs[0],  # routing_logits
                     routing_bias,
                     inputs[1],  # hidden_states
-                    hidden_states_scale,
+                    current_hidden_states_scale,
                     gemm1_weights,
                     gemm1_weights_scale,
                     gemm2_weights,
