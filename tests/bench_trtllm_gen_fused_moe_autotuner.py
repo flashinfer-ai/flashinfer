@@ -54,9 +54,15 @@ def bench_trtllm_gen_fused_moe_autotuner(
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
-    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
-        torch.bfloat16
-    )
+    # FP8 modes require float for routing_logits, others can use bfloat16
+    if quant_mode in ["FP8_block_scale", "FP8_per_tensor_scale"]:
+        routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+            torch.float
+        )
+    else:
+        routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+            torch.bfloat16
+        )
     hidden_states = torch.randn(num_tokens, hidden_size, device=device).to(
         torch.bfloat16
     )
