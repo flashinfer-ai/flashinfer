@@ -1119,17 +1119,11 @@ def get_trtllm_moe_sm100_module():
                         routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
-                        hidden_states_scale.to(torch.float32)
-                        if hidden_states_scale is not None
-                        else None,
+                        hidden_states_scale,
                         kwargs["gemm1_weights"],
-                        kwargs["gemm1_weights_scale"].to(torch.float32)
-                        if kwargs.get("gemm1_weights_scale") is not None
-                        else None,
+                        kwargs["gemm1_weights_scale"],
                         kwargs["gemm2_weights"],
-                        kwargs["gemm2_weights_scale"].to(torch.float32)
-                        if kwargs.get("gemm2_weights_scale") is not None
-                        else None,
+                        kwargs["gemm2_weights_scale"],
                         self.num_experts,
                         self.top_k,
                         kwargs["n_group"],
