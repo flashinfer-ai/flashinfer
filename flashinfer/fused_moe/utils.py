@@ -203,11 +203,13 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     return tuple(num_token_buckets)
 
 
-def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
+def get_last_power_of_2_num_tokens_buckets(
+    max_num_tokens, min_num_tokens=1
+) -> Tuple[int]:
     max_num_tokens = last_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
-    while m >= 1:
+    while m >= min_num_tokens:
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets)
