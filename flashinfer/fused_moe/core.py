@@ -1114,6 +1114,30 @@ def get_trtllm_moe_sm100_module():
             ):
                 # FP8 operations
                 if self.use_deepseek_fp8:
+                    print(
+                        routing_logits,
+                        kwargs["routing_bias"],
+                        hidden_states,
+                        hidden_states_scale,
+                        kwargs["gemm1_weights"],
+                        kwargs["gemm1_weights_scale"],
+                        kwargs["gemm2_weights"],
+                        kwargs["gemm2_weights_scale"],
+                        self.num_experts,
+                        self.top_k,
+                        kwargs["n_group"],
+                        kwargs["topk_group"],
+                        self.intermediate_size,
+                        kwargs["local_expert_offset"],
+                        kwargs["local_num_experts"],
+                        kwargs["routed_scaling_factor"],
+                        tile_tokens_dim,
+                        kwargs["routing_method_type"],
+                        kwargs["use_shuffled_weight"],
+                        kwargs["weight_layout"],
+                        kwargs["enable_pdl"],
+                        tactic,
+                    )
                     # FP8 block scale
                     return moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
@@ -1291,7 +1315,6 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim=tile_tokens_dim,
         )
 
-        # Use FP4-style input tensor list
         inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
 
         _, tactic = tuner.choose_one(
@@ -1436,7 +1459,6 @@ def get_trtllm_moe_sm100_module():
             tile_tokens_dim=tile_tokens_dim,
         )
 
-        # Use FP4-style input tensor list with hidden_states_scale
         inputs = [
             output,
             routing_logits,
