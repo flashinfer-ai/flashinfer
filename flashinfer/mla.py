@@ -22,7 +22,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_batch_mla_module, gen_jit_spec, sm100a_nvcc_flags
-from .utils import MaskMode, _check_shape_dtype_device, determine_mla_backend
+from .utils import MaskMode, check_shape_dtype_device, determine_mla_backend
 
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
@@ -231,15 +231,15 @@ class BatchMLAPagedAttentionWrapper:
 
         Parameters
         ----------
-        qo_indptr : torch.Tensor
+        qo_indptr : torch.IntTensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
             For decoding attention, the length of each query is 1, and the content
             of the tensor should be ``[0, 1, 2, ..., batch_size]``.
-        kv_indptr : torch.Tensor
+        kv_indptr : torch.IntTensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
-        kv_indices : torch.Tensor
+        kv_indices : torch.IntTensor
             The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]`` or larger.
-        kv_len_arr : torch.Tensor
+        kv_len_arr : torch.IntTensor
             The query length of each request, shape: ``[batch_size]``.
         num_heads : int
             The number of heads in query/output tensor.
@@ -260,6 +260,18 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+
+        for tensor, name in [
+            (kv_len_arr, "kv_len_arr"),
+            (kv_indptr, "kv_indptr"),
+            (qo_indptr, "qo_indptr"),
+            (kv_indices, "kv_indices"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"Expected {name}.dtype == torch.int32, got {tensor.dtype}"
+                )
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
@@ -382,7 +394,7 @@ class BatchMLAPagedAttentionWrapper:
             if out is None:
                 out = torch.empty_like(q_nope)
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
                 )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
@@ -414,7 +426,7 @@ class BatchMLAPagedAttentionWrapper:
         if out is None:
             out = torch.empty_like(q_nope)
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
 
@@ -422,7 +434,7 @@ class BatchMLAPagedAttentionWrapper:
             if lse is None:
                 lse = torch.empty(q_nope.shape[:2], dtype=torch.float32, device=device)
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
