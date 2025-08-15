@@ -1114,7 +1114,7 @@ def get_trtllm_moe_sm100_module():
             ):
                 # FP8 operations
                 if self.use_deepseek_fp8:
-                    # FP8 block scale - ensure hidden_states_scale has correct dtype
+                    # FP8 block scale
                     return moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         kwargs["routing_bias"],
@@ -1123,9 +1123,13 @@ def get_trtllm_moe_sm100_module():
                         if hidden_states_scale is not None
                         else None,
                         kwargs["gemm1_weights"],
-                        kwargs["gemm1_weights_scale"],
+                        kwargs["gemm1_weights_scale"].to(torch.float32)
+                        if kwargs.get("gemm1_weights_scale") is not None
+                        else None,
                         kwargs["gemm2_weights"],
-                        kwargs["gemm2_weights_scale"],
+                        kwargs["gemm2_weights_scale"].to(torch.float32)
+                        if kwargs.get("gemm2_weights_scale") is not None
+                        else None,
                         self.num_experts,
                         self.top_k,
                         kwargs["n_group"],
