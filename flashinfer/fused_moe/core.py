@@ -1168,6 +1168,145 @@ def get_trtllm_moe_sm100_module():
                 ),
             )
 
+    # FP8 MoE Runner for both per-tensor and block-scale modes
+    class FP8MoERunner(TunableRunner):
+        # Custom tensor initializers for FP8 tensors
+        fp8_tensor_initializers = [
+            lambda shapes, dtype, device: torch.randn(
+                shapes, device=device, dtype=torch.float
+            ).to(dtype),  # routing_logits
+            lambda shapes, dtype, device: torch.randn(
+                shapes, device=device, dtype=torch.float
+            ).to(dtype),  # hidden_states
+        ]
+
+        def __init__(self, mode: str, **context):
+            """Initialize FP8 MoE Runner.
+
+            Args:
+                mode: Either 'per_tensor' or 'block_scale'
+                **context: Parameters from the calling function
+            """
+            self.mode = mode
+            self.context = context
+            super().__init__()
+
+        @classmethod
+        @functools.lru_cache(maxsize=None)
+        def refine_tuning_config(cls, tune_max_num_tokens: int):
+            cls.tuning_config = TuningConfig(
+                dynamic_tensor_specs=(
+                    # Both routing_logits and hidden_states need num_tokens dimension modified
+                    DynamicTensorSpec(
+                        (
+                            0,
+                            1,
+                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
+                        (0, 0),  # Modify dimension 0 (num_tokens) for both
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        cls.fp8_tensor_initializers,
+                    ),
+                )
+            )
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                # Both routing_logits and hidden_states need num_tokens dimension modified
+                DynamicTensorSpec(
+                    (
+                        0,
+                        1,
+                    ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
+                    (0, 0),  # Modify dimension 0 (num_tokens) for both
+                    get_last_power_of_2_num_tokens_buckets(1024),
+                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    fp8_tensor_initializers,
+                ),
+            )
+        )
+
+        def get_valid_tactics(self, inputs, profile):
+            # Both modes use the same trtllm_get_valid_moe_configs function
+            num_tokens = inputs[0].shape[0]  # routing_logits.shape[0]
+            hidden_size = inputs[1].shape[1]  # hidden_states.shape[1]
+
+            # The only difference is useDeepSeekFp8 parameter
+            use_deepseek_fp8 = self.mode == "block_scale"
+
+            return moe_op.trtllm_get_valid_moe_configs(
+                self.context["tile_tokens_dim"],
+                5,
+                5,
+                use_deepseek_fp8,  # False for per_tensor, True for block_scale
+                self.context["top_k"],
+                hidden_size,
+                self.context["intermediate_size"],
+                self.context["local_num_experts"],
+                num_tokens,
+            )
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            if self.mode == "per_tensor":
+                return moe_op.trtllm_fp8_per_tensor_scale_moe(
+                    inputs[0],  # routing_logits
+                    self.context["routing_bias"],
+                    inputs[1],  # hidden_states
+                    self.context["gemm1_weights"],
+                    self.context["output1_scales_scalar"],
+                    self.context["output1_scales_gate_scalar"],
+                    self.context["gemm2_weights"],
+                    self.context["output2_scales_scalar"],
+                    self.context["num_experts"],
+                    self.context["top_k"],
+                    self.context["n_group"],
+                    self.context["topk_group"],
+                    self.context["intermediate_size"],
+                    self.context["local_expert_offset"],
+                    self.context["local_num_experts"],
+                    self.context["routed_scaling_factor"],
+                    self.context["use_routing_scales_on_input"],
+                    self.context["tile_tokens_dim"],
+                    self.context["routing_method_type"],
+                    self.context["enable_pdl"],
+                    tactic,
+                )
+            else:  # block_scale mode
+                # Create hidden_states_scale dynamically based on current input shapes
+                current_num_tokens = inputs[1].shape[0]
+                current_hidden_size = inputs[1].shape[1]
+                current_hidden_states_scale = torch.full(
+                    (current_hidden_size // 128, current_num_tokens),
+                    2.0,
+                    dtype=torch.float,
+                    device=inputs[1].device,
+                )
+
+                return moe_op.trtllm_fp8_block_scale_moe(
+                    inputs[0],  # routing_logits
+                    self.context["routing_bias"],
+                    inputs[1],  # hidden_states
+                    current_hidden_states_scale,
+                    self.context["gemm1_weights"],
+                    self.context["gemm1_weights_scale"],
+                    self.context["gemm2_weights"],
+                    self.context["gemm2_weights_scale"],
+                    self.context["num_experts"],
+                    self.context["top_k"],
+                    self.context["n_group"],
+                    self.context["topk_group"],
+                    self.context["intermediate_size"],
+                    self.context["local_expert_offset"],
+                    self.context["local_num_experts"],
+                    self.context["routed_scaling_factor"],
+                    self.context["tile_tokens_dim"],
+                    self.context["routing_method_type"],
+                    self.context["use_shuffled_weight"],
+                    self.context["weight_layout"],
+                    self.context["enable_pdl"],
+                    tactic,
+                )
+
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
         mutates_args=(""),
@@ -1198,84 +1337,35 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
-        # Create FP8 per-tensor TunableRunner similar to FP4
-        class FP8PerTensorMoERunner(TunableRunner):
-            # Custom tensor initializers for FP8 tensors
-            fp8_tensor_initializers = [
-                lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device, dtype=torch.float
-                ).to(dtype),  # routing_logits
-                lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device, dtype=torch.float
-                ).to(dtype),  # hidden_states
-            ]
-
-            tuning_config = TuningConfig(
-                dynamic_tensor_specs=(
-                    # Both routing_logits and hidden_states need num_tokens dimension modified
-                    DynamicTensorSpec(
-                        (
-                            0,
-                            1,
-                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
-                        (0, 0),  # Modify dimension 0 (num_tokens) for both
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                        fp8_tensor_initializers,
-                    ),
-                )
-            )
-
-            def get_valid_tactics(self, inputs, profile):
-                # For FP8 per-tensor, we'll use the trtllm_get_valid_moe_configs function
-                num_tokens = inputs[0].shape[0]  # routing_logits.shape[0]
-                hidden_size = inputs[1].shape[1]  # hidden_states.shape[1]
-                return moe_op.trtllm_get_valid_moe_configs(
-                    tile_tokens_dim,
-                    5,
-                    5,
-                    False,  # dtype_act=E4m3, dtype_weights=E4m3, useDeepSeekFp8=False
-                    top_k,
-                    hidden_size,
-                    intermediate_size,
-                    local_num_experts,
-                    num_tokens,
-                )
-
-            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-                return moe_op.trtllm_fp8_per_tensor_scale_moe(
-                    inputs[0],  # routing_logits
-                    routing_bias,
-                    inputs[1],  # hidden_states
-                    gemm1_weights,
-                    output1_scales_scalar,
-                    output1_scales_gate_scalar,
-                    gemm2_weights,
-                    output2_scales_scalar,
-                    num_experts,
-                    top_k,
-                    n_group,
-                    topk_group,
-                    intermediate_size,
-                    local_expert_offset,
-                    local_num_experts,
-                    routed_scaling_factor,
-                    use_routing_scales_on_input,
-                    tile_tokens_dim,
-                    routing_method_type,
-                    enable_pdl,
-                    tactic,
-                )
-
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        fp8_runner = FP8PerTensorMoERunner()
+        fp8_runner = FP8MoERunner(
+            "per_tensor",
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            output1_scales_scalar=output1_scales_scalar,
+            output1_scales_gate_scalar=output1_scales_gate_scalar,
+            gemm2_weights=gemm2_weights,
+            output2_scales_scalar=output2_scales_scalar,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            use_routing_scales_on_input=use_routing_scales_on_input,
+            tile_tokens_dim=tile_tokens_dim,
+            routing_method_type=routing_method_type,
+            enable_pdl=enable_pdl,
+        )
         inputs = [routing_logits, hidden_states]
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",
             [fp8_runner],
-            FP8PerTensorMoERunner.tuning_config,
+            FP8MoERunner.tuning_config,
             inputs,
         )
 
@@ -1365,95 +1455,35 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
-        # Create FP8 block-scale TunableRunner similar to FP4
-        class FP8BlockScaleMoERunner(TunableRunner):
-            # Custom tensor initializers for FP8 tensors
-            fp8_tensor_initializers = [
-                lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device, dtype=torch.float
-                ).to(dtype),  # routing_logits
-                lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device, dtype=torch.float
-                ).to(dtype),  # hidden_states
-            ]
-
-            tuning_config = TuningConfig(
-                dynamic_tensor_specs=(
-                    # Both routing_logits and hidden_states need num_tokens dimension modified
-                    DynamicTensorSpec(
-                        (
-                            0,
-                            1,
-                        ),  # Apply to inputs[0] (routing_logits) and inputs[1] (hidden_states)
-                        (0, 0),  # Modify dimension 0 (num_tokens) for both
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                        fp8_tensor_initializers,
-                    ),
-                )
-            )
-
-            def get_valid_tactics(self, inputs, profile):
-                # For FP8 block-scale, we'll use the trtllm_get_valid_moe_configs function
-                num_tokens = inputs[0].shape[0]  # routing_logits.shape[0]
-                hidden_size = inputs[1].shape[1]  # hidden_states.shape[1]
-                return moe_op.trtllm_get_valid_moe_configs(
-                    tile_tokens_dim,
-                    5,
-                    5,
-                    True,  # dtype_act=E4m3, dtype_weights=E4m3, useDeepSeekFp8=True
-                    top_k,
-                    hidden_size,
-                    intermediate_size,
-                    local_num_experts,
-                    num_tokens,
-                )
-
-            def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-                # Create hidden_states_scale dynamically based on current input shapes
-                current_num_tokens = inputs[1].shape[0]
-                current_hidden_size = inputs[1].shape[1]
-                current_hidden_states_scale = torch.full(
-                    (current_hidden_size // 128, current_num_tokens),
-                    2.0,
-                    dtype=torch.float,
-                    device=inputs[1].device,
-                )
-
-                return moe_op.trtllm_fp8_block_scale_moe(
-                    inputs[0],  # routing_logits
-                    routing_bias,
-                    inputs[1],  # hidden_states
-                    current_hidden_states_scale,
-                    gemm1_weights,
-                    gemm1_weights_scale,
-                    gemm2_weights,
-                    gemm2_weights_scale,
-                    num_experts,
-                    top_k,
-                    n_group,
-                    topk_group,
-                    intermediate_size,
-                    local_expert_offset,
-                    local_num_experts,
-                    routed_scaling_factor,
-                    tile_tokens_dim,
-                    routing_method_type,
-                    use_shuffled_weight,
-                    weight_layout,
-                    enable_pdl,
-                    tactic,
-                )
-
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        fp8_runner = FP8BlockScaleMoERunner()
+        fp8_runner = FP8MoERunner(
+            "block_scale",
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            tile_tokens_dim=tile_tokens_dim,
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            enable_pdl=enable_pdl,
+        )
         inputs = [routing_logits, hidden_states]
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_block_scale_moe",
             [fp8_runner],
-            FP8BlockScaleMoERunner.tuning_config,
+            FP8MoERunner.tuning_config,
             inputs,
         )
 
