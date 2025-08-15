@@ -35,7 +35,7 @@ from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import (
-    check_shape_dtype_device,
+    _check_shape_dtype_device,
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
@@ -784,7 +784,7 @@ def cutlass_fused_moe(
     if output is None:
         output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
     else:
-        check_shape_dtype_device(
+        _check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
 

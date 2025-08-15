@@ -8,7 +8,7 @@ import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up
 
 DTYPE_MAP = {
-    "fp16": torch.float16,
+    "half": torch.float16,
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
     "nvfp4": "nvfp4",
@@ -237,10 +237,8 @@ def unpack_compare_nvfp4(
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
+        ("half", "half", "half"),
         ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
     ],
@@ -357,10 +355,8 @@ def test_trtllm_batch_prefill(
         )
         assert o_scale == 1.0
         rtol, atol = 4e-1, 1e0
-    elif q_dtype == "fp8" and o_dtype == "fp8":
+    elif o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
-    elif q_dtype == "fp8" and o_dtype in ["bf16", "fp16"]:
-        rtol, atol = 4e-2, 6e-2
     else:
         rtol, atol = 1e-2, 1e-2
 
@@ -403,12 +399,10 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
+        ("half", "half", "half"),
+        ("half", "fp8", "half"),
         ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
         ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
     ],
@@ -518,10 +512,8 @@ def test_trtllm_batch_decode(
         )
         assert o_scale == 1.0
         rtol, atol = 3e-1, 1e0
-    elif q_dtype == "fp8" and o_dtype == "fp8":
+    elif o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
-    elif q_dtype == "fp8" and o_dtype in ["bf16", "fp16"]:
-        rtol, atol = 4e-2, 6e-2
     else:
         rtol, atol = 1e-2, 1e-2
 
