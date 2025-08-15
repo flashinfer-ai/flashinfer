@@ -53,6 +53,8 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("a_major", ["k"])
 @pytest.mark.parametrize("b_major", ["k"])
 @pytest.mark.parametrize("c_major", ["n"])
+@pytest.mark.parametrize("fuse_alpha", [False])
+@pytest.mark.parametrize("alpha_dtype", ["float32"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
 @pytest.mark.parametrize("tolerance", [1e-01])
@@ -67,6 +69,8 @@ def test_blockscaled_gemm_python_interface(
     a_major: str,
     b_major: str,
     c_major: str,
+    fuse_alpha: bool,
+    alpha_dtype: cutlass.dtype,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     tolerance: float,
@@ -164,6 +168,11 @@ def test_blockscaled_gemm_python_interface(
         is_dynamic_layout=True,
         assumed_align=16,
     )
+    alpha_tensor = (
+        torch.randn(l, dtype=torch.float32, device="cuda")
+        if fuse_alpha
+        else torch.ones(l, dtype=torch.float32, device="cuda")
+    )
 
     # for deepgemm-like python interface
     if ab_dtype == "float4_e2m1fn":
@@ -206,6 +215,8 @@ def test_blockscaled_gemm_python_interface(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            alpha=alpha_tensor,
+            alpha_dtype=alpha_dtype,
         )
         torch.cuda.synchronize()
 
@@ -257,3 +268,23 @@ def test_blockscaled_gemm_python_interface(
                 atol=tolerance,
                 rtol=1e-02,
             )
+
+
+if __name__ == "__main__":
+    test_blockscaled_gemm_python_interface(
+        lm=(1, 1024),
+        kn=(7168, 4096),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        sf_vec_size=16,
+        c_dtype="float16",
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        fuse_alpha=False,
+        alpha_dtype="float32",
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        tolerance=1e-01,
+        iterations=3,
+    )
