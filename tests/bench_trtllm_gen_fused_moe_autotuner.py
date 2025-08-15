@@ -54,8 +54,8 @@ def bench_trtllm_gen_fused_moe_autotuner(
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
-    # FP8 modes require float for routing_logits, others can use bfloat16
-    if quant_mode in ["FP8_block_scale", "FP8_per_tensor_scale"]:
+    # FP8_block_scale (DeepSeekV3) requires float, FP8_per_tensor_scale (Llama4) uses bfloat16
+    if quant_mode == "FP8_block_scale":
         routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
             torch.float
         )
@@ -66,6 +66,12 @@ def bench_trtllm_gen_fused_moe_autotuner(
     hidden_states = torch.randn(num_tokens, hidden_size, device=device).to(
         torch.bfloat16
     )
+
+    # Create routing bias for FP8 modes that use it
+    if quant_mode in ["FP8_block_scale", "FP8_per_tensor_scale"]:
+        routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+    else:
+        routing_bias = None
     if quant_mode == "NvFP4xNvFP4":
         hidden_states, hidden_states_scale = fp4_quantize(
             hidden_states,
@@ -252,7 +258,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
 
         fn = lambda: trtllm_fp8_block_scale_moe(
             routing_logits,
-            None,  # routing_bias
+            routing_bias,  # routing_bias for DeepSeekV3
             hidden_states.to(torch.float8_e4m3fn),
             2.0
             * torch.ones(
@@ -264,14 +270,14 @@ def bench_trtllm_gen_fused_moe_autotuner(
             w2_scale,
             num_experts,
             top_k,
-            0,  # n_group
-            0,  # topk_group
+            8,  # n_group for DeepSeekV3
+            4,  # topk_group for DeepSeekV3
             intermediate_size,
             0,  # local_expert_offset
             num_experts,
-            1.0,  # routed_scaling_factor
+            2.5,  # routed_scaling_factor for DeepSeekV3
             tile_tokens_dim,
-            RoutingMethodType.RenormalizeNaive,
+            RoutingMethodType.DeepSeekV3,
             use_shuffled_weight=True,
             weight_layout=WeightLayout.MajorK,
             enable_pdl=enable_pdl,
@@ -302,7 +308,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
 
         fn = lambda: trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
-            None,  # routing_bias
+            routing_bias,  # routing_bias for Llama4
             hidden_states,
             w13_kernel,
             output1_scale_scalar,
@@ -310,16 +316,16 @@ def bench_trtllm_gen_fused_moe_autotuner(
             w2_kernel,
             output2_scale_scalar,
             num_experts,
-            top_k,
-            0,  # n_group
-            0,  # topk_group
+            1,  # top_k=1 for Llama4 (override parameter)
+            0,  # n_group for Llama4
+            0,  # topk_group for Llama4
             intermediate_size,
             0,  # local_expert_offset
             num_experts,
-            1.0,  # routed_scaling_factor
-            False,  # use_routing_scales_on_input
+            2.5,  # routed_scaling_factor for Llama4
+            True,  # use_routing_scales_on_input for Llama4
             tile_tokens_dim,
-            RoutingMethodType.RenormalizeNaive,
+            RoutingMethodType.Llama4,
             tune_max_num_tokens=1024,
         )
     else:
