@@ -54,6 +54,11 @@ def bench_trtllm_gen_fused_moe_autotuner(
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
+
+    # Adjust parameters for specific routing methods
+    if quant_mode == "FP8_per_tensor_scale":
+        # Llama4 routing requires top_k=1
+        top_k = 1
     # FP8_block_scale (DeepSeekV3) requires float, FP8_per_tensor_scale (Llama4) uses bfloat16
     if quant_mode == "FP8_block_scale":
         routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
@@ -316,7 +321,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
             w2_kernel,
             output2_scale_scalar,
             num_experts,
-            1,  # top_k=1 for Llama4 (override parameter)
+            top_k,  # top_k (adjusted to 1 for Llama4)
             0,  # n_group for Llama4
             0,  # topk_group for Llama4
             intermediate_size,
@@ -343,10 +348,26 @@ def bench_trtllm_gen_fused_moe_autotuner(
         median_ms = np.median(ms_list)
         return median_ms
 
+    # Debug tensor shapes
+    print(
+        f"Tensor shapes - routing_logits: {routing_logits.shape}, hidden_states: {hidden_states.shape}"
+    )
+
     ms = bench(do_autotune=False)
     ms_tuned = bench(do_autotune=True)
+
+    # Determine routing info for display
+    routing_info = {
+        "FP8_block_scale": f"DeepSeekV3 (groups: 8/4, scaling: 2.5, top_k: {top_k})",
+        "FP8_per_tensor_scale": f"Llama4 (top_k: {top_k}, scaling: 2.5)",
+        "NvFP4xNvFP4": f"RenormalizeNaive (top_k: {top_k})",
+        "MxFP4xMxFP8": f"RenormalizeNaive (top_k: {top_k})",
+        "MxFP4xBf16": f"RenormalizeNaive (top_k: {top_k})",
+    }.get(quant_mode, f"Unknown (top_k: {top_k})")
+
+    print(f"Quant mode: {quant_mode}, Routing: {routing_info}")
     print(
-        f"num tokens: {num_tokens}, num experts: {num_experts}, hidden size: {hidden_size}, intermediate size: {intermediate_size}, top k: {top_k}"
+        f"Tokens: {num_tokens}, Experts: {num_experts}, Hidden: {hidden_size}, Intermediate: {intermediate_size}"
     )
     print(f"No autotune: {ms:.3f} ms; with autotune: {ms_tuned:.3f} ms")
 
