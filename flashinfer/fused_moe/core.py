@@ -1213,8 +1213,8 @@ def get_trtllm_moe_sm100_module():
 
             def get_valid_tactics(self, inputs, profile):
                 # For FP8 per-tensor, we'll use the trtllm_get_valid_moe_configs function
-                num_tokens = inputs[0].shape[0]
-                hidden_size = inputs[0].shape[1]
+                num_tokens = inputs[0].shape[0]  # routing_logits.shape[0]
+                hidden_size = inputs[1].shape[1]  # hidden_states.shape[1]
                 return moe_op.trtllm_get_valid_moe_configs(
                     tile_tokens_dim,
                     5,
@@ -1365,8 +1365,8 @@ def get_trtllm_moe_sm100_module():
 
             def get_valid_tactics(self, inputs, profile):
                 # For FP8 block-scale, we'll use the trtllm_get_valid_moe_configs function
-                num_tokens = inputs[0].shape[0]
-                hidden_size = inputs[0].shape[1]
+                num_tokens = inputs[0].shape[0]  # routing_logits.shape[0]
+                hidden_size = inputs[1].shape[1]  # hidden_states.shape[1]
                 return moe_op.trtllm_get_valid_moe_configs(
                     tile_tokens_dim,
                     5,
