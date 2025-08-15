@@ -139,6 +139,7 @@ def test_blockscaled_gemm_python_interface(
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
+    c_ref_clone = c_ref.clone()
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref,
         get_cutlass_dtype(ab_dtype),
