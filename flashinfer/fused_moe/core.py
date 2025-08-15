@@ -1255,35 +1255,62 @@ def get_trtllm_moe_sm100_module():
             hidden_size: int,
             intermediate_size: int,
             tile_tokens_dim: Optional[int] = None,
-            # FP8-specific parameters
+            # FP8-specific parameters (following original pattern)
             fp8_mode: Optional[str] = None,
-            **fp8_context,
+            routing_bias: Optional[torch.Tensor] = None,
+            gemm1_weights: Optional[torch.Tensor] = None,
+            gemm1_weights_scale: Optional[torch.Tensor] = None,
+            gemm2_weights: Optional[torch.Tensor] = None,
+            gemm2_weights_scale: Optional[torch.Tensor] = None,
+            output1_scales_scalar: Optional[torch.Tensor] = None,
+            output1_scales_gate_scalar: Optional[torch.Tensor] = None,
+            output2_scales_scalar: Optional[torch.Tensor] = None,
+            n_group: Optional[int] = None,
+            topk_group: Optional[int] = None,
+            local_expert_offset: int = 0,
+            local_num_experts: Optional[int] = None,
+            routed_scaling_factor: Optional[float] = None,
+            use_routing_scales_on_input: bool = False,
+            routing_method_type: int = 0,
+            use_shuffled_weight: bool = False,
+            weight_layout: int = 0,
+            enable_pdl: bool = True,
         ):
             self.num_experts = num_experts
             self.top_k = top_k
             self.dtype_act = dtype_act
             self.dtype_weights = dtype_weights
             self.use_deepseek_fp8 = use_deepseek_fp8
-            self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
             self.tile_tokens_dim = tile_tokens_dim
-            # FP8-specific attributes
+
+            # FP8-specific attributes (following original pattern - all as instance attributes)
             self.fp8_mode = fp8_mode  # None, 'per_tensor', or 'block_scale'
-            self.fp8_context = fp8_context if fp8_mode else {}
+            self.routing_bias = routing_bias
+            self.gemm1_weights = gemm1_weights
+            self.gemm1_weights_scale = gemm1_weights_scale
+            self.gemm2_weights = gemm2_weights
+            self.gemm2_weights_scale = gemm2_weights_scale
+            self.output1_scales_scalar = output1_scales_scalar
+            self.output1_scales_gate_scalar = output1_scales_gate_scalar
+            self.output2_scales_scalar = output2_scales_scalar
+            self.n_group = n_group
+            self.topk_group = topk_group
+            self.local_expert_offset = local_expert_offset
+            self.local_num_experts = local_num_experts or num_experts
+            self.routed_scaling_factor = routed_scaling_factor
+            self.use_routing_scales_on_input = use_routing_scales_on_input
+            self.routing_method_type = routing_method_type
+            self.use_shuffled_weight = use_shuffled_weight
+            self.weight_layout = weight_layout
+            self.enable_pdl = enable_pdl
 
         def __hash__(self):
             """Make MoERunner hashable for autotuner caching.
 
-            The fp8_context dict needs special handling since dicts are not hashable.
+            Following original pattern - all attributes are hashable types.
             """
-            # Convert fp8_context dict to a hashable representation
-            if self.fp8_context:
-                # Sort items to ensure consistent hashing regardless of dict order
-                fp8_context_tuple = tuple(sorted(self.fp8_context.items()))
-            else:
-                fp8_context_tuple = ()
-
             return hash(
                 (
                     self.top_k,
@@ -1295,7 +1322,17 @@ def get_trtllm_moe_sm100_module():
                     self.intermediate_size,
                     self.tile_tokens_dim,
                     self.fp8_mode,
-                    fp8_context_tuple,
+                    # FP8-specific hashable attributes
+                    self.n_group,
+                    self.topk_group,
+                    self.local_expert_offset,
+                    self.local_num_experts,
+                    self.routed_scaling_factor,
+                    self.use_routing_scales_on_input,
+                    self.routing_method_type,
+                    self.use_shuffled_weight,
+                    self.weight_layout,
+                    self.enable_pdl,
                 )
             )
 
@@ -1348,7 +1385,7 @@ def get_trtllm_moe_sm100_module():
                     self.top_k,
                     hidden_size,
                     self.intermediate_size,
-                    self.fp8_context["local_num_experts"],
+                    self.local_num_experts,
                     num_tokens,
                 )
             else:
@@ -1394,25 +1431,25 @@ def get_trtllm_moe_sm100_module():
             if self.fp8_mode == "per_tensor":
                 return moe_op.trtllm_fp8_per_tensor_scale_moe(
                     inputs[0],  # routing_logits
-                    self.fp8_context["routing_bias"],
+                    self.routing_bias,
                     inputs[1],  # hidden_states
-                    self.fp8_context["gemm1_weights"],
-                    self.fp8_context["output1_scales_scalar"],
-                    self.fp8_context["output1_scales_gate_scalar"],
-                    self.fp8_context["gemm2_weights"],
-                    self.fp8_context["output2_scales_scalar"],
-                    self.fp8_context["num_experts"],
-                    self.fp8_context["top_k"],
-                    self.fp8_context["n_group"],
-                    self.fp8_context["topk_group"],
-                    self.fp8_context["intermediate_size"],
-                    self.fp8_context["local_expert_offset"],
-                    self.fp8_context["local_num_experts"],
-                    self.fp8_context["routed_scaling_factor"],
-                    self.fp8_context["use_routing_scales_on_input"],
-                    self.fp8_context["tile_tokens_dim"],
-                    self.fp8_context["routing_method_type"],
-                    self.fp8_context["enable_pdl"],
+                    self.gemm1_weights,
+                    self.output1_scales_scalar,
+                    self.output1_scales_gate_scalar,
+                    self.gemm2_weights,
+                    self.output2_scales_scalar,
+                    self.num_experts,
+                    self.top_k,
+                    self.n_group,
+                    self.topk_group,
+                    self.intermediate_size,
+                    self.local_expert_offset,
+                    self.local_num_experts,
+                    self.routed_scaling_factor,
+                    self.use_routing_scales_on_input,
+                    self.tile_tokens_dim or 8,
+                    self.routing_method_type,
+                    self.enable_pdl,
                     tactic,
                 )
             elif self.fp8_mode == "block_scale":
@@ -1428,26 +1465,26 @@ def get_trtllm_moe_sm100_module():
 
                 return moe_op.trtllm_fp8_block_scale_moe(
                     inputs[0],  # routing_logits
-                    self.fp8_context["routing_bias"],
+                    self.routing_bias,
                     inputs[1],  # hidden_states
                     current_hidden_states_scale,
-                    self.fp8_context["gemm1_weights"],
-                    self.fp8_context["gemm1_weights_scale"],
-                    self.fp8_context["gemm2_weights"],
-                    self.fp8_context["gemm2_weights_scale"],
-                    self.fp8_context["num_experts"],
-                    self.fp8_context["top_k"],
-                    self.fp8_context["n_group"],
-                    self.fp8_context["topk_group"],
-                    self.fp8_context["intermediate_size"],
-                    self.fp8_context["local_expert_offset"],
-                    self.fp8_context["local_num_experts"],
-                    self.fp8_context["routed_scaling_factor"],
-                    self.fp8_context["tile_tokens_dim"],
-                    self.fp8_context["routing_method_type"],
-                    self.fp8_context["use_shuffled_weight"],
-                    self.fp8_context["weight_layout"],
-                    self.fp8_context["enable_pdl"],
+                    self.gemm1_weights,
+                    self.gemm1_weights_scale,
+                    self.gemm2_weights,
+                    self.gemm2_weights_scale,
+                    self.num_experts,
+                    self.top_k,
+                    self.n_group,
+                    self.topk_group,
+                    self.intermediate_size,
+                    self.local_expert_offset,
+                    self.local_num_experts,
+                    self.routed_scaling_factor,
+                    self.tile_tokens_dim or 8,
+                    self.routing_method_type,
+                    self.use_shuffled_weight,
+                    self.weight_layout,
+                    self.enable_pdl,
                     tactic,
                 )
             else:
