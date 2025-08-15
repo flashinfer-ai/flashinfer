@@ -1863,8 +1863,8 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type: Type of routing method to use (default: 0)
         use_shuffled_weight: Whether to use shuffled weight layout (default: False)
         weight_layout: Weight layout format (default: 0)
-        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 1024)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 1024)
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
