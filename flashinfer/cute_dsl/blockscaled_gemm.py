@@ -860,7 +860,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Launch the kernel synchronously
         self.kernel(
-            masked_m_tensor,  # todo(Yingyi): cleanup?
             tiled_mma,
             tiled_mma_sfb,
             tma_atom_a,
@@ -897,7 +896,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @cute.kernel
     def kernel(
         self,
-        masked_m: cute.Tensor,  # todo(Yingyi): cleanup?
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
