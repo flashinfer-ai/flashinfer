@@ -580,7 +580,7 @@ def main():
     gencode_flags = _get_cuda_arch_flags()
 
     def has_sm(compute: str, version: str) -> bool:
-        if not any("compute_90" in flag for flag in gencode_flags):
+        if not any(compute in flag for flag in gencode_flags):
             return False
         if torch.version.cuda is None:
             return True
