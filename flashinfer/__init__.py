@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Load environment variables from ~/.config/flashinfer.json
+from . import env
+
+env.initialize_env_config()
+
 try:
     from ._build_meta import __version__ as __version__
 except ModuleNotFoundError:

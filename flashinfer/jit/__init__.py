@@ -79,8 +79,8 @@ def get_cudnn_fmha_gen_module():
     return op
 
 
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
-)
+from .. import env as flashinfer_env
+
+cuda_lib_path = flashinfer_env.CUDA_LIB_PATH
 if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
     ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)

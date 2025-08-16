@@ -1,6 +1,5 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
-import os
 import subprocess
 import sys
 import sysconfig
@@ -17,6 +16,7 @@ from torch.utils.cpp_extension import (
 )
 
 from . import env as jit_env
+from .. import env as env_cfg
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -71,9 +71,8 @@ def generate_ninja_build_for_op(
         cflags += extra_cflags
 
     cuda_cflags: List[str] = []
-    cc_env = os.environ.get("CC")
-    if cc_env is not None:
-        cuda_cflags += ["-ccbin", cc_env]
+    if env_cfg.CC:
+        cuda_cflags += ["-ccbin", env_cfg.CC]
     cuda_cflags += [
         "$common_cflags",
         "--compiler-options=-fPIC",
@@ -95,25 +94,24 @@ def generate_ninja_build_for_op(
         "-lcudart",
     ]
 
-    env_extra_ldflags = os.environ.get("FLASHINFER_EXTRA_LDFLAGS")
-    if env_extra_ldflags:
+    if env_cfg.FLASHINFER_EXTRA_LDFLAGS:
         try:
             import shlex
 
-            ldflags += shlex.split(env_extra_ldflags)
+            ldflags += shlex.split(env_cfg.FLASHINFER_EXTRA_LDFLAGS)
         except ValueError as e:
             print(
                 f"Warning: Could not parse FLASHINFER_EXTRA_LDFLAGS with shlex: {e}. Falling back to simple split.",
                 file=sys.stderr,
             )
-            ldflags += env_extra_ldflags.split()
+            ldflags += env_cfg.FLASHINFER_EXTRA_LDFLAGS.split()
 
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
-    cxx = os.environ.get("CXX", "c++")
+    cxx = env_cfg.CXX
     cuda_home = CUDA_HOME or "/usr/local/cuda"
-    nvcc = os.environ.get("PYTORCH_NVCC", "$cuda_home/bin/nvcc")
+    nvcc = env_cfg.PYTORCH_NVCC
 
     lines = [
         "ninja_required_version = 1.3",

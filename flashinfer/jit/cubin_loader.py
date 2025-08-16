@@ -25,12 +25,12 @@ import filelock
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
 
-# This is the storage path for the cubins, it can be replaced
-# with a local path for testing.
-FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
-    "FLASHINFER_CUBINS_REPOSITORY",
-    "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",
-)
+from .. import env as env_cfg
+
+if env_cfg.FLASHINFER_CUBINS_REPOSITORY:
+    FLASHINFER_CUBINS_REPOSITORY = env_cfg.FLASHINFER_CUBINS_REPOSITORY
+else:
+    FLASHINFER_CUBINS_REPOSITORY = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/"
 
 
 def download_file(source, local_path, retries=3, delay=5, timeout=10, lock_timeout=30):
@@ -118,7 +118,7 @@ def load_cubin(cubin_path, sha256) -> bytes:
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
-            if os.getenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED"):
+            if env_cfg.FLASHINFER_CUBIN_CHECKSUM_DISABLED == "1":
                 return cubin
             m = hashlib.sha256()
             m.update(cubin)
