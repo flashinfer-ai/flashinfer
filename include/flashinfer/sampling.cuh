@@ -35,15 +35,11 @@
 #include "vec_dtypes.cuh"
 
 #if CUDA_VERSION >= 12090
-using MaxReduceOp = cuda::maximum<>;
-using MinReduceOp = cuda::minimum<>;
 #define MAX_OP \
   cuda::maximum<> {}
 #define MIN_OP \
   cuda::minimum<> {}
 #else
-using MaxReduceOp = cub::Max;
-using MinReduceOp = cub::Min;
 #define MAX_OP \
   cub::Max {}
 #define MIN_OP \
