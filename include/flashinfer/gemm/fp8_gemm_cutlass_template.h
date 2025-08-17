@@ -50,43 +50,44 @@ struct _2SM {};
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_,
           typename ClusterShape_, typename XSM_>
 size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B,
-                                         float const* alpha, T* D, int m, int n, int k, int b,
-                                         CutlassGemmConfig config, char* workspacePtr,
-                                         size_t const workspaceBytes, cudaStream_t stream);
+                                         float const* scale_a, float const* scale_b, T* D, int m,
+                                         int n, int k, int b, CutlassGemmConfig config,
+                                         char* workspacePtr, size_t const workspaceBytes,
+                                         cudaStream_t stream);
 
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_>
 size_t dispatchGemmClusterShapeSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B,
-                                     float const* alpha, T* D, int m, int n, int k, int b,
-                                     CutlassGemmConfig gemmConfig, char* workspacePtr,
+                                     float const* scale_a, float const* scale_b, T* D, int m, int n,
+                                     int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
                                      size_t const workspaceBytes, cudaStream_t stream) {
   using namespace cute;
 
   switch (gemmConfig.cluster_shape) {
     case ClusterShape::ClusterShape_1x1x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _1, _1>,
-                                               _1SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
-                                                     workspacePtr, workspaceBytes, stream);
+                                               _1SM>(
+          A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
 
     case ClusterShape::ClusterShape_2x1x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _1, _1>,
-                                               _2SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
-                                                     workspacePtr, workspaceBytes, stream);
+                                               _2SM>(
+          A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_1x2x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _2, _1>,
-                                               _1SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
-                                                     workspacePtr, workspaceBytes, stream);
+                                               _1SM>(
+          A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_2x2x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _2, _1>,
-                                               _2SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
-                                                     workspacePtr, workspaceBytes, stream);
+                                               _2SM>(
+          A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_1x4x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _4, _1>,
-                                               _1SM>(A, B, alpha, D, m, n, k, b, gemmConfig,
-                                                     workspacePtr, workspaceBytes, stream);
+                                               _1SM>(
+          A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
     default:
       throw std::runtime_error("invalid config for fp8 gemm");
@@ -95,9 +96,10 @@ size_t dispatchGemmClusterShapeSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
 }
 
 template <typename T>
-size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* alpha, void* D,
-                      int m, int n, int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
-                      size_t const workspaceBytes, cudaStream_t stream) {
+size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* scale_a,
+                      float const* scale_b, void* D, int m, int n, int k, int b,
+                      CutlassGemmConfig gemmConfig, char* workspacePtr, size_t const workspaceBytes,
+                      cudaStream_t stream) {
   using namespace cute;
 
   using arch = cutlass::arch::Sm100;
@@ -107,34 +109,34 @@ size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float cons
   // A rowmajor, B colmajor , C, D  rowmajor
   switch (gemmConfig.tile_config_sm100) {
     case CutlassTileConfigSM100::CtaShape64x64x128B:
-      return dispatchGemmClusterShapeSm100<T, arch, 64, 64, 128>(B, A, alpha, static_cast<T*>(D), n,
-                                                                 m, k, b, gemmConfig, workspacePtr,
-                                                                 workspaceBytes, stream);
+      return dispatchGemmClusterShapeSm100<T, arch, 64, 64, 128>(
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape64x128x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 64, 128, 128>(
-          B, A, alpha, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-          stream);
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape64x256x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 64, 256, 128>(
-          B, A, alpha, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-          stream);
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape128x64x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 128, 64, 128>(
-          B, A, alpha, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-          stream);
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape128x128x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 128, 128, 128>(
-          B, A, alpha, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-          stream);
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape128x256x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 128, 256, 128>(
-          B, A, alpha, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-          stream);
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
 
     default:
@@ -145,11 +147,12 @@ size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float cons
 
 template <typename T>
 void CutlassFp8GemmRunner<T>::gemm(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B,
-                                   float const* alpha, void* D, int m, int n, int k, int b,
-                                   CutlassGemmConfig gemmConfig, char* workspacePtr,
-                                   size_t const workspaceBytes, cudaStream_t stream) {
-  dispatchToArch<T>(A, B, alpha, reinterpret_cast<T*>(D), m, n, k, b, gemmConfig, workspacePtr,
-                    workspaceBytes, stream);
+                                   float const* scale_a, float const* scale_b, void* D, int m,
+                                   int n, int k, int b, CutlassGemmConfig gemmConfig,
+                                   char* workspacePtr, size_t const workspaceBytes,
+                                   cudaStream_t stream) {
+  dispatchToArch<T>(A, B, scale_a, scale_b, reinterpret_cast<T*>(D), m, n, k, b, gemmConfig,
+                    workspacePtr, workspaceBytes, stream);
 }
 
 template <typename T>
@@ -158,8 +161,8 @@ size_t CutlassFp8GemmRunner<T>::getWorkspaceSizeImpl(int m, int n, int k) {
   auto gemmConfigs = CutlassFp8GemmRunner<T>{}.getConfigs();
   for (auto const& gemmConfig : gemmConfigs) {
     try {
-      size_t curr_workspace_size = dispatchToArch<T>(nullptr, nullptr, nullptr, nullptr, m, n, k, 1,
-                                                     gemmConfig, nullptr, 0, nullptr);
+      size_t curr_workspace_size = dispatchToArch<T>(nullptr, nullptr, nullptr, nullptr, nullptr, m,
+                                                     n, k, 1, gemmConfig, nullptr, 0, nullptr);
 
       workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error& e) {
