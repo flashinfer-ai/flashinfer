@@ -31,9 +31,10 @@ class CutlassFp8GemmRunnerInterface {
   CutlassFp8GemmRunnerInterface() = default;
   virtual ~CutlassFp8GemmRunnerInterface() = default;
 
-  virtual void gemm(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* alpha, void* D,
-                    int m, int n, int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
-                    size_t const workspaceBytes, cudaStream_t stream) = 0;
+  virtual void gemm(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* scale_a,
+                    float const* scale_b, void* D, int m, int n, int k, int b,
+                    CutlassGemmConfig gemmConfig, char* workspacePtr, size_t const workspaceBytes,
+                    cudaStream_t stream) = 0;
 
   virtual size_t getWorkspaceSize(int m, int n, int k) = 0;
 
@@ -46,9 +47,9 @@ class CutlassFp8GemmRunner : public virtual CutlassFp8GemmRunnerInterface {
   CutlassFp8GemmRunner() = default;
   ~CutlassFp8GemmRunner() = default;
 
-  void gemm(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* alpha, void* D, int m,
-            int n, int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
-            size_t const workspaceBytes, cudaStream_t stream) override;
+  void gemm(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float const* scale_a,
+            float const* scale_b, void* D, int m, int n, int k, int b, CutlassGemmConfig gemmConfig,
+            char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream) override;
   size_t getWorkspaceSize(int m, int n, int k) override;
   std::vector<CutlassGemmConfig> getConfigs() const override;
 

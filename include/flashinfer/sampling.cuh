@@ -16,13 +16,12 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
+#include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
-#include <cub/block/block_adjacent_difference.cuh>
-#include <cub/block/block_reduce.cuh>
-#include <cub/block/block_scan.cuh>
+#include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -34,6 +33,16 @@
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
+
+// Define reduction operators based on CUDA version
+// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
+#if CUDA_VERSION >= 12090
+using MaxReduceOp = cuda::maximum<>;
+using MinReduceOp = cuda::minimum<>;
+#else
+using MaxReduceOp = cub::Max;
+using MinReduceOp = cub::Min;
+#endif
 
 namespace flashinfer {
 
@@ -254,11 +263,11 @@ __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_dat
     }
     max_val = max(
         max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, cub::Max()));
+                     .Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
     __syncthreads();
     min_val = min(
         min_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, cub::Min()));
+                     .Reduce<VEC_SIZE>(in_data_, MinReduceOp{}));
     __syncthreads();
   }
   if (tx == 0) {
@@ -292,7 +301,7 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
     }
     max_val = max(
         max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, cub::Max()));
+                     .Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
     __syncthreads();
   }
   if (tx == 0) {
@@ -352,7 +361,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
       thread_max = max(thread_max, logits_vec[j]);
     }
     float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                          .Reduce(thread_max, cub::Max());
+                          .Reduce(thread_max, MaxReduceOp{});
 
     if (tx == 0) {
       temp_storage.shared_state.max_val = block_max;
@@ -468,7 +477,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     }
 
     float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                          .Reduce(thread_max, cub::Max());
+                          .Reduce(thread_max, MaxReduceOp{});
 
     if (tx == 0) {
       temp_storage.shared_state.max_val = block_max;
@@ -653,7 +662,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   }
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
-          .Reduce(valid_index, cub::Max());
+          .Reduce(valid_index, MaxReduceOp{});
   if (tx == 0 && max_valid_index != -1) {
     temp_storage->last_valid_id = max_valid_index;
   }
@@ -1674,11 +1683,11 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       __syncthreads();
     }
     min_gt_low = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce(min_gt_low, cub::Min());
+                     .Reduce(min_gt_low, MinReduceOp{});
     __syncthreads();
     max_le_high =
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-            .Reduce(max_le_high, cub::Max());
+            .Reduce(max_le_high, MaxReduceOp{});
     if (tx == 0) {
       temp_storage.block_aggregate.values[0] = aggregate_gt_pivot_0;
       temp_storage.block_aggregate.values[1] = aggregate_gt_pivot_1;
@@ -1796,11 +1805,11 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       }
       min_gt_low =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, cub::Min());
+              .Reduce(min_gt_low, MinReduceOp{});
       __syncthreads();
       max_le_high =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, cub::Max());
+              .Reduce(max_le_high, MaxReduceOp{});
       if (tx == 0) {
         temp_storage.block_aggregate.counts[0] = aggregate_gt_pivot_0;
         temp_storage.block_aggregate.counts[1] = aggregate_gt_pivot_1;
@@ -1916,11 +1925,11 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       }
       min_gt_low =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, cub::Min());
+              .Reduce(min_gt_low, MinReduceOp{});
       __syncthreads();
       max_le_high =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, cub::Max());
+              .Reduce(max_le_high, MaxReduceOp{});
       if (tx == 0) {
         temp_storage.block_aggregate.pairs[0] = aggregate_gt_pivot_0;
         temp_storage.block_aggregate.pairs[1] = aggregate_gt_pivot_1;
@@ -2102,7 +2111,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0);
+      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0.0f);
     }
     sum_relu_q_minus_p +=
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
@@ -2136,7 +2145,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     vec_t<float, VEC_SIZE> relu_q_minus_p_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], 0);
+      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], 0.0f);
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
