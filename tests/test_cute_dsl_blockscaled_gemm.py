@@ -53,7 +53,7 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("a_major", ["k"])
 @pytest.mark.parametrize("b_major", ["k"])
 @pytest.mark.parametrize("c_major", ["n"])
-@pytest.mark.parametrize("fuse_alpha", [False])
+@pytest.mark.parametrize("fuse_alpha", [False, True])
 @pytest.mark.parametrize("alpha_dtype", ["float32"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
@@ -171,7 +171,7 @@ def test_blockscaled_gemm_python_interface(
     alpha_tensor = (
         torch.randn(l, dtype=torch.float32, device="cuda")
         if fuse_alpha
-        else torch.ones(l, dtype=torch.float32, device="cuda")
+        else torch.ones(l, dtype=torch.float32, device="cuda")  # or None
     )
 
     # for deepgemm-like python interface
@@ -224,6 +224,9 @@ def test_blockscaled_gemm_python_interface(
     res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
     res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
     ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
+
+    # [m, n, l] * [l, 1, 1] -> [m, n, l]
+    ref = ref * alpha_tensor.cpu().unsqueeze(1).unsqueeze(1)
 
     # Convert c back to f32 for comparison.
     c_ref_device = c_ref.cuda()

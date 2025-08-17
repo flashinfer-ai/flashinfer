@@ -2556,7 +2556,8 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_tensor,
             c_tensor,
             masked_m_tensor,
-            alpha_tensor,
+            # todo(Yingyi): fix ir error by this
+            # alpha_tensor,
             self._max_active_clusters,
             current_stream,
         )
