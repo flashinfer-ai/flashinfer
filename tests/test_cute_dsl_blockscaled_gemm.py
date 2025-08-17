@@ -169,9 +169,7 @@ def test_blockscaled_gemm_python_interface(
         assumed_align=16,
     )
     alpha_tensor = (
-        torch.randn(l, dtype=torch.float32, device="cuda")
-        if fuse_alpha
-        else torch.ones(l, dtype=torch.float32, device="cuda")  # or None
+        torch.randn(l, dtype=torch.float32, device="cuda") if fuse_alpha else None
     )
 
     # for deepgemm-like python interface
@@ -221,6 +219,8 @@ def test_blockscaled_gemm_python_interface(
         torch.cuda.synchronize()
 
     # compute ref output
+    if not fuse_alpha:
+        alpha_tensor = torch.ones(l, dtype=torch.float32, device="cuda")
     res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
     res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
     ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
@@ -269,23 +269,3 @@ def test_blockscaled_gemm_python_interface(
                 atol=tolerance,
                 rtol=1e-02,
             )
-
-
-if __name__ == "__main__":
-    test_blockscaled_gemm_python_interface(
-        lm=(1, 1024),
-        kn=(7168, 4096),
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e8m0fnu",
-        sf_vec_size=16,
-        c_dtype="float16",
-        a_major="k",
-        b_major="k",
-        c_major="n",
-        fuse_alpha=False,
-        alpha_dtype="float32",
-        mma_tiler_mn=(128, 128),
-        cluster_shape_mn=(1, 1),
-        tolerance=1e-01,
-        iterations=3,
-    )

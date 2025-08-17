@@ -270,7 +270,6 @@ class MaskedScheduler:
         # cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
         #     current_work_linear_idx, loc=loc, ip=ip
         # )
-        # todo(Yingyi): confirm work_tile.tile_idx[2] is batch index?
         cur_cluster_coord = (
             current_work_linear_idx // num_tiles_n - self._accum_tile_m,
             current_work_linear_idx % num_tiles_n,
