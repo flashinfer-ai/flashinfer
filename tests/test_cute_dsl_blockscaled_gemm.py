@@ -224,9 +224,7 @@ def test_blockscaled_gemm_python_interface(
     res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
     res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
     ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
-
-    # [m, n, l] * [l, 1, 1] -> [m, n, l]
-    ref = ref * alpha_tensor.cpu().unsqueeze(1).unsqueeze(1)
+    ref = torch.einsum("mnl,l->mnl", ref, alpha_tensor.cpu())
 
     # Convert c back to f32 for comparison.
     c_ref_device = c_ref.cuda()

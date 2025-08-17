@@ -339,8 +339,6 @@ This GEMM works as follows:
     - Type convert C matrix to output type.
     - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations,
       or directly store C matrix from registers (RMEM) to global memory (GMEM) without TMA operations.
-    - Optionally accept an elementwise lambda function epilogue_op to apply to the output tensor:
-      e.g., relu can set epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
 
 SM100 tcgen05.mma.kind.block_scale instructions operate as follows:
 - Read matrix A from SMEM
@@ -636,10 +634,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         masked_m_tensor: cute.Tensor,
+        alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
-        alpha_tensor: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -664,8 +661,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
-        :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
-        :type epilogue_op: cutlass.Constexpr
         :param alpha_tensor: Optional 1D tensor of shape (l,) containing per-batch scaling factors.
         :type alpha_tensor: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
@@ -872,6 +867,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_tensor_sfb,
             tma_atom_c,
             tma_tensor_c,
+            alpha_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -881,8 +877,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
-            epilogue_op,
-            alpha_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -908,6 +902,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mSFB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
+        alpha: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -917,8 +912,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         tile_sched_params: MaskedSchedulerParams,
-        epilogue_op: cutlass.Constexpr,
-        alpha: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1620,15 +1613,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Convert to C type
                     #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                    if cutlass.const_expr(alpha is not None):
+                        acc_vec = acc_vec * alpha[work_tile.tile_idx[2]]
 
-                    # Apply alpha scaling if provided (using const_expr for compile-time conditional?)
-                    # if cutlass.const_expr(alpha is not None):
-                    #     # Get current batch index from tile scheduler
-                    #     batch_idx = work_tile.tile_idx[2]
-                    #     # Scale the output by alpha[batch_idx]
-                    #     acc_vec = acc_vec * alpha[batch_idx]
-
+                    acc_vec = acc_vec.to(self.c_dtype)
                     tRS_rC.store(acc_vec)
 
                     #
@@ -2556,8 +2544,7 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_tensor,
             c_tensor,
             masked_m_tensor,
-            # todo(Yingyi): fix ir error by this
-            # alpha_tensor,
+            alpha_tensor,
             self._max_active_clusters,
             current_stream,
         )
