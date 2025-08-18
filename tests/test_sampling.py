@@ -264,6 +264,28 @@ def test_top_k_sampling(batch_size, vocab_size, k):
             torch.arange(batch_size), samples
         ]
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    k = torch.randint(1, k + 1, (batch_size,), device="cuda:0")
+    pivot = sorted_prob[torch.arange(batch_size), k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.top_k_sampling_from_probs(normalized_prob, k)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
