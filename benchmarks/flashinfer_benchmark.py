@@ -8,6 +8,7 @@ from routines.flashinfer_benchmark_utils import (
     output_column_dict,
 )
 from routines.gemm import parse_gemm_args, run_gemm_test
+from routines.moe import parse_moe_args, run_moe_test
 
 
 def run_test(args):
@@ -23,6 +24,8 @@ def run_test(args):
         res = run_attention_test(args)
     elif args.routine in benchmark_apis["gemm"]:
         res = run_gemm_test(args)
+    elif args.routine in benchmark_apis["moe"]:
+        res = run_moe_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -60,7 +63,9 @@ def parse_args(line=sys.argv[1:]):
         "-R",
         type=str,
         required=True,
-        choices=list(benchmark_apis["attention"]) + list(benchmark_apis["gemm"]),
+        choices=list(benchmark_apis["attention"])
+        + list(benchmark_apis["gemm"])
+        + list(benchmark_apis["moe"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -117,6 +122,8 @@ def parse_args(line=sys.argv[1:]):
         args = parse_attention_args(line, parser)
     elif args.routine in benchmark_apis["gemm"]:
         args = parse_gemm_args(line, parser)
+    elif args.routine in benchmark_apis["moe"]:
+        args = parse_moe_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

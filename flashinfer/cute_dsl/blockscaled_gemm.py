@@ -338,8 +338,6 @@ This GEMM works as follows:
     - Type convert C matrix to output type.
     - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations,
       or directly store C matrix from registers (RMEM) to global memory (GMEM) without TMA operations.
-    - Optionally accept an elementwise lambda function epilogue_op to apply to the output tensor:
-      e.g., relu can set epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
 
 SM100 tcgen05.mma.kind.block_scale instructions operate as follows:
 - Read matrix A from SMEM
@@ -635,9 +633,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         masked_m_tensor: cute.Tensor,
+        alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -662,8 +660,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
-        :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
-        :type epilogue_op: cutlass.Constexpr
+        :param alpha_tensor: Optional 1D tensor of shape (l,) containing per-batch scaling factors.
+        :type alpha_tensor: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -856,7 +854,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Launch the kernel synchronously
         self.kernel(
-            masked_m_tensor,  # todo(Yingyi): cleanup?
             tiled_mma,
             tiled_mma_sfb,
             tma_atom_a,
@@ -869,6 +866,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_tensor_sfb,
             tma_atom_c,
             tma_tensor_c,
+            alpha_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -878,7 +876,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
-            epilogue_op,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -892,7 +889,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @cute.kernel
     def kernel(
         self,
-        masked_m: cute.Tensor,  # todo(Yingyi): cleanup?
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
@@ -905,6 +901,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mSFB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
+        alpha: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -914,7 +911,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         tile_sched_params: MaskedSchedulerParams,
-        epilogue_op: cutlass.Constexpr,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1616,7 +1612,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Convert to C type
                     #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                    if cutlass.const_expr(alpha is not None):
+                        acc_vec = acc_vec * alpha[work_tile.tile_idx[2]]
+
+                    acc_vec = acc_vec.to(self.c_dtype)
                     tRS_rC.store(acc_vec)
 
                     #
@@ -2447,6 +2446,7 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         masked_mptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
@@ -2522,6 +2522,16 @@ class MaskedBatchedMatmulCuteDSL:
             layout=cute.make_ordered_layout((self._l,), order=(0,)),
         )
 
+        # Use const_expr for compile-time conditional
+        alpha_tensor = (
+            cute.make_tensor(
+                alpha_ptr,
+                layout=cute.make_ordered_layout((self._l,), order=(0,)),
+            )
+            if cutlass.const_expr(alpha_ptr is not None)
+            else None
+        )
+
         Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
@@ -2533,6 +2543,7 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_tensor,
             c_tensor,
             masked_m_tensor,
+            alpha_tensor,
             self._max_active_clusters,
             current_stream,
         )
@@ -2555,6 +2566,8 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_tensor_gpu: torch.Tensor,
         masked_m_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
+        alpha_dtype: Optional[torch.dtype] = None,
+        alpha_tensor_gpu: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Tuple[int, int] = (1, 1),
@@ -2609,9 +2622,6 @@ class MaskedBatchedMatmulCuteDSL:
         self._a_major = a_major
         self._b_major = b_major
         self._c_major = c_major
-        self._ab_dtype = ab_dtype
-        self._sf_dtype = sf_dtype
-        self._c_dtype = c_dtype
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
@@ -2648,25 +2658,25 @@ class MaskedBatchedMatmulCuteDSL:
             # fp4 gemm output is not supported
             c_tensor_gpu = torch.empty(
                 (self._l, self._m, self._n),
-                dtype=dtype(self._c_dtype),
+                dtype=dtype(c_dtype),
                 device="cuda",
             )
 
         # fp4 or fp8 torch tensor to cute tensor
         a_ptr = make_ptr(
-            self._ab_dtype,
+            ab_dtype,
             a_tensor_gpu.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         b_ptr = make_ptr(
-            self._ab_dtype,
+            ab_dtype,
             b_tensor_gpu.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         c_ptr = make_ptr(
-            self._c_dtype,
+            c_dtype,
             c_tensor_gpu.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -2678,19 +2688,29 @@ class MaskedBatchedMatmulCuteDSL:
             assumed_align=16,
         )
         sfa_ptr = make_ptr(
-            self._sf_dtype,
+            sf_dtype,
             sfa_tensor_gpu.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         sfb_ptr = make_ptr(
-            self._sf_dtype,
+            sf_dtype,
             sfb_tensor_gpu.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
+        alpha_ptr = (
+            make_ptr(
+                alpha_dtype,
+                alpha_tensor_gpu.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if alpha_tensor_gpu is not None
+            else None
+        )
         # todo(Yingyi): might add cute.assume() for shape alignment?
-        current_stream = cutlass_torch.default_stream()
+        current_stream = cutlass_torch.current_stream()
 
         self.run_cute_ptr(
             a_ptr,
@@ -2699,6 +2719,7 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_ptr,
             c_ptr,
             masked_m_ptr,
+            alpha_ptr,
             current_stream,
         )
 
@@ -2718,7 +2739,7 @@ def grouped_gemm_nt_masked(
     **kwargs,
 ):
     """
-    Executes a masked, batched matrix multiplication (GEMM) with scale factors.
+    Executes a masked, batched matrix multiplication (GEMM) with scale factors and optional alpha scaling at output.
 
     Args:
         lhs (Tuple[torch.Tensor, torch.Tensor]): Tuple containing the left-hand side input tensor (A) and its scale factor tensor (SFA).
@@ -2735,14 +2756,18 @@ def grouped_gemm_nt_masked(
         sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
         mma_tiler_mn (Tuple[int, int], optional): Shape of the MMA tiler (M, N). Default: (128, 128).
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
+        alpha_dtype (str, optional): Data type for alpha scaling factors.
+        alpha (torch.Tensor, optional): Optional 1D tensor of shape (l,) containing per-batch scaling factors. Perform per-batch scaling out = alpha * out.
 
     Notes:
         - Legends of the input tensors:
             * `l` is the batch size, `m/n` is the number of rows, and `k` is the number of columns.
             * `m/n32`, `m/n4`, `k4` are constant values 32, 4, 4 respectively.
-            * `m32 * m4 * rm` should be same as `m`, `n32 * n4 * rn` should be same as `n`.
-            * `k4 * rk` should be same as `k * sf_vec_size`. `rk` is the number of rows of the scale factor tensor.
+            * `m32 * m4 * rm` should be same as `M`, which is `m` padded up to the nearest multiple of 128.
+            * `n32 * n4 * rn` should be same as `N`, which is `n` padded up to the nearest multiple of 128.
+            * `k4 * rk` should be same as `K`, which is `k / sf_vec_size` padded up to the nearest multiple of 4.
         - The function applies masking per batch using masked_m.
+        - If alpha is provided, each batch output is multiplied by its corresponding alpha value. out = alpha * (A @ B).
         - The result is written to c_tensor.
     """
 
@@ -2760,6 +2785,9 @@ def grouped_gemm_nt_masked(
 
     mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
     cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
+
+    alpha = kwargs.get("alpha")
+    alpha_dtype = kwargs.get("alpha_dtype")
 
     # TODO(kaixih@nvidia): do we need `use_cuda_graph`?
     wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
@@ -2783,4 +2811,6 @@ def grouped_gemm_nt_masked(
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=c_torch,
         masked_m_tensor_gpu=masked_m,
+        alpha_dtype=get_cutlass_dtype(alpha_dtype),
+        alpha_tensor_gpu=alpha,
     )

@@ -406,7 +406,8 @@ def get_gemm_sm100_module_cutlass_fp8():
                 module.fp8_gemm.default(
                     a,
                     b.transpose(-2, -1),
-                    scale_a * scale_b,
+                    scale_a,
+                    scale_b,
                     out,
                     workspace_buffer,
                     tactic,
