@@ -54,11 +54,10 @@ def generate_cumsum_lens(lens):
     )
 
 
-def create_query_tensor(q_lens, q_len_per_req, num_qo_heads, head_dim, q_dtype):
+def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
     q = torch.randn(
         torch.sum(q_lens).item(),
         num_qo_heads,
-        q_len_per_req,
         head_dim,
         dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
         device=GPU_DEVICE,
@@ -436,9 +435,7 @@ def test_trtllm_batch_decode(
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor(
-        q_lens, num_qo_heads, head_dim, q_dtype, q_len_per_req=q_len_per_req
-    )
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
