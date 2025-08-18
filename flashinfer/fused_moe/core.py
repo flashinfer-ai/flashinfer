@@ -1432,7 +1432,8 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            tile_tokens_dim=tile_tokens_dim,
+            # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the size itself.
+            # tile_tokens_dim=tile_tokens_dim,
         )
         tunning_config = (
             MoERunner.tuning_config_no_hidden_states_scales
