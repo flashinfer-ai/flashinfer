@@ -40,20 +40,25 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             sf_vec_size=sf_vec_size,
         )
 
-    valid_m = data['masked_m'].sum().item()
     t = bench_kineto(test_func, 'Sm100BlockScaledPersistentDenseGemmKernel', suppress_kineto_output=True)
+
+    valid_m = data['masked_m'].sum().item()
+    t_calibrated = t / valid_m * (expected_m_per_group * num_groups)
 
     tflops = 2 * valid_m * n * k / t / 1e12
     gb_per_s = (count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups) + count_bytes(data["b"])) / 1e9 / t
+
     print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
           f'{t * 1e6:4.0f} us | {tflops:4.0f} TFLOPS | {gb_per_s:4.0f} GB/s')
 
     metrics = dict(
         num_groups=num_groups,
         m_per_group=expected_m_per_group,
+        valid_m=valid_m,
         n=n,
         k=k,
-        t_us=t * 1e6,
+        t_us_raw=t * 1e6,
+        t_us_calibrated=t_calibrated * 1e6,
         tflops=tflops,
         gb_per_s=gb_per_s,
     )
