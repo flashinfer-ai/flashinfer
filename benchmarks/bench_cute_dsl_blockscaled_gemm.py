@@ -19,6 +19,15 @@ def enumerate_m_grouped_masked():
             yield dict(num_groups=num_groups, max_m=max_m, m=m, n=n, k=k)
 
 
+def create_data():
+    return dict(
+        a=(a_torch, sfa_torch),
+        b=(b_torch, sfb_torch),
+        c=c_torch,
+        masked_m=masked_m_tensor,
+    )
+
+
 if __name__ == "__main__":
     torch.manual_seed(42)
     for config in enumerate_m_grouped_masked():
