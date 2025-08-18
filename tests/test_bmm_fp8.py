@@ -21,7 +21,7 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass"])
+@pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
