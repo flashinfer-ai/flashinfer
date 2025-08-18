@@ -1,3 +1,4 @@
+import cutlass
 from flashinfer.cute_dsl.blockscaled_gemm import (
     create_scale_factor_tensor,
     grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
@@ -10,14 +11,14 @@ from flashinfer.cute_dsl.utils import (
 )
 
 
-def bench_one(num_groups, max_m, m, n, k):
+def bench_one(num_groups, max_m, expected_m_per_group, n, k):
     TODO
 
 
 # ref: DeepGEMM
 def enumerate_m_grouped_masked():
     max_m = 4096
-    for num_groups, m in (
+    for num_groups, expected_m_per_group in (
             # GB200 cases
             (6, 1024), (6, 512),
             # DeepGEMM default cases
@@ -25,10 +26,29 @@ def enumerate_m_grouped_masked():
             # TODO scan more cases
     ):
         for n, k in ((4096, 7168), (7168, 2048),):
-            yield dict(num_groups=num_groups, max_m=max_m, m=m, n=n, k=k)
+            yield dict(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
 
 
-def create_data():
+def create_data(
+        num_groups, max_m, expected_m_per_group, n, k
+):
+    l = num_groups
+    m = max_m
+
+    ab_dtype = "float4_e2m1fn"
+    sf_dtype = "float8_e4m3fn"
+    c_dtype = "bfloat16"
+    sf_vec_size = 16
+
+    # DeepGEMM case
+    a_major = "k"
+    b_major = "k"
+    c_major = "n"
+
+    a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
+    b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
+    c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
+
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
         a_ref,
         get_cutlass_dtype(ab_dtype),
