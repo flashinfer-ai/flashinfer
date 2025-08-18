@@ -1,4 +1,5 @@
 #include <cooperative_groups.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -1494,7 +1495,9 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
       QUANT, [&]() -> cudaError_t {
         if constexpr (CUDA_VERSION < 120800 && QUANT) {
-          FLASHINFER_CHECK(false, "cuda version should be greater equal than 12.8 with trtllm_moe_allreduce_fusion quant");
+          FLASHINFER_CHECK(false,
+                           "cuda version should be greater equal than 12.8 with "
+                           "trtllm_moe_allreduce_fusion quant");
           return cudaErrorNotSupported;
         }
         FLASHINFER_CUDA_CALL(

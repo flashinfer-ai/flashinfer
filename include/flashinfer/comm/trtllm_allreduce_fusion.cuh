@@ -1,4 +1,5 @@
 #include <cooperative_groups.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -959,7 +960,7 @@ class FusedOp {
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
 #endif
-    if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+        if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
