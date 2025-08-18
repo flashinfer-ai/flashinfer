@@ -1,3 +1,4 @@
+import random
 import cutlass
 from flashinfer.cute_dsl.blockscaled_gemm import (
     create_scale_factor_tensor,
@@ -95,8 +96,7 @@ def create_data(
         l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
 
-    TODO_wrong
-    masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
+    masked_m_tensor = create_masked_m(num_groups=num_groups, expected_m_per_group=expected_m_per_group, max_m=max_m)
 
     return dict(
         a=(a_torch, sfa_torch),
@@ -105,8 +105,17 @@ def create_data(
         masked_m=masked_m_tensor,
     )
 
+def create_masked_m(num_groups, expected_m_per_group, max_m):
+    """Align with DeepGEMM :: generate_m_grouped_masked"""
+    masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+    for j in range(num_groups):
+        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+    assert masked_m.amax().item() <= max_m
+    return masked_m
+
 
 if __name__ == "__main__":
     torch.manual_seed(42)
+    random.seed(42)
     for config in enumerate_m_grouped_masked():
         bench_one(**config)
