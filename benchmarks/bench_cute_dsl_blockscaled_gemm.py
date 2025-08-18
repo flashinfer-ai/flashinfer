@@ -38,6 +38,7 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             sf_dtype=sf_dtype,
             c_dtype=c_dtype,
             sf_vec_size=sf_vec_size,
+            alpha_dtype="float32",
         )
 
     t = bench_kineto(test_func, 'Sm100BlockScaledPersistentDenseGemmKernel', suppress_kineto_output=True)
