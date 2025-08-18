@@ -32,6 +32,7 @@ def enumerate_m_grouped_masked():
             yield dict(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
 
 
+# Copy and modified from test_cute_dsl_blockscaled_gemm.py, may extract common logic later if needed
 def create_data(
         num_groups, max_m, expected_m_per_group, n, k
 ):
