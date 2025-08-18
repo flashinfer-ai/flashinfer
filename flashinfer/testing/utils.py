@@ -17,7 +17,7 @@ limitations under the License.
 import math
 import random
 import time
-from typing import Tuple
+from typing import Tuple, Any
 
 import os
 import sys
@@ -820,7 +820,7 @@ def bench_kineto(
             if not using_nsys
             else None
         )
-        profiler = (
+        profiler: Any = (
             torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule
             )
@@ -867,7 +867,7 @@ def bench_kineto(
     units = {"ms": 1e3, "us": 1e6}
     kernel_times = []
     for name in kernel_names:
-        total_time = 0
+        total_time = 0.0
         total_num = 0
         for line in prof_lines:
             if name in line:
