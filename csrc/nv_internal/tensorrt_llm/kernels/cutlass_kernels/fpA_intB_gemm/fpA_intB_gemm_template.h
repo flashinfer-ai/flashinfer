@@ -55,8 +55,6 @@ void generic_mixed_gemm_kernelLauncher(
     ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha,
     OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
 #ifdef ENABLE_BF16
   static_assert(
 #ifdef ENABLE_FP8
@@ -231,7 +229,6 @@ void filter_and_run_mixed_gemm(ActivationType const* A, WeightType const* B,
                                int const group_size, tkc::CutlassGemmConfig gemm_config,
                                char* workspace, size_t workspace_bytes, cudaStream_t stream,
                                int* occupancy = nullptr) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   if constexpr (Stages > 2 && arch::kMinComputeCapability < 80) {
     // Multistage only supported on Ampere
     std::string err_msg = "Cutlass fpA_intB gemm not supported for arch " +
@@ -269,7 +266,6 @@ void dispatch_gemm_config(ActivationType const* A, WeightType const* B,
                           float const alpha, OutputType* C, int m, int n, int k,
                           int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace,
                           size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   switch (gemm_config.stages) {
     case 2:
       filter_and_run_mixed_gemm<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType,
@@ -312,8 +308,6 @@ void dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
                               int const group_size, char* workspace, size_t workspace_bytes,
                               tkc::CutlassGemmConfig gemm_config, cudaStream_t stream,
                               int* occupancy = nullptr) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
   // Don't instantiate configs that are not supported pre-hopper. Produce a sensible error instead.
   constexpr bool any_is_fp8 = is_fp8<ActivationType>() || is_fp8<WeightType>() ||
                               is_fp8<ScaleZeroType>() || is_fp8<BiasType>() || is_fp8<OutputType>();
@@ -394,7 +388,6 @@ template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuant
           typename ScaleZeroType, typename BiasType, typename OutputType>
 CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType,
                          OutputType>::CutlassFpAIntBGemmRunner() {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   int device{-1};
   tk::check_cuda_error(cudaGetDevice(&device));
   sm_ = tk::getSMVersion();
@@ -405,9 +398,7 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp,
           typename ScaleZeroType, typename BiasType, typename OutputType>
 CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType,
-                         OutputType>::~CutlassFpAIntBGemmRunner() {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
+                         OutputType>::~CutlassFpAIntBGemmRunner() {}
 
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp,
           typename ScaleZeroType, typename BiasType, typename OutputType>
@@ -423,7 +414,6 @@ void CutlassFpAIntBGemmRunner<
                                                tkc::CutlassGemmConfig gemm_config,
                                                char* workspace_ptr, const size_t workspace_bytes,
                                                cudaStream_t stream, int* occupancy) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   if (sm_ >= 75 && sm_ < 80) {
     dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType,
                              cutlass::arch::Sm75, QuantOp, EpilogueTag>(
@@ -475,7 +465,6 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
                                                 tkc::CutlassGemmConfig gemmConfig,
                                                 char* workspace_ptr, const size_t workspace_bytes,
                                                 cudaStream_t stream) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   if constexpr ((QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS) ||
                 (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY)) {
     dispatch_to_arch<tkc::EpilogueOpBias>(
@@ -498,7 +487,6 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
                                                 tkc::CutlassGemmConfig gemmConfig,
                                                 char* workspace_ptr, const size_t workspace_bytes,
                                                 cudaStream_t stream) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   gemm(A, B, weight_scales, weight_zero_points, biases, 1.f, C, m, n, k, group_size, gemmConfig,
        workspace_ptr, workspace_bytes, stream);
 }
@@ -512,8 +500,6 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
                                                 tkc::CutlassGemmConfig gemmConfig,
                                                 char* workspace_ptr, const size_t workspace_bytes,
                                                 cudaStream_t stream) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
   if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY) {
     dispatch_to_arch<tkc::EpilogueOpBias>((ActivationType const*)A, (WeightType const*)B,
                                           (ScaleZeroType const*)weight_scales, nullptr, nullptr,
@@ -533,7 +519,6 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
                                                 int k, tkc::CutlassGemmConfig gemmConfig,
                                                 char* workspace_ptr, const size_t workspace_bytes,
                                                 cudaStream_t stream) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   gemm(A, B, weight_scales, 1.f, C, m, n, k, gemmConfig, workspace_ptr, workspace_bytes, stream);
 }
 
@@ -558,7 +543,6 @@ template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuant
 size_t CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType,
                                 OutputType>::getWorkspaceSize(int const m, int const n,
                                                               int const k) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   // For Hopper, we have to allocate large memory size in case for stream-K
   if (sm_ == 90) {
     // https://github.com/NVIDIA/cutlass/blob/19b4c5e065e7e5bbc8082dfc7dbd792bdac850fc/include/cutlass/gemm/kernel/tile_scheduler_params.h#L878-L892

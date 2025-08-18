@@ -66,8 +66,6 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_generic_mixed_moe_gemm_kernelLauncher(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
   /////////////////////////////////////////////////////////////////////////////////////////////////
   /// GEMM kernel configurations
   /////////////////////////////////////////////////////////////////////////////////////////////////

@@ -69,7 +69,6 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_dispatch_mainloop_schedules(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
   switch (inputs.gemm_config.mainloop_schedule) {
     case tkc::MainloopScheduleType::COOPERATIVE:
@@ -121,7 +120,6 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_dispatch_moe_mixed_dtype_gemm_config(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   switch (inputs.gemm_config.cluster_shape) {
     case tkc::ClusterShape::ClusterShape_1x1x1:
       sm90_dispatch_mainloop_schedules<T, WeightType, GemmOutputType, EpilogueTag, CTAShape,
@@ -155,7 +153,6 @@ template <typename T, typename WeightType, typename GemmOutputType, typename Epi
 void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually
   // perform the best for mixed type gemms.
 

@@ -60,8 +60,6 @@ void sm90_generic_mixed_gemm_kernelLauncher(
     ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha,
     OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy) {
-  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
 #ifdef COMPILE_HOPPER_TMA_GEMMS
   using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
