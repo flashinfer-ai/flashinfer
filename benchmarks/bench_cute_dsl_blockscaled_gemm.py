@@ -26,7 +26,13 @@ c_major = "n"
 
 
 def bench_one(num_groups, max_m, expected_m_per_group, n, k):
-    data = create_data(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
+    data = create_data(
+        num_groups=num_groups,
+        max_m=max_m,
+        expected_m_per_group=expected_m_per_group,
+        n=n,
+        k=k,
+    )
 
     def test_func():
         grouped_gemm_nt_masked(
@@ -41,16 +47,29 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             alpha_dtype="float32",
         )
 
-    t = bench_kineto(test_func, 'Sm100BlockScaledPersistentDenseGemmKernel', suppress_kineto_output=True)
+    t = bench_kineto(
+        test_func,
+        "Sm100BlockScaledPersistentDenseGemmKernel",
+        suppress_kineto_output=True,
+    )
 
-    valid_m = data['masked_m'].sum().item()
+    valid_m = data["masked_m"].sum().item()
     t_calibrated = t / valid_m * (expected_m_per_group * num_groups)
 
     tflops = 2 * valid_m * n * k / t / 1e12
-    gb_per_s = (count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups) + count_bytes(data["b"])) / 1e9 / t
+    gb_per_s = (
+        (
+            count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups)
+            + count_bytes(data["b"])
+        )
+        / 1e9
+        / t
+    )
 
-    print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
-          f'{t * 1e6:4.0f} us | {tflops:4.0f} TFLOPS | {gb_per_s:4.0f} GB/s')
+    print(
+        f" > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): "
+        f"{t * 1e6:4.0f} us | {tflops:4.0f} TFLOPS | {gb_per_s:4.0f} GB/s"
+    )
 
     metrics = dict(
         num_groups=num_groups,
@@ -70,20 +89,30 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
 def enumerate_m_grouped_masked():
     max_m = 4096
     for num_groups, expected_m_per_group in (
-            # GB200 cases
-            (6, 1024), (6, 512),
-            # DeepGEMM default cases
-            (1, 1024), (2, 512), (4, 256),
-            # TODO scan more cases
+        # GB200 cases
+        (6, 1024),
+        (6, 512),
+        # DeepGEMM default cases
+        (1, 1024),
+        (2, 512),
+        (4, 256),
+        # TODO scan more cases
     ):
-        for n, k in ((4096, 7168), (7168, 2048),):
-            yield dict(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
+        for n, k in (
+            (4096, 7168),
+            (7168, 2048),
+        ):
+            yield dict(
+                num_groups=num_groups,
+                max_m=max_m,
+                expected_m_per_group=expected_m_per_group,
+                n=n,
+                k=k,
+            )
 
 
 # Copy and modified from test_cute_dsl_blockscaled_gemm.py, may extract common logic later if needed
-def create_data(
-        num_groups, max_m, expected_m_per_group, n, k
-):
+def create_data(num_groups, max_m, expected_m_per_group, n, k):
     l = num_groups
     m = max_m
 
@@ -137,7 +166,9 @@ def create_data(
         l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
     )
 
-    masked_m_tensor = create_masked_m(num_groups=num_groups, expected_m_per_group=expected_m_per_group, max_m=max_m)
+    masked_m_tensor = create_masked_m(
+        num_groups=num_groups, expected_m_per_group=expected_m_per_group, max_m=max_m
+    )
 
     return dict(
         a=(a_torch, sfa_torch),
@@ -146,9 +177,10 @@ def create_data(
         masked_m=masked_m_tensor,
     )
 
+
 def create_masked_m(num_groups, expected_m_per_group, max_m):
     """Align with DeepGEMM :: generate_m_grouped_masked"""
-    masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+    masked_m = torch.empty((num_groups,), device="cuda", dtype=torch.int)
     for j in range(num_groups):
         masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
     assert masked_m.amax().item() <= max_m
