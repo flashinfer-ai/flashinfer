@@ -12,12 +12,35 @@ from flashinfer.cute_dsl.utils import (
 )
 from flashinfer.testing.utils import bench_kineto, count_bytes
 
+
+ab_dtype = "float4_e2m1fn"
+sf_dtype = "float8_e4m3fn"
+c_dtype = "bfloat16"
+sf_vec_size = 16
+
+# DeepGEMM case
+a_major = "k"
+b_major = "k"
+c_major = "n"
+
+
 def bench_one(num_groups, max_m, expected_m_per_group, n, k):
     data = create_data(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
 
     def test_func():
         grouped_gemm_nt_masked(
-            TODO=TODO,
+            lhs=data["a"],
+            rhs=data["b"],
+            out=data["c"],
+            masked_m=data["masked_m"],
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            alpha=alpha_tensor,
+            alpha_dtype=alpha_dtype,
         )
 
     valid_m = data['masked_m'].sum().item()
@@ -49,16 +72,6 @@ def create_data(
 ):
     l = num_groups
     m = max_m
-
-    ab_dtype = "float4_e2m1fn"
-    sf_dtype = "float8_e4m3fn"
-    c_dtype = "bfloat16"
-    sf_vec_size = 16
-
-    # DeepGEMM case
-    a_major = "k"
-    b_major = "k"
-    c_major = "n"
 
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
