@@ -90,11 +90,11 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
 
 def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
     assert sf_start_index + m <= scale.shape[0]
-    rounded_m = utils.round_up(m, 128)
+    full_m = scale.shape[0]
     scale_n = n // block_size
     rounded_n = utils.round_up(scale_n, 4)
     # Recover the swizzled scaling factor to linear layout
-    tmp = torch.reshape(scale, (1, rounded_m // 128, rounded_n // 4, 32, 4, 4))
+    tmp = torch.reshape(scale, (1, full_m // 128, rounded_n // 4, 32, 4, 4))
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-    result = torch.reshape(tmp, (rounded_m, rounded_n)).to(torch.float32)
+    result = torch.reshape(tmp, (full_m, rounded_n)).to(torch.float32)
     return result[sf_start_index : sf_start_index + m, :scale_n]

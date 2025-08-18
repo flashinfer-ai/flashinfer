@@ -585,6 +585,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_mxfp8_act_scaling: bool = False,
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -952,6 +953,7 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1036,6 +1038,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        enable_pdl: Optional[bool] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1179,6 +1182,8 @@ def get_trtllm_moe_sm100_module():
         tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
+        enable_pdl: Optional[bool] = None,
+        output: Optional[torch.Tensor] = None,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1236,6 +1241,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input: Whether to use routing scales on input
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
 
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
@@ -1308,7 +1314,7 @@ def trtllm_fp8_block_scale_moe(
         routed_scaling_factor: Scaling factor for routing
         tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
-
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -1365,6 +1371,7 @@ def trtllm_fp4_block_scale_moe(
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
@@ -1410,7 +1417,7 @@ def trtllm_fp4_block_scale_moe(
         do_finalize (bool): Whether to finalize the output (default: False)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
-
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -1445,6 +1452,7 @@ def trtllm_fp4_block_scale_moe(
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
+        enable_pdl,
         output,
     )
 

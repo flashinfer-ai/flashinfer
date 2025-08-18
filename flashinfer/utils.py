@@ -17,7 +17,6 @@ limitations under the License.
 import functools
 import math
 import os
-import importlib.util
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -547,8 +546,24 @@ class FP4Tensor:
         """
         if data.dtype != torch.uint8:
             raise ValueError(f"data must be uint8 tensor, got {data.dtype}")
+
+        # Validate scale factor tensor and scale start index
         if scale.dtype != torch.float8_e4m3fn:
             raise ValueError(f"scale must be float8_e4m3fn tensor, got {scale.dtype}")
+        if scale.shape[0] % 128 != 0:
+            raise ValueError(
+                f"scale.shape[0] must be a multiple of 128, got {scale.shape[0]}"
+            )
+        if scale_start_index < 0 or scale_start_index >= scale.shape[0]:
+            raise ValueError(
+                f"scale start index must be in the range [0, scale.shape[0]). "
+                f"scale_start_index={scale_start_index}, scale.shape[0]={scale.shape[0]}"
+            )
+        if scale_start_index + data.shape[0] > scale.shape[0]:
+            raise ValueError(
+                f"scale start index + data.shape[0] must not exceed scale.shape[0]. "
+                f"scale_start_index={scale_start_index}, data.shape[0]={data.shape[0]}, scale.shape[0]={scale.shape[0]}"
+            )
 
         # Validate shape relationship if original_shape is provided
         if original_shape is not None:
@@ -664,10 +679,3 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
-
-
-def is_cute_dsl_available() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )
