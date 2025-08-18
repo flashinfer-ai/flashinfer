@@ -1,3 +1,4 @@
+import json
 import random
 import cutlass
 from flashinfer.cute_dsl.blockscaled_gemm import (
@@ -41,11 +42,22 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
 
     valid_m = data['masked_m'].sum().item()
     t = bench_kineto(test_func, 'Sm100BlockScaledPersistentDenseGemmKernel', suppress_kineto_output=True)
-    TODO_output_json
+
+    tflops = 2 * valid_m * n * k / t / 1e12
+    gb_per_s = (count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups) + count_bytes(data["b"])) / 1e9 / t
     print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
-          f'{t * 1e6:4.0f} us | '
-          f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
-          f'{(count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups) + count_bytes(data["b"])) / 1e9 / t:4.0f} GB/s')
+          f'{t * 1e6:4.0f} us | {tflops:4.0f} TFLOPS | {gb_per_s:4.0f} GB/s')
+
+    metrics = dict(
+        num_groups=num_groups,
+        m_per_group=expected_m_per_group,
+        n=n,
+        k=k,
+        t_us=t * 1e6,
+        tflops=tflops,
+        gb_per_s=gb_per_s,
+    )
+    print(f"MAIN_OUTPUT={json.dumps(metrics)}")
 
 
 # ref: DeepGEMM
