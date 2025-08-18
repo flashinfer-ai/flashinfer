@@ -5,7 +5,7 @@ import torch
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 
 import flashinfer
-from flashinfer.utils import FP4Tensor
+from flashinfer.utils import FP4Tensor, ceil_div, round_up
 
 DTYPE_MAP = {
     "half": torch.float16,
@@ -162,19 +162,23 @@ def create_output(q, o_dtype, create_out_tensor):
 
     if create_out_tensor:
         if o_dtype == "nvfp4":
-            fp4_out_shape = q.shape[:-1] + (math.ceil(q.shape[-1] / 2),)
+            fp4_out_shape = q.shape[:-1] + (ceil_div(q.shape[-1], 2),)
+
+            extra_size = torch.randint(0, 256, (1,)).item()
 
             fp4_out_scale_shape = (
-                math.ceil(q.shape[0] / 128) * 128,
-                math.ceil(q.shape[1] * q.shape[2] / o_sf_vec_size / 4) * 4,
+                round_up(q.shape[0] + extra_size, 128),
+                round_up(q.shape[1] * q.shape[2] // o_sf_vec_size, 4),
             )
 
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=q.device
             )
-            extra_size = fp4_out_scale_shape[0] - q.shape[0]
+            rounded_extra_size = fp4_out_scale_shape[0] - q.shape[0]
             o_sf_start_index = (
-                torch.randint(0, extra_size, (1,)).item() if extra_size > 0 else 0
+                torch.randint(0, rounded_extra_size, (1,)).item()
+                if rounded_extra_size > 0
+                else 0
             )
             out_data = torch.empty(fp4_out_shape, dtype=torch.uint8, device=q.device)
             out = FP4Tensor(out_data, out_scale_factor, o_sf_start_index)
@@ -239,6 +243,7 @@ def unpack_compare_nvfp4(
         ("fp8", "fp8", "nvfp4"),
     ],
 )
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -249,6 +254,7 @@ def test_trtllm_batch_prefill(
     q_dtype,
     o_dtype,
     kv_dtype,
+    enable_pdl,
 ):
     # Set up test parameters
     torch.manual_seed(0)
@@ -340,6 +346,7 @@ def test_trtllm_batch_prefill(
         out_dtype=DTYPE_MAP[o_dtype],
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        enable_pdl=enable_pdl,
     )
 
     if o_dtype == "nvfp4":
@@ -372,6 +379,7 @@ def test_trtllm_batch_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -399,6 +407,7 @@ def test_trtllm_batch_prefill(
         ("fp8", "fp8", "nvfp4"),
     ],
 )
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -409,6 +418,7 @@ def test_trtllm_batch_decode(
     q_dtype,
     o_dtype,
     kv_dtype,
+    enable_pdl,
 ):
     # Set up test parameters
     torch.manual_seed(0)
@@ -493,6 +503,7 @@ def test_trtllm_batch_decode(
         out_dtype=DTYPE_MAP[o_dtype],
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        enable_pdl=enable_pdl,
     )
 
     if o_dtype == "nvfp4":
@@ -525,6 +536,7 @@ def test_trtllm_batch_decode(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
+            enable_pdl=enable_pdl,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
