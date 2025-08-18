@@ -202,7 +202,8 @@ def gen_cutlass_fused_moe_module(
     Generate a JitSpec for the cutlass fused moe module.
     """
     output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/cutlass_instantiations/"
+        jit_env.FLASHINFER_CSRC_DIR
+        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
     )
 
     try:
@@ -218,7 +219,7 @@ def gen_cutlass_fused_moe_module(
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
-        "fused_moe",
+        f"fused_moe_{device_arch}",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
