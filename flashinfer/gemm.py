@@ -532,8 +532,8 @@ def get_gemm_sm100_module_cutlass_fp4():
             ),
             constraint_specs=(
                 ConstraintSpec(
-                    (a_scale_tensor_index,),
-                    (0,),
+                    a_scale_tensor_index,
+                    0,
                     lambda shapes: pad_up(shapes[a_tensor_index][0], 128),
                 ),
                 ConstraintSpec(
@@ -2006,8 +2006,8 @@ def get_trtllm_fp4_gemm_module():
             ),
             constraint_specs=(
                 ConstraintSpec(
-                    (a_scale_tensor_index,),
-                    (0,),
+                    a_scale_tensor_index,
+                    0,
                     lambda shapes: pad_up(
                         shapes[a_tensor_index][0], 8 if use_8x4_sf_layout else 128
                     ),
