@@ -7,10 +7,7 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
 )
 import torch
 import cutlass.torch as cutlass_torch
-from flashinfer.cute_dsl.utils import (
-    get_cutlass_dtype,
-    is_cute_dsl_available,
-)
+from flashinfer.cute_dsl.utils import get_cutlass_dtype
 from flashinfer.testing.utils import bench_kineto, count_bytes
 
 

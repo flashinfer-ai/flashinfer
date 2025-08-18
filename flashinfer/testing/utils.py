@@ -828,7 +828,7 @@ def bench_kineto(
             else empty_suppress()
         )
         with profiler:
-            for i in range(2):
+            for _i in range(2):
                 for _ in range(num_tests):
                     if flush_l2:
                         torch.empty(
@@ -844,7 +844,7 @@ def bench_kineto(
         return 1
 
     # Parse the profiling table
-    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
+    assert isinstance(kernel_names, (str, tuple))
     is_tuple = isinstance(kernel_names, tuple)
     prof_lines = (
         profiler.key_averages()
