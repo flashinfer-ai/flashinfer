@@ -264,6 +264,7 @@ def test_top_k_sampling(batch_size, vocab_size, k):
             torch.arange(batch_size), samples
         ]
 
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
