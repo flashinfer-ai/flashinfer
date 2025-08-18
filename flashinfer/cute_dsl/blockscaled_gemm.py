@@ -2710,7 +2710,7 @@ class MaskedBatchedMatmulCuteDSL:
             else None
         )
         # todo(Yingyi): might add cute.assume() for shape alignment?
-        current_stream = cutlass_torch.default_stream()
+        current_stream = cutlass_torch.current_stream()
 
         self.run_cute_ptr(
             a_ptr,
