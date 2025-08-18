@@ -1,4 +1,13 @@
+from flashinfer.cute_dsl.blockscaled_gemm import (
+    create_scale_factor_tensor,
+    grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
+)
 import torch
+import cutlass.torch as cutlass_torch
+from flashinfer.cute_dsl.utils import (
+    get_cutlass_dtype,
+    is_cute_dsl_available,
+)
 
 
 def bench_one(num_groups, max_m, m, n, k):
@@ -20,6 +29,55 @@ def enumerate_m_grouped_masked():
 
 
 def create_data():
+    a_tensor, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    b_tensor, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    c_tensor, c_torch = cutlass_torch.cute_tensor_like(
+        c_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    # for deepgemm-like python interface
+    if ab_dtype == "float4_e2m1fn":
+        m, k, l = a_torch.shape
+        n, k, l = b_torch.shape
+        # slice into half after flatten
+        half_len_a = a_torch.numel() // 2
+        half_len_b = b_torch.numel() // 2
+        a_torch = (
+            a_torch.permute(2, 0, 1)
+            .flatten()[:half_len_a]
+            .reshape(l, m, k // 2)
+            .permute(1, 2, 0)
+        )
+        b_torch = (
+            b_torch.permute(2, 0, 1)
+            .flatten()[:half_len_b]
+            .reshape(l, n, k // 2)
+            .permute(1, 2, 0)
+        )
+
+    sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+    )
+    sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+    )
+
+    TODO_wrong
+    masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device="cuda")
+
     return dict(
         a=(a_torch, sfa_torch),
         b=(b_torch, sfb_torch),
