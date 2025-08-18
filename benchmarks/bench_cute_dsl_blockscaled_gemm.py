@@ -15,7 +15,17 @@ from flashinfer.cute_dsl.utils import (
 def bench_one(num_groups, max_m, expected_m_per_group, n, k):
     data = create_data(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
 
-    TODO
+    def test_func():
+        grouped_gemm_nt_masked(
+            TODO=TODO,
+        )
+
+    valid_m = data['masked_m'].sum().item()
+    t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+    print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
+          f'{t * 1e6:4.0f} us | '
+          f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+          f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
 
 
 # ref: DeepGEMM
