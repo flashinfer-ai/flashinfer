@@ -115,6 +115,29 @@ def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
         return False
 
 
+def deduce_trtllm_gen_tensor_dtype(
+    x: torch.Tensor, scale: Optional[torch.Tensor]
+) -> DtypeTrtllmGen:
+    hidden_size = x.shape[-1]
+    if x.dtype == torch.uint8:  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
+        hidden_size *= 2
+    if x.dtype == torch.bfloat16:
+        dtype = DtypeTrtllmGen.Bfloat16
+    elif x.dtype == torch.float8_e4m3fn:
+        dtype = DtypeTrtllmGen.E4m3 if scale is None else DtypeTrtllmGen.MxE4m3
+    elif (
+        x.dtype == torch.uint8
+    ):  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
+        assert scale is not None, "Scale tensor must be provided for float4x2 input"
+        if scale.shape[-1] == hidden_size // 16:
+            dtype = DtypeTrtllmGen.E2m1
+        else:
+            dtype = DtypeTrtllmGen.MxE2m1
+    else:
+        raise ValueError("Unsupported trtllm-gen input tensor.")
+    return dtype
+
+
 # See MatrixLayout from include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h
 class WeightLayout(IntEnum):
     # K-major layout (default). [Mn, K]
@@ -916,27 +939,6 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
     )
-
-
-def deduce_trtllm_gen_tensor_dtype(
-    x: torch.Tensor, scale: Optional[torch.Tensor]
-) -> DtypeTrtllmGen:
-    hidden_size = x.shape[-1]
-    if x.dtype == torch.uint8:
-        hidden_size *= 2
-    if x.dtype == torch.bfloat16:
-        dtype = DtypeTrtllmGen.Bfloat16
-    elif x.dtype == torch.float8_e4m3fn:
-        dtype = DtypeTrtllmGen.E4m3 if scale is None else DtypeTrtllmGen.MxE4m3
-    elif x.dtype == torch.uint8:
-        assert scale is not None, "scale must be provided for uint8 input"
-        if scale.shape[-1] == hidden_size // 16:
-            dtype = DtypeTrtllmGen.E2m1
-        else:
-            dtype = DtypeTrtllmGen.MxE2m1
-    else:
-        raise ValueError("Unsupported trtllm-gen input tensor.")
-    return dtype
 
 
 @functools.cache
