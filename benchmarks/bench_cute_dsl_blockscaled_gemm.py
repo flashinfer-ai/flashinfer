@@ -37,10 +37,6 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             sf_dtype=sf_dtype,
             c_dtype=c_dtype,
             sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            alpha=alpha_tensor,
-            alpha_dtype=alpha_dtype,
         )
 
     valid_m = data['masked_m'].sum().item()
