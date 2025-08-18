@@ -10,7 +10,7 @@ from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     is_cute_dsl_available,
 )
-
+from flashinfer.testing.utils import bench_kineto, count_bytes
 
 def bench_one(num_groups, max_m, expected_m_per_group, n, k):
     data = create_data(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
@@ -25,7 +25,7 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
     print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
           f'{t * 1e6:4.0f} us | '
           f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
-          f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+          f'{(count_bytes(data["a"], data["c"]) * valid_m / (max_m * num_groups) + count_bytes(data["b"])) / 1e9 / t:4.0f} GB/s')
 
 
 # ref: DeepGEMM

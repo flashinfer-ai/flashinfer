@@ -855,3 +855,13 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]
 
+
+def count_bytes(*tensors):
+    total = 0
+    for t in tensors:
+        if isinstance(t, (tuple, list)):
+            total += count_bytes(*t)
+        elif t is not None:
+            total += t.numel() * t.element_size()
+    return total
+
