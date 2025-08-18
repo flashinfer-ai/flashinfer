@@ -13,6 +13,8 @@ from flashinfer.cute_dsl.utils import (
 
 
 def bench_one(num_groups, max_m, expected_m_per_group, n, k):
+    data = create_data(num_groups=num_groups, max_m=max_m, expected_m_per_group=expected_m_per_group, n=n, k=k)
+
     TODO
 
 
