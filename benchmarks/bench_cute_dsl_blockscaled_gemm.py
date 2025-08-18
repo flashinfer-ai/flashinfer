@@ -85,7 +85,7 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
 # ref: DeepGEMM
 def enumerate_m_grouped_masked():
     max_m = 4096
-    for num_groups, expected_m_per_group in (
+    for num_groups, expected_m_per_group in [
         # GB200 cases
         (6, 1024),
         (6, 512),
@@ -93,8 +93,12 @@ def enumerate_m_grouped_masked():
         (1, 1024),
         (2, 512),
         (4, 256),
-        # TODO scan more cases
-    ):
+        # more GB200 cases
+        *[
+            (TODO, TODO)
+            for TODO in TODO
+        ],
+    ]:
         for n, k in (
             (4096, 7168),
             (7168, 2048),
