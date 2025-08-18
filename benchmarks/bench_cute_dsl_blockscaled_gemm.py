@@ -21,7 +21,8 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
         )
 
     valid_m = data['masked_m'].sum().item()
-    t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+    t = bench_kineto(test_func, 'Sm100BlockScaledPersistentDenseGemmKernel', suppress_kineto_output=True)
+    TODO_output_json
     print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): '
           f'{t * 1e6:4.0f} us | '
           f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
