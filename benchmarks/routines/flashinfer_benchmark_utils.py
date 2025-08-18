@@ -10,9 +10,9 @@ output_column_dict = {
         "std_time",
         "tflops",
         "tb_per_sec",
+        "backend",
     ],
     "attention": [
-        "backend",
         "page_size",
         "batch_size",
         "s_qo",
@@ -60,6 +60,9 @@ output_column_dict = {
         "no_cuda_graph",
         "allow_output_mismatch",
         "random_seed",
+        "case_tag",
+        "generate_repro_command",
+        "repro_command",
     ],
 }
 
@@ -94,7 +97,7 @@ benchmark_apis = {
 
 
 def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
-    output_backend_width = 10
+    output_backend_width = 15
     print(
         f"[PERF] {backend.ljust(output_backend_width)[:output_backend_width]}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
     )

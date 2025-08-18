@@ -14,10 +14,10 @@ This framework provides tools to:
 - Generate detailed performance reports
 
 Currently supports testing:
-- `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
-- `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
+- `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache. Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
+- `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache. Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and `trtllm_batch_context_with_kv_cache`.
 - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
-- `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
+- `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models. Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla`.
 - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
 - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
 - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
@@ -29,7 +29,7 @@ Currently supports testing:
 
 Support surface will expand to other operations such as MLA or non-attention operations in the future.
 ## Quick Start
-
+*See samples in samples/sample_testlist.txt for more example commands.*
 ### Single Test Run
 Example commands
 ```bash
@@ -51,22 +51,6 @@ python3 flashinfer_benchmark.py \
     --causal \
     --no_cuda_graph
 
-# Test prefill attention with ragged KV cache
-python3 flashinfer_benchmark.py \
-    --routine BatchPrefillWithRaggedKVCacheWrapper \
-    --backends fa2 cudnn cutlass \
-    --batch_size 16 \
-    --s_qo 4096 \
-    --s_kv 4096 \
-    --num_qo_heads 128 \
-    --num_kv_heads 128 \
-    --head_dim_qk 192 \
-    --head_dim_vo 128 \
-    --verbose \
-    --refcheck \
-    --causal \
-    --no_cuda_graph
-
 # Test decode attention with paged KV cache
 python3 flashinfer_benchmark.py \
     --routine BatchDecodeWithPagedKVCacheWrapper \
@@ -83,28 +67,17 @@ python3 flashinfer_benchmark.py \
     --verbose \
     --refcheck
 
-# FP8 GEMM
+# FP4 GEMM
 python3 flashinfer_benchmark.py \
-    --routine gemm_fp8_nt_groupwise \
+    --routine mm_fp4 \
     --m 8192 \
     --n 4096 \
     --k 16384 \
-    --mma_sm 2 \
+    --out_dtype bfloat16 \
+    --backends cudnn cutlass trtllm \
+    --use_128x4_sf_layout \
     --refcheck \
-    -vv
-
-# Group FP8 GEMM
-python3 flashinfer_benchmark.py \
-    --routine group_gemm_fp8_nt_groupwise \
-    --m 8192 \
-    --n 4096 \
-    --k 16384 \
-    --mma_sm 2 \
-    --group_size 2 \
-    --no_cuda_graph \
-    --scale_major_mode K \
-    --refcheck \
-    -vv
+    --verbose
 
 # MOE FP4 Block Scale (DeepSeekV3 routing)
 python3 flashinfer_benchmark.py \
@@ -231,7 +204,7 @@ python3 flashinfer_benchmark.py \
 
 Run multiple tests from a file and save results:
 ```bash
-python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path sample_testlist_output.csv
+python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
 ```
 
 The output CSV will contain detailed metrics including:
@@ -256,6 +229,8 @@ The output CSV will contain detailed metrics including:
 | `--output_path`          | Path to save CSV results                                                                                   |
 | `--testlist`             | Path to a file containing a list of test cases to run in batch mode                                        |
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
+| `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
+| `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |

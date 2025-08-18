@@ -500,6 +500,11 @@ def testTrtllmFp4BlockScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -710,7 +715,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp4_block_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -753,6 +758,11 @@ def testCutlassFusedMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     # Shapes
@@ -1028,7 +1038,7 @@ def testCutlassFusedMoe(args):
         active_experts=int(selected_experts.unique().numel()),
     )
 
-    backend = f"cutlass_fused_moe_{variant}"
+    backend = "cutlass"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1076,6 +1086,11 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -1284,7 +1299,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp8_block_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1333,6 +1348,11 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -1482,7 +1502,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp8_per_tensor_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []

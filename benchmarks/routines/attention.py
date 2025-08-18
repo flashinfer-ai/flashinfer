@@ -57,7 +57,15 @@ def parse_attention_args(line, parser):
         required=False,
         nargs="+",
         default=["fa2"],
-        choices=["fa2", "fa2_tc", "fa3", "cudnn", "cutlass", "trtllm-gen"],
+        choices=[
+            "fa2",
+            "fa2_tc",
+            "fa3",
+            "cudnn",
+            "cutlass",
+            "trtllm-gen",
+            "trtllm-gen-native",
+        ],
         help="Kernel backends to test. Default: fa2",
     )
     parser.add_argument(
@@ -195,6 +203,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     # Basic setup
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
@@ -471,6 +483,17 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 batch_offsets_q=ragged_q,
                 batch_offsets_o=ragged_q,
             )
+        elif backend == "trtllm-gen-native":
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv,
+                max_seq_len=s_kv,
+                bmm1_scale=scale if k_scale is None else k_scale * scale,
+                bmm2_scale=1.0 if v_scale is None else v_scale,
+            )
         else:
             raise ValueError(f"Backend {backend} not supported")
 
@@ -585,6 +608,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
 
@@ -612,6 +636,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     # Basic setup
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
@@ -911,6 +939,21 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_offsets_q=q_indptr,
                 batch_offsets_o=q_indptr,
             )[0]
+        elif backend == "trtllm-gen-native":
+            return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv_device,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=scale if k_scale is None else k_scale * scale,
+                bmm2_scale=1.0 if v_scale is None else v_scale,
+                batch_size=batch_size,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+            )
         else:
             raise ValueError(f"Backend {backend} not supported")
 
@@ -1024,6 +1067,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
 
@@ -1051,6 +1095,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     # Basic setup
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
@@ -1410,6 +1458,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
 
@@ -1437,6 +1486,10 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     # Basic setup
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     q_init_dtype = torch.bfloat16
     kv_init_dtype = torch.bfloat16
@@ -1469,6 +1522,18 @@ def testBatchMLAPagedAttentionWrapper(args):
     causal = False  # False for MLA
     run_refcheck = args.refcheck
 
+    # Check for backend-specific constraints
+    if "fa2" in backends:
+        remove_fa2 = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] FA2 backend does not support FP8. Skipping.")
+            remove_fa2 = True
+        if remove_fa2:
+            backends.remove("fa2")
+
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -1490,17 +1555,31 @@ def testBatchMLAPagedAttentionWrapper(args):
     q_pe = torch.zeros(
         batch_size, num_qo_heads, head_dim_kpe, dtype=q_init_dtype, device="cuda"
     )
+    q = torch.cat([q_nope, q_pe], dim=2)
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q_nope.shape = }")
         print(f"[VVERBOSE] {q_pe.shape = }")
+        print(f"[VVERBOSE] {q.shape = }")
 
     # Create KV cache
     num_pages_per_seq = (s_kv + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
 
+    # Now initialize the page tables
+    block_tables = torch.tensor(
+        [
+            [k + i * num_pages_per_seq for k in range(num_pages_per_seq)]
+            for i in range(batch_size)
+        ],
+        dtype=torch.int,
+        device=device,
+    )
+
     if args.verbose >= 2:
         print(f"[VVERBOSE] {num_pages_per_seq = }")
         print(f"[VVERBOSE] {total_num_pages = }")
+        print(f"[VVERBOSE] {block_tables.shape = }")
 
     # Initialize KV cache with appropriate shape and stride
     ckv_cache_shape = (
@@ -1516,6 +1595,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         head_dim_kpe,
     )
     kpe_cache = torch.randn(size=kpe_cache_shape, dtype=q_init_dtype, device=device)
+    kv_cache = torch.cat([ckv_cache, kpe_cache], dim=2)
 
     qo_indptr = torch.arange(0, batch_size + 1, device=device).int()
     kv_indptr = (
@@ -1548,6 +1628,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
         print(f"[VVERBOSE] {kpe_cache.shape = }")
+        print(f"[VVERBOSE] {kv_cache.shape = }")
         print(f"[VVERBOSE] {qo_indptr.shape = }")
         print(f"[VVERBOSE] {kv_indptr.shape = }")
         print(f"[VVERBOSE] {kv_indices.shape = }")
@@ -1580,38 +1661,35 @@ def testBatchMLAPagedAttentionWrapper(args):
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
         )
-    if "trtllm-gen" in backends:
-        ## Input preparation for flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla
-        head_dim_ckv = head_dim_ckv
-        head_dim_kpe = head_dim_kpe
-        page_size = page_size
 
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        q = q.to(q_dtype)
         q_pe = q_pe.to(q_dtype)
         q_nope = q_nope.to(q_dtype)
+    if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        ckv_cache = ckv_cache.to(kv_dtype)
+        kpe_cache = kpe_cache.to(kv_dtype)
+        kv_cache = kv_cache.to(kv_dtype)
 
     def run_backend_wrapper(backend):
         if backend == "fa2":
             return fi_fa2_mla_wrapper.run(
                 q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
             )
-        # if backend == "trtllm-gen":
-        #     return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-        #         query = query,
-        #         kv_cache = kv_cache,
-        #         workspace_buffer = workspace_buffer,
-        #         qk_nope_head_dim = head_dim_ckv,
-        #         kv_lora_rank = head_dim_ckv,
-        #         qk_rope_head_dim = head_dim_kpe,
-        #         block_tables = kv_indices,
-        #         seq_lens = actual_seq_lens_kv,
-        #         max_seq_len = s_kv,
-        #         # out
-        #         # bmm1_scale
-        #         # bmm2_scale
-        #         # bmm1_scale_log2_tensor
-        #         # bmm2_scale_tensor
-        #     )
+        if backend == "trtllm-gen-native":
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,  # To-do: Why??
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv,
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+            ).squeeze(1)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1728,5 +1806,6 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
