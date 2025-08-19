@@ -378,7 +378,7 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 }  // namespace maths
 
-enum class FP4QuantizationSFLayout {
+enum class QuantizationSFLayout {
   // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
   // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
   // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
@@ -479,7 +479,7 @@ template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                        int colIdx, std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
-                                                       FP4QuantizationSFLayout layout) {
+                                                       QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
@@ -487,7 +487,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   // TODO: stage through smem for packed STG.32
   // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
-    if (layout == FP4QuantizationSFLayout::SWIZZLED) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
@@ -495,7 +495,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
 
       auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-    } else if (layout == FP4QuantizationSFLayout::LINEAR) {
+    } else if (layout == QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
       int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
@@ -685,7 +685,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   // todo(review): why float* scale_factor in trt-llm?
   float scale_factor;
-  FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
 
   // moe-allreduce output (non-fused)
