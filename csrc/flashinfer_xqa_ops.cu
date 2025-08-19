@@ -13,28 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- 
+
 #include "pytorch_extension_utils.h"
 
-void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads,
-    int64_t slidingWinSize,
-    double qScale, at::Tensor output,
+void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
+                 double qScale, at::Tensor output,
 #if LOW_PREC_OUTPUT
-    at::Tensor rcpOutScale,
+                 at::Tensor rcpOutScale,
 #endif
-    at::Tensor q,
-    at::Tensor attentionSinks,
-    at::Tensor pool,
-    at::Tensor kvCachePageList,
-    int64_t maxSeqLen, at::Tensor seqLen,
-    int64_t batchSize,
-    at::Tensor kvCacheScale,
+                 at::Tensor q, at::Tensor attentionSinks, at::Tensor pool,
+                 at::Tensor kvCachePageList, int64_t maxSeqLen, at::Tensor seqLen,
+                 int64_t batchSize, at::Tensor kvCacheScale,
 #if SPEC_DEC
-    int64_t qSeqLen,
-    at::Tensor qCuSeqLens,
-    at::Tensor mask,
+                 int64_t qSeqLen, at::Tensor qCuSeqLens, at::Tensor mask,
 #endif
-    at::Tensor semaphores, at::Tensor scratch);
+                 at::Tensor semaphores, at::Tensor scratch);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "XQA Wrapper"

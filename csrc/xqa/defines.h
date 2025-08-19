@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
  * property and proprietary rights in and to this material, related
@@ -99,7 +99,8 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 
 // Paged KV Cache Format
 // 0 - XQA Original
-// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for VLLM/SGLang
+// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for
+// VLLM/SGLang
 #ifdef USE_PAGED_KV_CACHE
 #ifndef PAGED_KV_CACHE_LAYOUT
 #define PAGED_KV_CACHE_LAYOUT 0
@@ -160,7 +161,8 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && USE_PAGED_KV_CACHE && BEAM_WIDTH > 1)
+#define GRP_LOAD_V \
+  (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && USE_PAGED_KV_CACHE && BEAM_WIDTH > 1)
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER
@@ -172,7 +174,7 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 #ifndef IS_SPEC_DEC_TREE
-#define IS_SPEC_DEC_TREE 1 // by default SPEC_DEC expect tree-based draft token structure
+#define IS_SPEC_DEC_TREE 1  // by default SPEC_DEC expect tree-based draft token structure
 #endif
 
 #define DBG_BATCH_SIZE 2
@@ -182,5 +184,7 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 template <int32_t elemTypeEnum>
-using ElemType = mha::conditional_t<elemTypeEnum == 0, INPUT_ELEM,
-    mha::conditional_t<elemTypeEnum == 1, int8_t, mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;
+using ElemType = mha::conditional_t<
+    elemTypeEnum == 0, INPUT_ELEM,
+    mha::conditional_t<elemTypeEnum == 1, int8_t,
+                       mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;

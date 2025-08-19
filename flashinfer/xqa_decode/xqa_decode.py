@@ -2,6 +2,7 @@ import torch
 
 from ..xqa import get_xqa_module
 
+
 def xqa_decode(
     use_fp16: bool,
     token_per_page: int,
@@ -22,22 +23,25 @@ def xqa_decode(
     batchSize: int,
     kvCacheScale: torch.Tensor,
     semaphores: torch.Tensor,
-    scratch: torch.Tensor
+    scratch: torch.Tensor,
 ) -> None:
-    xqa_module = get_xqa_module(use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window)
+    xqa_module = get_xqa_module(
+        use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
+    )
     xqa_module.xqa(
-            multiProcessorCount,
-            nbKHeads,
-            sliding_win_size if use_sliding_window else 0,
-            qScale, 
-            output,
-            q,
-            attentionSinks,
-            pool,
-            kvCachePageList,
-            maxSeqLen, 
-            seqLen,
-            batchSize,
-            kvCacheScale,
-            semaphores, 
-            scratch)
+        multiProcessorCount,
+        nbKHeads,
+        sliding_win_size if use_sliding_window else 0,
+        qScale,
+        output,
+        q,
+        attentionSinks,
+        pool,
+        kvCachePageList,
+        maxSeqLen,
+        seqLen,
+        batchSize,
+        kvCacheScale,
+        semaphores,
+        scratch,
+    )
