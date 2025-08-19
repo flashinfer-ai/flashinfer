@@ -62,31 +62,9 @@ def generate_cumsum_lens(lens):
     )
 
 
-def create_query_tensor_prefill(q_lens, num_qo_heads, head_dim, q_dtype):
+def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
     q = torch.randn(
         torch.sum(q_lens).item(),
-        num_qo_heads,
-        head_dim,
-        dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
-        device=GPU_DEVICE,
-    )
-    if q_dtype == "fp8":
-        q, q_scale = to_float8(q)
-        # Reference implementation have functional issue or low precision with fp8, use bfloat16 and fake-quantization instead.
-        ref_q = q.bfloat16() * q_scale
-    else:
-        q_scale = 1.0
-        ref_q = q
-
-    return q, q_scale, ref_q
-
-
-def create_query_tensor_decode(
-    batch_size, num_qo_heads, head_dim, q_dtype, q_len_per_req
-):
-    q = torch.randn(
-        batch_size,
-        q_len_per_req,
         num_qo_heads,
         head_dim,
         dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
@@ -299,9 +277,7 @@ def test_trtllm_batch_prefill(
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor_prefill(
-        q_lens, num_qo_heads, head_dim, q_dtype
-    )
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
@@ -466,9 +442,7 @@ def test_trtllm_batch_decode(
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor_decode(
-        batch_size, num_qo_heads, head_dim, q_dtype, q_len_per_req
-    )
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
@@ -519,7 +493,6 @@ def test_trtllm_batch_decode(
         "window_left": window_left,
     }
     wrapper_ref.plan(**plan_params)
-    ref_q = ref_q.view(batch_size * q_len_per_req, num_qo_heads, head_dim)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
     # Run trtllm-gen function call
@@ -540,6 +513,7 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        q_len_per_req=q_len_per_req,
     )
 
     if o_dtype == "nvfp4":
@@ -556,7 +530,7 @@ def test_trtllm_batch_decode(
     # convert to float32 for fp8 is not supported by assert_close
     torch.testing.assert_close(
         output.float() * o_scale,
-        output_ref.view(batch_size, q_len_per_req, num_qo_heads, head_dim).float(),
+        output_ref.float(),
         rtol=rtol,
         atol=atol,
     )
@@ -576,13 +550,17 @@ def test_trtllm_batch_decode(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            q_len_per_req=q_len_per_req,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
             torch.testing.assert_close(
-                output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
+                output.view(batch_size, q_len_per_req, num_qo_heads, head_dim).float(),
+                output_wrapper.float(),
+                rtol=1e-1,
+                atol=1e-1,
             )
 
 
@@ -590,13 +568,13 @@ if __name__ == "__main__":
     test_trtllm_batch_decode(
         kv_layout="HND",
         batch_size=4,
-        q_len_per_req=2,
+        q_len_per_req=1,
         page_size=16,
         num_kv_heads=2,
         head_grp_size=1,
         window_left=-1,
         q_dtype="half",
-        kv_dtype="fp8",
+        kv_dtype="half",
         o_dtype="half",
-        enable_pdl=None,
+        enable_pdl=True,
     )

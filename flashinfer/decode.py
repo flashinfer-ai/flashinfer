@@ -1143,6 +1143,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1180,6 +1181,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        q_len_per_req : int
+            The number of query tokens per request, if not provided, will be set to ``1``.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1206,6 +1209,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
+        if self._backend == "trtllm-gen":
+            q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
@@ -2002,12 +2007,13 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
+    q_len_per_req: Optional[int] = 1,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [batch_size, q_len_per_request, num_heads, head_dim]
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
@@ -2146,7 +2152,9 @@ def trtllm_batch_decode_with_kv_cache(
     run_func(
         out,
         out_scale_factor,
-        query,
+        query.view(
+            query.size(0) // q_len_per_req, q_len_per_req, query.size(1), query.size(2)
+        ),
         k_cache,
         v_cache,
         workspace_buffer,
