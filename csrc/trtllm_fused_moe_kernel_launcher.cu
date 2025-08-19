@@ -1132,12 +1132,13 @@ int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t co
                                        int64_t const dtype_weights_, bool const useDeepSeekFp8,
                                        int64_t const top_k, int64_t const hidden_size,
                                        int64_t const intermediate_size,
-                                       int64_t const num_local_experts, int64_t const num_tokens) {
+                                       int64_t const num_local_experts,
+                                       int64_t const gated_act_type, int64_t const num_tokens) {
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
-      tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
   return moe_runner.getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
                                                num_local_experts, num_tokens);
 }
@@ -1145,12 +1146,13 @@ int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t co
 std::vector<int64_t> trtllm_get_valid_moe_configs(
     int64_t const tile_tokens_dim, int64_t const dtype_act_, int64_t const dtype_weights_,
     bool const useDeepSeekFp8, int64_t const top_k, int64_t const hidden_size,
-    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const num_tokens) {
+    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const gated_act_type,
+    int64_t const num_tokens) {
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
-      tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
   return moe_runner.getValidConfigIndices(top_k, hidden_size, intermediate_size, num_local_experts,
                                           num_tokens);
 }

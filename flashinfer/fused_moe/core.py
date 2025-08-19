@@ -1020,6 +1020,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8: bool,
             hidden_size: int,
             intermediate_size: int,
+            gated_act_type: int,
             tile_tokens_dim: Optional[int] = None,
         ):
             self.num_experts = num_experts
@@ -1030,6 +1031,7 @@ def get_trtllm_moe_sm100_module():
             self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
+            self.gated_act_type = gated_act_type
             self.tile_tokens_dim = tile_tokens_dim
 
         def get_tile_tokens_dim(self, num_tokens: int, top_k: int):
@@ -1082,6 +1084,7 @@ def get_trtllm_moe_sm100_module():
                 self.hidden_size,
                 self.intermediate_size,
                 self.num_experts,
+                self.gated_act_type,
                 num_tokens,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
@@ -1168,6 +1171,7 @@ def get_trtllm_moe_sm100_module():
                 kwargs["routing_method_type"],
                 kwargs["enable_pdl"],
                 kwargs["do_finalize"],
+                self.gated_act_type,
                 output,
                 tactic,
             )
@@ -1449,6 +1453,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            gated_act_type=gated_act_type,
             # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the tile_tokens_dim itself.
             # however, when the user chooses a different heuristic for tile_tokens_dim, the autotuner will fail to find the correct cached tactics.
             # tile_tokens_dim=tile_tokens_dim,
