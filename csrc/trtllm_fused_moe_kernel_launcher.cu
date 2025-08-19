@@ -39,6 +39,7 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+using tensorrt_llm::kernels::trtllmgen_moe::MoE::GatedActType;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
@@ -1058,8 +1059,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
     std::optional<int64_t> n_group, std::optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts,
     std::optional<double> routed_scaling_factor, int64_t tile_tokens_dim,
-    int64_t routing_method_type, bool do_finalize, bool enable_pdl, at::Tensor& output,
-    int64_t config_index) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t gated_act_type,
+    at::Tensor& output, int64_t config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
   int const num_tokens = hidden_states.sizes()[0];
@@ -1110,7 +1111,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe(
   // Properly initialize the runner using make_unique like in the original code
   auto mRunner = std::make_unique<RunnerType>(
       mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-      tensorrt_llm::kernels::ActType::SwiGlu, /*useShuffledMatrixA*/ true);
+      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
 
   if (config_index == -1) {
     config_index = mRunner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,

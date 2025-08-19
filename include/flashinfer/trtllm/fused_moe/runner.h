@@ -117,12 +117,34 @@ class Runner {
 };
 }  // namespace Routing
 
+namespace MoE {
+// The type of gated activation function
+// Please keep this in sync with the counterpart defined in flashinfer/flashinfer/fused_moe/core.py
+enum class GatedActType : int64_t {
+  // SwiGlu
+  SwiGlu = 0,
+  // GeGlu
+  GeGlu = 1,
+};
+
+inline std::string serializeGatedActType(GatedActType gatedActType) {
+  switch (gatedActType) {
+    case GatedActType::SwiGlu:
+      return "SwiGlu";
+    case GatedActType::GeGlu:
+      return "GeGlu";
+    default:
+      return "InvalidGatedActType";  // TODO throw error
+  };
+}
+}  // namespace MoE
+
 namespace PermuteGemm1 {
 class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-                  int tileTokensDim, ActType actType, bool useShuffledMatrixA,
+                  int tileTokensDim, MoE::GatedActType gatedActType, bool useShuffledMatrixA,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -140,7 +162,7 @@ class Runner {
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
-           float* ptrBias, float* ptrSwiGluAlpha, float* ptrSwiGluBeta, float* ptrClampLimit,
+           float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
            void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
            int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
@@ -311,8 +333,8 @@ class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-         bool useDeepSeekFp8, int tileTokensDim = 8, ActType actType = ActType::SwiGlu,
-         bool useShuffledMatrixA = false,
+         bool useDeepSeekFp8, int tileTokensDim = 8,
+         GatedActType gatedActType = GatedActType::SwiGlu, bool useShuffledMatrixA = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrixA = false,

@@ -149,6 +149,15 @@ class WeightLayout(IntEnum):
     BlockMajorK = 2
 
 
+# The type of gated activation function
+# Please keep this in sync with the counterpart defined in include/flashinfer/trtllm/fused_moe/runner.h
+class GatedActType(IntEnum):
+    # SwiGlu
+    SwiGlu = 0
+    # GeGlu
+    GeGlu = 1
+
+
 def _maybe_get_cached_w3_w1_permute_indices(
     _cache_permute_indices,
     dst_w3_w1_weight: torch.Tensor,
@@ -1388,6 +1397,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
+        gated_act_type: int = 0,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 1024,
     ) -> List[torch.Tensor]:
@@ -1516,6 +1526,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             do_finalize,
             enable_pdl,
+            gated_act_type,
             output,
             tactic,
         )
@@ -1554,6 +1565,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
+        gated_act_type: int,
         output: Optional[torch.Tensor],
         tune_max_num_tokens: int,
     ):
@@ -1744,6 +1756,7 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
+    gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 1024,
 ) -> List[torch.Tensor]:
@@ -1798,10 +1811,13 @@ def trtllm_fp4_block_scale_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         do_finalize (bool): Whether to finalize the output (default: False)
+        enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        gated_act_type (int): Type of gated activation function (default: 0)
+            - 0: SwiGlu
+            - 1: GeGlu
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
-        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -1837,6 +1853,7 @@ def trtllm_fp4_block_scale_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
+        gated_act_type,
         output,
         tune_max_num_tokens,
     )
@@ -1871,6 +1888,7 @@ def trtllm_fp4_block_scale_routed_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
+    gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 1024,
 ) -> List[torch.Tensor]:
@@ -1917,6 +1935,9 @@ def trtllm_fp4_block_scale_routed_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         do_finalize (bool): Whether to finalize the output (default: False)
+        gated_act_type (int): Type of gated activation function (default: 0)
+            - 0: SwiGlu
+            - 1: GeGlu
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
@@ -1956,6 +1977,7 @@ def trtllm_fp4_block_scale_routed_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
+        gated_act_type,
         output,
         tune_max_num_tokens,
     )

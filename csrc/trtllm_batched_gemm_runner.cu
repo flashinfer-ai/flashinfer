@@ -213,8 +213,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrPerTokenSfB =
       mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
   gemmData.mInputBuffers.mPtrBias = ptrBias;
-  gemmData.mInputBuffers.mPtrSwiGluAlpha = ptrAlpha;
-  gemmData.mInputBuffers.mPtrSwiGluBeta = ptrBeta;
+  gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
+  gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
   gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
   gemmData.mInputBuffers.mPtrRouteMap = routeMap;
