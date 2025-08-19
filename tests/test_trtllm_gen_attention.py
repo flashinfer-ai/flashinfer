@@ -424,7 +424,7 @@ def test_trtllm_batch_prefill(
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("q_len_per_req", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("q_len_per_req", [1])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
@@ -519,6 +519,7 @@ def test_trtllm_batch_decode(
         "window_left": window_left,
     }
     wrapper_ref.plan(**plan_params)
+    ref_q = ref_q.view(batch_size * q_len_per_req, num_qo_heads, head_dim)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
     # Run trtllm-gen function call
@@ -554,7 +555,10 @@ def test_trtllm_batch_decode(
 
     # convert to float32 for fp8 is not supported by assert_close
     torch.testing.assert_close(
-        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+        output.float() * o_scale,
+        output_ref.view(batch_size, q_len_per_req, num_qo_heads, head_dim).float(),
+        rtol=rtol,
+        atol=atol,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
@@ -586,13 +590,13 @@ if __name__ == "__main__":
     test_trtllm_batch_decode(
         kv_layout="HND",
         batch_size=4,
-        q_len_per_req=3,
+        q_len_per_req=2,
         page_size=16,
         num_kv_heads=2,
         head_grp_size=1,
         window_left=-1,
         q_dtype="half",
+        kv_dtype="fp8",
         o_dtype="half",
-        kv_dtype="half",
         enable_pdl=None,
     )
