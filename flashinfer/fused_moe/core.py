@@ -1383,8 +1383,8 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        tune_max_num_tokens: int = 1024,
         output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 1024,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1548,8 +1548,8 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
-        tune_max_num_tokens: int,
         output: Optional[torch.Tensor],
+        tune_max_num_tokens: int,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1738,8 +1738,8 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
-    tune_max_num_tokens: int = 1024,
     output: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 1024,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1756,10 +1756,20 @@ def trtllm_fp4_block_scale_moe(
             Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
         gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
             Scale tensor of FC1 weights. Dtype must be float8.
+        gemm1_bias (Optional[torch.Tensor]): shape [num_experts, 2 * intermediate_size]
+            Tensor of FC1 biases. Dtype is float32.
+        gemm1_alpha (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu alpha. Dtype is float32.
+        gemm1_beta (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu beta. Dtype is float32.
+        gemm1_clamp_limit (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu clamp limit. Dtype is float32.
         gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
             Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
-        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size//128, intermediate_size//128]
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // (32 if mxfp4 else 16)]
             Scale tensor of FC2 weights. Dtype must be float8.
+        gemm2_bias (Optional[torch.Tensor]): shape [num_experts, hidden_size]
+            Tensor of FC2 biases. Dtype is float32.
         output1_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
             Tensor of scaling factors for first layer activation output
         output1_scale_gate_scalar (Optional[torch.Tensor]): shape [local_num_experts]
@@ -1821,8 +1831,8 @@ def trtllm_fp4_block_scale_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        tune_max_num_tokens,
         output,
+        tune_max_num_tokens,
     )
 
 
@@ -1855,8 +1865,8 @@ def trtllm_fp4_block_scale_routed_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
-    tune_max_num_tokens: int = 1024,
     output: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 1024,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1940,6 +1950,6 @@ def trtllm_fp4_block_scale_routed_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        tune_max_num_tokens,
         output,
+        tune_max_num_tokens,
     )
