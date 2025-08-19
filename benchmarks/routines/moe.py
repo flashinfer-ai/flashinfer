@@ -132,9 +132,10 @@ def parse_moe_args(line, parser):
             "deepseek_v3",
             "llama4",
             "renormalize_naive",
+            "topk",
         ],
         help=(
-            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive."
+            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | topk."
         ),
     )
     parser.add_argument(
@@ -238,6 +239,7 @@ def parse_moe_args(line, parser):
         "deepseek_v3": 2,
         "llama4": 3,
         "renormalize_naive": 4,
+        "topk": 5,
     }
     args.routing_method_type = routing_method_name_to_type[args.routing_method]
 

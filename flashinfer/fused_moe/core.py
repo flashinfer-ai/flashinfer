@@ -50,7 +50,7 @@ from .utils import (
 
 
 # The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
+# Please keep this in sync with the counterpart defined in include/flashinfer/trtllm/fused_moe/runner.h
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
     Default = (0,)
@@ -62,8 +62,10 @@ class RoutingMethodType(IntEnum):
     Llama4 = (3,)
     # Qwen3: Softmax -> TopK -> Renormalize
     RenormalizeNaive = (4,)
+    # TopK only (no softmax)
+    TopK = (5,)
     # Unspecified
-    Unspecified = 5
+    Unspecified = 6
 
 
 class DtypeTrtllmGen(IntEnum):

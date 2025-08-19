@@ -33,7 +33,7 @@ namespace Routing {
 
 // The type of method in top-K routing, for use in torch custom op
 // Please keep this in sync with the counterpart defined in
-// tensorrt_llm/_torch/modules/fused_moe/routing.py
+// flashinfer/fused_moe/core.py
 enum class RoutingMethodType : int64_t {
   // Default: Softmax -> TopK
   Default = 0,
@@ -46,8 +46,10 @@ enum class RoutingMethodType : int64_t {
   Llama4 = 3,
   // RenormalizeNaive: Softmax -> TopK -> Renormalize
   RenormalizeNaive = 4,
+  // TopK only (no softmax)
+  TopK = 5,
   // Unspecified
-  Unspecified = 5,
+  Unspecified = 6,
 };
 
 inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType) {
@@ -62,6 +64,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "Llama4";
     case RoutingMethodType::RenormalizeNaive:
       return "RenormalizeNaive";
+    case RoutingMethodType::TopK:
+      return "TopK";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };

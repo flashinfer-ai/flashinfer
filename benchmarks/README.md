@@ -45,8 +45,8 @@ python3 flashinfer_benchmark.py --routine mm_fp4 --m 8192 --n 4096 --k 16384 --o
 # MOE FP4 Block Scale (DeepSeekV3 routing)
 python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight --verbose --generate_repro_command
 
-# MOE FP4 Block Scale (renormalize routing, GeGlu gated act)
-python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routed_scaling_factor 2.5 --use_routing_bias --routing_method renormalize --use_shuffled_weight --gated_act geglu --verbose --generate_repro_command
+# MOE FP4 Block Scale (topk routing, GeGlu gated act)
+python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method topk --use_shuffled_weight --gated_act geglu --verbose --generate_repro_command
 
 # MOE FP8 Block Scale with DeepSeekV3 routing
 python3 flashinfer_benchmark.py --routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight --verbose --generate_repro_command

@@ -1176,6 +1176,21 @@ def routing_reference_renormalize_naive(expert_logits, top_k, num_experts, paddi
     return permute_info, scores
 
 
+def routing_reference_topk(expert_logits, top_k, num_experts, padding):
+    """TopK only (no softmax) routing reference."""
+    topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
+
+    new_mask = torch.zeros_like(expert_logits)
+    new_mask.scatter_(-1, topk_idx, 1)
+    scores = expert_logits * new_mask
+
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
 def check_accuracy(a, b, atol, rtol, percent):
     """Unified accuracy checking function with detailed error reporting."""
     if torch.any(torch.isnan(a)):
@@ -1813,6 +1828,20 @@ def cache_permute_indices():
         pytest.param(
             {
                 "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+            },
+            id="TopK",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
                 "top_k": 1,
                 "padding": 8,
                 "n_groups": 0,
@@ -1960,6 +1989,10 @@ def test_moe_quantization_classes(
         )
     elif routing_method_type == RoutingMethodType.RenormalizeNaive:
         permute_info, scores = routing_reference_renormalize_naive(
+            expert_logits, top_k, num_experts, padding
+        )
+    elif routing_method_type == RoutingMethodType.TopK:
+        permute_info, scores = routing_reference_topk(
             expert_logits, top_k, num_experts, padding
         )
     elif routing_method_type == RoutingMethodType.Llama4:
