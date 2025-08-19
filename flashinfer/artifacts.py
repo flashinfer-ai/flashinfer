@@ -64,7 +64,7 @@ class MetaInfoHash:
         "0d124e546c8a2e9fa59499625e8a6d140a2465573d4a3944f9d29f29f73292fb"
     )
     TRTLLM_GEN_BMM: str = (
-        "aae02e5703ee0ce696c4b3a1f2a32936fcc960dcb69fdef52b6d0f8a7b673000"
+        "a2543b8fce60bebe071df40ef349edca32cea081144a4516b0089bd1487beb2b"
     )
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
     TRTLLM_GEN_GEMM: str = (
