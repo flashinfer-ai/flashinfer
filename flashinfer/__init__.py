@@ -126,3 +126,4 @@ from .sparse import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import get_xqa_module as get_xqa_module
+from .xqa_decode import xqa_decode as xqa_decode

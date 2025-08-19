@@ -4,10 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-import flashinfer
-import flashinfer.xqa_decode.xqa_decode as xqa_decode
-
-import math
+from flashinfer import xqa_decode
 
 def set_random_seed(seed=42):
     torch.manual_seed(seed)
@@ -47,7 +44,8 @@ class CacheSeq:
                    i % self.tokens_per_page)
         return self.pool[idx_head]
 
-def ref_attention(q, k_cache_seq, v_cache_seq, seq_len, q_scale, kv_scale, x_scale, attention_sinks, valid_elems_per_head):
+def ref_attention(q, k_cache_seq, v_cache_seq, seq_len, q_scale, kv_scale, x_scale, attention_sinks, sliding_win_size, valid_elems_per_head):
+    head_grp_size = q.shape[0]
     rcp_x_scale = 1.0 / x_scale
     qk_scale = q_scale * kv_scale / math.sqrt(valid_elems_per_head)
 
@@ -63,35 +61,57 @@ def ref_attention(q, k_cache_seq, v_cache_seq, seq_len, q_scale, kv_scale, x_sca
     # q_f32: [head_grp_size, valid_elems_per_head]
     # k_cache_f32: [seq_len, valid_elems_per_head]
     # gemm0_acc: [head_grp_size, seq_len]
-    gemm0_acc = torch.matmul(q_f32, k_cache_f32.t()) * qk_scale
+    gemm0_acc = torch.zeros(head_grp_size, seq_len, dtype=torch.float32, device=q_f32.device)
+
+    # Calculate sliding window start position
+    if sliding_win_size == 0 or seq_len < sliding_win_size:
+        seq_beg = 0
+    else:
+        seq_beg = seq_len - sliding_win_size
+
+    # Set positions before sliding window to negative infinity (masking)
+    if seq_beg > 0:
+        gemm0_acc[:, :seq_beg] = float('-inf')
+
+    # q_f32: [head_grp_size, valid_elems_per_head]
+    # k_cache_f32[seq_beg:seq_len]: [valid_seq_len, valid_elems_per_head]
+    if seq_beg < seq_len:
+        valid_k_cache = k_cache_f32[seq_beg:seq_len]  # [valid_seq_len, valid_elems_per_head]
+        valid_scores = torch.matmul(q_f32, valid_k_cache.t()) * qk_scale  # [head_grp_size, valid_seq_len]
+        gemm0_acc[:, seq_beg:seq_len] = valid_scores
 
     row_max = torch.max(gemm0_acc, dim=1, keepdim=True)[0]  # [head_grp_size, 1]
     x = torch.exp(gemm0_acc - row_max)  # [head_grp_size, seq_len]
 
-    x = x * rcp_x_scale
-
     row_sum = torch.sum(x, dim=1, keepdim=True)  # [head_grp_size, 1]
 
-    sink_weights = torch.exp(attention_sinks - row_max.squeeze(-1))  # [head_grp_size]
-    row_sum.squeeze(-1)[:] += sink_weights
+    x = x * rcp_x_scale
 
-    attention_weights = x / row_sum  # [head_grp_size, seq_len]
+    if seq_beg < seq_len:
+        valid_x = x[:, seq_beg:seq_len]  # [head_grp_size, valid_seq_len]
+        valid_v_cache = v_cache_f32[seq_beg:seq_len]  # [valid_seq_len, valid_elems_per_head]
+        out = torch.matmul(valid_x, valid_v_cache)  # [head_grp_size, valid_elems_per_head]
+    else:
+        out = torch.zeros(head_grp_size, valid_elems_per_head, dtype=torch.float32, device=q_f32.device)
 
-    # attention_weights: [head_grp_size, seq_len]
-    # v_cache_f32: [seq_len, valid_elems_per_head]
-    # out: [head_grp_size, valid_elems_per_head]
-    out = torch.matmul(attention_weights, v_cache_f32) * (x_scale * kv_scale)
+    if attention_sinks is not None:
+        sink_weights = torch.exp(attention_sinks - row_max.squeeze(-1))  # [head_grp_size]
+        row_sum.squeeze(-1)[:] += sink_weights
+
+    out = out * (x_scale * kv_scale) / row_sum
 
     return out
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
-@pytest.mark.parametrize("nb_k_heads", [1, 4, 8])
-@pytest.mark.parametrize("seq_len", [2, 15, 256, 514, 1024])
-@pytest.mark.parametrize("tokens_per_page", [16, 32, 64])
+@pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("use_fp16", [True, False])
-@pytest.mark.parametrize("valid_elems_per_head", [32, 64, 128])
+@pytest.mark.parametrize("use_attention_sinks", [True, False])
+@pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("nb_k_heads", [1, 4, 8])
+@pytest.mark.parametrize("tokens_per_page", [16, 64])
+@pytest.mark.parametrize("valid_elems_per_head", [32, 128])
 @pytest.mark.parametrize("head_grp_size", [8, 16])
-def test_xqa(batch_size, nb_k_heads, seq_len, tokens_per_page, use_fp16, valid_elems_per_head, head_grp_size):
+def test_xqa(batch_size, nb_k_heads, seq_len, tokens_per_page, use_fp16, valid_elems_per_head, head_grp_size, use_attention_sinks, use_sliding_window):
     set_random_seed(42)
 
     nb_v_heads = nb_k_heads
@@ -101,10 +121,17 @@ def test_xqa(batch_size, nb_k_heads, seq_len, tokens_per_page, use_fp16, valid_e
     output.fill_(float('nan'))
     q_heads = torch.zeros(batch_size, beam_width, nb_q_heads, valid_elems_per_head, dtype=torch.bfloat16 if not use_fp16 else torch.float16, device="cuda")
     q_heads.normal_(0, 1)
-    attention_sinks = torch.zeros(nb_k_heads, head_grp_size, dtype=torch.float32, device="cuda")
-    for i in range(nb_k_heads):
-        for j in range(head_grp_size):
-            attention_sinks[i, j] = 2.0 + float(j % 4)
+    if use_attention_sinks:
+        attention_sinks = torch.zeros(nb_k_heads, head_grp_size, dtype=torch.float32, device="cuda")
+        for i in range(nb_k_heads):
+            for j in range(head_grp_size):
+                attention_sinks[i, j] = 2.0 + float(j % 4)
+    else:
+        attention_sinks = None
+    if use_sliding_window:
+        sliding_win_size = 256
+    else:
+        sliding_win_size = 0
 
     max_seq_len = round_up(seq_len, tokens_per_page)
     total_nb_cache_heads = (nb_k_heads + nb_v_heads) * max_seq_len * beam_width * batch_size
@@ -160,6 +187,8 @@ def test_xqa(batch_size, nb_k_heads, seq_len, tokens_per_page, use_fp16, valid_e
         tokens_per_page,
         valid_elems_per_head,
         head_grp_size,
+        use_sliding_window,
+        sliding_win_size,
         sm_count,
         nb_k_heads,
         q_scale,
@@ -202,7 +231,8 @@ def test_xqa(batch_size, nb_k_heads, seq_len, tokens_per_page, use_fp16, valid_e
             q_scale=q_scale,
             kv_scale=kv_cache_scale[0],
             x_scale=1.0,
-            attention_sinks=attention_sinks[idx_k_head, :],
+            attention_sinks=attention_sinks[idx_k_head, :] if use_attention_sinks else None,
+            sliding_win_size=sliding_win_size if use_sliding_window else 0,
             valid_elems_per_head=valid_elems_per_head
         )
         kernel_output = output[req][b][idx_k_head*head_grp_size:(idx_k_head+1)*head_grp_size].to(torch.float32)

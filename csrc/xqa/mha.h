@@ -126,6 +126,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
+    uint32_t slidingWinSize,
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,

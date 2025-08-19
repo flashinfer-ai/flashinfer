@@ -18,6 +18,7 @@
 #include "mha.h"
 
 void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads,
+    int64_t slidingWinSize,
     double qScale, at::Tensor output,
 #if LOW_PREC_OUTPUT
     at::Tensor rcpOutScale,
@@ -36,13 +37,16 @@ void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads,
 #endif
     at::Tensor semaphores, at::Tensor scratch) {
     auto stream = at::cuda::getCurrentCUDAStream();
+    float const* attentionSinksPtr = attentionSinks.defined() ? reinterpret_cast<float const*>(attentionSinks.data_ptr()) : nullptr;
+
     launchMHAFlashInfer(multiProcessorCount, nbKHeads,
+        slidingWinSize,
         qScale, reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
         reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
 #endif
         reinterpret_cast<InputHead const*>(q.data_ptr()),
-        reinterpret_cast<float const*>(attentionSinks.data_ptr()),
+        attentionSinksPtr,
         reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
         reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
         maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()),
