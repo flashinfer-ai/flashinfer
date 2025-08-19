@@ -36,9 +36,17 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
-def generate_seq_lens(batch_size, max_q_len, max_in_kv_len):
+def generate_seq_lens_prefill(batch_size, max_q_len, max_in_kv_len):
     q_lens = torch.randint(1, max_q_len + 1, (batch_size,), dtype=torch.int32)
     q_lens[-1] = max_q_len
+    in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
+    in_kv_lens[-1] = max_in_kv_len
+    seq_lens = q_lens + in_kv_lens
+    return q_lens, in_kv_lens, seq_lens
+
+
+def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len):
+    q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
     in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
     in_kv_lens[-1] = max_in_kv_len
     seq_lens = q_lens + in_kv_lens
@@ -54,9 +62,31 @@ def generate_cumsum_lens(lens):
     )
 
 
-def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
+def create_query_tensor_prefill(q_lens, num_qo_heads, head_dim, q_dtype):
     q = torch.randn(
         torch.sum(q_lens).item(),
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
+        device=GPU_DEVICE,
+    )
+    if q_dtype == "fp8":
+        q, q_scale = to_float8(q)
+        # Reference implementation have functional issue or low precision with fp8, use bfloat16 and fake-quantization instead.
+        ref_q = q.bfloat16() * q_scale
+    else:
+        q_scale = 1.0
+        ref_q = q
+
+    return q, q_scale, ref_q
+
+
+def create_query_tensor_decode(
+    batch_size, num_qo_heads, head_dim, q_dtype, q_len_per_req
+):
+    q = torch.randn(
+        batch_size,
+        q_len_per_req,
         num_qo_heads,
         head_dim,
         dtype=torch.bfloat16 if q_dtype == "fp8" else DTYPE_MAP[q_dtype],
@@ -264,12 +294,14 @@ def test_trtllm_batch_prefill(
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
-    q_lens, in_kv_lens, seq_lens = generate_seq_lens(
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
         batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q, q_scale, ref_q = create_query_tensor_prefill(
+        q_lens, num_qo_heads, head_dim, q_dtype
+    )
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
@@ -430,12 +462,14 @@ def test_trtllm_batch_decode(
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
-    q_lens, in_kv_lens, seq_lens = generate_seq_lens(
-        batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+        batch_size, q_len_per_req, MAX_IN_KV_LEN
     )
 
     # Create query tensor and related data
-    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q, q_scale, ref_q = create_query_tensor_decode(
+        batch_size, num_qo_heads, head_dim, q_dtype, q_len_per_req
+    )
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
@@ -547,3 +581,19 @@ def test_trtllm_batch_decode(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_decode(
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=3,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="half",
+        o_dtype="half",
+        kv_dtype="half",
+        enable_pdl=None,
+    )
