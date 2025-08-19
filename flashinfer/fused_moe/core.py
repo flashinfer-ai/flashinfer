@@ -1437,7 +1437,8 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the size itself.
+            # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the tile_tokens_dim itself.
+            # however, when the user chooses a different heuristic for tile_tokens_dim, the autotuner will fail to find the correct cached tactics.
             # tile_tokens_dim=tile_tokens_dim,
         )
         tunning_config = (

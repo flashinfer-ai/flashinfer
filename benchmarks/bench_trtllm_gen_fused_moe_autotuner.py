@@ -1,4 +1,5 @@
 import argparse
+from typing import Optional, Literal
 import torch
 import numpy as np
 from flashinfer import (
@@ -35,14 +36,15 @@ def get_tile_tokens_dim(num_tokens, num_experts, top_k):
 
 
 def bench_trtllm_gen_fused_moe_autotuner(
-    quant_mode,
-    num_tokens,
-    num_experts,
-    hidden_size,
-    intermediate_size,
-    top_k,
-    warmups,
-    iterations,
+    tune_max_num_tokens: Optional[int],
+    quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    warmups: int,
+    iterations: int,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -157,6 +159,8 @@ def bench_trtllm_gen_fused_moe_autotuner(
         1,
         True,
         enable_pdl,
+        None,
+        num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
     )
 
     def bench(do_autotune):
@@ -190,6 +194,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-tokens", type=int, default=512, help="Number of tokens")
     parser.add_argument(
+        "--tune-max-num-tokens",
+        type=int,
+        default=None,
+        help="Maximum number of tokens for tunning",
+    )
+    parser.add_argument(
         "--num-experts", type=int, default=128, help="Number of experts"
     )
     parser.add_argument("--hidden-size", type=int, default=3072, help="Hidden size")
@@ -205,6 +215,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     bench_trtllm_gen_fused_moe_autotuner(
+        args.tune_max_num_tokens,
         args.quant_mode,
         args.num_tokens,
         args.num_experts,
