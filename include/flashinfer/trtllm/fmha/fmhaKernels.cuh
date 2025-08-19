@@ -26,7 +26,7 @@
 
 #include "../../utils.cuh"
 #include "../common.h"
-#include "cubin/kernelMetaInfo.h"
+#include "flashInferMetaInfo.h"
 #include "cuda_runtime_api.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
@@ -45,16 +45,13 @@ static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when comp
 
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
-std::string getMetaInfo(const std::string& name, const std::string& sha256,
-                        const std::string& extension);
 }  // namespace flashinfer::trtllm_cubin_loader
 using flashinfer::trtllm_cubin_loader::getCubin;
-using flashinfer::trtllm_cubin_loader::getMetaInfo;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {
  public:
-  using KernelMeta = TllmGenFmhaKernelMetaInfo;
+  using KernelMeta = tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo;
   using RunnerParams = TllmGenFmhaRunnerParams;
   using SelectKernelParams = TllmGenSelectKernelParams;
 
@@ -591,23 +588,17 @@ class TllmFmhaKernelFactory {
  public:
   using KernelType = TllmGenFmhaKernel;
 
-  KernelType const* getKernels(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
+  KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
+                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
                                unsigned int sm) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
-
-    if (!metainfo_loaded) {
-      std::string metainfo_raw = getMetaInfo(tllm_gen_fmha_cubin_path + "flashInferMetaInfo",
-                                             tllm_gen_fmha_metainfo_hash, ".h");
-      metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
-      metainfo_loaded = true;
-    }
 
     auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
       KernelType* newKernel =
-          new KernelType{metainfo.data(), metainfo.size(), dtypeQ, dtypeKv, dtypeOut, sm};
+          new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
@@ -640,14 +631,13 @@ class TllmFmhaKernelFactory {
   }
 
   std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
-  std::vector<KernelType::KernelMeta> metainfo;
-  bool metainfo_loaded = false;
 };
 
 inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
                                                    Data_type dtypeOut, unsigned int sm) {
 #ifndef EXCLUDE_SM_100
-  return TllmFmhaKernelFactory::Get().getKernels(dtypeQ, dtypeKv, dtypeOut, sm);
+  return TllmFmhaKernelFactory::Get().getKernels(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
+      sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) / sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),dtypeQ, dtypeKv, dtypeOut, sm);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100
