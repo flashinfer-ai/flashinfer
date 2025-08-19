@@ -30,7 +30,7 @@ def test_single_prefill_short_seq_is_finite():
     q = torch.randn(qo_len, num_qo_heads, head_dim, device=device, dtype=torch.float16)
 
     # Use the public API documented by FlashInfer
-    # https://docs.flashinfer.ai/generated/flashinfer.decode.single_decode_with_kv_cache.html
+    # https://docs.flashinfer.ai/generated/flashinfer.prefill.single_prefill_with_kv_cache.html
     out = fi.single_prefill_with_kv_cache(q, k, v, causal=True)
 
     # Some APIs may return (out, lse); accept both
@@ -39,4 +39,6 @@ def test_single_prefill_short_seq_is_finite():
 
     assert torch.isfinite(out).all(), "Non-finite values from single_prefill_with_kv_cache on qo_len=1"
     # shape sanity: [qo_len, num_qo_heads, head_dim] for prefill
+    assert out.shape == (qo_len, num_qo_heads, head_dim)
     assert out.shape[0] == qo_len and out.shape[1] == num_qo_heads
+
