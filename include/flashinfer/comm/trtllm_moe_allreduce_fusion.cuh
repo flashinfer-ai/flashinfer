@@ -1,7 +1,11 @@
 #include <cooperative_groups.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
+#if CUDA_VERSION >= 120800
 #include <cuda_fp4.h>
+#endif
 
 #include <cuda/std/optional>
 #include <tuple>
@@ -374,7 +378,7 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 }  // namespace maths
 
-enum class FP4QuantizationSFLayout {
+enum class QuantizationSFLayout {
   // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
   // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
   // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
@@ -475,7 +479,7 @@ template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
                                                        int colIdx, std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
-                                                       FP4QuantizationSFLayout layout) {
+                                                       QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
@@ -483,7 +487,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   // TODO: stage through smem for packed STG.32
   // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
-    if (layout == FP4QuantizationSFLayout::SWIZZLED) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
@@ -491,7 +495,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
 
       auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-    } else if (layout == FP4QuantizationSFLayout::LINEAR) {
+    } else if (layout == QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
       int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
@@ -519,6 +523,7 @@ __forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c
   return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
 }
 
+#if CUDA_VERSION >= 120800
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 // NOTE:bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
@@ -658,6 +663,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   return 0;
 #endif
 }
+#endif
 }  // namespace utils
 
 template <typename T>
@@ -679,7 +685,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   // todo(review): why float* scale_factor in trt-llm?
   float scale_factor;
-  FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
   cudaStream_t stream;
 
   // moe-allreduce output (non-fused)
@@ -828,6 +834,7 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   if constexpr (NormOut) {
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
+#if CUDA_VERSION >= 120800
   if constexpr (QuantOut) {
     constexpr int SF_VEC_SIZE = 16;
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
@@ -836,6 +843,7 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
         utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }
+#endif
 }
 
 template <typename T>
@@ -1486,6 +1494,12 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
   auto status = DISPATCH_MOEFINALIZEREDUCTION(
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
       QUANT, [&]() -> cudaError_t {
+        if constexpr (CUDA_VERSION < 120800 && QUANT) {
+          FLASHINFER_CHECK(false,
+                           "cuda version should be greater equal than 12.8 with "
+                           "trtllm_moe_allreduce_fusion quant");
+          return cudaErrorNotSupported;
+        }
         FLASHINFER_CUDA_CALL(
             (moefinalize_allreduce_fusion_kernel_launcher<T, N_RANKS, RES, RMS, QUANT>(
                 (params), (launch_with_pdl))));
