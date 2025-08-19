@@ -457,7 +457,6 @@ def test_trtllm_batch_decode(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_Q_LEN = 1  # must be 1 for decode test
     MAX_IN_KV_LEN = 110
 
     # Generate random sequence lengths
