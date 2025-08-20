@@ -1496,9 +1496,10 @@ def trtllm_gen_fmha_module():
     metainfo = get_cubin(
         f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_FMHA, ".h"
     )
+
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
-    
+
     return gen_jit_spec(
         "fmha_gen",
         [

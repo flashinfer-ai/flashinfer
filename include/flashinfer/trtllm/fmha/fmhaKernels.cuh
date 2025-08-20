@@ -26,8 +26,8 @@
 
 #include "../../utils.cuh"
 #include "../common.h"
-#include "flashInferMetaInfo.h"
 #include "cuda_runtime_api.h"
+#include "flashInferMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
@@ -589,16 +589,15 @@ class TllmFmhaKernelFactory {
   using KernelType = TllmGenFmhaKernel;
 
   KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
-                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
-                               unsigned int sm) {
+                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv,
+                               Data_type dtypeOut, unsigned int sm) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
 
     auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
-      KernelType* newKernel =
-          new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+      KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
@@ -636,8 +635,11 @@ class TllmFmhaKernelFactory {
 inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
                                                    Data_type dtypeOut, unsigned int sm) {
 #ifndef EXCLUDE_SM_100
-  return TllmFmhaKernelFactory::Get().getKernels(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
-      sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) / sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),dtypeQ, dtypeKv, dtypeOut, sm);
+  return TllmFmhaKernelFactory::Get().getKernels(
+      tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
+      sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) /
+          sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),
+      dtypeQ, dtypeKv, dtypeOut, sm);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100
