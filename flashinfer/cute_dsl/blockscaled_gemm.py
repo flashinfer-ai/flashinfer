@@ -2584,13 +2584,32 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            if alpha_data_ptr is not None
+            if alpha_data_ptr is not None and alpha_dtype is not None
             else None
         )
 
         return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, alpha_ptr]
 
-    kernel = None
+    kernel = cute.compile(
+        MaskedBatchedMatmulCuteDSL(
+            m=m,
+            n=n,
+            k=k,
+            l=l,
+            a_major=a_major,
+            b_major=b_major,
+            c_major=c_major,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            alpha_dtype=alpha_dtype,
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+        ),
+        *get_cute_pointers(None),
+        cutlass_torch.current_stream(),
+    )
 
     def tensor_api(
         a_tensor_gpu: torch.Tensor,
@@ -2613,38 +2632,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         current_stream = cutlass_torch.current_stream()
 
         nonlocal kernel
-        if kernel is None:
-            kernel = cute.compile(
-                MaskedBatchedMatmulCuteDSL(
-                    m=m,
-                    n=n,
-                    k=k,
-                    l=l,
-                    a_major=a_major,
-                    b_major=b_major,
-                    c_major=c_major,
-                    ab_dtype=ab_dtype,
-                    sf_dtype=sf_dtype,
-                    c_dtype=c_dtype,
-                    alpha_dtype=alpha_dtype,
-                    sf_vec_size=sf_vec_size,
-                    mma_tiler_mn=mma_tiler_mn,
-                    cluster_shape_mn=cluster_shape_mn,
-                ),
-                *get_cute_pointers(
-                    [
-                        a_tensor_gpu,
-                        b_tensor_gpu,
-                        sfa_tensor_gpu,
-                        sfb_tensor_gpu,
-                        c_tensor_gpu,
-                        masked_m_tensor_gpu,
-                        alpha_tensor_gpu,
-                    ]
-                ),
-                current_stream,
-            )
-
         kernel(
             *get_cute_pointers(
                 [
