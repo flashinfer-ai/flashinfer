@@ -224,13 +224,19 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
-  // KV-Cache strides
-  // The stride between different keys/vals.
-  int kvStrideKeysValues;
-  // The stride between different heads.
-  int kvStrideHeads;
-  // The stride between different batches.
-  int kvStrideBatch;
+  // The stride between different keys.
+  int kStrideKeysValues;
+  // The stride between different heads for K.
+  int kStrideHeads;
+  // The stride between different batches for K.
+  int kStrideBatch;
+
+  // The stride between different values.
+  int vStrideKeysValues;
+  // The stride between different heads for V.
+  int vStrideHeads;
+  // The stride between different batches for V.
+  int vStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;

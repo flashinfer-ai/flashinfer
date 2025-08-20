@@ -3122,6 +3122,108 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+def trtllm_ragged_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    o_sf_scale: float,
+    batch_size: int,
+    window_left: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    enable_pdl: bool,
+    is_causal: bool,
+    out: Optional[torch.Tensor] = None,
+    attention_sinks: Optional[List[torch.Tensor]] = None,
+) -> torch.Tensor:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [num_tokens, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [num_tokens, num_heads, head_dim]
+    workspace_buffer : torch.Tensor
+        workspace buffer
+    seq_lens : torch.Tensor
+        sequence lengths
+    max_q_len : int
+        max query length
+    max_kv_len : int
+        max key/value length
+    bmm1_scale : float
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+    bmm2_scale : float
+        scale for bmm2, scale_v
+    o_sf_scale : float
+        scale for output
+    batch_size : int
+        batch size
+    window_left : int
+        window left
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence lengths for query
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence lengths for key/value
+    enable_pdl : bool
+        enable pdl
+    is_causal : bool
+        is causal
+    out : Optional[torch.Tensor]
+        output tensor
+    attention_sinks : Optional[List[torch.Tensor]]
+        attention sinks
+    """
+    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+    sm_count = get_device_sm_count(query.device)
+    if out is None:
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            value.shape[2],
+            device=query.device,
+            dtype=query.dtype,
+        )
+
+    run_func(
+        out,
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale,
+        batch_size,
+        window_left,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        is_causal,
+        attention_sinks,
+    )
+    return out
+
+
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
