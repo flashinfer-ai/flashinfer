@@ -23,7 +23,6 @@ from flashinfer.cute_dsl.utils import (
 )
 
 
-# todo(Yingyi): complete this test for target python interface
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
 )

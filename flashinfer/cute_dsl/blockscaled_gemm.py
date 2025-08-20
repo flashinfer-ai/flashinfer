@@ -37,6 +37,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
+import functools
 from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_ptr
@@ -48,7 +49,8 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from flashinfer.cute_dsl.utils import get_cutlass_dtype
+from .utils import get_cutlass_dtype, cutlass_to_torch_dtype
+from typing import Callable, List
 
 
 class MaskedSchedulerParams:
@@ -1394,7 +1396,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_block in range(k_block_cnt):  # noqa: B007
+                for k_block in cutlass.range_constexpr(k_block_cnt):  # noqa: B007
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(
@@ -2397,48 +2399,65 @@ def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
 
 
 class MaskedBatchedMatmulCuteDSL:
-    """
-    Use example:
-
-    wrapper = MaskedBatchedMatmulCuteDSL(False)
-    wrapper.compile(
-        m=1500, # matrix A shape
-        n=2048, # matrix B shape
-        k=2048, # matrix A/B shape
-        l=100, # batch size
-        a_major="k", # ["k", "m"]
-        b_major="k", # ["k", "n"]
-        c_major="n", # ["n", "m"]
-        ab_dtype=cutlass.Float4E2M1FN, # mxfp4, nvfp4, fp8
-        sf_dtype=cutlass.Float8E8M0FNU,
-        c_dtype=cutlass.Float16,
-        sf_vec_size=16, # default 16 if not specified
-        mma_tiler_mn=(128, 128), # default (128, 128) if not specified
-        cluster_shape_mn=(1, 1), # default (1, 1) if not specified
-    )
-    wrapper.run(
-        a_tensor_gpu,
-        b_tensor_gpu,
-        sfa_tensor_gpu,
-        sfb_tensor_gpu,
-        c_tensor_gpu,
-        masked_m_tensor_gpu,
-    )
-    """
-
     def __init__(
         self,
-        use_cuda_graph: bool = False,
+        m: int,
+        n: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        c_major: str,
+        ab_dtype: torch.dtype,
+        sf_dtype: torch.dtype,
+        c_dtype: torch.dtype,
+        alpha_dtype: torch.dtype,
+        sf_vec_size: int,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
     ):
-        """
-        Initialize the MaskedBatchedMatmulCuteDSL
-        use_cuda_graph: bool = False, whether to use cuda graph
-        """
-        self._use_cuda_graph = use_cuda_graph
-        self._compiled_masked_bmm = None
+        self._m = m
+        self._n = n
+        self._k = k
+        self._l = l
+        self._a_major = a_major
+        self._b_major = b_major
+        self._c_major = c_major
+        self._ab_dtype = ab_dtype
+        self._sf_dtype = sf_dtype
+        self._c_dtype = c_dtype
+        self._alpha_dtype = alpha_dtype
+        self._sf_vec_size = sf_vec_size
+        self._mma_tiler_mn = mma_tiler_mn
+        self._cluster_shape_mn = cluster_shape_mn
+
+        if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            c_dtype,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            m,
+            n,
+            k,
+            l,
+            a_major,
+            b_major,
+            c_major,
+        ):
+            raise TypeError(
+                f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+            )
+
+        # Compute max active clusters on current device
+        hardware_info = cutlass.utils.HardwareInfo()
+        self._max_active_clusters = hardware_info.get_max_active_clusters(
+            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
+        )
 
     @cute.jit
-    def run_cute_ptr(
+    def __call__(
         self,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
@@ -2476,8 +2495,6 @@ class MaskedBatchedMatmulCuteDSL:
             return (a + b - 1) // b
 
         sf_k = ceil_div(self._k, self._sf_vec_size)
-        # ref_shape_a = (self._l, self._m, sf_k)
-        # ref_shape_b = (self._l, self._n, sf_k)
 
         atom_m = (32, 4)
         atom_k = 4
@@ -2497,7 +2514,6 @@ class MaskedBatchedMatmulCuteDSL:
             atom_m[1],
             atom_k,
         )
-        # ref_permute_order = (1, 2, 0)
         mma_permute_order = (3, 4, 1, 5, 2, 0)
 
         sfa_tensor = cute.make_tensor(
@@ -2548,182 +2564,188 @@ class MaskedBatchedMatmulCuteDSL:
             current_stream,
         )
 
-    def run(
-        self,
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        c_major: str,
-        ab_dtype: torch.dtype,
-        sf_dtype: torch.dtype,
-        c_dtype: torch.dtype,
-        a_tensor_gpu: torch.Tensor,
-        b_tensor_gpu: torch.Tensor,
-        sfa_tensor_gpu: torch.Tensor,
-        sfb_tensor_gpu: torch.Tensor,
-        masked_m_tensor_gpu: torch.Tensor,
-        c_tensor_gpu: Optional[torch.Tensor] = None,
-        alpha_dtype: Optional[torch.dtype] = None,
-        alpha_tensor_gpu: Optional[torch.Tensor] = None,
-        sf_vec_size: int = 16,
-        mma_tiler_mn: Tuple[int, int] = (128, 128),
-        cluster_shape_mn: Tuple[int, int] = (1, 1),
-    ):
-        """
-        Run the masked batched matmul
-        m: int, # matrix A shape
-        n: int, # matrix B shape
-        k: int, # matrix A/B shape
-        l: int, # batch size
-        a_major: str, # ["k", "m"]. row major or column major
-        b_major: str, # ["k", "n"]. row major or column major
-        c_major: str, # ["n", "m"]. row major or column major
-        ab_dtype: cutlass data type of A and B. [cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, cutlass.Float8E5M2]
-        sf_dtype: data type of scale factor [cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN]
-        c_dtype: data type of C [cutlass.Float16, cutlass.BFloat16, cutlass.Float32, cutlass.Float8E4M3FN, cutlass.Float8E5M2]
-        a_tensor_gpu: torch.Tensor of shape (l, m, k), with compiled layout (row major if a_major == "k", column major if a_major == "m")
-        b_tensor_gpu: torch.Tensor of shape (l, n, k), with compiled layout (row major if b_major == "k", column major if b_major == "n")
-        sfa_tensor_gpu: torch.Tensor of shape (l, m, k/sf_vec_size), with compiled layout (row major if a_major == "k", column major if a_major == "m")
-        sfb_tensor_gpu: torch.Tensor of shape (l, n, k/sf_vec_size), with compiled layout (row major if b_major == "k", column major if b_major == "n")
-        masked_m_tensor_gpu: torch.Tensor
-        c_tensor_gpu: Optional[torch.Tensor], result torch tensor
-        sf_vec_size: vector size of scale factor, default 16. [16, 32]
-        mma_tiler_mn: (M, N) shape of MMA instruction tiler, default (128, 128)
-        cluster_shape_mn: (ClusterM, ClusterN) shape of CTA cluster, default (1, 1)
-        """
-        if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-            ab_dtype,
-            sf_dtype,
-            sf_vec_size,
-            c_dtype,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m,
-            n,
-            k,
-            l,
-            a_major,
-            b_major,
-            c_major,
-        ):
-            raise TypeError(
-                f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+
+@functools.cache
+def get_cute_dsl_compiled_masked_gemm_kernel(
+    m: int,
+    n: int,
+    k: int,
+    l: int,
+    a_major: str,
+    b_major: str,
+    c_major: str,
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    alpha_dtype: Optional[Type[cutlass.Numeric]],
+    sf_vec_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> Callable:
+    def get_cute_pointers(
+        input_tensors: Optional[List[torch.tensor]],
+    ) -> List[cute.Pointer]:
+        mock_ptr = torch.randn(16, device="cuda:0").data_ptr()
+        if input_tensors is None:
+            (
+                a_data_ptr,
+                b_data_ptr,
+                sfa_data_ptr,
+                sfb_data_ptr,
+                c_data_ptr,
+                masked_m_data_ptr,
+                alpha_data_ptr,
+            ) = [mock_ptr for _ in range(7)]
+        else:
+            (
+                a_tensor_gpu,
+                b_tensor_gpu,
+                sfa_tensor_gpu,
+                sfb_tensor_gpu,
+                c_tensor_gpu,
+                masked_m_tensor_gpu,
+                alpha_tensor_gpu,
+            ) = input_tensors
+            (
+                a_data_ptr,
+                b_data_ptr,
+                sfa_data_ptr,
+                sfb_data_ptr,
+                c_data_ptr,
+                masked_m_data_ptr,
+                alpha_data_ptr,
+            ) = (
+                a_tensor_gpu.data_ptr(),
+                b_tensor_gpu.data_ptr(),
+                sfa_tensor_gpu.data_ptr(),
+                sfb_tensor_gpu.data_ptr(),
+                c_tensor_gpu.data_ptr(),
+                masked_m_tensor_gpu.data_ptr(),
+                alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
             )
 
-        # todo(Yingyi): add cuda graph support?
-
-        self._m = m
-        self._n = n
-        self._k = k
-        self._l = l
-        self._a_major = a_major
-        self._b_major = b_major
-        self._c_major = c_major
-        self._sf_vec_size = sf_vec_size
-        self._mma_tiler_mn = mma_tiler_mn
-        self._cluster_shape_mn = cluster_shape_mn
-
-        # Compute max active clusters on current device
-        hardware_info = cutlass.utils.HardwareInfo()
-        self._max_active_clusters = hardware_info.get_max_active_clusters(
-            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
-        )
-
-        def dtype(cutlass_dtype):
-            """
-            Return the corresponding torch.dtype per the given DSL type
-            """
-            torch_dtype = getattr(torch, cutlass_dtype.__name__.lower(), None)
-
-            torch_type_map = {
-                cutlass.dtypes.TFloat32: torch.float32,
-                cutlass.dtypes.Float32: torch.float32,
-                cutlass.dtypes.Float16: torch.float16,
-                cutlass.dtypes.BFloat16: torch.bfloat16,
-                cutlass.dtypes.Float8E5M2: torch.float8_e5m2,
-                cutlass.dtypes.Float8E4M3FN: torch.float8_e4m3fn,
-                cutlass.dtypes.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
-            }
-            if torch_dtype is None:
-                torch_dtype = torch_type_map.get(cutlass_dtype)
-
-            if torch_dtype is None:
-                raise TypeError(f"{cutlass_dtype} is not supported by torch")
-            return torch_dtype
-
-        if c_tensor_gpu is None:
-            # fp4 gemm output is not supported
-            c_tensor_gpu = torch.empty(
-                (self._l, self._m, self._n),
-                dtype=dtype(c_dtype),
-                device="cuda",
-            )
-
-        # fp4 or fp8 torch tensor to cute tensor
         a_ptr = make_ptr(
             ab_dtype,
-            a_tensor_gpu.data_ptr(),
+            a_data_ptr,
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         b_ptr = make_ptr(
             ab_dtype,
-            b_tensor_gpu.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        c_ptr = make_ptr(
-            c_dtype,
-            c_tensor_gpu.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        masked_m_ptr = make_ptr(
-            cutlass.Int32,
-            masked_m_tensor_gpu.data_ptr(),
+            b_data_ptr,
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         sfa_ptr = make_ptr(
             sf_dtype,
-            sfa_tensor_gpu.data_ptr(),
+            sfa_data_ptr,
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         sfb_ptr = make_ptr(
             sf_dtype,
-            sfb_tensor_gpu.data_ptr(),
+            sfb_data_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        c_ptr = make_ptr(
+            c_dtype,
+            c_data_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        masked_m_ptr = make_ptr(
+            cutlass.Int32,
+            masked_m_data_ptr,
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         alpha_ptr = (
             make_ptr(
                 alpha_dtype,
-                alpha_tensor_gpu.data_ptr(),
+                alpha_data_ptr,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            if alpha_tensor_gpu is not None
+            if alpha_data_ptr is not None
             else None
         )
-        # todo(Yingyi): might add cute.assume() for shape alignment?
+
+        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, alpha_ptr]
+
+    kernel = None
+
+    def tensor_api(
+        a_tensor_gpu: torch.Tensor,
+        b_tensor_gpu: torch.Tensor,
+        sfa_tensor_gpu: torch.Tensor,
+        sfb_tensor_gpu: torch.Tensor,
+        masked_m_tensor_gpu: torch.Tensor,
+        c_tensor_gpu: Optional[torch.Tensor] = None,
+        alpha_tensor_gpu: Optional[torch.Tensor] = None,
+    ):
+        if c_tensor_gpu is None:
+            # fp4 gemm output is not supported
+            c_tensor_gpu = torch.empty(
+                (l, m, n),
+                dtype=cutlass_to_torch_dtype(c_dtype),
+                device="cuda",
+            )
+
+        # fp4 or fp8 torch tensor to cute tensor
         current_stream = cutlass_torch.current_stream()
 
-        self.run_cute_ptr(
-            a_ptr,
-            b_ptr,
-            sfa_ptr,
-            sfb_ptr,
-            c_ptr,
-            masked_m_ptr,
-            alpha_ptr,
+        nonlocal kernel
+        if kernel is None:
+            kernel = cute.compile(
+                MaskedBatchedMatmulCuteDSL(
+                    m=m,
+                    n=n,
+                    k=k,
+                    l=l,
+                    a_major=a_major,
+                    b_major=b_major,
+                    c_major=c_major,
+                    ab_dtype=ab_dtype,
+                    sf_dtype=sf_dtype,
+                    c_dtype=c_dtype,
+                    alpha_dtype=alpha_dtype,
+                    sf_vec_size=sf_vec_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                ),
+                *get_cute_pointers(
+                    [
+                        a_tensor_gpu,
+                        b_tensor_gpu,
+                        sfa_tensor_gpu,
+                        sfb_tensor_gpu,
+                        c_tensor_gpu,
+                        masked_m_tensor_gpu,
+                        alpha_tensor_gpu,
+                    ]
+                ),
+                current_stream,
+            )
+
+        kernel(
+            *get_cute_pointers(
+                [
+                    a_tensor_gpu,
+                    b_tensor_gpu,
+                    sfa_tensor_gpu,
+                    sfb_tensor_gpu,
+                    c_tensor_gpu,
+                    masked_m_tensor_gpu,
+                    alpha_tensor_gpu,
+                ]
+            ),
             current_stream,
         )
 
         return c_tensor_gpu
+
+    return tensor_api
 
 
 def grouped_gemm_nt_masked(
@@ -2789,9 +2811,7 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")
 
-    # TODO(kaixih@nvidia): do we need `use_cuda_graph`?
-    wrapper = MaskedBatchedMatmulCuteDSL(use_cuda_graph=False)
-    wrapper.run(
+    return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
         n=n,
         k=k,
@@ -2801,16 +2821,17 @@ def grouped_gemm_nt_masked(
         c_major="n",
         ab_dtype=get_cutlass_dtype(ab_dtype),
         sf_dtype=get_cutlass_dtype(sf_dtype),
-        sf_vec_size=sf_vec_size,
         c_dtype=get_cutlass_dtype(c_dtype),
+        alpha_dtype=get_cutlass_dtype(alpha_dtype),
+        sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+    )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
         sfa_tensor_gpu=sfa_torch,
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=c_torch,
         masked_m_tensor_gpu=masked_m,
-        alpha_dtype=get_cutlass_dtype(alpha_dtype),
         alpha_tensor_gpu=alpha,
     )
