@@ -734,9 +734,15 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
+        cur_res["use_routing_bias"] = args.use_routing_bias
+        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         res.append(cur_res)
@@ -1061,6 +1067,13 @@ def testCutlassFusedMoe(args):
         cur_res["use_routing_scales_on_input"] = False
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = input_dtype
+        # CUTLASS fused MoE specific
+        cur_res["cutlass_variant"] = variant
+        cur_res["quantized_input"] = args.quantized_input
+        cur_res["tp_size"] = tp_size
+        cur_res["tp_rank"] = tp_rank
+        cur_res["ep_size"] = ep_size
+        cur_res["ep_rank"] = ep_rank
         res.append(cur_res)
 
     return res
@@ -1318,9 +1331,15 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
+        cur_res["use_routing_bias"] = args.use_routing_bias
+        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         res.append(cur_res)
@@ -1521,7 +1540,12 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
+        cur_res["use_routing_bias"] = args.use_routing_bias
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype

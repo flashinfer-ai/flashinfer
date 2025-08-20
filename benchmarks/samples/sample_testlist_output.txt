@@ -1,4 +1,4 @@
-$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
+$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path ./samples/sample_testlist_output.csv
 [INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'cudnn', 'trtllm-gen', 'trtllm-gen-native'], page_size=16, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithPagedKVCacheWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -19,10 +19,10 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] kv_indices.shape = torch.Size([335])
 [VVERBOSE] kv_last_page_len.shape = torch.Size([16])
 [VVERBOSE] scale = 0.08838834764831843
-[PERF] fa2            :: median time 0.199 ms; std 0.002 ms; achieved tflops 218.431 TFLOPs/sec; achieved tb_per_sec 0.973 TB/sec
-[PERF] cudnn          :: median time 0.162 ms; std 0.002 ms; achieved tflops 268.360 TFLOPs/sec; achieved tb_per_sec 1.195 TB/sec
-[PERF] trtllm-gen     :: median time 0.287 ms; std 0.002 ms; achieved tflops 151.376 TFLOPs/sec; achieved tb_per_sec 0.674 TB/sec
-[PERF] trtllm-gen-nati:: median time 0.221 ms; std 0.004 ms; achieved tflops 196.184 TFLOPs/sec; achieved tb_per_sec 0.874 TB/sec
+[PERF] fa2            :: median time 0.199 ms; std 0.002 ms; achieved tflops 218.449 TFLOPs/sec; achieved tb_per_sec 0.973 TB/sec
+[PERF] cudnn          :: median time 0.161 ms; std 0.002 ms; achieved tflops 269.828 TFLOPs/sec; achieved tb_per_sec 1.202 TB/sec
+[PERF] trtllm-gen     :: median time 0.287 ms; std 0.002 ms; achieved tflops 151.333 TFLOPs/sec; achieved tb_per_sec 0.674 TB/sec
+[PERF] trtllm-gen-nati:: median time 0.221 ms; std 0.005 ms; achieved tflops 196.155 TFLOPs/sec; achieved tb_per_sec 0.874 TB/sec
 [INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'cutlass', 'cudnn'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -37,9 +37,9 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] qo_indptr.shape = torch.Size([17])
 [VVERBOSE] kv_indptr.shape = torch.Size([17])
 [VVERBOSE] scale = 0.07216878364870323
-[PERF] fa2            :: median time 0.626 ms; std 0.044 ms; achieved tflops 173.342 TFLOPs/sec; achieved tb_per_sec 1.372 TB/sec
-[PERF] cutlass        :: median time 0.658 ms; std 0.042 ms; achieved tflops 164.758 TFLOPs/sec; achieved tb_per_sec 1.304 TB/sec
-[PERF] cudnn          :: median time 0.416 ms; std 0.040 ms; achieved tflops 260.954 TFLOPs/sec; achieved tb_per_sec 2.066 TB/sec
+[PERF] fa2            :: median time 0.624 ms; std 0.048 ms; achieved tflops 173.974 TFLOPs/sec; achieved tb_per_sec 1.377 TB/sec
+[PERF] cutlass        :: median time 0.659 ms; std 0.042 ms; achieved tflops 164.522 TFLOPs/sec; achieved tb_per_sec 1.303 TB/sec
+[PERF] cudnn          :: median time 0.401 ms; std 0.029 ms; achieved tflops 270.253 TFLOPs/sec; achieved tb_per_sec 2.140 TB/sec
 [INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'cudnn', 'trtllm-gen', 'trtllm-gen-native'], page_size=16, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchDecodeWithPagedKVCacheWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -58,11 +58,11 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] kv_indices.shape = torch.Size([509])
 [VVERBOSE] kv_last_page_len.shape = torch.Size([16])
 [VVERBOSE] scale = 0.08838834764831843
-[PERF] fa2            :: median time 0.051 ms; std 0.000 ms; achieved tflops 5.187 TFLOPs/sec; achieved tb_per_sec 0.659 TB/sec
-[PERF] fa2_tc         :: median time 0.016 ms; std 0.000 ms; achieved tflops 16.288 TFLOPs/sec; achieved tb_per_sec 2.068 TB/sec
-[PERF] cudnn          :: median time 0.012 ms; std 0.000 ms; achieved tflops 21.386 TFLOPs/sec; achieved tb_per_sec 2.716 TB/sec
+[PERF] fa2            :: median time 0.051 ms; std 0.000 ms; achieved tflops 5.188 TFLOPs/sec; achieved tb_per_sec 0.659 TB/sec
+[PERF] fa2_tc         :: median time 0.016 ms; std 0.000 ms; achieved tflops 16.257 TFLOPs/sec; achieved tb_per_sec 2.065 TB/sec
+[PERF] cudnn          :: median time 0.012 ms; std 0.000 ms; achieved tflops 21.394 TFLOPs/sec; achieved tb_per_sec 2.717 TB/sec
 [PERF] trtllm-gen     :: median time 0.010 ms; std 0.000 ms; achieved tflops 26.206 TFLOPs/sec; achieved tb_per_sec 3.328 TB/sec
-[PERF] trtllm-gen-nati:: median time 0.010 ms; std 0.000 ms; achieved tflops 25.940 TFLOPs/sec; achieved tb_per_sec 3.294 TB/sec
+[PERF] trtllm-gen-nati:: median time 0.010 ms; std 0.000 ms; achieved tflops 25.942 TFLOPs/sec; achieved tb_per_sec 3.294 TB/sec
 [INFO] args = Namespace(routine='BatchMLAPagedAttentionWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'trtllm-gen-native'], page_size=32, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=None, head_dim_vo=None, head_dim_ckv=512, head_dim_kpe=64, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchMLAPagedAttentionWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -87,7 +87,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] sm_scale = 0.041666666666666664
 [VVERBOSE] workspace_buffer.shape = torch.Size([134217728])
 [PERF] fa2            :: median time 0.041 ms; std 0.000 ms; achieved tflops 54.584 TFLOPs/sec; achieved tb_per_sec 0.570 TB/sec
-[PERF] trtllm-gen-nati:: median time 0.032 ms; std 0.001 ms; achieved tflops 69.141 TFLOPs/sec; achieved tb_per_sec 0.722 TB/sec
+[PERF] trtllm-gen-nati:: median time 0.033 ms; std 0.001 ms; achieved tflops 68.363 TFLOPs/sec; achieved tb_per_sec 0.713 TB/sec
 [INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'cudnn', 'trtllm-gen', 'trtllm-gen-native'], page_size=16, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='fp8_e4m3', kv_dtype='fp8_e4m3', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithPagedKVCacheWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -111,7 +111,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] kv_indices.shape = torch.Size([335])
 [VVERBOSE] kv_last_page_len.shape = torch.Size([16])
 [VVERBOSE] scale = 0.08838834764831843
-[PERF] trtllm-gen-nati:: median time 0.217 ms; std 0.002 ms; achieved tflops 199.885 TFLOPs/sec; achieved tb_per_sec 0.445 TB/sec
+[PERF] trtllm-gen-nati:: median time 0.217 ms; std 0.002 ms; achieved tflops 199.915 TFLOPs/sec; achieved tb_per_sec 0.445 TB/sec
 [INFO] args = Namespace(routine='BatchMLAPagedAttentionWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1-1k', generate_repro_command=True, repro_command='', backends=['fa2', 'trtllm-gen-native'], page_size=32, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=None, head_dim_vo=None, head_dim_ckv=512, head_dim_kpe=64, q_dtype='fp8_e4m3', kv_dtype='fp8_e4m3', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchMLAPagedAttentionWrapper
 [INFO] FlashInfer version: 0.2.12
@@ -136,7 +136,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] actual_seq_lens_kv.shape = torch.Size([16, 1, 1, 1])
 [VVERBOSE] sm_scale = 0.041666666666666664
 [VVERBOSE] workspace_buffer.shape = torch.Size([134217728])
-[PERF] trtllm-gen-nati:: median time 0.022 ms; std 0.001 ms; achieved tflops 99.739 TFLOPs/sec; achieved tb_per_sec 0.520 TB/sec
+[PERF] trtllm-gen-nati:: median time 0.022 ms; std 0.001 ms; achieved tflops 100.384 TFLOPs/sec; achieved tb_per_sec 0.524 TB/sec
 [INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='gemm_fp8_nt_groupwise_sample', generate_repro_command=True, repro_command='', batch_size=1, m=8192, n=4096, k=16384, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=2, backends=['cutlass', 'trtllm'], use_128x4_sf_layout=False)
 [INFO] Running testGemmFp8NtGroupwise
 [INFO] FlashInfer version: 0.2.12
@@ -149,7 +149,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] b_fp8.shape = torch.Size([4096, 16384])
 [VVERBOSE] a_scale.shape = torch.Size([128, 8192])
 [VVERBOSE] b_scale.shape = torch.Size([128, 32])
-[PERF] cutlass        :: median time 0.656 ms; std 0.033 ms; achieved tflops 1675.104 TFLOPs/sec; achieved tb_per_sec 0.409 TB/sec
+[PERF] cutlass        :: median time 0.583 ms; std 0.040 ms; achieved tflops 1887.068 TFLOPs/sec; achieved tb_per_sec 0.461 TB/sec
 [INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='group_gemm_fp8_nt_groupwise_sample', generate_repro_command=True, repro_command='', batch_size=1, m=8192, n=4096, k=16384, tile_size=128, group_size=2, scale_major_mode='K', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=2, backends=['cudnn'], use_128x4_sf_layout=False)
 [INFO] Running testGroupGemmFp8NtGroupwise
 [INFO] FlashInfer version: 0.2.12
@@ -162,7 +162,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] a_scale.shape = torch.Size([16384, 128])
 [VVERBOSE] b_scale.shape = torch.Size([2, 32, 128])
 [VVERBOSE] m_indptr.shape = torch.Size([3])
-[PERF] cutlass        :: median time 1.422 ms; std 0.021 ms; achieved tflops 1546.534 TFLOPs/sec; achieved tb_per_sec 0.378 TB/sec
+[PERF] cutlass        :: median time 1.424 ms; std 0.020 ms; achieved tflops 1544.796 TFLOPs/sec; achieved tb_per_sec 0.377 TB/sec
 [INFO] args = Namespace(routine='bmm_fp8', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='bmm_fp8_sample', generate_repro_command=True, repro_command='', batch_size=1, m=8192, n=4096, k=16384, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cublas', 'cutlass'], use_128x4_sf_layout=False)
 [INFO] Running testBmmFp8
 [INFO] FlashInfer version: 0.2.12
@@ -176,9 +176,9 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] input_inv_s.dtype = torch.float32
 [VVERBOSE] mat2_inv_s = tensor(0.0127, device='cuda:0')
 [VVERBOSE] mat2_inv_s.dtype = torch.float32
-[PERF] cudnn          :: median time 0.390 ms; std 0.021 ms; achieved tflops 2818.977 TFLOPs/sec; achieved tb_per_sec 0.688 TB/sec
-[PERF] cublas         :: median time 0.390 ms; std 0.024 ms; achieved tflops 2818.636 TFLOPs/sec; achieved tb_per_sec 0.688 TB/sec
-[PERF] cutlass        :: median time 0.787 ms; std 0.047 ms; achieved tflops 1397.766 TFLOPs/sec; achieved tb_per_sec 0.341 TB/sec
+[PERF] cudnn          :: median time 0.390 ms; std 0.020 ms; achieved tflops 2819.342 TFLOPs/sec; achieved tb_per_sec 0.688 TB/sec
+[PERF] cublas         :: median time 0.390 ms; std 0.027 ms; achieved tflops 2820.707 TFLOPs/sec; achieved tb_per_sec 0.689 TB/sec
+[PERF] cutlass        :: median time 0.788 ms; std 0.052 ms; achieved tflops 1395.403 TFLOPs/sec; achieved tb_per_sec 0.341 TB/sec
 [INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mm_fp4_sample', generate_repro_command=True, repro_command='', batch_size=1, m=8192, n=4096, k=16384, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True)
 [INFO] Running testMmFp4
 [INFO] FlashInfer version: 0.2.12
@@ -188,9 +188,9 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] input_fp4.dtype = torch.uint8
 [VVERBOSE] mat2_fp4.shape = torch.Size([4096, 8192])
 [VVERBOSE] mat2_fp4.dtype = torch.uint8
-[PERF] cudnn          :: median time 0.233 ms; std 0.019 ms; achieved tflops 4727.570 TFLOPs/sec; achieved tb_per_sec 0.721 TB/sec
-[PERF] cutlass        :: median time 0.207 ms; std 0.011 ms; achieved tflops 5306.401 TFLOPs/sec; achieved tb_per_sec 0.810 TB/sec
-[PERF] trtllm         :: median time 0.444 ms; std 0.001 ms; achieved tflops 2475.249 TFLOPs/sec; achieved tb_per_sec 0.378 TB/sec
+[PERF] cudnn          :: median time 0.233 ms; std 0.030 ms; achieved tflops 4728.057 TFLOPs/sec; achieved tb_per_sec 0.721 TB/sec
+[PERF] cutlass        :: median time 0.207 ms; std 0.007 ms; achieved tflops 5310.460 TFLOPs/sec; achieved tb_per_sec 0.810 TB/sec
+[PERF] trtllm         :: median time 0.444 ms; std 0.001 ms; achieved tflops 2476.471 TFLOPs/sec; achieved tb_per_sec 0.378 TB/sec
 [INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=256, top_k=8, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2)
 [INFO] Running testTrtllmFp4BlockScaleMoe
 [INFO] FlashInfer version: 0.2.12
@@ -201,7 +201,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp4.shape = torch.Size([256, 2048, 512])
 [VVERBOSE] gemm2_weights_fp4.shape = torch.Size([256, 1024, 512])
-[PERF] trtllm         :: median time 0.216 ms; std 0.000 ms; achieved tflops 238.426 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
+[PERF] trtllm         :: median time 0.216 ms; std 0.000 ms; achieved tflops 238.313 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
 [INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=8, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='renormalize_naive', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=4)
 [INFO] Running testTrtllmFp4BlockScaleMoe
 [INFO] FlashInfer version: 0.2.12
@@ -212,7 +212,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp4.shape = torch.Size([128, 2048, 512])
 [VVERBOSE] gemm2_weights_fp4.shape = torch.Size([128, 1024, 512])
-[PERF] trtllm         :: median time 0.219 ms; std 0.000 ms; achieved tflops 235.407 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
+[PERF] trtllm         :: median time 0.219 ms; std 0.000 ms; achieved tflops 235.520 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
 [INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=256, top_k=8, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2)
 [INFO] Running testTrtllmFp8BlockScaleMoe
 [INFO] FlashInfer version: 0.2.12
@@ -223,7 +223,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([256, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([256, 1024, 1024])
-[PERF] trtllm         :: median time 0.557 ms; std 0.000 ms; achieved tflops 92.607 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
+[PERF] trtllm         :: median time 0.558 ms; std 0.000 ms; achieved tflops 92.445 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
 [INFO] args = Namespace(routine='trtllm_fp8_per_tensor_scale_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=1, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='llama4', use_shuffled_weight=False, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=True, input_dtype='bfloat16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=3)
 [INFO] Running testTrtllmFp8PerTensorScaleMoe
 [INFO] FlashInfer version: 0.2.12
@@ -234,7 +234,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([128, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([128, 1024, 1024])
-[PERF] trtllm         :: median time 0.123 ms; std 0.000 ms; achieved tflops 52.232 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
+[PERF] trtllm         :: median time 0.123 ms; std 0.000 ms; achieved tflops 52.399 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
 [INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=1, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='renormalize', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=1)
 [INFO] Running testTrtllmFp8BlockScaleMoe
 [INFO] FlashInfer version: 0.2.12
@@ -245,7 +245,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([128, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([128, 1024, 1024])
-[PERF] trtllm         :: median time 0.109 ms; std 0.000 ms; achieved tflops 59.326 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
+[PERF] trtllm         :: median time 0.109 ms; std 0.000 ms; achieved tflops 59.102 TFLOPs/sec; achieved tb_per_sec -1.000 TB/sec
 [INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_base', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2)
 [INFO] Running testCutlassFusedMoe
 [INFO] FlashInfer version: 0.2.12
@@ -272,7 +272,7 @@ $ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --outpu
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([2, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([2, 128, 128])
-[PERF] cutlass        :: median time 0.030 ms; std 0.000 ms; achieved tflops 0.213 TFLOPs/sec; achieved tb_per_sec 0.002 TB/sec
+[PERF] cutlass        :: median time 0.030 ms; std 0.000 ms; achieved tflops 0.212 TFLOPs/sec; achieved tb_per_sec 0.002 TB/sec
 [INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_weights_quantized', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', cutlass_variant='nvfp4', quantized_input=True, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2)
 [INFO] Running testCutlassFusedMoe
 [INFO] FlashInfer version: 0.2.12
