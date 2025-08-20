@@ -78,6 +78,7 @@ def generate_ninja_build_for_op(
         "$common_cflags",
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
+        "-static-global-template-stub=false",
     ]
     cuda_cflags += _get_cuda_arch_flags(extra_cuda_cflags)
     if extra_cuda_cflags is not None:
