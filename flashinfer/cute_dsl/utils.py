@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import cutlass
+import torch
 import importlib.util
 
 
@@ -36,3 +37,26 @@ def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
         "float4_e2m1fn": cutlass.Float4E2M1FN,
     }
     return dtype_map[dtype]
+
+
+def cutlass_to_torch_dtype(cutlass_dtype):
+    """
+    Return the corresponding torch.dtype per the given DSL type
+    """
+    torch_dtype = getattr(torch, cutlass_dtype.__name__.lower(), None)
+
+    torch_type_map = {
+        cutlass.TFloat32: torch.float32,
+        cutlass.Float32: torch.float32,
+        cutlass.Float16: torch.float16,
+        cutlass.BFloat16: torch.bfloat16,
+        cutlass.Float8E5M2: torch.float8_e5m2,
+        cutlass.Float8E4M3FN: torch.float8_e4m3fn,
+        cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
+    }
+    if torch_dtype is None:
+        torch_dtype = torch_type_map.get(cutlass_dtype)
+
+    if torch_dtype is None:
+        raise TypeError(f"{cutlass_dtype} is not supported by torch")
+    return torch_dtype
