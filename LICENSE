@@ -221,3 +221,9 @@ BSD 3-Clause "New" License
 
 3rdparty/cutlass
 include/flashinfer/attention/hopper/block_sparse_gather.cuh
+
+MIT License
+-----------
+
+3rdparty/spdlog
+3rdparty/spdlog/include/spdlog/fmt/bundled (fmt library)
