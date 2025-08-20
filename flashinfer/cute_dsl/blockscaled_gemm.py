@@ -40,7 +40,7 @@ import torch
 import functools
 from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import (
     Int32,
     Integer,
@@ -2316,88 +2316,6 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(
     sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
 
 
-# Create scale factor tensor SFA/SFB
-def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
-    def ceil_div(a, b):
-        return (a + b - 1) // b
-
-    sf_k = ceil_div(k, sf_vec_size)
-    ref_shape = (l, mn, sf_k)
-
-    atom_m = (32, 4)
-    atom_k = 4
-    mma_shape = (
-        l,
-        ceil_div(mn, atom_m[0] * atom_m[1]),
-        ceil_div(sf_k, atom_k),
-        atom_m[0],
-        atom_m[1],
-        atom_k,
-    )
-
-    ref_permute_order = (1, 2, 0)
-    mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-    # Create f32 ref torch tensor (cpu)
-    ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-        ref_shape,
-        torch.float32,
-        permute_order=ref_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=1,
-            max_val=3,
-        ),
-    )
-
-    # Create f32 cute torch tensor (cpu)
-    cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-        mma_shape,
-        torch.float32,
-        permute_order=mma_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=0,
-            max_val=1,
-        ),
-    )
-
-    # convert ref f32 tensor to cute f32 tensor
-    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-        from_dlpack(ref_f32_torch_tensor_cpu),
-        from_dlpack(cute_f32_torch_tensor_cpu),
-    )
-    cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
-
-    # reshape makes memory contiguous
-    ref_f32_torch_tensor_cpu = (
-        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-        .unsqueeze(-1)
-        .expand(l, mn, sf_k, sf_vec_size)
-        .reshape(l, mn, sf_k * sf_vec_size)
-        .permute(*ref_permute_order)
-    )
-    # prune to mkl for reference check.
-    ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
-
-    # Create dtype cute torch tensor (cpu)
-    cute_tensor, cute_torch_tensor = cutlass_torch.cute_tensor_like(
-        cute_f32_torch_tensor_cpu,
-        dtype,
-        is_dynamic_layout=True,
-        assumed_align=16,
-    )
-
-    # Convert f32 cute tensor to dtype cute tensor
-    cute_tensor = cutlass_torch.convert_cute_tensor(
-        cute_f32_torch_tensor,
-        cute_tensor,
-        dtype,
-        is_dynamic_layout=True,
-    )
-    return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
-
-
 class MaskedBatchedMatmulCuteDSL:
     def __init__(
         self,
@@ -2585,7 +2503,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
     ) -> List[cute.Pointer]:
-        mock_ptr = torch.randn(16, device="cuda:0").data_ptr()
         if input_tensors is None:
             (
                 a_data_ptr,
@@ -2595,7 +2512,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 c_data_ptr,
                 masked_m_data_ptr,
                 alpha_data_ptr,
-            ) = [mock_ptr for _ in range(7)]
+            ) = [16 for _ in range(7)]
         else:
             (
                 a_tensor_gpu,
