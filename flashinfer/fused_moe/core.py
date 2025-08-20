@@ -1499,6 +1499,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type=routing_method_type,
             enable_pdl=enable_pdl,
             do_finalize=do_finalize,
+            gated_act_type=gated_act_type,
         )
 
         # Call the C++ function for block scale MoE

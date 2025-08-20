@@ -159,6 +159,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
         1,
         True,
         enable_pdl,
+        0,  # gated_act_type
         None,
         num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
     )
