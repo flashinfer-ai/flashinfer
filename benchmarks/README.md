@@ -173,8 +173,8 @@ The following support surface applies to attention operations in `flashinfer_ben
 | fa3                | ✗           | ✓             | ✓              | ✗    | [FlashAttention-3](https://github.com/Dao-AILab/flash-attention) implemented with CUTLASS. Hopper Only.  |
 | cudnn              | ✓           | ✓             | ✓              | ✗    |  |
 | cutlass            | ✗           | ✗             | ✓              | ✗    | FMHA implemented with CUTLASS.          |
-| trtllm-gen         | ✓           | ✓             | ✗              | ✗    |                                          |
-| trtllm-gen-native  | ✓           | ✓             | ✗              | ✓    |                                          |
+| trtllm-gen         | ✓           | ✓             | ✗              | ✗    | trtllm-gen kernels called through unified wrapper interface, such as `Batch...Wrapper` by setting `backend='trtllm-gen'` |
+| trtllm-gen-native  | ✓           | ✓             | ✗              | ✓    | trtllm-gen kernels called through a separate API such as `flashinfer.[prefill,decode].trtllm_batch_...` |
 
 Notes:
 - CUDA graph support is only stable with BatchDecodeWithPagedKVCacheWrapper. For BatchPrefillWithPagedKVCacheWrapper and BatchPrefillWithRaggedKVCacheWrapper, it is recommended that `--no_cuda_graph` is used.
