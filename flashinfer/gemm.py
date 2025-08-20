@@ -207,7 +207,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     major, minor = torch.cuda.get_device_capability(device)
 
     # protecting current_device_nvcc_flags
-    assert major in [9, 10], "currently only support Hopper and Blackwell"
+    assert major in [9, 10, 12], "currently only support compute capability 9, 10, 12"
 
     return gen_jit_spec(
         "fp4_gemm_cutlass",
