@@ -2739,7 +2739,7 @@ def grouped_gemm_nt_masked(
         ab_dtype=get_cutlass_dtype(ab_dtype),
         sf_dtype=get_cutlass_dtype(sf_dtype),
         c_dtype=get_cutlass_dtype(c_dtype),
-        alpha_dtype=get_cutlass_dtype(alpha_dtype),
+        alpha_dtype=None if alpha is None else get_cutlass_dtype(alpha_dtype),
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
