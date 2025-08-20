@@ -183,7 +183,7 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
 def testBatchDecodeWithPagedKVCacheWrapper(args):
     """
     Test BatchDecodeWithPagedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa2_tc, cudnn, and trtllm-gen backends.
+    Supports fa2, fa2_tc, cudnn, trtllm-gen, trtllm-gen-native backends.
 
     This test:
     1. Creates paged KV cache and query tensors
@@ -616,7 +616,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithPagedKVCacheWrapper(args):
     """
     Test BatchPrefillWithPagedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, trtllm-gen, and cudnn backends.
+    Supports fa2, fa3, trtllm-gen, trtllm-gen-native, and cudnn backends.
 
     This test:
     1. Creates paged KV cache and query tensors for prefill
@@ -1466,7 +1466,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 def testBatchMLAPagedAttentionWrapper(args):
     """
     Test BatchMLAPagedAttentionWrapper and equivalent APIs.
-    Supports fa2. trtllm-gen is not supported yet.
+    Supports fa2. and trtllm-gen-native.
 
     This test:
     1. Creates paged query and key-value cache tensors
