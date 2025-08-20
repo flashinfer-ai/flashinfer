@@ -733,10 +733,11 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   } else if (static_cast<RoutingMethodType>(routing_method_type) ==
                  RoutingMethodType::Renormalize ||
              static_cast<RoutingMethodType>(routing_method_type) ==
-                 RoutingMethodType::RenormalizeNaive) {
+                 RoutingMethodType::RenormalizeNaive ||
+             static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::TopK) {
     TORCH_CHECK(
         top_k <= 8 && top_k > 0,
-        "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+        "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && top_k>0.");
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
   }
