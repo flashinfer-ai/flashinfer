@@ -25,10 +25,14 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if auto_tuning and backend == "cudnn":
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
     
-    # FIXME (bringup) apparent fail at autotuning but likely inside cutlass module instead
     device_capability = torch.cuda.get_device_capability()
-    if device_capability == (10, 3) and use_128x4_sf_layout and auto_tuning:
-        pytest.fail("There still are errors in the cutlass module and will appear to fail at autotuning")
+    if device_capability == (10, 3):
+        if use_128x4_sf_layout and auto_tuning:
+            # FIXME (bringup) apparent fail at autotuning but likely inside cutlass module instead
+            pytest.fail("There still are errors in the cutlass module and will appear to fail at autotuning")
+        if backend == "trtllm":
+            # FIXME (bringup) need to get sm103a kernels or compile with sm100f 
+            pytest.skip("Skipping test for trtllm fp4 with SM 10.3")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -66,7 +70,6 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
         )
 
     # FIXME (bringup) torch.AcceleratorError: CUDA error: unspecified launch failure Trying to use TMA Descriptor Prefetch without CUTE_ARCH_TMA_SM90_ENABLED
-    torch.cuda.synchronize()
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > 0.97
 
