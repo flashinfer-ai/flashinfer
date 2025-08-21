@@ -29,7 +29,12 @@ def _get_cuda_version() -> Version:
     else:
         nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
     txt = subprocess.check_output([nvcc, "--version"], text=True)
-    return Version(re.findall(r"release (\d+\.\d+),", txt)[0])
+    matches = re.findall(r"release (\d+\.\d+),", txt)
+    if not matches:
+        raise RuntimeError(
+            f"Could not parse CUDA version from nvcc --version output: {txt}"
+        )
+    return Version(matches[0])
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -94,9 +99,7 @@ def generate_ninja_build_for_op(
     ]
     cuda_version = _get_cuda_version()
     # enable -static-global-template-stub when cuda version >= 12.8
-    if cuda_version.major > 12 or (
-        cuda_version.major == 12 and cuda_version.minor >= 8
-    ):
+    if cuda_version >= Version("12.8"):
         cuda_cflags += [
             "-static-global-template-stub=false",
         ]
