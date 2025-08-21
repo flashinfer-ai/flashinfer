@@ -750,9 +750,13 @@ class AutoTuner:
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
-        default_initializer = lambda shapes, dtype, device: torch.rand(
-            shapes, device=device
-        ).to(dtype)
+        def default_initializer(shapes, dtype, device):
+            # Handle uint8 specifically for FP4 packed tensors
+            # Note: This is a workaround - on SM100 this might not even be called
+            if dtype == torch.uint8:
+                return torch.randint(0, 256, shapes, device=device, dtype=dtype)
+            else:
+                return torch.rand(shapes, device=device).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):
             if any(isinstance(d, DynamicDim) for d in p):
