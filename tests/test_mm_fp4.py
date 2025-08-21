@@ -65,6 +65,7 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
             backend=backend,
         )
 
+    torch.cuda.synchronize()
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > 0.97
 
