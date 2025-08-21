@@ -25,6 +25,7 @@ from torch.nn import functional as F
 
 from flashinfer import (
     RoutingMethodType,
+    GatedActType,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
     mxfp8_dequantize_host,
@@ -203,6 +204,7 @@ class CUDAGraphMoE:
             routed_scaling_factor=self.config["routed_scaling"],
             tile_tokens_dim=self.config["tile_tokens_dim"],
             routing_method_type=self.config["routing_method_type"],
+            gated_act_type=self.config["gated_act_type"],
             do_finalize=True,
         )
         return output  # Extract tensor from tuple
@@ -545,6 +547,7 @@ class FP4Moe(Moe):
         top_k_groups = kwargs["top_k_groups"]
         intermediate_size = kwargs["intermediate_size"]
         routed_scaling = kwargs["routed_scaling"]
+        gated_act_type = kwargs["gated_act_type"]
         routing_method_type = kwargs["routing_method_type"]
         tile_tokens_dim = kwargs["tile_tokens_dim"]
 
@@ -558,6 +561,7 @@ class FP4Moe(Moe):
             "intermediate_size": intermediate_size,
             "routed_scaling": routed_scaling,
             "tile_tokens_dim": tile_tokens_dim,
+            "gated_act_type": gated_act_type,
             "routing_method_type": routing_method_type,
         }
 
@@ -959,6 +963,7 @@ class moe_args:
         gemm2_scales_global,
         permute_info,
         use_routing_scales_on_input,
+        gated_act_type,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -978,6 +983,7 @@ class moe_args:
         self.gemm2_scales_global = gemm2_scales_global
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
+        self.gated_act_type = gated_act_type
 
 
 class moe_args_dequant:
@@ -997,6 +1003,7 @@ class moe_args_dequant:
         gemm2_weights,
         permute_info,
         use_routing_scales_on_input,
+        gated_act_type,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1010,6 +1017,7 @@ class moe_args_dequant:
         self.gemm2_weights = gemm2_weights
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
+        self.gated_act_type = gated_act_type
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -1164,6 +1172,21 @@ def routing_reference_renormalize_naive(expert_logits, top_k, num_experts, paddi
         topk_values /= topk_values.sum(dim=-1, keepdim=True)
     topk_values = topk_values.to(expert_logits.dtype)
     scores = scores.to(expert_logits.dtype)
+
+    new_mask = torch.zeros_like(expert_logits)
+    new_mask.scatter_(-1, topk_idx, 1)
+    scores = expert_logits * new_mask
+
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = topk_values[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
+def routing_reference_topk(expert_logits, top_k, num_experts, padding):
+    """TopK only (no softmax) routing reference."""
+    topk_values, topk_idx = torch.topk(expert_logits, k=top_k, dim=-1)
 
     new_mask = torch.zeros_like(expert_logits)
     new_mask.scatter_(-1, topk_idx, 1)
@@ -1454,6 +1477,13 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         (total_num_padded_tokens, args.intermediate_size), float("nan"), device="cuda"
     ).to(torch.float)
 
+    gated_act_type = args.gated_act_type
+    gated_act_type_to_func = {
+        0: F.silu,
+        1: F.gelu,
+    }
+    gated_act_func = gated_act_type_to_func[gated_act_type]
+
     i = 0
     for expert_idx in range(args.num_experts):
         my_num_tokens = num_tokens_per_expert[expert_idx]
@@ -1462,7 +1492,7 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         my_a = gemm1_output[i : i + my_num_tokens]
         my_x1 = my_a[:, : args.intermediate_size]
         my_x2 = my_a[:, args.intermediate_size :]
-        activation_output[i : i + my_num_tokens] = F.silu(my_x2) * my_x1
+        activation_output[i : i + my_num_tokens] = gated_act_func(my_x2) * my_x1
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -1589,6 +1619,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
+        args.gated_act_type,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
@@ -1631,6 +1662,7 @@ def run_moe_reference_dsfp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
+        GatedActType.SwiGlu.value,  # gated_act_type
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -1667,6 +1699,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
+        GatedActType.SwiGlu.value,  # gated_act_type
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -1701,6 +1734,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "routing_method_type": kwargs["routing_method_type"],
         "tile_tokens_dim": kwargs["tile_tokens_dim"],
         "do_finalize": True,
+        "gated_act_type": args.gated_act_type,
     }
 
     return moe_impl.call_moe(
@@ -1729,9 +1763,9 @@ def cache_permute_indices():
     return _cache_permute_indices
 
 
-@pytest.mark.parametrize("num_tokens", [1, 1024])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024, 768, 384])
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 8192])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -1812,6 +1846,20 @@ def cache_permute_indices():
         ),
         pytest.param(
             {
+                "num_experts": 16,
+                "top_k": 2,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+            },
+            id="TopK",
+        ),
+        pytest.param(
+            {
                 "num_experts": 128,
                 "top_k": 1,
                 "padding": 8,
@@ -1855,6 +1903,13 @@ def cache_permute_indices():
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "gated_act_type",
+    [
+        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
+        pytest.param(GatedActType.GeGlu, id="GeGlu"),
+    ],
+)
 def test_moe_quantization_classes(
     num_tokens,
     hidden_size,
@@ -1862,6 +1917,7 @@ def test_moe_quantization_classes(
     moe_impl,
     routing_config,
     weight_processing,
+    gated_act_type,
     cache_permute_indices,
 ):
     """
@@ -1874,6 +1930,24 @@ def test_moe_quantization_classes(
     Each quantization class clearly shows which precision is being used.
     """
     # Skip incompatible combinations
+    if gated_act_type == GatedActType.GeGlu and (
+        type(moe_impl) is not FP4Moe
+        or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
+        or routing_config["routing_method_type"] != RoutingMethodType.TopK
+        or num_tokens > 128
+    ):
+        # GeGlu is only supported for FP4Moe FP4_NVFP4_NVFP4 and TopK routing
+        pytest.skip(
+            f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
+        )
+    elif gated_act_type == GatedActType.SwiGlu and (
+        hidden_size > 1024 or intermediate_size > 1024
+    ):
+        # Skip some tests for SwiGlu for testing speed
+        pytest.skip(
+            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
+        )
+
     if type(moe_impl) not in routing_config["compatible_moe_impls"]:
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {routing_config['routing_method_type'].name}"
@@ -1962,6 +2036,10 @@ def test_moe_quantization_classes(
         permute_info, scores = routing_reference_renormalize_naive(
             expert_logits, top_k, num_experts, padding
         )
+    elif routing_method_type == RoutingMethodType.TopK:
+        permute_info, scores = routing_reference_topk(
+            expert_logits, top_k, num_experts, padding
+        )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(
             expert_logits,
@@ -2011,6 +2089,7 @@ def test_moe_quantization_classes(
         quant_data["gemm2_scales_global"],
         permute_info,
         use_routing_scales_on_input,
+        gated_act_type,
     )
 
     # Compute reference output using the moe_impl

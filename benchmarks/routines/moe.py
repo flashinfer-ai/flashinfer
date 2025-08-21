@@ -132,9 +132,10 @@ def parse_moe_args(line, parser):
             "deepseek_v3",
             "llama4",
             "renormalize_naive",
+            "topk",
         ],
         help=(
-            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive."
+            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | topk."
         ),
     )
     parser.add_argument(
@@ -176,6 +177,14 @@ def parse_moe_args(line, parser):
         required=False,
         default="bfloat16",
         help="Data type of the weights (before quantization).",
+    )
+    parser.add_argument(
+        "--gated_act",
+        type=str,
+        required=False,
+        default="swiglu",
+        choices=["swiglu", "geglu"],
+        help="Type of gated activation function: swiglu | geglu.",
     )
 
     # CUTLASS fused MoE specific
@@ -225,13 +234,22 @@ def parse_moe_args(line, parser):
     args = parser.parse_args(line)
 
     # Normalize routing method (map string to internal int expected by kernels)
-    name_to_type = {
+    routing_method_name_to_type = {
         "renormalize": 1,
         "deepseek_v3": 2,
         "llama4": 3,
         "renormalize_naive": 4,
+        "topk": 5,
     }
-    args.routing_method_type = name_to_type[args.routing_method]
+    args.routing_method_type = routing_method_name_to_type[args.routing_method]
+
+    # Normalize gated act type (map string to internal int expected by kernels)
+    gated_act_name_to_type = {
+        "swiglu": 0,
+        "geglu": 1,
+    }
+    args.gated_act_type = gated_act_name_to_type[args.gated_act]
+
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -451,8 +469,7 @@ def calculate_moe_bandwidth(
     if active_experts is not None:
         num_active_experts = active_experts
     else:
-        # CUTLASS MoE does not support active_experts, so we return -1
-        return -1
+        num_active_experts = min(num_experts, top_k * num_tokens)
     weight_bytes = num_active_experts * weight_bytes_per_expert
 
     # Output memory (typically full precision)
@@ -539,6 +556,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
+    gated_act_type = args.gated_act_type
 
     if args.verbose >= 1:
         print(
@@ -669,6 +687,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
+            gated_act_type=gated_act_type,
             do_finalize=True,
         )
 
@@ -745,6 +764,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        cur_res["gated_act"] = args.gated_act
         res.append(cur_res)
 
     return res

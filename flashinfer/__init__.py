@@ -64,6 +64,7 @@ from .fp4_quantization import (
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     RoutingMethodType,
+    GatedActType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
