@@ -116,6 +116,26 @@ def parse_args(line=sys.argv[1:]):
         default=5,
         help="Number of dry runs.",
     )
+    parser.add_argument(
+        "--case_tag",
+        type=str,
+        required=False,
+        default=None,
+        help="Optional tag for the test case for annotating output.",
+    )
+    parser.add_argument(
+        "--generate_repro_command",
+        action="store_true",
+        default=False,
+        help="If set, will print reproducer command and store it to output csv.",
+    )
+    parser.add_argument(
+        "--repro_command",
+        type=str,
+        required=False,
+        default="",
+        help="Placeholder for generated reproducer command for the test case. Not to be used directly.",
+    )
 
     ## Check routine and pass on to routine-specific argument parser
     if args.routine in benchmark_apis["attention"]:
@@ -127,6 +147,8 @@ def parse_args(line=sys.argv[1:]):
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
+    if args.generate_repro_command:
+        args.repro_command = "python3 flashinfer_benchmark.py " + " ".join(line)
     return args
 
 
