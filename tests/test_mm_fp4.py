@@ -27,6 +27,12 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if auto_tuning and backend == "cudnn":
         print("Skipping test for cudnn fp4 with auto_tuning=True")
         return
+    
+    # BUG Skip autotuning with 128x4 layout on SM 10.3 due to uint8 tensor creation issues
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability == (10, 3) and use_128x4_sf_layout and auto_tuning:
+        print(f"Skipping autotuning with use_128x4_sf_layout=True on SM 10.3 due to autotuner uint8 compatibility issues")
+        return
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)

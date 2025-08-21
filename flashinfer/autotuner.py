@@ -60,17 +60,10 @@ class DynamicTensorSpec:
     def __post_init__(self):
         # Set default tensor_initializers if not provided
         if self.tensor_initializers is None:
-            def create_tensor_initializer():
-                def tensor_initializer(shapes, dtype, device):
-                    # Handle uint8 specifically for FP4 packed tensors
-                    if dtype == torch.uint8:
-                        return torch.randint(0, 256, shapes, device=device, dtype=dtype)
-                    else:
-                        return torch.randn(shapes, device=device, dtype=dtype)
-                return tensor_initializer
-            
             self.tensor_initializers = [
-                create_tensor_initializer()
+                lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device, dtype=dtype
+                )
                 for _ in range(len(self.input_idx))
             ]
 
@@ -757,13 +750,9 @@ class AutoTuner:
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
-        def default_initializer(shapes, dtype, device):
-            # Handle uint8 specifically for FP4 packed tensors
-            # Note: This is a workaround - on SM100 this might not even be called
-            if dtype == torch.uint8:
-                return torch.randint(0, 256, shapes, device=device, dtype=dtype)
-            else:
-                return torch.rand(shapes, device=device).to(dtype)
+        default_initializer = lambda shapes, dtype, device: torch.rand(
+            shapes, device=device
+        ).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):
             if any(isinstance(d, DynamicDim) for d in p):
