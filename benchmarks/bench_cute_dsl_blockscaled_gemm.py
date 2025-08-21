@@ -9,7 +9,7 @@ import torch
 import cutlass.torch as cutlass_torch
 from flashinfer.cute_dsl.utils import get_cutlass_dtype
 from flashinfer.testing.utils import bench_kineto, count_bytes
-
+from flashinfer.autotune import autotune
 
 ab_dtype = "float4_e2m1fn"
 sf_dtype = "float8_e4m3fn"
@@ -22,7 +22,7 @@ b_major = "k"
 c_major = "n"
 
 
-def bench_one(num_groups, max_m, expected_m_per_group, n, k):
+def bench_one(num_groups, max_m, expected_m_per_group, n, k, do_autotune):
     data = create_data(
         num_groups=num_groups,
         max_m=max_m,
@@ -43,6 +43,11 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             sf_vec_size=sf_vec_size,
             alpha_dtype="float32",
         )
+
+    # warmup
+    with autotune(do_autotune):
+        for _ in range(10):
+            test_func()
 
     t = bench_kineto(
         test_func,
@@ -198,4 +203,5 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     random.seed(42)
     for config in enumerate_m_grouped_masked():
-        bench_one(**config)
+        for do_autotune in [False, True]:
+            bench_one(**config, do_autotune=do_autotune)
