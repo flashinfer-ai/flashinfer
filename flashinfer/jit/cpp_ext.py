@@ -1,9 +1,12 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
+import functools
 import os
+import re
 import subprocess
 import sys
 import sysconfig
+from packaging.version import Version
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,6 +20,16 @@ from torch.utils.cpp_extension import (
 )
 
 from . import env as jit_env
+
+
+@functools.cache
+def _get_cuda_version() -> Version:
+    if CUDA_HOME is None:
+        nvcc = "nvcc"
+    else:
+        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    return Version(re.findall(r"release (\d+\.\d+),", txt)[0])
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -78,8 +91,15 @@ def generate_ninja_build_for_op(
         "$common_cflags",
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
-        "-static-global-template-stub=false",
     ]
+    cuda_version = _get_cuda_version()
+    # enable -static-global-template-stub when cuda version >= 12.8
+    if cuda_version.major > 12 or (
+        cuda_version.major == 12 and cuda_version.minor >= 8
+    ):
+        cuda_cflags += [
+            "-static-global-template-stub=false",
+        ]
     cuda_cflags += _get_cuda_arch_flags(extra_cuda_cflags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
