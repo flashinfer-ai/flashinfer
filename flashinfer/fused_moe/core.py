@@ -31,7 +31,13 @@ from ..autotuner import (
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
+from ..jit import (
+    gen_jit_spec,
+    setup_cubin_loader,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    current_device_nvcc_flags,
+)
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import (
@@ -245,7 +251,7 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = sm100a_nvcc_flags + [
+    nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
         "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
@@ -253,6 +259,14 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
+
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+
+    # protecting current_device_nvcc_flags
+    assert major == 10, "currently only support Blackwell"
+    nvcc_flags += current_device_nvcc_flags
+
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 

@@ -59,7 +59,7 @@ from .jit import (
     gen_jit_spec,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
+    current_device_nvcc_flags,
 )
 from .jit.cubin_loader import setup_cubin_loader
 from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
@@ -206,14 +206,13 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
 
-    nvcc_flags = sm100a_nvcc_flags
-    if major == 10 and minor == 3:
-        nvcc_flags += sm103a_nvcc_flags
+    # protecting current_device_nvcc_flags
+    assert major in [9, 10], "currently only support Hopper and Blackwell"
 
     return gen_jit_spec(
         "fp4_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=nvcc_flags
+        extra_cuda_cflags=current_device_nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",

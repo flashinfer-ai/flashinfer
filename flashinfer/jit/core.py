@@ -70,6 +70,15 @@ sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_fl
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
 sm110_nvcc_flags = ["-gencode=arch=compute_110,code=sm_110"] + common_nvcc_flags
 sm120_nvcc_flags = ["-gencode=arch=compute_120,code=sm_120"] + common_nvcc_flags
+try:
+    current_device_nvcc_flags = [
+        "-gencode=arch=compute_{0}{1}a,code=sm_{0}{1}a".format(
+            *torch.cuda.get_device_capability()
+        )
+    ] + common_nvcc_flags
+except Exception as e:
+    logger.warning(f"Failed to get current device nvcc flags: {e}")
+    current_device_nvcc_flags = common_nvcc_flags
 
 
 @dataclasses.dataclass
