@@ -2459,7 +2459,7 @@ class MaskedBatchedMatmulCuteDSL:
         )
         # if sm_count is provided, use it instead of the default max value
         if sm_count > 0:
-            self._max_active_clusters = sm_count
+            self._max_active_clusters = min(self._max_active_clusters, sm_count)
 
     @cute.jit
     def __call__(
