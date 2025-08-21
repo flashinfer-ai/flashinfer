@@ -2748,7 +2748,7 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
-    sm_count: Optional[int],
+    sm_count: Optional[int] = None,
     **kwargs,
 ):
     """
