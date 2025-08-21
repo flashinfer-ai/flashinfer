@@ -203,7 +203,7 @@ def create_masked_m(num_groups, expected_m_per_group, max_m):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("flashinfer.jit").setLevel(logging.DEBUG)
     torch.manual_seed(42)
     random.seed(42)
     for config in enumerate_m_grouped_masked():
