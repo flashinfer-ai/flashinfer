@@ -47,7 +47,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
             comm.QuantizationSFLayout.LINEAR,
-            comm.QuantizationSFLayout.SWIZZLED,
+            comm.QuantizationSFLayout.SWIZZLED_128x4,
+            comm.QuantizationSFLayout.SWIZZLED_8x4,
         ]
         launch_with_pdls = [True, False]
 

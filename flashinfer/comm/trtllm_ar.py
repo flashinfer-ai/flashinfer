@@ -90,10 +90,11 @@ class QuantizationSFLayout:
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
     #
     # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-    SWIZZLED = 0
+    SWIZZLED_128x4 = 0
+    SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
     # kernels standard.
-    LINEAR = 1
+    LINEAR = 2
 
 
 def gen_trtllm_comm_module() -> JitSpec:
