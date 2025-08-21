@@ -132,9 +132,10 @@ def parse_moe_args(line, parser):
             "deepseek_v3",
             "llama4",
             "renormalize_naive",
+            "topk",
         ],
         help=(
-            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive."
+            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | topk."
         ),
     )
     parser.add_argument(
@@ -176,6 +177,14 @@ def parse_moe_args(line, parser):
         required=False,
         default="bfloat16",
         help="Data type of the weights (before quantization).",
+    )
+    parser.add_argument(
+        "--gated_act",
+        type=str,
+        required=False,
+        default="swiglu",
+        choices=["swiglu", "geglu"],
+        help="Type of gated activation function: swiglu | geglu.",
     )
 
     # CUTLASS fused MoE specific
@@ -225,13 +234,22 @@ def parse_moe_args(line, parser):
     args = parser.parse_args(line)
 
     # Normalize routing method (map string to internal int expected by kernels)
-    name_to_type = {
+    routing_method_name_to_type = {
         "renormalize": 1,
         "deepseek_v3": 2,
         "llama4": 3,
         "renormalize_naive": 4,
+        "topk": 5,
     }
-    args.routing_method_type = name_to_type[args.routing_method]
+    args.routing_method_type = routing_method_name_to_type[args.routing_method]
+
+    # Normalize gated act type (map string to internal int expected by kernels)
+    gated_act_name_to_type = {
+        "swiglu": 0,
+        "geglu": 1,
+    }
+    args.gated_act_type = gated_act_name_to_type[args.gated_act]
+
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -451,8 +469,7 @@ def calculate_moe_bandwidth(
     if active_experts is not None:
         num_active_experts = active_experts
     else:
-        # CUTLASS MoE does not support active_experts, so we return -1
-        return -1
+        num_active_experts = min(num_experts, top_k * num_tokens)
     weight_bytes = num_active_experts * weight_bytes_per_expert
 
     # Output memory (typically full precision)
@@ -500,6 +517,11 @@ def testTrtllmFp4BlockScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -534,6 +556,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
+    gated_act_type = args.gated_act_type
 
     if args.verbose >= 1:
         print(
@@ -664,6 +687,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
+            gated_act_type=gated_act_type,
             do_finalize=True,
         )
 
@@ -710,7 +734,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp4_block_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -729,11 +753,18 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
+        cur_res["use_routing_bias"] = args.use_routing_bias
+        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        cur_res["gated_act"] = args.gated_act
         res.append(cur_res)
 
     return res
@@ -753,6 +784,11 @@ def testCutlassFusedMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
     # Shapes
@@ -1028,7 +1064,7 @@ def testCutlassFusedMoe(args):
         active_experts=int(selected_experts.unique().numel()),
     )
 
-    backend = f"cutlass_fused_moe_{variant}"
+    backend = "cutlass"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1051,6 +1087,13 @@ def testCutlassFusedMoe(args):
         cur_res["use_routing_scales_on_input"] = False
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = input_dtype
+        # CUTLASS fused MoE specific
+        cur_res["cutlass_variant"] = variant
+        cur_res["quantized_input"] = args.quantized_input
+        cur_res["tp_size"] = tp_size
+        cur_res["tp_rank"] = tp_rank
+        cur_res["ep_size"] = ep_size
+        cur_res["ep_rank"] = ep_rank
         res.append(cur_res)
 
     return res
@@ -1076,6 +1119,11 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -1284,7 +1332,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp8_block_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1303,9 +1351,15 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
+        cur_res["use_routing_bias"] = args.use_routing_bias
+        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         res.append(cur_res)
@@ -1333,6 +1387,11 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
 
@@ -1482,7 +1541,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm_fp8_per_tensor_scale"
+    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1501,7 +1560,12 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["top_k"] = top_k
         cur_res["n_group"] = n_group
         cur_res["topk_group"] = topk_group
+        cur_res["routed_scaling_factor"] = routed_scaling_factor
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
+        cur_res["use_routing_bias"] = args.use_routing_bias
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype

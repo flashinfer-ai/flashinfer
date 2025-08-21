@@ -417,6 +417,18 @@ def version_at_least(version: str, base_version: str) -> bool:
     return pkg_version.parse(version) >= pkg_version.parse(base_version)
 
 
+def has_cuda_cudart() -> bool:
+    """
+    Check if cuda.cudart module is available (cuda-python <= 12.9).
+
+    Returns:
+        True if cuda.cudart exists, False otherwise
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("cuda.cudart") is not None
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")

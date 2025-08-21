@@ -25,13 +25,13 @@
 namespace torch_ext {
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
 inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
-                          tensorrt_llm::FP4QuantizationSFLayout layout, bool useUE8M0 = false) {
+                          tensorrt_llm::QuantizationSFLayout layout, bool useUE8M0 = false) {
   constexpr int kColumnGroup0Size = 4;
   constexpr int kRowGroup0Size = 32;
   constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
   // Swizzled layout is used as default layout.
-  if (layout == tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED_128x4) {
+  if (layout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
     // int paddedRow = PadUpFn(totalRow, 128);
     int paddedColumn = PadUpFn(totalColumn, 4);
 
@@ -51,7 +51,7 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
            rowGroupIdx * rowGroupStride;
   }
   // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
-  else if (layout == tensorrt_llm::FP4QuantizationSFLayout::LINEAR) {
+  else if (layout == tensorrt_llm::QuantizationSFLayout::LINEAR) {
     // no padding needed. totalColumn is multiple of kVecSize.
     return rowIdx * totalColumn + colIdx;
   } else {
@@ -61,7 +61,7 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 
 // input: [M, K], fp16/bf16_quantized
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
-// linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
+// linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // alignment: sfVecSize
 // returns fp8_quantized and block_scale_factors.
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool is_sf_swizzled_layout,
@@ -69,7 +69,7 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool is_sf_s
 
 // x_fp32: [M, K], fp32_quantized (on the host)
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
-// linear layout. See FP4QuantizationSFLayout enum for more details about the two layouts.
+// linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns fp8_quantized and block_scale_factors (on the host).
 std::tuple<at::Tensor, at::Tensor> mxfp8_quantize_host(at::Tensor x_fp32,
                                                        bool is_sf_swizzled_layout = true);

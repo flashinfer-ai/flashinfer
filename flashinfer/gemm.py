@@ -100,9 +100,9 @@ def get_gemm_module():
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                *,
                 tactic: int = -1,
                 do_preparation: bool = False,
+                **kwargs,
             ) -> torch.Tensor:
                 cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
@@ -398,9 +398,9 @@ def get_gemm_sm100_module_cutlass_fp8():
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                *,
                 tactic: int = -1,
                 do_preparation: bool = False,
+                **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 module.fp8_gemm.default(
@@ -447,8 +447,8 @@ def fp8_gemm_sm100(
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                a_tensor_index,
-                -2,
+                (a_tensor_index,),
+                (-2,),
                 get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2,
             ),
@@ -489,9 +489,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
             module.fp4_gemm.default(
@@ -524,8 +524,8 @@ def get_gemm_sm100_module_cutlass_fp4():
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    a_tensor_index,
-                    0,
+                    (a_tensor_index,),
+                    (0,),
                     get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2,
                 ),
@@ -1421,9 +1421,9 @@ def _cudnn_gemm_fp8_runner():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
             _cudnn_gemm_fp8(workspace_buffer, a, b, scale_a, scale_b, out, out.dtype)
@@ -1946,9 +1946,9 @@ def get_trtllm_fp4_gemm_module():
         def forward(
             self,
             inputs: List[torch.Tensor],
-            *,
             tactic: int = -1,
             do_preparation: bool = False,
+            **kwargs,
         ):
             (
                 workspace_buffer,
@@ -1998,8 +1998,8 @@ def get_trtllm_fp4_gemm_module():
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    a_tensor_index,
-                    0,
+                    (a_tensor_index,),
+                    (0,),
                     get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2,
                 ),

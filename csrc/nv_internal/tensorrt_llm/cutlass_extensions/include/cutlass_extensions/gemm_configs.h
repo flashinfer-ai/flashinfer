@@ -262,7 +262,6 @@ enum class ClusterShape {
   ClusterShape_1x2x1,
   ClusterShape_2x2x1,
   ClusterShape_1x4x1,
-  ClusterShape_4x1x1,
   ClusterShape_4x2x1,
   ClusterShape_2x4x1,
   ClusterShape_4x4x1,
@@ -279,8 +278,6 @@ static auto get_cluster_shape_name(ClusterShape Shape_MNK) {
     return "1x2x1";
   } else if (Shape_MNK == ClusterShape::ClusterShape_2x2x1) {
     return "2x2x1";
-  } else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
-    return "4x1x1";
   } else if (Shape_MNK == ClusterShape::ClusterShape_1x8x1) {
     return "1x8x1";
   } else if (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
@@ -300,8 +297,6 @@ constexpr auto get_cluster_shape() {
     return cute::Shape<_1, _2, _1>{};
   } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_2x2x1) {
     return cute::Shape<_2, _2, _1>{};
-  } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
-    return cute::Shape<_4, _1, _1>{};
   } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_1x8x1) {
     return cute::Shape<_1, _8, _1>{};
   } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
@@ -378,8 +373,8 @@ struct CutlassGemmConfig {
         is_tma_warp_specialized(true) {}
 
   int getTileConfigAsInt() const {
-    if (sm_version == 120 || sm_version == 121) return (int)tile_config_sm120;
-    if (sm_version >= 100 && sm_version < 120) return (int)tile_config_sm100;
+    if (sm_version == 120) return (int)tile_config_sm120;
+    if (sm_version >= 100) return (int)tile_config_sm100;
     if (sm_version == 90) return (int)tile_config_sm90;
     if (sm_version < 90) return (int)tile_config_sm80;
     assert(false && "Invalid SM version");
@@ -416,22 +411,22 @@ struct CutlassGemmConfig {
 
 inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& config) {
   // clang-format off
-    if (config.is_tma_warp_specialized)
-    {
-        out << "tile_config_sm90_enum: " << config.getTileConfigAsInt()
-            << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
-            << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
-            << ", cluster_shape_enum: " << int(config.cluster_shape)
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
-    }
-    else
-    {
-        out << "tile_config_enum: " << config.getTileConfigAsInt()
-            << ", split_k_style_enum: " << int(config.split_k_style)
-            << ", split_k_factor: " << config.split_k_factor
-            << ", stages: " << config.stages
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
-    }
+     if (config.is_tma_warp_specialized)
+     {
+         out << "tile_config_sm90_enum: " << config.getTileConfigAsInt()
+             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
+             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
+             << ", cluster_shape_enum: " << int(config.cluster_shape)
+             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+     }
+     else
+     {
+         out << "tile_config_enum: " << config.getTileConfigAsInt()
+             << ", split_k_style_enum: " << int(config.split_k_style)
+             << ", split_k_factor: " << config.split_k_factor
+             << ", stages: " << config.stages
+             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+     }
   // clang-format on
   return out;
 }

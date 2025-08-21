@@ -79,7 +79,7 @@ class AllReduceFusionPattern:
     kARResidualRMSNormOutFP4Quant = 5
 
 
-class FP4QuantizationSFLayout:
+class QuantizationSFLayout:
     # Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
     # blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
     # values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
@@ -90,10 +90,11 @@ class FP4QuantizationSFLayout:
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
     #
     # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-    SWIZZLED = 0
+    SWIZZLED_128x4 = 0
+    SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
     # kernels standard.
-    LINEAR = 1
+    LINEAR = 2
 
 
 def gen_trtllm_comm_module() -> JitSpec:
@@ -262,7 +263,7 @@ def get_trtllm_comm_module():
         rms_gamma: Optional[torch.Tensor],
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
-        layout_code: Optional[FP4QuantizationSFLayout],
+        layout_code: Optional[QuantizationSFLayout],
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -329,7 +330,7 @@ def get_trtllm_comm_module():
         moe_reduction_scale_input: torch.Tensor,
         moe_reduction_active_experts_token_input: torch.Tensor,
         moe_reduction_token_input: torch.Tensor,
-        layout_code: Optional[FP4QuantizationSFLayout],
+        layout_code: Optional[QuantizationSFLayout],
         moe_allreduce_out: Optional[torch.Tensor],
         residual_out: Optional[torch.Tensor],
         norm_out: Optional[torch.Tensor],
@@ -790,7 +791,7 @@ def trtllm_allreduce_fusion(
     rms_gamma: Optional[torch.Tensor],
     rms_eps: Optional[float],
     scale_factor: Optional[Union[torch.Tensor, float]],
-    layout_code: Optional[FP4QuantizationSFLayout],
+    layout_code: Optional[QuantizationSFLayout],
 ) -> None:
     """
     Parameters:
@@ -885,7 +886,7 @@ def trtllm_moe_allreduce_fusion(
     moe_reduction_scale_input: torch.Tensor,
     moe_reduction_active_experts_token_input: torch.Tensor,
     moe_reduction_token_input: torch.Tensor,
-    layout_code: Optional[FP4QuantizationSFLayout],
+    layout_code: Optional[QuantizationSFLayout],
     moe_allreduce_out: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
     norm_out: Optional[torch.Tensor],

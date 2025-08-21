@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -31,20 +32,26 @@
 #else
 #include <iostream>
 
+template <typename T>
+void printArgs(T arg) {
+#ifdef TLLM_GEN_DEBUG
+  std::cout << arg;
+#endif
+}
+
 template <typename T, typename... Args>
 void printArgs(T first, Args... args) {
-#ifdef TLLM_GEN_DEBUG
-  std::cout << first;
+  printArgs(first);
   if constexpr (sizeof...(args) > 0) {
-    std::cout << " ";
+    printArgs(", ");
     printArgs(args...);
   }
-#endif
 }
 
 #define TLLM_CHECK_ERROR(cond, ...) \
   if (!(cond)) {                    \
     printArgs(__VA_ARGS__);         \
+    printArgs("\n");                \
     return false;                   \
   }
 
@@ -55,6 +62,7 @@ void printArgs(T first, Args... args) {
 #define TLLM_CHECK_WARNING(cond, ...) \
   if (!(cond)) {                      \
     printArgs(__VA_ARGS__);           \
+    printArgs("\n");                  \
     return false;                     \
   }
 
@@ -62,7 +70,7 @@ void printArgs(T first, Args... args) {
 
 #define TLLM_LOG_INFO(...) TLLM_CHECK_WARNING(false, __VA_ARGS__)
 
-#endif
+#endif  // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm {
 
@@ -100,8 +108,8 @@ struct GemmOptions {
               bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
               bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA,
               bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
-              tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-              int sfReshapeFactor, TileScheduler tileScheduler)
+              std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
+              tg::SfLayout sfLayoutC, int sfReshapeFactor, TileScheduler tileScheduler)
       : mAllReduceAlgo{allReduceAlgo},
         mBiasType{biasType},
         mBlockK(blockK),
@@ -164,6 +172,7 @@ struct GemmOptions {
         mUseTmaStore{useTmaStore},
         mUseTwoTmaLoadWarps{useTwoTmaLoadWarps},
         mUseTwoMmaWarps{useTwoMmaWarps},
+        mSfBlockSizeA{sfBlockSizeA},
         mSfLayoutA{sfLayoutA},
         mSfLayoutB{sfLayoutB},
         mSfLayoutC{sfLayoutC},
@@ -308,6 +317,8 @@ struct GemmOptions {
   bool mUseTwoTmaLoadWarps{false};
   // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
   bool mUseTwoMmaWarps{false};
+  // Block size of A. For dtypeA == E2m1 and dtypeB == E4m3.
+  std::optional<int32_t> mSfBlockSizeA{std::nullopt};
   // Scale factors layout for A.
   tg::SfLayout mSfLayoutA{tg::SfLayout::R128c4};
   // Scale factors layout for B.
@@ -379,33 +390,25 @@ inline std::string toString(trtllm::gen::MmaKind e) {
 
 inline std::string dumpOptions(GemmOptions const& options) {
   std::stringstream ss;
-  ss << "mAllReduceAlgo="
-     << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")"
-     << "," << std::endl;
-  ss << "mBiasType="
-     << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")"
-     << "," << std::endl;
+  ss << "mAllReduceAlgo=" << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo)
+     << ")" << "," << std::endl;
+  ss << "mBiasType=" << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")" << ","
+     << std::endl;
   ss << "mBlockK=" << options.mBlockK << "," << std::endl;
   ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
   ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
   ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
-  ss << "mDtypeAcc="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
+  ss << "mDtypeAcc=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
      << "," << std::endl;
-  ss << "mDtypeA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")"
+  ss << "mDtypeA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")" << ","
+     << std::endl;
+  ss << "mDtypeB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")" << ","
+     << std::endl;
+  ss << "mDtypeC=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")" << ","
+     << std::endl;
+  ss << "mDtypeMmaA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
      << "," << std::endl;
-  ss << "mDtypeB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")"
-     << "," << std::endl;
-  ss << "mDtypeC="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
+  ss << "mDtypeMmaB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
      << "," << std::endl;
   ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
   ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
@@ -422,16 +425,14 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mHoistLoadTaskInit=" << options.mHoistLoadTaskInit << "," << std::endl;
   ss << "mHoistMmaTaskTryWaits=" << options.mHoistMmaTaskTryWaits << "," << std::endl;
   ss << "mK=" << options.mK << "," << std::endl;
-  ss << "mKernelTraits={}"
-     << "," << std::endl;
-  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
-     << "," << std::endl;
-  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
-     << "," << std::endl;
+  ss << "mKernelTraits={}" << "," << std::endl;
+  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")" << ","
+     << std::endl;
+  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")" << ","
+     << std::endl;
   ss << "mM=" << options.mM << "," << std::endl;
   ss << "mMmaK=" << options.mMmaK << "," << std::endl;
-  ss << "mMmaKind="
-     << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
+  ss << "mMmaKind=" << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
      << "," << std::endl;
   ss << "mMmaM=" << options.mMmaM << "," << std::endl;
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
@@ -448,9 +449,8 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
   ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
   ss << "mSliceK=" << options.mSliceK << "," << std::endl;
-  ss << "mSplitK="
-     << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
-     << "," << std::endl;
+  ss << "mSplitK=" << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")" << ","
+     << std::endl;
   ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
   ss << "mTileM=" << options.mTileM << "," << std::endl;
   ss << "mTileN=" << options.mTileN << "," << std::endl;
@@ -465,18 +465,20 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
   ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
   ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
-  ss << "mSfLayoutA="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
+  if (options.mSfBlockSizeA.has_value()) {
+    ss << "mSfBlockSizeA=" << options.mSfBlockSizeA.value() << "," << std::endl;
+  } else {
+    ss << "mSfBlockSizeA=" << "std::nullopt" << ", " << std::endl;
+  }
+  ss << "mSfLayoutA=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutB="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
+  ss << "mSfLayoutB=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutC="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
+  ss << "mSfLayoutC=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
      << "," << std::endl;
   ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
-  ss << "mTileScheduler="
-     << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")" << std::endl;
+  ss << "mTileScheduler=" << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler)
+     << ")" << std::endl;
   return ss.str();
 }
 
@@ -690,8 +692,26 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     TLLM_CHECK_ERROR(options.mMmaN >= 64 || options.mMmaN == options.mTileN, "MmaN (",
                      options.mMmaN, ") must be >= 64 or equal to TileN (", options.mTileN, ")");
   }
+
+  if (options.mSfBlockSizeA.has_value()) {
+    // Only E2m1 x E4m3 is tested. MxE2m1 x bf16 may also work.
+    TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeB == tg::Dtype::E4m3,
+                     "sfBlockSizeA is only supported for E2m1 and E4m3 types. Found dtypeA=",
+                     tg::dtypeToString(options.mDtypeA),
+                     " dtypeB=", tg::dtypeToString(options.mDtypeB));
+
+    // sfBlockSizeA must be 16 or 32.
+    // SfBlockSizeA can also support 64 and 128, although they are not officially supported Nvida
+    // format. Note that the type conversion needs to happen before TCs.
+    // For example, convert e2m1 to e4m3 inside TmemCastA.
+    // If we want to support sfBlockSizeA=8, we can write another version of convertE2m1ToSfE4m3,
+    // which only packs 8 e2m1 elements.
+    TLLM_CHECK_ERROR(options.mSfBlockSizeA.value() == 16 || options.mSfBlockSizeA.value() == 32,
+                     "SfBlockSizeA (", options.mSfBlockSizeA.value(), ") must be 16 or 32.");
+  }
+
   if (tg::dtypeIsBlockFmt(options.mDtypeA)) {
-    int numEltsPerSfA = tg::dtypeNumEltsPerSf(options.mDtypeA);
+    int numEltsPerSfA = options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA));
     TLLM_CHECK_ERROR(options.mTileK % (4 * numEltsPerSfA) == 0, "TileK (", options.mTileK,
                      ") must be a multiple of ", (4 * numEltsPerSfA), " for typeA ",
                      gemm::toString(options.mDtypeA));

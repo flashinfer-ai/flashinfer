@@ -62,9 +62,9 @@ def _pad_scale_factors(
         ).contiguous()
 
 
-def gen_fp4_quantization_sm100_module() -> JitSpec:
+def gen_fp4_quantization_module() -> JitSpec:
     return gen_jit_spec(
-        "fp4_quantization_sm100",
+        "fp4_quantization",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
@@ -79,10 +79,12 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
+            "-DENABLE_FP4",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -92,8 +94,8 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
 
 
 @functools.cache
-def get_fp4_quantization_sm100_module():
-    module = gen_fp4_quantization_sm100_module().build_and_load()
+def get_fp4_quantization_module():
+    module = gen_fp4_quantization_module().build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
@@ -152,10 +154,35 @@ def get_fp4_quantization_sm100_module():
         )
 
     @register_custom_op(
-        "flashinfer::nvfp4_block_scale_interleave_sm100",
+        "flashinfer::mxfp4_dequantize_host",
+        mutates_args=(""),
+    )
+    def mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        return module.mxfp4_dequantize_host(
+            weight,
+            scale,
+            group_size,
+        )
+
+    @register_fake_op("flashinfer::mxfp4_dequantize_host")
+    def _fake_mxfp4_dequantize_host(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        group_size: int = 32,
+    ) -> torch.Tensor:
+        return weight.new_empty(
+            [weight.shape[0], weight.shape[1] * 2], dtype=torch.float32
+        )
+
+    @register_custom_op(
+        "flashinfer::block_scale_interleave_sm100",
         mutates_args=("",),
     )
-    def nvfp4_block_scale_interleave_sm100(
+    def block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         """Swizzle block scale tensor for FP4 format.
@@ -166,12 +193,12 @@ def get_fp4_quantization_sm100_module():
         Returns:
             torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        return module.nvfp4_block_scale_interleave(
+        return module.block_scale_interleave_sm100(
             unswizzled_sf,
         )
 
-    @register_fake_op("flashinfer::nvfp4_block_scale_interleave_sm100")
-    def _fake_nvfp4_block_scale_interleave_sm100(
+    @register_fake_op("flashinfer::block_scale_interleave_sm100")
+    def _fake_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
         return unswizzled_sf.new_empty(
@@ -206,7 +233,7 @@ def get_fp4_quantization_sm100_module():
         Returns:
             torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
         """
-        return module.e2m1_and_ufp8sf_scale_to_float(
+        return module.e2m1_and_ufp8sf_scale_to_float_sm100(
             e2m1_tensor.cpu(),
             ufp8_scale_tensor.cpu().reshape(-1),
             global_scale_tensor.cpu(),
@@ -231,8 +258,9 @@ def get_fp4_quantization_sm100_module():
     # Register the module
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
-        nvfp4_block_scale_interleave_sm100=nvfp4_block_scale_interleave_sm100,
+        block_scale_interleave_sm100=block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
+        mxfp4_dequantize_host=mxfp4_dequantize_host,
     )
 
 
@@ -282,7 +310,7 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
+    x_q, sf = get_fp4_quantization_module().fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,
@@ -299,7 +327,7 @@ def fp4_quantize(
     return x_q, sf
 
 
-def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
+def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
@@ -318,9 +346,13 @@ def nvfp4_block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     assert unswizzled_sf.dtype == torch.uint8, (
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
     )
-    return get_fp4_quantization_sm100_module().nvfp4_block_scale_interleave_sm100(
+    return get_fp4_quantization_module().block_scale_interleave_sm100(
         unswizzled_sf,
     )
+
+
+# Maintain compatibility with libraries using the old name
+nvfp4_block_scale_interleave = block_scale_interleave
 
 
 def e2m1_and_ufp8sf_scale_to_float(
@@ -348,8 +380,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-
-    return get_fp4_quantization_sm100_module().e2m1_and_ufp8sf_scale_to_float_sm100(
+    return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor,
         ufp8_scale_tensor,
         global_scale_tensor,
@@ -389,7 +420,7 @@ def shuffle_matrix_sf_a(
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
     # 128x4
-    return nvfp4_block_scale_interleave(w_shuffled)
+    return block_scale_interleave(w_shuffled)
 
 
 class SfLayout(Enum):
@@ -427,6 +458,7 @@ def nvfp4_quantize(
             - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
+
     if do_shuffle:
         # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
         assert sfLayout == SfLayout.layout_128x4
@@ -459,3 +491,64 @@ def nvfp4_quantize(
         )
 
     return a_fp4, a_sf
+
+
+def mxfp4_quantize(a):
+    """
+    Quantize input tensor to MXFP4 format.
+
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [M, K/2] with dtype uint8 (FLOAT4_E2M1X2)
+            - Scale factors tensor with shape determined by layout and sf_vec_size (uint8)
+    """
+    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+    a_fp4, a_sf = fp4_quantize(a.cuda(), a_global_sf.cuda(), 32, True, True)
+    return a_fp4, a_sf
+
+
+def mxfp4_dequantize(a_fp4, a_sf):
+    """
+    Dequantize input tensor from MXFP4 format.
+
+    Parameters:
+        a_fp4 (torch.Tensor): Quantized tensor of shape [M, K/2] with dtype uint8 (FLOAT4_E2M1X2)
+        a_sf (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size (uint8)
+
+    Returns:
+        torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
+    """
+    return e2m1_and_ufp8sf_scale_to_float(
+        a_fp4.cpu().view(torch.uint8),
+        a_sf.cpu().view(torch.uint8).reshape(-1),
+        torch.tensor([1.0], device=a_fp4.device),
+        32,
+        0,
+        True,
+    )
+
+
+def mxfp4_dequantize_host(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    """
+    Dequantize input tensor from MXFP4 format on host.
+
+    Parameters:
+        weight (torch.Tensor): Quantized tensor of shape [M, K/2] with dtype uint8 (FLOAT4_E2M1X2)
+        scale (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size (uint8)
+        group_size (int, optional): Group size for dequantization. Defaults to 32.
+
+    Returns:
+        torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
+    """
+    return get_fp4_quantization_module().mxfp4_dequantize_host(
+        weight,
+        scale,
+        group_size,
+    )
