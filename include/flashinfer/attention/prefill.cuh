@@ -1504,10 +1504,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        if (tid.y == 0 && tid.z == 0) {
-          printf("mask_iteration: %d, qo_packed_idx_base: %d, kv_idx_base: %d\n", mask_iteration,
-                 qo_packed_idx_base, kv_idx_base);
-        }
         logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                              qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
       }

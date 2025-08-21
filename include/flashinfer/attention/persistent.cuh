@@ -272,10 +272,6 @@ struct BlockBatchPagedAttentionPersistent {
               ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
               : kv_len,
           len_kv_chunk);
-      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      //   printf("bx:%d, by:%d, work_idx:%d, num_kv_chunks:%d, packed_qo_start:%d\n", blockIdx.x,
-      //   blockIdx.y, work_idx, num_kv_chunks, packed_qo_start);
-      // }
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
       const uint32_t qo_upperbound =
@@ -520,6 +516,13 @@ struct BlockBatchReductionPersistent {
 
       // remap workload
       uint32_t packed_qo_idx = i / num_kv_heads;
+      const uint32_t num_index_sets = indptr[packed_qo_idx + 1] - indptr[packed_qo_idx];
+      if (num_index_sets == 0 || num_index_sets == 1) {
+        // already write through, bypass
+        PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kReduction);
+        continue;
+      }
+
       uint32_t kv_head_idx = i % num_kv_heads;
       uint32_t qo_head_idx = packed_qo_idx % gqa_group_size;
 
@@ -533,13 +536,6 @@ struct BlockBatchReductionPersistent {
       };
 
       state_t<vec_size> st;
-      const uint32_t num_index_sets = indptr[packed_qo_idx + 1] - indptr[packed_qo_idx];
-
-      if (num_index_sets == 0 || num_index_sets == 1) {
-        // already write through, bypass
-        PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kReduction);
-        continue;
-      }
 
 #pragma unroll
       for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
