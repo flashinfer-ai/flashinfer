@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -20,22 +21,7 @@ namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 namespace details {
 
@@ -500,7 +486,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   // TODO: stage through smem for packed STG.32
   // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
-    if (layout == QuantizationSFLayout::SWIZZLED) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
@@ -769,7 +755,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   float* scale_factor;
   bool use_oneshot;
-  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
