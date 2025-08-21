@@ -3,7 +3,7 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Iterator
 
 import torch
 import torch.version
@@ -45,63 +45,61 @@ def gen_fa2(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_attention_sink: bool,
-) -> List[JitSpec]:
+) -> Iterator[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
-        return []
+        return
     if dtype_qo.itemsize == 1:
-        return []  # fp8 tensor cores not supported in fa2
+        return  # fp8 tensor cores not supported in fa2
 
-    # TODO: support for AoT sink attention.
+    yield gen_single_prefill_module(
+        backend="fa2",
+        dtype_q=dtype_qo,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_qo,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        pos_encoding_mode=0,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=False,
+    )
 
-    return [
-        gen_single_prefill_module(
-            backend="fa2",
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_fp16_qk_reduction=False,
-        ),
-        gen_batch_prefill_module(
-            backend="fa2",
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_fp16_qk_reduction=False,
-        ),
-        gen_single_decode_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        ),
-        gen_batch_decode_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        ),
-    ]
+    yield gen_batch_prefill_module(
+        backend="fa2",
+        dtype_q=dtype_qo,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_qo,
+        dtype_idx=torch.int32,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        pos_encoding_mode=0,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=False,
+    )
+
+    yield gen_single_decode_module(
+        dtype_q=dtype_qo,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_qo,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        pos_encoding_mode=0,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+    )
+
+    yield gen_batch_decode_module(
+        dtype_q=dtype_qo,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_qo,
+        dtype_idx=torch.int32,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        pos_encoding_mode=0,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+    )
 
 
 def gen_fa3(
@@ -112,47 +110,30 @@ def gen_fa3(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_attention_sink: bool,
-) -> List[JitSpec]:
+) -> Iterator[JitSpec]:
     if dtype_q != dtype_kv:
-        return []  # fa3 template do not support mixed precision
+        return  # fa3 template do not support mixed precision
     if dtype_q.itemsize == 2:
         if dtype_q != dtype_o:
-            return []  # for fp16, dtype_o must be the same as dtype_q/dtype_kv
+            return  # for fp16, dtype_o must be the same as dtype_q/dtype_kv
 
     if dtype_kv.itemsize == 1:
         if head_dim_qk == 192 or head_dim_qk == 64:
-            return []  # (192, 128) & (64, 64) not supported for fp8 yet.
+            return  # (192, 128) & (64, 64) not supported for fp8 yet.
 
-    # TODO: support for AoT sink attention.
-
-    return [
-        gen_single_prefill_module(
-            backend="fa3",
-            dtype_q=dtype_q,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_o,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_fp16_qk_reduction=False,
-        ),
-        gen_batch_prefill_module(
-            backend="fa3",
-            dtype_q=dtype_q,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_o,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_fp16_qk_reduction=False,
-        ),
-    ]
+    yield gen_batch_prefill_module(
+        backend="fa3",
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+        dtype_o=dtype_o,
+        dtype_idx=torch.int32,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        pos_encoding_mode=0,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=False,
+    )
 
 
 def gen_attention(
@@ -166,10 +147,9 @@ def gen_attention(
     has_sm100: bool,
     add_gemma: bool,
     add_oai_oss: bool,
-) -> List[JitSpec]:
+) -> Iterator[JitSpec]:
     head_dim_ckv = 512
     head_dim_kpe = 64
-    jit_specs: List[JitSpec] = []
 
     # FA2 MHA / MQA / GQA
     for (
@@ -185,14 +165,13 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
-        jit_specs += gen_fa2(
+        yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
-            use_attention_sink=False,
         )
 
     # FA3 MHA / MQA / GQA
@@ -210,7 +189,7 @@ def gen_attention(
             use_sliding_window_,
             use_logits_soft_cap_,
         ):
-            jit_specs += gen_fa3(
+            yield from gen_fa3(
                 dtype_q=dtype_qkv,
                 dtype_kv=dtype_qkv,
                 dtype_o=dtype_o,
@@ -218,7 +197,6 @@ def gen_attention(
                 head_dim_vo=head_dim_vo,
                 use_sliding_window=use_sliding_window,
                 use_logits_soft_cap=use_logits_soft_cap,
-                use_attention_sink=False,
             )
 
     # Gemma
@@ -232,14 +210,13 @@ def gen_attention(
             f16_dtype_ + f8_dtype_,
             [(True, True)],
         ):
-            jit_specs += gen_fa2(
+            yield from gen_fa2(
                 dtype_qo=dtype_qo,
                 dtype_kv=dtype_kv,
                 head_dim_qk=256,
                 head_dim_vo=256,
                 use_sliding_window=use_sliding_window,
                 use_logits_soft_cap=use_logits_soft_cap,
-                use_attention_sink=False,
             )
         if has_sm90:
             for (
@@ -251,7 +228,7 @@ def gen_attention(
                 f16_dtype_,
                 [(True, True)],
             ):
-                jit_specs += gen_fa3(
+                yield from gen_fa3(
                     dtype_q=dtype_qkv,
                     dtype_kv=dtype_qkv,
                     dtype_o=dtype_o,
@@ -259,73 +236,61 @@ def gen_attention(
                     head_dim_vo=256,
                     use_sliding_window=use_sliding_window,
                     use_logits_soft_cap=use_logits_soft_cap,
-                    use_attention_sink=False,
                 )
 
     # OAI OSS
     if add_oai_oss:
-        for (
-            dtype_qo,
-            dtype_kv,
-            use_sliding_window,
-        ) in product(
-            f16_dtype_,
-            f16_dtype_ + f8_dtype_,
-            [True],
-        ):
-            jit_specs += gen_fa2(
-                dtype_qo=dtype_qo,
-                dtype_kv=dtype_kv,
-                head_dim_qk=64,
-                head_dim_vo=64,
-                use_sliding_window=use_sliding_window,
-                use_logits_soft_cap=False,
-                use_attention_sink=True,
-            )
+        from .jit.attention import gen_batch_prefill_attention_sink_module
+
+        for dtype in f16_dtype_:
+            for backend in ["fa2", "fa3"]:
+                for use_swa in [True, False]:
+                    yield gen_batch_prefill_attention_sink_module(
+                        backend=backend,
+                        dtype_q=dtype,
+                        dtype_kv=dtype,
+                        dtype_o=dtype,
+                        dtype_idx=torch.int32,
+                        head_dim_qk=64,
+                        head_dim_vo=64,
+                        pos_encoding_mode=0,
+                        use_sliding_window=use_swa,
+                    )
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
     if has_sm100:
-        jit_specs.append(
-            gen_fmha_cutlass_sm100a_module(
-                dtype_q=torch.bfloat16,
-                dtype_kv=torch.bfloat16,
-                dtype_o=torch.bfloat16,
-                dtype_idx=torch.int32,
-                head_dim_qk=128,
-                head_dim_vo=128,
-                pos_encoding_mode=0,
-                use_sliding_window=False,
-                use_logits_soft_cap=False,
-            )
+        yield gen_fmha_cutlass_sm100a_module(
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.bfloat16,
+            dtype_o=torch.bfloat16,
+            dtype_idx=torch.int32,
+            head_dim_qk=128,
+            head_dim_vo=128,
+            pos_encoding_mode=0,
+            use_sliding_window=False,
+            use_logits_soft_cap=False,
         )
 
     # MLA
     # NOTE: fp8 kv not supported in MLA
-    mla_backend_ = ["fa2"]
-    if has_sm90:
-        mla_backend_.append("fa3")
+    mla_backend_ = ["fa2"] + (["fa3"] if has_sm90 else [])
     for dtype_qo in f16_dtype_:
-        dtype_kv = dtype_qo
         for backend in mla_backend_:
-            jit_specs.append(
-                gen_batch_mla_module(
-                    backend=backend,
-                    dtype_q=dtype_qo,
-                    dtype_kv=dtype_kv,
-                    dtype_o=dtype_qo,
-                    dtype_idx=torch.int32,
-                    head_dim_ckv=head_dim_ckv,
-                    head_dim_kpe=head_dim_kpe,
-                    use_profiler=False,
-                )
+            yield gen_batch_mla_module(
+                backend=backend,
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_qo,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                use_profiler=False,
             )
 
     # MLA SM100
     if has_sm100:
-        jit_specs.append(gen_mla_module())
-
-    return jit_specs
+        yield gen_mla_module()
 
 
 def gen_all_modules(
@@ -346,17 +311,19 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
 
-    jit_specs += gen_attention(
-        f16_dtype_,
-        f8_dtype_,
-        fa2_head_dim_,
-        fa3_head_dim_,
-        use_sliding_window_,
-        use_logits_soft_cap_,
-        has_sm90,
-        has_sm100,
-        add_gemma,
-        add_oai_oss,
+    jit_specs += list(
+        gen_attention(
+            f16_dtype_,
+            f8_dtype_,
+            fa2_head_dim_,
+            fa3_head_dim_,
+            use_sliding_window_,
+            use_logits_soft_cap_,
+            has_sm90,
+            has_sm100,
+            add_gemma,
+            add_oai_oss,
+        )
     )
 
     if add_act:
@@ -378,7 +345,6 @@ def gen_all_modules(
         from .comm.nvshmem import gen_nvshmem_module
 
         jit_specs.append(gen_nvshmem_module())
-
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
         jit_specs.append(gen_vllm_comm_module())
@@ -392,8 +358,8 @@ def gen_all_modules(
             gen_rope_module(),
             gen_sampling_module(),
         ]
-    if has_sm90:
-        jit_specs.append(get_trtllm_utils_spec())
+        if has_sm90:
+            jit_specs.append(get_trtllm_utils_spec())
 
     # dedup
     names = set()
@@ -543,10 +509,10 @@ def main():
         # True,
     ]
     add_comm = False
-    add_gemma = True
+    add_gemma = False
     add_oai_oss = True
     add_moe = False
-    add_act = True
+    add_act = False
     add_misc = True
 
     # Override
