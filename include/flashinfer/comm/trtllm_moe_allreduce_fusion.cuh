@@ -12,10 +12,10 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
-#include "./trtllm_layout.cuh"
 
 namespace flashinfer {
 
@@ -379,7 +379,7 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 }  // namespace maths
 
-using flashinfer::tensorrt_llm::QuantizationSFLayout;
+using flashinfer::QuantizationSFLayout;
 
 namespace utils {
 #define FINAL_MASK 0xffffffff

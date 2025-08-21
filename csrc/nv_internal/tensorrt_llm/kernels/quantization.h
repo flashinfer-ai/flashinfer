@@ -19,27 +19,10 @@
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/common/quantization.h"
-#include "flashinfer/comm/trtllm_layout.cuh"
+#include "flashinfer/fp4_layout.cuh"
 
 namespace tensorrt_llm {
-// using QuantizationSFLayout = flashinfer::tensorrt_llm::QuantizationSFLayout;
-
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  SWIZZLED_128x4,
-  SWIZZLED_8x4,
-
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 // This denotes the input and output data types of the block scale quantization.
 enum class BlockScaleQuantizationType {

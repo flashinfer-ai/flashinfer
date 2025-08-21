@@ -12,16 +12,16 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
-#include "./trtllm_layout.cuh"
 
 namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
-using flashinfer::tensorrt_llm::QuantizationSFLayout;
+using flashinfer::QuantizationSFLayout;
 
 namespace details {
 

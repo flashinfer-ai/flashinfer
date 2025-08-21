@@ -17,7 +17,6 @@
 #pragma once
 
 namespace flashinfer {
-namespace tensorrt_llm {
 
 enum class QuantizationSFLayout {
   // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
@@ -36,4 +35,3 @@ enum class QuantizationSFLayout {
   LINEAR
 };
 };
-};  // namespace flashinfer
