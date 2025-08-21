@@ -19,6 +19,7 @@ import math
 import os
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+import collections
 
 import torch
 import torch.version
@@ -691,3 +692,20 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+class FrozenDict(collections.abc.Mapping):
+    def __init__(self, *args, **kwargs):
+        self._d = dict(*args, **kwargs)
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self):
+        return len(self._d)
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def __hash__(self):
+        return hash(tuple(sorted(self._d.items())))
