@@ -123,7 +123,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     )
                                     if (
                                         swizzled_layout_code
-                                        == comm.QuantizationSFLayout.SWIZZLED
+                                        == comm.QuantizationSFLayout.SWIZZLED_128x4
                                     ):
                                         # TODO(Yingyi): check this
                                         padded_message_size = (

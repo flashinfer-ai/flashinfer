@@ -95,7 +95,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )
                             if (
                                 swizzled_layout_code
-                                == comm.QuantizationSFLayout.SWIZZLED
+                                == comm.QuantizationSFLayout.SWIZZLED_128x4
                             ):
                                 padded_message_size = (
                                     comm.compute_fp4_swizzled_layout_sf_size(
