@@ -23,7 +23,11 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags
+from .jit import (
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from .utils import (
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
@@ -63,6 +67,13 @@ def _pad_scale_factors(
 
 
 def gen_fp4_quantization_module() -> JitSpec:
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+
+    nvcc_flags = sm100a_nvcc_flags
+    if major == 10 and minor == 3:
+        nvcc_flags += sm103a_nvcc_flags
+
     return gen_jit_spec(
         "fp4_quantization",
         [
@@ -75,7 +86,7 @@ def gen_fp4_quantization_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
