@@ -709,3 +709,6 @@ class FrozenDict(collections.abc.Mapping):
 
     def __hash__(self):
         return hash(tuple(sorted(self._d.items())))
+
+    def __repr__(self):
+        return f"FrozenDict({self._d})"
