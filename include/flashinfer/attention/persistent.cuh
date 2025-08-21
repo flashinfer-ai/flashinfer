@@ -272,7 +272,10 @@ struct BlockBatchPagedAttentionPersistent {
               ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
               : kv_len,
           len_kv_chunk);
-
+      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      //   printf("bx:%d, by:%d, work_idx:%d, num_kv_chunks:%d, packed_qo_start:%d\n", blockIdx.x,
+      //   blockIdx.y, work_idx, num_kv_chunks, packed_qo_start);
+      // }
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
       const uint32_t qo_upperbound =
@@ -459,9 +462,8 @@ struct StateReductionKernelTraits {
   static constexpr uint32_t NUM_THREADS = NUM_THREADS_;
   static constexpr uint32_t NUM_WARPS = NUM_THREADS / 32;
 
-  static constexpr uint32_t vec_size = (16U / sizeof(DTypeIn)) > (HEAD_DIM_VO / 32U)
-                                           ? (16U / sizeof(DTypeIn))
-                                           : (HEAD_DIM_VO / 32U);
+  static constexpr uint32_t vec_size =
+      std::max<uint32_t>(16U / static_cast<uint32_t>(sizeof(DTypeIn)), HEAD_DIM_VO / 32U);
   static constexpr uint32_t bdx = HEAD_DIM_VO / vec_size;
 
   // gridDim is accessed by runtime variable and should be set by core attention

@@ -31,6 +31,8 @@ def _build_seq_len_configs():
     torch.manual_seed(42)
 
     seq_len_configs = [
+        [(2, 235)]
+        + [(1, 13355)],  # corner case with a large number of masked out tokens
         [(67, 1)],
         [(182, 1)],
         [(2011, 1)],
@@ -73,14 +75,16 @@ def _run_attention(
     Run both implementations and return (output_old, lse_old, output_new, lse_new)
     """
     dev = torch.device(device)
-    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
-    q_lens = torch.tensor(qo_lens, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=dev)
+    q_lens = torch.tensor(qo_lens, dtype=torch.int32, device=dev)
 
     seq_lens_blocks = torch.ceil(seq_lens / page_block_size).int()
 
-    q_indptr = torch.cat([torch.tensor([0]), torch.cumsum(q_lens, 0)], dim=0).int()
+    q_indptr = torch.cat(
+        [torch.tensor([0], device=dev), torch.cumsum(q_lens, 0)], dim=0
+    ).int()
     kv_indptr = torch.cat(
-        [torch.tensor([0]), torch.cumsum(seq_lens_blocks, 0)], dim=0
+        [torch.tensor([0], device=dev), torch.cumsum(seq_lens_blocks, 0)], dim=0
     ).int()
 
     num_blocks = kv_indptr[-1].item()
@@ -117,10 +121,10 @@ def _run_attention(
     )
     last_page_len = (seq_lens - 1) % page_block_size + 1
     wrapper_old.plan(
-        q_indptr.to(dev),
-        kv_indptr.to(dev),
+        q_indptr,
+        kv_indptr,
         torch.arange(num_blocks, device=dev).int(),
-        last_page_len.to(dev),
+        last_page_len,
         num_qo_heads,
         num_kv_heads,
         head_dim,
@@ -135,10 +139,10 @@ def _run_attention(
     # --------- new / mixed scheduler --------- #
     wrapper = flashinfer.BatchAttention(kv_layout=layout)
     wrapper.plan(
-        q_indptr.to(dev),
-        kv_indptr.to(dev),
+        q_indptr,
+        kv_indptr,
         torch.arange(num_blocks, device=dev).int(),
-        seq_lens.to(dev),
+        seq_lens,
         num_qo_heads,
         num_kv_heads,
         head_dim,
@@ -153,6 +157,7 @@ def _run_attention(
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse_old, lse_new, rtol=1e-2, atol=1e-2)
 
 
 # -------------------------  PyTest test case  ----------------------------- #

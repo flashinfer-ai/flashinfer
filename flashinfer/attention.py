@@ -151,11 +151,10 @@ class BatchAttention:
 
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
-            out = torch.empty_like(q)
+            out = torch.zeros_like(q)
         if lse is None:
             # lse shape: [batch_size, num_qo_heads]
-            lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
-
+            lse = torch.zeros(q.shape[0], q.shape[1], device=q.device)
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
