@@ -27,7 +27,7 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     
     device_capability = torch.cuda.get_device_capability()
     if device_capability == (10, 3):
-        if use_128x4_sf_layout and auto_tuning:
+        if backend == "cutlass" and use_128x4_sf_layout and auto_tuning:
             # FIXME (bringup) apparent fail at autotuning but likely inside cutlass module instead
             pytest.fail("There still are errors in the cutlass module and will appear to fail at autotuning")
         if backend == "trtllm":
