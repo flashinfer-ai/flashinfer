@@ -70,7 +70,7 @@ def gen_fp4_quantization_module() -> JitSpec:
     major, minor = torch.cuda.get_device_capability(device)
 
     # protecting current_device_nvcc_flags
-    assert major == 10, "currently only support Blackwell"
+    assert major == 10 or major == 11, "currently only support Blackwell and Thor"
 
     return gen_jit_spec(
         "fp4_quantization",
