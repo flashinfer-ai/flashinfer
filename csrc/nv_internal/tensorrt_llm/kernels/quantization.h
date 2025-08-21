@@ -18,8 +18,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tensorrt_llm/common/quantization.h"
 #include "flashinfer/fp4_layout.cuh"
+#include "tensorrt_llm/common/quantization.h"
 
 namespace tensorrt_llm {
 using flashinfer::QuantizationSFLayout;
