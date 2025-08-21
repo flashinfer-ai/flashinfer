@@ -2764,7 +2764,7 @@ class _MaskedBatchedMatmulCuteDSLTunableRunner(SimpleTunableRunner):
         cls,
         inputs: List[torch.Tensor],
         tactic: Any,
-        static_args: Dict[str, Any],
+        static_args,
     ):
         a_torch, sfa_torch, b_torch, sfb_torch, c_torch, masked_m, alpha = inputs
 

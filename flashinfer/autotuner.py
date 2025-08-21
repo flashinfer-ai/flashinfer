@@ -297,7 +297,7 @@ class SimpleTunableRunner(TunableRunner, ABC):
         cls,
         inputs: List[torch.Tensor],
         tactic: Any,
-        static_args: Dict[str, Any],
+        static_args,
     ):
         raise NotImplementedError
 
