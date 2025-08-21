@@ -2800,6 +2800,7 @@ def grouped_gemm_nt_masked(
 
     mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
     cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
+    sm_count = kwargs.get("sm_count", 0)
 
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")
@@ -2819,6 +2820,7 @@ def grouped_gemm_nt_masked(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+        sm_count=sm_count,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
