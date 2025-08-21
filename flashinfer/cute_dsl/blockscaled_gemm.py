@@ -49,7 +49,7 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype
+from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 
 
@@ -2416,7 +2416,7 @@ class MaskedBatchedMatmulCuteDSL:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        sm_count: int = 0,
+        sm_count: int,
     ):
         self._m = m
         self._n = n
@@ -2455,11 +2455,8 @@ class MaskedBatchedMatmulCuteDSL:
         # Compute max active clusters on current device
         hardware_info = cutlass.utils.HardwareInfo()
         self._max_active_clusters = hardware_info.get_max_active_clusters(
-            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
+            min(self._cluster_shape_mn[0] * self._cluster_shape_mn[1], sm_count)
         )
-        # if sm_count is provided, use it instead of the default max value
-        if sm_count > 0:
-            self._max_active_clusters = min(self._max_active_clusters, sm_count)
 
     @cute.jit
     def __call__(
@@ -2586,7 +2583,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     sf_vec_size: int,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
-    sm_count: int = 0,
+    sm_count: int,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2751,6 +2748,7 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    sm_count: Optional[int],
     **kwargs,
 ):
     """
@@ -2769,11 +2767,11 @@ def grouped_gemm_nt_masked(
         sf_dtype (str): Data type for scale factors. Supported: "float8_e8m0fnu", "float8_e4m3fn".
         c_dtype (str): Data type for output matrix C. Supported: "float16", "bfloat16", "float32", "float8_e4m3fn", "float8_e5m2".
         sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
+        sm_count (int, optional): Number of SMs to use. Default: max available SMs under the CTA configuration.
         mma_tiler_mn (Tuple[int, int], optional): Shape of the MMA tiler (M, N). Default: (128, 128).
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
         alpha_dtype (str, optional): Data type for alpha scaling factors.
         alpha (torch.Tensor, optional): Optional 1D tensor of shape (l,) containing per-batch scaling factors. Perform per-batch scaling out = alpha * out.
-        sm_count (int, optional): Number of SMs to use. Default: 0.
 
     Notes:
         - Legends of the input tensors:
@@ -2801,7 +2799,8 @@ def grouped_gemm_nt_masked(
 
     mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
     cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
-    sm_count = kwargs.get("sm_count", 0)
+    if sm_count is None:
+        sm_count = get_num_sm(a_torch.device)
 
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")

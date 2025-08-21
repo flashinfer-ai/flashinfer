@@ -119,8 +119,8 @@ def enumerate_m_grouped_masked():
 
 
 # Copy and modified from test_cute_dsl_blockscaled_gemm.py, may extract common logic later if needed
-def create_data(num_groups, max_m, expected_m_per_group, n, k):
-    device = torch.device("cuda:0")
+def create_data(num_groups, max_m, expected_m_per_group, n, k, device="cuda:0"):
+    device = torch.device(device)
     l = num_groups
     m = max_m
 
