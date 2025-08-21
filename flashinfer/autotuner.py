@@ -60,10 +60,17 @@ class DynamicTensorSpec:
     def __post_init__(self):
         # Set default tensor_initializers if not provided
         if self.tensor_initializers is None:
+            def create_tensor_initializer():
+                def tensor_initializer(shapes, dtype, device):
+                    # Handle uint8 specifically for FP4 packed tensors
+                    if dtype == torch.uint8:
+                        return torch.randint(0, 256, shapes, device=device, dtype=dtype)
+                    else:
+                        return torch.randn(shapes, device=device, dtype=dtype)
+                return tensor_initializer
+            
             self.tensor_initializers = [
-                lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device, dtype=dtype
-                )
+                create_tensor_initializer()
                 for _ in range(len(self.input_idx))
             ]
 
