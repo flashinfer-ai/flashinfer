@@ -708,10 +708,14 @@ def testTrtllmFp4BlockScaleMoe(args):
 
     # Optional autotune warmup (supported for FP4 TRTLlm fused MoE)
     if getattr(args, "autotune", False):
-        warmup_iters = args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
         backend = "trtllm_autotune"
         if args.verbose >= 1:
-            print(f"[INFO] Autotune warmup for FP4 block scale MoE: {warmup_iters} iters")
+            print(
+                f"[INFO] Autotune warmup for FP4 block scale MoE: {warmup_iters} iters"
+            )
         with autotune(True):
             for _ in range(warmup_iters):
                 run_fp4_moe()
@@ -1036,10 +1040,12 @@ def testCutlassFusedMoe(args):
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
     backend = "cutlass"
-    
+
     # Optional autotune warmup (supported for CUTLASS fused MoE)
     if getattr(args, "autotune", False):
-        warmup_iters = args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
         backend = "cutlass_autotune"
         if args.verbose >= 1:
             print(f"[INFO] Autotune warmup for CUTLASS fused MoE: {warmup_iters} iters")
