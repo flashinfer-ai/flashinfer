@@ -2773,6 +2773,7 @@ def grouped_gemm_nt_masked(
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
         alpha_dtype (str, optional): Data type for alpha scaling factors.
         alpha (torch.Tensor, optional): Optional 1D tensor of shape (l,) containing per-batch scaling factors. Perform per-batch scaling out = alpha * out.
+        sm_count (int, optional): Number of SMs to use. Default: 0.
 
     Notes:
         - Legends of the input tensors:
