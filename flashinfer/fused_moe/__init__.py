@@ -16,6 +16,7 @@ limitations under the License.
 
 from .core import (
     RoutingMethodType,
+    GatedActType,
     WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -30,6 +31,7 @@ from .core import (
 
 __all__ = [
     "RoutingMethodType",
+    "GatedActType",
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",

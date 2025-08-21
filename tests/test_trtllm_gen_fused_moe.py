@@ -25,6 +25,7 @@ from torch.nn import functional as F
 
 from flashinfer import (
     RoutingMethodType,
+    GatedActType,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
     mxfp8_dequantize_host,
@@ -1661,7 +1662,7 @@ def run_moe_reference_dsfp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        0,  # gated_act_type
+        GatedActType.SwiGlu.value,  # gated_act_type
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -1698,7 +1699,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        0,  # gated_act_type
+        GatedActType.SwiGlu.value,  # gated_act_type
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -1905,8 +1906,8 @@ def cache_permute_indices():
 @pytest.mark.parametrize(
     "gated_act_type",
     [
-        pytest.param(0, id="SwiGlu"),
-        pytest.param(1, id="GeGlu"),
+        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
+        pytest.param(GatedActType.GeGlu, id="GeGlu"),
     ],
 )
 def test_moe_quantization_classes(
@@ -1929,7 +1930,7 @@ def test_moe_quantization_classes(
     Each quantization class clearly shows which precision is being used.
     """
     # Skip incompatible combinations
-    if gated_act_type == 1 and (
+    if gated_act_type == GatedActType.GeGlu and (
         type(moe_impl) is not FP4Moe
         or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
         or routing_config["routing_method_type"] != RoutingMethodType.TopK
@@ -1939,7 +1940,9 @@ def test_moe_quantization_classes(
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
-    elif gated_act_type == 0 and (hidden_size > 1024 or intermediate_size > 1024):
+    elif gated_act_type == GatedActType.SwiGlu and (
+        hidden_size > 1024 or intermediate_size > 1024
+    ):
         # Skip some tests for SwiGlu for testing speed
         pytest.skip(
             f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
