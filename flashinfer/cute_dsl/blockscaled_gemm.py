@@ -2416,6 +2416,7 @@ class MaskedBatchedMatmulCuteDSL:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        sm_count: int = 0,
     ):
         self._m = m
         self._n = n
@@ -2456,6 +2457,9 @@ class MaskedBatchedMatmulCuteDSL:
         self._max_active_clusters = hardware_info.get_max_active_clusters(
             self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
+        # if sm_count is provided, use it instead of the default max value
+        if sm_count > 0:
+            self._max_active_clusters = sm_count
 
     @cute.jit
     def __call__(
@@ -2582,6 +2586,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     sf_vec_size: int,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
+    sm_count: int = 0,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2689,6 +2694,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            sm_count=sm_count,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),

@@ -120,6 +120,7 @@ def enumerate_m_grouped_masked():
 
 # Copy and modified from test_cute_dsl_blockscaled_gemm.py, may extract common logic later if needed
 def create_data(num_groups, max_m, expected_m_per_group, n, k):
+    device = torch.device("cuda:0")
     l = num_groups
     m = max_m
 
@@ -167,10 +168,10 @@ def create_data(num_groups, max_m, expected_m_per_group, n, k):
         )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
     )
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
     )
 
     masked_m_tensor = create_masked_m(

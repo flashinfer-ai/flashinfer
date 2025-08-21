@@ -56,6 +56,7 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("alpha_dtype", ["float32"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
+@pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
 def test_blockscaled_gemm_python_interface(
@@ -72,6 +73,7 @@ def test_blockscaled_gemm_python_interface(
     alpha_dtype: cutlass.dtype,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
+    sm_count: int,
     tolerance: float,
     iterations: int,
 ):
@@ -179,6 +181,7 @@ def test_blockscaled_gemm_python_interface(
             cluster_shape_mn=cluster_shape_mn,
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
+            sm_count=sm_count,
         )
 
     # compute ref output
