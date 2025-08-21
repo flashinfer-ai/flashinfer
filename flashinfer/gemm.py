@@ -65,13 +65,14 @@ from .utils import (
     is_float8,
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
 def _match_sm_version(sm_version: str):
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(torch.device("cuda"))
     device_arch = f"{major * 10 + minor}"
     return device_arch == sm_version
 
@@ -449,7 +450,7 @@ def fp8_gemm_sm100(
         runners.append(_cudnn_gemm_fp8_runner())
 
     if len(runners) == 0:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = get_compute_capability(torch.device("cuda"))
         raise ValueError(f"No valid runner found for current device sm{major}{minor}")
 
     tuner = AutoTuner.get()
