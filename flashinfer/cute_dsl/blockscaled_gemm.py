@@ -2858,6 +2858,8 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.get("alpha")
 
     tuner = AutoTuner.get()
+    tuner.stream_delay_micro_secs = 1000000
+
     runner = _MaskedBatchedMatmulCuteDSLTunableRunner(
         static_args=dict(
             ab_dtype=ab_dtype,
