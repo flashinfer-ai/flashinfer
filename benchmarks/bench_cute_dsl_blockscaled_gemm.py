@@ -9,7 +9,7 @@ import torch
 import cutlass.torch as cutlass_torch
 from flashinfer.cute_dsl.utils import get_cutlass_dtype
 from flashinfer.testing.utils import bench_kineto, count_bytes
-from flashinfer.autotune import autotune
+from flashinfer.autotuner import autotune
 
 ab_dtype = "float4_e2m1fn"
 sf_dtype = "float8_e4m3fn"
