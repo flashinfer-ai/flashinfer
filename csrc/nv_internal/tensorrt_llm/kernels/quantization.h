@@ -19,8 +19,10 @@
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/common/quantization.h"
+#include "flashinfer/comm/trtllm_layout.cuh"
 
 namespace tensorrt_llm {
+// using QuantizationSFLayout = flashinfer::tensorrt_llm::QuantizationSFLayout;
 
 enum class QuantizationSFLayout {
   // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
