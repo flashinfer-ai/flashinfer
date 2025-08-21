@@ -71,8 +71,8 @@ from .utils import (
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
-def _match_sm_version(sm_version: str):
-    major, minor = get_compute_capability(torch.device("cuda"))
+def _match_sm_version(device: torch.device, sm_version: str):
+    major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
     return device_arch == sm_version
 
@@ -441,7 +441,7 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100 = _match_sm_version("100")
+    is_sm100 = _match_sm_version(a.device, "100")
     if "cutlass" in runner_names and is_sm100 and not is_e5m2:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
@@ -1882,7 +1882,7 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not _match_sm_version("100"):
+    if not _match_sm_version(a.device, "100"):
         raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
 
     if backend == "cutlass":
@@ -2151,7 +2151,7 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if not _match_sm_version("100"):
+    if not _match_sm_version(a.device, "100"):
         raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
 
     int_workspace_buffer = _get_cache_buf(
