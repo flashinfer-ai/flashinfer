@@ -14,10 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import cuda.bindings.driver as driver
-import cuda.bindings.runtime as runtime
-import cuda.cudart as cudart
-import cuda.nvrtc as nvrtc
+from flashinfer.utils import has_cuda_cudart
+
+# Check if cuda.cudart module is available and import accordingly
+if has_cuda_cudart():
+    # cuda-python <= 12.9 (has cuda.cudart)
+    import cuda.bindings.driver as driver
+    import cuda.bindings.runtime as runtime
+    import cuda.cudart as cudart
+    import cuda.nvrtc as nvrtc
+else:
+    # cuda-python >= 13.0 (no cuda.cudart, use runtime as cudart)
+    from cuda.bindings import driver, nvrtc, runtime
+
+    cudart = runtime  # Alias runtime as cudart for compatibility
 
 
 def _cudaGetErrorEnum(error):

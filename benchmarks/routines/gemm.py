@@ -175,6 +175,10 @@ def testGemmFp8NtGroupwise(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     ## Parse input arguments
     backends = args.backends
@@ -343,6 +347,7 @@ def testGemmFp8NtGroupwise(args):
             cur_res["out_dtype"] = out_dtype
             cur_res["mma_sm"] = mma_sm
             cur_res["backend"] = backend
+            cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res
 
@@ -369,6 +374,10 @@ def testGroupGemmFp8NtGroupwise(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     ## Parse input arguments
     backends = ["cutlass"]  # Cutlass is currently the only supported backend
@@ -521,6 +530,7 @@ def testGroupGemmFp8NtGroupwise(args):
             cur_res["out_dtype"] = out_dtype
             cur_res["mma_sm"] = mma_sm
             cur_res["backend"] = backend
+            cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res
 
@@ -547,6 +557,10 @@ def testBmmFp8(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     ## Parse input arguments
     backends = args.backends
@@ -600,7 +614,7 @@ def testBmmFp8(args):
         print(f"[VVERBOSE] {mat2_inv_s.dtype = }")
 
     def run_backend(backend):
-        if backend in ["cudnn", "cublas"]:
+        if backend in ["cudnn", "cublas", "cutlass"]:
             return flashinfer.gemm.bmm_fp8(
                 A=input_fp8,
                 B=mat2_fp8,
@@ -701,6 +715,7 @@ def testBmmFp8(args):
                 cur_res["mat2_dtype"] = mat2_dtype
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
 
@@ -727,6 +742,10 @@ def testMmFp4(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
 
     ## Parse input arguments
     backends = args.backends
@@ -904,5 +923,6 @@ def testMmFp4(args):
                 cur_res["out_dtype"] = res_dtype
                 cur_res["use_128x4_sf_layout"] = use_128x4_sf_layout
                 cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
