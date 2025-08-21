@@ -2741,6 +2741,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
+# WARN: Tuning may be related to data content, e.g. `masked_m`
+# Thus we may only do auto tuning statically with controlled data and save the tuned results
 class _MaskedBatchedMatmulCuteDSLTunableRunner(SimpleTunableRunner):
     PARTIAL_NAME = "MaskedBatchedMatmulCuteDSL"
 
