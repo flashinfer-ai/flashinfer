@@ -3,6 +3,8 @@ from typing import Optional, Literal
 import torch
 import numpy as np
 from flashinfer import (
+    RoutingMethodType,
+    GatedActType,
     fp4_quantize,
     mxfp8_quantize,
     next_positive_power_of_2,
@@ -156,10 +158,10 @@ def bench_trtllm_gen_fused_moe_autotuner(
         num_experts,
         None,  # routed_scaling_factor
         tile_tokens_dim,
-        1,
+        RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
-        0,  # gated_act_type
+        GatedActType.SwiGlu.value,  # gated_act_type
         None,
         num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
     )
