@@ -3122,7 +3122,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-def trtllm_ragged_attention(
+def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -3139,8 +3139,10 @@ def trtllm_ragged_attention(
     cum_seq_lens_kv: torch.Tensor,
     enable_pdl: bool,
     is_causal: bool,
+    return_lse: bool,
     out: Optional[torch.Tensor] = None,
     attention_sinks: Optional[List[torch.Tensor]] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -3199,6 +3201,14 @@ def trtllm_ragged_attention(
             device=query.device,
             dtype=query.dtype,
         )
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            2,
+            device=query.device,
+            dtype=torch.float32,
+        )
 
     run_func(
         out,
@@ -3220,8 +3230,13 @@ def trtllm_ragged_attention(
         enable_pdl,
         is_causal,
         attention_sinks,
+        lse,
     )
-    return out
+    if return_lse:
+        lse = (lse[:, :, 0] + torch.log(lse[:, :, 1])) / math.log(2)
+        return out, lse
+    else:
+        return out
 
 
 def trtllm_batch_context_with_kv_cache(

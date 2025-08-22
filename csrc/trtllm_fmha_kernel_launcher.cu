@@ -318,12 +318,12 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
 
 void trtllm_ragged_attention_launcher(
     void* out, void* query, void* key, void* value, void* workspace_buffer, int* seq_lens,
-    int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, Data_type q_data_type,
-    Data_type kv_data_type, Data_type o_data_type, int64_t max_q_len, int64_t max_kv_len,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk, int64_t head_dim_v,
-    int64_t sum_seq_q, int64_t sum_seq_kv, double bmm1_scale, double bmm2_scale, double o_sf_scale,
-    int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl, bool is_causal,
-    int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
+    int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, float2* lse,
+    Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type, int64_t max_q_len,
+    int64_t max_kv_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
+    int64_t head_dim_v, int64_t sum_seq_q, int64_t sum_seq_kv, double bmm1_scale, double bmm2_scale,
+    double o_sf_scale, int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl,
+    bool is_causal, int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
     cudaStream_t stream) {
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
@@ -370,6 +370,7 @@ void trtllm_ragged_attention_launcher(
   runner_params.mTileScheduler = TileScheduler::Persistent;
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
+  runner_params.softmaxStatsPtr = lse;
   size_t max_batch_size = 8192;
   size_t max_num_qo_heads = 256;
   size_t num_semaphores =
@@ -394,12 +395,18 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
                              double o_sf_scale, int64_t batch_size, int64_t window_left,
                              at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
                              int64_t sm_count, bool enable_pdl, bool is_causal,
-                             std::optional<at::Tensor> attention_sinks) {
+                             std::optional<at::Tensor> attention_sinks,
+                             std::optional<at::Tensor> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks) {
     TORCH_CHECK(attention_sinks->scalar_type() == at::ScalarType::Float,
                 "attention_sinks must be a float tensor");
     attention_sinks_ptr = attention_sinks->data_ptr<float>();
+  }
+  float2* lse_ptr = nullptr;
+  if (lse) {
+    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be a float tensor");
+    lse_ptr = reinterpret_cast<float2*>(lse->data_ptr<float>());
   }
   TORCH_CHECK(out.dim() == 3, "out must be a 3D tensor");
   TORCH_CHECK(query.dim() == 3, "query must be a 3D tensor");
@@ -428,7 +435,7 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(seq_lens.data_ptr()),
       static_cast<int*>(cum_seq_lens_q.data_ptr()), static_cast<int*>(cum_seq_lens_kv.data_ptr()),
-      attention_sinks_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
+      attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale,
       bmm2_scale, o_sf_scale, batch_size, window_left, sm_count, enable_pdl, is_causal,
       k_stride_keys_values, k_stride_heads, k_stride_batch, v_stride_keys_values, v_stride_heads,

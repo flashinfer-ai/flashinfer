@@ -578,11 +578,11 @@ def test_trtllm_gen_prefill_deepseek(
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
 
-    q = torch.ones(
+    q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
 
-    k_cache = torch.ones(
+    k_cache = torch.randn(
         (cumsum_s_kv, num_kv_heads, head_dim_qk),
         device=device,
         dtype=torch.bfloat16,
@@ -636,11 +636,11 @@ def test_trtllm_gen_prefill_deepseek(
         kv_data_type=torch.bfloat16,
     )
     output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
-
     output = torch.empty_like(output_ref)
-    bmm1_scale = 1.0 / (head_dim_qk**0.5)
+
+    bmm1_scale = scale
     bmm2_scale = 1.0
-    output_trtllm = flashinfer.prefill.trtllm_ragged_attention(
+    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
         q,
         k_cache,
         v_cache,
@@ -657,12 +657,18 @@ def test_trtllm_gen_prefill_deepseek(
         kv_indptr,
         False,
         causal,
+        True,
         output,
     )
-
     torch.testing.assert_close(
         output_trtllm,
         output_ref,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        lse_trtllm,
+        lse_ref,
         atol=1e-2,
         rtol=1e-2,
     )
