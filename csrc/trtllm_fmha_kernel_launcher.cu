@@ -382,7 +382,7 @@ void trtllm_ragged_attention_launcher(
       round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
   runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
       static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t) +
-      sizeof(float) * 2 * max_num_qo_heads * max_batch_size);
+      sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
   runner_params.multiCtasKvCounterPtr =
       reinterpret_cast<int32_t*>(static_cast<char*>(workspace_buffer) +
                                  sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
