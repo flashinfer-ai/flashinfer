@@ -658,7 +658,7 @@ def test_trtllm_gen_prefill_deepseek(
         False,
         causal,
         True,
-        output,
+        out=output,
     )
     torch.testing.assert_close(
         output_trtllm,

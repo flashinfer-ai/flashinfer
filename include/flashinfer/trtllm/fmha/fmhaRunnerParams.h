@@ -217,6 +217,9 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
+  // The LSE buffer.
+  float* lsePtr;
+
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
   // The output buffer.

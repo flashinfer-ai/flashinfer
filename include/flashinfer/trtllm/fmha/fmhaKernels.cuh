@@ -30,6 +30,7 @@
 #include "cuda_runtime_api.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "lse.cuh"
 
 #ifdef TLLM_GEN_FMHA_CUBIN_PATH
 static const std::string tllm_gen_fmha_cubin_path = std::string(TLLM_GEN_FMHA_CUBIN_PATH);
@@ -241,6 +242,10 @@ class TllmGenFmhaKernel {
         }
       }
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+
+      flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
+                                   params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
+                                   params.stream);
       // Break the while op.
       break;
     }

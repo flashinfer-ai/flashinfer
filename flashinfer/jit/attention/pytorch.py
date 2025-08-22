@@ -1491,7 +1491,6 @@ def trtllm_gen_fmha_module():
     return gen_jit_spec(
         "fmha_gen",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],

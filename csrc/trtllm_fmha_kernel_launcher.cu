@@ -21,7 +21,7 @@
 #include <nvrtc.h>
 
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
-#include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
+// #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
 #include <optional>
@@ -318,7 +318,7 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
 
 void trtllm_ragged_attention_launcher(
     void* out, void* query, void* key, void* value, void* workspace_buffer, int* seq_lens,
-    int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, float2* lse,
+    int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, float* lse,
     Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type, int64_t max_q_len,
     int64_t max_kv_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
     int64_t head_dim_v, int64_t sum_seq_q, int64_t sum_seq_kv, double bmm1_scale, double bmm2_scale,
@@ -376,14 +376,18 @@ void trtllm_ragged_attention_launcher(
   runner_params.mTileScheduler = TileScheduler::Persistent;
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
-  runner_params.softmaxStatsPtr = lse;
+  runner_params.lsePtr = lse;
   size_t max_batch_size = 8192;
   size_t max_num_qo_heads = 256;
   size_t num_semaphores =
       round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
   runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-      static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
-  runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
+      static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t) +
+      sizeof(float) * 2 * max_num_qo_heads * max_batch_size);
+  runner_params.multiCtasKvCounterPtr =
+      reinterpret_cast<int32_t*>(static_cast<char*>(workspace_buffer) +
+                                 sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
+  runner_params.softmaxStatsPtr = reinterpret_cast<float2*>(workspace_buffer);
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
   if (!foundKernels) {
@@ -409,10 +413,10 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
                 "attention_sinks must be a float tensor");
     attention_sinks_ptr = attention_sinks->data_ptr<float>();
   }
-  float2* lse_ptr = nullptr;
+  float* lse_ptr = nullptr;
   if (lse) {
     TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be a float tensor");
-    lse_ptr = reinterpret_cast<float2*>(lse->data_ptr<float>());
+    lse_ptr = lse->data_ptr<float>();
   }
   TORCH_CHECK(out.dim() == 3, "out must be a 3D tensor");
   TORCH_CHECK(query.dim() == 3, "query must be a 3D tensor");

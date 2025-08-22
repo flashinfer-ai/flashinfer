@@ -3140,10 +3140,10 @@ def trtllm_ragged_attention_deepseek(
     enable_pdl: bool,
     is_causal: bool,
     return_lse: bool,
-    out: Optional[torch.Tensor] = None,
     attention_sinks: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -3179,10 +3179,19 @@ def trtllm_ragged_attention_deepseek(
         enable pdl
     is_causal : bool
         is causal
-    out : Optional[torch.Tensor]
-        output tensor
     attention_sinks : Optional[torch.Tensor]
         attention sinks
+    out : Optional[torch.Tensor]
+        output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
+    lse : Optional[torch.Tensor]
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
     assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
@@ -3205,7 +3214,6 @@ def trtllm_ragged_attention_deepseek(
         lse = torch.empty(
             query.shape[0],
             query.shape[1],
-            2,
             device=query.device,
             dtype=torch.float32,
         )
@@ -3233,7 +3241,6 @@ def trtllm_ragged_attention_deepseek(
         lse,
     )
     if return_lse:
-        lse = (lse[:, :, 0] + torch.log(lse[:, :, 1])) / math.log(2)
         return out, lse
     else:
         return out
