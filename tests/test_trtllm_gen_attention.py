@@ -36,9 +36,17 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
-def generate_seq_lens(batch_size, max_q_len, max_in_kv_len):
+def generate_seq_lens_prefill(batch_size, max_q_len, max_in_kv_len):
     q_lens = torch.randint(1, max_q_len + 1, (batch_size,), dtype=torch.int32)
     q_lens[-1] = max_q_len
+    in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
+    in_kv_lens[-1] = max_in_kv_len
+    seq_lens = q_lens + in_kv_lens
+    return q_lens, in_kv_lens, seq_lens
+
+
+def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len):
+    q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
     in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
     in_kv_lens[-1] = max_in_kv_len
     seq_lens = q_lens + in_kv_lens
@@ -264,7 +272,7 @@ def test_trtllm_batch_prefill(
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
-    q_lens, in_kv_lens, seq_lens = generate_seq_lens(
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
         batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
     )
 
@@ -392,6 +400,7 @@ def test_trtllm_batch_prefill(
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
+@pytest.mark.parametrize("q_len_per_req", [1])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_kv_heads", [2, 4])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
@@ -411,6 +420,7 @@ def test_trtllm_batch_prefill(
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
+    q_len_per_req,
     page_size,
     num_kv_heads,
     head_grp_size,
@@ -423,13 +433,12 @@ def test_trtllm_batch_decode(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_Q_LEN = 1  # must be 1 for decode test
     MAX_IN_KV_LEN = 110
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
-    q_lens, in_kv_lens, seq_lens = generate_seq_lens(
-        batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+        batch_size, q_len_per_req, MAX_IN_KV_LEN
     )
 
     # Create query tensor and related data
@@ -504,6 +513,7 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        q_len_per_req=q_len_per_req,
     )
 
     if o_dtype == "nvfp4":
@@ -519,7 +529,10 @@ def test_trtllm_batch_decode(
 
     # convert to float32 for fp8 is not supported by assert_close
     torch.testing.assert_close(
-        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
@@ -537,11 +550,31 @@ def test_trtllm_batch_decode(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            q_len_per_req=q_len_per_req,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
             torch.testing.assert_close(
-                output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
+                output.view(batch_size, q_len_per_req, num_qo_heads, head_dim).float(),
+                output_wrapper.float(),
+                rtol=1e-1,
+                atol=1e-1,
             )
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_decode(
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="half",
+        kv_dtype="half",
+        o_dtype="half",
+        enable_pdl=True,
+    )
