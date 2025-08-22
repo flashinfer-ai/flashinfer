@@ -669,6 +669,6 @@ def test_trtllm_gen_prefill_deepseek(
     torch.testing.assert_close(
         lse_trtllm,
         lse_ref,
-        atol=1e-2,
-        rtol=1e-2,
+        atol=1e-3,
+        rtol=1e-3,
     )

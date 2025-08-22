@@ -40,7 +40,7 @@ __global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restric
 
 inline cudaError_t ComputeLSEFromMD(float2* md, float* lse, int n, bool launch_with_pdl,
                                     cudaStream_t stream) {
-  int num_threads = UpPowerOfTwo(n);
+  int num_threads = std::min(1024, UpPowerOfTwo(n));
   int num_blocks = ceil_div(n, num_threads);
   cudaLaunchConfig_t config;
   config.gridDim = num_blocks;
