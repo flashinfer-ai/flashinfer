@@ -434,6 +434,15 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline int getSMRegisters() {
+  int device{-1};
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int regs_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&regs_per_block, cudaDevAttrMaxRegistersPerBlock, device));
+  return regs_per_block;
+}
+
 inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
                                                   std::optional<int> numRows, int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
@@ -1309,6 +1318,16 @@ cudaError_t launch_oneshot_lamport(AllReduceFusionParams<T> const& params,
   return cudaSuccess;
 }
 
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
+          bool TriggerCompletionAtEnd = true>
+int get_registers_per_thread_oneshot() {
+  auto kernel =
+      allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, TriggerCompletionAtEnd>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
+}
+
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaunchConfig_t& cfg,
                                 std::array<int, NRanks> begin_tokens,
@@ -1317,6 +1336,14 @@ cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaun
       cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>,
                          params, begin_tokens, token_num_per_ranks));
   return cudaSuccess;
+}
+
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+int get_registers_per_thread_twoshot() {
+  auto kernel = allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
 }
 
 bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
@@ -1360,7 +1387,23 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     cluster_size /= 2;
   }
   int sm_count = get_sm_count();
-  while (cluster_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512) {
+  int registers_per_thread;
+  if (oneshot) {
+    if (params.trigger_completion_at_end) {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, true>();
+    } else {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, false>();
+    }
+  } else {
+    registers_per_thread = get_registers_per_thread_twoshot<Pattern, T, NRanks, Fp32Acc>();
+  }
+  static int max_registers = -1;
+  if (max_registers < 0) {
+    max_registers = utils::getSMRegisters();
+  }
+  int max_threads_per_block = min(max_registers / registers_per_thread, 1024);
+  while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
+         threads_per_block <= max_threads_per_block / 2) {
     threads_per_block *= 2;
     cluster_size /= 2;
   }
