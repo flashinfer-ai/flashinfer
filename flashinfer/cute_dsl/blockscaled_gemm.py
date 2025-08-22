@@ -2454,8 +2454,11 @@ class MaskedBatchedMatmulCuteDSL:
 
         # Compute max active clusters on current device
         hardware_info = cutlass.utils.HardwareInfo()
-        self._max_active_clusters = hardware_info.get_max_active_clusters(
-            min(self._cluster_shape_mn[0] * self._cluster_shape_mn[1], sm_count)
+        self._max_active_clusters = min(
+            hardware_info.get_max_active_clusters(
+                self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
+            ),
+            sm_count,
         )
 
     @cute.jit
