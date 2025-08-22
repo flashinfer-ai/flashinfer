@@ -1292,9 +1292,8 @@ int get_sm_count() {
   if (sm_count == 0) {
     int device_id;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&device_id));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    FLASHINFER_CUDA_CALL(
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   }
   return sm_count;
 }
