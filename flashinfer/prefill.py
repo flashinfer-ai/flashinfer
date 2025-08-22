@@ -3141,7 +3141,7 @@ def trtllm_ragged_attention_deepseek(
     is_causal: bool,
     return_lse: bool,
     out: Optional[torch.Tensor] = None,
-    attention_sinks: Optional[List[torch.Tensor]] = None,
+    attention_sinks: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -3181,7 +3181,7 @@ def trtllm_ragged_attention_deepseek(
         is causal
     out : Optional[torch.Tensor]
         output tensor
-    attention_sinks : Optional[List[torch.Tensor]]
+    attention_sinks : Optional[torch.Tensor]
         attention sinks
     """
     assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (

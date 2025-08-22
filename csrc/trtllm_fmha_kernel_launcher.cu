@@ -326,6 +326,12 @@ void trtllm_ragged_attention_launcher(
     bool is_causal, int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
     cudaStream_t stream) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
+            << " and num_qo_heads: " << num_qo_heads;
+    FLASHINFER_ERROR(err_msg.str());
+  }
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params;
 
