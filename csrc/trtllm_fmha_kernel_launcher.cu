@@ -21,7 +21,6 @@
 #include <nvrtc.h>
 
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
-// #include <flashinfer/trtllm/fmha/gen_kernel_launcher.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
 #include <optional>
