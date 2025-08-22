@@ -973,10 +973,10 @@ void decode(int64_t max_s_kv, at::Tensor q, at::Tensor k_cache, at::Tensor v_cac
                                     CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1));
     }
 
-    // Get number of SMs perf GPU
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    sm_count = prop.multiProcessorCount;
+    // Get number of SMs per GPU
+    int device_id;
+    cudaGetDevice(&device_id);
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
   }
 
   int64_t b = q.size(0);

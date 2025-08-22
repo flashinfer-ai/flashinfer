@@ -919,9 +919,7 @@ int get_sm_count() {
     auto status = cudaGetDevice(&device_id);
     FLASHINFER_CHECK(status == cudaSuccess, "cudaGetDevice failed with error code " +
                                                 std::string(cudaGetErrorString(status)));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
   }
   return sm_count;
 }
