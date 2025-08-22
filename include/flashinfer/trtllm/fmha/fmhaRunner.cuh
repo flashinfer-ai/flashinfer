@@ -24,19 +24,35 @@
 class TllmGenFmhaRunner {
  public:
   // Constructor.
-  explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
+  explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
+      : mSM(getSMVersion()), mDtypeQ(dtypeQ), mDtypeKv(dtypeKv), mDtypeOut(dtypeOut) {
+    TORCH_CHECK(mSM == kSM_100, "Unsupported architecture");
+    TORCH_CHECK(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
+                "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));
+    TORCH_CHECK(
+        mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
+        "Unsupported Kv data type: " + std::string(toStr(mDtypeKv)));
+    TORCH_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
+                    mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
+                "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
+    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
+  }
 
   TllmGenFmhaRunner() = default;
 
   // Check if fmha is supported.
-  bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) const;
+  bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) {
+    return mKernel->checkIfKernelExist(runnerParams).first;
+  }
 
   // Check if fmha is supported with additional info.
   std::pair<bool, std::string> isSupportedWithInfo(
-      TllmGenFmhaRunnerParams const& runnerParams) const;
+      TllmGenFmhaRunnerParams const& runnerParams) const {
+    return mKernel->checkIfKernelExist(runnerParams);
+  }
 
   // Run the fmha kernel.
-  void run(TllmGenFmhaRunnerParams const&);
+  void run(TllmGenFmhaRunnerParams const& runnerParams) { mKernel->run(runnerParams); }
 
  private:
   // The input/output datatype.
