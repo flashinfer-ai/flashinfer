@@ -33,3 +33,15 @@ Code Contribution Procedure
 * (Optional) Add benchmark suites under `benchmark/`
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
+
+# Release Versioning
+
+When incrementing a version and creating a release, follow [Semantic Versioning](https://packaging.python.org/en/latest/discussions/versioning/) (`major.minor.patch`) [^1]. In particular:
+
+* major increment signals incompatible API changes
+* minor increment signals added functionality that is backwards-compatible (e.g. new kernels, new SM support, etc)
+* patch increment signals backwards-compatible bug fixes (both for functional and performance issues)
+
+Optionally, use post-releases (e.g., `X.Y.Zpost1`) for minor changes, like a documentation change.
+
+[^1]: We have not followed this strictly through v0.2.13. But after v0.2.13, the versioning should follow SemVer.
