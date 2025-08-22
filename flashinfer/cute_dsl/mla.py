@@ -26,21 +26,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
-import enum
+
 import math
-import time
-from typing import Type, Tuple, Optional, Union, Callable, overload, Literal
+from typing import Type, Tuple, Optional, Union, overload, Literal
 from types import SimpleNamespace
 
 import torch
-from torch._prims.executor import P
-import torch.nn.functional as F
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
@@ -50,6 +45,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
@@ -242,6 +238,7 @@ def create_mla_static_tile_scheduler(
 
 
 LOG2_E = 1.4426950408889634074
+
 
 class BlackwellMultiLatentAttentionForward:
     def __init__(
@@ -594,9 +591,9 @@ class BlackwellMultiLatentAttentionForward:
         vc_copy_size = cute.size_in_bytes(self.v_dtype, vc_smem_layout) * cute.size(
             pv_tiled_mma.thr_id.shape
         )
-        assert (
-            kc_copy_size == vc_copy_size
-        ), "kc_copy_size and vc_copy_size must be the same"
+        assert kc_copy_size == vc_copy_size, (
+            "kc_copy_size and vc_copy_size must be the same"
+        )
 
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_kc_bytes = kc_copy_size
@@ -648,7 +645,6 @@ class BlackwellMultiLatentAttentionForward:
 
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
-
 
         softmax_scale_log2 = softmax_scale * LOG2_E
         # Launch the kernel synchronously
@@ -868,9 +864,11 @@ class BlackwellMultiLatentAttentionForward:
             storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk
         )
         if cutlass.const_expr(self.is_cpasync):
-            load_pt_pipeline = self.make_and_init_load_pt_pipeline(
-                storage.load_pt_mbar_ptr.data_ptr()
-            )
+            # TODO: Implement page table loading pipeline
+            # load_pt_pipeline = self.make_and_init_load_pt_pipeline(
+            #     storage.load_pt_mbar_ptr.data_ptr()
+            # )
+            pass
 
         # Cluster arrive after barrier init
         if cutlass.const_expr(cute.size(self.cluster_shape_mnk) > 1):
@@ -1253,7 +1251,7 @@ class BlackwellMultiLatentAttentionForward:
             # calculate the global_lse
             global_lse = (
                 lse_max + cute.arch.log2(sum_lse)
-                if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse
+                if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
                 else self.lse_dtype.inf
             )
             if tidx == 0:
@@ -1737,6 +1735,7 @@ class BlackwellMultiLatentAttentionForward:
         pipeline.PipelineState,
         pipeline.PipelineState,
         pipeline.PipelineState,
+        pipeline.PipelineState,
     ]:
         """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and pipeline states.
 
@@ -1784,9 +1783,9 @@ class BlackwellMultiLatentAttentionForward:
             cute.select(self.mma_pv_tiler, mode=[0, 1])
         )
         # mma O has 1 stage.
-        assert (
-            self.mma_o_stage == 1
-        ), "mma O has 1 stage, otherwise the tmem usage exceeds the limit."
+        assert self.mma_o_stage == 1, (
+            "mma O has 1 stage, otherwise the tmem usage exceeds the limit."
+        )
         tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
         tOtO_layout = cute.append(
             tOtO.layout,
@@ -1858,7 +1857,7 @@ class BlackwellMultiLatentAttentionForward:
                 )
                 k_tile_count -= 1
             # release q consumer states
-            for i in cutlass.range_constexpr(self.iterations_qk):
+            for _ in cutlass.range_constexpr(self.iterations_qk):
                 load_q_pipeline.consumer_release(load_q_release_state)
                 load_q_release_state.advance()
             (
@@ -2382,7 +2381,12 @@ class BlackwellMultiLatentAttentionForward:
     def _tmem_load_partition(
         self, common_params: SimpleNamespace, tiled_mma_pv: cute.TiledMma, iter_n: int
     ) -> tuple[
-        cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
     ]:
         """Tensor memory load partition for rescale and epilogue.
 
@@ -2641,7 +2645,8 @@ class BlackwellMultiLatentAttentionForward:
                     (1, None, 1),
                 )
                 cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mAccLSE[
+                    cute.make_identity_tensor(
+                        epilogue_params.mAccLSE[
                             None, common_params.blk_coord[3], None
                         ].shape
                     ),
@@ -2859,7 +2864,6 @@ class BlackwellMultiLatentAttentionForward:
 
         return tile_sched_params, grid
 
-
     @staticmethod
     def get_workspace_size(
         H: int,
@@ -3036,7 +3040,10 @@ class BlackwellMultiLatentAttentionForward:
             return False
         return True
 
-def create_page_table(batch_size, seq_len, is_var_seq, use_page_table, page_size):
+
+def create_page_table(
+    batch_size, seq_len, is_var_seq, use_page_table, page_size, cache_seqs_torch
+):
     page_table_ref, page_table, page_table_gpu = None, None, None
     if use_page_table:
         max_seq_len = seq_len if not is_var_seq else torch.max(cache_seqs_torch)
@@ -3047,10 +3054,11 @@ def create_page_table(batch_size, seq_len, is_var_seq, use_page_table, page_size
             for j in range(page_count):
                 page_table_ref[b, j] = b + j * batch_size
         page_table_gpu = page_table_ref.permute(1, 0).cuda()
-        page_table = from_dlpack(
-            page_table_gpu, assumed_align=16
-        ).mark_layout_dynamic(leading_dim=0)
+        page_table = from_dlpack(page_table_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=0
+        )
     return page_table_ref, page_table, page_table_gpu
+
 
 def create_block_split_kvs(
     batch_size,
@@ -3066,13 +3074,11 @@ def create_block_split_kvs(
     if is_var_split_kv:
         block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
         for b in range(batch_size):
-            block_split_kvs_ref[b] = (
-                BlackwellMultiLatentAttentionForward.get_split_kv(
-                    batch_size,
-                    cache_seqs_ref[b].item(),
-                    mma_qk_tiler_mn,
-                    max_active_clusters * cluster_shape_mnk[0],
-                )
+            block_split_kvs_ref[b] = BlackwellMultiLatentAttentionForward.get_split_kv(
+                batch_size,
+                cache_seqs_ref[b].item(),
+                mma_qk_tiler_mn,
+                max_active_clusters * cluster_shape_mnk[0],
             )
         split_kv = torch.max(block_split_kvs_ref).item()
         block_split_kvs_gpu = block_split_kvs_ref.cuda()
@@ -3088,6 +3094,7 @@ def create_block_split_kvs(
         )
     return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
+
 def create_workspace(num_heads, latent_dim, batch_size, split_kv, acc_dtype):
     workspace_size = BlackwellMultiLatentAttentionForward.get_workspace_size(
         num_heads,
@@ -3102,6 +3109,7 @@ def create_workspace(num_heads, latent_dim, batch_size, split_kv, acc_dtype):
         workspace_torch = torch.empty([workspace_size], dtype=torch.int8).cuda()
         workspace = from_dlpack(workspace_torch, assumed_align=16)
     return workspace, workspace_torch
+
 
 class BatchMLAPagedAttentionWrapperCuteDSL:
     def __init__(
@@ -3132,7 +3140,6 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._acc_dtype = cutlass.Float32
         self._lse_dtype = cutlass.Float32
         self._split_kv = split_kv
-
 
     def plan(
         self,
@@ -3209,11 +3216,11 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         self._causal = causal
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
-        self._use_2cta_instrs = True if num_heads == 128 else False
+        self._use_2cta_instrs = num_heads == 128
         self._mma_qk_tiler_mn = (128, 128)
         self._mma_pv_tiler_mn = (128, 256)
         self._cluster_shape_mnk = (2, 1, 1)
-        
+
         # Set data types based on input parameters
         if q_data_type == torch.bfloat16:
             self._in_dtype = cutlass.BFloat16
@@ -3235,10 +3242,18 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             batch_size * 1, num_heads, head_dim_kpe, dtype=q_data_type, device="cuda"
         )
         ckv = torch.randn(
-            batch_size * pages_num, page_size, head_dim_ckv, dtype=q_data_type, device="cuda"
+            batch_size * pages_num,
+            page_size,
+            head_dim_ckv,
+            dtype=q_data_type,
+            device="cuda",
         )
         kpe = torch.randn(
-            batch_size * pages_num, page_size, head_dim_kpe, dtype=q_data_type, device="cuda"
+            batch_size * pages_num,
+            page_size,
+            head_dim_kpe,
+            dtype=q_data_type,
+            device="cuda",
         )
 
         if not BlackwellMultiLatentAttentionForward.can_implement(
@@ -3271,46 +3286,78 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
                 f"{self._use_page_table}, {page_size}"
             )
 
-
         self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
         self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=True)
         self._kv_indices_buf = kv_indices.to(self.device, non_blocking=True)
         self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
 
         self._cache_seqs_cute = from_dlpack(kv_len_arr, assumed_align=16)
-        self._page_table_ref, self._page_table, self._page_table_gpu = create_page_table(
-            batch_size, seq_len, self._is_var_seq, self._use_page_table, page_size
+        self._page_table_ref, self._page_table, self._page_table_gpu = (
+            create_page_table(
+                batch_size,
+                seq_len,
+                self._is_var_seq,
+                self._use_page_table,
+                page_size,
+                kv_len_arr,
+            )
         )
         cluster_shape_mnk = self._cluster_shape_mnk
         hardware_info = utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(
             cluster_shape_mnk[0] * cluster_shape_mnk[1]
         )
-        self._split_kv, self._block_split_kvs_ref, self._block_split_kvs, self._block_split_kvs_gpu = (
-            create_block_split_kvs(
-                batch_size,
-                self._split_kv,
-                kv_len_arr,
-                self._is_var_split_kv,
-                self._mma_qk_tiler_mn,
-                cluster_shape_mnk,
-                max_active_clusters,
-            )
+        (
+            self._split_kv,
+            self._block_split_kvs_ref,
+            self._block_split_kvs,
+            self._block_split_kvs_gpu,
+        ) = create_block_split_kvs(
+            batch_size,
+            self._split_kv,
+            kv_len_arr,
+            self._is_var_split_kv,
+            self._mma_qk_tiler_mn,
+            cluster_shape_mnk,
+            max_active_clusters,
         )
 
-        q_latent_cute, q_latent_torch = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
+        q_latent_cute, q_latent_torch = torch_to_cute(
+            q_nope, self._in_dtype, is_dynamic_layout=True
+        )
 
-        q_rope_cute, q_rope_torch = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
+        q_rope_cute, q_rope_torch = torch_to_cute(
+            q_pe, self._in_dtype, is_dynamic_layout=True
+        )
 
-        c_latent_cute, c_latent_torch = torch_to_cute(ckv, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
+        c_latent_cute, c_latent_torch = torch_to_cute(
+            ckv,
+            self._in_dtype,
+            is_dynamic_layout=True,
+            page_table=self._page_table,
+            page_size=self._page_size,
+            cache_seqs=kv_len_arr,
+        )
 
-        c_rope_cute, c_rope_torch = torch_to_cute(kpe, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len_arr)
+        c_rope_cute, c_rope_torch = torch_to_cute(
+            kpe,
+            self._in_dtype,
+            is_dynamic_layout=True,
+            page_table=self._page_table,
+            page_size=self._page_size,
+            cache_seqs=kv_len_arr,
+        )
 
         o_cute, o_torch = create_tensor(
             batch_size, num_heads, head_dim_ckv, self._out_dtype, is_dynamic_layout=True
         )
         lse_cute, lse_torch = create_tensor(
-            batch_size, num_heads, 1, self._lse_dtype, is_dynamic_layout=True, is_lse=True,
+            batch_size,
+            num_heads,
+            1,
+            self._lse_dtype,
+            is_dynamic_layout=True,
+            is_lse=True,
         )
         self._workspace, self._workspace_torch = create_workspace(
             num_heads, head_dim_ckv, batch_size, self._split_kv, self._acc_dtype
@@ -3367,7 +3414,12 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        profiler_buffer: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -3377,7 +3429,12 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        profiler_buffer: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -3400,21 +3457,45 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
 
         assert return_lse is True, "return_lse must be True for CuteDSL implementation"
 
-        q_latent_cute, q_latent_torch = torch_to_cute(q_nope, self._in_dtype, is_dynamic_layout=True)
+        q_latent_cute, q_latent_torch = torch_to_cute(
+            q_nope, self._in_dtype, is_dynamic_layout=True
+        )
 
-        q_rope_cute, q_rope_torch = torch_to_cute(q_pe, self._in_dtype, is_dynamic_layout=True)
+        q_rope_cute, q_rope_torch = torch_to_cute(
+            q_pe, self._in_dtype, is_dynamic_layout=True
+        )
 
-        c_latent_cute, c_latent_torch = torch_to_cute(ckv_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
+        c_latent_cute, c_latent_torch = torch_to_cute(
+            ckv_cache,
+            self._in_dtype,
+            is_dynamic_layout=True,
+            page_table=self._page_table,
+            page_size=self._page_size,
+            cache_seqs=kv_len,
+        )
 
-        c_rope_cute, c_rope_torch = torch_to_cute(kpe_cache, self._in_dtype, is_dynamic_layout=True, page_table=self._page_table, page_size=self._page_size, cache_seqs=kv_len)
+        c_rope_cute, c_rope_torch = torch_to_cute(
+            kpe_cache,
+            self._in_dtype,
+            is_dynamic_layout=True,
+            page_table=self._page_table,
+            page_size=self._page_size,
+            cache_seqs=kv_len,
+        )
 
         if out is None:
             out = torch.empty_like(q_nope, device=q_nope.device)
         o_cute, o_torch = torch_to_cute(out, self._out_dtype, is_dynamic_layout=True)
 
         if lse is None:
-            lse = torch.empty((self._batch_size, self._num_heads), dtype=torch.float32, device=q_nope.device)
-        lse_cute, lse_torch = torch_to_cute(lse, self._lse_dtype, is_dynamic_layout=True, is_lse=True)
+            lse = torch.empty(
+                (self._batch_size, self._num_heads),
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        lse_cute, lse_torch = torch_to_cute(
+            lse, self._lse_dtype, is_dynamic_layout=True, is_lse=True
+        )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -3443,57 +3524,57 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def torch_to_cute(
-        torch_tensor_gpu,
-        dtype,
-        is_dynamic_layout=True,
-        page_table=None,
-        page_size=None,
-        cache_seqs=None,
-        is_lse=False,
-    ):
-        if is_lse:
-            shape = torch_tensor_gpu.shape
-            B, HK = shape
-            permute_order = (1, 0)
-            stride_order = (1, 0)
-            leading_dim = 0
+    torch_tensor_gpu,
+    dtype,
+    is_dynamic_layout=True,
+    page_table=None,
+    page_size=None,
+    cache_seqs=None,
+    is_lse=False,
+):
+    if is_lse:
+        shape = torch_tensor_gpu.shape
+        B, HK = shape
+        permute_order = (1, 0)
+        stride_order = (1, 0)
+        leading_dim = 0
+    else:
+        shape = torch_tensor_gpu.shape
+        B, HK, D = shape
+        permute_order = (1, 2, 0)
+        stride_order = (2, 0, 1)
+        leading_dim = 1
+    if page_table is not None:
+        if cache_seqs is not None:
+            max_seq_len = torch.max(cache_seqs)
+            shape = (B * ceil_div(max_seq_len, page_size), page_size, D)
         else:
-            shape = torch_tensor_gpu.shape
-            B, HK, D = shape
-            permute_order = (1, 2, 0)
-            stride_order = (2, 0, 1)
-            leading_dim = 1
-        if page_table is not None:
-            if cache_seqs is not None:
-                max_seq_len = torch.max(cache_seqs)
-                shape = (B * ceil_div(max_seq_len, page_size), page_size, D)
-            else:
-                shape = (B * ceil_div(HK, page_size), page_size, D)
+            shape = (B * ceil_div(HK, page_size), page_size, D)
 
+    # permute torch tensor according to permute_order
+    torch_tensor_gpu = torch_tensor_gpu.permute(permute_order)
 
-        # permute torch tensor according to permute_order
-        torch_tensor_gpu = torch_tensor_gpu.permute(permute_order)
-
-        # Create dtype cute tensor (gpu)
-        cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
-        cute_tensor.element_type = dtype
-        if is_dynamic_layout:
-            cute_tensor = cute_tensor.mark_layout_dynamic(
-                leading_dim=leading_dim
-            ).mark_compact_shape_dynamic(
-                mode=leading_dim,
-                stride_order=stride_order,
-                divisibility=(128 // dtype.width),
-            )
-
-        cute_tensor = cutlass_torch.convert_cute_tensor(
-            torch_tensor_gpu,
-            cute_tensor,
-            dtype,
-            is_dynamic_layout=is_dynamic_layout,
+    # Create dtype cute tensor (gpu)
+    cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
+    cute_tensor.element_type = dtype
+    if is_dynamic_layout:
+        cute_tensor = cute_tensor.mark_layout_dynamic(
+            leading_dim=leading_dim
+        ).mark_compact_shape_dynamic(
+            mode=leading_dim,
+            stride_order=stride_order,
+            divisibility=(128 // dtype.width),
         )
 
-        return cute_tensor, torch_tensor_gpu
+    cute_tensor = cutlass_torch.convert_cute_tensor(
+        torch_tensor_gpu,
+        cute_tensor,
+        dtype,
+        is_dynamic_layout=is_dynamic_layout,
+    )
+
+    return cute_tensor, torch_tensor_gpu
+
 
 def create_tensor(
     B,

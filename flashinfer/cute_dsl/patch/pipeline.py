@@ -2,9 +2,17 @@ from typing import Optional, Type, Tuple
 
 import cutlass.cute as cute
 
-from cutlass.pipeline import PipelineAsync, PipelineState, CooperativeGroup, Agent, PipelineUserType, make_pipeline_state
+from cutlass.pipeline import (
+    PipelineAsync,
+    PipelineState,
+    CooperativeGroup,
+    Agent,
+    PipelineUserType,
+    make_pipeline_state,
+)
 
-from cutlass.cutlass_dsl import Boolean, Int32, if_generate
+from cutlass.cutlass_dsl import Boolean
+
 
 class ImmutableResourceHandle:
     __origin: PipelineAsync
@@ -50,6 +58,7 @@ class ImmutableResourceHandle:
         return self.__class__(
             self.__origin, self.__immutable_state.__new_from_mlir_values__(values)
         )
+
 
 class PipelineProducer:
     """A class representing a producer in an asynchronous pipeline.
@@ -172,9 +181,9 @@ class PipelineProducer:
         This allows consumers to start processing the data.
         """
         if handle is not None:
-            assert (
-                handle.get_origin() is self
-            ), "ResourceHandle does not belong to this PipelineProducer instance"
+            assert handle.get_origin() is self, (
+                "ResourceHandle does not belong to this PipelineProducer instance"
+            )
             handle.commit()
         else:
             self.__pipeline.producer_commit(self.__state)
@@ -205,6 +214,7 @@ class PipelineProducer:
         return PipelineProducer(
             self.__pipeline, self.__state.__new_from_mlir_values__(values), self.__group
         )
+
 
 class PipelineConsumer:
     """A class representing a consumer in an asynchronous pipeline.
@@ -312,9 +322,9 @@ class PipelineConsumer:
         This allows producers to start producing new data.
         """
         if handle is not None:
-            assert (
-                handle.get_origin() is self
-            ), "ResourceHandle does not belong to this PipelineConsumer instance"
+            assert handle.get_origin() is self, (
+                "ResourceHandle does not belong to this PipelineConsumer instance"
+            )
             handle.release()
         else:
             self.__pipeline.consumer_release(self.__state)
@@ -394,11 +404,15 @@ def make_pipeline_participants(
             producer_group=producer_group,
             consumer_group=consumer_group,
         )
-    return make_pipeline_producer(pipeline, producer_group), make_pipeline_consumer(pipeline, consumer_group)
+    return make_pipeline_producer(pipeline, producer_group), make_pipeline_consumer(
+        pipeline, consumer_group
+    )
+
 
 def make_pipeline_producer(pipeline, group: CooperativeGroup):
     state = make_pipeline_state(PipelineUserType.Producer, pipeline.num_stages)
     return PipelineProducer(pipeline, state, group)
+
 
 def make_pipeline_consumer(pipeline, group: CooperativeGroup):
     state = make_pipeline_state(PipelineUserType.Consumer, pipeline.num_stages)

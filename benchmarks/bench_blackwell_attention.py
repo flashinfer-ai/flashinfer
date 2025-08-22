@@ -18,8 +18,6 @@ import numpy as np
 import torch
 
 import flashinfer
-import cutlass.cute as cute
-import math
 from flashinfer.testing.utils import bench_gpu_time
 
 from flashinfer.cute_dsl.prefill import BatchPrefillCuteDSLWrapper
@@ -80,7 +78,12 @@ def bench_fmha_blackwell(
             return batch_size * qkv_len * qkv_len * num_heads * head_dim * 4 / ms / 1e9
 
     def io(ms):
-        mem_size = q.numel() * q.element_size() + k.numel() * k.element_size() + v.numel() * v.element_size() + o.numel() * o.element_size()
+        mem_size = (
+            q.numel() * q.element_size()
+            + k.numel() * k.element_size()
+            + v.numel() * v.element_size()
+            + o.numel() * o.element_size()
+        )
         return mem_size / ms / 1e6
 
     print(
@@ -98,8 +101,8 @@ def bench_fmha_cutedsl(
     sm_scale=None,
 ):
     if sm_scale is None:
-        sm_scale = 1.0 / (head_dim ** 0.5)
-    
+        sm_scale = 1.0 / (head_dim**0.5)
+
     q = torch.randn(
         batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
     )
@@ -147,7 +150,12 @@ def bench_fmha_cutedsl(
             return batch_size * qkv_len * qkv_len * num_heads * head_dim * 4 / ms / 1e9
 
     def io(ms):
-        mem_size = q.numel() * q.element_size() + k.numel() * k.element_size() + v.numel() * v.element_size() + o.numel() * o.element_size()
+        mem_size = (
+            q.numel() * q.element_size()
+            + k.numel() * k.element_size()
+            + v.numel() * v.element_size()
+            + o.numel() * o.element_size()
+        )
         return mem_size / ms / 1e6
 
     print(

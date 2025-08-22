@@ -21,7 +21,6 @@ import flashinfer
 from flashinfer.cute_dsl.mla import BatchMLAPagedAttentionWrapperCuteDSL
 
 
-
 def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     head_dim_ckv = 512
     head_dim_kpe = 64
@@ -78,6 +77,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     print(f"Memory bandwidth: {io * 1e-6 / ms:.2f} GB/s")
     print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs")
 
+
 def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
     head_dim_ckv = 512
     head_dim_kpe = 64
@@ -90,28 +90,38 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
     )
     pages_num = math.ceil(seq_len / page_size)
     ckv = torch.randn(
-        batch_size * pages_num, page_size, head_dim_ckv, dtype=torch.bfloat16, device="cuda"
+        batch_size * pages_num,
+        page_size,
+        head_dim_ckv,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     kpe = torch.randn(
-        batch_size * pages_num, page_size, head_dim_kpe, dtype=torch.bfloat16, device="cuda"
+        batch_size * pages_num,
+        page_size,
+        head_dim_kpe,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
-    
+
     # Calculate workspace size
     # workspace_size = flashinfer.mla_cutedsl.BlackwellMultiLatentAttentionForward.get_workspace_size(
     #     num_heads, head_dim_ckv, batch_size, -1, flashinfer.mla_cutedsl.cutlass.Float32
     # )
     workspace_buffer = torch.empty(1, dtype=torch.int8, device="cuda")
-    
+
     # Create wrapper and initialize
     wrapper = BatchMLAPagedAttentionWrapperCuteDSL(workspace_buffer)
-    
+
     # Create indptr tensors for the wrapper
     qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
-    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda") * seq_len
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda") * seq_len
+    )
     kv_indices = torch.arange(batch_size * seq_len, dtype=torch.int32, device="cuda")
     kv_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
-    
+
     # Plan the computation
     wrapper.plan(
         qo_indptr=qo_indptr,
@@ -129,11 +139,7 @@ def bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads):
     )
     # Run the computation once to warm up
     o, lse = wrapper.run(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        ckv_cache=ckv,
-        kpe_cache=kpe,
-        return_lse=True
+        q_nope=q_nope, q_pe=q_pe, ckv_cache=ckv, kpe_cache=kpe, return_lse=True
     )
 
     # Benchmark the computation
@@ -164,7 +170,7 @@ def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
     kv_lora_rank = 512
     page_size = 64
     q_len_per_request = 1
-    
+
     # Initialize query tensor [batch_size, q_len_per_request, num_heads, kv_lora_rank + qk_rope_head_dim]
     query = torch.randn(
         batch_size,
@@ -172,29 +178,29 @@ def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
         num_heads,
         kv_lora_rank + qk_rope_head_dim,
         dtype=torch.bfloat16,
-        device="cuda"
+        device="cuda",
     )
-    
+
     # Calculate number of blocks needed
     num_tokens = seq_len * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
-    
+
     # Create sequence lengths (all sequences have the same length for simplicity)
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
     max_seq_len = seq_len
-    
+
     # Calculate blocks per sequence
     blocks_per_seq = (seq_lens + page_size - 1) // page_size
     max_num_blocks_per_seq = blocks_per_seq.max().item()
-    
+
     # Generate block tables
     total_blocks_needed = sum(blocks_per_seq)
     all_block_ids = torch.randperm(total_blocks_needed, device="cuda")
-    
+
     block_tables = torch.zeros(
         (batch_size, max_num_blocks_per_seq), dtype=torch.int32, device="cuda"
     )
-    
+
     block_id = 0
     for i in range(batch_size):
         num_blocks_needed = blocks_per_seq[i]
@@ -202,27 +208,32 @@ def bench_deepseek_mla_decode_trtllm(batch_size, seq_len, num_heads):
             block_id : block_id + num_blocks_needed
         ]
         block_id += num_blocks_needed
-    
+
     # Create KV cache [num_blocks, page_size, kv_lora_rank + qk_rope_head_dim]
     kv_cache = torch.randn(
-        num_blocks, page_size, kv_lora_rank + qk_rope_head_dim, 
-        dtype=torch.bfloat16, device="cuda"
+        num_blocks,
+        page_size,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
-    
+
     # Allocate workspace buffer
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
-    
+
     # Calculate scale factors
     sm_scale = 1.0 / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
-    
+
     # Dynamic scale tensors (set to None for static scaling)
     bmm1_scale_log2_tensor = None
     bmm2_scale_tensor = None
-    
+
     # Run the computation once to warm up
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
-        kv_cache=kv_cache.unsqueeze(1),  # Add dimension for [num_blocks, 1, page_size, head_dim]
+        kv_cache=kv_cache.unsqueeze(
+            1
+        ),  # Add dimension for [num_blocks, 1, page_size, head_dim]
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
@@ -270,13 +281,13 @@ if __name__ == "__main__":
     #     for batch_size in [64, 128, 768]:
     #         for num_heads in [128]:
     #             bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "auto")
-    
+
     print("\n=== CuteDSL Benchmark ===")
     for seq_len in [1024, 2048, 8192]:
         for batch_size in [64, 128, 768]:
             for num_heads in [128]:
                 bench_deepseek_mla_decode_dsl(batch_size, seq_len, num_heads)
-    
+
     # print("\n=== TensorRT-LLM MLA Benchmark ===")
     # for seq_len in [1024, 2048, 8192]:
     #     for batch_size in [64, 128, 768]:

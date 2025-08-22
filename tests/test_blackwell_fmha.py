@@ -12,8 +12,6 @@ from sink_attention_reference import sink_softmax
 from types import SimpleNamespace
 import cutlass.cute as cute
 
-from flashinfer.cute_dsl.prefill import BatchPrefillCuteDSLWrapper
-
 
 def attention_ref(
     batch_size,
@@ -30,14 +28,20 @@ def attention_ref(
     num_kv_heads = k.shape[1]
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
-    
+
     # Handle GQA: if num_qo_heads > num_kv_heads, repeat K and V to match Q shape
     if num_qo_heads > num_kv_heads:
-        assert num_qo_heads % num_kv_heads == 0, f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        assert num_qo_heads % num_kv_heads == 0, (
+            f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        )
         group_size = num_qo_heads // num_kv_heads
-        k = torch.repeat_interleave(k, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_qk)
-        v = torch.repeat_interleave(v, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_vo)
-    
+        k = torch.repeat_interleave(
+            k, group_size, dim=1
+        )  # (batch * kv_len, num_qo_heads, head_dim_qk)
+        v = torch.repeat_interleave(
+            v, group_size, dim=1
+        )  # (batch * kv_len, num_qo_heads, head_dim_vo)
+
     # Now all tensors have the same number of heads, use standard attention logic
     logits = (
         torch.einsum(
@@ -73,7 +77,6 @@ def attention_ref(
     )
 
     return o_ref, lse_ref * math.log2(math.e)
-
 
 
 def attention_varlen_ref(
@@ -122,14 +125,20 @@ def attention_sigmoid_ref(
     num_kv_heads = k.shape[1]
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
-    
+
     # Handle GQA: if num_qo_heads > num_kv_heads, repeat K and V to match Q shape
     if num_qo_heads > num_kv_heads:
-        assert num_qo_heads % num_kv_heads == 0, f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        assert num_qo_heads % num_kv_heads == 0, (
+            f"num_qo_heads ({num_qo_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA"
+        )
         group_size = num_qo_heads // num_kv_heads
-        k = torch.repeat_interleave(k, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_qk)
-        v = torch.repeat_interleave(v, group_size, dim=1)  # (batch * kv_len, num_qo_heads, head_dim_vo)
-    
+        k = torch.repeat_interleave(
+            k, group_size, dim=1
+        )  # (batch * kv_len, num_qo_heads, head_dim_qk)
+        v = torch.repeat_interleave(
+            v, group_size, dim=1
+        )  # (batch * kv_len, num_qo_heads, head_dim_vo)
+
     # Now all tensors have the same number of heads, use standard attention logic
     logits = (
         torch.einsum(
@@ -148,10 +157,10 @@ def attention_sigmoid_ref(
         mask = torch.ones(qo_len, kv_len, device=q.device)
 
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
-    
+
     # Use sigmoid instead of softmax
     p = torch.sigmoid(logits + sigmoid_bias)
-    
+
     o_ref = (
         torch.einsum(
             "bhmn,bnhd->bmhd",
@@ -434,7 +443,7 @@ def test_blackwell_cutedsl_fmha(
 
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
-    
+
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
@@ -468,14 +477,13 @@ def test_blackwell_cutedsl_fmha(
         kv_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
-    o_ref, lse_ref = attention_ref(
-        batch_size, q, k, v, causal, sm_scale
-    )
+    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     else:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
 
 @pytest.mark.parametrize("indptr", [[0, 256, 1024, 2048, 2560]])
 @pytest.mark.parametrize("num_qo_heads", [32])
@@ -497,7 +505,7 @@ def test_blackwell_cutedsl_fmha_varlen(
 ):
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
-    
+
     torch.manual_seed(42)
 
     q = torch.randn(indptr[-1], num_qo_heads, head_dim_qk, dtype=dtype, device="cuda")
@@ -538,7 +546,6 @@ def test_blackwell_cutedsl_fmha_varlen(
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
 
-
 # @pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
 # @pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
 # @pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
@@ -559,13 +566,15 @@ def test_blackwell_cutedsl_fmha_logits_transform(
     causal,
     dtype,
 ):
-
     params = SimpleNamespace(
         scale=1.0 * math.log2(math.exp(1.0)),
         bias=0.0,
     )
+
     @cute.jit
-    def sigmoid_logits_transform(params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
+    def sigmoid_logits_transform(
+        params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx
+    ):
         scale = params.scale
         bias = params.bias
         return cute.arch.rcp_approx(1 + cute.arch.exp2(-(x * scale + bias)))
@@ -575,7 +584,7 @@ def test_blackwell_cutedsl_fmha_logits_transform(
 
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
-    
+
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
@@ -615,11 +624,9 @@ def test_blackwell_cutedsl_fmha_logits_transform(
     gqa_group_ratio = num_qo_heads // num_kv_heads
     k_repeat = k.repeat(1, gqa_group_ratio, 1)
     v_repeat = v.repeat(1, gqa_group_ratio, 1)
-    
+
     # Use sigmoid-based attention reference instead of softmax
-    o_ref = attention_sigmoid_ref(
-        batch_size, q, k_repeat, v_repeat, causal, 1.0, 0.0
-    )
+    o_ref = attention_sigmoid_ref(batch_size, q, k_repeat, v_repeat, causal, 1.0, 0.0)
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
@@ -647,9 +654,10 @@ def test_blackwell_cutedsl_fmha_output_transform(
     causal,
     dtype,
 ):
-
     @cute.jit
-    def dumb_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
+    def dumb_output_transform(
+        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
+    ):
         return output * scale * 2.0 * rcp_d
 
     if qo_len > kv_len and causal:
@@ -657,7 +665,7 @@ def test_blackwell_cutedsl_fmha_output_transform(
 
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
-    
+
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
@@ -696,17 +704,16 @@ def test_blackwell_cutedsl_fmha_output_transform(
     gqa_group_ratio = num_qo_heads // num_kv_heads
     k_repeat = k.repeat(1, gqa_group_ratio, 1)
     v_repeat = v.repeat(1, gqa_group_ratio, 1)
-    
+
     # Use sigmoid-based attention reference instead of softmax
-    o_ref, _ = attention_ref(
-        batch_size, q, k_repeat, v_repeat, causal, 1.0
-    )
+    o_ref, _ = attention_ref(batch_size, q, k_repeat, v_repeat, causal, 1.0)
     o_ref_transform = o_ref * 2.0
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref_transform, rtol=1e-2, atol=1e-2)
     else:
         torch.testing.assert_close(o, o_ref_transform, rtol=1e-2, atol=1e-2)
+
 
 # @pytest.mark.parametrize("batch_size", [1, 2, 3, 9, 17])
 # @pytest.mark.parametrize("qo_len", [1, 17, 177, 377, 977])
@@ -732,14 +739,20 @@ def test_blackwell_cutedsl_fmha_attention_sink(
 
     @cute.jit
     def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
-        log_sink = params.sink[qo_head_idx] * math.log2(math.exp(1.0)) if (kv_tile_idx == 0 and qo_head_idx < num_qo_heads) else -math.inf
+        log_sink = (
+            params.sink[qo_head_idx] * math.log2(math.exp(1.0))
+            if (kv_tile_idx == 0 and qo_head_idx < num_qo_heads)
+            else -math.inf
+        )
         m_new = log_sink if log_sink > m else m
         scale = cute.arch.exp2(m - m_new)
         d_new = cute.arch.exp2(log_sink - m_new) + d * scale
         return m_new, d_new
-    
+
     @cute.jit
-    def sink_output_transform(params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
+    def sink_output_transform(
+        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
+    ):
         return output * scale * rcp_d
 
     if qo_len > kv_len and causal:
@@ -747,7 +760,7 @@ def test_blackwell_cutedsl_fmha_attention_sink(
 
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("SM100A is not supported on this device")
-    
+
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
@@ -785,11 +798,9 @@ def test_blackwell_cutedsl_fmha_attention_sink(
         use_attention_sink=True,
     )
     o = wrapper.run(q, k, v, sink=sink)
-    
+
     # Use sigmoid-based attention reference instead of softmax
-    o_ref, _ = attention_ref(
-        batch_size, q, k, v, causal, 1.0, sink=sink
-    )
+    o_ref, _ = attention_ref(batch_size, q, k, v, causal, 1.0, sink=sink)
 
     if dtype == torch.half:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
