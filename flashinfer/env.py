@@ -98,7 +98,12 @@ DEFAULT_CONFIG = {
                 "description": 'Enable verbose JIT compilation logging ("1" = enabled, "0" = disabled).',
                 "default": "0",
                 "type": "string_boolean",
-            }
+            },
+            "FLASHINFER_LOGGING_LEVEL": {
+                "description": 'Logging level for FlashInfer (e.g., "debug", "info", "warning", "error").',
+                "default": "info",
+                "type": "string",
+            },
         },
         "build": {
             "FLASHINFER_EXTRA_LDFLAGS": {

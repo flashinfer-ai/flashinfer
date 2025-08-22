@@ -23,7 +23,7 @@ os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
-        logging_level = os.getenv("FLASHINFER_LOGGING_LEVEL", "info")
+        logging_level = env_cfg.FLASHINFER_LOGGING_LEVEL
         self.setLevel(logging_level.upper())
         self.addHandler(logging.StreamHandler())
         log_path = jit_env.FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
