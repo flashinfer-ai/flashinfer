@@ -437,9 +437,10 @@ inline int getSMVersion() {
 inline int getSMRegisters() {
   int device{-1};
   FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  cudaDeviceProp prop;
-  FLASHINFER_CUDA_CALL(cudaGetDeviceProperties(&prop, device));
-  return prop.regsPerBlock;
+  int regs_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&regs_per_block, cudaDevAttrMaxRegistersPerBlock, device));
+  return regs_per_block;
 }
 
 inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
