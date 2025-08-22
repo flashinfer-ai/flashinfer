@@ -29,6 +29,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..jit.core import logger
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
@@ -990,8 +991,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4, 5),
                     (0, 0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers,
                 ),
             )
@@ -1001,8 +1002,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4),
                     (0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers[:5],
                 ),
             ),
@@ -1088,9 +1089,14 @@ def get_trtllm_moe_sm100_module():
                 num_tokens,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
-                MoERunner.valid_tactics_dict[instance_key] = (
-                    moe_op.trtllm_get_valid_moe_configs(*instance_key)
-                )
+                try:
+                    valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
+                except Exception as e:
+                    logger.debug(
+                        f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
+                    )
+                    return []
+                MoERunner.valid_tactics_dict[instance_key] = valid_tactics
             return MoERunner.valid_tactics_dict[instance_key]
 
         def forward(
@@ -1141,7 +1147,7 @@ def get_trtllm_moe_sm100_module():
 
             # TODO(siyuan): support fp8
             moe_op.trtllm_fp4_block_scale_moe(
-                routing_logits.to(torch.bfloat16),
+                routing_logits,
                 topk_ids,
                 expert_weights,
                 kwargs["routing_bias"],
@@ -1184,7 +1190,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
@@ -1195,7 +1201,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers[:5],
                     ),
@@ -1405,7 +1411,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         gated_act_type: int = 0,
         output: Optional[torch.Tensor] = None,
-        tune_max_num_tokens: int = 1024,
+        tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1766,7 +1772,7 @@ def trtllm_fp4_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1823,7 +1829,7 @@ def trtllm_fp4_block_scale_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
     Returns:
@@ -1898,7 +1904,7 @@ def trtllm_fp4_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1946,7 +1952,7 @@ def trtllm_fp4_block_scale_routed_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
 

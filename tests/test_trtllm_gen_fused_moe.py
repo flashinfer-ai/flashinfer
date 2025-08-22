@@ -34,6 +34,7 @@ from flashinfer import (
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -81,6 +82,12 @@ class CUDAGraphMoE:
         self.input_tensor = None
         self.output_tensor = None
         self.is_captured = False
+
+    def autotune(self, hidden_states_sample, **runtime_args):
+        """Autotune the MoE computation."""
+        self.input_tensor = hidden_states_sample.clone()
+        with autotune():
+            self._run_moe_computation(runtime_args)
 
     def capture(self, hidden_states_sample, **runtime_args):
         """Capture CUDA graph with the given sample input."""
@@ -573,6 +580,7 @@ class FP4Moe(Moe):
         # Create, capture and launch CUDA graph in one shot
         cuda_graph = CUDAGraphMoE(self, static_data, **config)
         try:
+            cuda_graph.autotune(hidden_states_orig, **runtime_args)
             cuda_graph.capture(hidden_states_orig, **runtime_args)
             output = cuda_graph.launch(hidden_states_orig)
             return output[0].to(torch.float)
