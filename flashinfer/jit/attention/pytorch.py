@@ -18,6 +18,7 @@ import os
 from typing import List
 
 import jinja2
+from pathlib import Path
 import torch
 
 from ...artifacts import ArtifactPath, MetaInfoHash
@@ -1558,8 +1559,34 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
+def reassemble_flashinfer_metainfo(origin_file: Path, target_file: Path) -> None:
+    flashinfer_metainfo_template = None
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_flashinfer_metainfo_cuda12.jinja"
+    ) as f:
+        flashinfer_metainfo_template = jinja2.Template(f.read())
+
+    assert flashinfer_metainfo_template, (
+        f"{jit_env.FLASHINFER_CSRC_DIR}/trtllm_fmha_flashinfer_metainfo_cuda12.jinja not found"
+    )
+
+    raw_content = None
+    with open(origin_file) as f:
+        raw_content = f.read()
+
+    assert raw_content, f"{origin_file} not found"
+
+    # Render the flashInferMetaInfo.h
+    rendered_content = flashinfer_metainfo_template.render({"raw_content": raw_content})
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write the rendered flashInferMetaInfo.h
+    target_file.write_text(rendered_content, encoding="utf-8")
+
+
 def trtllm_gen_fmha_module():
-    include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
+    include_path = ArtifactPath.TRTLLM_GEN_FMHA_INCLUDE_PATH
     header_name = "flashInferMetaInfo"
 
     # use `get_cubin` to get "flashinferMetaInfo.h"
@@ -1569,6 +1596,20 @@ def trtllm_gen_fmha_module():
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    # If the CUDA version is 12.x try to find the metainfo header from
+    # fmha/trtllm-gen/include/flashInferMetaInfo.h and update the include path
+    if jit_env.FLASHINFER_CUDA_VERSION.major < 13:
+        origin_meta_info = (
+            jit_env.FLASHINFER_CUBIN_DIR / include_path / f"{header_name}.h"
+        )
+        target_meta_info = (
+            jit_env.FLASHINFER_CUBIN_DIR / include_path / f"include/{header_name}.h"
+        )
+        # If header file not exist, then ressemble it
+        if not target_meta_info.exists():
+            reassemble_flashinfer_metainfo(origin_meta_info, target_meta_info)
+        include_path = include_path + "include/"
 
     return gen_jit_spec(
         "fmha_gen",

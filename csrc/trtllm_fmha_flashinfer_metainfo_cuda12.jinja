@@ -1,0 +1,48 @@
+#pragma once
+
+#include <flashinfer/trtllm/fmha/kernelParams.h>
+
+namespace tensorrt_llm
+{
+namespace kernels
+{
+// clang-format off
+
+
+struct TllmGenFmhaKernelMetaInfo
+{
+    Data_type mDataTypeQ;
+    Data_type mDataTypeKv;
+    Data_type mDataTypeO;
+    int mTileSizeQ;
+    int mTileSizeKv;
+    int mStepQ;
+    int mStepKv;
+    int mHeadDimPerCtaV;
+    int mHeadDimQk;
+    int mHeadDimV;
+    int mSM;
+    const char* mFuncName;
+    int mSharedMemBytes;
+    int mThreadsPerCTA;
+    int mQkvLayout;
+    int mNumTokensPerPage;
+    int mMaskType;
+    int mKernelType;
+    int mMaxNumHeadsQPerKvInCta;
+    int mTileScheduler;
+    int mMultiCtasKvMode;
+    bool mGroupsHeadsQ;
+    bool mReuseSmemKForV;
+    bool m2CtaMma;
+    const char* sha256;
+};
+
+static const TllmGenFmhaKernelMetaInfo sTllmGenFmhaKernelMetaInfos[] = {
+
+{{ raw_content }}
+
+};
+// clang-format on
+} // namespace kernels
+} // namespace tensorrt_llm

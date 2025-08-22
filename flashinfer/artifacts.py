@@ -51,6 +51,7 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 
 class ArtifactPathBase:
     TRTLLM_GEN_FMHA: ClassVar[str]
+    TRTLLM_GEN_FMHA_INCLUDE_PATH: ClassVar[str]
     TRTLLM_GEN_BMM: ClassVar[str]
     TRTLLM_GEN_GEMM: ClassVar[str]
     CUDNN_SDPA: ClassVar[str]
@@ -62,6 +63,7 @@ class ArtifactPathBase:
             cls.TRTLLM_GEN_FMHA = (
                 "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/fmha/trtllm-gen/"
             )
+            cls.TRTLLM_GEN_FMHA_INCLUDE_PATH = cls.TRTLLM_GEN_FMHA + "include/"
             cls.TRTLLM_GEN_BMM = (
                 "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/batched_gemm-6492001-c97c649/"
             )
@@ -74,6 +76,7 @@ class ArtifactPathBase:
             cls.TRTLLM_GEN_FMHA = (
                 "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/fmha/trtllm-gen/"
             )
+            cls.TRTLLM_GEN_FMHA_INCLUDE_PATH = cls.TRTLLM_GEN_FMHA
             cls.TRTLLM_GEN_BMM = (
                 "364304c7693814410e18e4bae11d8da011860117/batched_gemm-6492001-c97c649/"
             )
@@ -131,12 +134,9 @@ class MetaInfoHash(MetaInfoHashBase):
 def download_artifacts() -> bool:
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
-    fmha_metainfo_path = "flashInferMetaInfo"
-    if jit_env.FLASHINFER_CUDA_VERSION.major >= 13:
-        fmha_metainfo_path = "include/flashInferMetaInfo"
 
     cubin_files = [
-        (ArtifactPath.TRTLLM_GEN_FMHA + fmha_metainfo_path, ".h"),
+        (ArtifactPath.TRTLLM_GEN_FMHA_INCLUDE_PATH + "flashInferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
     ]
