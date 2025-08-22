@@ -1,8 +1,6 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
-import functools
 import os
-import re
 import subprocess
 import sys
 import sysconfig
@@ -20,21 +18,6 @@ from torch.utils.cpp_extension import (
 )
 
 from . import env as jit_env
-
-
-@functools.cache
-def _get_cuda_version() -> Version:
-    if CUDA_HOME is None:
-        nvcc = "nvcc"
-    else:
-        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
-    txt = subprocess.check_output([nvcc, "--version"], text=True)
-    matches = re.findall(r"release (\d+\.\d+),", txt)
-    if not matches:
-        raise RuntimeError(
-            f"Could not parse CUDA version from nvcc --version output: {txt}"
-        )
-    return Version(matches[0])
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -97,7 +80,7 @@ def generate_ninja_build_for_op(
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
     ]
-    cuda_version = _get_cuda_version()
+    cuda_version = jit_env.FLASHINFER_CUDA_VERSION
     # enable -static-global-template-stub when cuda version >= 12.8
     if cuda_version >= Version("12.8"):
         cuda_cflags += [

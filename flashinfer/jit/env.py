@@ -20,10 +20,15 @@ limitations under the License.
 
 import os
 import pathlib
+from packaging.version import Version
 import re
+import subprocess
 import warnings
 
-from torch.utils.cpp_extension import _get_cuda_arch_flags
+from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    _get_cuda_arch_flags,
+)
 
 FLASHINFER_BASE_DIR = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
@@ -88,3 +93,20 @@ def get_nvshmem_lib_dirs():
 
     path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "lib"
     return [path]
+
+
+def get_cuda_version() -> Version:
+    if CUDA_HOME is None:
+        nvcc = "nvcc"
+    else:
+        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    matches = re.findall(r"release (\d+\.\d+),", txt)
+    if not matches:
+        raise RuntimeError(
+            f"Could not parse CUDA version from nvcc --version output: {txt}"
+        )
+    return Version(matches[0])
+
+
+FLASHINFER_CUDA_VERSION = get_cuda_version()

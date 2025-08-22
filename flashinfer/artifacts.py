@@ -17,12 +17,14 @@ limitations under the License.
 import os
 import re
 import time
+from typing import Any, Type, ClassVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests  # type: ignore[import-untyped]
 
 from .jit.core import logger
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY, get_cubin
+from .jit import env as jit_env
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
@@ -47,36 +49,94 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
                 return []
 
 
-class ArtifactPath:
-    TRTLLM_GEN_FMHA: str = "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/fmha/trtllm-gen/"
-    TRTLLM_GEN_BMM: str = (
-        "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/batched_gemm-6492001-c97c649/"
-    )
-    TRTLLM_GEN_GEMM: str = (
-        "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/gemm-6492001-434a6e1/"
-    )
-    CUDNN_SDPA: str = "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/fmha/cudnn/"
-    DEEPGEMM: str = "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/deep-gemm/"
+class ArtifactPathBase:
+    TRTLLM_GEN_FMHA: ClassVar[str]
+    TRTLLM_GEN_BMM: ClassVar[str]
+    TRTLLM_GEN_GEMM: ClassVar[str]
+    CUDNN_SDPA: ClassVar[str]
+    DEEPGEMM: ClassVar[str]
+
+    def __init_subclass__(cls: Type["ArtifactPathBase"], **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if jit_env.FLASHINFER_CUDA_VERSION.major >= 13:
+            cls.TRTLLM_GEN_FMHA = (
+                "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/fmha/trtllm-gen/"
+            )
+            cls.TRTLLM_GEN_BMM = (
+                "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/batched_gemm-6492001-c97c649/"
+            )
+            cls.TRTLLM_GEN_GEMM = (
+                "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/gemm-6492001-434a6e1/"
+            )
+            cls.CUDNN_SDPA = "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/fmha/cudnn/"
+            cls.DEEPGEMM = "d8c2e4e646bd7e73ea79f06ae52b4ba13adddc64/deep-gemm/"
+        else:
+            cls.TRTLLM_GEN_FMHA = (
+                "c8e0abb4b0438880a2b0a9b68449e3cf1513aadf/fmha/trtllm-gen/"
+            )
+            cls.TRTLLM_GEN_BMM = (
+                "364304c7693814410e18e4bae11d8da011860117/batched_gemm-6492001-c97c649/"
+            )
+            cls.TRTLLM_GEN_GEMM = (
+                "5d347c6234c9f0e7f1ab6519ea933183b48216ed/gemm-32110eb-434a6e1/"
+            )
+            cls.CUDNN_SDPA = "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
+            cls.DEEPGEMM = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
 
 
-class MetaInfoHash:
-    TRTLLM_GEN_FMHA: str = (
-        "9f8e809647a205f80547ad813892cec9b92ca086110878e135ba9e1be9ce805c"
-    )
-    TRTLLM_GEN_BMM: str = (
-        "7709b92d29263c9e7eb2060a20233c6f93f0d8361f115b2eec68f1e437f48f89"
-    )
-    DEEPGEMM: str = "c17e9d4ca3593774cab4e788cb87ad152c2db220d52311ec2a014bda5286753d"
-    TRTLLM_GEN_GEMM: str = (
-        "9be7fada4f4eced19c4414dfe0860da0b1ca7cc38fec85c007534d88307e23df"
-    )
+class MetaInfoHashBase:
+    TRTLLM_GEN_FMHA: ClassVar[str]
+    TRTLLM_GEN_BMM: ClassVar[str]
+    DEEPGEMM: ClassVar[str]
+    TRTLLM_GEN_GEMM: ClassVar[str]
+
+    def __init_subclass__(cls: Type["MetaInfoHashBase"], **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if jit_env.FLASHINFER_CUDA_VERSION.major >= 13:
+            cls.TRTLLM_GEN_FMHA = (
+                "9f8e809647a205f80547ad813892cec9b92ca086110878e135ba9e1be9ce805c"
+            )
+            cls.TRTLLM_GEN_BMM = (
+                "7709b92d29263c9e7eb2060a20233c6f93f0d8361f115b2eec68f1e437f48f89"
+            )
+            cls.DEEPGEMM = (
+                "c17e9d4ca3593774cab4e788cb87ad152c2db220d52311ec2a014bda5286753d"
+            )
+            cls.TRTLLM_GEN_GEMM = (
+                "9be7fada4f4eced19c4414dfe0860da0b1ca7cc38fec85c007534d88307e23df"
+            )
+        else:
+            cls.TRTLLM_GEN_FMHA = (
+                "0d124e546c8a2e9fa59499625e8a6d140a2465573d4a3944f9d29f29f73292fb"
+            )
+            cls.TRTLLM_GEN_BMM = (
+                "a2543b8fce60bebe071df40ef349edca32cea081144a4516b0089bd1487beb2b"
+            )
+            cls.DEEPGEMM = (
+                "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
+            )
+            cls.TRTLLM_GEN_GEMM = (
+                "a00ef9d834cb66c724ec7c72337bc955dc53070a65a6f68b34f852d144fa6ea3"
+            )
+
+
+class ArtifactPath(ArtifactPathBase):
+    pass
+
+
+class MetaInfoHash(MetaInfoHashBase):
+    pass
 
 
 def download_artifacts() -> bool:
     env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
     os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
+    fmha_metainfo_path = "flashInferMetaInfo"
+    if jit_env.FLASHINFER_CUDA_VERSION.major >= 13:
+        fmha_metainfo_path = "include/flashInferMetaInfo"
+
     cubin_files = [
-        (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_FMHA + fmha_metainfo_path, ".h"),
         (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
     ]
