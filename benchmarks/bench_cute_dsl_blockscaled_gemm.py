@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 import cutlass
 from flashinfer.cute_dsl.blockscaled_gemm import (
@@ -9,7 +10,7 @@ import torch
 import cutlass.torch as cutlass_torch
 from flashinfer.cute_dsl.utils import get_cutlass_dtype
 from flashinfer.testing.utils import bench_kineto, count_bytes
-
+from flashinfer.autotuner import autotune
 
 ab_dtype = "float4_e2m1fn"
 sf_dtype = "float8_e4m3fn"
@@ -22,7 +23,7 @@ b_major = "k"
 c_major = "n"
 
 
-def bench_one(num_groups, max_m, expected_m_per_group, n, k):
+def bench_one(num_groups, max_m, expected_m_per_group, n, k, do_autotune):
     data = create_data(
         num_groups=num_groups,
         max_m=max_m,
@@ -43,6 +44,11 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             sf_vec_size=sf_vec_size,
             alpha_dtype="float32",
         )
+
+    # warmup
+    with autotune(do_autotune):
+        for _ in range(10):
+            test_func()
 
     t = bench_kineto(
         test_func,
@@ -120,6 +126,8 @@ def enumerate_m_grouped_masked():
 
 # Copy and modified from test_cute_dsl_blockscaled_gemm.py, may extract common logic later if needed
 def create_data(num_groups, max_m, expected_m_per_group, n, k):
+    device = torch.device("cuda:0")
+
     l = num_groups
     m = max_m
 
@@ -167,10 +175,10 @@ def create_data(num_groups, max_m, expected_m_per_group, n, k):
         )
 
     sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
     )
     sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype)
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
     )
 
     masked_m_tensor = create_masked_m(
@@ -195,7 +203,9 @@ def create_masked_m(num_groups, expected_m_per_group, max_m):
 
 
 if __name__ == "__main__":
+    logging.getLogger("flashinfer.jit").setLevel(logging.DEBUG)
     torch.manual_seed(42)
     random.seed(42)
     for config in enumerate_m_grouped_masked():
-        bench_one(**config)
+        for do_autotune in [False, True]:
+            bench_one(**config, do_autotune=do_autotune)

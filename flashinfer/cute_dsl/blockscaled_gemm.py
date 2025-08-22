@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union, Any
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -51,6 +51,12 @@ from cutlass.cutlass_dsl import (
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype
 from typing import Callable, List
+
+from ..autotuner import (
+    SimpleTunableRunner,
+    AutoTuner,
+    TuningConfig,
+)
 
 
 class MaskedSchedulerParams:
@@ -2735,6 +2741,69 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
+# WARN: Tuning may be related to data content, e.g. `masked_m`
+# Thus we may only do auto tuning statically with controlled data and save the tuned results
+class _MaskedBatchedMatmulCuteDSLTunableRunner(SimpleTunableRunner):
+    PARTIAL_NAME = "MaskedBatchedMatmulCuteDSL"
+
+    @classmethod
+    def _compute_tactics(cls):
+        return [
+            dict(
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+            ),
+            dict(
+                mma_tiler_mn=(256, 128),
+                cluster_shape_mn=(2, 1),
+            ),
+        ]
+
+    @classmethod
+    def _forward_impl(
+        cls,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        static_args,
+    ):
+        a_torch, sfa_torch, b_torch, sfb_torch, c_torch, masked_m, alpha = inputs
+
+        m, k, l = a_torch.shape
+        n, _, _ = b_torch.shape
+
+        if static_args["ab_dtype"] == "float4_e2m1fn":
+            # todo(yingyi): update mnk based on a_major and b_major, and support more major.
+            # Note: only support deepgemm-like shape for now
+            k = k * 2
+
+        return get_cute_dsl_compiled_masked_gemm_kernel(
+            m=m,
+            n=n,
+            k=k,
+            l=l,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            ab_dtype=get_cutlass_dtype(static_args["ab_dtype"]),
+            sf_dtype=get_cutlass_dtype(static_args["sf_dtype"]),
+            c_dtype=get_cutlass_dtype(static_args["c_dtype"]),
+            alpha_dtype=None
+            if alpha is None
+            else get_cutlass_dtype(static_args["alpha_dtype"]),
+            sf_vec_size=static_args["sf_vec_size"],
+            mma_tiler_mn=tactic["mma_tiler_mn"],
+            cluster_shape_mn=tactic["cluster_shape_mn"],
+        )(
+            a_tensor_gpu=a_torch,
+            b_tensor_gpu=b_torch,
+            sfa_tensor_gpu=sfa_torch,
+            sfb_tensor_gpu=sfb_torch,
+            c_tensor_gpu=c_torch,
+            masked_m_tensor_gpu=masked_m,
+            alpha_tensor_gpu=alpha,
+        )
+
+
 def grouped_gemm_nt_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -2784,41 +2853,29 @@ def grouped_gemm_nt_masked(
     b_torch, sfb_torch = rhs
     c_torch = out
 
-    m, k, l = a_torch.shape
-    n, _, _ = b_torch.shape
-
-    if ab_dtype == "float4_e2m1fn":
-        # todo(yingyi): update mnk based on a_major and b_major, and support more major.
-        # Note: only support deepgemm-like shape for now
-        k = k * 2
-
-    mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
-    cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
+    # TODO maybe we do not need to expose it to users?
+    # mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
+    # cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
 
     alpha = kwargs.get("alpha")
-    alpha_dtype = kwargs.get("alpha_dtype")
 
-    return get_cute_dsl_compiled_masked_gemm_kernel(
-        m=m,
-        n=n,
-        k=k,
-        l=l,
-        a_major="k",
-        b_major="k",
-        c_major="n",
-        ab_dtype=get_cutlass_dtype(ab_dtype),
-        sf_dtype=get_cutlass_dtype(sf_dtype),
-        c_dtype=get_cutlass_dtype(c_dtype),
-        alpha_dtype=None if alpha is None else get_cutlass_dtype(alpha_dtype),
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-    )(
-        a_tensor_gpu=a_torch,
-        b_tensor_gpu=b_torch,
-        sfa_tensor_gpu=sfa_torch,
-        sfb_tensor_gpu=sfb_torch,
-        c_tensor_gpu=c_torch,
-        masked_m_tensor_gpu=masked_m,
-        alpha_tensor_gpu=alpha,
+    tuner = AutoTuner.get()
+    tuner.stream_delay_micro_secs = 1000000
+
+    runner = _MaskedBatchedMatmulCuteDSLTunableRunner(
+        static_args=dict(
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            alpha_dtype=kwargs.get("alpha_dtype"),
+        ),
     )
+
+    # everything is static currently, since we only have few shapes needed
+    tuning_config = TuningConfig()
+
+    inputs = [a_torch, sfa_torch, b_torch, sfb_torch, c_torch, masked_m, alpha]
+    _, tactic = tuner.choose_one(runner.name, [runner], tuning_config, inputs)
+
+    return runner(inputs=inputs, tactic=tactic)

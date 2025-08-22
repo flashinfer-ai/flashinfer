@@ -15,6 +15,7 @@ import torch
 # from tensorrt_llm.logger import logger
 from flashinfer.tllm_utils import delay_kernel
 
+from flashinfer.utils import FrozenDict
 from .jit.core import logger
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
@@ -245,6 +246,60 @@ class TunableRunner(ABC):
 
     def __hash__(self):
         return hash(tuple(self.__dict__.values()))
+
+
+class SimpleTunableRunner(TunableRunner, ABC):
+    PARTIAL_NAME = ""
+
+    def __init__(self, static_args: Dict[str, Any]):
+        self._static_args = FrozenDict(static_args)
+
+    @property
+    def name(self):
+        assert self.PARTIAL_NAME
+        return f"{self.PARTIAL_NAME}__" + "_".join(
+            f"{k}_{v}" for k, v in sorted(self._static_args.items())
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return list(range(len(self._get_tactics())))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ):
+        if tactic == -1:
+            tactic = 0
+
+        return self._forward_impl(
+            inputs, tactic=self._get_tactics()[tactic], static_args=self._static_args
+        )
+
+    @classmethod
+    def _get_tactics(cls):
+        if not hasattr(cls, "_cached_tactics"):
+            cls._cached_tactics = cls._compute_tactics()
+        return cls._cached_tactics
+
+    @classmethod
+    def _compute_tactics(cls):
+        raise NotImplementedError
+
+    @classmethod
+    def _forward_impl(
+        cls,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        static_args,
+    ):
+        raise NotImplementedError
 
 
 @contextlib.contextmanager
