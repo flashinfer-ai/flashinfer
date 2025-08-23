@@ -31,8 +31,9 @@ def _build_seq_len_configs():
     torch.manual_seed(42)
 
     seq_len_configs = [
+        [(8190, 7939)],
         [(2, 235)]
-        + [(1, 13355)],  # corner case with a large number of masked out tokens
+        + [(1, 13353)],  # corner case with a large number of masked out tokens
         [(67, 1)],
         [(182, 1)],
         [(2011, 1)],
@@ -163,7 +164,7 @@ def _run_attention(
 # -------------------------  PyTest test case  ----------------------------- #
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @pytest.mark.parametrize("page_block_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("num_kv_heads", [8, 1, 4])
 @pytest.mark.parametrize("gqa_group_size", [1, 4, 7])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("causal", [False, True])

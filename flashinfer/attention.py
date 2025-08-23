@@ -45,7 +45,7 @@ class BatchAttention:
         self._kv_layout = kv_layout
 
         self.float_workspace_buffer = torch.empty(
-            256 * 1024 * 1024,
+            384 * 1024 * 1024,
             dtype=torch.uint8,
             device=torch.device(device),
         )
@@ -115,7 +115,6 @@ class BatchAttention:
         # No addtional buf allocated for CUDA graph tensor
         # Allocate outside FlashInfer
         self._kv_indices = kv_indices
-
         self._plan_info = self.module.plan(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -154,7 +153,9 @@ class BatchAttention:
             out = torch.empty_like(q)
         if lse is None:
             # lse shape: [batch_size, num_qo_heads]
-            lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
+            lse = torch.empty(
+                q.shape[0], q.shape[1], device=q.device, dtype=torch.float32
+            )
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
