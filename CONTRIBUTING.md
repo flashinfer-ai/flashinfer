@@ -15,7 +15,7 @@ We recommend using the `--no-build-isolation` flag to ensure compatibility with 
 flashinfer/
 | --include/  # kernel definitions and common utilities functions
 | --csrc/  # op registration to frameworks (pytorch), and binding codes
-| --python/  # python interface exposed to users.
+| --python/  # python interface exposed to users
 | --docs/  # documentation (using sphinx)
 | --tests/  # unittests in python (using pytest)
 | --benchmarks/  # kernel benchmarks in python
