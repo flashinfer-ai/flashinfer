@@ -691,7 +691,7 @@ struct KernelParams {
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
 #if CUDA_VERSION < 13000
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-    params.mNumMtpTokens = 0;
+    params.mNumMtpTokens = options.mMaxSeqLenQ;
 #else
 #endif
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
