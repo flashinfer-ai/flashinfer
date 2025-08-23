@@ -136,6 +136,12 @@ struct KernelParams {
   int32_t mNumHeadsQPerKv;
   // The hidden size of O.
   int64_t mNumHiddenEltsO;
+#if CUDA_VERSION < 13000
+  // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
+  // without paddings.
+  int32_t mNumMtpTokens;
+#else
+#endif
   // The total number of pages in the paged-kv memory pool.
   int32_t mNumPagesInMemPool;
   // The output scale for FP8 quantization.
@@ -683,7 +689,11 @@ struct KernelParams {
     params.mMaxNumCtasQ = maxNumCtasQ;
     params.mMaxNumCtasKv = maxNumCtasKv;
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
+#if CUDA_VERSION < 13000
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
+    params.mNumMtpTokens = 0;
+#else
+#endif
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
