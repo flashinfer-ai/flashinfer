@@ -107,24 +107,76 @@ def init_git(submodule = false) {
 
 def run_unittest_CPU_AOT_COMPILE(node_type) {
   echo "Running CPU AOT Compile Unittest"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-aot')) {
-      init_git(true)
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+
+  if (node_type.contains('SPOT')) {
+    // Add timeout only for spot instances
+    def node_allocated = false
+    try {
+      timeout(time: 15, unit: 'MINUTES') {
+        node(node_type) {
+          node_allocated = true
+          // Node allocation successful, now run the test without timeout
+          ws(per_exec_ws('flashinfer-aot')) {
+            init_git(true)
+            sh(script: "ls -alh", label: 'Show work directory')
+            sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+            sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+          }
+        }
+      }
+    } catch (Exception e) {
+      if (!node_allocated) {
+        echo "Node allocation timeout or failure after 15 minutes for ${node_type}: ${e.toString()}"
+      }
+      throw e
+    }
+  } else {
+    // No timeout for non-spot instances
+    node(node_type) {
+      ws(per_exec_ws('flashinfer-aot')) {
+        init_git(true)
+        sh(script: "ls -alh", label: 'Show work directory')
+        sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+        sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+      }
     }
   }
 }
 
 def shard_run_unittest_GPU(node_type, shard_id) {
   echo "Running unittest on ${node_type}, shard ${shard_id}"
-  node(node_type) {
-    ws(per_exec_ws('flashinfer-unittest')) {
-      init_git(true) // we need cutlass submodule
-      sh(script: "ls -alh", label: 'Show work directory')
-      sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-      sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
+
+  if (node_type.contains('SPOT')) {
+    // Add timeout only for spot instances
+    def node_allocated = false
+    try {
+      timeout(time: 15, unit: 'MINUTES') {
+        node(node_type) {
+          node_allocated = true
+          // Node allocation successful, now run the test without timeout
+          ws(per_exec_ws('flashinfer-unittest')) {
+            init_git(true) // we need cutlass submodule
+            sh(script: "ls -alh", label: 'Show work directory')
+            sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+            sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
+          }
+        }
+      }
+    } catch (Exception e) {
+      if (!node_allocated) {
+        echo "Node allocation timeout or failure after 15 minutes for ${node_type}: ${e.toString()}"
+      }
+      throw e
+    }
+  } else {
+    // No timeout for non-spot instances
+    node(node_type) {
+      ws(per_exec_ws('flashinfer-unittest')) {
+        init_git(true) // we need cutlass submodule
+        sh(script: "ls -alh", label: 'Show work directory')
+        sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+        sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
+      }
     }
   }
 }
