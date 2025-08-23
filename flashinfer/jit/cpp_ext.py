@@ -62,6 +62,7 @@ def generate_ninja_build_for_op(
         "$torch_home/include",
         "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
+        "$cuda_home/include/cccl",
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
