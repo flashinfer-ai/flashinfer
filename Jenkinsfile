@@ -39,7 +39,10 @@
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
-docker_run = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
+// Now supports multiple CUDA versions
+docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:latest"
+docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:latest"
+docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:latest"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -105,8 +108,19 @@ def init_git(submodule = false) {
 //   }
 // }
 
-def run_unittest_CPU_AOT_COMPILE(node_type) {
-  echo "Running CPU AOT Compile Unittest"
+def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
+  echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
+
+  def docker_run = ""
+  if (cuda_version == "cu126") {
+    docker_run = docker_run_cu126
+  } else if (cuda_version == "cu128") {
+    docker_run = docker_run_cu128
+  } else if (cuda_version == "cu129") {
+    docker_run = docker_run_cu129
+  } else {
+    error("Unknown CUDA version: ${cuda_version}")
+  }
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -150,8 +164,19 @@ def run_unittest_CPU_AOT_COMPILE(node_type) {
   }
 }
 
-def shard_run_unittest_GPU(node_type, shard_id) {
-  echo "Running unittest on ${node_type}, shard ${shard_id}"
+def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
+  echo "Running unittest on ${node_type}, shard ${shard_id}, CUDA ${cuda_version}"
+
+  def docker_run = ""
+  if (cuda_version == "cu126") {
+    docker_run = docker_run_cu126
+  } else if (cuda_version == "cu128") {
+    docker_run = docker_run_cu128
+  } else if (cuda_version == "cu129") {
+    docker_run = docker_run_cu129
+  } else {
+    error("Unknown CUDA version: ${cuda_version}")
+  }
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -199,108 +224,273 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    'AOT-Build-Import-x86-64': {
+    // CUDA 12.6 Tests
+    'AOT-Build-Import-x86-64-cu126': {
       try {
-        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT')
+        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
+          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu126')
         } else {
           echo 'Exit since it is not last build'
           throw ex
         }
       }
     },
-    'AOT-Build-Import-aarch64': {
+    'AOT-Build-Import-aarch64-cu126': {
       try {
-        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT')
+        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('ARM-LARGE')
+          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu126')
         } else {
           echo 'Exit since it is not last build'
           throw ex
         }
       }
     },
-    'JIT-Unittest-1': {
+    'JIT-Unittest-1-cu126': {
       try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 1)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 1)
+          shard_run_unittest_GPU('GPU-G5', 1, 'cu126')
         } else {
           echo 'Exit since it is not last build'
           throw ex
         }
       }
     },
-    'JIT-Unittest-2': {
+    'JIT-Unittest-2-cu126': {
       try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 2)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 2)
+          shard_run_unittest_GPU('GPU-G5', 2, 'cu126')
         } else {
           echo 'Exit since it is not last build'
           throw ex
         }
       }
     },
-    'JIT-Unittest-3': {
+    'JIT-Unittest-3-cu126': {
       try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 3)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 3)
+          shard_run_unittest_GPU('GPU-G5', 3, 'cu126')
         } else {
           echo 'Exit since it is not last build'
           throw ex
         }
       }
     },
-    'JIT-Unittest-4': {
+    'JIT-Unittest-4-cu126': {
       try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 4)
+        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu126')
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
           echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
           currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 4)
+          shard_run_unittest_GPU('GPU-G5', 4, 'cu126')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    // CUDA 12.8 Tests
+    'AOT-Build-Import-x86-64-cu128': {
+      try {
+        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'AOT-Build-Import-aarch64-cu128': {
+      try {
+        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-1-cu128': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 1, 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-2-cu128': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 2, 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-3-cu128': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 3, 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-4-cu128': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu128')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 4, 'cu128')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    // CUDA 12.9 Tests
+    'AOT-Build-Import-x86-64-cu129': {
+      try {
+        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu129')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'AOT-Build-Import-aarch64-cu129': {
+      try {
+        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu129')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-1-cu129': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 1, 'cu129')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-2-cu129': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 2, 'cu129')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-3-cu129': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 3, 'cu129')
+        } else {
+          echo 'Exit since it is not last build'
+          throw ex
+        }
+      }
+    },
+    'JIT-Unittest-4-cu129': {
+      try {
+        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu129')
+      } catch (Throwable ex) {
+        echo 'Exception during SPOT run ' + ex.toString()
+        if (is_last_build()) {
+          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+          currentBuild.result = 'SUCCESS'
+          shard_run_unittest_GPU('GPU-G5', 4, 'cu129')
         } else {
           echo 'Exit since it is not last build'
           throw ex

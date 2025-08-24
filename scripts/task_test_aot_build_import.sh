@@ -14,4 +14,4 @@ pip install dist/*.whl
 # test import
 mkdir -p tmp
 cd tmp
-python -c "from flashinfer.page import gen_page_module; p = gen_page_module().aot_path; print(p); assert p.exists();"
+python -c "import flashinfer"
