@@ -353,9 +353,6 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
 }
 
 at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t group_size) {
-  at::Tensor dequant_weight =
-      at::empty({n, k}, at::dtype(at::ScalarType::Float).device(at::kCPU).requires_grad(false));
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
   // weight (n, k / 2)
   // scale (n, k / group_size)
 
@@ -372,13 +369,16 @@ at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t gr
   TORCH_CHECK(weight.size(1) * 2 == scale.size(1) * group_size,
               "weight and scale must have the same number of columns");
 
-  uint8_t* weight_packed_ptr = weight.data_ptr<uint8_t>();
-  __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(scale.data_ptr<uint8_t>());
-
   int const n = weight.size(0);
   int const k = weight.size(1) * 2;
 
+  at::Tensor dequant_weight =
+      at::empty({n, k}, at::dtype(at::ScalarType::Float).device(at::kCPU).requires_grad(false));
+
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
   float* dequant_weight_ptr = dequant_weight.data_ptr<float>();
+  uint8_t* weight_packed_ptr = weight.data_ptr<uint8_t>();
+  __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(scale.data_ptr<uint8_t>());
 
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
