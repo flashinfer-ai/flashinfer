@@ -353,6 +353,9 @@ at::Tensor E2M1AndUFP8SFScaleToFloatV2(at::Tensor valueE2M1, at::Tensor scaleFP8
 }
 
 at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t group_size) {
+  at::Tensor dequant_weight =
+      at::empty({n, k}, at::dtype(at::ScalarType::Float).device(at::kCPU).requires_grad(false));
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
   // weight (n, k / 2)
   // scale (n, k / group_size)
 
@@ -375,8 +378,6 @@ at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t gr
   int const n = weight.size(0);
   int const k = weight.size(1) * 2;
 
-  at::Tensor dequant_weight =
-      at::empty({n, k}, at::dtype(at::ScalarType::Float).device(at::kCPU).requires_grad(false));
   float* dequant_weight_ptr = dequant_weight.data_ptr<float>();
 
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
@@ -399,6 +400,9 @@ at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t gr
     dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
     dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;
   }
+#else
+  TLLM_THROW("CUDA 12.8 is required for e8m0.");
+#endif
 
   return dequant_weight;
 }
