@@ -332,13 +332,13 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
-        jit_specs.append(gen_fp4_quantization_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
+            jit_specs.append(gen_fp4_quantization_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
