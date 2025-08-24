@@ -295,7 +295,10 @@ def test_e2m1_dequantization(
     )
 
 
-def test_mxfp4_quantize_roundtrip():
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_mxfp4_quantize_roundtrip(device: str):
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     x = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16) / 10
 
     quant_a, sfs = mxfp4_quantize(x)
