@@ -228,6 +228,9 @@ stage('Unittest') {
     'AOT-Build-Import-x86-64-cu126': {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu126')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -243,6 +246,9 @@ stage('Unittest') {
     'AOT-Build-Import-aarch64-cu126': {
       try {
         run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu126')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -255,70 +261,13 @@ stage('Unittest') {
         }
       }
     },
-    'JIT-Unittest-1-cu126': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu126')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 1, 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-2-cu126': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu126')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 2, 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-3-cu126': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu126')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 3, 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-4-cu126': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu126')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 4, 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
     // CUDA 12.8 Tests
     'AOT-Build-Import-x86-64-cu128': {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu128')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -334,6 +283,9 @@ stage('Unittest') {
     'AOT-Build-Import-aarch64-cu128': {
       try {
         run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu128')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -346,70 +298,13 @@ stage('Unittest') {
         }
       }
     },
-    'JIT-Unittest-1-cu128': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu128')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 1, 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-2-cu128': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu128')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 2, 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-3-cu128': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu128')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 3, 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'JIT-Unittest-4-cu128': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu128')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 4, 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
-    },
     // CUDA 12.9 Tests
     'AOT-Build-Import-x86-64-cu129': {
       try {
         run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -425,6 +320,9 @@ stage('Unittest') {
     'AOT-Build-Import-aarch64-cu129': {
       try {
         run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -437,9 +335,13 @@ stage('Unittest') {
         }
       }
     },
+    // JIT unittest only for cu129
     'JIT-Unittest-1-cu129': {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -455,6 +357,9 @@ stage('Unittest') {
     'JIT-Unittest-2-cu129': {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -470,6 +375,9 @@ stage('Unittest') {
     'JIT-Unittest-3-cu129': {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
@@ -485,6 +393,9 @@ stage('Unittest') {
     'JIT-Unittest-4-cu129': {
       try {
         shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu129')
+      } catch (hudson.AbortException abortEx) {
+        echo "Received normal AbortException, exit now: " + abortEx.toString()
+        throw abortEx
       } catch (Throwable ex) {
         echo 'Exception during SPOT run ' + ex.toString()
         if (is_last_build()) {
