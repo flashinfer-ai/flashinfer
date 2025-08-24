@@ -646,6 +646,11 @@ class BlackwellMultiLatentAttentionForward:
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
+            @classmethod
+            def size_in_bytes(cls) -> int: ...  # noqa: F811
+
+            # ^ stub only; decorator fills real impl at runtime
+
         softmax_scale_log2 = softmax_scale * LOG2_E
         # Launch the kernel synchronously
         self.split_kv_kernel(

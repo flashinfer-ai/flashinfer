@@ -686,6 +686,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 self.buffer_align_bytes,
             ]
 
+            @classmethod
+            def size_in_bytes(cls) -> int: ...  # noqa: F811
+
+            # ^ stub only; decorator fills real impl at runtime
+
         self.shared_storage = SharedStorage
 
         # Launch the kernel synchronously
@@ -1079,41 +1084,41 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     # Q0
                     q0_coord = 2 * curr_block_coord_q[0]
-                    q0_handle = load_q_producer.acquire_and_advance()
+                    q0_handle_producer = load_q_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_q,
                         tQgQ[None, q0_coord],
-                        tQsQ[None, q0_handle.index],
-                        tma_bar_ptr=q0_handle.barrier,
+                        tQsQ[None, q0_handle_producer.index],
+                        tma_bar_ptr=q0_handle_producer.barrier,
                     )
                     # K0
                     kv_coord = self.get_kv_start_block_idx(
                         curr_block_coord, self.cta_tiler, seqlen_k
                     )  # seqlen_kv_loop
 
-                    k_handle = load_kv_producer.acquire_and_advance()
+                    k_handle_producer = load_kv_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_k,
                         tKgK[None, kv_coord],
-                        tKsK[None, k_handle.index],
-                        tma_bar_ptr=k_handle.barrier,
+                        tKsK[None, k_handle_producer.index],
+                        tma_bar_ptr=k_handle_producer.barrier,
                     )
                     # Q1
                     q1_coord = q0_coord + 1
-                    q1_handle = load_q_producer.acquire_and_advance()
+                    q1_handle_producer = load_q_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_q,
                         tQgQ[None, q1_coord],
-                        tQsQ[None, q1_handle.index],
-                        tma_bar_ptr=q1_handle.barrier,
+                        tQsQ[None, q1_handle_producer.index],
+                        tma_bar_ptr=q1_handle_producer.barrier,
                     )
                     # V0
-                    v_handle = load_kv_producer.acquire_and_advance()
+                    v_handle_producer = load_kv_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_v,
                         tVgV[None, kv_coord],
-                        tVsV[None, v_handle.index],
-                        tma_bar_ptr=v_handle.barrier,
+                        tVsV[None, v_handle_producer.index],
+                        tma_bar_ptr=v_handle_producer.barrier,
                     )
                     kv_coord += 1
 
@@ -1123,20 +1128,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         # Ki
-                        k_handle = load_kv_producer.acquire_and_advance()
+                        k_handle_producer = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_k,
                             tKgK[None, kv_coord],
-                            tKsK[None, k_handle.index],
-                            tma_bar_ptr=k_handle.barrier,
+                            tKsK[None, k_handle_producer.index],
+                            tma_bar_ptr=k_handle_producer.barrier,
                         )
                         # Vi
-                        v_handle = load_kv_producer.acquire_and_advance()
+                        v_handle_producer = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
                             tVgV[None, kv_coord],
-                            tVsV[None, v_handle.index],
-                            tma_bar_ptr=v_handle.barrier,
+                            tVsV[None, v_handle_producer.index],
+                            tma_bar_ptr=v_handle_producer.barrier,
                         )
                         kv_coord += 1
                     # End of seqlen_kv loop
@@ -1186,13 +1191,13 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     # GEMM_QK00 (Q0 * K0 -> S0)
                     # 1. wait for Q0
-                    q0_handle = load_q_consumer.wait_and_advance()
-                    tSrQ0 = tSrQ[None, None, None, q0_handle.index]
+                    q0_handle_consumer = load_q_consumer.wait_and_advance()
+                    tSrQ0 = tSrQ[None, None, None, q0_handle_consumer.index]
                     # 2. wait for K0
-                    k_handle = load_kv_consumer.wait_and_advance()
-                    tSrK0 = tSrK[None, None, None, k_handle.index]
+                    k_handle_consumer = load_kv_consumer.wait_and_advance()
+                    tSrK0 = tSrK[None, None, None, k_handle_consumer.index]
                     # 3. acquire empty S0 buffer
-                    s0_handle = mma_s0_producer.acquire_and_advance()
+                    s0_handle_producer = mma_s0_producer.acquire_and_advance()
                     # 4. gemm
                     num_kphases = cute.size(tSrQ0, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
@@ -1206,15 +1211,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tStS0,
                         )
                     # 5. release S0
-                    s0_handle.commit()
+                    s0_handle_producer.commit()
                     # End of GEMM (Q0 * K0 -> S0)
 
                     # GEMM_QK10 (Q1 * K0 -> S1), K0 is ready in GEMM_QK00
                     # 1. wait for Q1
-                    q1_handle = load_q_consumer.wait_and_advance()
-                    tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                    q1_handle_consumer = load_q_consumer.wait_and_advance()
+                    tSrQ1 = tSrQ[None, None, None, q1_handle_consumer.index]
                     # 2. acquire empty S1
-                    s1_handle = mma_s1_producer.acquire_and_advance()
+                    s1_handle_producer = mma_s1_producer.acquire_and_advance()
                     # 3. gemm
                     num_kphases = cute.size(tSrQ1, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
@@ -1228,25 +1233,25 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tStS1,
                         )
                     # 4. release S1
-                    s1_handle.commit()
+                    s1_handle_producer.commit()
                     # 5. release K0
-                    k_handle.release()
+                    k_handle_consumer.release()
                     # End of GEMM (Q1 * K0 -> S1)
                     # Note: Q0 & Q1 are still needed in the seqlen_kv loop
                     # so we need to release them after the seqlen_kv loop
 
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
-                    v_handle = load_kv_consumer.wait_and_advance()
-                    tOrVi = tOrV[None, None, None, v_handle.index]
+                    v_handle_consumer = load_kv_consumer.wait_and_advance()
+                    tOrVi = tOrV[None, None, None, v_handle_consumer.index]
                     # 2. acquire corrected O0_partial
                     # Note: acquire corr first to take it out of the critical
                     # path since softmax takes longer
-                    o0_handle = mma_corr_producer.acquire_and_advance()
+                    o0_handle_producer = mma_corr_producer.acquire_and_advance()
                     # 3. acquire P0
                     # this acquire returns the ownership of all of S0 to the mma warp
                     # including the P0 part (inplaced in S0)
-                    s0_handle = mma_s0_producer.acquire_and_advance()
+                    s0_handle_producer = mma_s0_producer.acquire_and_advance()
                     # 4. gemm
                     num_kphases = cute.size(tOrP0, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
@@ -1260,7 +1265,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tOtO0,
                         )
                     # 5. release accumulated O0_partial
-                    o0_handle.commit()
+                    o0_handle_producer.commit()
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
 
                     seqlen_kv_loop_steps = (
@@ -1273,8 +1278,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         # GEMM_QK0i (Q0 * Ki -> S0)
                         # 1. wait for Ki
-                        k_handle = load_kv_consumer.wait_and_advance()
-                        tSrKi = tSrK[None, None, None, k_handle.index]
+                        k_handle_consumer = load_kv_consumer.wait_and_advance()
+                        tSrKi = tSrK[None, None, None, k_handle_consumer.index]
                         # 2. gemm
                         inner_num_kphases = cute.size(tSrQ0, mode=[2])
                         for kphase_idx in cutlass.range(
@@ -1290,14 +1295,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tStS0,
                             )
                         # 3. release S0
-                        s0_handle.commit()
+                        s0_handle_producer.commit()
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
 
                         # GEMM_PV1(i-1) (P1 * V(i-1) -> O1_partial), V(i-1) is ready in GEMM_PV0(i-1)
                         # 1. acquire corrected O1_partial
-                        o1_handle = mma_corr_producer.acquire_and_advance()
+                        o1_handle_producer = mma_corr_producer.acquire_and_advance()
                         # 2. acquire P1
-                        s1_handle = mma_s1_producer.acquire_and_advance()
+                        s1_handle_producer = mma_s1_producer.acquire_and_advance()
                         # 3. gemm
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
                         for kphase_idx in cutlass.range(
@@ -1314,9 +1319,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                             )
                             pv_whether_acc = True
                         # 4. release accumulated O1_partial
-                        o1_handle.commit()
+                        o1_handle_producer.commit()
                         # 5. release V(i-1)
-                        v_handle.release()
+                        v_handle_consumer.release()
                         # End of GEMM_PV1(i-1) (P1 * V(i-1) -> O1_partial)
 
                         # GEMM_QK1i (Q1 * Ki -> S1), Q1 is ready in GEMM_QK10; Ki is ready in GEMM_QK0i
@@ -1334,19 +1339,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrKi[kphase_coord_5],
                                 tStS1,
                             )
-                        s1_handle.commit()
+                        s1_handle_producer.commit()
                         # 2. release Ki
-                        k_handle.release()
+                        k_handle_consumer.release()
                         # End of GEMM_QK1i (Q1 * Ki -> S1)
 
                         # GEMM_PV0i (P0 * Vi -> O0_partial)
                         # 1. wait for Vi
-                        v_handle = load_kv_consumer.wait_and_advance()
-                        tOrVi = tOrV[None, None, None, v_handle.index]
+                        v_handle_consumer = load_kv_consumer.wait_and_advance()
+                        tOrVi = tOrV[None, None, None, v_handle_consumer.index]
                         # 2. acquire corrected O0_partial
-                        o0_handle = mma_corr_producer.acquire_and_advance()
+                        o0_handle_producer = mma_corr_producer.acquire_and_advance()
                         # 3. acquire P0
-                        s0_handle = mma_s0_producer.acquire_and_advance()
+                        s0_handle_producer = mma_s0_producer.acquire_and_advance()
                         # 4. gemm
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
                         for kphase_idx in cutlass.range(
@@ -1362,19 +1367,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tOtO0,
                             )
                         # 5. release accumulated O0_partial
-                        o0_handle.commit()
+                        o0_handle_producer.commit()
                         # End of GEMM_PV0i (P0 * Vi -> O0_partial)
                     # End of seqlen_kv loop
 
                     # release Q0 & Q1
-                    q0_handle.release()
-                    q1_handle.release()
+                    q0_handle_consumer.release()
+                    q1_handle_consumer.release()
 
                     # GEMM_PV1(i_end) (P1 * Vi_end -> O1)
                     # 1. acquire corrected O1_partial
                     o1_handle = mma_corr_producer.acquire_and_advance()
                     # 2. acquire P1
-                    s1_handle = mma_s1_producer.acquire_and_advance()
+                    s1_handle_producer = mma_s1_producer.acquire_and_advance()
                     # 3. gemm
                     num_kphases = cute.size(tOrP1, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
@@ -1390,12 +1395,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # 4. commit accumulated O1
                     o1_handle.commit()
                     # 5. release Vi_end
-                    v_handle.release()
+                    v_handle_consumer.release()
                     # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
                     # Commit S0 and S1
-                    s0_handle.commit()
-                    s1_handle.commit()
+                    s0_handle_producer.commit()
+                    s1_handle_producer.commit()
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
@@ -1475,23 +1480,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # wait from corr, issue tma store on smem
                     # O0
                     # 1. wait for O0 final
-                    o0_handle = corr_epi_consumer.wait_and_advance()
+                    o0_handle_consumer = corr_epi_consumer.wait_and_advance()
                     # 2. copy O0 to gmem
                     cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
                     cute.arch.cp_async_bulk_commit_group()
                     # O1
                     # 1. wait for O1 final
-                    o1_handle = corr_epi_consumer.wait_and_advance()
+                    o1_handle_consumer = corr_epi_consumer.wait_and_advance()
                     # 2. copy O1 to gmem
                     cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
                     cute.arch.cp_async_bulk_commit_group()
 
                     # Ensure O0 buffer is ready to be released
                     cute.arch.cp_async_bulk_wait_group(1, read=True)
-                    o0_handle.release()
+                    o0_handle_consumer.release()
                     # Ensure O1 buffer is ready to be released
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    o1_handle.release()
+                    o1_handle_consumer.release()
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
@@ -1638,13 +1643,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                         scale = cute.arch.exp2(scale_)
 
                         # wait for o0
-                        o0_handle = mma_corr_consumer.wait_and_advance()
+                        o0_handle_consumer = mma_corr_consumer.wait_and_advance()
                         if cutlass.const_expr(not self.custom_logits_transform):
                             self.correction_rescale(pv_thr_mma, tOtO0, scale)
                         # release vec1 & o0
                         vec1_handle.release()
                         cute.arch.fence_view_async_tmem_store()
-                        o0_handle.release()
+                        o0_handle_consumer.release()
 
                         # wait for vec1 (row_wise current max & previous max)
                         vec1_handle = s1_corr_consumer.wait_and_advance()
@@ -1656,12 +1661,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                         )
                         scale = cute.arch.exp2(scale_)
 
-                        o1_handle = mma_corr_consumer.wait_and_advance()
+                        o1_handle_consumer = mma_corr_consumer.wait_and_advance()
                         if cutlass.const_expr(not self.custom_logits_transform):
                             self.correction_rescale(pv_thr_mma, tOtO1, scale)
                         vec0_handle.release()
                         cute.arch.fence_view_async_tmem_store()
-                        o1_handle.release()
+                        o1_handle_consumer.release()
                     # End of seqlen_corr_loop_steps
                     vec1_handle.release()
 
@@ -1674,7 +1679,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     cute.arch.fence_view_async_tmem_load()
                     vec0_handle.release()
                     # wait for o0
-                    o0_handle = mma_corr_consumer.wait_and_advance()
+                    o0_handle_consumer = mma_corr_consumer.wait_and_advance()
                     o0_final_handle = corr_epi_producer.acquire_and_advance()
 
                     epilogue_scale = scale_output
@@ -1691,7 +1696,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         head_coord,
                         qo_idx_offset,
                     )
-                    o0_handle.release()
+                    o0_handle_consumer.release()
                     o0_final_handle.commit()
 
                     # wait for vec1 (row_wise global sum)
@@ -1700,7 +1705,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     cute.arch.fence_view_async_tmem_load()
                     vec1_handle.release()
                     # wait for o1
-                    o1_handle = mma_corr_consumer.wait_and_advance()
+                    o1_handle_consumer = mma_corr_consumer.wait_and_advance()
                     o1_final_handle = corr_epi_producer.acquire_and_advance()
 
                     epilogue_scale = scale_output
@@ -1717,7 +1722,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         head_coord,
                         qo_idx_offset + self.qk_mma_tiler[0],
                     )
-                    o1_handle.release()
+                    o1_handle_consumer.release()
                     o1_final_handle.commit()
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
