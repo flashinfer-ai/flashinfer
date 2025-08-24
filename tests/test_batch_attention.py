@@ -19,6 +19,32 @@ import pytest
 import torch
 
 import flashinfer
+from jit_utils import (
+    gen_persistent_batch_attention_modules,
+    gen_prefill_attention_modules,
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    flashinfer.jit.build_jit_specs(
+        gen_persistent_batch_attention_modules(
+            [torch.float16, torch.bfloat16],  # q_dtypes
+            [torch.float16, torch.bfloat16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [False, True],  # use_logits_soft_cap
+        )
+        + gen_prefill_attention_modules(
+            [torch.float16, torch.bfloat16],  # q_dtypes
+            [torch.float16, torch.bfloat16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [0],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False, True],  # use_logits_soft_caps
+            [False],  # use_fp16_qk_reductions
+        ),
+        verbose=False,
+    )
 
 
 # -------------------------  Configuration generation function  ----------------------------- #

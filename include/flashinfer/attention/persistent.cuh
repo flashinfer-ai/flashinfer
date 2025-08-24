@@ -483,6 +483,7 @@ struct BlockBatchReductionPersistent {
       const typename KTraits::IdType num_packed_qo_len, const uint_fastdiv gqa_group_size,
       const uint32_t num_kv_heads, const typename KTraits::IdType* indptr,
       const typename KTraits::IdType* o_indices, uint8_t* smem PROFILER_CLOSURE_FUNC_PARAMS) {
+    __syncthreads();  // NOTE(Zihao): required for guarantee correctness on blackwell
     using DTypeIn = typename KTraits::DTypeIn;
     using DTypeO = typename KTraits::DTypeO;
     using IdType = typename KTraits::IdType;
