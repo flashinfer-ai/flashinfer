@@ -18,7 +18,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #include <cuda_fp4.h>
+#endif
 #include <cuda_fp8.h>
 
 #include "cutlass/bfloat16.h"
