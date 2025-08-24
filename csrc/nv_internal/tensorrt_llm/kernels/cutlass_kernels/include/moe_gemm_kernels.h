@@ -32,7 +32,9 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #include <cuda_fp4.h>
+#endif
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {

@@ -23,7 +23,7 @@ from . import env as jit_env
 
 
 @functools.cache
-def _get_cuda_version() -> Version:
+def get_cuda_version() -> Version:
     if CUDA_HOME is None:
         nvcc = "nvcc"
     else:
@@ -35,6 +35,10 @@ def _get_cuda_version() -> Version:
             f"Could not parse CUDA version from nvcc --version output: {txt}"
         )
     return Version(matches[0])
+
+
+def is_cuda_version_at_least(version_str: str) -> bool:
+    return get_cuda_version() >= Version(version_str)
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -97,7 +101,7 @@ def generate_ninja_build_for_op(
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
     ]
-    cuda_version = _get_cuda_version()
+    cuda_version = get_cuda_version()
     # enable -static-global-template-stub when cuda version >= 12.8
     if cuda_version >= Version("12.8"):
         cuda_cflags += [
