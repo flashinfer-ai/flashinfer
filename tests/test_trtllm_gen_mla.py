@@ -116,7 +116,7 @@ def test_trtllm_batch_decode_mla(
     )
 
     # Run decode-MLA
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+    output, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -131,6 +131,7 @@ def test_trtllm_batch_decode_mla(
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
+        return_lse=True,
     )
 
     # Run reference attention and align output
@@ -183,7 +184,7 @@ def test_trtllm_batch_decode_mla(
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
     # check is nan
     assert not torch.isnan(o_ref).any(), "o_ref is nan"
@@ -213,3 +214,4 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
