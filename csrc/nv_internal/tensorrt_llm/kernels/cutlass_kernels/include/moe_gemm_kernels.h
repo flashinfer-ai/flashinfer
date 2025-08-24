@@ -272,6 +272,8 @@ class MoeGemmRunner {
   static constexpr bool use_wfp4a16 =
       std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
 #endif
+#else
+  static constexpr bool use_wfp4a16 = false;
 #endif
 
 #if defined(ENABLE_FP8)
