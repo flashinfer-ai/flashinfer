@@ -1755,7 +1755,6 @@ __global__ void finalizeMoeRoutingKernel(
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token,
     int const num_experts_per_node, int const start_expert_id) {
-  assert(orig_cols % 4 == 0);
   int64_t const original_row = blockIdx.x;
   int64_t const num_rows = gridDim.x;
   auto const offset = original_row * orig_cols;
@@ -1764,6 +1763,8 @@ __global__ void finalizeMoeRoutingKernel(
   // Load 128-bits per thread, according to the smallest data type we read/write
   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
       128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+  assert(orig_cols % FINALIZE_ELEM_PER_THREAD == 0);
 
   int64_t const start_offset = threadIdx.x;
   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
@@ -1794,6 +1795,11 @@ __global__ void finalizeMoeRoutingKernel(
 
       int64_t const expanded_original_row = original_row + k_idx * num_rows;
       int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+      int64_t expanded_rows = num_rows * experts_per_token;
+      if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+        continue;
+      }
 
       float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
 
@@ -1828,8 +1834,6 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
     int const* permuted_row_to_unpermuted_row, int const* token_selected_experts,
     int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const orig_cols,
     int64_t const experts_per_token, int const num_experts_per_node, int const start_expert_id) {
-  assert(orig_cols % 4 == 0);
-
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
@@ -1864,6 +1868,8 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
     constexpr int64_t FINALIZE_ELEM_PER_THREAD =
         128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
 
+    assert(orig_cols % FINALIZE_ELEM_PER_THREAD == 0);
+
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
     int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
@@ -1889,6 +1895,11 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
 
         int64_t const expanded_permuted_row_from_k_idx =
             unpermuted_row_to_permuted_row[source_row + k_idx * num_rows];
+        int64_t valid_tokens = expert_first_token_offset[num_experts_per_node];
+        if (expanded_permuted_row_from_k_idx < 0 ||
+            expanded_permuted_row_from_k_idx >= valid_tokens) {
+          continue;
+        }
 
         float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
 
