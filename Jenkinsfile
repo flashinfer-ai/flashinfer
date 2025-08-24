@@ -100,6 +100,25 @@ def init_git(submodule = false) {
   }
 }
 
+def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_closure) {
+  try {
+    test_closure(spot_node_type)
+  } catch (hudson.AbortException abortEx) {
+    echo "Received normal AbortException, exit now: " + abortEx.toString()
+    throw abortEx
+  } catch (Throwable ex) {
+    echo "Exception during SPOT run for ${test_name}: " + ex.toString()
+    if (is_last_build()) {
+      echo "Exception during SPOT run for ${test_name}: " + ex.toString() + " retry on-demand"
+      currentBuild.result = 'SUCCESS'
+      test_closure(on_demand_node_type)
+    } else {
+      echo 'Exit since it is not last build'
+      throw ex
+    }
+  }
+}
+
 // stage('Lint') {
 //   node('CPU-SPOT') {
 //     ws(per_exec_ws('flashinfer-lint')) {
@@ -226,187 +245,47 @@ stage('Unittest') {
     failFast: true,
     // CUDA 12.6 Tests
     'AOT-Build-Import-x86-64-cu126': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu126')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
     },
     'AOT-Build-Import-aarch64-cu126': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu126')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu126')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
     },
     // CUDA 12.8 Tests
     'AOT-Build-Import-x86-64-cu128': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu128')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
     },
     'AOT-Build-Import-aarch64-cu128': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu128')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu128')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
     },
     // CUDA 12.9 Tests
     'AOT-Build-Import-x86-64-cu129': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT', 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE', 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
     },
     'AOT-Build-Import-aarch64-cu129': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT', 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('ARM-LARGE', 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
     },
     // JIT unittest only for cu129
     'JIT-Unittest-1-cu129': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 1, 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 1, 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-1-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 1, 'cu129') })
     },
     'JIT-Unittest-2-cu129': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 2, 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 2, 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-2-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 2, 'cu129') })
     },
     'JIT-Unittest-3-cu129': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 3, 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 3, 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-3-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu129') })
     },
     'JIT-Unittest-4-cu129': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 4, 'cu129')
-      } catch (hudson.AbortException abortEx) {
-        echo "Received normal AbortException, exit now: " + abortEx.toString()
-        throw abortEx
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 4, 'cu129')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-4-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 4, 'cu129') })
     }
   )
 }
