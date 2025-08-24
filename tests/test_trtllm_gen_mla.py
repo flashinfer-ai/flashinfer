@@ -215,3 +215,13 @@ def test_trtllm_batch_decode_mla(
             print("o_ref:", o_ref)
             raise e
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_decode_mla(
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.float8_e4m3fn,
+        page_size=32,
+        q_len_per_request=1,
+    )

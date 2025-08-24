@@ -2155,6 +2155,14 @@ def trtllm_batch_decode_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
     run_func(
         out,
         out_scale_factor,
