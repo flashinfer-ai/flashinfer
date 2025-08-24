@@ -14,6 +14,7 @@ from filelock import FileLock
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
+from .. import env as env_cfg
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -22,7 +23,7 @@ os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
-        logging_level = os.getenv("FLASHINFER_LOGGING_LEVEL", "info")
+        logging_level = env_cfg.FLASHINFER_LOGGING_LEVEL
         self.setLevel(logging_level.upper())
         self.addHandler(logging.StreamHandler())
         log_path = jit_env.FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
@@ -144,7 +145,7 @@ class JitSpec:
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+            verbose = env_cfg.FLASHINFER_JIT_VERBOSE == "1"
             self.build(verbose, need_lock=False)
             result = self.load(so_path, class_name)
 
@@ -161,7 +162,7 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+    verbose = env_cfg.FLASHINFER_JIT_VERBOSE == "1"
 
     cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [

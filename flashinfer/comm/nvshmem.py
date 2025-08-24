@@ -1,6 +1,5 @@
 import ctypes
 import functools
-import os
 import shlex
 from typing import Sequence
 
@@ -9,6 +8,7 @@ import torch
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec
+from .. import env as env_cfg
 
 
 def gen_nvshmem_module() -> JitSpec:
@@ -16,7 +16,7 @@ def gen_nvshmem_module() -> JitSpec:
     ldflags = (
         [f"-L{lib_dir}" for lib_dir in lib_dirs]
         + ["-lnvshmem_device"]
-        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
+        + shlex.split(env_cfg.NVSHMEM_LDFLAGS or "")
     )
 
     return gen_jit_spec(

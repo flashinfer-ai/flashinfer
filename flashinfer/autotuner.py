@@ -386,8 +386,10 @@ class AutoTuner:
             cache_key = AutoTuner._get_cache_key(
                 custom_op, r, input_shapes, tuning_config
             )
+            from . import env as env_cfg
+
             if (
-                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                env_cfg.FLASHINFER_AUTOTUNER_LOAD_FROM_FILE == "1"
                 and not self.is_tuning_mode
             ):
                 output = load_from_file(cache_key)
