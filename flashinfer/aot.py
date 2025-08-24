@@ -343,7 +343,6 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
-            jit_specs.append(gen_fp4_quantization_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
