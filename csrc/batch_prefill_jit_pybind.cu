@@ -29,6 +29,8 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
                                       at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
                                       std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                                       int64_t layout, int64_t window_left,
+                                      std::optional<at::Tensor> maybe_q_rope_offset,
+                                      std::optional<at::Tensor> maybe_k_rope_offset,
                                       bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 void BatchPrefillWithPagedKVCacheRun(
@@ -36,13 +38,60 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
     at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+    int64_t window_left, std::optional<at::Tensor> maybe_q_rope_offset,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache plan
   m.def("plan", BatchPrefillWithKVCachePlan);
   // Batch-request prefill attention with KV-Cache operator
-  m.def("ragged_run", BatchPrefillWithRaggedKVCacheRun);
+  m.def("ragged_run", 
+        [](at::Tensor float_workspace_buffer,
+           at::Tensor int_workspace_buffer,
+           at::Tensor plan_info_vec,
+           at::Tensor q,
+           at::Tensor k,
+           at::Tensor v,
+           at::Tensor qo_indptr,
+           at::Tensor kv_indptr,
+           at::Tensor o,
+           std::optional<at::Tensor> maybe_lse,
+           int64_t mask_mode_code,
+           int64_t layout,
+           int64_t window_left,
+           std::optional<at::Tensor> maybe_q_rope_offset,
+           std::optional<at::Tensor> maybe_k_rope_offset,
+           bool enable_pdl,
+           std::vector<at::Tensor> additional_params) {
+             return BatchPrefillWithRaggedKVCacheRun(
+                 float_workspace_buffer, int_workspace_buffer, plan_info_vec, q, k, v,
+                 qo_indptr, kv_indptr, o, maybe_lse, mask_mode_code, layout, window_left,
+                 maybe_q_rope_offset, maybe_k_rope_offset, enable_pdl, additional_params);
+           });
   // Batch-request prefill attention with KV-Cache operator
-  m.def("paged_run", BatchPrefillWithPagedKVCacheRun);
+  m.def("paged_run",
+        [](at::Tensor float_workspace_buffer,
+           at::Tensor int_workspace_buffer,
+           at::Tensor plan_info_vec,
+           at::Tensor q,
+           at::Tensor paged_k_cache,
+           at::Tensor paged_v_cache,
+           at::Tensor qo_indptr,
+           at::Tensor paged_kv_indptr,
+           at::Tensor paged_kv_indices,
+           at::Tensor paged_kv_last_page_len,
+           at::Tensor o,
+           std::optional<at::Tensor> maybe_lse,
+           int64_t mask_mode_code,
+           int64_t layout,
+           int64_t window_left,
+           std::optional<at::Tensor> maybe_q_rope_offset,
+           bool enable_pdl,
+           std::vector<at::Tensor> additional_params) {
+             return BatchPrefillWithPagedKVCacheRun(
+                 float_workspace_buffer, int_workspace_buffer, plan_info_vec, q, paged_k_cache,
+                 paged_v_cache, qo_indptr, paged_kv_indptr, paged_kv_indices,
+                 paged_kv_last_page_len, o, maybe_lse, mask_mode_code, layout, window_left,
+                 maybe_q_rope_offset, enable_pdl, additional_params);
+           });
 }

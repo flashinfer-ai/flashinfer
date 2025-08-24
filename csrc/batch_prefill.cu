@@ -76,6 +76,8 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
                                       at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
                                       std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                                       int64_t layout, int64_t window_left,
+                                      std::optional<at::Tensor> maybe_q_rope_offset,
+                                      std::optional<at::Tensor> maybe_k_rope_offset,
                                       bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
@@ -128,6 +130,8 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
         params.kv_indptr = static_cast<IdType*>(kv_indptr.data_ptr());
+        params.maybe_q_rope_offset = maybe_q_rope_offset ? static_cast<IdType*>(maybe_q_rope_offset->data_ptr()) : nullptr;
+        params.maybe_k_rope_offset = maybe_k_rope_offset ? static_cast<IdType*>(maybe_k_rope_offset->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
         params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
@@ -202,7 +206,8 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
     at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+    int64_t window_left, std::optional<at::Tensor> maybe_q_rope_offset,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -263,8 +268,8 @@ void BatchPrefillWithPagedKVCacheRun(
         params.paged_kv = paged_kv;
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
-
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.maybe_q_rope_offset = maybe_q_rope_offset ? static_cast<IdType*>(maybe_q_rope_offset->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
         params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
         params.q_stride_n = q_stride_n;
