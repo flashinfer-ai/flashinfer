@@ -266,7 +266,7 @@ struct BlockBatchPagedAttentionPersistent {
       const auto [q_indptr, kv_indptr, o_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end,
                   kv_head_idx, len_kv_chunk] = get_block_coord(params, work_idx);
 
-      const uint32_t kv_chunk_idx = ceil_div(kv_start, len_kv_chunk);
+      const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
       const uint32_t num_kv_chunks = ceil_div(
           CAUSAL
               ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)

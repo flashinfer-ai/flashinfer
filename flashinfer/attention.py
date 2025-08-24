@@ -45,7 +45,7 @@ class BatchAttention:
         self._kv_layout = kv_layout
 
         self.float_workspace_buffer = torch.empty(
-            384 * 1024 * 1024,
+            256 * 1024 * 1024,
             dtype=torch.uint8,
             device=torch.device(device),
         )

@@ -1189,8 +1189,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         cluster_kv_start(num_clusters, std::vector<IdType>()),
         cluster_kv_end(num_clusters, std::vector<IdType>()),
         cluster_kv_head_idx(num_clusters, std::vector<IdType>()),
-        cluster_partial_indptr(num_clusters, std::vector<IdType>()),
-        cluster_len_kv_chunk(num_clusters, std::vector<IdType>());
+        cluster_partial_indptr(num_clusters, std::vector<IdType>());
 
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
@@ -1218,7 +1217,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
             cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
 
             // use kv_chunk to rematerize num_kv_tiles and kv_tile_idx
-            cluster_len_kv_chunk[cluster_idx].push_back(kv_len_limit);
             cluster_partial_indptr[cluster_idx].push_back(partial_o_nnz);
 
             cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
@@ -1265,7 +1263,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
     auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
     auto kv_head_idx_vec = flatten(cluster_kv_head_idx, total_num_works);
-    auto len_kv_chunk_vec = flatten(cluster_len_kv_chunk, total_num_works);
 
     plan_info.tasks[task].q_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_indptr");
