@@ -1431,13 +1431,14 @@ __global__ void expandInputRowsKernel(
   static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE ||
                     !PRE_QUANT_AWQ,
                 "AWQ and Block Scaling are mutually exclusive");
-#ifdef ENABLE_FP4
   constexpr bool is_mxfp8 =
       std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX &&
       !PRE_QUANT_AWQ;
   constexpr bool is_mxfp8_input = is_mxfp8 && std::is_same_v<InputActivationsType, __nv_fp8_e4m3>;
   constexpr bool need_mxfp8_quant = is_mxfp8 && !is_mxfp8_input;
+
+#ifdef ENABLE_FP4
   constexpr bool is_nvfp4 =
       std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4 &&
@@ -1445,9 +1446,6 @@ __global__ void expandInputRowsKernel(
   constexpr bool is_nvfp4_input = is_nvfp4 && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>;
   constexpr bool need_nvfp4_quant = is_nvfp4 && !is_nvfp4_input;
 #else
-  constexpr bool is_mxfp8 = false;
-  constexpr bool is_mxfp8_input = false;
-  constexpr bool need_mxfp8_quant = false;
   constexpr bool is_nvfp4 = false;
   constexpr bool is_nvfp4_input = false;
   constexpr bool need_nvfp4_quant = false;
@@ -4120,9 +4118,13 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
       TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF weight_block_scale_value_int{};
 #ifdef ENABLE_FP8
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
       __nv_fp8_e8m0 tmp;
       tmp.__x = __nv_cvt_float_to_e8m0(1.0f, __NV_SATFINITE, cudaRoundPosInf);
       std::memcpy(&weight_block_scale_value_int, &tmp, sizeof(tmp));
+#else
+      TLLM_CHECK_WITH_INFO(false, "WFP4AFP8 is not supported on CUDA ");
+#endif
 #endif
 
       auto act_sf_rows = std::min(expanded_num_rows, num_rows * num_experts_per_node);

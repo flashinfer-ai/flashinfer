@@ -113,6 +113,7 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
   }
 #endif
   else {
+#ifdef ENABLE_FP4
     auto getFunc = [&]() {
       if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>) {
         TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type ==
@@ -131,6 +132,9 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
       }
     };
     getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+#else
+    TLLM_THROW("FP4 data type is not supported on this architecture and CUDA version");
+#endif
   }
 }
 
