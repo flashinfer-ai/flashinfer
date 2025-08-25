@@ -648,6 +648,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         masked_m_tensor: cute.Tensor,
+        src_signals_tensor: Optional[cute.Tensor],
+        dst_signals_tensor: Optional[cute.Tensor],
         alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -811,6 +813,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
             masked_m_tensor,  # add masked layout
+            src_signals_tensor,
+            dst_signals_tensor,
             c_tensor,
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
@@ -2024,6 +2028,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @staticmethod
     def _compute_grid(
         masked_m_tensor: cute.Tensor,
+        src_signals_tensor: Optional[cute.Tensor],
+        dst_signals_tensor: Optional[cute.Tensor],
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
@@ -2049,7 +2055,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, src_signals, dst_signals, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor, src_signals_tensor, dst_signals_tensor, c, c_tiler, cluster_shape_mnl
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
