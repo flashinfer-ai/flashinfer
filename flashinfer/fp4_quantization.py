@@ -24,6 +24,7 @@ import torch
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags
+from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
@@ -87,12 +88,12 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4",
+            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4",
+            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
