@@ -57,6 +57,8 @@ class MaskedSchedulerParams:
     def __init__(
         self,
         masked_m: cute.Tensor,
+        src_signals: Optional[cute.Tensor],
+        dst_signals: Optional[cute.Tensor],
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
         cluster_shape_mnk: cute.Shape,
@@ -70,6 +72,8 @@ class MaskedSchedulerParams:
         gc = cute.zipped_divide(c, tiler=c_tiler)
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.masked_m = masked_m
+        self.src_signals = src_signals
+        self.dst_signals = dst_signals
         self.c = c
         self.c_tiler = c_tiler
         self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
@@ -90,6 +94,8 @@ class MaskedSchedulerParams:
         values, self._values_pos = [], []
         for obj in [
             self.masked_m,
+            self.src_signals,
+            self.dst_signals,
             self.c,
             self.c_tiler,
             self._cluster_shape_mnk,
@@ -102,7 +108,7 @@ class MaskedSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.masked_m, self.c, self.c_tiler, self._cluster_shape_mnk],
+            [self.masked_m, self.src_signals, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
             self._values_pos,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
@@ -234,6 +240,7 @@ class MaskedScheduler:
     def _get_current_work_for_linear_idx(
         self,
         current_work_linear_idx: Int32,
+        write_out_signals: bool,
     ) -> WorkTileInfo:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
@@ -251,7 +258,11 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            TODO
+            if write_out_signals and (self.params.dst_signals is not None):
+                atomic_add_release_global(self.params.dst_signals + curr_group_idx, 1)
+            if self.params.src_signals is not None:
+                wait_signal(self.params.src_signals + (curr_group_idx + 1), 1)
+
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
             )
@@ -292,9 +303,10 @@ class MaskedScheduler:
         return WorkTileInfo(cur_tile_coord, is_valid)
 
     @dsl_user_op
-    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+    def get_current_work(self, write_out_signals: bool = False, *, loc=None, ip=None) -> WorkTileInfo:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
+            write_out_signals=write_out_signals,
         )
 
     @dsl_user_op
@@ -1172,6 +1184,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta
             )
 
+        # TODO may optimize if too slow
+        if tile_sched_params.src_signals is not None:
+            wait_signal(tile_sched_params.src_signals + 0, 1)
+
         #
         # Specialized TMA load warp
         #
@@ -1669,7 +1685,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_tile = tile_sched.get_current_work(
+                    # TODO is this write late enough?
+                    # Assume epilogue warps contains the first warp
+                    write_out_signals=tidx == 0,
+                )
 
             #
             # Dealloc the tensor memory buffer
@@ -2029,7 +2049,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor, src_signals, dst_signals, c, c_tiler, cluster_shape_mnl
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
