@@ -192,6 +192,7 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -219,6 +220,7 @@ def get_trtllm_gen_prefill_module():
             sm_count,
             enable_pdl,
             sinks,
+            lse,
         )
         return out
 
@@ -569,6 +571,7 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                lse=maybe_lse,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -3260,12 +3263,14 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
+    return_lse: bool = False,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3298,6 +3303,8 @@ def trtllm_batch_context_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+    return_lse : bool = False
+        whether to return lse
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -3308,7 +3315,8 @@ def trtllm_batch_context_with_kv_cache(
         vector size for nvfp4 output tensor scale factor.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3400,6 +3408,14 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
     run_func(
         out,
         out_scale_factor,
@@ -3423,9 +3439,17 @@ def trtllm_batch_context_with_kv_cache(
         sm_count,
         enable_pdl,
         sinks,
+        lse,
     )
-    return (
-        out
-        if out_dtype != "nvfp4"
-        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
-    )
+    if return_lse:
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        ), lse
+    else:
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
