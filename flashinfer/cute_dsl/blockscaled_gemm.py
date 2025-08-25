@@ -2497,6 +2497,8 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         masked_mptr: cute.Pointer,
+        src_signals_ptr: Optional[cute.Pointer],
+        dst_signals_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
@@ -2569,6 +2571,14 @@ class MaskedBatchedMatmulCuteDSL:
             masked_mptr,
             layout=cute.make_ordered_layout((self._l,), order=(0,)),
         )
+        src_signals_tensor = cute.make_tensor(
+            src_signals_ptr,
+            layout=cute.make_ordered_layout((self._l,), order=(0,)),
+        )
+        dst_signals_tensor = cute.make_tensor(
+            dst_signals_ptr,
+            layout=cute.make_ordered_layout((self._l,), order=(0,)),
+        )
 
         # Use const_expr for compile-time conditional
         alpha_tensor = (
@@ -2591,6 +2601,8 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_tensor,
             c_tensor,
             masked_m_tensor,
+            src_signals_tensor,
+            dst_signals_tensor,
             alpha_tensor,
             self._max_active_clusters,
             current_stream,
@@ -2733,6 +2745,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         sfa_tensor_gpu: torch.Tensor,
         sfb_tensor_gpu: torch.Tensor,
         masked_m_tensor_gpu: torch.Tensor,
+        src_signals_tensor_gpu: torch.Tensor,
+        dst_signals_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
     ):
@@ -2757,6 +2771,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     sfb_tensor_gpu,
                     c_tensor_gpu,
                     masked_m_tensor_gpu,
+                    src_signals_tensor_gpu,
+                    dst_signals_tensor_gpu,
                     alpha_tensor_gpu,
                 ]
             ),
@@ -2773,6 +2789,8 @@ def grouped_gemm_nt_masked(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     masked_m: torch.Tensor,
+    src_signals: Optional[torch.Tensor],
+    dst_signals: Optional[torch.Tensor],
     *,
     ab_dtype: str,
     sf_dtype: str,
@@ -2858,5 +2876,7 @@ def grouped_gemm_nt_masked(
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=c_torch,
         masked_m_tensor_gpu=masked_m,
+        src_signals_tensor_gpu=src_signals,
+        dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
     )
