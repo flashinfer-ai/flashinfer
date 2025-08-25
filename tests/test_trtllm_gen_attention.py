@@ -672,3 +672,6 @@ def test_trtllm_gen_prefill_deepseek(
         atol=1e-3,
         rtol=1e-3,
     )
+if __name__ == "__main__":
+    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
+    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
