@@ -79,6 +79,15 @@ using namespace cub;
     __VA_ARGS__                                                     \
   }
 
+#define DISPATCH_RADIK_SHM_AWARE_NUM_THREADS(compute_capacity, BLOCK_THREADS, ...) \
+  if (compute_capacity.first >= 8) {                                               \
+    constexpr uint32_t BLOCK_THREADS = 512;                                        \
+    __VA_ARGS__                                                                    \
+  } else {                                                                         \
+    constexpr uint32_t BLOCK_THREADS = 256;                                        \
+    __VA_ARGS__                                                                    \
+  }
+
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
@@ -2696,158 +2705,163 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
   FLASHINFER_CUDA_CALL(
       cudaMemsetAsync(histPtr, 0, sizeof(int) * batch_size * ((1 << 12) + 1), stream));
 
+  // === Iter 1 ===
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+      // iter1: countBin
+      dim3 countbin_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
+                                batch_size);
+      dim3 countbin_iter1_nthrs(BLOCK_THREADS);
+
+      auto countbin_iter1_kernel = countBinExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
+      void* countbin_iter1_args[] = {&probs, &taskLenPtr[0], &histPtr, &d, &batch_size, &indices};
+
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter1_kernel, countbin_iter1_nblks,
+                                            countbin_iter1_nthrs, countbin_iter1_args, 0, stream));
+
+      // iter1: selectBin
+      dim3 selectbin_iter1_nblks(batch_size);
+      dim3 selectbin_iter1_nthrs(BLOCK_THREADS);
+      size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
+
+      auto selectbin_iter1_kernel = selectBinKernel<BLOCK_THREADS, (1 << 12)>;
+      void* selectbin_iter1_args[] = {&histPtr, &binIdPtr, &kPtr, &taskLenPtr[0]};
+
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+          selectbin_iter1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter1_kernel, selectbin_iter1_nblks,
+                                            selectbin_iter1_nthrs, selectbin_iter1_args, smem_size,
+                                            stream));
+    });
+
+    DISPATCH_RADIK_SHM_AWARE_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+      // iter1: selectCandidate
+      dim3 selectcan_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
+                                 batch_size);
+      dim3 selectcan_iter1_nthrs(BLOCK_THREADS);
+
+      auto selectcan_iter1_kernel =
+          selectCandidateExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
+      void* selectcan_iter1_args[] = {
+          &probs, &valBuffer[0], &globalCountPtr, &binIdPtr, &taskLenPtr[1], &d, &indices};
+
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter1_kernel, selectcan_iter1_nblks,
+                                            selectcan_iter1_nthrs, selectcan_iter1_args, 0,
+                                            stream));
+    });
+  });
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenHost.data(), taskLenPtr[0], sizeof(int) * batch_size,
+                                       cudaMemcpyDefault, stream));
+
+  // === Iter 2 ===
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
-    DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
-      DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-        // iter1: countBin
-        dim3 countbin_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
-                                  batch_size);
-        dim3 countbin_iter1_nthrs(BLOCK_THREADS);
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+    int maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
+    int flag = 0;
 
-        auto countbin_iter1_kernel = countBinExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
-        void* countbin_iter1_args[] = {&probs, &taskLenPtr[0], &histPtr, &d, &batch_size, &indices};
+    if (maxTaskLen != 1) {
+      // clear hist and globalCount
+      FLASHINFER_CUDA_CALL(
+          cudaMemsetAsync(histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter1_kernel, countbin_iter1_nblks,
-                                              countbin_iter1_nthrs, countbin_iter1_args, 0,
-                                              stream));
+      // iter2: countBin
+      dim3 countbin_iter2_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+      dim3 countbin_iter2_nthrs(BLOCK_THREADS);
 
-        // iter1: selectBin
-        dim3 selectbin_iter1_nblks(batch_size);
-        dim3 selectbin_iter1_nthrs(BLOCK_THREADS);
-        size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
+      auto countbin_iter2_kernel = countBinKernel<BLOCK_THREADS, 12, 20>;
+      void* countbin_iter2_args[] = {&valBuffer[flag], &taskLenPtr[flag], &histPtr, &d,
+                                     &batch_size};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter2_kernel, countbin_iter2_nblks,
+                                            countbin_iter2_nthrs, countbin_iter2_args, 0, stream));
 
-        auto selectbin_iter1_kernel = selectBinKernel<BLOCK_THREADS, (1 << 12)>;
-        void* selectbin_iter1_args[] = {&histPtr, &binIdPtr, &kPtr, &taskLenPtr[0]};
+      // iter2: selectBin
+      dim3 selectbin_iter2_nblks(batch_size);
+      dim3 selectbin_iter2_nthrs(BLOCK_THREADS);
+      size_t smem_size = sizeof(SelectBinTempStorage<BLOCK_THREADS>);
 
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-            selectbin_iter1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      auto selectbin_iter2_kernel = selectBinKernel<BLOCK_THREADS, (1 << 12)>;
+      void* selectbin_iter2_args[] = {&histPtr, &binIdPtr, &kPtr, &taskLenPtr[flag ^ 1]};
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter1_kernel, selectbin_iter1_nblks,
-                                              selectbin_iter1_nthrs, selectbin_iter1_args,
-                                              smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+          selectbin_iter2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter2_kernel, selectbin_iter2_nblks,
+                                            selectbin_iter2_nthrs, selectbin_iter2_args, smem_size,
+                                            stream));
 
-        // iter1: selectCandidate
-        dim3 selectcan_iter1_nblks((d + BLOCK_THREADS * VEC_SIZE - 1) / (BLOCK_THREADS * VEC_SIZE),
-                                   batch_size);
-        dim3 selectcan_iter1_nthrs(BLOCK_THREADS);
+      // iter2: selectCandidate
+      dim3 selectcan_iter2_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+      dim3 selectcan_iter2_nthrs(BLOCK_THREADS);
 
-        auto selectcan_iter1_kernel =
-            selectCandidateExKernel<BLOCK_THREADS, 0, 20, VEC_SIZE, T, IdType>;
-        void* selectcan_iter1_args[] = {
-            &probs, &valBuffer[0], &globalCountPtr, &binIdPtr, &taskLenPtr[1], &d, &indices};
+      auto selectcan_iter2_kernel = selectCandidateKernel<BLOCK_THREADS, 12, 20>;
+      void* selectcan_iter2_args[] = {&valBuffer[flag], &valBuffer[flag ^ 1], &globalCountPtr,
+                                      &binIdPtr,        &taskLenPtr[flag],    &d};
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter1_kernel, selectcan_iter1_nblks,
-                                              selectcan_iter1_nthrs, selectcan_iter1_args, 0,
-                                              stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter2_kernel, selectcan_iter2_nblks,
+                                            selectcan_iter2_nthrs, selectcan_iter2_args, 0,
+                                            stream));
 
-        FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenHost.data(), taskLenPtr[0],
-                                             sizeof(int) * batch_size, cudaMemcpyDefault, stream));
+      // update taskLen
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenHost.data(), taskLenPtr[flag ^ 1],
+                                           sizeof(int) * batch_size, cudaMemcpyDefault, stream));
+      flag ^= 1;
+    }
 
-        int flag = 0;
-        // second iter
-        FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
-        int maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
-        if (maxTaskLen != 1) {
-          // clear hist and globalCount
-          FLASHINFER_CUDA_CALL(
-              cudaMemsetAsync(histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
+    // === Iter 3 ===
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+    maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
+    if (maxTaskLen != 1) {
+      // clear hist and globalCount
+      int* new_histPtr = histPtr;
+      FLASHINFER_CUDA_CALL(
+          cudaMemsetAsync(new_histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
+      // iter3: countBin
+      dim3 countbin_iter3_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+      dim3 countbin_iter3_nthrs(BLOCK_THREADS);
+      auto countbin_iter3_kernel = countBinKernel<BLOCK_THREADS, 24, 24>;
+      void* countbin_iter3_args[] = {&valBuffer[flag], &taskLenPtr[flag], &new_histPtr, &d,
+                                     &batch_size};
 
-          // iter2: countBin
-          dim3 countbin_iter2_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
-          dim3 countbin_iter2_nthrs(BLOCK_THREADS);
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter3_kernel, countbin_iter3_nblks,
+                                            countbin_iter3_nthrs, countbin_iter3_args, 0, stream));
 
-          auto countbin_iter2_kernel = countBinKernel<BLOCK_THREADS, 12, 20>;
-          void* countbin_iter2_args[] = {&valBuffer[flag], &taskLenPtr[flag], &histPtr, &d,
-                                         &batch_size};
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter2_kernel, countbin_iter2_nblks,
-                                                countbin_iter2_nthrs, countbin_iter2_args, 0,
-                                                stream));
+      // iter3: selectBin
+      // NOTE: setting Third iter selectBin BLOCK_THREADS=256
+      dim3 selectbin_iter3_nblks(batch_size);
+      dim3 selectbin_iter3_nthrs(256);
+      size_t smem_size = sizeof(SelectBinTempStorage<256>);
 
-          // iter2: selectBin
-          dim3 selectbin_iter2_nblks(batch_size);
-          dim3 selectbin_iter2_nthrs(BLOCK_THREADS);
+      auto selectbin_iter3_kernel = selectBinKernel<256, (1 << 8)>;
+      void* selectbin_iter3_args[] = {&new_histPtr, &binIdPtr, &kPtr, &taskLenPtr[flag ^ 1]};
 
-          auto selectbin_iter2_kernel = selectBinKernel<BLOCK_THREADS, (1 << 12)>;
-          void* selectbin_iter2_args[] = {&histPtr, &binIdPtr, &kPtr, &taskLenPtr[flag ^ 1]};
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+          selectbin_iter3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-              selectbin_iter2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter2_kernel,
-                                                selectbin_iter2_nblks, selectbin_iter2_nthrs,
-                                                selectbin_iter2_args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter3_kernel, selectbin_iter3_nblks,
+                                            selectbin_iter3_nthrs, selectbin_iter3_args, smem_size,
+                                            stream));
 
-          // iter2: selectCandidate
-          dim3 selectcan_iter2_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
-          dim3 selectcan_iter2_nthrs(BLOCK_THREADS);
+      // iter3: selectCandidate
+      dim3 selectcan_iter3_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
+      dim3 selectcan_iter3_nthrs(BLOCK_THREADS);
 
-          auto selectcan_iter2_kernel = selectCandidateKernel<BLOCK_THREADS, 12, 20>;
-          void* selectcan_iter2_args[] = {&valBuffer[flag], &valBuffer[flag ^ 1], &globalCountPtr,
-                                          &binIdPtr,        &taskLenPtr[flag],    &d};
+      auto selectcan_iter3_kernel = selectCandidateKernel<BLOCK_THREADS, 24, 24>;
+      void* selectcan_iter3_args[] = {&valBuffer[flag], &valBuffer[flag ^ 1], &globalCountPtr,
+                                      &binIdPtr,        &taskLenPtr[flag],    &d};
 
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter2_kernel,
-                                                selectcan_iter2_nblks, selectcan_iter2_nthrs,
-                                                selectcan_iter2_args, 0, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter3_kernel, selectcan_iter3_nblks,
+                                            selectcan_iter3_nthrs, selectcan_iter3_args, 0,
+                                            stream));
 
-          // update taskLen
-          FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenHost.data(), taskLenPtr[flag ^ 1],
-                                               sizeof(int) * batch_size, cudaMemcpyDefault,
-                                               stream));
-          flag ^= 1;
-        }
+      flag ^= 1;
+    }
+    // clear globalCount
+    FLASHINFER_CUDA_CALL(cudaMemsetAsync(globalCountPtr, 0, sizeof(int) * batch_size, stream));
+    // reset taskLenPtr
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(), sizeof(int) * batch_size,
+                                         cudaMemcpyDefault, stream));
 
-        // third iter
-        FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
-        maxTaskLen = *std::max_element(taskLenHost.begin(), taskLenHost.end());
-        if (maxTaskLen != 1) {
-          // clear hist and globalCount
-          int* new_histPtr = histPtr;
-          FLASHINFER_CUDA_CALL(
-              cudaMemsetAsync(new_histPtr, 0, sizeof(int) * ((1 << 12) + 1) * batch_size, stream));
-          // iter3: countBin
-          dim3 countbin_iter3_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
-          dim3 countbin_iter3_nthrs(BLOCK_THREADS);
-          auto countbin_iter3_kernel = countBinKernel<BLOCK_THREADS, 24, 24>;
-          void* countbin_iter3_args[] = {&valBuffer[flag], &taskLenPtr[flag], &new_histPtr, &d,
-                                         &batch_size};
-
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)countbin_iter3_kernel, countbin_iter3_nblks,
-                                                countbin_iter3_nthrs, countbin_iter3_args, 0,
-                                                stream));
-
-          // iter3: selectBin
-          // Note: Set Third iter selectBin BLOCK_THREADS=256
-          dim3 selectbin_iter3_nblks(batch_size);
-          dim3 selectbin_iter3_nthrs(256);
-
-          auto selectbin_iter3_kernel = selectBinKernel<256, (1 << 8)>;
-          void* selectbin_iter3_args[] = {&new_histPtr, &binIdPtr, &kPtr, &taskLenPtr[flag ^ 1]};
-
-          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-              selectbin_iter3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectbin_iter3_kernel,
-                                                selectbin_iter3_nblks, selectbin_iter3_nthrs,
-                                                selectbin_iter3_args, smem_size, stream));
-
-          // iter3: selectCandidate
-          dim3 selectcan_iter3_nblks((maxTaskLen + BLOCK_THREADS - 1) / BLOCK_THREADS, batch_size);
-          dim3 selectcan_iter3_nthrs(BLOCK_THREADS);
-
-          auto selectcan_iter3_kernel = selectCandidateKernel<BLOCK_THREADS, 24, 24>;
-          void* selectcan_iter3_args[] = {&valBuffer[flag], &valBuffer[flag ^ 1], &globalCountPtr,
-                                          &binIdPtr,        &taskLenPtr[flag],    &d};
-
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)selectcan_iter3_kernel,
-                                                selectcan_iter3_nblks, selectcan_iter3_nthrs,
-                                                selectcan_iter3_args, 0, stream));
-
-          flag ^= 1;
-        }
-        // clear globalCount
-        FLASHINFER_CUDA_CALL(cudaMemsetAsync(globalCountPtr, 0, sizeof(int) * batch_size, stream));
-        // reset taskLenPtr
-        FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
-                                             sizeof(int) * batch_size, cudaMemcpyDefault, stream));
 #define RADIX_TOPK_CALL_FILTER(CACHE_SIZE)                                                  \
   do {                                                                                      \
     auto filter_kernel = filterKernel<BLOCK_THREADS, VEC_SIZE, (CACHE_SIZE), IdType, T>;    \
@@ -2855,36 +2869,39 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
                                           filter_args, 0, stream));                         \
   } while (0)
 
-        dim3 filter_nblks(batch_size);
-        dim3 filter_nthrs(BLOCK_THREADS);
-        void* filter_args[] = {&probs,
-                               &valBuffer[flag],
-                               &top_k_select_result,
-                               &top_k_select_idx,
-                               &globalCountPtr,
-                               &top_k_arr,
-                               &taskLenPtr[0],
-                               &d,
-                               &max_top_k_val,
-                               &batch_size,
-                               &indices};
-        if (max_top_k_val <= 128) {
-          RADIX_TOPK_CALL_FILTER(128);
-        } else if (max_top_k_val <= 256) {
-          RADIX_TOPK_CALL_FILTER(256);
-        } else if (max_top_k_val <= 512) {
-          RADIX_TOPK_CALL_FILTER(512);
-        } else if (max_top_k_val <= 1024) {
-          RADIX_TOPK_CALL_FILTER(1024);
-        }
-      });
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      dim3 filter_nblks(batch_size);
+      dim3 filter_nthrs(BLOCK_THREADS);
+      void* filter_args[] = {&probs,
+                             &valBuffer[flag],
+                             &top_k_select_result,
+                             &top_k_select_idx,
+                             &globalCountPtr,
+                             &top_k_arr,
+                             &taskLenPtr[0],
+                             &d,
+                             &max_top_k_val,
+                             &batch_size,
+                             &indices};
+      if (max_top_k_val <= 128) {
+        RADIX_TOPK_CALL_FILTER(128);
+      } else if (max_top_k_val <= 256) {
+        RADIX_TOPK_CALL_FILTER(256);
+      } else if (max_top_k_val <= 512) {
+        RADIX_TOPK_CALL_FILTER(512);
+      } else if (max_top_k_val <= 1024) {
+        RADIX_TOPK_CALL_FILTER(1024);
+      }
+    });
 
-      vec_size = 1;
-      DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    // TODO: Fix misaligned access to top_k_select_result when VEC_SIZE > 1 and top_k_arr == nullptr
+    vec_size = 1;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         dim3 sample_nblks(output_batch_size);
         dim3 sample_nthrs(BLOCK_THREADS);
         auto sample_kernel = SamplingFromRadiKSelectKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
-                                                           VEC_SIZE, false, T, IdType>;
+                                                           VEC_SIZE, DETERMINISTIC, T, IdType>;
         const uint32_t sample_smem_size =
             sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
         void* sample_args[] = {&top_k_select_result, &top_k_select_idx, &output,
