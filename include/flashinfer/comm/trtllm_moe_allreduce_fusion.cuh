@@ -1478,7 +1478,7 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
   auto status = DISPATCH_MOEFINALIZEREDUCTION(
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
       QUANT, [&]() -> cudaError_t {
-        if constexpr (CUDA_VERSION < 120800 && QUANT) {
+        if constexpr (CUDA_VERSION < 12080 && QUANT) {
           FLASHINFER_CHECK(false,
                            "cuda version should be greater equal than 12.8 with "
                            "trtllm_moe_allreduce_fusion quant");
