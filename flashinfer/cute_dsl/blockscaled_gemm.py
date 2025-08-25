@@ -43,14 +43,65 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import (
     Int32,
+    UInt32,
+    T,
     Integer,
     dsl_user_op,
     extract_mlir_values,
     new_from_mlir_values,
 )
+from cutlass._mlir.dialects import llvm
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
+from cutlass import UInt32
+
+
+@dsl_user_op
+def atomic_add_release_global(ptr: cutlass.Pointer, value: UInt32, *, loc=None, ip=None) -> UInt32:
+    return UInt32(
+        llvm.inline_asm(
+            T.u32(),
+            [
+                ptr.toint(loc=loc, ip=ip).ir_value(),
+                UInt32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.add.release.gpu.global.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def wait_signal(addr: cutlass.Pointer, expect_value: UInt32, *, loc=None, ip=None):
+    ready = TODO_read_address(addr)
+
+    while ready != expect_value:
+        ready = UInt32(
+            llvm.inline_asm(
+                T.u32(),
+                [addr.toint(loc=loc, ip=ip).ir_value()],
+                # TODO how to add `:"memory"` clobber?
+                "ld.acquire.gpu.global.u32 $0, [$1];",
+                "=r,l",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
+        llvm.inline_asm(
+            None,
+            [],
+            "nanosleep.u32 20;",
+            "",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
 
 
 class MaskedSchedulerParams:
