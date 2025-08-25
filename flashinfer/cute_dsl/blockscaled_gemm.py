@@ -1241,7 +1241,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # TODO may optimize if too slow
         if tile_sched_params.src_signals is not None:
-            wait_signal(tile_sched_params.src_signals + 0, 1)
+            wait_signal(tile_sched_params.src_signals + 0, src_signal_expect_value)
 
         #
         # Specialized TMA load warp
