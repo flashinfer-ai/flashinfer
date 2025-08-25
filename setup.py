@@ -61,6 +61,7 @@ install_requires = [
     "cuda-python",
     "pynvml",
     "einops",
+    "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
 generate_build_meta({})

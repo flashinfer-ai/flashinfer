@@ -33,7 +33,7 @@ namespace Routing {
 
 // The type of method in top-K routing, for use in torch custom op
 // Please keep this in sync with the counterpart defined in
-// tensorrt_llm/_torch/modules/fused_moe/routing.py
+// flashinfer/fused_moe/core.py
 enum class RoutingMethodType : int64_t {
   // Default: Softmax -> TopK
   Default = 0,
@@ -46,8 +46,10 @@ enum class RoutingMethodType : int64_t {
   Llama4 = 3,
   // RenormalizeNaive: Softmax -> TopK -> Renormalize
   RenormalizeNaive = 4,
+  // TopK only (no softmax)
+  TopK = 5,
   // Unspecified
-  Unspecified = 5,
+  Unspecified = 6,
 };
 
 inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType) {
@@ -62,6 +64,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "Llama4";
     case RoutingMethodType::RenormalizeNaive:
       return "RenormalizeNaive";
+    case RoutingMethodType::TopK:
+      return "TopK";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -117,12 +121,34 @@ class Runner {
 };
 }  // namespace Routing
 
+namespace MoE {
+// The type of gated activation function
+// Please keep this in sync with the counterpart defined in flashinfer/flashinfer/fused_moe/core.py
+enum class GatedActType : int64_t {
+  // SwiGlu
+  SwiGlu = 0,
+  // GeGlu
+  GeGlu = 1,
+};
+
+inline std::string serializeGatedActType(GatedActType gatedActType) {
+  switch (gatedActType) {
+    case GatedActType::SwiGlu:
+      return "SwiGlu";
+    case GatedActType::GeGlu:
+      return "GeGlu";
+    default:
+      return "InvalidGatedActType";  // TODO throw error
+  };
+}
+}  // namespace MoE
+
 namespace PermuteGemm1 {
 class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-                  int tileTokensDim, ActType actType, bool useShuffledMatrixA,
+                  int tileTokensDim, MoE::GatedActType gatedActType, bool useShuffledMatrixA,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -140,7 +166,7 @@ class Runner {
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
-           float* ptrBias, float* ptrSwiGluAlpha, float* ptrSwiGluBeta, float* ptrClampLimit,
+           float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
            void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
            int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
@@ -311,8 +337,8 @@ class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-         bool useDeepSeekFp8, int tileTokensDim = 8, ActType actType = ActType::SwiGlu,
-         bool useShuffledMatrixA = false,
+         bool useDeepSeekFp8, int tileTokensDim = 8,
+         GatedActType gatedActType = GatedActType::SwiGlu, bool useShuffledMatrixA = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrixA = false,

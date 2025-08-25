@@ -17,6 +17,7 @@ limitations under the License.
 import cutlass
 import torch
 import importlib.util
+import functools
 
 
 def is_cute_dsl_available() -> bool:
@@ -60,3 +61,9 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     if torch_dtype is None:
         raise TypeError(f"{cutlass_dtype} is not supported by torch")
     return torch_dtype
+
+
+@functools.cache
+def get_num_sm(device: torch.device) -> int:
+    # get the compute capability of the device, which would be cached
+    return torch.cuda.get_device_properties(device).multi_processor_count

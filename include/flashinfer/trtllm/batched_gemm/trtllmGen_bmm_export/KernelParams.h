@@ -192,8 +192,8 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM,
-                                   int tileN, int tileK, tg::Dtype dtypeElt, tg::SfLayout layout,
-                                   int sfReshapeFactor) {
+                                   int tileN, int tileK, tg::SfLayout layout, int sfReshapeFactor,
+                                   const int32_t numEltsPerSf) {
   // The outer dimension.
   auto numTokens = matrixType == MatrixType::MatrixA ? mM : mN;
   // The inner dimension.
@@ -202,8 +202,6 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
   auto numTokensPerTile = matrixType == MatrixType::MatrixA ? tileM : tileN;
   // The inner tile dimension.
   auto hiddenSizePerTile = tileK;
-  // Number of elements per scaling factor.
-  const int32_t numEltsPerSf = (dtypeElt == tg::Dtype::E2m1) ? 16 : 32;
 
   switch (layout) {
     case tg::SfLayout::R128c4: {
@@ -297,7 +295,7 @@ static KernelParams setKernelParams(
     GemmOptions_ const& options, bool const batchM, void const* ptrA, void const* ptrB, void* ptrC,
     void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA, void const* ptrPerTokenSfB,
     void const* ptrBias, void* dSfC, float const* ptrScaleC, float const* ptrScaleGate,
-    float const* ptrClampLimit, float const* ptrSwiGluAlpha, float const* ptrSwiGluBeta,
+    float const* ptrClampLimit, float const* ptrGatedActAlpha, float const* ptrGatedActBeta,
     int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
     int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
     int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
@@ -314,8 +312,8 @@ static KernelParams setKernelParams(
   params.ptrScaleC = ptrScaleC;
   params.ptrScaleGate = ptrScaleGate;
   params.ptrClampLimit = ptrClampLimit;
-  params.ptrSwiGluAlpha = ptrSwiGluAlpha;
-  params.ptrSwiGluBeta = ptrSwiGluBeta;
+  params.ptrGatedActAlpha = ptrGatedActAlpha;
+  params.ptrGatedActBeta = ptrGatedActBeta;
 
   int32_t ctaOffset = 0;
 
@@ -418,8 +416,9 @@ static KernelParams setKernelParams(
       // Build TMA descriptor for gmem A block scaling factors.
       auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
           options.mM * options.mNumBatches, options.mN, options.mK, MatrixType::MatrixA,
-          options.mTileM, options.mTileN, options.mTileK, options.mDtypeA, tg::SfLayout::R128c4,
-          options.mSfReshapeFactor);
+          options.mTileM, options.mTileN, options.mTileK, tg::SfLayout::R128c4,
+          options.mSfReshapeFactor,
+          options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA)));
       params.tmaSfA[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA,
                                                     const_cast<void*>(dSfA));
     }
@@ -453,10 +452,10 @@ static KernelParams setKernelParams(
         auto const inputNumTokensSfB = ctaOffset * options.mTileN;
 
         // Build TMA descriptor for gmem B block scaling factors.
-        auto [shapeSfB, strideSfB, tileShapesSfB] =
-            makeTmaShapeStrideSfAb(options.mM, inputNumTokensSfB, options.mK, MatrixType::MatrixB,
-                                   options.mTileM, options.mTileN, options.mTileK, options.mDtypeB,
-                                   options.mSfLayoutB, options.mSfReshapeFactor);
+        auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
+            options.mM, inputNumTokensSfB, options.mK, MatrixType::MatrixB, options.mTileM,
+            options.mTileN, options.mTileK, options.mSfLayoutB, options.mSfReshapeFactor,
+            tg::dtypeNumEltsPerSf(options.mDtypeB));
         params.tmaSfB[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB,
                                                       const_cast<void*>(dSfB));
       }
@@ -515,10 +514,10 @@ static KernelParams setKernelParams(
         auto const inputNumTokensSfA = ctaOffset * options.mTileM;
 
         // Build TMA descriptor for gmem A block scaling factors.
-        auto [shapeSfA, strideSfA, tileShapesSfA] =
-            makeTmaShapeStrideSfAb(inputNumTokensSfA, options.mN, options.mK, MatrixType::MatrixA,
-                                   options.mTileM, options.mTileN, options.mTileK, options.mDtypeA,
-                                   tg::SfLayout::R128c4, options.mSfReshapeFactor);
+        auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
+            inputNumTokensSfA, options.mN, options.mK, MatrixType::MatrixA, options.mTileM,
+            options.mTileN, options.mTileK, tg::SfLayout::R128c4, options.mSfReshapeFactor,
+            options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA)));
         params.tmaSfA[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA,
                                                       const_cast<void*>(dSfA));
       }
@@ -532,8 +531,8 @@ static KernelParams setKernelParams(
       // Build TMA descriptor for gmem B block scaling factors.
       auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
           options.mM, options.mN * options.mNumBatches, options.mK, MatrixType::MatrixB,
-          options.mTileM, options.mTileN, options.mTileK, options.mDtypeB, options.mSfLayoutB,
-          options.mSfReshapeFactor);
+          options.mTileM, options.mTileN, options.mTileK, options.mSfLayoutB,
+          options.mSfReshapeFactor, tg::dtypeNumEltsPerSf(options.mDtypeB));
       params.tmaSfB[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB,
                                                     const_cast<void*>(dSfB));
     }
@@ -576,4 +575,5 @@ static KernelParams setKernelParams(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace batchedGemm
+
 }  // namespace batchedGemm

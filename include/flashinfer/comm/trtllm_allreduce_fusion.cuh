@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -20,22 +21,7 @@ namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 namespace details {
 
@@ -448,6 +434,15 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline int getSMRegisters() {
+  int device{-1};
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int regs_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&regs_per_block, cudaDevAttrMaxRegistersPerBlock, device));
+  return regs_per_block;
+}
+
 inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
                                                   std::optional<int> numRows, int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
@@ -769,7 +764,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   float* scale_factor;
   bool use_oneshot;
-  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
@@ -1306,9 +1301,8 @@ int get_sm_count() {
   if (sm_count == 0) {
     int device_id;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&device_id));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    FLASHINFER_CUDA_CALL(
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   }
   return sm_count;
 }
@@ -1324,6 +1318,16 @@ cudaError_t launch_oneshot_lamport(AllReduceFusionParams<T> const& params,
   return cudaSuccess;
 }
 
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
+          bool TriggerCompletionAtEnd = true>
+int get_registers_per_thread_oneshot() {
+  auto kernel =
+      allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, TriggerCompletionAtEnd>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
+}
+
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaunchConfig_t& cfg,
                                 std::array<int, NRanks> begin_tokens,
@@ -1332,6 +1336,14 @@ cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaun
       cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>,
                          params, begin_tokens, token_num_per_ranks));
   return cudaSuccess;
+}
+
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+int get_registers_per_thread_twoshot() {
+  auto kernel = allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
 }
 
 bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
@@ -1375,7 +1387,23 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     cluster_size /= 2;
   }
   int sm_count = get_sm_count();
-  while (cluster_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512) {
+  int registers_per_thread;
+  if (oneshot) {
+    if (params.trigger_completion_at_end) {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, true>();
+    } else {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, false>();
+    }
+  } else {
+    registers_per_thread = get_registers_per_thread_twoshot<Pattern, T, NRanks, Fp32Acc>();
+  }
+  static int max_registers = -1;
+  if (max_registers < 0) {
+    max_registers = utils::getSMRegisters();
+  }
+  int max_threads_per_block = min(max_registers / registers_per_thread, 1024);
+  while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
+         threads_per_block <= max_threads_per_block / 2) {
     threads_per_block *= 2;
     cluster_size /= 2;
   }

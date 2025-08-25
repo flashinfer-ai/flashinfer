@@ -48,6 +48,10 @@ def gen_decode_attention_modules(
         use_sliding_window_options,
         use_logits_soft_cap_options,
     ):
+        if q_dtype != kv_dtype:
+            if kv_dtype.itemsize > 1:
+                continue  # skip fp16/bf16 mixed precision
+
         jit_specs.append(
             flashinfer.decode.gen_single_decode_module(
                 q_dtype,
@@ -71,6 +75,46 @@ def gen_decode_attention_modules(
                 pos_encoding_mode,
                 use_sliding_window,
                 use_logits_soft_cap,
+            )
+        )
+
+    return jit_specs
+
+
+def gen_persistent_batch_attention_modules(
+    q_dtypes,
+    kv_dtypes,
+    head_dims,
+    use_logits_soft_cap_options,
+) -> list[JitSpec]:
+    jit_specs: list[JitSpec] = []
+
+    for (
+        q_dtype,
+        kv_dtype,
+        head_dim,
+        use_logits_soft_cap,
+    ) in itertools.product(
+        q_dtypes,
+        kv_dtypes,
+        head_dims,
+        use_logits_soft_cap_options,
+    ):
+        if q_dtype != kv_dtype:
+            if kv_dtype.itemsize > 1:
+                continue  # skip fp16/bf16 mixed precision
+
+        jit_specs.append(
+            flashinfer.attention.gen_batch_attention_module(
+                q_dtype,
+                kv_dtype,
+                q_dtype,
+                torch.int32,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
+                0,  # pos_encoding_mode
+                use_logits_soft_cap,
+                False,  # use_profiler
             )
         )
 
@@ -105,6 +149,10 @@ def gen_prefill_attention_modules(
         use_logits_soft_cap_options,
         use_fp16_qk_reduction_options,
     ):
+        if q_dtype != kv_dtype:
+            if kv_dtype.itemsize > 1:
+                continue  # skip fp16/bf16 mixed precision
+
         if is_sm90a_supported(torch.device("cuda")) and is_fa3_backend_supported(
             pos_encoding_mode,
             use_fp16_qk_reduction,

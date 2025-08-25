@@ -59,6 +59,7 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "input_dtype",
         "weight_dtype",
+        "gated_act",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",

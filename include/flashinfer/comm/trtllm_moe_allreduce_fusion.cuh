@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -378,22 +379,7 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 }  // namespace maths
 
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 namespace utils {
 #define FINAL_MASK 0xffffffff
@@ -685,7 +671,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   // todo(review): why float* scale_factor in trt-llm?
   float scale_factor;
-  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
 
   // moe-allreduce output (non-fused)
@@ -933,9 +919,7 @@ int get_sm_count() {
     auto status = cudaGetDevice(&device_id);
     FLASHINFER_CHECK(status == cudaSuccess, "cudaGetDevice failed with error code " +
                                                 std::string(cudaGetErrorString(status)));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
   }
   return sm_count;
 }

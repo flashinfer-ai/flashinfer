@@ -136,9 +136,6 @@ struct KernelParams {
   int32_t mNumHeadsQPerKv;
   // The hidden size of O.
   int64_t mNumHiddenEltsO;
-  // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
-  // without paddings.
-  int32_t mNumMtpTokens;
   // The total number of pages in the paged-kv memory pool.
   int32_t mNumPagesInMemPool;
   // The output scale for FP8 quantization.
@@ -310,10 +307,19 @@ struct KernelParams {
   // Compute the strides for K and V.
   template <class FmhaOptions>
   static auto makeStrideKv(FmhaOptions const& options, bool isK) {
-    int strideKeysVals = options.kvStrideKeysValues;
-    int strideHeads = options.kvStrideHeads;
-    int strideBatch = options.kvStrideBatch;
+    int strideKeysVals = 0;
+    int strideHeads = 0;
+    int strideBatch = 0;
 
+    if (isK) {
+      strideKeysVals = options.kStrideKeysValues;
+      strideHeads = options.kStrideHeads;
+      strideBatch = options.kStrideBatch;
+    } else {
+      strideKeysVals = options.vStrideKeysValues;
+      strideHeads = options.vStrideHeads;
+      strideBatch = options.vStrideBatch;
+    }
     // The 3 strides (the other ones are 1 and 0).
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
@@ -678,7 +684,6 @@ struct KernelParams {
     params.mMaxNumCtasKv = maxNumCtasKv;
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-    params.mNumMtpTokens = options.mMaxSeqLenQ;
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
@@ -692,7 +697,7 @@ struct KernelParams {
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
-    params.ptrSoftmaxStats = nullptr;
+    params.ptrSoftmaxStats = options.softmaxStatsPtr;
     return params;
   }
 };
