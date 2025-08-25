@@ -991,8 +991,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4, 5),
                     (0, 0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers,
                 ),
             )
@@ -1002,8 +1002,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4),
                     (0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers[:5],
                 ),
             ),
@@ -1142,7 +1142,7 @@ def get_trtllm_moe_sm100_module():
 
             # TODO(siyuan): support fp8
             moe_op.trtllm_fp4_block_scale_moe(
-                routing_logits.to(torch.bfloat16),
+                routing_logits,
                 topk_ids,
                 expert_weights,
                 kwargs["routing_bias"],
@@ -1185,7 +1185,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
@@ -1196,7 +1196,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers[:5],
                     ),
@@ -1406,7 +1406,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         gated_act_type: int = 0,
         output: Optional[torch.Tensor] = None,
-        tune_max_num_tokens: int = 1024,
+        tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1466,7 +1466,9 @@ def get_trtllm_moe_sm100_module():
         )
         inputs = [
             output,
-            routing_logits,
+            torch.empty(num_tokens, num_experts, dtype=routing_dtype, device="meta")
+            if routing_logits is None
+            else routing_logits,
             topk_ids,
             expert_weights,
             hidden_states,
@@ -1767,7 +1769,7 @@ def trtllm_fp4_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1824,7 +1826,7 @@ def trtllm_fp4_block_scale_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
     Returns:
@@ -1899,7 +1901,7 @@ def trtllm_fp4_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1918,10 +1920,20 @@ def trtllm_fp4_block_scale_routed_moe(
             Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
         gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
             Scale tensor of FC1 weights. Dtype must be float8.
+        gemm1_bias (Optional[torch.Tensor]): shape [num_experts, 2 * intermediate_size]
+            Tensor of FC1 biases. Dtype is float32.
+        gemm1_alpha (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu alpha. Dtype is float32.
+        gemm1_beta (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu beta. Dtype is float32.
+        gemm1_clamp_limit (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu clamp limit. Dtype is float32.
         gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
             Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
-        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size//128, intermediate_size//128]
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // (32 if mxfp4 else 16)]
             Scale tensor of FC2 weights. Dtype must be float8.
+        gemm2_bias (Optional[torch.Tensor]): shape [num_experts, hidden_size]
+            Tensor of FC2 biases. Dtype is float32.
         output1_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
             Tensor of scaling factors for first layer activation output
         output1_scale_gate_scalar (Optional[torch.Tensor]): shape [local_num_experts]
@@ -1947,7 +1959,7 @@ def trtllm_fp4_block_scale_routed_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
 
