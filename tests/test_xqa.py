@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer import xqa_decode
+from flashinfer import xqa
 
 
 def set_random_seed(seed=42):
@@ -286,7 +286,7 @@ def test_xqa(
     scratch_size = 256 << 20
     scratch_buf = torch.zeros(scratch_size, dtype=torch.uint8, device="cuda")
 
-    xqa_decode(
+    xqa(
         use_fp16,
         tokens_per_page,
         valid_elems_per_head,
