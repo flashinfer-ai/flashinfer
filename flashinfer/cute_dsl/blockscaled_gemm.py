@@ -259,9 +259,9 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if write_out_signals and (self.params.dst_signals is not None):
-                atomic_add_release_global(self.params.dst_signals + curr_group_idx, 1)
+                atomic_add_release_global(self.params.dst_signals + batch_idx, 1)
             if self.params.src_signals is not None:
-                wait_signal(self.params.src_signals + (curr_group_idx + 1), 1)
+                wait_signal(self.params.src_signals + (batch_idx + 1), 1)
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
