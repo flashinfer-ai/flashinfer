@@ -342,7 +342,7 @@ def gen_gemm_sm100_module() -> JitSpec:
     major, minor = torch.cuda.get_device_capability(device)
 
     # protecting current_device_nvcc_flags
-    assert major in [10, 12], "currently only support compute capability 10, 12"
+    assert major in [10, 11, 12], "currently only support compute capability 10, 11, 12"
 
     return gen_jit_spec(
         "gemm_sm100",
