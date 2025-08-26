@@ -26,8 +26,8 @@ from .jit import gen_jit_spec
 from .utils import (
     _get_cache_buf,
     device_support_pdl,
-    register_custom_op,
-    register_fake_op,
+    fast_register_custom_op,
+    fast_register_fake_op,
 )
 
 
@@ -53,7 +53,7 @@ def error_generator_if_torch_compile(generator: Optional[torch._C.Generator]):
 def init_sampling_module():
     module = gen_sampling_module().build_and_load()
 
-    @register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
+    @fast_register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
     def softmax(
         workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
@@ -76,7 +76,7 @@ def init_sampling_module():
         )
         return probs
 
-    @register_fake_op("flashinfer::softmax")
+    @fast_register_fake_op("flashinfer::softmax")
     def _fake_softmax(
         workspace_buffer: torch.Tensor,
         logits: torch.Tensor,
@@ -87,7 +87,7 @@ def init_sampling_module():
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
     # torch library for sampling_from_logits
-    @register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
+    @fast_register_custom_op("flashinfer::sampling_from_logits", mutates_args=())
     def sampling_from_logits(
         logits: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -109,7 +109,7 @@ def init_sampling_module():
         )
         return samples
 
-    @register_fake_op("flashinfer::sampling_from_logits")
+    @fast_register_fake_op("flashinfer::sampling_from_logits")
     def _fake_sampling_from_logits(
         logits: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -121,7 +121,7 @@ def init_sampling_module():
 
     # torch library for sampling_from_probs
 
-    @register_custom_op("flashinfer::sampling_from_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::sampling_from_probs", mutates_args=())
     def sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -143,7 +143,7 @@ def init_sampling_module():
 
     # torch library for sampling_from_probs
 
-    @register_fake_op("flashinfer::sampling_from_probs")
+    @fast_register_fake_op("flashinfer::sampling_from_probs")
     def _fake_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -155,7 +155,7 @@ def init_sampling_module():
 
     # torch library for top_p_sampling_from_probs
 
-    @register_custom_op("flashinfer::top_p_sampling_from_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_p_sampling_from_probs", mutates_args=())
     def top_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -182,7 +182,7 @@ def init_sampling_module():
         )
         return samples
 
-    @register_fake_op("flashinfer::top_p_sampling_from_probs")
+    @fast_register_fake_op("flashinfer::top_p_sampling_from_probs")
     def _fake_top_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -197,7 +197,7 @@ def init_sampling_module():
 
     # torch library for top_k_sampling_from_probs
 
-    @register_custom_op("flashinfer::top_k_sampling_from_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_k_sampling_from_probs", mutates_args=())
     def top_k_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -222,7 +222,7 @@ def init_sampling_module():
         )
         return samples
 
-    @register_fake_op("flashinfer::top_k_sampling_from_probs")
+    @fast_register_fake_op("flashinfer::top_k_sampling_from_probs")
     def _fake_top_k_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -237,7 +237,7 @@ def init_sampling_module():
 
     # torch library for min_p_sampling_from_probs
 
-    @register_custom_op("flashinfer::min_p_sampling_from_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::min_p_sampling_from_probs", mutates_args=())
     def min_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -264,7 +264,7 @@ def init_sampling_module():
         )
         return samples
 
-    @register_fake_op("flashinfer::min_p_sampling_from_probs")
+    @fast_register_fake_op("flashinfer::min_p_sampling_from_probs")
     def _fake_min_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -279,7 +279,7 @@ def init_sampling_module():
 
     # torch library for top_k_top_p_sampling_from_probs
 
-    @register_custom_op("flashinfer::top_k_top_p_sampling_from_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_k_top_p_sampling_from_probs", mutates_args=())
     def top_k_top_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -311,7 +311,7 @@ def init_sampling_module():
         )
         return samples
 
-    @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
+    @fast_register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
     def _fake_top_k_top_p_sampling_from_probs(
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
@@ -328,7 +328,7 @@ def init_sampling_module():
 
     # torch library for top_p_renorm_probs
 
-    @register_custom_op("flashinfer::top_p_renorm_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_p_renorm_probs", mutates_args=())
     def top_p_renorm_probs(
         probs: torch.Tensor,
         maybe_top_p_arr: Optional[torch.Tensor],
@@ -347,7 +347,7 @@ def init_sampling_module():
         )
         return renorm_probs
 
-    @register_fake_op("flashinfer::top_p_renorm_probs")
+    @fast_register_fake_op("flashinfer::top_p_renorm_probs")
     def _fake_top_p_renorm_probs(
         probs: torch.Tensor,
         maybe_top_p_arr: Optional[torch.Tensor],
@@ -357,7 +357,7 @@ def init_sampling_module():
 
     # torch library for top_k_renorm_probs
 
-    @register_custom_op("flashinfer::top_k_renorm_probs", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_k_renorm_probs", mutates_args=())
     def top_k_renorm_probs(
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
@@ -374,7 +374,7 @@ def init_sampling_module():
         )
         return renorm_probs
 
-    @register_fake_op("flashinfer::top_k_renorm_probs")
+    @fast_register_fake_op("flashinfer::top_k_renorm_probs")
     def _fake_top_k_renorm_probs(
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
@@ -384,7 +384,7 @@ def init_sampling_module():
 
     # torch library for top_k_mask_logits
 
-    @register_custom_op("flashinfer::top_k_mask_logits", mutates_args=())
+    @fast_register_custom_op("flashinfer::top_k_mask_logits", mutates_args=())
     def top_k_mask_logits(
         logits: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
@@ -401,7 +401,7 @@ def init_sampling_module():
         )
         return mask_logits
 
-    @register_fake_op("flashinfer::top_k_mask_logits")
+    @fast_register_fake_op("flashinfer::top_k_mask_logits")
     def _fake_top_k_mask_logits(
         logits: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
@@ -411,7 +411,7 @@ def init_sampling_module():
 
     # torch library for chain_speculative_sampling
 
-    @register_custom_op(
+    @fast_register_custom_op(
         "flashinfer::chain_speculative_sampling",
         mutates_args=(
             "output_accepted_token_num",
@@ -447,7 +447,7 @@ def init_sampling_module():
         )
         return output_token_ids
 
-    @register_fake_op("flashinfer::chain_speculative_sampling")
+    @fast_register_fake_op("flashinfer::chain_speculative_sampling")
     def _fake_chain_speculative_sampling(
         draft_probs: torch.Tensor,
         draft_token_ids: torch.Tensor,

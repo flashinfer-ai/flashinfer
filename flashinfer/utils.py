@@ -260,20 +260,54 @@ else:
     ) -> Callable:
         # NOTE(Zihao): torch.library.custom_op has significant overhead as mentioned in the following link
         # https://github.com/vllm-project/vllm/blob/36e76700453924c8d421db99af70a88a1df835cd/vllm/utils.py#L1660-L1674
-
-        return torch.library.custom_op(
-            name,
-            fn,
-            mutates_args=mutates_args,
-            device_types=device_types,
-            schema=schema,
-        )
+        return lambda x: x
 
     def register_fake_op(
         name: str,
         fn: Optional[Callable] = None,
     ) -> Callable:
-        return torch.library.register_fake(name, fn)
+        return lambda x: x
+
+
+flashinfer_lib = torch.library.Library("flashinfer", "FRAGMENT")  # noqa
+lib = flashinfer_lib
+
+
+def fast_register_custom_op(
+    name: str,
+    fn: Optional[Callable] = None,
+    /,
+    *,
+    mutates_args: Union[str, Iterable[str]],
+    device_types: Optional[Union[str, Sequence[str]]] = None,
+    schema: Optional[str] = None,
+    dispatch_key: str = "CUDA",
+):
+    if IS_BUILDING_DOCS or not supports_custom_op():
+        return lambda x: x
+
+    _, op_name = name.split("::")
+
+    def wrapper(func):
+        schema = torch.library.infer_schema(func, mutates_args=mutates_args)
+        lib.define(op_name + schema)
+        lib.impl(op_name, func, dispatch_key=dispatch_key)
+        return torch._library.utils.lookup_op(name)
+    return wrapper
+
+
+def fast_register_fake_op(
+    name: str,
+    fn: Optional[Callable] = None,
+):
+    if IS_BUILDING_DOCS or not supports_custom_op():
+        return lambda x: x
+
+    _, op_name = name.split("::")
+
+    def wrapper(func):
+        lib._register_fake(op_name, func)
+    return wrapper
 
 
 def determine_gemm_backend(device: torch.device) -> str:
