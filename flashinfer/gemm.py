@@ -207,7 +207,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     major, minor = torch.cuda.get_device_capability(device)
 
     # protecting current_device_nvcc_flags
-    assert major in [9, 10, 12], "currently only support compute capability 9, 10, 12"
+    assert major in [10, 12], "currently only support compute capability 10, 12"
 
     return gen_jit_spec(
         "fp4_gemm_cutlass",
@@ -339,10 +339,16 @@ def gen_gemm_sm100_module() -> JitSpec:
         with open(src_path, "r") as f:
             source = f.read()
         write_if_different(dest_path, source)
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+
+    # protecting current_device_nvcc_flags
+    assert major in [10, 12], "currently only support compute capability 10, 12"
+
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=current_device_nvcc_flags,
     )
 
 
