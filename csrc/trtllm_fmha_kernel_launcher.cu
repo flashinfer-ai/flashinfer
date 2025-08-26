@@ -36,8 +36,11 @@ enum class TllmPagedAttentionMode {
   ForGen,
 };
 
-#include <memory>
-#include <mutex>
+// 128MB: max workspace buffer size for trtllm-gen fixed at python api side
+constexpr size_t kMaxWorkspaceBufferSize = 128 * 1024 * 1024;
+
+// #include <memory>
+// #include <mutex>
 
 class TllmGenFmhaRunnerCache {
  public:
@@ -152,8 +155,9 @@ void trtllm_paged_attention_launcher(
     size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
     size_t num_semaphores =
         round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-    runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-        static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
+    runner_params.multiCtasKvScratchPtr =
+        reinterpret_cast<void*>(static_cast<char*>(workspace_buffer) + kMaxWorkspaceBufferSize -
+                                num_semaphores * sizeof(uint32_t));
     runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
   }
 
@@ -380,9 +384,10 @@ void trtllm_ragged_attention_launcher(
   size_t max_num_qo_heads = 256;
   size_t num_semaphores =
       round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-  runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-      static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t) +
-      sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
+  // semaphores be at the last 8MB of 128 MB workspace buffer
+  runner_params.multiCtasKvScratchPtr =
+      reinterpret_cast<void*>(static_cast<char*>(workspace_buffer) + kMaxWorkspaceBufferSize -
+                              num_semaphores * sizeof(uint32_t));
   runner_params.multiCtasKvCounterPtr =
       reinterpret_cast<int32_t*>(static_cast<char*>(workspace_buffer) +
                                  sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
