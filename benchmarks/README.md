@@ -152,6 +152,7 @@ The output CSV will contain detailed metrics including:
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
 | `--gated_act`            | Gated activation function: `swiglu` (default) or `geglu`                                                   |
+| `--autotune`             | Enable autotune for supported operation                                                                     |
 
 ### MOE Routing Method Compatibility
 
