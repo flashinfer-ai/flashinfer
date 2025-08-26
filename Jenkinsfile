@@ -39,7 +39,10 @@
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
-docker_run = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
+// Now supports multiple CUDA versions
+docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:latest"
+docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:latest"
+docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:latest"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -97,6 +100,25 @@ def init_git(submodule = false) {
   }
 }
 
+def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_closure) {
+  try {
+    test_closure(spot_node_type)
+  } catch (hudson.AbortException abortEx) {
+    echo "Received normal AbortException, exit now: " + abortEx.toString()
+    throw abortEx
+  } catch (Throwable ex) {
+    echo "Exception during SPOT run for ${test_name}: " + ex.toString()
+    if (is_last_build()) {
+      echo "Exception during SPOT run for ${test_name}: " + ex.toString() + " retry on-demand"
+      currentBuild.result = 'SUCCESS'
+      test_closure(on_demand_node_type)
+    } else {
+      echo 'Exit since it is not last build'
+      throw ex
+    }
+  }
+}
+
 // stage('Lint') {
 //   node('CPU-SPOT') {
 //     ws(per_exec_ws('flashinfer-lint')) {
@@ -105,8 +127,19 @@ def init_git(submodule = false) {
 //   }
 // }
 
-def run_unittest_CPU_AOT_COMPILE(node_type) {
-  echo "Running CPU AOT Compile Unittest"
+def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
+  echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
+
+  def docker_run = ""
+  if (cuda_version == "cu126") {
+    docker_run = docker_run_cu126
+  } else if (cuda_version == "cu128") {
+    docker_run = docker_run_cu128
+  } else if (cuda_version == "cu129") {
+    docker_run = docker_run_cu129
+  } else {
+    error("Unknown CUDA version: ${cuda_version}")
+  }
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -150,8 +183,19 @@ def run_unittest_CPU_AOT_COMPILE(node_type) {
   }
 }
 
-def shard_run_unittest_GPU(node_type, shard_id) {
-  echo "Running unittest on ${node_type}, shard ${shard_id}"
+def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
+  echo "Running unittest on ${node_type}, shard ${shard_id}, CUDA ${cuda_version}"
+
+  def docker_run = ""
+  if (cuda_version == "cu126") {
+    docker_run = docker_run_cu126
+  } else if (cuda_version == "cu128") {
+    docker_run = docker_run_cu128
+  } else if (cuda_version == "cu129") {
+    docker_run = docker_run_cu129
+  } else {
+    error("Unknown CUDA version: ${cuda_version}")
+  }
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -199,113 +243,49 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    'AOT-Build-Import-x86-64': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('CPU-LARGE-SPOT')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('CPU-LARGE')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    // CUDA 12.6 Tests
+    'AOT-Build-Import-x86-64-cu126': {
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
     },
-    'AOT-Build-Import-aarch64': {
-      try {
-        run_unittest_CPU_AOT_COMPILE('ARM-LARGE-SPOT')
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_unittest_CPU_AOT_COMPILE('ARM-LARGE')
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    'AOT-Build-Import-aarch64-cu126': {
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
     },
-    'JIT-Unittest-1': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 1)
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 1)
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    // CUDA 12.8 Tests
+    'AOT-Build-Import-x86-64-cu128': {
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
     },
-    'JIT-Unittest-2': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 2)
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 2)
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    'AOT-Build-Import-aarch64-cu128': {
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
     },
-    'JIT-Unittest-3': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 3)
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 3)
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    // CUDA 12.9 Tests
+    'AOT-Build-Import-x86-64-cu129': {
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
     },
-    'JIT-Unittest-4': {
-      try {
-        shard_run_unittest_GPU('GPU-G5-SPOT', 4)
-      } catch (Throwable ex) {
-        echo 'Exception during SPOT run ' + ex.toString()
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU('GPU-G5', 4)
-        } else {
-          echo 'Exit since it is not last build'
-          throw ex
-        }
-      }
+    'AOT-Build-Import-aarch64-cu129': {
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+    },
+    // JIT unittest only for cu129
+    'JIT-Unittest-1-cu129': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-1-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 1, 'cu129') })
+    },
+    'JIT-Unittest-2-cu129': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-2-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 2, 'cu129') })
+    },
+    'JIT-Unittest-3-cu129': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-3-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu129') })
+    },
+    'JIT-Unittest-4-cu129': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-4-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 4, 'cu129') })
     }
   )
 }

@@ -2469,7 +2469,7 @@ class MaskedBatchedMatmulCuteDSL:
         sfa_ptr: cute.Pointer,
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        masked_mptr: cute.Pointer,
+        masked_m_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
@@ -2539,7 +2539,7 @@ class MaskedBatchedMatmulCuteDSL:
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L_mma_spec(sfb_tensor)
 
         masked_m_tensor = cute.make_tensor(
-            masked_mptr,
+            masked_m_ptr,
             layout=cute.make_ordered_layout((self._l,), order=(0,)),
         )
 

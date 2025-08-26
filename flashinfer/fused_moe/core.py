@@ -32,10 +32,11 @@ from ..autotuner import (
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
+from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
 from ..utils import (
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
@@ -273,7 +274,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
-        "-DENABLE_FP4",
+        "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
@@ -867,7 +868,7 @@ def cutlass_fused_moe(
     if output is None:
         output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
     else:
-        _check_shape_dtype_device(
+        check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
 

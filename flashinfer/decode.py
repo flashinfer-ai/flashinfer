@@ -32,7 +32,6 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_decode_uri,
     setup_cubin_loader,
-    setup_metainfo_loader,
     trtllm_gen_fmha_module,
 )
 from .page import get_seq_lens
@@ -49,7 +48,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_range_buf,
@@ -306,7 +305,6 @@ def get_trtllm_gen_fmha_module():
     mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
-    setup_metainfo_loader(mod.get_library_path())
     return op
 
 
@@ -1231,14 +1229,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q)
         else:
-            _check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
 
         if self.use_tensor_cores:
             run_args = [
@@ -1749,7 +1747,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         if out is None:
             out = torch.empty_like(q_nope, device=device)
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
 
@@ -1761,7 +1759,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                     device=device,
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse,
                     (q_nope.size(0), q_nope.size(1)),
                     q_nope.dtype,
@@ -1802,13 +1800,9 @@ class TrtllmGenDecodeModule:
         self._sm_count: Optional[int] = None
         self._mod = trtllm_gen_fmha_module()
         self._op = self._mod.build_and_load()
-        from flashinfer.jit.cubin_loader import (
-            setup_cubin_loader,
-            setup_metainfo_loader,
-        )
+        from flashinfer.jit.cubin_loader import setup_cubin_loader
 
         setup_cubin_loader(self._mod.get_library_path())
-        setup_metainfo_loader(self._mod.get_library_path())
 
     def _paged_run(
         self,
@@ -2123,9 +2117,9 @@ def trtllm_batch_decode_with_kv_cache(
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
-        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
 
-        _check_shape_dtype_device(
+        check_shape_dtype_device(
             out_scale_factor,
             fp4_out_scale_shape,
             torch.float8_e4m3fn,
@@ -2149,9 +2143,12 @@ def trtllm_batch_decode_with_kv_cache(
         assert o_sf_vec_size is None
         out_scale_factor = None
         o_sf_start_index = 0
-        out_dtype = out_dtype or query.dtype
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
         out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
@@ -2324,7 +2321,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
     else:
         batch_size, _, num_q_heads, _ = query.shape
-        _check_shape_dtype_device(
+        check_shape_dtype_device(
             out,
             [batch_size, num_q_heads, kv_lora_rank],
             torch.bfloat16,

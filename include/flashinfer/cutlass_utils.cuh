@@ -42,7 +42,9 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
 #if defined(FLASHINFER_ENABLE_FP4_E2M1)
+#if (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 12080)
 #include <cuda_fp4.h>
+#endif
 #endif
 
 namespace flashinfer {

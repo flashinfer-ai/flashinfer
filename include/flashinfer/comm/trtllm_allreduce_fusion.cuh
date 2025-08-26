@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 
@@ -531,7 +531,7 @@ __forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c
   return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
 }
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 // NOTE: bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
@@ -623,7 +623,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 12080)
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmp);
@@ -945,7 +945,7 @@ class FusedOp {
       }
     }
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       // NOTE(Yingyi): might update later
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
@@ -1469,24 +1469,26 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);      \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                 \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 120800) {                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);    \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float!");           \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");    \
+        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");            \
       }                                                                                      \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                              \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);   \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                              \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 120800) {                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks); \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float!");        \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher"); \
+        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");         \
       }                                                                                      \
       break;                                                                                 \
     default:                                                                                 \
-      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern!");                      \
+      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                       \
   }
 
   switch (params.nranks) {

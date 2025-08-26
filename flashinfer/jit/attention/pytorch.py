@@ -23,6 +23,7 @@ import torch
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -1558,12 +1559,25 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def trtllm_gen_fmha_module():
+    include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
+    header_name = "flashInferMetaInfo"
+
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_FMHA, ".h"
+    )
+
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
+
     return gen_jit_spec(
         "fmha_gen",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_cuda_cflags=[
             f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
             f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',

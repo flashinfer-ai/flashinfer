@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     WeightLayout,
     trtllm_fp4_block_scale_moe,
@@ -185,6 +186,14 @@ def parse_moe_args(line, parser):
         default="swiglu",
         choices=["swiglu", "geglu"],
         help="Type of gated activation function: swiglu | geglu.",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+        ),
     )
 
     # CUTLASS fused MoE specific
@@ -604,10 +613,11 @@ def testTrtllmFp4BlockScaleMoe(args):
     hidden_states_fp4 = hidden_states_fp4_bytes.view(torch.uint8).reshape(
         hidden_states.shape[0], hidden_states.shape[1] // 2
     )
+    # Hidden-states scale for FP4 must be 2D: [num_tokens, hidden_size // 16]
     hidden_states_scale_linear_fp4 = hidden_states_scale_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(-1)
-    # Ensure expected vector size (16 elements per hidden value for NvFP4)
+    )
+    # Ensure expected shape (16 elements per hidden value for NvFP4)
     expected_scale_elems = (num_tokens * hidden_size) // 16
     if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
         if args.verbose >= 1:
@@ -617,6 +627,9 @@ def testTrtllmFp4BlockScaleMoe(args):
         hidden_states_scale_linear_fp4 = torch.ones(
             expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
         )
+    hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4.reshape(
+        num_tokens, hidden_size // 16
+    )
 
     # Prepare weights for kernel
     # For FP4 weights, keep them as uint8 (packed format) - don't convert to float8_e4m3fn
@@ -691,6 +704,22 @@ def testTrtllmFp4BlockScaleMoe(args):
             do_finalize=True,
         )
 
+    backend = "trtllm"
+
+    # Optional autotune warmup (supported for FP4 TRTLlm fused MoE)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "trtllm_autotune"
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Autotune warmup for FP4 block scale MoE: {warmup_iters} iters"
+            )
+        with autotune(True):
+            for _ in range(warmup_iters):
+                run_fp4_moe()
+
     # Benchmark timing
     if is_cuda_graph_compatible:
         times = bench_gpu_time_with_cudagraph(
@@ -734,7 +763,6 @@ def testTrtllmFp4BlockScaleMoe(args):
         routing_logits_dtype=routing_logits.dtype,
     )
 
-    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []
@@ -1011,6 +1039,20 @@ def testCutlassFusedMoe(args):
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
+    backend = "cutlass"
+
+    # Optional autotune warmup (supported for CUTLASS fused MoE)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "cutlass_autotune"
+        if args.verbose >= 1:
+            print(f"[INFO] Autotune warmup for CUTLASS fused MoE: {warmup_iters} iters")
+        with autotune(True):
+            for _ in range(warmup_iters):
+                run_cutlass()
+
     # Measure
     if is_cuda_graph_compatible:
         times = bench_gpu_time_with_cudagraph(
@@ -1064,7 +1106,6 @@ def testCutlassFusedMoe(args):
         active_experts=int(selected_experts.unique().numel()),
     )
 
-    backend = "cutlass"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
     res = []

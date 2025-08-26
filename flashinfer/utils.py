@@ -443,22 +443,22 @@ def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
 
-def _check_shape_dtype_device(
+def check_shape_dtype_device(
     x: torch.Tensor,
-    expected_shape: Sequence[int],
-    expected_dtype: torch.dtype,
-    expected_device: torch.device,
+    expected_shape: Optional[Sequence[int]],
+    expected_dtype: Optional[torch.dtype],
+    expected_device: Optional[torch.device],
     name: str,
 ) -> None:
-    if x.shape != torch.Size(expected_shape):
+    if expected_shape and x.shape != torch.Size(expected_shape):
         raise ValueError(
             f"Invalid shape of {name}: expected {expected_shape}, got {x.shape}"
         )
-    if x.dtype != expected_dtype:
+    if expected_dtype and x.dtype != expected_dtype:
         raise ValueError(
             f"Invalid dtype of {name}: expected {expected_dtype}, got {x.dtype}"
         )
-    if x.device != expected_device:
+    if expected_device and x.device != expected_device:
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
