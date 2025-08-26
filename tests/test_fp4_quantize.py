@@ -2,7 +2,7 @@ import functools
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
+from utils_fp4 import cast_from_fp4, ref_fp4_quant
 
 from flashinfer import (
     block_scale_interleave,
@@ -123,11 +123,8 @@ def test_fp4_quantization(
     else:
         out_scale = out_scale.view(torch.float8_e4m3fn).to(torch.float32)
     if is_swizzled:
-        scale_ans = recover_swizzled_scales(
-            out_scale.reshape(-1, n // sf_vec_size),
-            m,
-            n,
-            sf_vec_size,
+        scale_ans = unswizzle_sf(
+            out_scale.reshape(-1, n // sf_vec_size), m, n, sf_vec_size
         )
     else:
         scale_ans = out_scale
