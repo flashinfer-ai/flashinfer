@@ -991,8 +991,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4, 5),
                     (0, 0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers,
                 ),
             )
@@ -1002,8 +1002,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4),
                     (0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(1024, 8),
-                    lambda x: min(last_positive_power_of_2(x), 1024),
+                    get_last_power_of_2_num_tokens_buckets(8192, 1),
+                    lambda x: min(last_positive_power_of_2(x), 8192),
                     dynamic_tensor_initializers[:5],
                 ),
             ),
@@ -1015,7 +1015,7 @@ def get_trtllm_moe_sm100_module():
         def __init__(
             self,
             top_k: int,
-            num_experts: int,
+            num_local_experts: int,
             dtype_act: DtypeTrtllmGen,
             dtype_weights: DtypeTrtllmGen,
             use_deepseek_fp8: bool,
@@ -1024,7 +1024,7 @@ def get_trtllm_moe_sm100_module():
             gated_act_type: int,
             tile_tokens_dim: Optional[int] = None,
         ):
-            self.num_experts = num_experts
+            self.num_local_experts = num_local_experts
             self.top_k = top_k
             self.dtype_act = dtype_act
             self.dtype_weights = dtype_weights
@@ -1046,7 +1046,7 @@ def get_trtllm_moe_sm100_module():
             imbalance_factor = 1.3
             # Calculate the number of tokens per expert
             # assuming perfect distribution.
-            num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
+            num_tokens_per_expert = (num_tokens * top_k) // self.num_local_experts
             # Apply the imbalance factor.
             num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
             # And pad the number to the next power of 2.
@@ -1084,7 +1084,7 @@ def get_trtllm_moe_sm100_module():
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
-                self.num_experts,
+                self.num_local_experts,
                 self.gated_act_type,
                 num_tokens,
             )
@@ -1142,7 +1142,7 @@ def get_trtllm_moe_sm100_module():
 
             # TODO(siyuan): support fp8
             moe_op.trtllm_fp4_block_scale_moe(
-                routing_logits.to(torch.bfloat16),
+                routing_logits,
                 topk_ids,
                 expert_weights,
                 kwargs["routing_bias"],
@@ -1160,13 +1160,13 @@ def get_trtllm_moe_sm100_module():
                 kwargs["output1_scale_scalar"],
                 kwargs["output1_scale_gate_scalar"],
                 kwargs["output2_scale_scalar"],
-                self.num_experts,
+                kwargs["num_experts"],
                 self.top_k,
                 kwargs["n_group"],
                 kwargs["topk_group"],
                 self.intermediate_size,
                 kwargs["local_expert_offset"],
-                kwargs["num_local_experts"],
+                self.num_local_experts,
                 kwargs["routed_scaling_factor"],
                 tile_tokens_dim,
                 kwargs["routing_method_type"],
@@ -1185,7 +1185,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
@@ -1196,7 +1196,7 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 8),
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers[:5],
                     ),
@@ -1398,7 +1398,7 @@ def get_trtllm_moe_sm100_module():
         topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
-        local_num_experts: int,
+        num_local_experts: int,
         routed_scaling_factor: Optional[float],
         tile_tokens_dim: int,
         routing_method_type: int,
@@ -1406,7 +1406,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         gated_act_type: int = 0,
         output: Optional[torch.Tensor] = None,
-        tune_max_num_tokens: int = 1024,
+        tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1448,7 +1448,7 @@ def get_trtllm_moe_sm100_module():
         )
         moe_runner = MoERunner(
             top_k=top_k,
-            num_experts=num_experts,
+            num_local_experts=num_local_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
             use_deepseek_fp8=False,
@@ -1466,7 +1466,9 @@ def get_trtllm_moe_sm100_module():
         )
         inputs = [
             output,
-            routing_logits,
+            torch.empty(num_tokens, num_experts, dtype=routing_dtype, device="meta")
+            if routing_logits is None
+            else routing_logits,
             topk_ids,
             expert_weights,
             hidden_states,
@@ -1479,7 +1481,7 @@ def get_trtllm_moe_sm100_module():
             [moe_runner],
             tunning_config,
             inputs,
-            num_local_experts=num_experts,
+            num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -1529,7 +1531,7 @@ def get_trtllm_moe_sm100_module():
             topk_group,
             intermediate_size,
             local_expert_offset,
-            local_num_experts,
+            num_local_experts,
             routed_scaling_factor,
             tile_tokens_dim,
             routing_method_type,
@@ -1767,7 +1769,7 @@ def trtllm_fp4_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1824,7 +1826,7 @@ def trtllm_fp4_block_scale_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
     Returns:
@@ -1899,7 +1901,7 @@ def trtllm_fp4_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
-    tune_max_num_tokens: int = 1024,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -1918,10 +1920,20 @@ def trtllm_fp4_block_scale_routed_moe(
             Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
         gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
             Scale tensor of FC1 weights. Dtype must be float8.
+        gemm1_bias (Optional[torch.Tensor]): shape [num_experts, 2 * intermediate_size]
+            Tensor of FC1 biases. Dtype is float32.
+        gemm1_alpha (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu alpha. Dtype is float32.
+        gemm1_beta (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu beta. Dtype is float32.
+        gemm1_clamp_limit (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu clamp limit. Dtype is float32.
         gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
             Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
-        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size//128, intermediate_size//128]
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // (32 if mxfp4 else 16)]
             Scale tensor of FC2 weights. Dtype must be float8.
+        gemm2_bias (Optional[torch.Tensor]): shape [num_experts, hidden_size]
+            Tensor of FC2 biases. Dtype is float32.
         output1_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
             Tensor of scaling factors for first layer activation output
         output1_scale_gate_scalar (Optional[torch.Tensor]): shape [local_num_experts]
@@ -1947,7 +1959,7 @@ def trtllm_fp4_block_scale_routed_moe(
         gated_act_type (int): Type of gated activation function (default: 0)
             - 0: SwiGlu
             - 1: GeGlu
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 1024)
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
 
