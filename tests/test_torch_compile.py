@@ -1,17 +1,19 @@
 import pytest
 import torch
 
-from flashinfer.sampling import get_sampling_module, _to_tensor_scalar_tuple
+from flashinfer.sampling import _to_tensor_scalar_tuple, get_sampling_module
 
 
 def opcheck(fn):
     def wrapper(*args, **kwargs):
         return torch.library.opcheck(fn, args, kwargs)
+
     return wrapper
 
     # return SimpleNamespace(
     #     top_k_mask_logits=top_k_mask_logits,
     # )
+
 
 module = get_sampling_module()
 chain_speculative_sampling = opcheck(module.chain_speculative_sampling)
@@ -73,13 +75,20 @@ def test_softmax(
 
     if temperature_arr:
         temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")
-        softmax(workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature_arr), False)
+        softmax(
+            workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature_arr), False
+        )
     else:
         softmax(workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature), False)
 
 
 # Reduce number of inputs
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -104,7 +113,12 @@ def test_sampling_freq(vocab_size, distribution, zero_ratio):
     )
 
 
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -135,7 +149,12 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     )
 
 
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -164,7 +183,12 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 def test_sampling(batch_size, vocab_size):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
@@ -178,7 +202,12 @@ def test_sampling(batch_size, vocab_size):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 def test_sampling_from_logits(batch_size, vocab_size):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0")
@@ -190,7 +219,12 @@ def test_sampling_from_logits(batch_size, vocab_size):
     )
 
 
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -211,7 +245,12 @@ def test_sampling_from_logits_freq(vocab_size, distribution):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -273,8 +312,14 @@ def test_min_p_sampling(batch_size, vocab_size, p):
         None,  # generator
     )
 
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -301,7 +346,12 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -311,7 +361,12 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
@@ -323,7 +378,12 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("k", [10, 100, 500])
 @pytest.mark.parametrize("neginf_input", [False, True])
 def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
@@ -341,7 +401,12 @@ def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111,])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        111,
+    ],
+)
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
 @pytest.mark.parametrize("onehot_target", [False, True])
 def test_chain_speculative_sampling(
