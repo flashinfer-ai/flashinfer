@@ -283,7 +283,7 @@ def fast_register_custom_op(
     schema: Optional[str] = None,
     dispatch_key: str = "CUDA",
 ):
-    if IS_BUILDING_DOCS or not supports_custom_op():
+    if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
         return lambda x: x
 
     _, op_name = name.split("::")
@@ -300,7 +300,7 @@ def fast_register_fake_op(
     name: str,
     fn: Optional[Callable] = None,
 ):
-    if IS_BUILDING_DOCS or not supports_custom_op():
+    if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
         return lambda x: x
 
     _, op_name = name.split("::")
