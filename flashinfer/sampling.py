@@ -44,7 +44,9 @@ def gen_sampling_module() -> JitSpec:
 
 def error_generator_if_torch_compile(generator: Optional[torch._C.Generator]):
     if torch.compiler.is_compiling() and generator:
-        raise ValueError("Cannot torch.compile with generator. Please, set generator=None")
+        raise ValueError(
+            "Cannot torch.compile with generator. Please, set generator=None"
+        )
 
 
 @functools.cache
@@ -476,6 +478,7 @@ def init_sampling_module():
 
 
 _sampling_modules = init_sampling_module()
+
 
 def get_sampling_module():
     return _sampling_modules
