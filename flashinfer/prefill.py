@@ -3391,10 +3391,11 @@ def trtllm_batch_context_with_kv_cache(
         assert o_sf_vec_size is None
         out_scale_factor = None
         o_sf_start_index = 0
-        out_dtype = out_dtype or query.dtype
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
+        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
             raise ValueError(f"Unsupported out_dtype: {out_dtype}")
-        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
