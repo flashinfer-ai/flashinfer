@@ -702,6 +702,18 @@ if __name__ == "__main__":
         kv_dtype="fp16",
         enable_pdl=True,
     )
+    test_trtllm_batch_prefill(
+        kv_layout="HND",
+        batch_size=1,
+        page_size=32,
+        num_kv_heads=16,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="fp16",
+        o_dtype="fp16",
+        kv_dtype="fp16",
+        enable_pdl=True,
+    )
     test_trtllm_batch_decode(
         kv_layout="HND",
         batch_size=1,
