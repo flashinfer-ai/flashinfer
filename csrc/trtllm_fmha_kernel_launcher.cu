@@ -132,6 +132,13 @@ void trtllm_paged_attention_launcher(
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
   runner_params.lsePtr = lse;
+
+  // workspace buffer counter layout
+  size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
+  size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
+  size_t num_semaphores =
+      round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
+
   if (mode == TllmPagedAttentionMode::Context) {
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
@@ -140,6 +147,8 @@ void trtllm_paged_attention_launcher(
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
+    runner_params.softmaxStatsPtr = reinterpret_cast<float2*>(static_cast<char*>(workspace_buffer) +
+                                                              num_semaphores * sizeof(uint32_t));
   } else {
     // ForGen
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
@@ -149,17 +158,13 @@ void trtllm_paged_attention_launcher(
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = use_multi_block;
 
-    size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
-    size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
-    size_t num_semaphores =
-        round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-    // semaphores be at the first 8MB of workspace buffer: counter | scratch
+    // semaphores be at the first 8MB of workspace buffer: counter | softmax | scratch
+    runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
+    runner_params.softmaxStatsPtr = reinterpret_cast<float2*>(static_cast<char*>(workspace_buffer) +
+                                                              num_semaphores * sizeof(uint32_t));
     runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-        static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
-    runner_params.multiCtasKvCounterPtr =
-        reinterpret_cast<int32_t*>(static_cast<char*>(workspace_buffer) +
-                                   sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
-    runner_params.softmaxStatsPtr = reinterpret_cast<float2*>(workspace_buffer);
+        static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t) +
+        sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
   }
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);

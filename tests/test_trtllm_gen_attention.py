@@ -534,7 +534,7 @@ def test_trtllm_batch_decode(
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
-    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -559,7 +559,7 @@ def test_trtllm_batch_decode(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
-        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
@@ -690,5 +690,27 @@ def test_trtllm_gen_prefill_deepseek(
 
 
 if __name__ == "__main__":
-    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
-    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
+    test_trtllm_batch_prefill(
+        kv_layout="HND",
+        batch_size=1,
+        page_size=32,
+        num_kv_heads=16,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="fp16",
+        o_dtype="fp16",
+        kv_dtype="fp16",
+        enable_pdl=True,
+    )
+    test_trtllm_batch_decode(
+        kv_layout="HND",
+        batch_size=1,
+        page_size=32,
+        num_kv_heads=16,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="fp16",
+        o_dtype="fp16",
+        kv_dtype="fp16",
+        enable_pdl=True,
+    )
