@@ -682,6 +682,18 @@ def test_trtllm_gen_prefill_deepseek(
 
 
 if __name__ == "__main__":
+    test_trtllm_batch_prefill(
+        kv_layout="HND",
+        batch_size=1,
+        page_size=32,
+        num_kv_heads=16,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="half",
+        o_dtype="half",
+        kv_dtype="half",
+        enable_pdl=True,
+    )
     test_trtllm_batch_decode(
         kv_layout="HND",
         batch_size=1,

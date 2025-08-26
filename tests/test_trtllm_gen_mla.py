@@ -224,4 +224,6 @@ if __name__ == "__main__":
         dtype=torch.float8_e4m3fn,
         page_size=32,
         q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=True,
     )
