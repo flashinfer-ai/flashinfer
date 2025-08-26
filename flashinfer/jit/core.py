@@ -22,7 +22,8 @@ os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
-        self.setLevel(logging.INFO)
+        logging_level = os.getenv("FLASHINFER_LOGGING_LEVEL", "info")
+        self.setLevel(logging_level.upper())
         self.addHandler(logging.StreamHandler())
         log_path = jit_env.FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
         if not os.path.exists(log_path):
@@ -73,7 +74,7 @@ try:
         "-gencode=arch=compute_{0}{1}a,code=sm_{0}{1}a".format(major, minor)
     ]
     # TODO: clean up if not needed.
-    #if major == 10 and minor == 3:
+    # if major == 10 and minor == 3:
     #    # FIXME (bringup) for functional testing, TBD.
     #    current_device_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"]
     current_device_nvcc_flags += common_nvcc_flags

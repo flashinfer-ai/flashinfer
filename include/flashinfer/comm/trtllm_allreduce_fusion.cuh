@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 
@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -20,22 +21,7 @@ namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
 
-enum class QuantizationSFLayout {
-  // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-  // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-  // values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-  // columns to the nearest multiple of 4.
-  //
-  // The scale factor block rows map to data block rows in an interleaved pattern:
-  // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-  // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-  //
-  // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-  SWIZZLED,
-  // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-  // kernels standard.
-  LINEAR
-};
+using flashinfer::QuantizationSFLayout;
 
 namespace details {
 
@@ -448,6 +434,15 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline int getSMRegisters() {
+  int device{-1};
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int regs_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&regs_per_block, cudaDevAttrMaxRegistersPerBlock, device));
+  return regs_per_block;
+}
+
 inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
                                                   std::optional<int> numRows, int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
@@ -500,7 +495,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
   // TODO: stage through smem for packed STG.32
   // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
-    if (layout == QuantizationSFLayout::SWIZZLED) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
@@ -536,7 +531,7 @@ __forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c
   return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
 }
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 // NOTE: bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
@@ -628,7 +623,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 12080)
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     SFValue = static_cast<float>(tmp);
@@ -769,7 +764,7 @@ struct AllReduceFusionParams {
   float rms_eps;
   float* scale_factor;
   bool use_oneshot;
-  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
+  QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
@@ -950,7 +945,7 @@ class FusedOp {
       }
     }
 
-#if CUDA_VERSION >= 120800
+#if CUDA_VERSION >= 12080
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       // NOTE(Yingyi): might update later
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
@@ -1306,9 +1301,8 @@ int get_sm_count() {
   if (sm_count == 0) {
     int device_id;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&device_id));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    FLASHINFER_CUDA_CALL(
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   }
   return sm_count;
 }
@@ -1324,6 +1318,16 @@ cudaError_t launch_oneshot_lamport(AllReduceFusionParams<T> const& params,
   return cudaSuccess;
 }
 
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
+          bool TriggerCompletionAtEnd = true>
+int get_registers_per_thread_oneshot() {
+  auto kernel =
+      allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc, TriggerCompletionAtEnd>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
+}
+
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaunchConfig_t& cfg,
                                 std::array<int, NRanks> begin_tokens,
@@ -1332,6 +1336,14 @@ cudaError_t launch_twoshot_sync(AllReduceFusionParams<T> const& params, cudaLaun
       cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>,
                          params, begin_tokens, token_num_per_ranks));
   return cudaSuccess;
+}
+
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+int get_registers_per_thread_twoshot() {
+  auto kernel = allreduce_fusion_kernel_twoshot_sync<Pattern, T, NRanks, Fp32Acc>;
+  cudaFuncAttributes attr;
+  cudaFuncGetAttributes(&attr, kernel);
+  return attr.numRegs;
 }
 
 bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
@@ -1375,7 +1387,23 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     cluster_size /= 2;
   }
   int sm_count = get_sm_count();
-  while (cluster_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512) {
+  int registers_per_thread;
+  if (oneshot) {
+    if (params.trigger_completion_at_end) {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, true>();
+    } else {
+      registers_per_thread = get_registers_per_thread_oneshot<Pattern, T, NRanks, Fp32Acc, false>();
+    }
+  } else {
+    registers_per_thread = get_registers_per_thread_twoshot<Pattern, T, NRanks, Fp32Acc>();
+  }
+  static int max_registers = -1;
+  if (max_registers < 0) {
+    max_registers = utils::getSMRegisters();
+  }
+  int max_threads_per_block = min(max_registers / registers_per_thread, 1024);
+  while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
+         threads_per_block <= max_threads_per_block / 2) {
     threads_per_block *= 2;
     cluster_size /= 2;
   }
@@ -1441,24 +1469,26 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);      \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                 \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 120800) {                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);    \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float!");           \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "FP4Quant requires CUDA 12.8 or higher");    \
+        FLASHINFER_CHECK(false, "FP4Quant pattern cannot work with DType=float");            \
       }                                                                                      \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant:                              \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, NRanks);   \
       break;                                                                                 \
     case AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant:                              \
-      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 120800) {                   \
+      if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                    \
         DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, NRanks); \
       } else {                                                                               \
-        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float!");        \
+        FLASHINFER_CHECK(CUDA_VERSION >= 12080, "OutFP4Quant requires CUDA 12.8 or higher"); \
+        FLASHINFER_CHECK(false, "OutFP4Quant pattern cannot work with DType=float");         \
       }                                                                                      \
       break;                                                                                 \
     default:                                                                                 \
-      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern!");                      \
+      FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                       \
   }
 
   switch (params.nranks) {

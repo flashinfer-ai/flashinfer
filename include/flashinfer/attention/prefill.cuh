@@ -1497,18 +1497,15 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/0, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+                                qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/0, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+                             qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
       }
 
       // compute m,d states in online softmax
@@ -1935,18 +1932,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                             kv_head_idx);
       }
 
       // compute m,d states in online softmax
@@ -2298,43 +2293,33 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
           if (iter >= mask_iteration || iter < window_iteration) {
-            logits_mask<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start +
-                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                qo_len, kv_len, chunk_end, group_size, s_frag);
+            logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
           }
         } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
           if (iter + 1 >= num_iterations_prefix) {
             logits_mask_multi_item_scoring<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start +
-                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
+                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
+                kv_len, window_left, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
                 maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
                 kv_head_idx);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
-              logits_mask<KTraits>(
-                  params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                  chunk_start +
-                      (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                  qo_len, kv_len, chunk_end, group_size, s_frag);
+              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
             }
           }
         }

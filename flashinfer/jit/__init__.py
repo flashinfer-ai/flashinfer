@@ -69,7 +69,7 @@ from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import current_device_nvcc_flags as current_device_nvcc_flags
-from .cubin_loader import setup_cubin_loader, setup_metainfo_loader
+from .cubin_loader import setup_cubin_loader
 
 
 @functools.cache

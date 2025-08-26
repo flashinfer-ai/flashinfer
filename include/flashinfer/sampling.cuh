@@ -1415,7 +1415,7 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset, &d};
+  void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
   DISPATCH_ALIGNED_VEC_SIZE(

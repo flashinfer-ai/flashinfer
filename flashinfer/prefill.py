@@ -30,7 +30,6 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
-    setup_metainfo_loader,
     trtllm_gen_fmha_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
@@ -44,7 +43,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -172,7 +171,6 @@ def get_trtllm_gen_prefill_module():
     mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
-    setup_metainfo_loader(mod.get_library_path())
 
     def _paged_run(
         query: torch.Tensor,
@@ -2034,7 +2032,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
@@ -2043,7 +2041,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
 
@@ -2833,7 +2831,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
@@ -2841,7 +2839,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
             )
         if self._backend == "cutlass":
@@ -3118,8 +3116,131 @@ def get_trtllm_gen_fmha_module():
     mod = trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
-    setup_metainfo_loader(mod.get_library_path())
     return op
+
+
+def trtllm_ragged_attention_deepseek(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    o_sf_scale: float,
+    batch_size: int,
+    window_left: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    enable_pdl: bool,
+    is_causal: bool,
+    return_lse: bool,
+    attention_sinks: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [num_tokens, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [num_tokens, num_heads, head_dim]
+    workspace_buffer : torch.Tensor
+        workspace buffer
+    seq_lens : torch.Tensor
+        sequence lengths
+    max_q_len : int
+        max query length
+    max_kv_len : int
+        max key/value length
+    bmm1_scale : float
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+    bmm2_scale : float
+        scale for bmm2, scale_v
+    o_sf_scale : float
+        scale for output
+    batch_size : int
+        batch size
+    window_left : int
+        window left
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence lengths for query
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence lengths for key/value
+    enable_pdl : bool
+        enable pdl
+    is_causal : bool
+        is causal
+    attention_sinks : Optional[torch.Tensor]
+        attention sinks
+    out : Optional[torch.Tensor]
+        output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
+    lse : Optional[torch.Tensor]
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+    sm_count = get_device_sm_count(query.device)
+    if out is None:
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            value.shape[2],
+            device=query.device,
+            dtype=query.dtype,
+        )
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
+    run_func(
+        out,
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale,
+        batch_size,
+        window_left,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        is_causal,
+        attention_sinks,
+        lse,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out
 
 
 def trtllm_batch_context_with_kv_cache(
@@ -3244,9 +3365,9 @@ def trtllm_batch_context_with_kv_cache(
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
-        _check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
 
-        _check_shape_dtype_device(
+        check_shape_dtype_device(
             out_scale_factor,
             fp4_out_scale_shape,
             torch.float8_e4m3fn,
@@ -3270,9 +3391,12 @@ def trtllm_batch_context_with_kv_cache(
         assert o_sf_vec_size is None
         out_scale_factor = None
         o_sf_start_index = 0
-        out_dtype = out_dtype or query.dtype
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
         out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 

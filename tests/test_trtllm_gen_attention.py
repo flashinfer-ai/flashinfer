@@ -8,7 +8,7 @@ import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up
 
 DTYPE_MAP = {
-    "half": torch.float16,
+    "fp16": torch.float16,
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
     "nvfp4": "nvfp4",
@@ -237,8 +237,10 @@ def unpack_compare_nvfp4(
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
-        ("half", "half", "half"),
         ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
     ],
@@ -355,8 +357,10 @@ def test_trtllm_batch_prefill(
         )
         assert o_scale == 1.0
         rtol, atol = 4e-1, 1e0
-    elif o_dtype == "fp8":
+    elif q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
+    elif q_dtype == "fp8" and o_dtype in ["bf16", "fp16"]:
+        rtol, atol = 4e-2, 6e-2
     else:
         rtol, atol = 1e-2, 1e-2
 
@@ -399,10 +403,12 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
-        ("half", "half", "half"),
-        ("half", "fp8", "half"),
         ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
         ("bf16", "fp8", "bf16"),
+        ("fp16", "fp8", "fp16"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
     ],
@@ -512,8 +518,10 @@ def test_trtllm_batch_decode(
         )
         assert o_scale == 1.0
         rtol, atol = 3e-1, 1e0
-    elif o_dtype == "fp8":
+    elif q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
+    elif q_dtype == "fp8" and o_dtype in ["bf16", "fp16"]:
+        rtol, atol = 4e-2, 6e-2
     else:
         rtol, atol = 1e-2, 1e-2
 
@@ -545,3 +553,135 @@ def test_trtllm_batch_decode(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
+
+
+@pytest.mark.parametrize("batch_size", [4, 128, 256])
+@pytest.mark.parametrize("s_qo", [32, 64, 87])
+@pytest.mark.parametrize("s_kv", [32, 64, 87])
+@pytest.mark.parametrize("num_kv_heads", [16, 32])
+@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize("causal", [True, False])
+def test_trtllm_gen_prefill_deepseek(
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+):
+    if s_qo > s_kv:
+        pytest.skip("s_qo > s_kv, skipping test as causal")
+
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim_qk = 192
+    head_dim_vo = 128
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+
+    cumsum_s_qo = torch.sum(actual_seq_lens_q)
+    cumsum_s_kv = torch.sum(actual_seq_lens_kv)
+
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+
+    k_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_qk),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_vo),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    # Initialize scale
+    scale = float(1.0 / (head_dim_qk**0.5))
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
+
+    # kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * s_kv
+
+    # Create kv_indptr as cumulative sum of actual_seq_lens_kv
+    kv_indptr = torch.cat(
+        [
+            torch.tensor(
+                [0],
+                device=device,
+            ),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=scale,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
+    output = torch.empty_like(output_ref)
+
+    bmm1_scale = scale
+    bmm2_scale = 1.0
+    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv,
+        s_qo,
+        s_kv,
+        bmm1_scale,
+        bmm2_scale,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        True,
+        out=output,
+    )
+    torch.testing.assert_close(
+        output_trtllm,
+        output_ref,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        lse_trtllm,
+        lse_ref,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
+    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)

@@ -40,7 +40,12 @@ enum class ActType {
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
   //
   // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
-  SwiGlu
+  SwiGlu,
+  // For ActType == GeGlu, we use the simplified version
+  //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
+  // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+  // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+  GeGlu,
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {
@@ -74,7 +79,7 @@ class TrtllmGenBatchedGemmRunner {
            int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a,
            void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
            void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
-           float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+           float const* bias, float const* gatedActAlpha, float const* gatedActBeta,
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
@@ -87,7 +92,7 @@ class TrtllmGenBatchedGemmRunner {
 
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            void const* a, void const* sfA, void const* b, void const* sfB, float const* bias,
-           float const* swiGluAlpha, float const* swiGluBeta, float const* clampLimit, void* c,
+           float const* gatedActAlpha, float const* gatedActBeta, float const* clampLimit, void* c,
            void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex,
            bool enable_pdl);
 
