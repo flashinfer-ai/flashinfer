@@ -279,3 +279,45 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
+
+void radik_sampling_from_probs(at::Tensor workspace_buffer, at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
+                               std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               bool deterministic, std::optional<at::Tensor> maybe_selected_probs,
+                               std::optional<at::Generator> gen_) {
+  CHECK_INPUT(workspace_buffer);
+  CHECK_INPUT(probs);
+  CHECK_INPUT(output);
+  CHECK_GE(1024, top_k_val);  // only support top-k <= 1024 currently
+  auto device = probs.device();
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);
+  CHECK_DIM(1, output);
+  unsigned int batch_size = output.size(0);
+  unsigned int vocab_size = probs.size(1);
+
+  bool has_top_k_arr = maybe_top_k_arr.has_value();
+
+  uint64_t philox_seed, philox_offset;
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      gen_, at::cuda::detail::getDefaultCUDAGenerator());
+  std::lock_guard<std::mutex> lock(gen->mutex_);
+  at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(32 * batch_size);
+  philox_seed = rng_engine_inputs.seed_.val;
+  philox_offset = rng_engine_inputs.offset_.val;
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t status = sampling::RadiKSamplingFromProb<float, int>(
+      static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, probs.size(0),
+      maybe_indices.has_value() ? maybe_indices->size(0) : batch_size, top_k_val, vocab_size,
+      philox_seed, philox_offset, deterministic, workspace_buffer.data_ptr(),
+      workspace_buffer.element_size() * workspace_buffer.size(0),
+      maybe_selected_probs.has_value() ? static_cast<float*>(maybe_selected_probs->data_ptr())
+                                       : nullptr,
+      stream);
+  TORCH_CHECK(status == cudaSuccess, "RadiKSamplingFromProbs failed with error code " +
+                                         std::string(cudaGetErrorString(status)));
+}
