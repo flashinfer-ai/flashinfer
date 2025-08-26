@@ -10,10 +10,6 @@ def opcheck(fn):
 
     return wrapper
 
-    # return SimpleNamespace(
-    #     top_k_mask_logits=top_k_mask_logits,
-    # )
-
 
 module = get_sampling_module()
 chain_speculative_sampling = opcheck(module.chain_speculative_sampling)
