@@ -39,8 +39,8 @@ enum class TllmPagedAttentionMode {
 // 128MB: max workspace buffer size for trtllm-gen fixed at python api side
 constexpr size_t kMaxWorkspaceBufferSize = 128 * 1024 * 1024;
 
-// #include <memory>
-// #include <mutex>
+#include <memory>
+#include <mutex>
 
 class TllmGenFmhaRunnerCache {
  public:
