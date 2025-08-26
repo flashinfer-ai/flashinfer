@@ -214,6 +214,37 @@ def get_sampling_module():
         )
         return samples
 
+    @register_custom_op(
+        "flashinfer::radik_sampling_from_probs", mutates_args=("workspace_buffer",)
+    )
+    def radik_sampling_from_probs(
+        workspace_buffer: torch.Tensor,
+        probs: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        maybe_top_k_arr: Optional[torch.Tensor],
+        top_k_val: int,
+        deterministic: bool,
+        selected_probs: Optional[torch.Tensor],
+        generator: Optional[torch.Generator],
+    ) -> torch.Tensor:
+        device = probs.device
+        probs = probs.float()
+        batch_size = indices.size(0) if indices is not None else probs.size(0)
+        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+        samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+        module.radik_sampling_from_probs.default(
+            workspace_buffer,
+            probs,
+            samples,
+            indices,
+            maybe_top_k_arr,
+            top_k_val,
+            deterministic,
+            selected_probs,
+            generator,
+        )
+        return samples
+
     @register_fake_op("flashinfer::top_k_sampling_from_probs")
     def _fake_top_k_sampling_from_probs(
         probs: torch.Tensor,
@@ -453,6 +484,7 @@ def get_sampling_module():
         top_k_renorm_probs=top_k_renorm_probs,
         top_k_mask_logits=top_k_mask_logits,
         chain_speculative_sampling=chain_speculative_sampling,
+        radik_sampling_from_probs=radik_sampling_from_probs,
     )
 
 
@@ -803,6 +835,66 @@ def top_k_sampling_from_probs(
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().top_k_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(top_k), deterministic, generator
+    )
+
+
+def radik_sampling_from_probs(
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    indices: Optional[torch.Tensor] = None,
+    deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
+    selected_probs: Optional[torch.Tensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    r"""Fused GPU kernel for top-k sampling from probabilities,
+    this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
+
+    The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
+    which is more efficient than the naive implementation that launches a series of kernels.
+
+    Parameters
+    ----------
+    probs: torch.Tensor
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
+    top_k: Union[torch.Tensor, int]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        If a scalar, the same threshold is used for all requests.
+        If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
+    selected_probs: Optional[torch.Tensor]
+        Optional tensor of shape ``(batch_size, top_k)`` that stores the top-k selected probabilities.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
+    """
+    if check_nan:
+        if torch.any(torch.isnan(probs)):
+            raise ValueError("Input probs contains NaN.")
+
+    workspace_buffer = _get_cache_buf(
+        "radik_sampling_from_probs_workspace", 64 * 1024 * 1024, probs.device
+    )
+
+    return get_sampling_module().radik_sampling_from_probs(
+        workspace_buffer,
+        probs,
+        indices,
+        *_to_tensor_scalar_tuple(top_k),
+        deterministic,
+        selected_probs,
+        generator,
     )
 
 
