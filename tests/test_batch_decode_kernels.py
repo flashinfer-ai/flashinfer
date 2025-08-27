@@ -114,7 +114,7 @@ def test_batch_decode_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
     )
 
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -255,7 +255,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
     )
 
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -393,7 +393,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         batch_size, device="cuda:0", dtype=torch.int32
     )
 
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_indptr_device_buffer,
