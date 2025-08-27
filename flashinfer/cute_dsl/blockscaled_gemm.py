@@ -1782,15 +1782,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             dsm_counter += 1
                             will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
-                            # The original c_pipeline.producer_acquire()
-                            #   := PipelineTmaStore.producer_acquire()
-                            #   := TmaStoreFence.wait()
-                            #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
-                            cute.arch.cp_async_bulk_wait_group(
-                                c_pipeline.num_stages - 1,
-                                # If write signals, wait for both read *and* write
-                                read=not will_write_signals,
-                            )
+                            if will_write_signals:
+                                # The original c_pipeline.producer_acquire()
+                                #   := PipelineTmaStore.producer_acquire()
+                                #   := TmaStoreFence.wait()
+                                #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
+                                cute.arch.cp_async_bulk_wait_group(
+                                    c_pipeline.num_stages - 1,
+                                    # Change `read` from True to False to also wait writes
+                                    read=False,
+                                )
+                            else:
+                                c_pipeline.producer_acquire()
 
                         else:
                             c_pipeline.producer_acquire()
