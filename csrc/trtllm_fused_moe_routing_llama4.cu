@@ -391,16 +391,15 @@ void run(Data const& data, void* stream) {
   TORCH_CHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
                   data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
               "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-              MaxNumTopExperts, data.mTopK);
-  TORCH_CHECK(data.mNumExperts <= MaxNumExperts,
-              "Routing kernel expects #experts %d to be at most max #experts %d", data.mNumExperts,
-              MaxNumExperts);
+  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
+              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
+  TORCH_CHECK(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts ",
+              data.mNumExperts, " to be at most max #experts ", MaxNumExperts);
   static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
   static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
-  TORCH_CHECK(data.mNumExperts % 4 == 0,
-              "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d",
+  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
+              " to be a multiple of 4.");
+  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
               data.mPaddingLog2);
 
   bool const useSingleWarp =
@@ -450,7 +449,7 @@ void run(Data const& data, void* stream) {
     } else {
       // Reset the global histograms.
       CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
-                                       static_cast<size_t>(2 * NumThreads) * sizeof(int32_t),
+                                       static_cast<size_t>(2 * data.mNumExperts) * sizeof(int32_t),
                                        (cudaStream_t)stream));
     }
     LAUNCH_ROUTING(data,

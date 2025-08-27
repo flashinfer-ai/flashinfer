@@ -38,7 +38,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
   while (n >>= 1) {
     ++out;
   }
-  TORCH_CHECK((1 << out) == val, "Expected %s to be a power of 2, got %d", name.c_str(), val);
+  TORCH_CHECK((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
   return out;
 }
 }  // namespace
@@ -93,7 +93,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
   } else if (routingMethodType == RoutingMethodType::Llama4) {
     TORCH_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
     if (nGroup > 0 || topkGroup > 0) {
-      TORCH_WARN("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup,
+      TORCH_WARN("For Llama routing method, nGroup/topkGroup is ignored, got ", nGroup, "/",
                  topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
@@ -170,8 +170,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     moe::dev::routing::routingRenormalize::run(routingData, stream);
   } else {
-    TORCH_CHECK(false, "Unimplemented routing method %s of enum %d",
-                serializeMoeRoutingMethodType(routingMethodType).c_str(), (int)routingMethodType);
+    TORCH_CHECK(false, "Unimplemented routing method ",
+                serializeMoeRoutingMethodType(routingMethodType), " of enum ",
+                (int)routingMethodType);
   }
 }
 }  // namespace Routing
@@ -202,8 +203,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .weightLayout = weightLayout};
     return options;
   } else {
-    TORCH_CHECK(false, "Unimplemented gated act type %s of enum %d",
-                MoE::serializeGatedActType(gatedActType).c_str(), (int)gatedActType);
+    TORCH_CHECK(false, "Unimplemented gated act type ", MoE::serializeGatedActType(gatedActType),
+                " of enum ", (int)gatedActType);
   }
 }
 

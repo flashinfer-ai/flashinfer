@@ -17,6 +17,7 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None
+workspace_size = 128 * 1024 * 1024
 
 
 def flip_coin(*args, **kwargs):
@@ -298,10 +299,22 @@ def test_trtllm_batch_prefill(
         q, o_dtype, create_out_tensor
     )
 
+    # determine to pass out_dtype explicitly or not
+    if q_dtype != o_dtype and not create_out_tensor:
+        out_dtype = DTYPE_MAP[o_dtype]
+    else:
+        out_dtype = (
+            DTYPE_MAP[o_dtype]
+            if flip_coin(
+                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+            )
+            else None
+        )
+
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -345,7 +358,7 @@ def test_trtllm_batch_prefill(
         kv_indptr,
         window_left,  # window_left
         out=out,
-        out_dtype=DTYPE_MAP[o_dtype],
+        out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
@@ -469,10 +482,22 @@ def test_trtllm_batch_decode(
         q, o_dtype, create_out_tensor
     )
 
+    # determine to pass out_dtype explicitly or not
+    if q_dtype != o_dtype and not create_out_tensor:
+        out_dtype = DTYPE_MAP[o_dtype]
+    else:
+        out_dtype = (
+            DTYPE_MAP[o_dtype]
+            if flip_coin(
+                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+            )
+            else None
+        )
+
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -510,7 +535,7 @@ def test_trtllm_batch_decode(
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
         out=out,
-        out_dtype=DTYPE_MAP[o_dtype],
+        out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
@@ -611,7 +636,7 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
 
     qo_indptr = torch.cat(
         [
@@ -634,7 +659,7 @@ def test_trtllm_gen_prefill_deepseek(
     ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
         kv_layout="NHD",
         backend="cutlass",
     )
@@ -690,39 +715,5 @@ def test_trtllm_gen_prefill_deepseek(
 
 
 if __name__ == "__main__":
-    test_trtllm_batch_prefill(
-        kv_layout="HND",
-        batch_size=1,
-        page_size=32,
-        num_kv_heads=16,
-        head_grp_size=1,
-        window_left=-1,
-        q_dtype="fp16",
-        o_dtype="fp16",
-        kv_dtype="fp16",
-        enable_pdl=True,
-    )
-    test_trtllm_batch_prefill(
-        kv_layout="HND",
-        batch_size=1,
-        page_size=32,
-        num_kv_heads=16,
-        head_grp_size=1,
-        window_left=-1,
-        q_dtype="fp16",
-        o_dtype="fp16",
-        kv_dtype="fp16",
-        enable_pdl=True,
-    )
-    test_trtllm_batch_decode(
-        kv_layout="HND",
-        batch_size=1,
-        page_size=32,
-        num_kv_heads=16,
-        head_grp_size=1,
-        window_left=-1,
-        q_dtype="fp16",
-        o_dtype="fp16",
-        kv_dtype="fp16",
-        enable_pdl=True,
-    )
+    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
+    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)

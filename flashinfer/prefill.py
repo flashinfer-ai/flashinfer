@@ -187,6 +187,7 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         enable_pdl: bool,
+        workspace_size: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -217,6 +218,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
+            workspace_size,
             sinks,
             lse,
         )
@@ -527,6 +529,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -565,6 +568,7 @@ def get_batch_prefill_module(backend, *args):
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
                 enable_pdl,
+                workspace_size,
                 window_left,
                 out=o,
                 sinks=sinks,
@@ -681,6 +685,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -1400,6 +1405,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
 
         self._float_workspace_buffer = float_workspace_buffer
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
         self.device = float_workspace_buffer.device
         self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
         if backend in ["fa3", "auto", "trtllm-gen"]:
@@ -1629,7 +1638,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
-
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2139,6 +2147,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     None,  # scale_v
                     rope_scale,
                     rope_theta,
+                    self._workspace_size,
                     self._token_pos_in_items_len,
                     self._num_qo_heads,
                     self._num_kv_heads,
@@ -3217,6 +3226,7 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
         query,
@@ -3236,6 +3246,7 @@ def trtllm_ragged_attention_deepseek(
         sm_count,
         enable_pdl,
         is_causal,
+        workspace_size,
         attention_sinks,
         lse,
     )
@@ -3356,6 +3367,8 @@ def trtllm_batch_context_with_kv_cache(
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
         elif out is None:
             fp4_out_scale_shape = (
                 round_up(query.shape[0], 128),
@@ -3369,6 +3382,7 @@ def trtllm_batch_context_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        assert out_dtype == "nvfp4"
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
@@ -3415,6 +3429,7 @@ def trtllm_batch_context_with_kv_cache(
             dtype=torch.float32,
         )
 
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
         out_scale_factor,
@@ -3437,6 +3452,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
+        workspace_size,
         sinks,
         lse,
     )

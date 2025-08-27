@@ -244,8 +244,9 @@ void TrtllmGenBatchedGemmRunner::run(
 
   TORCH_CHECK(err == 0,
               "Error occurred when running GEMM!"
-              " (numBatches: %d, GemmMNK: %d %d %d, Kernel: %s)",
-              numBatches, m, n, k, config.mFunctionName);
+              " (numBatches: ",
+              numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
+              ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
