@@ -298,6 +298,18 @@ def test_trtllm_batch_prefill(
         q, o_dtype, create_out_tensor
     )
 
+    # determine to pass out_dtype explicitly or not
+    if q_dtype != o_dtype and not create_out_tensor:
+        out_dtype = DTYPE_MAP[o_dtype]
+    else:
+        out_dtype = (
+            DTYPE_MAP[o_dtype]
+            if flip_coin(
+                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+            )
+            else None
+        )
+
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
@@ -345,7 +357,7 @@ def test_trtllm_batch_prefill(
         kv_indptr,
         window_left,  # window_left
         out=out,
-        out_dtype=DTYPE_MAP[o_dtype],
+        out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
@@ -465,6 +477,18 @@ def test_trtllm_batch_decode(
         q, o_dtype, create_out_tensor
     )
 
+    # determine to pass out_dtype explicitly or not
+    if q_dtype != o_dtype and not create_out_tensor:
+        out_dtype = DTYPE_MAP[o_dtype]
+    else:
+        out_dtype = (
+            DTYPE_MAP[o_dtype]
+            if flip_coin(
+                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+            )
+            else None
+        )
+
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
@@ -506,7 +530,7 @@ def test_trtllm_batch_decode(
         v_scale / o_scale,  # bmm2_scale
         window_left,  # window_left
         out=out,
-        out_dtype=DTYPE_MAP[o_dtype],
+        out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,

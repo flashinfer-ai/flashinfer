@@ -2091,6 +2091,8 @@ def trtllm_batch_decode_with_kv_cache(
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
         elif out is None:
             fp4_out_scale_shape = (
                 round_up(query.shape[0], 128),
@@ -2104,6 +2106,7 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        assert out_dtype == "nvfp4"
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
