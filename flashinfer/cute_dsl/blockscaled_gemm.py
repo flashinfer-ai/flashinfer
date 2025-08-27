@@ -94,7 +94,7 @@ def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) 
     )
 
 
-@dsl_user_op
+@cute.jit
 def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
     while True:
         ready = Uint32(
