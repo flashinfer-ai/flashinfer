@@ -210,19 +210,20 @@ if IS_BUILDING_DOCS:
 
 else:
     import pynvml
+
     if TYPE_CHECKING:
-        from mpi4py import MPI
+        from mpi4py import MPI  # noqa: F401
 
     def lazy_import_mpi():
         """Lazy import for mpi4py"""
         try:
             from mpi4py import MPI
+
             return MPI
-        except ImportError:
-            raise ImportError("mpi4py is not installed")
-    
+        except ImportError as err:
+            raise ImportError("mpi4py is not installed") from err  # type: ignore[no-redef]
+
     class MpiComm:  # type: ignore[no-redef]
-        # _comm: MPI.Intracomm = MPI.COMM_WORLD
         _comm: Any = None
         _MPI: Any = None
 
@@ -238,7 +239,7 @@ else:
             cls._get_mpi()
             # Optional: add type checking here
             cls._comm = new_comm
-    
+
         def __getattr__(self, name):
             if self._comm is None:
                 self._get_mpi()
@@ -246,6 +247,7 @@ else:
 
     class CommBackend(ABC):
         """Abstract communication backend interface"""
+
         @abstractmethod
         def Get_rank(self) -> int: ...
 
@@ -256,12 +258,9 @@ else:
         def allgather(self, data: int) -> List[int]: ...
 
         @abstractmethod
-        def allgather_bytes(self, data): ...
+        def Split(self, color: int, key: int) -> "CommBackend": ...
 
-        @abstractmethod
-        def Split(self, color: int, key: int) -> 'CommBackend': ...
-
-    class LegacyMPIBackend(CommBackend):
+    class MPIBackend(CommBackend):
         def __init__(self):
             self._mpicomm = MpiComm()
 
@@ -274,21 +273,17 @@ else:
         def allgather(self, data: int) -> List[int]:
             return self._mpicomm.allgather(data)
 
-        def allgather_bytes(self, data):
-            return self._mpicomm.allgather(data)
-
         def Split(self, color: int, key: int) -> CommBackend:
-            # Original split logic
-            new_comm = self._mpicomm.Split(color, key)
-            return LegacyMPIBackend()  # Returns new adapter
+            self._mpicomm = self._mpicomm.Split(color, key)
+            return MPIBackend()  # Returns new adapter
 
     @dataclass
     class MnnvlConfig:
         """Configuration for MNNVL memory management"""
+
         comm_backend: Optional[CommBackend] = None
         allocation_granularity: int = 0
         fabric_page_size: int = 1 << 29  # 512MB
-
 
     class MnnvlMemory:  # type: ignore[no-redef]
         initialized: bool = False
@@ -310,6 +305,8 @@ else:
 
         allocated_map: Dict[int, Any] = {}
         address_refcnt: Dict[int, Any] = {}
+
+        config: Optional[MnnvlConfig] = None
 
         def __init__(self, mapping: Mapping, size: int):
             self.mapping = mapping
@@ -346,8 +343,8 @@ else:
                 MnnvlMemory.initialized = True
 
         @staticmethod
-        def set_comm(mapping: Mapping, config: MnnvlConfig = None):
-            MnnvlMemory._config = config or MnnvlConfig(comm_backend=LegacyMPIBackend())
+        def set_comm_from_config(mapping: Mapping, config: MnnvlConfig = None) -> None:
+            MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())
             comm = config.comm_backend.Split(
                 mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
             )
