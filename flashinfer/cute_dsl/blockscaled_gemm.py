@@ -77,16 +77,17 @@ def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
     return ((obj >> (index * 8)) & 0xFF).to(Uint8)
 
 
+# TODO unify i32 (here) and the signal buffer (u32)
 @dsl_user_op
-def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
+def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
         llvm.inline_asm(
-            T.ui32(),
+            T.i32(),
             [
                 addr.ir_value(loc=loc, ip=ip),
-                Uint32(value).ir_value(loc=loc, ip=ip),
+                Int32(value).ir_value(loc=loc, ip=ip),
             ],
-            "atom.add.release.gpu.global.u32 $0, [$1], $2;",
+            "atom.add.release.gpu.global.i32 $0, [$1], $2;",
             "=r,l,r",
             has_side_effects=True,
             is_align_stack=False,
