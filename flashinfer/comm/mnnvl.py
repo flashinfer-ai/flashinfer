@@ -299,7 +299,7 @@ else:
         fabric_page_size: int = 1 << 29
 
         # MPI communicator
-        comm = None
+        comm: Optional[CommBackend] = None
 
         dev_id: int = None
 
@@ -343,12 +343,12 @@ else:
                 MnnvlMemory.initialized = True
 
         @staticmethod
-        def set_comm_from_config(mapping: Mapping, config: MnnvlConfig = None) -> None:
-            MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())
+        def set_comm_from_config(mapping: Mapping, config: MnnvlConfig = None):
+            MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())  # type: ignore[attr-defined]
             comm = config.comm_backend.Split(
                 mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
             )
-            MnnvlMemory.comm = comm
+            MnnvlMemory.comm = comm  # type: ignore[assignment]
 
         @staticmethod
         def get_comm(mapping: Mapping):
