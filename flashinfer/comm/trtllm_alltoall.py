@@ -304,7 +304,7 @@ class MnnvlMoe:
         MnnvlMoe.moe_mapping = mapping
         workspace_size_per_rank = get_moe_commworkspace_size_per_rank(mapping.tp_size)
         if config:
-            MnnvlMemory.set_comm_from_config(mapping, config)
+            MnnvlMemory.set_comm_from_config(mapping, config)  # type: ignore[attr-defined]
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
             torch.uint64
