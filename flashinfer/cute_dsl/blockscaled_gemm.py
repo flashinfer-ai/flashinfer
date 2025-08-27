@@ -1749,9 +1749,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             bSG_sC[(None, c_buffer)],
                             bSG_gC[(None, subtile_idx)],
                         )
+
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
+
+                        if tile_sched_params.dst_signals is not None:
+                            dsm_counter += 1
+
                         c_pipeline.producer_acquire()
+
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
