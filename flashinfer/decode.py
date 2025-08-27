@@ -2091,6 +2091,8 @@ def trtllm_batch_decode_with_kv_cache(
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
+            # out_dtype may be None
+            out_dtype = "nvfp4"
         elif out is None:
             fp4_out_scale_shape = (
                 round_up(query.shape[0], 128),
