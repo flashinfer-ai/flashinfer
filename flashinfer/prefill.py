@@ -59,8 +59,6 @@ from .utils import (
     round_up,
 )
 
-# DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
-
 
 @functools.cache
 def get_fmha_module(
