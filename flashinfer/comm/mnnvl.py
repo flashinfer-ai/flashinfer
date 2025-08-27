@@ -131,6 +131,22 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
     return device_ptr
 
 
+class CommBackend(ABC):
+    """Abstract communication backend interface"""
+
+    @abstractmethod
+    def Get_rank(self) -> int: ...
+
+    @abstractmethod
+    def Get_size(self) -> int: ...
+
+    @abstractmethod
+    def allgather(self, data: int) -> List[int]: ...
+
+    @abstractmethod
+    def Split(self, color: int, key: int) -> "CommBackend": ...
+
+
 if IS_BUILDING_DOCS:
     # Mock classes for building docs
 
@@ -245,20 +261,6 @@ else:
                 self._get_mpi()
             return getattr(self._comm, name)
 
-    class CommBackend(ABC):
-        """Abstract communication backend interface"""
-
-        @abstractmethod
-        def Get_rank(self) -> int: ...
-
-        @abstractmethod
-        def Get_size(self) -> int: ...
-
-        @abstractmethod
-        def allgather(self, data: int) -> List[int]: ...
-
-        @abstractmethod
-        def Split(self, color: int, key: int) -> "CommBackend": ...
 
     class MPIBackend(CommBackend):
         def __init__(self):
