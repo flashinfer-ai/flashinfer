@@ -64,7 +64,7 @@ sizeof_u64 = 8
 
 @dsl_user_op
 def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
-    assert index >= 0 and index < sizeof_u64
+    # assert index >= 0 and index < sizeof_u64
     obj &= ~(0xff << (index * 8))
     obj |= value << (index * 8)
     return obj
@@ -72,7 +72,7 @@ def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> 
 
 @dsl_user_op
 def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
-    assert index >= 0 and index < sizeof_u64
+    # assert index >= 0 and index < sizeof_u64
     return ((obj >> (index * 8)) & 0xFF).to(Uint8)
 
 
