@@ -15,9 +15,13 @@
  * limitations under the License.
  */
 
+#include <ATen/cuda/EmptyTensor.h>
+
+#include <optional>
 #include <vector>
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
+#include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer::trtllm_alltoall;
@@ -217,10 +221,113 @@ void setMaxUsableSmCount(int64_t maxSmCount) {
   flashinfer::trtllm_alltoall::setMaxUsableSmCount(static_cast<int>(maxSmCount));
 }
 
+int64_t getPrepareWorkspaceSizePerRank(int64_t epSize) {
+  int epSize32 = static_cast<int>(epSize);
+  return flashinfer::trtllm_alltoall::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+}
+
+std::tuple<at::Tensor, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, std::optional<at::Tensor>>
+moePrepareOp(at::Tensor expertsIds, std::optional<at::Tensor> scales,
+             std::optional<at::Tensor> expertsStatics, at::Tensor allWorkspaces,
+             int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
+             int64_t slotCount, int64_t topK) {
+  CHECK_INPUT_TYPE(expertsIds, at::ScalarType::Int);
+  TORCH_CHECK(expertCount % 4 == 0, "expertCount must be divisible by 4");
+  TORCH_CHECK(slotCount % 4 == 0, "slotCount must be divisible by 4");
+
+  int64_t maxSendRanksPerToken = std::max(epSize, topK);
+  int64_t tokenCount = expertsIds.size(0);
+
+  at::Tensor preparedLocalExpertIds = at::detail::empty_cuda(
+      {maxTokenCountPerRank * epSize, topK}, expertsIds.options().dtype(at::ScalarType::Int));
+
+  at::Tensor sendRankCountCumSum =
+      at::detail::empty_cuda({epSize}, expertsIds.options().dtype(at::ScalarType::Int));
+  at::Tensor RecvRankCountCumSum =
+      at::detail::empty_cuda({epSize}, expertsIds.options().dtype(at::ScalarType::Int));
+
+  at::Tensor gatherRecvRankIndices = at::detail::empty_cuda(
+      {maxTokenCountPerRank * epSize}, expertsIds.options().dtype(at::ScalarType::Int));
+  at::Tensor recvRankIndices = at::detail::empty_cuda(
+      {maxTokenCountPerRank * epSize}, expertsIds.options().dtype(at::ScalarType::Int));
+
+  at::Tensor gatherBackwardRecvRankIndices =
+      at::detail::empty_cuda({maxTokenCountPerRank * maxSendRanksPerToken},
+                             expertsIds.options().dtype(at::ScalarType::Int));
+  at::Tensor backwardRecvRankIndices =
+      at::detail::empty_cuda({maxTokenCountPerRank * maxSendRanksPerToken},
+                             expertsIds.options().dtype(at::ScalarType::Int));
+
+  at::Tensor gatherSendRankIndices =
+      at::detail::empty_cuda({maxTokenCountPerRank * maxSendRanksPerToken},
+                             expertsIds.options().dtype(at::ScalarType::Int));
+  at::Tensor sendRankIndices =
+      at::detail::empty_cuda({maxTokenCountPerRank * maxSendRanksPerToken},
+                             expertsIds.options().dtype(at::ScalarType::Int));
+
+  std::optional<at::Tensor> preparedLocalScales;
+  float* scalesPtr = nullptr;
+  float* preparedLocalScalesPtr = nullptr;
+  if (scales.has_value()) {
+    CHECK_INPUT_TYPE(scales.value(), at::ScalarType::Float);
+    scalesPtr = scales->data_ptr<float>();
+    preparedLocalScales = at::detail::empty_cuda({maxTokenCountPerRank * epSize, topK},
+                                                 expertsIds.options().dtype(at::ScalarType::Float));
+    preparedLocalScalesPtr = preparedLocalScales->data_ptr<float>();
+  }
+
+  int* localExpertStaticsPtr = nullptr;
+  int* gatheredExpertStaticsPtr = nullptr;
+  std::optional<at::Tensor> gatheredExpertStatics;
+  if (expertsStatics.has_value()) {
+    localExpertStaticsPtr = expertsStatics.value().data_ptr<int>();
+    gatheredExpertStatics = at::detail::empty_cuda({epSize, expertCount},
+                                                   expertsIds.options().dtype(at::ScalarType::Int));
+    gatheredExpertStaticsPtr = gatheredExpertStatics.value().data_ptr<int>();
+  }
+
+  flashinfer::trtllm_alltoall::moe_prepare::MoeCommWorkspace workspace;
+  workspace.workspacePtr = allWorkspaces.data_ptr<uint64_t>();
+  workspace.rankStrideInU64 = allWorkspaces.stride(0);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  flashinfer::trtllm_alltoall::moe_prepare::computeCountAndIndice(
+      expertsIds.data_ptr<int>(), sendRankCountCumSum.data_ptr<int>(),
+      RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+      backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), workspace,
+      tokenCount, maxTokenCountPerRank, topK, slotCount, epRank, epSize, stream);
+
+  flashinfer::trtllm_alltoall::moe_prepare::computeCumsum(sendRankCountCumSum.data_ptr<int>(),
+                                                          RecvRankCountCumSum.data_ptr<int>(),
+                                                          epRank, epSize, stream);
+
+  flashinfer::trtllm_alltoall::moe_prepare::moveIndice(
+      sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(),
+      sendRankIndices.data_ptr<int>(), gatherSendRankIndices.data_ptr<int>(),
+      backwardRecvRankIndices.data_ptr<int>(), gatherBackwardRecvRankIndices.data_ptr<int>(),
+      recvRankIndices.data_ptr<int>(), gatherRecvRankIndices.data_ptr<int>(), epRank, epSize,
+      maxTokenCountPerRank, stream);
+
+  flashinfer::trtllm_alltoall::moe_prepare::allToAllMetadata(
+      expertsIds.data_ptr<int>(), preparedLocalExpertIds.data_ptr<int>(), scalesPtr,
+      preparedLocalScalesPtr, localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace,
+      sendRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
+      RecvRankCountCumSum.data_ptr<int>(), recvRankIndices.data_ptr<int>(), tokenCount,
+      maxTokenCountPerRank, topK, expertCount, slotCount, epRank, epSize, stream);
+
+  return std::make_tuple(preparedLocalExpertIds, preparedLocalScales, sendRankCountCumSum,
+                         gatherSendRankIndices, RecvRankCountCumSum, gatherRecvRankIndices,
+                         gatherBackwardRecvRankIndices, gatheredExpertStatics);
+}
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("moe_comm_prepare_indices", &moeCommPrepareIndicesOp);
   m.def("moe_local_gather", &moeLocalGatherOp);
   m.def("moe_comm", &moeCommOp);
   m.def("set_moe_max_usable_sm_count", static_cast<void (*)(int64_t)>(&setMaxUsableSmCount));
   m.def("get_moe_commworkspace_size_per_rank", &getWorkspaceSizePerRank);
+  m.def("get_moe_prepare_workspace_size_per_rank", &getPrepareWorkspaceSizePerRank);
+  m.def("moe_prepare", &moePrepareOp);
 }
