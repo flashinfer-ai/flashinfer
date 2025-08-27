@@ -43,6 +43,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import (
     Int32,
+    Int64,
     UInt32,
     T,
     Integer,
@@ -55,6 +56,9 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 from cutlass import UInt32
+
+
+sizeof_i32 = 4
 
 
 @dsl_user_op
@@ -76,12 +80,12 @@ def atomic_add_release_global(ptr: cutlass.Pointer, value: UInt32, *, loc=None, 
 
 
 @dsl_user_op
-def wait_signal(addr: cutlass.Pointer, expect_value: UInt32, *, loc=None, ip=None):
+def wait_signal(addr: Int64, expect_value: UInt32, *, loc=None, ip=None):
     while True:
         ready = UInt32(
             llvm.inline_asm(
                 T.u32(),
-                [addr.toint(loc=loc, ip=ip).ir_value()],
+                [addr.ir_value(loc=loc, ip=ip)],
                 # TODO how to add `:"memory"` clobber?
                 "ld.acquire.gpu.global.u32 $0, [$1];",
                 "=r,l",
@@ -316,7 +320,10 @@ class MaskedScheduler:
             if write_out_signals and (self.params.dst_signals is not None):
                 atomic_add_release_global(self.params.dst_signals + batch_idx, 1)
             if self.params.src_signals is not None:
-                wait_signal(self.params.src_signals + (batch_idx + 1), self.params.src_signal_expect_value)
+                wait_signal(
+                    self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
+                    expect_value=self.params.src_signal_expect_value,
+                )
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
@@ -1248,7 +1255,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # TODO may optimize if too slow
         if tile_sched_params.src_signals is not None:
-            wait_signal(tile_sched_params.src_signals + 0, tile_sched_params.src_signal_expect_value)
+            wait_signal(
+                tile_sched_params.src_signals.toint() + sizeof_i32 * 0,
+                expect_value=tile_sched_params.src_signal_expect_value,
+            )
 
         #
         # Specialized TMA load warp
