@@ -167,7 +167,7 @@ def gen_jit_spec(
     cuda_cflags = [
         "-O3",
         "-std=c++17",
-        f"--threads={min(os.cpu_count() or 4, 32)}",
+        "--threads=4",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
