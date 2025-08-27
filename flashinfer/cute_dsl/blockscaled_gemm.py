@@ -2781,6 +2781,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
     src_signal_expect_value: int,
+    enable_src_signals: bool,
+    enable_dst_signals: bool,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2797,6 +2799,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 dst_signals_data_ptr,
                 alpha_data_ptr,
             ) = [16 for _ in range(9)]
+
+            if not enable_src_signals:
+                src_signals_data_ptr = None
+            if not enable_dst_signals:
+                dst_signals_data_ptr = None
+
         else:
             (
                 a_tensor_gpu,
@@ -2809,6 +2817,10 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
             ) = input_tensors
+
+            assert enable_src_signals == (src_signals_tensor_gpu is not None)
+            assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
+
             (
                 a_data_ptr,
                 b_data_ptr,
@@ -3055,6 +3067,8 @@ def grouped_gemm_nt_masked(
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
         src_signal_expect_value=src_signal_expect_value,
+        enable_src_signals=src_signals is not None,
+        enable_dst_signals=dst_signals is not None,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
