@@ -59,6 +59,8 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
+@pytest.mark.parametrize("enable_src_signals", [False])
+@pytest.mark.parametrize("enable_dst_signals", [False])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
@@ -76,6 +78,8 @@ def test_blockscaled_gemm_python_interface(
     sm_count: int,
     tolerance: float,
     iterations: int,
+    enable_src_signals: int,
+    enable_dst_signals: int,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda:0")
@@ -167,6 +171,8 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
 
     for _ in range(iterations):
+        dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
             (a_torch, sfa_torch),
@@ -182,7 +188,13 @@ def test_blockscaled_gemm_python_interface(
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
             sm_count=sm_count,
+            src_signals=torch.ones((l,), dtype=torch.uint32, device="cuda") if enable_src_signals else None,
+            src_signal_expect_value=1 if enable_src_signals else 0,
+            dst_signals=dst_signals,
         )
+
+        if enable_dst_signals:
+            assert torch.all(dst_signals == sm_count), f"{dst_signals}"
 
     # compute ref output
     if not fuse_alpha:
