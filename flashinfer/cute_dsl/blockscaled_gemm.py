@@ -67,6 +67,7 @@ def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> 
     # assert index >= 0 and index < sizeof_u64
     obj &= ~(0xff << (index * 8))
     obj |= value << (index * 8)
+    assert isinstance(obj, Uint64), f"{obj=}"
     return obj
 
 
