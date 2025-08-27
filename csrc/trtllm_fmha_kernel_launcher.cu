@@ -139,7 +139,7 @@ void trtllm_paged_attention_launcher(
   size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
   size_t num_semaphores =
       round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
-  // semaphores be at the first 8MB of workspace buffer: counter | scratch
+  // semaphores be at the first 8MB of workspace buffer: counter | softmax | scratch
   runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
       num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
   // softmax buffer for lse return
