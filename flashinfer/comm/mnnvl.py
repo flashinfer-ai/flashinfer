@@ -261,7 +261,6 @@ else:
                 self._get_mpi()
             return getattr(self._comm, name)
 
-
     class MPIBackend(CommBackend):
         def __init__(self):
             self._mpicomm = MpiComm()
