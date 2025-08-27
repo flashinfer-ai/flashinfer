@@ -543,6 +543,7 @@ def get_batch_prefill_module(backend, *args):
         sinks: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
+            assert workspace_size != 0
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -2147,8 +2148,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     None,  # scale_v
                     rope_scale,
                     rope_theta,
-                    self._workspace_size,
                     self._token_pos_in_items_len,
+                    self._workspace_size,
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,

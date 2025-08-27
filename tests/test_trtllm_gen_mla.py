@@ -213,8 +213,8 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
-    # print("lse:", lse)
-    # print("lse_ref:", lse_ref)
+    print("lse:", lse)
+    print("lse_ref:", lse_ref)
     # print("lse_ref_div:", lse_ref / lse)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 

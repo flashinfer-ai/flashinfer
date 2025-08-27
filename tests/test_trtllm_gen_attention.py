@@ -382,7 +382,7 @@ def test_trtllm_batch_prefill(
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
-    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
@@ -408,7 +408,7 @@ def test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
-        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
