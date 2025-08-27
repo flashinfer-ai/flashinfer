@@ -1788,7 +1788,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 #   := TmaStoreFence.wait()
                                 #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
                                 cute.arch.cp_async_bulk_wait_group(
-                                    c_pipeline.num_stages - 1,
+                                    self.num_c_stage - 1,
                                     # Change `read` from True to False to also wait writes
                                     read=False,
                                 )
