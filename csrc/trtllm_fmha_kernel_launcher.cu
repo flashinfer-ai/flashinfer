@@ -330,7 +330,7 @@ void trtllm_ragged_attention_launcher(
     double o_sf_scale, int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl,
     bool is_causal, int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    cudaStream_t stream) {
+    int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -382,17 +382,20 @@ void trtllm_ragged_attention_launcher(
   runner_params.mMaskType =
       is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
   runner_params.lsePtr = lse;
+
+  AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   size_t max_batch_size = 8192;
   size_t max_num_qo_heads = 256;
   size_t num_semaphores =
       round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
   // semaphores be at the first 8MB of workspace buffer: counter | softmax | scratch
-  runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
-  runner_params.softmaxStatsPtr = reinterpret_cast<float2*>(static_cast<char*>(workspace_buffer) +
-                                                            num_semaphores * sizeof(uint32_t));
-  runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-      static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t) +
-      sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ);
+  runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
+      num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+  runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
+      sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ, 16,
+      "trtllm_gen_softmax_workspace");
+  runner_params.multiCtasKvScratchPtr =
+      float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
   if (!foundKernels) {
@@ -410,7 +413,7 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
                              double o_sf_scale, int64_t batch_size, int64_t window_left,
                              at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
                              int64_t sm_count, bool enable_pdl, bool is_causal,
-                             std::optional<at::Tensor> attention_sinks,
+                             int64_t workspace_size, std::optional<at::Tensor> attention_sinks,
                              std::optional<at::Tensor> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks) {
@@ -454,7 +457,7 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale,
       bmm2_scale, o_sf_scale, batch_size, window_left, sm_count, enable_pdl, is_causal,
       k_stride_keys_values, k_stride_heads, k_stride_batch, v_stride_keys_values, v_stride_heads,
-      v_stride_batch, stream);
+      v_stride_batch, workspace_size, stream);
 }
 
 namespace trtllm_cubin_loader {

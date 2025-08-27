@@ -59,6 +59,8 @@ from .utils import (
     round_up,
 )
 
+DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
+
 
 @functools.cache
 def get_fmha_module(
@@ -1532,7 +1534,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
-        workspace_size: int = 128 * 1024 * 1024,
+        workspace_size: int = DEFAULT_WORKSPACE_SIZE,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1633,7 +1635,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
         workspace_size: int
-            The workspace size in bytes, default to 128 * 1024 * 1024.
+            The workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3145,6 +3147,7 @@ def trtllm_ragged_attention_deepseek(
     enable_pdl: bool,
     is_causal: bool,
     return_lse: bool,
+    workspace_size: int = DEFAULT_WORKSPACE_SIZE,
     attention_sinks: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -3184,6 +3187,8 @@ def trtllm_ragged_attention_deepseek(
         enable pdl
     is_causal : bool
         is causal
+    workspace_size : int
+        workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE)
     attention_sinks : Optional[torch.Tensor]
         attention sinks
     out : Optional[torch.Tensor]
@@ -3242,6 +3247,7 @@ def trtllm_ragged_attention_deepseek(
         sm_count,
         enable_pdl,
         is_causal,
+        workspace_size,
         attention_sinks,
         lse,
     )
@@ -3265,7 +3271,7 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
-    workspace_size: int = 128 * 1024 * 1024,
+    workspace_size: int = DEFAULT_WORKSPACE_SIZE,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -3315,7 +3321,7 @@ def trtllm_batch_context_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
     workspace_size : int
-        workspace size in bytes, default to 128 * 1024 * 1024
+        workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE)
 
     Returns
     -------
