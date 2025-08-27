@@ -336,6 +336,7 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if (dsm_pending_packed is not None) and (self.params.dst_signals is not None):
+                # TODO check off by one
                 dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
             if self.params.src_signals is not None:
                 wait_signal(
