@@ -73,8 +73,10 @@ def _pad_scale_factors(
 def gen_fp4_quantization_sm100_module() -> JitSpec:
     return gen_fp4_quantization_module(sm100a_nvcc_flags, "100")
 
+
 def gen_fp4_quantization_sm103_module() -> JitSpec:
     return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
+
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
@@ -119,7 +121,7 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 def get_fp4_quantization_module(backend: str = "100"):
     if backend == "110":
         module = gen_fp4_quantization_sm110_module().build_and_load()
-    elif backend == "100" or backend == "103":
+    elif backend == "100":
         module = gen_fp4_quantization_sm100_module().build_and_load()
     elif backend == "103":
         module = gen_fp4_quantization_sm103_module().build_and_load()
