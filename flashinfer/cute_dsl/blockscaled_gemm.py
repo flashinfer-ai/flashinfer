@@ -44,9 +44,9 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import (
     Int32,
     Int64,
-    UInt32,
-    UInt8,
-    UInt64,
+    Uint32,
+    Uint8,
+    Uint64,
     T,
     Integer,
     dsl_user_op,
@@ -57,14 +57,13 @@ from cutlass._mlir.dialects import llvm
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
-from cutlass import UInt32
 
 
 sizeof_i32 = 4
 sizeof_u64 = 8
 
 @dsl_user_op
-def with_byte(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> UInt64:
+def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
     assert index >= 0 and index < sizeof_u64
     obj &= ~(0xff << (index * 8))
     obj |= value << (index * 8)
@@ -72,19 +71,19 @@ def with_byte(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> 
 
 
 @dsl_user_op
-def read_byte(obj: UInt64, index: Int32, *, loc=None, ip=None) -> UInt8:
+def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
     assert index >= 0 and index < sizeof_u64
-    return ((obj >> (index * 8)) & 0xFF).to(UInt8)
+    return ((obj >> (index * 8)) & 0xFF).to(Uint8)
 
 
 @dsl_user_op
-def atomic_add_release_global(addr: Int64, value: UInt32, *, loc=None, ip=None) -> UInt32:
-    return UInt32(
+def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
         llvm.inline_asm(
             T.u32(),
             [
                 addr.ir_value(loc=loc, ip=ip),
-                UInt32(value).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
             ],
             "atom.add.release.gpu.global.u32 $0, [$1], $2;",
             "=r,l,r",
@@ -96,9 +95,9 @@ def atomic_add_release_global(addr: Int64, value: UInt32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
-def wait_signal(addr: Int64, expect_value: UInt32, *, loc=None, ip=None):
+def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
     while True:
-        ready = UInt32(
+        ready = Uint32(
             llvm.inline_asm(
                 T.u32(),
                 [addr.ir_value(loc=loc, ip=ip)],
@@ -315,10 +314,10 @@ class MaskedScheduler:
     def _get_current_work_for_linear_idx(
         self,
         current_work_linear_idx: Int32,
-        dsm_pending_packed: Optional[UInt64],
-        dsm_counter: Optional[UInt8],
+        dsm_pending_packed: Optional[Uint64],
+        dsm_counter: Optional[Uint8],
         num_c_stage: Optional[int] = None,
-    ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
+    ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
@@ -386,11 +385,11 @@ class MaskedScheduler:
     @dsl_user_op
     def get_current_work(
         self,
-        dsm_pending_packed: Optional[UInt64] = None,
-        dsm_counter: Optional[UInt8] = None,
+        dsm_pending_packed: Optional[Uint64] = None,
+        dsm_counter: Optional[Uint8] = None,
         num_c_stage: Optional[int] = None,
         *, loc=None, ip=None,
-    ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
+    ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
             dsm_pending_packed=dsm_pending_packed,
@@ -1683,9 +1682,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
                 assert num_experts <= 8, "need to be packable into a u64"
-                dsm_pending_packed = UInt64(0)
+                dsm_pending_packed = Uint64(0)
                 dsm_pending_idx = Int32(0)
-                dsm_counter = UInt8(0)
+                dsm_counter = Uint8(0)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -2869,7 +2868,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         )
         src_signals_ptr = (
             make_ptr(
-                cutlass.UInt32,
+                cutlass.Uint32,
                 src_signals_data_ptr,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
@@ -2879,7 +2878,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         )
         dst_signals_ptr = (
             make_ptr(
-                cutlass.UInt32,
+                cutlass.Uint32,
                 dst_signals_data_ptr,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
