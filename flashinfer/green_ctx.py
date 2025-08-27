@@ -15,11 +15,17 @@ limitations under the License.
 """
 
 from typing import List, Tuple
-
-import cuda.bindings.driver as driver
-import cuda.bindings.runtime as runtime
 import torch
-from cuda.bindings.driver import CUdevice, CUdevResource
+
+try:
+    import cuda.bindings.driver as driver
+    import cuda.bindings.runtime as runtime
+    from cuda.bindings.driver import CUdevice, CUdevResource
+except ImportError as e:
+    raise ImportError(
+        "Could not import the 'cuda' module. "
+        "Please install cuda-python that matches your CUDA version."
+    ) from e
 
 from .cuda_utils import checkCudaErrors
 from .utils import get_compute_capability, round_up
