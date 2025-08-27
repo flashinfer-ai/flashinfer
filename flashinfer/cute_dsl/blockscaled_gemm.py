@@ -62,6 +62,15 @@ from cutlass import UInt32
 
 sizeof_i32 = 4
 
+@dsl_user_op
+def packed_u64_set(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> UInt64:
+    return TODO
+
+
+@dsl_user_op
+def packed_u64_get(obj: UInt64, index: Int32, *, loc=None, ip=None) -> UInt8:
+    return TODO
+
 
 @dsl_user_op
 def atomic_add_release_global(addr: Int64, value: UInt32, *, loc=None, ip=None) -> UInt32:
