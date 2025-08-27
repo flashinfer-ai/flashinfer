@@ -61,15 +61,20 @@ from cutlass import UInt32
 
 
 sizeof_i32 = 4
+sizeof_u64 = 8
 
 @dsl_user_op
 def with_byte(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> UInt64:
-    return TODO
+    assert index >= 0 and index < sizeof_u64
+    obj &= ~(0xff << (index * 8))
+    obj |= value << (index * 8)
+    return obj
 
 
 @dsl_user_op
 def read_byte(obj: UInt64, index: Int32, *, loc=None, ip=None) -> UInt8:
-    return TODO
+    assert index >= 0 and index < sizeof_u64
+    return ((obj >> (index * 8)) & 0xFF).to(UInt8)
 
 
 @dsl_user_op
