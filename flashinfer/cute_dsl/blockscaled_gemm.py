@@ -1660,6 +1660,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 assert tile_sched_params.masked_m.shape[0] <= 8, "need to be packable into a u64"
                 dsm_pending_packed = UInt64(0)
+                dsm_pending_index = Int32(0)
                 dsm_counter = UInt8(0)
 
             while work_tile.is_valid_tile:
@@ -1755,8 +1756,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                         if tile_sched_params.dst_signals is not None:
                             dsm_counter += 1
+                            will_write_signals = dsm_pending_packed[dsm_pending_index] == dsm_counter
 
-                        c_pipeline.producer_acquire()
+                            # The original c_pipeline.producer_acquire()
+                            #   := PipelineTmaStore.producer_acquire()
+                            #   := TmaStoreFence.wait()
+                            #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
+                            cute.arch.cp_async_bulk_wait_group(c_pipeline.num_stages - 1, read=True)
+
+                        else:
+                            c_pipeline.producer_acquire()
 
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
