@@ -30,6 +30,7 @@ from .jit import (
     gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
+    sm100a_nvcc_flags,
 )
 from .mla import gen_mla_module
 from .norm import gen_norm_module
@@ -273,6 +274,7 @@ def gen_attention(
             pos_encoding_mode=0,
             use_sliding_window=False,
             use_logits_soft_cap=False,
+            extra_cuda_cflags=sm100a_nvcc_flags,
         )
 
     # MLA

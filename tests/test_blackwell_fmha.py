@@ -5,7 +5,7 @@ import torch
 from conftest import VARLEN_INDPTR_PARAMS
 
 import flashinfer
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 
 def attention_ref(
@@ -110,7 +110,9 @@ def test_blackwell_cutlass_fmha(
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
 
-    if not is_sm100a_supported(torch.device("cuda")):
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
         pytest.skip("SM100A is not supported on this device")
     torch.manual_seed(42)
     q = torch.randn(

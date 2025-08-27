@@ -276,7 +276,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     major, minor = torch.cuda.get_device_capability(device)
 
     # protecting current_device_nvcc_flags
-    assert major in [10, 12], "currently only support Blackwell"
+    assert major in [10, 11, 12], "currently only support Blackwell"
     nvcc_flags += current_device_nvcc_flags
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -398,7 +398,7 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("100", "103", "121", "122"):
+    if backend in ("100", "103", "110", "121", "122"):
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
             use_fast_build
         ).build_and_load(class_name="FusedMoeRunner")

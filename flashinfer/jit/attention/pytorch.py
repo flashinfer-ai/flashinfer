@@ -22,7 +22,13 @@ import torch
 
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags, current_device_nvcc_flags
+from ..core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    current_device_nvcc_flags,
+)
 from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
@@ -1533,6 +1539,7 @@ def gen_fmha_cutlass_sm100a_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    extra_cuda_cflags: List[str],
 ) -> JitSpec:
     uri = get_fmha_cutlass_sm100a_uri(
         dtype_q,
@@ -1551,11 +1558,11 @@ def gen_fmha_cutlass_sm100a_module(
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
-    
+
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
     # protecting current_device_nvcc_flags
-    assert major in [10], "currently only support compute capability 10"
+    assert major in [10, 11, 12], "currently only support Blackwell and later"
 
     return gen_jit_spec(
         uri,
