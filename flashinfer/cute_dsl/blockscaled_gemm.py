@@ -111,7 +111,7 @@ def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
         )
 
         if ready == expect_value:
-            return
+            break
 
         llvm.inline_asm(
             None,
