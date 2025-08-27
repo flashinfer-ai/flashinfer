@@ -1679,7 +1679,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-            if tile_sched_params.dst_signals is not None:
+            if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
                 assert num_experts <= 8, "need to be packable into a u64"
@@ -1778,7 +1778,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
 
-                        if tile_sched_params.dst_signals is not None:
+                        if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                             dsm_counter += 1
                             will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
@@ -1800,7 +1800,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         number_of_threads=epilog_threads,
                     )
 
-                    if tile_sched_params.dst_signals is not None:
+                    if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                         lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                             while (
@@ -1852,7 +1852,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Wait for C store complete
             #
-            if tile_sched_params.dst_signals is not None:
+            if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                 # The original c_pipeline.producer_tail()
                 #   := PipelineTmaStore.producer_tail()
                 #   := TmaStoreFence.tail()
