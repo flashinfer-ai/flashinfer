@@ -27,11 +27,6 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
 
     device_capability = torch.cuda.get_device_capability()
     if device_capability == (10, 3):
-        if backend == "cutlass" and use_128x4_sf_layout and auto_tuning:
-            # FIXME (bringup) apparent fail at autotuning but likely inside cutlass module instead
-            pytest.fail(
-                "There still are errors in the cutlass module and will appear to fail at autotuning"
-            )
         if backend == "trtllm":
             # FIXME (bringup) need to get sm103a kernels or compile with sm100f
             pytest.skip("Skipping test for trtllm fp4 with SM 10.3")
@@ -77,4 +72,5 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    test_mm_fp4(m=128, n=128, k=128, res_dtype=torch.bfloat16, backend="cutlass", use_128x4_sf_layout=True, auto_tuning=True)
+    #pytest.main([__file__])

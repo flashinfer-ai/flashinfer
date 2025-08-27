@@ -27,6 +27,7 @@ from .jit import (
     gen_jit_spec,
     sm110a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
     sm90a_nvcc_flags,
 )
 from .jit.cpp_ext import is_cuda_version_at_least
@@ -72,6 +73,8 @@ def _pad_scale_factors(
 def gen_fp4_quantization_sm100_module() -> JitSpec:
     return gen_fp4_quantization_module(sm100a_nvcc_flags, "100")
 
+def gen_fp4_quantization_sm103_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
@@ -118,6 +121,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         module = gen_fp4_quantization_sm110_module().build_and_load()
     elif backend == "100":
         module = gen_fp4_quantization_sm100_module().build_and_load()
+    elif backend == "103":
+        module = gen_fp4_quantization_sm103_module().build_and_load()
     elif backend == "90":
         module = gen_fp4_quantization_sm90_module().build_and_load()
     else:
