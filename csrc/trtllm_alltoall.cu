@@ -17,8 +17,8 @@
 
 #include <ATen/cuda/EmptyTensor.h>
 
-#include <vector>
 #include <optional>
+#include <vector>
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
 #include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
