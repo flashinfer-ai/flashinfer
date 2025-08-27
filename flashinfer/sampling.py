@@ -50,7 +50,7 @@ def error_generator_if_torch_compile(generator: Optional[torch._C.Generator]):
 
 
 @functools.cache
-def init_sampling_module():
+def _get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
     @fast_register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
@@ -477,11 +477,9 @@ def init_sampling_module():
     )
 
 
-_sampling_modules = init_sampling_module()
-
-
+@torch._dynamo.disable(reason="Dynamo cannot trace 'get_sampling_module'. Set fullgraph=False")
 def get_sampling_module():
-    return _sampling_modules
+    return _get_sampling_module()
 
 
 def _to_tensor_scalar_tuple(x):
