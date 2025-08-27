@@ -264,4 +264,6 @@ if __name__ == "__main__":
         tolerance=1e-01,
         iterations=3,
         sm_count=132,
+        enable_src_signals=False,
+        enable_dst_signals=True,
     )
