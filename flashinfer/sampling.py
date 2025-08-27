@@ -477,7 +477,7 @@ def _get_sampling_module():
     )
 
 
-@torch._dynamo.disable(reason="Dynamo cannot trace 'get_sampling_module'. Set fullgraph=False")
+@torch._dynamo.disable
 def get_sampling_module():
     return _get_sampling_module()
 
