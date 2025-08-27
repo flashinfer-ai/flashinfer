@@ -303,6 +303,7 @@ class MaskedScheduler:
         current_work_linear_idx: Int32,
         dsm_pending_packed: Optional[UInt64],
         dsm_counter: Optional[UInt8],
+        num_c_stage: Optional[int] = None,
     ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
@@ -321,7 +322,7 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if (dsm_pending_packed is not None) and (self.params.dst_signals is not None):
-                dsm_pending_packed = packed_u64_set(dsm_pending_packed, batch_idx, dsm_counter + TODO)
+                dsm_pending_packed = packed_u64_set(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
             if self.params.src_signals is not None:
                 wait_signal(
                     self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
@@ -372,12 +373,14 @@ class MaskedScheduler:
         self,
         dsm_pending_packed: Optional[UInt64] = None,
         dsm_counter: Optional[UInt8] = None,
+        num_c_stage: Optional[int] = None,
         *, loc=None, ip=None,
     ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
             dsm_pending_packed=dsm_pending_packed,
             dsm_counter=dsm_counter,
+            num_c_stage=num_c_stage,
         )
 
     @dsl_user_op
@@ -1810,6 +1813,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 work_tile, dsm_pending_packed = tile_sched.get_current_work(
                     dsm_pending_packed=dsm_pending_packed,
                     dsm_counter=dsm_counter,
+                    num_c_stage=self.num_c_stage,
                 )
 
             #
