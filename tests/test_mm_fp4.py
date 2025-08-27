@@ -72,5 +72,4 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
 
 
 if __name__ == "__main__":
-    test_mm_fp4(m=128, n=128, k=128, res_dtype=torch.bfloat16, backend="cutlass", use_128x4_sf_layout=True, auto_tuning=True)
-    #pytest.main([__file__])
+    pytest.main([__file__])
