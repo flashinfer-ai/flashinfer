@@ -335,10 +335,10 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if (dsm_pending_packed is not None) and cute.constexpr(self.params.dst_signals is not None):
+            if (dsm_pending_packed is not None) and cutlass.constexpr(self.params.dst_signals is not None):
                 # TODO check off by one
                 dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
-            if cute.constexpr(self.params.src_signals is not None):
+            if cutlass.constexpr(self.params.src_signals is not None):
                 wait_signal(
                     self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
                     expect_value=self.params.src_signal_expect_value,
@@ -1282,7 +1282,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
         # TODO may optimize if too slow
-        if cute.constexpr(tile_sched_params.src_signals is not None):
+        if cutlass.constexpr(tile_sched_params.src_signals is not None):
             wait_signal(
                 tile_sched_params.src_signals.toint() + sizeof_i32 * 0,
                 expect_value=tile_sched_params.src_signal_expect_value,
