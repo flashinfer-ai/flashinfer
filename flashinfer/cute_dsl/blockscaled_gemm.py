@@ -63,12 +63,12 @@ from cutlass import UInt32
 sizeof_i32 = 4
 
 @dsl_user_op
-def packed_u64_set(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> UInt64:
+def with_byte(obj: UInt64, index: Int32, value: UInt8, *, loc=None, ip=None) -> UInt64:
     return TODO
 
 
 @dsl_user_op
-def packed_u64_get(obj: UInt64, index: Int32, *, loc=None, ip=None) -> UInt8:
+def read_byte(obj: UInt64, index: Int32, *, loc=None, ip=None) -> UInt8:
     return TODO
 
 
@@ -331,7 +331,7 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if (dsm_pending_packed is not None) and (self.params.dst_signals is not None):
-                dsm_pending_packed = packed_u64_set(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
+                dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
             if self.params.src_signals is not None:
                 wait_signal(
                     self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
@@ -1774,7 +1774,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                         if tile_sched_params.dst_signals is not None:
                             dsm_counter += 1
-                            will_write_signals = packed_u64_get(dsm_pending_packed, dsm_pending_idx) == dsm_counter
+                            will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
                             # The original c_pipeline.producer_acquire()
                             #   := PipelineTmaStore.producer_acquire()
@@ -1799,7 +1799,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                             while (
                                 (dsm_pending_idx < num_experts) and
-                                (packed_u64_get(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
+                                (read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
                             ):
                                 # TODO unify w/ the other branch
                                 atomic_add_release_global(
