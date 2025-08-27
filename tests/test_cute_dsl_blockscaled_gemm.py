@@ -59,7 +59,9 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
+# TODO enable in tests
 @pytest.mark.parametrize("enable_src_signals", [False])
+# TODO enable in tests
 @pytest.mark.parametrize("enable_dst_signals", [False])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
