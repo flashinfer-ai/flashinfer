@@ -818,7 +818,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         page_size: int,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
-        workspace_size: int = DEFAULT_WORKSPACE_SIZE,
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -856,8 +855,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
-        workspace_size : int
-            workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -892,7 +889,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        self._workspace_size = workspace_size
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
