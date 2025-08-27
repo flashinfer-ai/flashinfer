@@ -449,7 +449,7 @@ void run(Data const& data, void* stream) {
     } else {
       // Reset the global histograms.
       CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
-                                       static_cast<size_t>(2 * NumThreads) * sizeof(int32_t),
+                                       static_cast<size_t>(2 * data.mNumExperts) * sizeof(int32_t),
                                        (cudaStream_t)stream));
     }
     LAUNCH_ROUTING(data,
