@@ -124,6 +124,10 @@ Starting from FlashInfer v0.2, users can customize their own attention variants 
 
 FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
 
+## GPU Support
+
+FlashInfer currently provides support for NVIDIA SM architectures 80 and higher, and beta support 100, 103, 120, and 121.
+
 ## Adoption
 
 We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:
