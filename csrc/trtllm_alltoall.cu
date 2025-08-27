@@ -18,6 +18,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 
 #include <vector>
+#include <optional>
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
 #include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
@@ -225,10 +226,10 @@ int64_t getPrepareWorkspaceSizePerRank(int64_t epSize) {
   return flashinfer::trtllm_alltoall::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
 }
 
-std::tuple<at::Tensor, c10::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           at::Tensor, c10::optional<at::Tensor>>
-moePrepareOp(at::Tensor expertsIds, c10::optional<at::Tensor> scales,
-             c10::optional<at::Tensor> expertsStatics, at::Tensor allWorkspaces,
+std::tuple<at::Tensor, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, std::optional<at::Tensor>>
+moePrepareOp(at::Tensor expertsIds, std::optional<at::Tensor> scales,
+             std::optional<at::Tensor> expertsStatics, at::Tensor allWorkspaces,
              int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
              int64_t slotCount, int64_t topK) {
   CHECK_INPUT_TYPE(expertsIds, at::ScalarType::Int);
@@ -265,7 +266,7 @@ moePrepareOp(at::Tensor expertsIds, c10::optional<at::Tensor> scales,
       at::detail::empty_cuda({maxTokenCountPerRank * maxSendRanksPerToken},
                              expertsIds.options().dtype(at::ScalarType::Int));
 
-  c10::optional<at::Tensor> preparedLocalScales;
+  std::optional<at::Tensor> preparedLocalScales;
   float* scalesPtr = nullptr;
   float* preparedLocalScalesPtr = nullptr;
   if (scales.has_value()) {
@@ -278,7 +279,7 @@ moePrepareOp(at::Tensor expertsIds, c10::optional<at::Tensor> scales,
 
   int* localExpertStaticsPtr = nullptr;
   int* gatheredExpertStaticsPtr = nullptr;
-  c10::optional<at::Tensor> gatheredExpertStatics;
+  std::optional<at::Tensor> gatheredExpertStatics;
   if (expertsStatics.has_value()) {
     localExpertStaticsPtr = expertsStatics.value().data_ptr<int>();
     gatheredExpertStatics = at::detail::empty_cuda({epSize, expertCount},
