@@ -62,12 +62,12 @@ sizeof_i32 = 4
 
 
 @dsl_user_op
-def atomic_add_release_global(ptr: cutlass.Pointer, value: UInt32, *, loc=None, ip=None) -> UInt32:
+def atomic_add_release_global(addr: Int64, value: UInt32, *, loc=None, ip=None) -> UInt32:
     return UInt32(
         llvm.inline_asm(
             T.u32(),
             [
-                ptr.toint(loc=loc, ip=ip).ir_value(),
+                addr.ir_value(loc=loc, ip=ip),
                 UInt32(value).ir_value(loc=loc, ip=ip),
             ],
             "atom.add.release.gpu.global.u32 $0, [$1], $2;",
@@ -318,7 +318,10 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if write_out_signals and (self.params.dst_signals is not None):
-                atomic_add_release_global(self.params.dst_signals + batch_idx, 1)
+                atomic_add_release_global(
+                    self.params.dst_signals.toint() + sizeof_i32 * batch_idx,
+                    value=1,
+                )
             if self.params.src_signals is not None:
                 wait_signal(
                     self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
