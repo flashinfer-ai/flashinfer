@@ -1658,7 +1658,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             if tile_sched_params.dst_signals is not None:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
-                assert tile_sched_params.masked_m.shape[0] <= 8, "need to be packable into a u64"
+                num_experts = tile_sched_params.masked_m.shape[0]
+                assert num_experts <= 8, "need to be packable into a u64"
                 dsm_pending_packed = UInt64(0)
                 dsm_pending_idx = Int32(0)
                 dsm_counter = UInt8(0)
