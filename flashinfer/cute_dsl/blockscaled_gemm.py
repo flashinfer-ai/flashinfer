@@ -2780,17 +2780,25 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        src_signals_ptr = make_ptr(
-            cutlass.UInt32,
-            src_signals_data_ptr,
-            cute.AddressSpace.gmem,
-            assumed_align=16,
+        src_signals_ptr = (
+            make_ptr(
+                cutlass.UInt32,
+                src_signals_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if src_signals_data_ptr is not None
+            else None
         )
-        dst_signals_ptr = make_ptr(
-            cutlass.UInt32,
-            dst_signals_data_ptr,
-            cute.AddressSpace.gmem,
-            assumed_align=16,
+        dst_signals_ptr = (
+            make_ptr(
+                cutlass.UInt32,
+                dst_signals_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if dst_signals_data_ptr is not None
+            else None
         )
         alpha_ptr = (
             make_ptr(
