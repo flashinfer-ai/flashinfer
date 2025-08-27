@@ -1620,6 +1620,8 @@ def mm_fp4(
         raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if backend == "trtllm" and _match_sm_version(a.device, "110"):
+        raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1866,6 +1868,9 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
+    if backend == "trtllm" and _match_sm_version(a.device, "110"):
+        raise ValueError("TRTLLM FP8 GEMM is not supported on SM110.")
+
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
