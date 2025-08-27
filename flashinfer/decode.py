@@ -2246,7 +2246,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
-    workspace_size: int = DEFAULT_WORKSPACE_SIZE,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -2265,7 +2264,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
     sinks: additional value per head in the denominator of the softmax.
-    workspace_size: workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE)
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
@@ -2343,7 +2341,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         -1,  # window_left
         sm_count,
         enable_pdl,
-        workspace_size,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
     )
     return out
