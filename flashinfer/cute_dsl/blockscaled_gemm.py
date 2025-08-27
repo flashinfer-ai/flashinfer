@@ -715,8 +715,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         masked_m_tensor: cute.Tensor,
-        src_signals: Optional[cute.Tensor],
-        dst_signals: Optional[cute.Tensor],
+        src_signals: Optional[cute.Pointer],
+        dst_signals: Optional[cute.Pointer],
         alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -2099,9 +2099,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @staticmethod
     def _compute_grid(
         masked_m_tensor: cute.Tensor,
-        src_signals: Optional[cute.Tensor],
+        src_signals: Optional[cute.Pointer],
         src_signals_expect_value: int,
-        dst_signals: Optional[cute.Tensor],
+        dst_signals: Optional[cute.Pointer],
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
