@@ -94,18 +94,19 @@ def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) 
     )
 
 
+# TODO unify i32 or u32
 @cute.jit
 def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
-    ready = Uint32(0)
+    ready = Int32(0)
 
     # early exiting / early return is not supported in cute dsl
-    while ready != expect_value:
-        ready = Uint32(
+    while ready != expect_value.to(Int32):
+        ready = Int32(
             llvm.inline_asm(
-                T.ui32(),
+                T.i32(),
                 [addr.ir_value(loc=loc, ip=ip)],
                 # TODO how to add `:"memory"` clobber?
-                "ld.acquire.gpu.global.u32 $0, [$1];",
+                "ld.acquire.gpu.global.i32 $0, [$1];",
                 "=r,l",
                 has_side_effects=True,
                 is_align_stack=False,
