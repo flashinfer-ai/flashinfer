@@ -301,8 +301,9 @@ class MaskedScheduler:
     def _get_current_work_for_linear_idx(
         self,
         current_work_linear_idx: Int32,
-        write_out_signals: bool,
-    ) -> WorkTileInfo:
+        dsm_pending_packed: Optional[UInt64],
+        dsm_counter: Optional[UInt8],
+    ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
@@ -319,11 +320,8 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if write_out_signals and (self.params.dst_signals is not None):
-                atomic_add_release_global(
-                    self.params.dst_signals.toint() + sizeof_i32 * batch_idx,
-                    value=1,
-                )
+            if (dsm_pending_packed is not None) and (self.params.dst_signals is not None):
+                dsm_pending_packed = packed_u64_set(dsm_pending_packed, batch_idx, dsm_counter + TODO)
             if self.params.src_signals is not None:
                 wait_signal(
                     self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
@@ -367,13 +365,20 @@ class MaskedScheduler:
             )
         )
 
-        return WorkTileInfo(cur_tile_coord, is_valid)
+        return WorkTileInfo(cur_tile_coord, is_valid), dsm_pending_packed
 
     @dsl_user_op
-    def get_current_work(self, write_out_signals: bool = False, *, loc=None, ip=None) -> WorkTileInfo:
+    def get_current_work(
+        self,
+        write_out_signals: bool = False,
+        dsm_pending_packed: Optional[UInt64] = None,
+        dsm_counter: Optional[UInt8] = None,
+        *, loc=None, ip=None,
+    ) -> Tuple[WorkTileInfo, Optional[UInt64]]:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
-            write_out_signals=write_out_signals,
+            dsm_pending_packed=dsm_pending_packed,
+            dsm_counter=dsm_counter,
         )
 
     @dsl_user_op
@@ -1802,12 +1807,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work(
-                    # TODO is this write late enough?
-                    # Assume epilogue warps contains the first warp
-                    write_out_signals=tidx == 0,
-                    dsm_pending_packed=TODO,
-                    dsm_counter=TODO,
+                work_tile, dsm_pending_packed = tile_sched.get_current_work(
+                    dsm_pending_packed=dsm_pending_packed,
+                    dsm_counter=dsm_counter,
                 )
 
             #
