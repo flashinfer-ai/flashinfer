@@ -1935,9 +1935,9 @@ def get_trtllm_gen_decode_module(*args):
             max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+            workspace_size,
             window_left,
             enable_pdl,
-            workspace_size,
             out=o,
             sinks=sinks,
         )
