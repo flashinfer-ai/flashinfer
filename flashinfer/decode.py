@@ -63,8 +63,6 @@ from .utils import (
     round_up,
 )
 
-DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
-
 
 @functools.cache
 def get_single_decode_module(*args):
@@ -2004,7 +2002,6 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale: float,
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
-    workspace_size: int = DEFAULT_WORKSPACE_SIZE,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -2043,9 +2040,6 @@ def trtllm_batch_decode_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
-
-    workspace_size : int
-        workspace size in bytes, default to 128 * 1024 * 1024 (DEFAULT_WORKSPACE_SIZE)
 
     out :  Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
@@ -2176,7 +2170,7 @@ def trtllm_batch_decode_with_kv_cache(
         window_left,
         sm_count,
         enable_pdl,
-        workspace_size,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
     )
 
