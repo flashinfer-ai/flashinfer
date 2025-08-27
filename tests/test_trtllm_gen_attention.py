@@ -325,7 +325,6 @@ def test_trtllm_batch_prefill(
         "q_data_type": ref_q.dtype,
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
-        "workspace_size": workspace_size,
     }
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
@@ -351,7 +350,6 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
-        workspace_size=workspace_size,
     )
 
     if o_dtype == "nvfp4":
@@ -491,7 +489,6 @@ def test_trtllm_batch_decode(
         "kv_data_type": ref_kv_cache.dtype,
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
-        "workspace_size": workspace_size,
     }
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
@@ -514,7 +511,6 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
-        workspace_size=workspace_size,
     )
 
     if o_dtype == "nvfp4":
