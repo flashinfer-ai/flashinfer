@@ -2756,7 +2756,7 @@ class MaskedBatchedMatmulCuteDSL:
             c_tensor,
             masked_m_tensor,
             src_signals_ptr,
-            src_signals_ptr,
+            dst_signals_ptr,
             alpha_tensor,
             self._max_active_clusters,
             current_stream,
