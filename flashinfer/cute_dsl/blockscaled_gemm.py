@@ -1687,9 +1687,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
                 assert num_experts <= 8, "need to be packable into a u64"
-                dsm_pending_packed = Uint64(0)
-                dsm_pending_idx = Int32(0)
-                dsm_counter = Uint8(0)
+            dsm_pending_packed = Uint64(0)
+            dsm_pending_idx = Int32(0)
+            dsm_counter = Uint8(0)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
