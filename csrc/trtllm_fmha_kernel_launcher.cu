@@ -156,8 +156,10 @@ void trtllm_paged_attention_launcher(
     size_t num_semaphores =
         round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
     // semaphores be at the first 8MB of workspace buffer: counter | scratch
+    // todo(Yingyi): add softmax buffer later for lse return
     runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
         num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+    // scratch takes the rest of the workspace buffer
     runner_params.multiCtasKvScratchPtr =
         float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
   }
@@ -394,6 +396,7 @@ void trtllm_ragged_attention_launcher(
   runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
       sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ, 16,
       "trtllm_gen_softmax_workspace");
+  // scratch takes the rest of the workspace buffer
   runner_params.multiCtasKvScratchPtr =
       float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
 
