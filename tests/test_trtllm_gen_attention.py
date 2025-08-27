@@ -17,6 +17,7 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None
+workspace_size = 128 * 1024 * 1024
 
 
 def flip_coin(*args, **kwargs):
@@ -313,7 +314,7 @@ def test_trtllm_batch_prefill(
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -492,7 +493,7 @@ def test_trtllm_batch_decode(
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -628,7 +629,7 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
 
     qo_indptr = torch.cat(
         [
@@ -651,7 +652,7 @@ def test_trtllm_gen_prefill_deepseek(
     ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
         kv_layout="NHD",
         backend="cutlass",
     )
@@ -707,5 +708,5 @@ def test_trtllm_gen_prefill_deepseek(
 
 
 if __name__ == "__main__":
-    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
-    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
+    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
+    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
