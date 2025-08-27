@@ -1839,6 +1839,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     read=False,
                 )
 
+                lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
                         # TODO unify w/ the other branch
