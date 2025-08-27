@@ -370,7 +370,6 @@ class MaskedScheduler:
     @dsl_user_op
     def get_current_work(
         self,
-        write_out_signals: bool = False,
         dsm_pending_packed: Optional[UInt64] = None,
         dsm_counter: Optional[UInt8] = None,
         *, loc=None, ip=None,
@@ -383,7 +382,8 @@ class MaskedScheduler:
 
     @dsl_user_op
     def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return self.get_current_work(loc=loc, ip=ip)
+        tile_info, _ = self.get_current_work(loc=loc, ip=ip)
+        return tile_info
 
     @dsl_user_op
     def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
@@ -1374,7 +1374,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_tile, _ = tile_sched.get_current_work()
 
             #
             # Wait A/B buffer empty
@@ -1578,7 +1578,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_tile, _ = tile_sched.get_current_work()
 
             #
             # Wait for accumulator buffer empty
