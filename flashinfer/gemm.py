@@ -1903,8 +1903,8 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if not (backend == "cutlass" and (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103"))):
+        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100 or SM103 in cutlass backend.")
 
     if backend == "cutlass":
         assert scale_major_mode is not None
@@ -2172,8 +2172,8 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if not (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103")):
+        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100 or SM103.")
 
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
