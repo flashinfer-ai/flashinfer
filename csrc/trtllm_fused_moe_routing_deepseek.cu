@@ -417,43 +417,38 @@ void run(Data& data, void* stream) {
                 "If permuted index is required, `mPtrExpertIdx` is also required");
   TORCH_CHECK(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
   TORCH_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
-              "Routing kernel expects <= %d top groups, got %d", MaxNumTopGroups,
+              "Routing kernel expects <= ", MaxNumTopGroups, " top groups, got ",
               data.mNumLimitedGroups);
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-              MaxNumTopExperts, data.mTopK);
-  TORCH_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got %d",
+  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
+              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
+  TORCH_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ",
               data.mTopK);
   TORCH_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
-              "Routing kernel expects top K * top groups <= warp size (for now), got %d * %d",
-              data.mTopK, data.mNumLimitedGroups);
-  TORCH_CHECK(data.mNumExperts >= MaxNumTopExperts,
-              "Routing kernel expects %d to be at most #experts %d", MaxNumTopExperts,
-              data.mNumExperts);
-  TORCH_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d  <= #threads %d",
-              data.mNumExperts, NumThreads);
-  TORCH_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups,
-              "Routing kernel expects top groups %d to be limited by #expert groups %d",
-              data.mNumLimitedGroups, data.mNumExpertGroups);
+              "Routing kernel expects top K * top groups <= warp size (for now), got ", data.mTopK,
+              " * ", data.mNumLimitedGroups);
+  TORCH_CHECK(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ", MaxNumTopExperts,
+              " to be at most #experts ", data.mNumExperts);
+  TORCH_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ", data.mNumExperts,
+              " <= #threads ", NumThreads);
+  TORCH_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups, "Routing kernel expects top groups ",
+              data.mNumLimitedGroups, " to be limited by #expert groups ", data.mNumExpertGroups);
   if (data.mNumExpertGroups > 1) {
-    TORCH_CHECK(data.mNumExpertGroups <= NumWarps,
-                "Routing kernel expects #experts groups %d to be <= #warps %d",
-                data.mNumExpertGroups, NumWarps);
-    TORCH_CHECK(data.mNumExperts % data.mNumExpertGroups == 0,
-                "Routing kernel expects #experts %d to be a multiple of #expert groups %d",
-                data.mNumExperts, data.mNumExpertGroups);
+    TORCH_CHECK(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
+                data.mNumExpertGroups, " to be <= #warps ", NumWarps);
+    TORCH_CHECK(data.mNumExperts % data.mNumExpertGroups == 0, "Routing kernel expects #experts ",
+                data.mNumExperts, " to be a multiple of #expert groups ", data.mNumExpertGroups);
     TORCH_CHECK(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-                "Routing kernel expects #experts per group <= warp size, got %d",
+                "Routing kernel expects #experts per group <= warp size, got ",
                 data.mNumExperts / data.mNumExpertGroups);
   } else {
-    TORCH_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups,
-                "Routing kernel expects #experts %d <= WarpSize * MaxNumTopGroups %d",
-                data.mNumExperts, WarpSize * MaxNumTopGroups);
-    TORCH_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K %d to be <= #warps %d",
-                data.mTopK, NumWarps);
+    TORCH_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups, "Routing kernel expects #experts ",
+                data.mNumExperts, " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
+    TORCH_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK,
+                " to be <= #warps ", NumWarps);
   }
-  TORCH_CHECK(data.mNumExperts % 4 == 0,
-              "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d",
+  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
+              " to be a multiple of 4.");
+  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
               data.mPaddingLog2);
   int const numBlocks = data.mNumTokens;
 
