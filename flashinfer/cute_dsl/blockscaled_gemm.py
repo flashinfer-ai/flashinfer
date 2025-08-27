@@ -1810,7 +1810,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Wait for C store complete
             #
-            c_pipeline.producer_tail()
+            if tile_sched_params.dst_signals is not None:
+                # The original c_pipeline.producer_tail()
+                #   := PipelineTmaStore.producer_tail()
+                #   := TmaStoreFence.tail()
+                #   := cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+            else:
+                c_pipeline.producer_tail()
 
     def mainloop_s2t_copy_and_partition(
         self,
