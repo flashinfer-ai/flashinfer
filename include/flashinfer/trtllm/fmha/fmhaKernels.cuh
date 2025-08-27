@@ -242,10 +242,9 @@ class TllmGenFmhaKernel {
 
       if (params.lsePtr != nullptr) {
         // printf(
-        //     "softmaxStatsPtr: %p, lsePtr: %p, mSumOfSeqLensQ: %d, mNumHeadsQ: %d, enable_pdl: %d, "
-        //     "stream: %p\n",
-        //     params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ, params.mNumHeadsQ,
-        //     params.enable_pdl, params.stream);
+        //     "softmaxStatsPtr: %p, lsePtr: %p, mSumOfSeqLensQ: %d, mNumHeadsQ: %d, enable_pdl: %d,
+        //     " "stream: %p\n", params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
+        //     params.mNumHeadsQ, params.enable_pdl, params.stream);
         flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
                                      params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
                                      params.stream);
