@@ -110,6 +110,7 @@ class MaskedSchedulerParams:
         self,
         masked_m: cute.Tensor,
         src_signals: Optional[cute.Tensor],
+        src_signal_expect_value: int,
         dst_signals: Optional[cute.Tensor],
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
@@ -125,6 +126,7 @@ class MaskedSchedulerParams:
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.masked_m = masked_m
         self.src_signals = src_signals
+        self.src_signal_expect_value = src_signal_expect_value
         self.dst_signals = dst_signals
         self.c = c
         self.c_tiler = c_tiler
@@ -147,6 +149,7 @@ class MaskedSchedulerParams:
         for obj in [
             self.masked_m,
             self.src_signals,
+            self.src_signal_expect_value,
             self.dst_signals,
             self.c,
             self.c_tiler,
@@ -160,7 +163,7 @@ class MaskedSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.masked_m, self.src_signals, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
+            [self.masked_m, self.src_signals, self.src_signal_expect_value, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
             self._values_pos,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
@@ -313,7 +316,7 @@ class MaskedScheduler:
             if write_out_signals and (self.params.dst_signals is not None):
                 atomic_add_release_global(self.params.dst_signals + batch_idx, 1)
             if self.params.src_signals is not None:
-                wait_signal(self.params.src_signals + (batch_idx + 1), src_signal_expect_value)
+                wait_signal(self.params.src_signals + (batch_idx + 1), self.params.src_signal_expect_value)
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
@@ -496,6 +499,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        src_signal_expect_value: int,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -523,6 +527,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
+        self.src_signal_expect_value = src_signal_expect_value
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -866,6 +871,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.tile_sched_params, grid = self._compute_grid(
             masked_m_tensor,  # add masked layout
             src_signals_tensor,
+            self.src_signal_expect_value,
             dst_signals_tensor,
             c_tensor,
             self.cta_tile_shape_mnk,
@@ -1242,7 +1248,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # TODO may optimize if too slow
         if tile_sched_params.src_signals is not None:
-            wait_signal(tile_sched_params.src_signals + 0, src_signal_expect_value)
+            wait_signal(tile_sched_params.src_signals + 0, tile_sched_params.src_signal_expect_value)
 
         #
         # Specialized TMA load warp
@@ -2081,6 +2087,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     def _compute_grid(
         masked_m_tensor: cute.Tensor,
         src_signals_tensor: Optional[cute.Tensor],
+        src_signals_expect_value: int,
         dst_signals_tensor: Optional[cute.Tensor],
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
@@ -2107,7 +2114,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, src_signals_tensor, dst_signals_tensor, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor, src_signals_tensor, src_signals_expect_value, dst_signals_tensor, c, c_tiler, cluster_shape_mnl
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -2496,6 +2503,7 @@ class MaskedBatchedMatmulCuteDSL:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
+        src_signal_expect_value: int,
     ):
         self._m = m
         self._n = n
@@ -2511,6 +2519,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
+        self._src_signal_expect_value = src_signal_expect_value
 
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
@@ -2646,6 +2655,7 @@ class MaskedBatchedMatmulCuteDSL:
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
+            src_signal_expect_value=self._src_signal_expect_value,
         )(
             a_tensor,
             b_tensor,
@@ -2678,6 +2688,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
+    src_signal_expect_value: int,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2786,6 +2797,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
+            src_signal_expect_value=src_signal_expect_value,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2848,6 +2860,7 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    src_signal_expect_value: int = 0,
     sm_count: Optional[int] = None,
     **kwargs,
 ):
@@ -2921,6 +2934,7 @@ def grouped_gemm_nt_masked(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
+        src_signal_expect_value=src_signal_expect_value,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
