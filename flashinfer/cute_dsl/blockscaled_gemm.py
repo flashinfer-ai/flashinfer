@@ -1762,7 +1762,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             #   := PipelineTmaStore.producer_acquire()
                             #   := TmaStoreFence.wait()
                             #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
-                            cute.arch.cp_async_bulk_wait_group(c_pipeline.num_stages - 1, read=True)
+                            cute.arch.cp_async_bulk_wait_group(
+                                c_pipeline.num_stages - 1,
+                                # If write signals, wait for both read *and* write
+                                read=not will_write_signals,
+                            )
 
                         else:
                             c_pipeline.producer_acquire()
@@ -1815,7 +1819,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #   := PipelineTmaStore.producer_tail()
                 #   := TmaStoreFence.tail()
                 #   := cute.arch.cp_async_bulk_wait_group(0, read=True)
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(
+                    0,
+                    # Change `read` from True to False to also wait writes
+                    read=False,
+                )
 
             else:
                 c_pipeline.producer_tail()
