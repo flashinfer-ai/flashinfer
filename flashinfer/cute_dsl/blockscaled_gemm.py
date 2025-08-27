@@ -96,7 +96,10 @@ def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) 
 
 @cute.jit
 def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
-    while True:
+    ready = Uint32(0)
+
+    # early exiting / early return is not supported in cute dsl
+    while ready != expect_value:
         ready = Uint32(
             llvm.inline_asm(
                 T.ui32(),
@@ -109,9 +112,6 @@ def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
                 asm_dialect=llvm.AsmDialect.AD_ATT,
             )
         )
-
-        if ready == expect_value:
-            break
 
         llvm.inline_asm(
             None,
