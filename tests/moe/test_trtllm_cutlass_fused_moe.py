@@ -1093,7 +1093,7 @@ def dequant_mxfp4_batches(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11],
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100 and SM110",
 )
 def test_moe_mxfp8_mxfp4(

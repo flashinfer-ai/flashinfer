@@ -34,10 +34,10 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
                                                 int64_t num_rows, int64_t gemm_n, int64_t gemm_k,
                                                 int num_experts, int multi_processor_count,
                                                 cudaStream_t stream, int* kernel_occupancy) {
-  constexpr auto activation_type = fused_moe_oss::EpilogueRouting<EpilogueTag>(true);
+  constexpr auto activation_type = fused_moe::EpilogueRouting<EpilogueTag>(true);
   using GemmType =
-      fused_moe_oss::Fused_Moe_Kernel_sm80<ElementType_, CutlassWeightType_, ElementType_,
-                                           MaxTileM_, TileN_, TileK_, Stages_, activation_type>;
+      fused_moe::Fused_Moe_Kernel_sm80<ElementType_, CutlassWeightType_, ElementType_, MaxTileM_,
+                                       TileN_, TileK_, Stages_, activation_type>;
 
   // make sure GPU has enough resources..
   if (kernel_occupancy != nullptr) {
@@ -51,7 +51,7 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
       tensorrt_llm::common::check_cuda_error(cudaDeviceGetAttribute(
           &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
       tensorrt_llm::common::check_cuda_error(
-          cudaFuncGetAttributes(&attr, fused_moe_oss::run_global<GemmType>));
+          cudaFuncGetAttributes(&attr, fused_moe::run_global<GemmType>));
       if (smem_size + attr.sharedSizeBytes >= static_cast<size_t>(max_smem_per_block)) {
         // This should mean that
         // cudaFuncSetAttribute(cutlass::Kernel<GemmKernel>,
@@ -64,12 +64,11 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
 
     int max_active_blocks = -1;
     tensorrt_llm::common::check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks, fused_moe_oss::run_global<GemmType>, GemmType::kThreadCount,
-        smem_size));
+        &max_active_blocks, fused_moe::run_global<GemmType>, GemmType::kThreadCount, smem_size));
     *kernel_occupancy = max_active_blocks;
     return;
   }
-  int occupancy = std::min(2, fused_moe_oss::fused_gemm_maximum_active_blocks<GemmType>());
+  int occupancy = std::min(2, fused_moe::fused_gemm_maximum_active_blocks<GemmType>());
   int const threadblock_count = multi_processor_count * occupancy;
   TLLM_CHECK_WITH_INFO(occupancy > 0,
                        "GPU lacks the shared memory resources to run fused_moe kernel");
@@ -83,7 +82,7 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
   auto params = GemmType::to_underlying_arguments(args);
   if (GemmType::kSmemSize >= (48 << 10)) {
     cudaError_t result =
-        cudaFuncSetAttribute(fused_moe_oss::run_global<GemmType>,
+        cudaFuncSetAttribute(fused_moe::run_global<GemmType>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, GemmType::kSmemSize);
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "Fail to set the max smem size to " +
                                                     std::to_string(GemmType::kSmemSize) +
@@ -91,7 +90,7 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
   }
   dim3 grid(params.threadblock_count, 1, 1);
   dim3 block(GemmType::kThreadCount);
-  fused_moe_oss::run_global<GemmType><<<grid, block, GemmType::kSmemSize, stream>>>(params);
+  fused_moe::run_global<GemmType><<<grid, block, GemmType::kSmemSize, stream>>>(params);
   auto result = cudaGetLastError();
   TLLM_CHECK_WITH_INFO(result == cudaSuccess, "Fail to execute fused moe kernel, cuda error %d\n",
                        (int)(result));
