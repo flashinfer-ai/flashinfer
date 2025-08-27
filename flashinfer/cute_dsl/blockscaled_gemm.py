@@ -1778,6 +1778,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
 
                     if tile_sched_params.dst_signals is not None:
+                        lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                             while (
                                 (dsm_pending_idx < num_experts) and
@@ -1805,6 +1806,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # TODO is this write late enough?
                     # Assume epilogue warps contains the first warp
                     write_out_signals=tidx == 0,
+                    dsm_pending_packed=TODO,
+                    dsm_counter=TODO,
                 )
 
             #
