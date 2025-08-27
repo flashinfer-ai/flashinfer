@@ -1660,7 +1660,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 assert tile_sched_params.masked_m.shape[0] <= 8, "need to be packable into a u64"
                 dsm_pending_packed = UInt64(0)
-                dsm_pending_index = Int32(0)
+                dsm_pending_idx = Int32(0)
                 dsm_counter = UInt8(0)
 
             while work_tile.is_valid_tile:
@@ -1756,7 +1756,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                         if tile_sched_params.dst_signals is not None:
                             dsm_counter += 1
-                            will_write_signals = dsm_pending_packed[dsm_pending_index] == dsm_counter
+                            will_write_signals = packed_u64_get(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
                             # The original c_pipeline.producer_acquire()
                             #   := PipelineTmaStore.producer_acquire()
@@ -1775,6 +1775,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
+
+                    if tile_sched_params.dst_signals is not None:
+                        if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
+                            while (
+                                (dsm_pending_idx < num_experts) and
+                                (packed_u64_get(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
+                            ):
+                                atomic_add_release_global(
+                                    tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                                    value=1,
+                                )
+                                dsm_pending_idx += 1
 
                 #
                 # Async arrive accumulator buffer empty
