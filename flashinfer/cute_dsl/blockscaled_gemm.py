@@ -77,9 +77,7 @@ def atomic_add_release_global(ptr: cutlass.Pointer, value: UInt32, *, loc=None, 
 
 @dsl_user_op
 def wait_signal(addr: cutlass.Pointer, expect_value: UInt32, *, loc=None, ip=None):
-    ready = TODO_read_address(addr)
-
-    while ready != expect_value:
+    while True:
         ready = UInt32(
             llvm.inline_asm(
                 T.u32(),
@@ -92,6 +90,9 @@ def wait_signal(addr: cutlass.Pointer, expect_value: UInt32, *, loc=None, ip=Non
                 asm_dialect=llvm.AsmDialect.AD_ATT,
             )
         )
+
+        if ready == expect_value:
+            return
 
         llvm.inline_asm(
             None,
