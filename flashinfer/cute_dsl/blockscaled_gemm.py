@@ -80,7 +80,7 @@ def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
 def atomic_add_release_global(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
-            T.u32(),
+            T.ui32(),
             [
                 addr.ir_value(loc=loc, ip=ip),
                 Uint32(value).ir_value(loc=loc, ip=ip),
@@ -99,7 +99,7 @@ def wait_signal(addr: Int64, expect_value: Uint32, *, loc=None, ip=None):
     while True:
         ready = Uint32(
             llvm.inline_asm(
-                T.u32(),
+                T.ui32(),
                 [addr.ir_value(loc=loc, ip=ip)],
                 # TODO how to add `:"memory"` clobber?
                 "ld.acquire.gpu.global.u32 $0, [$1];",
