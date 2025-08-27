@@ -45,6 +45,8 @@ from cutlass.cutlass_dsl import (
     Int32,
     Int64,
     UInt32,
+    UInt8,
+    UInt64,
     T,
     Integer,
     dsl_user_op,
@@ -1653,6 +1655,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
+
+            if tile_sched_params.dst_signals is not None:
+                assert self.num_c_stage < 256, "must be representable in 1 byte"
+                assert num_experts <= 8, "need to be packable into a u64"
+                dsm_pending_packed = UInt64(0)
+                dsm_counter = UInt8(0)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
