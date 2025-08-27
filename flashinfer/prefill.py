@@ -187,6 +187,7 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         enable_pdl: bool,
+        workspace_size: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -216,6 +217,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
+            workspace_size,
             sinks,
         )
         return out
@@ -525,6 +527,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -564,6 +567,7 @@ def get_batch_prefill_module(backend, *args):
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
                 enable_pdl,
+                workspace_size,
                 window_left,
                 out=o,
                 sinks=sinks,
@@ -1528,6 +1532,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
+        workspace_size: int = 128 * 1024 * 1024,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1627,7 +1632,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
-
+        workspace_size: int
+            The workspace size in bytes, default to 128 * 1024 * 1024.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1654,6 +1660,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
+        self._workspace_size = workspace_size
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
@@ -2137,6 +2144,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     None,  # scale_v
                     rope_scale,
                     rope_theta,
+                    self._workspace_size,
                     self._token_pos_in_items_len,
                     self._num_qo_heads,
                     self._num_kv_heads,
@@ -3257,6 +3265,7 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
+    workspace_size: int = 128 * 1024 * 1024,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -3305,6 +3314,8 @@ def trtllm_batch_context_with_kv_cache(
         vector size for nvfp4 output tensor scale factor.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
+    workspace_size : int
+        workspace size in bytes, default to 128 * 1024 * 1024
 
     Returns
     -------
@@ -3422,6 +3433,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
+        workspace_size,
         sinks,
     )
     return (

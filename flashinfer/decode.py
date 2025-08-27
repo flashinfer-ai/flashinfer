@@ -816,6 +816,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         page_size: int,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
+        workspace_size: int = 128 * 1024 * 1024,
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -853,6 +854,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        workspace_size : int
+            workspace size in bytes, default to 128 * 1024 * 1024
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -887,6 +890,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        self._workspace_size = workspace_size
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1276,6 +1281,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                     0,  # token_pos_in_items_len
+                    self._workspace_size,
                     paged_kv_cache,
                     self._num_qo_heads,
                     self._num_kv_heads,
@@ -1815,6 +1821,7 @@ class TrtllmGenDecodeModule:
         max_seq_len: int,
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
+        workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
@@ -1845,6 +1852,7 @@ class TrtllmGenDecodeModule:
             window_left,
             self._sm_count,
             enable_pdl,
+            workspace_size,
             sinks,
         )
         return out
@@ -1898,6 +1906,7 @@ def get_trtllm_gen_decode_module(*args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
@@ -1928,6 +1937,7 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             window_left,
             enable_pdl,
+            workspace_size,
             out=o,
             sinks=sinks,
         )
@@ -1992,6 +2002,7 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale: float,
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
+    workspace_size: int = 128 * 1024 * 1024,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -2030,6 +2041,9 @@ def trtllm_batch_decode_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+
+    workspace_size : int
+        workspace size in bytes, default to 128 * 1024 * 1024
 
     out :  Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
@@ -2160,6 +2174,7 @@ def trtllm_batch_decode_with_kv_cache(
         window_left,
         sm_count,
         enable_pdl,
+        workspace_size,
         sinks,
     )
 
@@ -2229,6 +2244,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
+    workspace_size: int = 128 * 1024 * 1024,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -2247,6 +2263,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
     sinks: additional value per head in the denominator of the softmax.
+    workspace_size: workspace size in bytes, default to 128 * 1024 * 1024
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
@@ -2324,6 +2341,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         -1,  # window_left
         sm_count,
         enable_pdl,
+        workspace_size,
         sinks,
     )
     return out

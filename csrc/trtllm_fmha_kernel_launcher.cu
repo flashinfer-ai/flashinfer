@@ -14,6 +14,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <flashinfer/allocator.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
 #include <flashinfer/trtllm/fmha/decoder_impl_common.h>
@@ -80,7 +81,7 @@ void trtllm_paged_attention_launcher(
     int64_t kv_stride_heads, int64_t kv_stride_batch, int64_t max_num_blocks_per_seq,
     double bmm1_scale, double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
     int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q, int64_t sm_count,
-    bool enable_pdl, cudaStream_t stream) {
+    bool enable_pdl, int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -131,6 +132,8 @@ void trtllm_paged_attention_launcher(
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
+
+  AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
@@ -153,9 +156,10 @@ void trtllm_paged_attention_launcher(
     size_t num_semaphores =
         round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
     // semaphores be at the first 8MB of workspace buffer: counter | scratch
-    runner_params.multiCtasKvScratchPtr = reinterpret_cast<void*>(
-        static_cast<char*>(workspace_buffer) + num_semaphores * sizeof(uint32_t));
-    runner_params.multiCtasKvCounterPtr = reinterpret_cast<int32_t*>(workspace_buffer);
+    runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
+        num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+    runner_params.multiCtasKvScratchPtr =
+        float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
   }
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
@@ -195,7 +199,8 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out
                                    at::Tensor seq_lens, int64_t max_kv_len, double bmm1_scale,
                                    double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
                                    int64_t o_sf_start_index, int64_t window_left, int64_t sm_count,
-                                   bool enable_pdl, std::optional<at::Tensor> attention_sinks) {
+                                   bool enable_pdl, int64_t workspace_size,
+                                   std::optional<at::Tensor> attention_sinks) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
   auto kv_data_type = torch_dtype_to_tllm_data_type(key_cache.scalar_type());
   TORCH_CHECK_EQ(key_cache.dim(), value_cache.dim());
@@ -253,7 +258,7 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale,
       bmm2_scale, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sm_count,
-      enable_pdl, stream);
+      enable_pdl, workspace_size, stream);
 }
 
 void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> out_scale_factor,
@@ -264,7 +269,7 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
                                     int64_t o_sf_vec_size, int64_t o_sf_start_index,
                                     int64_t batch_size, int64_t window_left,
                                     at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
-                                    int64_t sm_count, bool enable_pdl,
+                                    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
                                     std::optional<at::Tensor> attention_sinks) {
   auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
   auto kv_data_type = torch_dtype_to_tllm_data_type(key_cache.scalar_type());
@@ -313,7 +318,7 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
       max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q,
       head_dim_o, page_size, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale, bmm2_scale, o_sf_scale, o_sf_vec_size, o_sf_start_index,
-      window_left, sum_seq_q, sm_count, enable_pdl, stream);
+      window_left, sum_seq_q, sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_ragged_attention_launcher(

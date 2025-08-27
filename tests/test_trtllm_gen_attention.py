@@ -17,6 +17,7 @@ DTYPE_MAP = {
 GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None
+workspace_size = 128 * 1024 * 1024
 
 
 def flip_coin(*args, **kwargs):
@@ -301,7 +302,7 @@ def test_trtllm_batch_prefill(
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -324,6 +325,7 @@ def test_trtllm_batch_prefill(
         "q_data_type": ref_q.dtype,
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
+        "workspace_size": workspace_size,
     }
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
@@ -349,6 +351,7 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        workspace_size=workspace_size,
     )
 
     if o_dtype == "nvfp4":
@@ -468,7 +471,7 @@ def test_trtllm_batch_decode(
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=GPU_DEVICE
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
     workspace_buffer = global_workspace_buffer
 
@@ -488,6 +491,7 @@ def test_trtllm_batch_decode(
         "kv_data_type": ref_kv_cache.dtype,
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
+        "workspace_size": workspace_size,
     }
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
@@ -510,6 +514,7 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        workspace_size=workspace_size,
     )
 
     if o_dtype == "nvfp4":
@@ -604,7 +609,7 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
 
     qo_indptr = torch.cat(
         [
@@ -627,7 +632,7 @@ def test_trtllm_gen_prefill_deepseek(
     ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
         kv_layout="NHD",
         backend="cutlass",
     )
@@ -683,5 +688,5 @@ def test_trtllm_gen_prefill_deepseek(
 
 
 if __name__ == "__main__":
-    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
-    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "half", "half", "half", False)
+    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
+    test_trtllm_batch_decode("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
