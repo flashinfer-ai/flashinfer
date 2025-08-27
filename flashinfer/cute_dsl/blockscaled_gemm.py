@@ -2706,8 +2706,10 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_data_ptr,
                 c_data_ptr,
                 masked_m_data_ptr,
+                src_signals_data_ptr,
+                dst_signals_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(7)]
+            ) = [16 for _ in range(9)]
         else:
             (
                 a_tensor_gpu,
@@ -2716,6 +2718,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_tensor_gpu,
                 c_tensor_gpu,
                 masked_m_tensor_gpu,
+                src_signals_tensor_gpu,
+                dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
             ) = input_tensors
             (
@@ -2725,6 +2729,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_data_ptr,
                 c_data_ptr,
                 masked_m_data_ptr,
+                src_signals_data_ptr,
+                dst_signals_data_ptr,
                 alpha_data_ptr,
             ) = (
                 a_tensor_gpu.data_ptr(),
@@ -2733,6 +2739,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_tensor_gpu.data_ptr(),
                 c_tensor_gpu.data_ptr(),
                 masked_m_tensor_gpu.data_ptr(),
+                src_signals_tensor_gpu.data_ptr() if src_signals_tensor_gpu is not None else None,
+                dst_signals_tensor_gpu.data_ptr() if dst_signals_tensor_gpu is not None else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
             )
 
@@ -2772,6 +2780,18 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
+        src_signals_ptr = make_ptr(
+            cutlass.UInt32,
+            src_signals_data_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        dst_signals_ptr = make_ptr(
+            cutlass.UInt32,
+            dst_signals_data_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
         alpha_ptr = (
             make_ptr(
                 alpha_dtype,
@@ -2783,7 +2803,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             else None
         )
 
-        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, alpha_ptr]
+        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, src_signals_ptr, dst_signals_ptr, alpha_ptr]
 
     kernel = cute.compile(
         MaskedBatchedMatmulCuteDSL(
