@@ -1780,7 +1780,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         c_pipeline.producer_commit()
 
                         if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                            dsm_counter += 1
+                            dsm_counter = (dsm_counter + 1).to(Uint8)
                             will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
                             if will_write_signals:
