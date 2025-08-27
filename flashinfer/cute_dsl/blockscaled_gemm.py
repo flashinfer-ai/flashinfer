@@ -1782,6 +1782,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 (dsm_pending_idx < num_experts) and
                                 (packed_u64_get(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
                             ):
+                                # TODO unify w/ the other branch
                                 atomic_add_release_global(
                                     tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
                                     value=1,
@@ -1836,6 +1837,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Change `read` from True to False to also wait writes
                     read=False,
                 )
+
+                if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
+                    while dsm_pending_idx < num_experts:
+                        # TODO unify w/ the other branch
+                        atomic_add_release_global(
+                            tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                            value=1,
+                        )
+                        dsm_pending_idx += 1
 
             else:
                 c_pipeline.producer_tail()
