@@ -87,7 +87,7 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
                 addr.ir_value(loc=loc, ip=ip),
                 Int32(value).ir_value(loc=loc, ip=ip),
             ],
-            "atom.add.release.gpu.global.i32 $0, [$1], $2;",
+            "atom.add.release.gpu.global.s32 $0, [$1], $2;",
             "=r,l,r",
             has_side_effects=True,
             is_align_stack=False,
