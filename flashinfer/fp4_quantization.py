@@ -119,7 +119,7 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 def get_fp4_quantization_module(backend: str = "100"):
     if backend == "110":
         module = gen_fp4_quantization_sm110_module().build_and_load()
-    elif backend == "100":
+    elif backend == "100" or backend == "103":
         module = gen_fp4_quantization_sm100_module().build_and_load()
     elif backend == "103":
         module = gen_fp4_quantization_sm103_module().build_and_load()
