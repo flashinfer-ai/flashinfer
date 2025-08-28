@@ -82,6 +82,7 @@ def test_blockscaled_gemm_python_interface(
     iterations: int,
     enable_src_signals: int,
     enable_dst_signals: int,
+    masked_m_override_value=None,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda:0")
@@ -171,6 +172,8 @@ def test_blockscaled_gemm_python_interface(
         l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
     )
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
+    if masked_m_override_value is not None:
+        masked_m_tensor[...] = masked_m_override_value
 
     for _ in range(iterations):
         dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
@@ -271,9 +274,13 @@ if __name__ == "__main__":
     # )
 
     test_blockscaled_gemm_python_interface(
-        # TODO real value in masked_m is smaller than this m shape
-        lm=(6, 36864),
-        kn=(7168, 4096),
+        # # TODO real value in masked_m is smaller than this m shape
+        # lm=(6, 36864),
+        # kn=(7168, 4096),
+        lm=(6, 1024),
+        kn=(2048, 7168),
+        masked_m_override_value=1024, # NOTE HACK
+
         ab_dtype="float4_e2m1fn",
         sf_dtype="float8_e8m0fnu",
         sf_vec_size=16,
