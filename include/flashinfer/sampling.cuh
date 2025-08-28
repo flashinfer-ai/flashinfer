@@ -405,7 +405,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   vec_t<DType, VEC_SIZE> prob_vec;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     if constexpr (CACHE_INPUT) {
-      logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
     } else {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
