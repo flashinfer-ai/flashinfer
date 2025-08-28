@@ -126,7 +126,7 @@ FlashInfer also provides C++ API and TVM bindings, please refer to [documentatio
 
 ## GPU Support
 
-FlashInfer currently provides support for NVIDIA SM architectures 80 and higher, and beta support 100, 103, 110, 120, and 121.
+FlashInfer currently provides support for NVIDIA SM architectures 80 and higher and beta support for 103, 110, 120, and 121.
 
 ## Adoption
 
