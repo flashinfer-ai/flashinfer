@@ -25,12 +25,6 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if auto_tuning and backend == "cudnn":
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
 
-    device_capability = torch.cuda.get_device_capability()
-    if device_capability == (10, 3):
-        if backend == "trtllm":
-            # FIXME (bringup) need to get sm103a kernels or compile with sm100f
-            pytest.skip("Skipping test for trtllm fp4 with SM 10.3")
-
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     a_sf_layout = SfLayout.layout_128x4 if use_128x4_sf_layout else SfLayout.layout_8x4

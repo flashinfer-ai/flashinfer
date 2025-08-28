@@ -937,6 +937,9 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    #assert major in [10], "currently only support Blackwell"
+    nvcc_flags = current_device_nvcc_flags
+
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
@@ -961,7 +964,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_FP4",
             f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
-        + sm100a_nvcc_flags,
+        + nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache
