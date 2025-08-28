@@ -543,7 +543,7 @@ def get_batch_prefill_module(backend, *args):
         sinks: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
-            assert workspace_size != 0
+            assert workspace_size > 0, "workspace_size must be greater than 0"
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
