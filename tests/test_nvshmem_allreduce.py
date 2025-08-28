@@ -109,4 +109,4 @@ def test_nvshmem_allreduce(world_size):
         _run_correctness_worker,
         target_args=(),
     )
-    print(f"NVSHMEM allreduce tp
+    print(f"NVSHMEM allreduce tp = {world_size}: OK")

@@ -468,4 +468,4 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
 
 
 if __name__ == "__main__":
-    test_trtllm_moe_allreduce_fus
+    test_trtllm_moe_allreduce_fusion(2, torch.float16)

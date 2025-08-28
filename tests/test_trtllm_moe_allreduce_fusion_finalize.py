@@ -309,4 +309,4 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
             residual,
         ),
     )
-    print(f"moe finalize allreduce fusion tp
+    print(f"moe finalize allreduce fusion tp = {world_size}: OK")

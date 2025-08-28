@@ -370,4 +370,4 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
         _run_correctness_worker,
         target_args=(),
     )
-    print(f"allreduce fusion tp
+    print(f"allreduce fusion tp = {world_size}: OK")

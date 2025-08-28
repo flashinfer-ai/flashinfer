@@ -289,4 +289,4 @@ def test_trtllm_custom_allreduce(world_size, dtype):
         _run_correctness_worker,
         target_args=(),
     )
-    print(f"custom allreduce tp
+    print(f"custom allreduce tp = {world_size}: OK")
