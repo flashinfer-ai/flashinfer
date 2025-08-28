@@ -35,6 +35,7 @@ except ImportError as e:
         "Please install cuda-python that matches your CUDA version."
     ) from e
 
+
 def _cudaGetErrorEnum(error):
     if isinstance(error, driver.CUresult):
         err, name = driver.cuGetErrorName(error)
