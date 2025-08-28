@@ -12,6 +12,9 @@ jobs:
       matrix:
         cuda: [cu126, cu128, cu129, cu130]
         arch: [amd64, arm64]
+        exclude:
+          - cuda: cu130
+            arch: arm64
     steps:
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
@@ -57,7 +60,7 @@ jobs:
     needs: build
     strategy:
       matrix:
-        cuda: [cu126, cu128, cu129]
+        cuda: [cu126, cu128, cu129, cu130]
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,6 +73,11 @@ jobs:
 
       - name: Create and push multi-arch manifest for ${{ matrix.cuda }}
         run: |
-          docker buildx imagetools create -t flashinfer/flashinfer-ci-${{ matrix.cuda }}:latest \
-            flashinfer/flashinfer-ci-${{ matrix.cuda }}:amd64 \
-            flashinfer/flashinfer-ci-${{ matrix.cuda }}:arm64
+          if [ "${{ matrix.cuda }}" = "cu130" ]; then
+            docker buildx imagetools create -t flashinfer/flashinfer-ci-${{ matrix.cuda }}:latest \
+              flashinfer/flashinfer-ci-${{ matrix.cuda }}:amd64
+          else
+            docker buildx imagetools create -t flashinfer/flashinfer-ci-${{ matrix.cuda }}:latest \
+              flashinfer/flashinfer-ci-${{ matrix.cuda }}:amd64 \
+              flashinfer/flashinfer-ci-${{ matrix.cuda }}:arm64
+          fi
