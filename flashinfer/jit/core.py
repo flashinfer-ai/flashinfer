@@ -56,7 +56,7 @@ def check_cuda_arch():
 
     # Raise error only if all detected architectures are lower than sm75
     if all(arch < 75 for arch in archs):
-        raise RuntimeError("FlashInfer requires at least one GPU with sm75 or higher")
+        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
 
 
 def clear_cache_dir():
