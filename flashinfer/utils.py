@@ -513,6 +513,8 @@ def set_log_level(lvl_str: str) -> None:
 
 
 def device_support_pdl(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     major, _ = get_compute_capability(device)
     return major >= 9
 
