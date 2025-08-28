@@ -341,10 +341,11 @@ class MaskedScheduler:
                 # TODO check off by one
                 dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
             if cutlass.const_expr(self.params.src_signals is not None):
-                wait_signal(
-                    self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
-                    expect_value=self.params.src_signal_expect_value,
-                )
+                if batch_idx < self.params.masked_m.shape[0] - 1:
+                    wait_signal(
+                        self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
+                        expect_value=self.params.src_signal_expect_value,
+                    )
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
