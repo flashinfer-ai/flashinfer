@@ -108,7 +108,7 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
                 T.i32(),
                 [addr.ir_value(loc=loc, ip=ip)],
                 # TODO how to add `:"memory"` clobber?
-                "ld.acquire.gpu.global.i32 $0, [$1];",
+                "ld.acquire.gpu.global.s32 $0, [$1];",
                 "=r,l",
                 has_side_effects=True,
                 is_align_stack=False,
