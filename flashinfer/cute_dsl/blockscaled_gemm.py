@@ -1730,9 +1730,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                if tidx == 0:
-                    cute.printf("block_idx={} tile_idx={} subtile_cnt={} num_prev_subtiles={} num_c_stage={}",
-                                cute.arch.block_idx(), work_tile.tile_idx, subtile_cnt, num_prev_subtiles, self.num_c_stage)
                 for subtile_idx in cutlass.range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
@@ -2965,7 +2962,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         # fp4 or fp8 torch tensor to cute tensor
         current_stream = cutlass_torch.current_stream()
 
-        print("tensor_api START")
         nonlocal kernel
         kernel(
             *get_cute_pointers(
@@ -2983,7 +2979,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             ),
             current_stream,
         )
-        print("tensor_api END")
 
         return c_tensor_gpu
 
