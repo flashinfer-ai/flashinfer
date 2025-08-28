@@ -48,6 +48,7 @@ from cutlass.cutlass_dsl import (
     extract_mlir_values,
     new_from_mlir_values,
 )
+from flashinfer.utils import get_compute_capability
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
@@ -431,6 +432,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        sm_version: str,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -480,7 +482,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -2417,6 +2419,7 @@ class MaskedBatchedMatmulCuteDSL:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
+        sm_version: str,
     ):
         self._m = m
         self._n = n
@@ -2460,6 +2463,7 @@ class MaskedBatchedMatmulCuteDSL:
             ),
             sm_count,
         )
+        self._sm_version = sm_version
 
     @cute.jit
     def __call__(
@@ -2557,6 +2561,7 @@ class MaskedBatchedMatmulCuteDSL:
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
+            sm_version=self._sm_version,
         )(
             a_tensor,
             b_tensor,
@@ -2587,6 +2592,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
+    sm_version: str,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2695,6 +2701,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
+            sm_version=sm_version,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2808,6 +2815,10 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")
 
+    major, minor = get_compute_capability(a_torch.device)
+    if major == 11 and minor == 0:
+        raise ValueError("SM110 is not supported for cute-dsl backend.")
+
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
         n=n,
@@ -2824,6 +2835,7 @@ def grouped_gemm_nt_masked(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
+        sm_version=f"sm_{major}{minor}",
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
