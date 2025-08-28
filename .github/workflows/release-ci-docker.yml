@@ -2,13 +2,15 @@ name: Release CI Docker
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: ['main']
 
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cuda: [cu126, cu128, cu129]
+        cuda: [cu126, cu128, cu129, cu130]
         arch: [amd64, arm64]
     steps:
       - name: Free Disk Space
