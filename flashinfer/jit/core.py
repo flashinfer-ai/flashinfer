@@ -48,11 +48,15 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 
 def check_cuda_arch():
-    # cuda arch check for fp8 at the moment.
+    # Collect all detected CUDA architectures
+    archs = []
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
         arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
-        if arch < 75:
-            raise RuntimeError("FlashInfer requires sm75+")
+        archs.append(arch)
+
+    # Raise error only if all detected architectures are lower than sm75
+    if all(arch < 75 for arch in archs):
+        raise RuntimeError("FlashInfer requires at least one GPU with sm75 or higher")
 
 
 def clear_cache_dir():
