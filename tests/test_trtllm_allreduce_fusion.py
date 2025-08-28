@@ -358,7 +358,7 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
     torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")
@@ -370,4 +370,4 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
         _run_correctness_worker,
         target_args=(),
     )
-    print(f"allreduce fusion tp = {world_size}: OK")
+    print(f"allreduce fusion tp

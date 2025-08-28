@@ -279,7 +279,7 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")
@@ -309,4 +309,4 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
             residual,
         ),
     )
-    print(f"moe finalize allreduce fusion tp = {world_size}: OK")
+    print(f"moe finalize allreduce fusion tp
