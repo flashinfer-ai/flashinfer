@@ -19,7 +19,9 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <type_traits>
@@ -1037,7 +1039,7 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
   }
 };
 
-#if defined(FLASHINFER_ENABLE_FP4_E2M1)
+#if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
 /******************* vec_t<__nv_fp4_e2m1> *******************/
 
 // __nv_fp4_e2m1 x 1
@@ -1246,7 +1248,7 @@ struct vec_t<__nv_fp4_e2m1, vec_size> {
   }
 };
 
-#endif  // FLASHINFER_ENABLE_FP4_E2M1
+#endif  // FLASHINFER_ENABLE_FP4_E2M1 && CUDA_VERSION >= 12080
 
 /******************* vec_t<half> *******************/
 
