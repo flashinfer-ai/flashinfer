@@ -456,6 +456,18 @@ def is_sm110a_supported(device: torch.device) -> bool:
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+def is_sm120a_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    # SM120 (RTX Pro 6000) requires CUDA 12.8+
+    return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
+
+
+def is_sm121a_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    # SM121 (DGX Spark) requires CUDA 12.9+
+    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 

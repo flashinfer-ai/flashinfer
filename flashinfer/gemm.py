@@ -38,6 +38,8 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .jit.cubin_loader import get_cubin
+from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
+from .jit.core import sm121a_nvcc_flags
 
 CUDNN_AVAILABLE = False
 try:
@@ -59,6 +61,14 @@ from .jit import (
     gen_jit_spec,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm120a_nvcc_flags,
+    sm121a_nvcc_flags,
+    current_device_nvcc_flags,
+)
+from .jit import (
+    gen_jit_spec,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
     current_compilation_context,
 )
 from .jit.cubin_loader import setup_cubin_loader
@@ -73,7 +83,7 @@ from .utils import (
     get_compute_capability,
 )
 
-DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024  # 32MB should be sufficient for kernel workspace
 
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
@@ -412,7 +422,217 @@ def get_gemm_sm100_module():
     return module
 
 
-def gen_trtllm_gen_gemm_module() -> JitSpec:
+def gen_gemm_sm120_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm120"
+    gen_directory.mkdir(parents=True, exist_ok=True)
+    source_paths = []
+
+    # Generate kernel instantiations - SM120 supports fixed scale granularities
+    prefix = "gemm_groupwise"
+    dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+    dtype_out_list = [torch.float16, torch.bfloat16]
+    scale_major_k_list = ["true", "false"]
+    # SM120 Cooperative kernel requires tile M >= 128, so only MmaSM=1 is supported (gives 128x128x128 tile)
+    mma_sm_list = [1]  # MmaSM=2 would give 64x128x128 tile which violates Cooperative kernel requirements
+    # SM120 supports scale granularities that divide the tile size (128)
+    # IMPORTANT: ScaleGranularityK must equal TileK (128) per CUTLASS requirement
+    # Valid values for N: 128, 64, 32, 16
+    scale_granularity_configs = [
+        (1, 128, 128), (1, 64, 128), (1, 32, 128), (1, 16, 128),  # k must be 128
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    for dtype_in, dtype_out, scale_major_k, mma_sm, (scale_m, scale_n, scale_k) in product(
+        dtype_in_list, dtype_out_list, scale_major_k_list, mma_sm_list, scale_granularity_configs
+    ):
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_m{scale_m}_n{scale_n}_k{scale_k}_sm120.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+            scale_major_k=scale_major_k,
+            mma_sm=mma_sm,
+            scale_granularity_m=scale_m,
+            scale_granularity_n=scale_n,
+            scale_granularity_k=scale_k,
+        )
+        write_if_different(dest_path, source)
+
+    # Generate group gemm kernel instantiations
+    prefix = "group_gemm_fp8_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    # Use the same mma_sm_list and scale_granularity_configs as regular gemm
+    for dtype_in, dtype_out, scale_major_k, mma_sm, (scale_m, scale_n, scale_k) in product(
+        dtype_in_list, dtype_out_list, scale_major_k_list, mma_sm_list, scale_granularity_configs
+    ):
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_m{scale_m}_n{scale_n}_k{scale_k}_sm120.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+            scale_major_k=scale_major_k,
+            mma_sm=mma_sm,
+            scale_granularity_m=scale_m,
+            scale_granularity_n=scale_n,
+            scale_granularity_k=scale_k,
+        )
+        write_if_different(dest_path, source)
+
+    # Copy source files
+    for filename in [
+        "gemm_groupwise_sm120.cu",
+        "group_gemm_fp8_groupwise_sm120.cu",
+        "gemm_sm120_pybind.cu",
+        "group_gemm_sm120_pybind.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    print(f"Debugging SM120/SM121 NVCC flags: {sm121a_nvcc_flags}")
+
+    return gen_jit_spec(
+        "gemm_sm120",
+        source_paths,
+        extra_cuda_cflags=sm121a_nvcc_flags, # TODO (yongwww): fix
+    )
+
+
+@functools.cache
+def get_gemm_sm120_module():
+    module = gen_gemm_sm120_module().build_and_load()
+    return module
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_fp8():
+    """Get CUTLASS FP8 runner for SM120/SM121 using the groupwise scaling kernel."""
+    module = get_gemm_sm120_module()
+    
+    def cutlass_fp8_gemm_runner():
+        class CutlassFp8GemmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                # For now, return a single default tactic
+                return [-1]
+            
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                
+                # Handle both 2D (MM) and 3D (BMM) cases
+                # SM120 kernel now supports batch operations natively
+                if a.dim() == 2:
+                    # 2D case: simple matrix multiplication
+                    # Make B column-major for the kernel
+                    b_col_major = b.transpose(-2, -1)
+                else:
+                    # 3D case: batch matrix multiplication
+                    # B is already in the right format [batch, k, n] (column-major)
+                    b_col_major = b
+                
+                # Determine dimensions first to know scale granularity
+                if a.dim() == 2:
+                    n_dim = b_col_major.shape[0]
+                    m_dim = a.shape[0]
+                    k_dim = a.shape[1]
+                    batch_size = 1
+                else:
+                    n_dim = b_col_major.shape[2]  # BMM case: [batch, k, n]
+                    m_dim = a.shape[1]
+                    k_dim = a.shape[2]
+                    batch_size = a.shape[0]
+                
+                # SM120 blockwise scaling requires k >= 128 due to CUTLASS constraint
+                # ScaleGranularityK must equal TileK (128)
+                if k_dim < 128:
+                    # Cannot use SM120 blockwise scaling kernel for k < 128
+                    raise ValueError(f"SM120/SM121 CUTLASS blockwise scaling requires k >= 128, got k={k_dim}. "
+                                     "This is a hardware limitation that cannot be bypassed.")
+                
+                # Choose the appropriate scale granularity based on dimensions
+                scale_gran_m = 1    # Always 1 for SM120
+                scale_gran_k = 128  # Always 128 for SM120 per CUTLASS requirement
+                
+                # For n dimension - choose largest granularity that divides n evenly
+                supported_n_grans = [128, 64, 32, 16]
+                scale_gran_n = 16  # Default to most flexible
+                for gran in supported_n_grans:
+                    # Check if n is divisible by gran AND gran doesn't exceed n AND 128 is divisible by gran
+                    if n_dim >= gran and n_dim % gran == 0 and 128 % gran == 0:
+                        scale_gran_n = gran
+                        break
+                
+                # For scalar scales, create compatible shapes for SM120
+                # SM120 requires scale tensors with specific shapes based on granularity
+                # Scale shape should be [m/scale_gran_m, k/scale_gran_k] for A
+                # and [n/scale_gran_n, k/scale_gran_k] for B
+                if scale_a.numel() == 1:
+                    # Calculate the expected scale dimensions
+                    scale_m_count = (batch_size * m_dim + scale_gran_m - 1) // scale_gran_m
+                    scale_k_count = (k_dim + scale_gran_k - 1) // scale_gran_k  # k dimension
+                    scale_a_expanded = scale_a.view(1, 1).expand(scale_m_count, scale_k_count)
+                else:
+                    scale_a_expanded = scale_a
+                
+                if scale_b.numel() == 1:
+                    # Calculate the expected scale dimensions  
+                    scale_n_count = (batch_size * n_dim + scale_gran_n - 1) // scale_gran_n
+                    scale_k_count = (k_dim + scale_gran_k - 1) // scale_gran_k  # k dimension
+                    scale_b_expanded = scale_b.view(1, 1).expand(scale_n_count, scale_k_count)
+                else:
+                    scale_b_expanded = scale_b
+                
+                # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
+                module.gemm_fp8_nt_groupwise.default(
+                    workspace_buffer,
+                    a,
+                    b_col_major,
+                    scale_a_expanded,
+                    scale_b_expanded,
+                    out,
+                    scale_gran_m,   # scale_granularity_m
+                    scale_gran_n,   # scale_granularity_n 
+                    scale_gran_k,   # scale_granularity_k (adjusted for small k)
+                    "MN",           # scale_major_mode
+                    1,              # mma_sm
+                )
+                return out
+        
+        return CutlassFp8GemmRunner()
+    
+    # Register the module
+    return SimpleNamespace(
+        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+    )
+
+
+def trtllm_gemm_gen_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
@@ -505,8 +725,17 @@ def fp8_gemm_sm100(
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
     is_sm_supported = _match_sm_version(a.device, ["100", "103", "110"])
-    if "cutlass" in runner_names and is_sm_supported and not is_e5m2:
-        runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+    is_sm120_supported = _match_sm_version(a.device, ["120", "121"])
+
+    if "cutlass" in runner_names and not is_e5m2:
+        if is_sm_supported:
+            runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+        elif is_sm120_supported:
+            # Get k dimension (handling both 2D and 3D tensors)
+            k_dim = a.shape[-1] if a.dim() == 2 else a.shape[2]
+            if k_dim >= 128:
+                # No CUTLASS support for SM120/SM121 with k < 128 due to hardware limitations
+                runners.append(get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if CUDNN_AVAILABLE and "cudnn" in runner_names:
@@ -1975,9 +2204,9 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
-        if not _match_sm_version(a.device, ["100", "103", "110"]):
+        if not _match_sm_version(a.device, ["100", "103", "110", "120", "121"]):
             raise ValueError(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110 in cutlass backend."
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121 in cutlass backend."
             )
     elif backend == "trtllm":
         if not _match_sm_version(a.device, ["100", "103"]):
@@ -1987,17 +2216,32 @@ def gemm_fp8_nt_groupwise(
 
     if backend == "cutlass":
         assert scale_major_mode is not None
-        get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-            workspace_buffer,
-            a,
-            b,
-            a_scale,
-            b_scale,
-            out,
-            *scale_granularity_mnk,
-            scale_major_mode,
-            mma_sm,
-        )
+        if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+            get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
+                workspace_buffer,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                *scale_granularity_mnk,
+                scale_major_mode,
+                mma_sm,
+            )
+        elif is_sm100a_supported(a.device):
+            get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+                workspace_buffer,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                *scale_granularity_mnk,
+                scale_major_mode,
+                mma_sm,
+            )
+        else:
+            raise ValueError(f"Unsupported device for FP8 GEMM: {a.device}")
     elif backend == "trtllm":
         assert scale_granularity_mnk == (1, 128, 128)
         assert a.shape[1] >= 256
@@ -2251,6 +2495,8 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
+    if not is_sm100a_supported(a.device) and not is_sm120a_supported(a.device) and not is_sm121a_supported(a.device):
+        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100, SM120, and SM121.")
     if not (_match_sm_version(a.device, ["100", "103", "110"])):
         raise ValueError(
             "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110."
@@ -2297,21 +2543,40 @@ def group_gemm_fp8_nt_groupwise(
         assert out.shape == out_shape
         assert out.dtype == out_dtype
 
-    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-        int_workspace_buffer,
-        float_workspace_buffer,
-        a,
-        b,
-        a_scale,
-        b_scale,
-        out,
-        m_indptr,
-        n,
-        k,
-        *scale_granularity_mnk,
-        scale_major_mode,
-        mma_sm,
-    )
+    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            *scale_granularity_mnk,
+            scale_major_mode,
+            mma_sm,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            *scale_granularity_mnk,
+            scale_major_mode,
+            mma_sm,
+        )
+    else:
+        raise ValueError(f"group_gemm_fp8_nt_groupwise requires SM100, SM120, or SM121, but got {a.device}")
     return out
 
 

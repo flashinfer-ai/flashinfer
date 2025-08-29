@@ -101,7 +101,7 @@ void compileTimeDebug(T&&) {
     auto status = cmd;                                                                \
     if (status != cutlass::Status::kSuccess) {                                        \
       std::ostringstream err_msg;                                                     \
-      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
+      err_msg << "cutlass " << #cmd << " failed: " << ::cutlass::cutlassGetStatusString(status); \
       FLASHINFER_ERROR(err_msg.str());                                                \
     }                                                                                 \
   } while (0)
