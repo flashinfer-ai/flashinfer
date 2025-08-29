@@ -6,7 +6,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, current_device_nvcc_flags
+from .jit import gen_jit_spec, current_compilation_context
 from .utils import (
     device_support_pdl,
     register_custom_op,
@@ -26,7 +26,7 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=current_device_nvcc_flags
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(supported_major_versions=None)
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",

@@ -80,7 +80,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer
-               export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
                python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
                python -m pip install --no-build-isolation --verbose .
 
@@ -109,7 +109,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer
-               export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
                python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
                python -m build --no-isolation --wheel
                ls -la dist/
