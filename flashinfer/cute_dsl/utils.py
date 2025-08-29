@@ -186,8 +186,8 @@ def make_ptr(
     :type value: Union[int, ctypes._Pointer]
     :param mem_space: Memory address space, defaults to AddressSpace.generic
     :type mem_space: AddressSpace, optional
-    :param align_bytes: Alignment in bytes, defaults to None
-    :type align_bytes: int, optional
+    :param assumed_align: Alignment in bytes, defaults to None
+    :type assumed_align: int, optional
     :return: A pointer object
     :rtype: Pointer
 
@@ -207,10 +207,6 @@ def make_ptr(
 
         # Create pointer from address
         y = make_ptr(cutlass.Float32, ptr_address)
-
-        # Check properties
-        print(y.element_type)
-        print(type(y))  # <class 'cutlass.cute.Pointer'>
     """
     # check if value is int or ctypes.POINTER
     if isinstance(value, int):
