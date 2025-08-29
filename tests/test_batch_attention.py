@@ -142,7 +142,7 @@ def _run_attention(
 
     # --------- old scheduler --------- #
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev),
+        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev),
         kv_layout=layout,
         backend="fa2",
     )
