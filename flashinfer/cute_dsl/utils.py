@@ -112,16 +112,15 @@ class _Pointer(Pointer):
             self._assumed_align = dtype.width // 8
         else:
             self._assumed_align = assumed_align
-        
+
         self._desc = None
         self._c_pointer = None
-        assert (
-            int(self._pointer) % self._assumed_align == 0
-        ), f"pointer must be {self._assumed_align} bytes aligned"
+        assert int(self._pointer) % self._assumed_align == 0, (
+            f"pointer must be {self._assumed_align} bytes aligned"
+        )
 
     def size_in_bytes(self) -> int:
-        self._desc = ctypes.c_void_p(int(self._pointer))
-        return ctypes.sizeof(self._desc)
+        return ctypes.sizeof(ctypes.c_void_p(int(self._pointer)))
 
     def __get_mlir_types__(self):
         return [self.mlir_type]
@@ -155,11 +154,12 @@ class _Pointer(Pointer):
         raise NotImplementedError("align is not supported in runtime")
 
     def verify(self, expected_py_type):
-        if expected_py_type is Pointer:
-            return True
-        elif (
-            isinstance(expected_py_type, ir.Value)
-            and expected_py_type.ty is Pointer
+        # if expected_py_type is Pointer:
+        #     return True
+        # elif isinstance(expected_py_type, ir.Value) and expected_py_type.ty is Pointer:
+        #     return True
+        if expected_py_type is Pointer or (
+            isinstance(expected_py_type, ir.Value) and expected_py_type.ty is Pointer
         ):
             return True
 
@@ -224,9 +224,4 @@ def make_ptr(
             f"Expect int or ctypes.POINTER for value but got {type(value)=}"
         )
 
-    return _Pointer(
-        address_value,
-        dtype,
-        mem_space,
-        assumed_align=assumed_align
-    )
+    return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
