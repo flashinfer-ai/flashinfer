@@ -43,6 +43,7 @@ import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:latest"
 docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:latest"
 docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:latest"
+docker_run_cu130 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu130:latest"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -137,6 +138,8 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
     docker_run = docker_run_cu128
   } else if (cuda_version == "cu129") {
     docker_run = docker_run_cu129
+  } else if (cuda_version == "cu130") {
+    docker_run = docker_run_cu130
   } else {
     error("Unknown CUDA version: ${cuda_version}")
   }
@@ -243,7 +246,7 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    // CUDA 12.6 Tests
+    // CUDA 12.6 AOT Tests
     'AOT-Build-Import-x86-64-cu126': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
@@ -252,7 +255,7 @@ stage('Unittest') {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
     },
-    // CUDA 12.8 Tests
+    // CUDA 12.8 AOT Tests
     'AOT-Build-Import-x86-64-cu128': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
@@ -261,7 +264,7 @@ stage('Unittest') {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
     },
-    // CUDA 12.9 Tests
+    // CUDA 12.9 AOT Tests
     'AOT-Build-Import-x86-64-cu129': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
@@ -269,6 +272,15 @@ stage('Unittest') {
     'AOT-Build-Import-aarch64-cu129': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
         { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+    },
+    // CUDA 13.0 AOT Tests
+    'AOT-Build-Import-x86-64-cu130': {
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu130',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
+    },
+    'AOT-Build-Import-aarch64-cu130': {
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu130',
+        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
     },
     // JIT unittest only for cu129
     'JIT-Unittest-1-cu129': {
