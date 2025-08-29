@@ -40,7 +40,8 @@ import torch
 import functools
 from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass.cute.runtime import from_dlpack
+
 from cutlass.cutlass_dsl import (
     Int32,
     Integer,
@@ -49,7 +50,7 @@ from cutlass.cutlass_dsl import (
     new_from_mlir_values,
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
+from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_ptr
 from typing import Callable, List
 
 
