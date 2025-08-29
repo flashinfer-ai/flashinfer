@@ -457,7 +457,9 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100_sm103 = _match_sm_version(a.device, "100") or _match_sm_version(a.device, "103")
+    is_sm100_sm103 = _match_sm_version(a.device, "100") or _match_sm_version(
+        a.device, "103"
+    )
     if "cutlass" in runner_names and is_sm100_sm103 and not is_e5m2:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
@@ -1903,8 +1905,13 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not (backend == "cutlass" and (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103"))):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100 or SM103 in cutlass backend.")
+    if not (
+        backend == "cutlass"
+        and (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103"))
+    ):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100 or SM103 in cutlass backend."
+        )
 
     if backend == "cutlass":
         assert scale_major_mode is not None

@@ -35,7 +35,6 @@ from ..jit import (
     gen_jit_spec,
     setup_cubin_loader,
     sm90a_nvcc_flags,
-    sm100a_nvcc_flags,
     current_device_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
@@ -937,7 +936,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    #assert major in [10], "currently only support Blackwell"
+    # assert major in [10], "currently only support Blackwell"
     nvcc_flags = current_device_nvcc_flags
 
     return gen_jit_spec(
