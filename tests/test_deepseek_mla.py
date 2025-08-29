@@ -166,6 +166,8 @@ def test_single_prefill_with_kv_cache(
     clear_cuda_cache(device)
     if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
+    if is_sm110a_supported(device) and num_heads * kv_len > 700000:
+        pytest.skip("skip large tests on Thor due to memory limit")
     torch.manual_seed(42)
     head_dim_qk = 192
     head_dim_vo = 128
