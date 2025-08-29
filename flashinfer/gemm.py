@@ -210,7 +210,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
-    nvcc_flags = current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10, 11, 12])
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10, 11, 12])
     return gen_jit_spec(
         "fp4_gemm_cutlass",
         source_paths,
@@ -259,7 +259,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
-    nvcc_flags = current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10, 11, 12])
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10, 11, 12])
 
     return gen_jit_spec(
         "fp8_gemm_cutlass",
@@ -344,7 +344,7 @@ def gen_gemm_sm100_module() -> JitSpec:
             source = f.read()
         write_if_different(dest_path, source)
         
-    nvcc_flags = current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10, 11, 12])
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10, 11, 12])
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,

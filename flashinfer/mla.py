@@ -59,7 +59,7 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
 
 
 def gen_mla_module() -> JitSpec:
-    nvcc_flags = current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10, 11])
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10, 11])
     return gen_jit_spec(
         "mla",
         [

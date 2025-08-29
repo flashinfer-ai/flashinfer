@@ -272,7 +272,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
 
-    nvcc_flags += current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10, 11, 12])
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10, 11, 12])
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
@@ -933,7 +933,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     assert metainfo, f"{header_name}.h not found"
 
     # currently only support Blackwell
-    nvcc_flags = current_compilation_context.get_nvcc_flags_str(supported_major_versions=[10])
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10])
 
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",

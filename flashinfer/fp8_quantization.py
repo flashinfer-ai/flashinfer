@@ -26,7 +26,7 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_str(supported_major_versions=None)
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(supported_major_versions=None)
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",

@@ -38,7 +38,10 @@ class CompilationContext:
         else:
             try:
                 for device in range(torch.cuda.device_count()):
-                    self.TARGET_CUDA_ARCHS.add(torch.cuda.get_device_capability(device))
+                    major, minor = torch.cuda.get_device_capability(device)
+                    if major >= 9:
+                        minor = str(minor) + "a"
+                    self.TARGET_CUDA_ARCHS.add((int(major), minor))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
     
@@ -48,8 +51,3 @@ class CompilationContext:
         else:
             supported_cuda_archs = self.TARGET_CUDA_ARCHS
         return [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}" for major, minor in supported_cuda_archs] + self.COMMON_NVCC_FLAGS
-
-
-    def get_nvcc_flags_str(self, supported_major_versions: list[int] = None) -> str:
-        nvcc_flags_list = self.get_nvcc_flags_list(supported_major_versions)
-        return " ".join(nvcc_flags_list)
