@@ -1897,12 +1897,16 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not (
-        backend == "cutlass" and _match_sm_version(a.device, ["100", "103", "110"])
-    ):
-        raise ValueError(
-            "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110 in cutlass backend."
-        )
+    if backend == "cutlass":
+        if not _match_sm_version(a.device, ["100", "103", "110"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110 in cutlass backend."
+            )
+    elif backend == "trtllm":
+        if not _match_sm_version(a.device, ["100", "103"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+            )
 
     if backend == "cutlass":
         assert scale_major_mode is not None

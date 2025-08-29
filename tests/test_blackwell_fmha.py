@@ -113,7 +113,7 @@ def test_blackwell_cutlass_fmha(
     if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
         torch.device("cuda")
     ):
-        pytest.skip("SM100A is not supported on this device")
+        pytest.skip("only SM100A and SM110A are supported on this device")
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
@@ -184,8 +184,10 @@ def test_blackwell_cutlass_varlen(
     causal,
     dtype,
 ):
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100A is not supported on this device")
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("only SM100A and SM110A are supported on this device")
     torch.manual_seed(42)
     qkv = torch.randn(
         indptr[-1],
@@ -264,8 +266,10 @@ def test_blackwell_cutlass_qo_kv_varlen(
     dtype,
 ):
     causal = False
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100A is not supported on this device")
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("only SM100A and SM110A are supported on this device")
     torch.manual_seed(42)
     q = torch.randn(
         qo_indptr_list[-1],
