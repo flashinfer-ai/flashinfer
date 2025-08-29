@@ -4,7 +4,7 @@ set -eo pipefail
 set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=""}
-export TORCH_CUDA_ARCH_LIST=$(python3 -c '
+export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
 import torch
 cuda_ver = torch.version.cuda
 arches = ["7.5", "8.0", "8.9", "9.0+PTX"]

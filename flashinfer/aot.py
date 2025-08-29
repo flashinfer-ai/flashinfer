@@ -552,8 +552,8 @@ def main():
         add_misc = bool(args.add_misc)
 
     # Cuda Arch
-    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
     gencode_flags = _get_cuda_arch_flags()
 
     def has_sm(compute: str, version: str) -> bool:
@@ -592,7 +592,7 @@ def main():
     print("  f8_dtype:", f8_dtype_)
     print("  use_sliding_window:", use_sliding_window_)
     print("  use_logits_soft_cap:", use_logits_soft_cap_)
-    print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
+    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
     print("  add_comm:", add_comm)

@@ -68,7 +68,7 @@ To pre-compile essential kernels ahead-of-time (AOT), run the following command:
 
 ```bash
 # Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
 # Build AOT kernels. Will produce AOT kernels in aot-ops/
 python -m flashinfer.aot
 # Build AOT wheel

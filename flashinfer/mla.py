@@ -24,7 +24,7 @@ from .jit import env as jit_env
 from .jit import (
     gen_batch_mla_module,
     gen_jit_spec,
-    current_device_nvcc_flags,
+    current_compilation_context,
 )
 from .utils import MaskMode, check_shape_dtype_device, determine_mla_backend
 
@@ -59,17 +59,14 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
 
 
 def gen_mla_module() -> JitSpec:
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    # protecting current_device_nvcc_flags
-    assert major in [10, 11], "currently only support compute capability 10 and 11"
+    nvcc_flags = current_compilation_context.get_nvcc_flags(supported_major_versions=[10, 11])
     return gen_jit_spec(
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
         ],
-        extra_cuda_cflags=current_device_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 

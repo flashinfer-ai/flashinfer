@@ -14,6 +14,7 @@ from filelock import FileLock
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
+from ..compilation_context import CompilationContext
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -70,19 +71,8 @@ sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
-try:
-    major, minor = torch.cuda.get_device_capability()
-    current_device_nvcc_flags = [
-        "-gencode=arch=compute_{0}{1}a,code=sm_{0}{1}a".format(major, minor)
-    ]
-    # TODO: clean up if not needed.
-    # if major == 10 and minor == 3:
-    #    # FIXME (bringup) for functional testing, TBD.
-    #    current_device_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"]
-    current_device_nvcc_flags += common_nvcc_flags
-except Exception as e:
-    logger.warning(f"Failed to get current device nvcc flags: {e}")
-    current_device_nvcc_flags = common_nvcc_flags
+
+current_compilation_context = CompilationContext()
 
 
 @dataclasses.dataclass

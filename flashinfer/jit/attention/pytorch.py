@@ -27,7 +27,7 @@ from ..core import (
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
-    current_device_nvcc_flags,
+    current_compilation_context,
 )
 from ...jit.cubin_loader import get_cubin
 from ..utils import (
@@ -1559,15 +1559,12 @@ def gen_fmha_cutlass_sm100a_module(
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
 
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    # protecting current_device_nvcc_flags
-    assert major in [10, 11, 12], "currently only support Blackwell and later"
-
+    
+    nvcc_flags = current_compilation_context.get_nvcc_flags(supported_major_versions=[10, 11, 12])
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=current_device_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
