@@ -80,17 +80,14 @@ def test_blockscaled_gemm_python_interface(
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     major, minor = torch.cuda.get_device_capability(device)
-    
+
     if not (major == 10 and minor == 0):
-        pytest.skip(
-            f"Cute-dsl backend is only supported on SM100."
-        )
+        pytest.skip("Cute-dsl backend is only supported on SM100.")
 
     l, m = lm
     k, n = kn
 
     print(f"device: {device}")
-
 
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
         get_cutlass_dtype(ab_dtype),
