@@ -7,7 +7,6 @@ from typing import List, Tuple, Iterator
 
 import torch
 import torch.version
-from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
@@ -40,6 +39,7 @@ from .rope import gen_rope_module
 from .sampling import gen_sampling_module
 from .tllm_utils import get_trtllm_utils_spec
 from .utils import version_at_least
+from .compilation_context import CompilationContext
 
 
 def gen_fa2(
@@ -554,10 +554,12 @@ def main():
     # Cuda Arch
     if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
-    gencode_flags = _get_cuda_arch_flags()
+
+    compilation_context = CompilationContext()
+    gencode_flags_list = compilation_context.get_nvcc_flags_list(supported_major_versions=None)
 
     def has_sm(compute: str, version: str) -> bool:
-        if not any(compute in flag for flag in gencode_flags):
+        if not any(compute in flag for flag in gencode_flags_list):
             return False
         if torch.version.cuda is None:
             return True

@@ -41,11 +41,15 @@ class CompilationContext:
                     self.TARGET_CUDA_ARCHS.add(torch.cuda.get_device_capability(device))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
-
-    def get_nvcc_flags(self, supported_major_versions: list[int]) -> str:
+    
+    def get_nvcc_flags_list(self, supported_major_versions: list[int] = None) -> list[str]:
         if supported_major_versions:
             supported_cuda_archs = [major_minor_tuple for major_minor_tuple in  self.TARGET_CUDA_ARCHS if major_minor_tuple[0] in supported_major_versions]
         else:
             supported_cuda_archs = self.TARGET_CUDA_ARCHS
-        arch_flags = [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}" for major, minor in supported_cuda_archs] + self.COMMON_NVCC_FLAGS
-        return " ".join(arch_flags)
+        return [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}" for major, minor in supported_cuda_archs] + self.COMMON_NVCC_FLAGS
+
+
+    def get_nvcc_flags_str(self, supported_major_versions: list[int] = None) -> str:
+        nvcc_flags_list = self.get_nvcc_flags_list(supported_major_versions)
+        return " ".join(nvcc_flags_list)
