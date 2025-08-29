@@ -76,10 +76,10 @@ from .utils import (
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
-def _match_sm_version(device: torch.device, sm_version: str):
+def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
-    return device_arch == sm_version
+    return device_arch in sm_version
 
 
 def gen_gemm_module() -> JitSpec:
@@ -457,7 +457,7 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100_sm103 = _match_sm_version(a.device, "100") or _match_sm_version(a.device, "103")
+    is_sm100_sm103 = _match_sm_version(a.device, ["100", "103"])
     if "cutlass" in runner_names and is_sm100_sm103 and not is_e5m2:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
@@ -1620,7 +1620,7 @@ def mm_fp4(
         raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if backend == "trtllm" and _match_sm_version(a.device, "110"):
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
 
     # allocate the output tensor if not provided
@@ -1868,7 +1868,7 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
-    if backend == "trtllm" and _match_sm_version(a.device, "110"):
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
         raise ValueError("TRTLLM FP8 GEMM is not supported on SM110.")
 
     workspace_buffer = _get_cache_buf(
@@ -1903,8 +1903,12 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not (backend == "cutlass" and (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103"))):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100 or SM103 in cutlass backend.")
+    if not (
+        backend == "cutlass" and _match_sm_version(a.device, ["100", "103", "110"])
+    ):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110 in cutlass backend."
+        )
 
     if backend == "cutlass":
         assert scale_major_mode is not None
@@ -2172,8 +2176,10 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if not (_match_sm_version(a.device, "100") or _match_sm_version(a.device, "103")):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100 or SM103.")
+    if not (_match_sm_version(a.device, ["100", "103", "110"])):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110."
+        )
 
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
