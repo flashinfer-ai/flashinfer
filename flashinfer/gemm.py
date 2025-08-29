@@ -457,8 +457,8 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100_sm103 = _match_sm_version(a.device, ["100", "103"])
-    if "cutlass" in runner_names and is_sm100_sm103 and not is_e5m2:
+    is_sm_supported = _match_sm_version(a.device, ["100", "103", "110"])
+    if "cutlass" in runner_names and is_sm_supported and not is_e5m2:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
