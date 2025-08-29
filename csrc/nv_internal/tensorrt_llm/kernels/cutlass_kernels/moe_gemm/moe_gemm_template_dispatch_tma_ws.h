@@ -346,7 +346,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     } else {
       TLLM_THROW("Unsupported SM110 configuration requested");
     }
-  } else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 120) {
+  } else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 110) {
     if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                       T, WeightType, EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm100) {
