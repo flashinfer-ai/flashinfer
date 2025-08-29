@@ -72,6 +72,20 @@ common_nvcc_flags = [
 ]
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
+sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
+sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags  # SM121 (DGX Spark)
+try:
+    major, minor = torch.cuda.get_device_capability()
+    current_device_nvcc_flags = [
+        "-gencode=arch=compute_{0}{1}a,code=sm_{0}{1}a".format(major, minor)
+    ]
+    if major == 10 and minor == 3:
+        # FIXME (bringup) for functional testing, TBD
+        current_device_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"]
+    current_device_nvcc_flags += common_nvcc_flags
+except Exception as e:
+    logger.warning(f"Failed to get current device nvcc flags: {e}")
+    current_device_nvcc_flags = common_nvcc_flags
 
 
 @dataclasses.dataclass
