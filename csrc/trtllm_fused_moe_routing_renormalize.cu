@@ -32,7 +32,8 @@ __forceinline__ __device__ void routingTopKExperts(
     cg::thread_block_tile<WarpSize> const& warp, DataType (&score)[VecSize],
     int32_t (&idx)[VecSize], DataType (&warpTopKScore)[MaxNumTopExperts],
     int32_t (&warpTopKExpertIdx)[MaxNumTopExperts], int32_t const laneIdx, int32_t const numExperts,
-    int32_t topK, InputType const* ptrScores, bool const normTopkProb) {
+    int32_t topK, InputType const* ptrScores, bool const normTopkProb,
+    bool const applySoftmaxAfterTopK) {
   DataType minScore = DataType{-INFINITY};
 
   for (int i = 0; i < VecSize; i++) {
@@ -59,11 +60,14 @@ __forceinline__ __device__ void routingTopKExperts(
       warpTopKScore[laneIdx] = warpTopKScore[laneIdx] / sum;
     }
   } else {
-    auto softmaxScore =
-        calcSoftmax(warp, laneIdx < topK ? warpTopKScore[laneIdx] : minScore, laneIdx, topK);
-    if (laneIdx < topK) {
-      warpTopKScore[laneIdx] = softmaxScore;
+    if (applySoftmaxAfterTopK) {
+      auto softmaxScore =
+          calcSoftmax(warp, laneIdx < topK ? warpTopKScore[laneIdx] : minScore, laneIdx, topK);
+      if (laneIdx < topK) {
+        warpTopKScore[laneIdx] = softmaxScore;
+      }
     }
+    // If applySoftmaxAfterTopK is false, we keep the raw TopK values without softmax
   }
 }
 
@@ -113,7 +117,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     if (validToken) {
       routingTopKExperts<BaseType, InputT, VecSize, KernelParams::DoSoftmaxBeforeTopK>(
           warp, score, idx, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts,
-          params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb);
+          params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb,
+          params.mApplySoftmaxAfterTopK);
 
       if (laneIdx < params.mTopK) {
         smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx] =
@@ -205,7 +210,8 @@ __global__ void __launch_bounds__(NumThreadsHist)
 
     routingTopKExperts<BaseType, InputT, VecSize, KernelParams::DoSoftmaxBeforeTopK>(
         warp, allScores, allExpertIdx, warpTopKScore, warpTopKExpertIdx, laneIdx,
-        params.mNumExperts, params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb);
+        params.mNumExperts, params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb,
+        params.mApplySoftmaxAfterTopK);
 
     if (laneIdx < params.mTopK) {
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(warpTopKScore[laneIdx]),
@@ -223,16 +229,15 @@ void run(Data const& data, void* stream) {
   TORCH_CHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
                   data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
               "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-              MaxNumTopExperts, data.mTopK);
-  TORCH_CHECK(data.mNumExperts <= MaxNumExperts,
-              "Routing kernel expects #experts %d to be at most max #experts %d", data.mNumExperts,
-              MaxNumExperts);
+  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
+              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
+  TORCH_CHECK(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts ",
+              data.mNumExperts, " to be at most max #experts ", MaxNumExperts);
   static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
   static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
-  TORCH_CHECK(data.mNumExperts % 4 == 0,
-              "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d",
+  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
+              " to be a multiple of 4.");
+  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
               data.mPaddingLog2);
 
   bool const useSingleCluster =
@@ -273,7 +278,7 @@ void run(Data const& data, void* stream) {
     } else {
       // Reset the global histograms.
       CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
-                                       static_cast<size_t>(2 * NumThreads) * sizeof(int32_t),
+                                       static_cast<size_t>(2 * data.mNumExperts) * sizeof(int32_t),
                                        (cudaStream_t)stream));
     }
     LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramKernel, numBlocksHistogram,

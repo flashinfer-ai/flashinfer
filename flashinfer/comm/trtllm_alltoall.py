@@ -26,7 +26,7 @@ from ..jit import env as jit_env
 from ..jit import gen_jit_spec
 from ..utils import register_custom_op
 from .mapping import Mapping
-from .mnnvl import MnnvlMemory
+from .mnnvl import MnnvlMemory, MnnvlConfig
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -34,6 +34,7 @@ def gen_comm_alltoall_module() -> JitSpec:
         "comm",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
         ],
     )
 
@@ -184,12 +185,61 @@ def get_comm_alltoall_module():
     ) -> int:
         return module.get_moe_commworkspace_size_per_rank(ep_size)
 
+    @register_custom_op(
+        "flashinfer::get_moe_prepare_workspace_size_per_rank",
+        mutates_args=[],
+    )
+    def get_moe_prepare_workspace_size_per_rank(
+        ep_size: int,
+    ) -> int:
+        return module.get_moe_prepare_workspace_size_per_rank(ep_size)
+
+    @register_custom_op(
+        "flashinfer::moe_prepare",
+        mutates_args=[],
+    )
+    def moe_prepare(
+        experts_ids: torch.Tensor,
+        scales: Optional[torch.Tensor],
+        experts_statics: Optional[torch.Tensor],
+        workspace: torch.Tensor,
+        max_token_count_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        expert_count: int,
+        slot_count: int,
+        top_k: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        return module.moe_prepare(
+            experts_ids,
+            scales,
+            experts_statics,
+            workspace,
+            max_token_count_per_rank,
+            ep_rank,
+            ep_size,
+            expert_count,
+            slot_count,
+            top_k,
+        )
+
     return SimpleNamespace(
         moe_comm_prepare_indices=moe_comm_prepare_indices,
         moe_local_gather=moe_local_gather,
         moe_comm=moe_comm,
         set_moe_max_usable_sm_count=set_moe_max_usable_sm_count,
         get_moe_commworkspace_size_per_rank=get_moe_commworkspace_size_per_rank,
+        get_moe_prepare_workspace_size_per_rank=get_moe_prepare_workspace_size_per_rank,
+        moe_prepare=moe_prepare,
     )
 
 
@@ -279,6 +329,47 @@ def get_moe_commworkspace_size_per_rank(
     return get_comm_alltoall_module().get_moe_commworkspace_size_per_rank(ep_size)
 
 
+def get_moe_prepare_workspace_size_per_rank(
+    ep_size: int,
+) -> int:
+    return get_comm_alltoall_module().get_moe_prepare_workspace_size_per_rank(ep_size)
+
+
+def moe_prepare(
+    experts_ids: torch.Tensor,
+    scales: Optional[torch.Tensor],
+    experts_statics: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    max_token_count_per_rank: int,
+    ep_rank: int,
+    ep_size: int,
+    expert_count: int,
+    slot_count: int,
+    top_k: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return get_comm_alltoall_module().moe_prepare(
+        experts_ids,
+        scales,
+        experts_statics,
+        workspace,
+        max_token_count_per_rank,
+        ep_rank,
+        ep_size,
+        expert_count,
+        slot_count,
+        top_k,
+    )
+
+
 @dataclass
 class MoEAlltoallInfo:
     local_gather_indices: torch.Tensor
@@ -292,22 +383,44 @@ class MoEAlltoallInfo:
 
 class MnnvlMoe:
     moe_workspace: MnnvlMemory = None
+    moe_prepare_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
+    moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
 
     @staticmethod
-    def get_moe_workspaces(mapping: Mapping):
+    def get_moe_workspaces(mapping: Mapping, config: Optional[MnnvlConfig] = None):
         if MnnvlMoe.moe_workspace is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_workspace_tensor
 
         MnnvlMoe.moe_mapping = mapping
         workspace_size_per_rank = get_moe_commworkspace_size_per_rank(mapping.tp_size)
+        if config:
+            MnnvlMemory.set_comm_from_config(mapping, config)  # type: ignore[attr-defined]
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
             torch.uint64
         )
         return MnnvlMoe.moe_workspace_tensor
+
+    @staticmethod
+    def get_moe_prepare_workspace(
+        mapping: Mapping, config: Optional[MnnvlConfig] = None
+    ):
+        if MnnvlMoe.moe_prepare_workspace_tensor is not None:
+            assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
+            return MnnvlMoe.moe_prepare_workspace_tensor
+        workspace_size_per_rank = get_moe_prepare_workspace_size_per_rank(
+            mapping.tp_size
+        )
+        if config:
+            MnnvlMemory.set_comm_from_config(mapping, config)  # type: ignore[attr-defined]
+        MnnvlMoe.moe_prepare_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_prepare_workspace_tensor = (
+            MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
+        )
+        return MnnvlMoe.moe_prepare_workspace_tensor
 
     @staticmethod
     def compute_target_rank_id(
@@ -319,6 +432,62 @@ class MnnvlMoe:
         expert_per_rank = expert_count // ep_size
         token_target_rank_ids = token_selected_experts // expert_per_rank
         return token_target_rank_ids
+
+    @staticmethod
+    def mnnvl_moe_alltoallv_prepare_without_allgather(
+        expert_ids: torch.Tensor,
+        scales: torch.Tensor,
+        expert_statics: Optional[torch.Tensor],
+        workspace: torch.Tensor,
+        max_token_count_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        expert_count: int,
+        slot_count: int,
+        top_k: int,
+    ):
+        (
+            prepared_local_experts,
+            prepared_local_scales,
+            local_send_rank_count_cumsum,
+            local_send_rank_indices,
+            local_recv_rank_count_cumsum,
+            local_recv_rank_indices,
+            backward_local_recv_rank_indices,
+            gathered_expert_statics,
+        ) = moe_prepare(
+            expert_ids,
+            scales,
+            expert_statics,
+            workspace,
+            max_token_count_per_rank,
+            ep_rank,
+            ep_size,
+            expert_count,
+            slot_count,
+            top_k,
+        )
+
+        local_token_allocation_count = max_token_count_per_rank * ep_size
+        # Looks like we don't need this.
+        local_gather_indices = None
+
+        alltoall_info = MoEAlltoallInfo(
+            local_gather_indices,
+            local_send_rank_count_cumsum,
+            local_send_rank_indices,
+            local_recv_rank_count_cumsum,
+            local_recv_rank_indices,
+            backward_local_recv_rank_indices,
+            local_token_allocation_count,
+        )
+
+        return (
+            alltoall_info,
+            prepared_local_experts,
+            prepared_local_scales,
+            gathered_expert_statics,
+        )
 
     @staticmethod
     def mnnvl_moe_alltoallv_prepare(

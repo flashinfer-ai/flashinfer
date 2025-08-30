@@ -7,231 +7,62 @@ The aim of `flashinfer_benchmark.py` is to provide a single framework for benchm
 ## Overview
 
 This framework provides tools to:
-- Benchmark different attention implementations (FlashAttention2/3, cuDNN, CUTLASS, TensorRT-LLM)
-- Benchmark the GEMM performance.
+- Benchmark FlashInfer's Attention, GEMM, and MOE API performance from different kernel backends (FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, TensorRT-LLM)
 - Compare performance across different configurations
 - Batch performance test multiple attention test cases
-- Generate detailed performance reports
 
-Currently supports testing:
-- `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
-- `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
-- `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
-- `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
-- `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
-- `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
-- `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
-- `mm_fp4` - Maxtrix multiplication with NVFP4 inputs.
-- `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
-- `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
-- `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
-- `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+Currently supports testing most attention, gemm, and fused MOE APIs:
+- Attention:
+    - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache. Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
+    - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache. Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
+    - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
+    - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models. Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla`.
+- GEMM:
+    - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
+    - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
+    - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
+    - `mm_fp4` - Maxtrix multiplication with NVFP4 inputs.
+- MOE:
+    - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
+    - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
+    - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+    - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
 
-Support surface will expand to other operations such as MLA or non-attention operations in the future.
 ## Quick Start
-
+*See samples in samples/sample_testlist.txt for more example commands.*
 ### Single Test Run
 Example commands
 ```bash
 # Test prefill attention with paged KV cache
-python3 flashinfer_benchmark.py \
-    --routine BatchPrefillWithPagedKVCacheWrapper \
-    --backends fa2 cudnn trtllm-gen \
-    --page_size 16 \
-    --batch_size 16 \
-    --s_qo 4096 \
-    --s_kv 4096 \
-    --num_qo_heads 64 \
-    --num_kv_heads 8 \
-    --head_dim_qk 128 \
-    --head_dim_vo 128 \
-    --random_actual_seq_len \
-    --verbose \
-    --refcheck \
-    --causal \
-    --no_cuda_graph
-
-# Test prefill attention with ragged KV cache
-python3 flashinfer_benchmark.py \
-    --routine BatchPrefillWithRaggedKVCacheWrapper \
-    --backends fa2 cudnn cutlass \
-    --batch_size 16 \
-    --s_qo 4096 \
-    --s_kv 4096 \
-    --num_qo_heads 128 \
-    --num_kv_heads 128 \
-    --head_dim_qk 192 \
-    --head_dim_vo 128 \
-    --verbose \
-    --refcheck \
-    --causal \
-    --no_cuda_graph
+python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 4096 --s_kv 4096 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len --verbose --refcheck --causal --no_cuda_graph --generate_repro_command
 
 # Test decode attention with paged KV cache
-python3 flashinfer_benchmark.py \
-    --routine BatchDecodeWithPagedKVCacheWrapper \
-    --backends fa2 fa2_tc trtllm-gen cudnn \
-    --page_size 16 \
-    --batch_size 16 \
-    --s_qo 1 \
-    --s_kv 8192 \
-    --num_qo_heads 64 \
-    --num_kv_heads 8 \
-    --head_dim_qk 128 \
-    --head_dim_vo 128 \
-    --random_actual_seq_len \
-    --verbose \
-    --refcheck
+python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm-gen cudnn --page_size 16 --batch_size 16 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len --verbose --refcheck --generate_repro_command
 
-# FP8 GEMM
-python3 flashinfer_benchmark.py \
-    --routine gemm_fp8_nt_groupwise \
-    --m 8192 \
-    --n 4096 \
-    --k 16384 \
-    --mma_sm 2 \
-    --refcheck \
-    -vv
-
-# Group FP8 GEMM
-python3 flashinfer_benchmark.py \
-    --routine group_gemm_fp8_nt_groupwise \
-    --m 8192 \
-    --n 4096 \
-    --k 16384 \
-    --mma_sm 2 \
-    --group_size 2 \
-    --no_cuda_graph \
-    --scale_major_mode K \
-    --refcheck \
-    -vv
+# FP4 GEMM
+python3 flashinfer_benchmark.py --routine mm_fp4 --m 8192 --n 4096 --k 16384 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --refcheck --verbose --generate_repro_command
 
 # MOE FP4 Block Scale (DeepSeekV3 routing)
-python3 flashinfer_benchmark.py \
-    --routine trtllm_fp4_block_scale_moe \
-    --num_tokens 1024 \
-    --hidden_size 1024 \
-    --intermediate_size 1024 \
-    --num_experts 128 \
-    --top_k 8 \
-    --n_group 8 \
-    --topk_group 4 \
-    --routed_scaling_factor 2.5 \
-    --use_routing_bias \
-    --routing_method deepseek_v3 \
-    --use_shuffled_weight \
-    --verbose
+python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight --verbose --generate_repro_command
+
+# MOE FP4 Block Scale (topk routing, GeGlu gated act)
+python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method topk --use_shuffled_weight --gated_act geglu --verbose --generate_repro_command
 
 # MOE FP8 Block Scale with DeepSeekV3 routing
-python3 flashinfer_benchmark.py \
-    --routine trtllm_fp8_block_scale_moe \
-    --num_tokens 1024 \
-    --hidden_size 1024 \
-    --intermediate_size 1024 \
-    --num_experts 128 \
-    --top_k 8 \
-    --n_group 8 \
-    --topk_group 4 \
-    --routed_scaling_factor 2.5 \
-    --use_routing_bias \
-    --routing_method deepseek_v3 \
-    --use_shuffled_weight \
-    --verbose
-
-# MOE FP8 Block Scale with Renormalize routing (no groups)
-python3 flashinfer_benchmark.py \
-    --routine trtllm_fp8_block_scale_moe \
-    --num_tokens 1024 \
-    --hidden_size 1024 \
-    --intermediate_size 1024 \
-    --num_experts 128 \
-    --top_k 1 \
-    --routing_method renormalize \
-    --verbose
+python3 flashinfer_benchmark.py --routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight --verbose --generate_repro_command
 
 # CUTLASS Fused MoE (base variant)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 2 \
-    --top_k 2 \
-    --cutlass_variant base \
-    --input_dtype float16 \
-    --verbose
+python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant base --input_dtype float16 --verbose --generate_repro_command
 
-# CUTLASS Fused MoE (fp8 variant)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 2 \
-    --top_k 2 \
-    --cutlass_variant fp8 \
-    --input_dtype float16 \
-    --verbose
-
-# CUTLASS Fused MoE (nvfp4 weights; optional quantized input)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 2 \
-    --top_k 2 \
-    --cutlass_variant nvfp4 \
-    --input_dtype float16 \
-    --verbose
-
-# CUTLASS Fused MoE (nvfp4 weights with quantized input)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 2 \
-    --top_k 2 \
-    --cutlass_variant nvfp4 \
-    --quantized_input \
-    --input_dtype float16 \
-    --verbose
-
-# CUTLASS Fused MoE with Expert Parallel (EP)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 8 \
-    --top_k 2 \
-    --cutlass_variant base \
-    --input_dtype float16 \
-    --ep_size 4 \
-    --ep_rank 0 \
-    --verbose
-
-# CUTLASS Fused MoE with Tensor Parallel (TP)
-python3 flashinfer_benchmark.py \
-    --routine cutlass_fused_moe \
-    --num_tokens 32 \
-    --hidden_size 128 \
-    --intermediate_size 128 \
-    --num_experts 2 \
-    --top_k 2 \
-    --cutlass_variant base \
-    --input_dtype float16 \
-    --tp_size 2 \
-    --tp_rank 0 \
-    --verbose
+# CUTLASS Fused MoE with Tensor Parallelism (TP)
+python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --verbose --generate_repro_command
 ```
 
 ### Batch Testing
 
 Run multiple tests from a file and save results:
 ```bash
-python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path sample_testlist_output.csv
+python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
 ```
 
 The output CSV will contain detailed metrics including:
@@ -239,28 +70,30 @@ The output CSV will contain detailed metrics including:
 - Standard deviation
 - TFLOPS/sec
 - Memory throughput (TB/sec)
+- Input flags
+- Reproducer commands if `--generate_repro_command` is provided
 
 ## Command Line Arguments
 ### General Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--routine`              | Test routine to run: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4`, `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe` |
-|                          |                                                                                                             |
-|                          | Also: `cutlass_fused_moe` (CUTLASS fused MoE; variants: base, fp8, nvfp4)                                   |
+| `--routine`              | Test routine to run: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `bmm_fp8`, `mm_fp4`, `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe`, `cutlass_fused_moe` |
 | `--num_iters`            | Number of iterations for performance measurement                                                           |
 | `--dry_run_iters`        | Number of warmup iterations                                                                                |
 | `--no_cuda_graph`        | Disable CUDA graph to execute kernels outside of the graph.                                                |
-| `--allow_output_mismatch`| Continue testing even if outputs don't match between backends                                              |
 | `--refcheck`             | Verify outputs match between different backends                                                            |
+| `--allow_output_mismatch`| Continue testing even if outputs don't pass refcheck                                              |
 | `--random_seed`          | Random seed for reproducibility                                                                            |
 | `--output_path`          | Path to save CSV results                                                                                   |
 | `--testlist`             | Path to a file containing a list of test cases to run in batch mode                                        |
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
+| `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
+| `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, cudnn, cutlass, trtllm, trtllm-gen, trtllm-gen-native, cublas|
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--backends`             | List of backends to test: fa2, fa2_tc, fa3, cudnn, cutlass, trtllm, trtllm-gen, cublas                      |
 | `--page_size`            | Page size for paged attention. Required for paged attention tests.                                          |
 | `--batch_size`           | Number of sequences to process in parallel                                                                  |
 | `--s_qo`                 | Query/output sequence length. Should be 1 for decode tests.                                                 |
@@ -318,6 +151,8 @@ The output CSV will contain detailed metrics including:
 | `--tp_rank`              | Tensor-parallel rank                                                                                        |
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
+| `--gated_act`            | Gated activation function: `swiglu` (default) or `geglu`                                                   |
+| `--autotune`             | Enable autotune for supported operation                                                                     |
 
 ### MOE Routing Method Compatibility
 
@@ -335,15 +170,16 @@ Notes:
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
 ## Tester Attention Backend Support Matrix
-The following support surface applies to attention operations in `flashinfer_benchmark.py`
-| Backend  | Decode Paged | Prefill Paged | Prefill Ragged | FP8  | Notes                                    |
-|----------|-------------|---------------|----------------|------|------------------------------------------|
-| fa2      | ✓           | ✓             | ✓              | ✗    | Does not support GQA ratio of 5          |
-| fa2_tc   | ✓           | ✗             | ✗              | ✗    | Uses tensor cores                        |
-| fa3      | ✗           | ✓             | ✓              | ✗    | Hopper Only      |
-| cudnn    | ✓           | ✓*            | ✓*             | ✗    | *Requires specific head dims (192 or 128) |
-| cutlass  | ✗           | ✗             | ✓              | ✗    |                                          |
-| trtllm   | ✓           | ✗             | ✗              | ✗    |                                          |
+The following support surface applies to attention operations in `flashinfer_benchmark.py`. Support surface has been tested on NVIDIA B200 GPU unless noted otherwise.
+| Backend            | Decode Paged| Prefill Paged | Prefill Ragged | MLA  | Notes                                    |
+|--------------------|-------------|---------------|----------------|------|------------------------------------------|
+| fa2                | ✓           | ✓             | ✓              | ✓    | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) without tensor cores. Does not support GQA ratio of 5          |
+| fa2_tc             | ✓           | ✗             | ✗              | ✗    | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) with tensor cores                        |
+| fa3                | ✗           | ✓             | ✓              | ✗    | [FlashAttention-3](https://github.com/Dao-AILab/flash-attention) implemented with CUTLASS. Hopper Only.  |
+| cudnn              | ✓           | ✓             | ✓              | ✗    |  |
+| cutlass            | ✗           | ✗             | ✓              | ✗    | FMHA implemented with CUTLASS.          |
+| trtllm-gen         | ✓           | ✓             | ✗              | ✗    | trtllm-gen kernels called through unified wrapper interface, such as `Batch...Wrapper` by setting `backend='trtllm-gen'` |
+| trtllm-gen-native  | ✓           | ✓             | ✗              | ✓    | trtllm-gen kernels called through a separate API such as `flashinfer.[prefill,decode].trtllm_batch_...` |
 
 Notes:
 - CUDA graph support is only stable with BatchDecodeWithPagedKVCacheWrapper. For BatchPrefillWithPagedKVCacheWrapper and BatchPrefillWithRaggedKVCacheWrapper, it is recommended that `--no_cuda_graph` is used.
@@ -352,69 +188,32 @@ Notes:
 
 ## Example Outputs
 ```bash
-$ python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len --refcheck --causal --no_cuda_graph -vv
-[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=8, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
+$ python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len --refcheck --causal --no_cuda_graph --generate_repro_command -v
+[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=1, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', backends=['fa2', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=8, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.2.8
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] FlashInfer version: 0.2.12
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 8 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len --refcheck --causal --no_cuda_graph --generate_repro_command -v
 [VERBOSE] Average actual seq len: 327
-[VVERBOSE] actual_seq_lens_q.flatten() = tensor([103, 436, 861, 271, 107,  72, 701,  21, 615, 122, 467, 215, 331, 459,
-         88, 373], dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([5242, 8, 128])
-[VVERBOSE] num_pages_per_seq = 64
-[VVERBOSE] total_num_pages = 1024
-[VVERBOSE] kv_cache.shape = torch.Size([1024, 2, 8, 16, 128])
-[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
-[VVERBOSE] block_tables.shape = torch.Size([16, 64])
-[VVERBOSE] qo_indptr.shape = torch.Size([17])
-[VVERBOSE] qo_indptr.dtype = torch.int32
-[VVERBOSE] kv_indptr.shape = torch.Size([17])
-[VVERBOSE] kv_indices.shape = torch.Size([335])
-[VVERBOSE] kv_last_page_len.shape = torch.Size([16])
-[VVERBOSE] scale = 0.08838834764831843ze([16])
-[VVERBOSE] scale = 0.08838834764831843
 [PERF] fa2       :: median time 0.059 ms; std 0.001 ms; achieved tflops 91.278 TFLOPs/sec; achieved tb_per_sec 0.723 TB/sec
 [PERF] cudnn     :: median time 0.047 ms; std 0.002 ms; achieved tflops 116.377 TFLOPs/sec; achieved tb_per_sec 0.921 TB/sec
 [PERF] trtllm-gen:: median time 0.051 ms; std 0.002 ms; achieved tflops 105.873 TFLOPs/sec; achieved tb_per_sec 0.838 TB/sec
 
-$ python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128  --refcheck --causal --no_cuda_graph -vv
-INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'cudnn', 'cutlass'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=False)
+$ python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128  --refcheck --causal --no_cuda_graph --generate_repro_command -v
+[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=True, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=1, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', backends=['fa2', 'cudnn', 'cutlass'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=False)
 [INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
-[INFO] FlashInfer version: 0.2.8
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] FlashInfer version: 0.2.12
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cudnn cutlass --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --refcheck --causal --no_cuda_graph --generate_repro_command -v
 [VERBOSE] Average actual seq len: 1024
-[VVERBOSE] actual_seq_lens_q.flatten() = tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
-        1024, 1024, 1024, 1024], dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([16384, 128, 192])
-[VVERBOSE] k.shape = torch.Size([16384, 128, 192])
-[VVERBOSE] v.shape = torch.Size([16384, 128, 128])
-[VVERBOSE] qo_indptr.shape = torch.Size([17])
-[VVERBOSE] kv_indptr.shape = torch.Size([17])
-[VVERBOSE] scale = 0.07216878364870323
 [PERF] fa2       :: median time 2.252 ms; std 0.038 ms; achieved tflops 305.092 TFLOPs/sec; achieved tb_per_sec 1.192 TB/sec
 [PERF] cudnn     :: median time 1.178 ms; std 0.054 ms; achieved tflops 583.460 TFLOPs/sec; achieved tb_per_sec 2.279 TB/sec
 [PERF] cutlass   :: median time 1.494 ms; std 0.034 ms; achieved tflops 459.866 TFLOPs/sec; achieved tb_per_sec 1.796 TB/sec
 
-$ python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm-gen cudnn --page_size 16 --batch_size 32 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --refcheck -vv
-INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, backends=['fa2', 'fa2_tc', 'trtllm-gen', 'cudnn'], page_size=16, batch_size=32, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=False)
+$ python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm-gen cudnn --page_size 16 --batch_size 32 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --refcheck --generate_repro_command -v
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=1, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'trtllm-gen', 'cudnn'], page_size=16, batch_size=32, s_qo=1, s_kv=8192, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=False)
 [INFO] Running testBatchDecodeWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.2.8
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] FlashInfer version: 0.2.12
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc trtllm-gen cudnn --page_size 16 --batch_size 32 --s_qo 1 --s_kv 8192 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --refcheck --generate_repro_command -v
 [VERBOSE] Average actual seq len: 8192
-[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
-        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
-        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192], device='cuda:0',
-       dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([32, 64, 128])
-[VVERBOSE] num_pages_per_seq = 512
-[VVERBOSE] total_num_pages = 16384
-[VVERBOSE] kv_cache.shape = torch.Size([16384, 2, 8, 16, 128])
-[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
-[VVERBOSE] block_tables.shape = torch.Size([32, 512])
-[VVERBOSE] kv_indptr.shape = torch.Size([33])
-[VVERBOSE] kv_indices.shape = torch.Size([16384])
-[VVERBOSE] kv_last_page_len.shape = torch.Size([32])
-[VVERBOSE] scale = 0.08838834764831843
 [PERF] fa2       :: median time 0.712 ms; std 0.000 ms; achieved tflops 12.070 TFLOPs/sec; achieved tb_per_sec 1.510 TB/sec
 [PERF] fa2_tc    :: median time 0.187 ms; std 0.002 ms; achieved tflops 46.022 TFLOPs/sec; achieved tb_per_sec 5.758 TB/sec
 [PERF] trtllm-gen:: median time 0.157 ms; std 0.001 ms; achieved tflops 54.581 TFLOPs/sec; achieved tb_per_sec 6.829 TB/sec

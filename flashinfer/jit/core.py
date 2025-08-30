@@ -22,7 +22,8 @@ os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
-        self.setLevel(logging.INFO)
+        logging_level = os.getenv("FLASHINFER_LOGGING_LEVEL", "info")
+        self.setLevel(logging_level.upper())
         self.addHandler(logging.StreamHandler())
         log_path = jit_env.FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
         if not os.path.exists(log_path):
@@ -47,11 +48,15 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 
 def check_cuda_arch():
-    # cuda arch check for fp8 at the moment.
+    # Collect all detected CUDA architectures
+    archs = []
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
         arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
-        if arch < 75:
-            raise RuntimeError("FlashInfer requires sm75+")
+        archs.append(arch)
+
+    # Raise error only if all detected architectures are lower than sm75
+    if all(arch < 75 for arch in archs):
+        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
 
 
 def clear_cache_dir():
@@ -166,7 +171,7 @@ def gen_jit_spec(
     cuda_cflags = [
         "-O3",
         "-std=c++17",
-        f"--threads={min(os.cpu_count() or 4, 32)}",
+        f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",

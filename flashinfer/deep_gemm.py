@@ -31,7 +31,14 @@ import hashlib
 import json
 from typing import Any, Dict, Optional, Tuple
 
-import cuda.bindings.driver as cbd
+try:
+    import cuda.bindings.driver as cbd
+except ImportError as e:
+    raise ImportError(
+        "Could not import the 'cuda' module. "
+        "Please install cuda-python that matches your CUDA version."
+    ) from e
+
 import torch
 
 from .artifacts import ArtifactPath, MetaInfoHash

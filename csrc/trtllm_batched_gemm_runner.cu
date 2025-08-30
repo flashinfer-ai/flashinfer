@@ -103,8 +103,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         tileSize == mOptions.tileSize &&
         options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
         options.mLayoutA == mOptions.weightLayout) {
-      // FIXME: Disable split-k for now.
-      if (options.mClusterDimZ != 1) {
+      // FIXME: Disable split-k for swiglu for now.
+      if (static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType) ==
+              batchedGemm::gemmGatedAct::ActType::SwiGlu &&
+          options.mClusterDimZ != 1) {
         continue;
       }
 
@@ -213,8 +215,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrPerTokenSfB =
       mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
   gemmData.mInputBuffers.mPtrBias = ptrBias;
-  gemmData.mInputBuffers.mPtrSwiGluAlpha = ptrAlpha;
-  gemmData.mInputBuffers.mPtrSwiGluBeta = ptrBeta;
+  gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
+  gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
   gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
   gemmData.mInputBuffers.mPtrRouteMap = routeMap;
@@ -242,8 +244,9 @@ void TrtllmGenBatchedGemmRunner::run(
 
   TORCH_CHECK(err == 0,
               "Error occurred when running GEMM!"
-              " (numBatches: %d, GemmMNK: %d %d %d, Kernel: %s)",
-              numBatches, m, n, k, config.mFunctionName);
+              " (numBatches: ",
+              numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
+              ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,

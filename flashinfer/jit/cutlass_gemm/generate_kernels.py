@@ -2,7 +2,22 @@ import enum
 import os
 from itertools import chain, product
 
-from .cutlass_library import *
+from .cutlass_library import (
+    enum_auto,
+    DataTypeNames,
+    DataTypeSize,
+    DataType,
+    DataTypeTag,
+    GemmKind,
+    GemmKindNames,
+    KernelScheduleType,
+    KernelScheduleTag,
+    KernelScheduleSuffixes,
+    EpilogueScheduleType,
+    EpilogueScheduleTag,
+    EpilogueScheduleSuffixes,
+)
+from ..cpp_ext import is_cuda_version_at_least
 
 
 ################################################################################
@@ -586,10 +601,20 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
         (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16, DataType.bf16),
     ]
-    supported_dtypes_fp4 = [
-        (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
-        (DataType.bf16, DataType.e2m1, DataType.ue8m0, DataType.bf16, DataType.bf16),
-    ]
+
+    if is_cuda_version_at_least("12.8"):
+        supported_dtypes_fp4 = [
+            (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
+            (
+                DataType.bf16,
+                DataType.e2m1,
+                DataType.ue8m0,
+                DataType.bf16,
+                DataType.bf16,
+            ),
+        ]
+    else:
+        supported_dtypes_fp4 = []
 
     quant_ops = [TrtLlm_QuantOp.finegrained_scale_only]
 

@@ -250,6 +250,7 @@ struct Data : public DataBase {
 
   bool mDoSoftmaxBeforeTopK{false};
   bool mNormTopkProb{true};  // Default value is true for Qwen3 model
+  bool mApplySoftmaxAfterTopK{false};
 };
 
 template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
@@ -264,6 +265,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   int32_t mTopK = 0;
 
   bool mNormTopkProb = true;
+  bool mApplySoftmaxAfterTopK = false;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -271,6 +273,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
 
     params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
     params.mNormTopkProb = data.mNormTopkProb;
+    params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
     params.mTopK = data.mTopK;
     return params;
   }

@@ -42,19 +42,19 @@ struct TrtllmGenGemmRunnerOptions {
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
                           const gemm::gemm::GemmInterface& interface) {
   static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s6_TN_transOut_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_"
       "noShflA_dsFp8_schedP_sm100a";
 
   static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s6_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100a";
 
   static constexpr const char* KERNEL_NAME_LARGE_N =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s6_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_"
       "transOut_noShflA_dsFp8_schedP_sm100a";
 
   static constexpr const char* KERNEL_NAME_DEFAULT =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100a";
 
   double const n_k_ratio = static_cast<double>(N) / static_cast<double>(K);

@@ -23,6 +23,7 @@ import torch
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -385,6 +386,28 @@ def get_batch_prefill_uri(
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
+
+def get_batch_prefill_attention_sink_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> str:
+    return (
+        f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"use_swa_{use_sliding_window}_" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -853,6 +876,54 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+    )
+
+
+def gen_batch_prefill_attention_sink_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+) -> JitSpec:
+    from flashinfer.jit.attention.variants import attention_sink_decl
+
+    uri = get_batch_prefill_attention_sink_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+    )
+
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        ["sink"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
+        "AttentionSink",
+        attention_sink_decl[backend],
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=False,
+        use_fp16_qk_reduction=False,
+        fp8_enabled=False,
     )
 
 
@@ -1488,13 +1559,25 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def trtllm_gen_fmha_module():
+    include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
+    header_name = "flashInferMetaInfo"
+
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_FMHA, ".h"
+    )
+
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
+
     return gen_jit_spec(
         "fmha_gen",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_cuda_cflags=[
             f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
             f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',

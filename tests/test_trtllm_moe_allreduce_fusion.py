@@ -47,7 +47,8 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         # candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
             comm.QuantizationSFLayout.LINEAR,
-            comm.QuantizationSFLayout.SWIZZLED,
+            comm.QuantizationSFLayout.SWIZZLED_128x4,
+            comm.QuantizationSFLayout.SWIZZLED_8x4,
         ]
         launch_with_pdls = [True, False]
 
@@ -94,7 +95,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )
                             if (
                                 swizzled_layout_code
-                                == comm.QuantizationSFLayout.SWIZZLED
+                                == comm.QuantizationSFLayout.SWIZZLED_128x4
                             ):
                                 padded_message_size = (
                                     comm.compute_fp4_swizzled_layout_sf_size(
@@ -452,7 +453,7 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
     torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")
