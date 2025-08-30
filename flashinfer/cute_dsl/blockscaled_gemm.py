@@ -99,6 +99,9 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
 # TODO unify i32 or u32
 @cute.jit
 def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
+    # TODO disable this time check
+    repeat_count = Int64(0)
+
     ready = Int32(0)
 
     # early exiting / early return is not supported in cute dsl
@@ -125,6 +128,11 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+        repeat_count += 1
+        if repeat_count > 1_000_000_000:
+            tidx, _, _ = cute.arch.thread_idx()
+            cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
 
 
 class MaskedSchedulerParams:
