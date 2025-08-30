@@ -1212,8 +1212,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
-        if self._backend == "trtllm-gen":
-            q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
@@ -1247,6 +1245,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             out = torch.empty_like(q)
         else:
             check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+
+        if self._backend == "trtllm-gen":
+            q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self.use_tensor_cores:
             run_args = [
