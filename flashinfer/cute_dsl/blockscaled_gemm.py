@@ -59,6 +59,10 @@ from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 
 
+DEBUG_EXIT_AFTER_FIRST_WAIT = True
+# DEBUG_EXIT_AFTER_FIRST_WAIT = False
+
+
 sizeof_i32 = 4
 sizeof_u64 = 8
 
@@ -1300,6 +1304,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tile_sched_params.src_signals.toint() + sizeof_i32 * 0,
                 expect_value=tile_sched_params.src_signal_expect_value,
             )
+
+            if cutlass.const_expr(DEBUG_EXIT_AFTER_FIRST_WAIT):
+                return
 
         #
         # Specialized TMA load warp
