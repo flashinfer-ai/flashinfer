@@ -1,14 +1,12 @@
 import dataclasses
 import logging
 import os
-import re
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 import torch
-import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
 
 from . import env as jit_env
@@ -50,13 +48,16 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 def check_cuda_arch():
     # Collect all detected CUDA architectures
-    archs = []
-    for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
-        arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
-        archs.append(arch)
+    eligible = False
+    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
+        if major >= 8:
+            eligible = True
+        elif major == 7 and minor.isdigit():
+            if int(minor) >= 5:
+                eligible = True
 
     # Raise error only if all detected architectures are lower than sm75
-    if all(arch < 75 for arch in archs):
+    if not eligible:
         raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
 
 
