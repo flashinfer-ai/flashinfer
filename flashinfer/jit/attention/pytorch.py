@@ -1539,7 +1539,6 @@ def gen_fmha_cutlass_sm100a_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    extra_cuda_cflags: List[str],
 ) -> JitSpec:
     uri = get_fmha_cutlass_sm100a_uri(
         dtype_q,

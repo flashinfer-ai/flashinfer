@@ -31,8 +31,6 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
     trtllm_gen_fmha_module,
-    sm100a_nvcc_flags,
-    sm110a_nvcc_flags,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -88,9 +86,6 @@ def get_fmha_module(
             pos_encoding_mode,
             use_sliding_window,
             use_logits_soft_cap,
-            extra_cuda_cflags=sm100a_nvcc_flags
-            if is_sm100a_supported(device)
-            else sm110a_nvcc_flags,
         ).build_and_load()
     else:
         raise ValueError("SM100A is not supported on this device")
