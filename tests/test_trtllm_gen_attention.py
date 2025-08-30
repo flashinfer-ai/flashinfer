@@ -498,20 +498,6 @@ def test_trtllm_batch_decode(
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
 
-    # Skip specific failing cases with fp8-fp8-fp8 and batch_size=256, q_len_per_req=3, etc.
-    # if not (
-    #     q_dtype == "fp8"
-    #     and kv_dtype == "fp8"
-    #     and o_dtype == "fp8"
-    #     and batch_size == 256
-    #     and q_len_per_req == 3
-    #     and page_size == 64
-    #     and num_kv_heads == 4
-    #     and head_grp_size == 5
-    # ):
-    #     # todo(Yingyi): fix precision issue with this test
-    #     pytest.skip("Known precision issue with this configuration. Fix later.")
-
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
@@ -624,13 +610,13 @@ def test_trtllm_batch_decode(
         rtol, atol = 1e-2, 1e-2
 
     # convert to float32 for fp8 is not supported by assert_close
-    # todo(Yingyi): fix precision issue with this test
-    # torch.testing.assert_close(
-    #     output.float() * o_scale,
-    #     output_ref.float(),
-    #     rtol=rtol,
-    #     atol=atol,
-    # )
+    # todo(Yingyi): fix precision issue by prefill wrapper
+    torch.testing.assert_close(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+    )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
