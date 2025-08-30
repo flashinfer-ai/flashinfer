@@ -134,7 +134,7 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                                                int64_t k, int64_t mma_sm, int64_t tile_m,
                                                int64_t tile_n, int64_t tile_k, bool swap_ab) {
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::cuda::getCurrentCUDAStream(A.device().index());
   int num_groups = m_indptr.size(0) - 1;
   DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
       A.scalar_type(), B.scalar_type(), SFA.scalar_type(), SFB.scalar_type(), D.scalar_type(),

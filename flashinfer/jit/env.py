@@ -38,9 +38,9 @@ FLASHINFER_CUBIN_DIR = pathlib.Path(
 def _get_workspace_dir_name() -> pathlib.Path:
     try:
         with warnings.catch_warnings():
-            # Ignore the warning for TORCH_CUDA_ARCH_LIST not set
+            # Ignore the warning for FLASHINFER_CUDA_ARCH_LIST not set
             warnings.filterwarnings(
-                "ignore", r".*TORCH_CUDA_ARCH_LIST.*", module="torch"
+                "ignore", r".*FLASHINFER_CUDA_ARCH_LIST.*", module="torch"
             )
             flags = _get_cuda_arch_flags()
         arch = "_".join(sorted(set(re.findall(r"compute_(\d+)", "".join(flags)))))

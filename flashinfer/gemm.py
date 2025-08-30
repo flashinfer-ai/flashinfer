@@ -55,7 +55,12 @@ except OSError as e:
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit import (
+    gen_jit_spec,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    current_compilation_context,
+)
 from .jit.cubin_loader import setup_cubin_loader
 from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 from .utils import (
@@ -71,10 +76,10 @@ from .utils import (
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
-def _match_sm_version(device: torch.device, sm_version: str):
+def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
-    return device_arch == sm_version
+    return device_arch in sm_version
 
 
 def gen_gemm_module() -> JitSpec:
@@ -205,10 +210,13 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         "fp4_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
@@ -253,10 +261,14 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+
     return gen_jit_spec(
         "fp8_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
         ],
@@ -335,10 +347,14 @@ def gen_gemm_sm100_module() -> JitSpec:
         with open(src_path, "r") as f:
             source = f.read()
         write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
@@ -441,8 +457,8 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100 = _match_sm_version(a.device, "100")
-    if "cutlass" in runner_names and is_sm100 and not is_e5m2:
+    is_sm_supported = _match_sm_version(a.device, ["100", "103", "110"])
+    if "cutlass" in runner_names and is_sm_supported and not is_e5m2:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
@@ -1604,6 +1620,8 @@ def mm_fp4(
         raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
+        raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1850,6 +1868,9 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
+        raise ValueError("TRTLLM FP8 GEMM is not supported on SM110.")
+
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
@@ -1882,8 +1903,16 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if backend == "cutlass":
+        if not _match_sm_version(a.device, ["100", "103", "110"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110 in cutlass backend."
+            )
+    elif backend == "trtllm":
+        if not _match_sm_version(a.device, ["100", "103"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+            )
 
     if backend == "cutlass":
         assert scale_major_mode is not None
@@ -2151,8 +2180,10 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if not (_match_sm_version(a.device, ["100", "103", "110"])):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110."
+        )
 
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device

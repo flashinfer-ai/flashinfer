@@ -166,8 +166,18 @@ struct GemmData {
     // The dtype is float32.
     void const* mPtrBias{nullptr};
 
-    // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
+    // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
+    // scaleC = dequantA * dequantB * quantC,
+    // where dequantA is global dequantization scaling factor of A
+    //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+    //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+    //    otherwise it is 1.
+    // dequantB is defined similarly to dequantA.
+    // quantC is the quantization scaling factor of C.
+    //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
+    //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
+    //    otherwise it is 1.
     // Shape is [1].
     void* mPtrScaleC{nullptr};
   };
@@ -395,7 +405,7 @@ bool GemmInterface::isValidConfig(GemmConfig const& config, GemmData const& data
   auto options = getOptionsFromConfigAndData(config, data);
 
   // Is Blackwell?
-  bool isBlackwell = config.mSm == SmVersion::Sm100a;
+  bool isBlackwell = isSmVersionBlackwell(config.mSm);
 
   // Check options without modifications.
   return checkAndUpdateGemmOptions(options, isBlackwell, data.mProblemDimensions.mWorldSize,
@@ -435,7 +445,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
   int numTilesN = gemm::divUp(options.mN, options.mTileN);
 
   // Create kernel params.
-  auto kernelParams = gemm::KernelParams::setKernelParams(
+  auto kernelParams = gemm::KernelParamsSetup::setKernelParams(
       options, data.mInputBuffers.mPtrA, data.mInputBuffers.mPtrSfA,
       data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB, data.mInputBuffers.mPtrSfB,
       data.mInputBuffers.mPtrPerTokenSfB, data.mInputBuffers.mPtrBias, data.mOutputBuffers.mPtrC,
@@ -529,6 +539,49 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
   config.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid);
 #endif
 
+  return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int32_t GemmInterface::runInitBeforeWorldSync(GemmConfig const& config, GemmData const& data,
+                                              void* cudaStream) const {
+  if (data.mProblemDimensions.mWorldSize > 1) {
+    // Get options from config and data.
+    auto options = getOptionsFromConfigAndData(config, data);
+    if (options.mAllReduceAlgo == gemm::AllReduceAlgo::OneShot) {
+      // The size of each element of C in bits.
+      int64_t const numBitsPerEltC = options.mAllReduceAlgo == gemm::AllReduceAlgo::TwoShot
+                                         ? tg::dtypeGetNumBits(options.mDtypeAcc)
+                                         : tg::dtypeGetNumBits(options.mDtypeC);
+      // The number of bytes for C.
+      int64_t const numBytesC =
+          data.mProblemDimensions.mM * data.mProblemDimensions.mN * numBitsPerEltC / /*bits*/ 8;
+      // Reset the output buffer as one-shot uses UTMAREDG at multicast memory for reduction.
+      auto err = cudaMemsetAsync(data.mOutputBuffers.mPtrC, 0x00, numBytesC,
+                                 reinterpret_cast<cudaStream_t>(cudaStream));
+      if (err != cudaSuccess) {
+        return 1;
+      }
+    }
+    // The number of tiles in the M dimension.
+    int numTilesM = gemm::divUp(options.mM, options.mTileM);
+    // The number of tiles in the N dimension.
+    int numTilesN = gemm::divUp(options.mN, options.mTileN);
+    // The number of bytes for the tile barriers.
+    int32_t numBytesTileBars = numTilesM * numTilesN * sizeof(uint32_t);
+    // Sanitize system barriers.
+    auto err = cudaMemsetAsync((void*)data.mAllReduceBuffers.mPtrTileBars, 0x00, numBytesTileBars,
+                               reinterpret_cast<cudaStream_t>(cudaStream));
+    if (err != cudaSuccess) {
+      return 2;
+    }
+    err = cudaMemsetAsync((void*)data.mAllReduceBuffers.mPtrCompletionBars, 0x00, numBytesTileBars,
+                          reinterpret_cast<cudaStream_t>(cudaStream));
+    if (err != cudaSuccess) {
+      return 3;
+    }
+  }
   return 0;
 }
 

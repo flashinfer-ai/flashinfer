@@ -86,18 +86,17 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, bool mockAllReduce, int n,
       int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma,
       int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
-      bool outputDebugTensors, bool patchF2fp, bool useShuffledMatrixA, bool sliceK,
-      gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-      bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
-      bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA,
-      bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
-      std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
-      tg::SfLayout sfLayoutC, int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler,
-      gemmGatedAct::ActType actType, bool clampBeforeAct, std::vector<int> batchedM,
-      std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch,
-      int numTokens, RouteImpl routeImpl, bool gridWaitForPrimaryRouting, bool fusedAct,
-      int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps,
-      bool useTmaOobOpt)
+      bool outputDebugTensors, bool patchF2fp, std::optional<int32_t> sfBlockSizeA,
+      tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
+      int32_t sfReshapeFactor, bool sliceK, gemm::SplitK splitK, int tileK, int tileM, int tileN,
+      gemm::TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomMmaSchedule,
+      bool useDeepSeekFp8, bool useHoistTryWaitForCustomMmaSchedule, bool usePerTokenSfA,
+      bool usePerTokenSfB, bool useShuffledMatrixA, bool useTmaStore, bool useTwoTmaLoadWarps,
+      bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int worldSize, gemmGatedAct::ActType actType,
+      bool clampBeforeAct, std::vector<int> batchedM, std::vector<int> batchedN,
+      BatchMode batchMode, int numBatches, bool isStaticBatch, int numTokens, RouteImpl routeImpl,
+      bool gridWaitForPrimaryRouting, bool fusedAct, int numRegsPerThreadNonEpilogueWarp,
+      int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps, bool useTmaOobOpt)
       : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(
                 allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc,
@@ -108,11 +107,12 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
                 hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK,
                 mmaKind, mmaM, mmaN, mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK,
                 numStages, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile,
-                numStagesWorkId, outputDebugTensors, patchF2fp, useShuffledMatrixA, sliceK, splitK,
-                transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma,
-                useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8,
-                usePerTokenSfA, usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
-                sfBlockSizeA, sfLayoutA, sfLayoutB, sfLayoutC, sfReshapeFactor, tileScheduler),
+                numStagesWorkId, outputDebugTensors, patchF2fp, sfBlockSizeA, sfLayoutA, sfLayoutB,
+                sfLayoutC, sfReshapeFactor, sliceK, splitK, tileK, tileM, tileN, tileScheduler,
+                transposeMmaOutput, useCustomMmaSchedule, useDeepSeekFp8,
+                useHoistTryWaitForCustomMmaSchedule, usePerTokenSfA, usePerTokenSfB,
+                useShuffledMatrixA, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
+                useUnrollLoop2xForMma, worldSize),
             actType, clampBeforeAct),
         mBatchedM(batchedM),
         mBatchedN(batchedN),
@@ -299,12 +299,6 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
   // TMA based load handles the case transparently.
   if (doesRouteImplUseLdgsts(options.mRouteImpl)) {
     TLLM_CHECK_ERROR(options.mK % options.mTileK == 0, "K must be a multiple of TileK");
-  }
-
-  if (options.mUseTmaOobOpt) {
-    // FIXME: DeepSeek FP8 does not work with TMA OOB optimization yet.
-    TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8,
-                     "TMA OOB optimization is not supported with DeepSeek FP8.");
   }
 
   return isValid;

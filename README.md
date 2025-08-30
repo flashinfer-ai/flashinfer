@@ -68,7 +68,7 @@ To pre-compile essential kernels ahead-of-time (AOT), run the following command:
 
 ```bash
 # Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
 # Build AOT kernels. Will produce AOT kernels in aot-ops/
 python -m flashinfer.aot
 # Build AOT wheel
@@ -123,6 +123,10 @@ Starting from FlashInfer v0.2, users can customize their own attention variants 
 ## C++ API and TVM Bindings
 
 FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
+
+## GPU Support
+
+FlashInfer currently provides support for NVIDIA SM architectures 80 and higher and beta support for 103, 110, 120, and 121.
 
 ## Adoption
 

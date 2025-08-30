@@ -146,24 +146,25 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         MainloopSchedule>::CollectiveOp;                                                                     \
                                                                                                              \
     template <typename Base>                                                                                 \
-    struct Sm10xOnly : Base {                                                                                \
+    struct Sm10x11xOnly : Base {                                                                             \
       using typename Base::Params;                                                                           \
       CUTLASS_DEVICE                                                                                         \
       void operator()(Params const& params, char* smem_buf) {                                                \
-        if constexpr (flashinfer::arch::is_major_v<10>) {                                                    \
+        if constexpr (flashinfer::arch::is_major_v<10> || flashinfer::arch::is_major_v<11>) {                \
           this->Base::operator()(params, smem_buf);                                                          \
         } else {                                                                                             \
           if (cute::thread0()) {                                                                             \
-            printf("%s : This kernel shall only run on SM10x devices.\n", __PRETTY_FUNCTION__);              \
+            printf("%s : This kernel shall only run on SM10x and SM11x devices.\n",                          \
+                   __PRETTY_FUNCTION__);                                                                     \
             __trap();                                                                                        \
           }                                                                                                  \
         }                                                                                                    \
       }                                                                                                      \
     };                                                                                                       \
     using GemmKernel =                                                                                       \
-        Sm10xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                      \
-                                                       CollectiveMainloop, CollectiveEpilogue,               \
-                                                       cutlass::gemm::PersistentScheduler>>;                 \
+        Sm10x11xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                   \
+                                                          CollectiveMainloop, CollectiveEpilogue,            \
+                                                          cutlass::gemm::PersistentScheduler>>;              \
                                                                                                              \
     using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                           \
   };                                                                                                         \
