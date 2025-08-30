@@ -130,7 +130,7 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
         )
 
         repeat_count += 1
-        if repeat_count > 1_000_000_000:
+        if repeat_count % 1_000_000_000 == 0:
             tidx, _, _ = cute.arch.thread_idx()
             cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
 
