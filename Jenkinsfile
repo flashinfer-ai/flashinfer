@@ -286,6 +286,10 @@ stage('Unittest') {
     'JIT-Unittest-4-cu129': {
       run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-4-cu129',
         { node_type -> shard_run_unittest_GPU(node_type, 4, 'cu129') })
-    }
+    },
+    'JIT-Unittest-5-cu129': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-5-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 5, 'cu129') })
+    },
   )
 }

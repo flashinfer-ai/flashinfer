@@ -104,6 +104,18 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
+def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = num_tokens * top_k // num_experts
+
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+    return tile_tokens_dim
+
+
 def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
@@ -506,6 +518,8 @@ def set_log_level(lvl_str: str) -> None:
 
 
 def device_support_pdl(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     major, _ = get_compute_capability(device)
     return major >= 9
 

@@ -887,6 +887,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1276,6 +1281,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                     0,  # token_pos_in_items_len
+                    self._workspace_size,
                     paged_kv_cache,
                     self._num_qo_heads,
                     self._num_kv_heads,
@@ -1815,6 +1821,7 @@ class TrtllmGenDecodeModule:
         max_seq_len: int,
         bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
         bmm2_scale: float,
+        workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
@@ -1845,6 +1852,7 @@ class TrtllmGenDecodeModule:
             window_left,
             self._sm_count,
             enable_pdl,
+            workspace_size,
             sinks,
         )
         return out
@@ -1898,6 +1906,7 @@ def get_trtllm_gen_decode_module(*args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
@@ -1926,6 +1935,7 @@ def get_trtllm_gen_decode_module(*args):
             max_kv_len,
             sm_scale,
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+            workspace_size,
             window_left,
             enable_pdl,
             out=o,
@@ -2091,6 +2101,8 @@ def trtllm_batch_decode_with_kv_cache(
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
         elif out is None:
             fp4_out_scale_shape = (
                 round_up(query.shape[0], 128),
@@ -2104,6 +2116,7 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        assert out_dtype == "nvfp4"
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
@@ -2160,6 +2173,7 @@ def trtllm_batch_decode_with_kv_cache(
         window_left,
         sm_count,
         enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
     )
 
@@ -2324,6 +2338,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         -1,  # window_left
         sm_count,
         enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
     )
     return out
