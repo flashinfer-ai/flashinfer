@@ -97,6 +97,7 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
 
 
 # TODO unify i32 or u32
+# TODO only wait once per warp?
 @cute.jit
 def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
     # TODO disable this time check
@@ -132,7 +133,8 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
         repeat_count += 1
         if repeat_count % 1_000_000_000 == 0:
             tidx, _, _ = cute.arch.thread_idx()
-            cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
+            if tidx % 32 == 0:
+                cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
 
 
 class MaskedSchedulerParams:
