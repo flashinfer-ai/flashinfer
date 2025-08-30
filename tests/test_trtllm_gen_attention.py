@@ -205,36 +205,47 @@ def get_last_page_len(seq_lens, page_size):
 
 
 def assert_close_with_mismatch_tolerance(
-    actual, expected, rtol=1e-5, atol=1e-8, max_mismatched_elements=5
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+    max_mismatched_elements: int = 0,
 ):
-    """Assert that tensors are close, allowing up to max_mismatched_elements to differ."""
-    # Flatten tensors for easier comparison
-    actual_flat = actual.flatten()
-    expected_flat = expected.flatten()
+    """
+    Asserts that two tensors are close, allowing for a specified number of mismatched elements.
+    This function correctly implements the same logic as torch.isclose.
+    """
+    # Ensure tensors are float for comparison
+    actual_float = actual.float()
+    expected_float = expected.float()
 
-    # Calculate differences
-    abs_diff = torch.abs(actual_flat - expected_flat)
-    rel_diff = abs_diff / (torch.abs(expected_flat) + atol)
-
-    # Find elements that exceed tolerance
-    exceeds_atol = abs_diff > atol
-    exceeds_rtol = rel_diff > rtol
-    mismatched = exceeds_atol & exceeds_rtol
+    # This is the core logic from torch.isclose
+    # A mismatch occurs if the difference is greater than the combined tolerance
+    mismatched = torch.abs(actual_float - expected_float) > (
+        atol + rtol * torch.abs(expected_float)
+    )
 
     num_mismatched = torch.sum(mismatched).item()
-    total_elements = actual_flat.numel()
 
     if num_mismatched > max_mismatched_elements:
-        max_abs_diff = torch.max(abs_diff).item()
-        max_rel_diff = torch.max(rel_diff).item()
+        # For a helpful error message, let's find the worst offenders
+        actual_flat = actual_float.flatten()
+        expected_flat = expected_float.flatten()
+        abs_diff = torch.abs(actual_flat - expected_flat)
+
+        # Calculate relative difference only where expected is not zero to avoid division by zero
+        # Add a small epsilon to the denominator for stability
+        rel_diff = abs_diff / (torch.abs(expected_flat) + 1e-12)
+
+        total_elements = actual_flat.numel()
+
         raise AssertionError(
-            f"Tensor-likes are not close!\n"
+            f"Tensors are not close enough!\n"
             f"Mismatched elements: {num_mismatched} / {total_elements} "
-            f"({100.0 * num_mismatched / total_elements:.1f}%)\n"
-            f"Greatest absolute difference: {max_abs_diff} (up to {atol} allowed)\n"
-            f"Greatest relative difference: {max_rel_diff} (up to {rtol} allowed)\n"
-            f"Allowed mismatched elements: {max_mismatched_elements}, "
-            f"but found {num_mismatched}"
+            f"({100.0 * num_mismatched / total_elements:.2f}%)\n"
+            f"Allowed mismatched elements: {max_mismatched_elements}, but found {num_mismatched}.\n"
+            f"Greatest absolute difference: {torch.max(abs_diff).item():.4g} (atol={atol})\n"
+            f"Greatest relative difference: {torch.max(rel_diff).item():.4g} (rtol={rtol})"
         )
 
 
@@ -488,18 +499,18 @@ def test_trtllm_batch_decode(
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
 
     # Skip specific failing cases with fp8-fp8-fp8 and batch_size=256, q_len_per_req=3, etc.
-    if (
-        q_dtype == "fp8"
-        and kv_dtype == "fp8"
-        and o_dtype == "fp8"
-        and batch_size == 256
-        and q_len_per_req == 3
-        and page_size == 64
-        and num_kv_heads == 4
-        and head_grp_size == 5
-    ):
-        # todo(Yingyi): fix precision issue with this test
-        pytest.skip("Known precision issue with this configuration. Fix later.")
+    # if not (
+    #     q_dtype == "fp8"
+    #     and kv_dtype == "fp8"
+    #     and o_dtype == "fp8"
+    #     and batch_size == 256
+    #     and q_len_per_req == 3
+    #     and page_size == 64
+    #     and num_kv_heads == 4
+    #     and head_grp_size == 5
+    # ):
+    #     # todo(Yingyi): fix precision issue with this test
+    #     pytest.skip("Known precision issue with this configuration. Fix later.")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -642,12 +653,31 @@ def test_trtllm_batch_decode(
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
-            torch.testing.assert_close(
-                output.float(),
-                output_wrapper.float(),
-                rtol=1e-1,
-                atol=1e-1,
-            )
+            # todo(Yingyi): fix precision issue with this test
+            if not (
+                q_dtype == "fp8"
+                and kv_dtype == "fp8"
+                and o_dtype == "fp8"
+                and batch_size == 256
+                and q_len_per_req == 3
+                and page_size == 64
+                and num_kv_heads == 4
+                and head_grp_size == 5
+            ):
+                torch.testing.assert_close(
+                    output.float(),
+                    output_wrapper.float(),
+                    rtol=1e-1,
+                    atol=1e-1,
+                )
+            else:
+                assert_close_with_mismatch_tolerance(
+                    output.float(),
+                    output_wrapper.float(),
+                    rtol=1e-1,
+                    atol=1e-1,
+                    max_mismatched_elements=5,
+                )
 
 
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
