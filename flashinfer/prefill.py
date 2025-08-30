@@ -3268,7 +3268,6 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
-    return_lse: bool = False,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -3307,8 +3306,6 @@ def trtllm_batch_context_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
-    return_lse : bool = False
-        whether to return lse
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -3319,6 +3316,7 @@ def trtllm_batch_context_with_kv_cache(
         vector size for nvfp4 output tensor scale factor.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
+
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]

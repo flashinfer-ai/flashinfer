@@ -555,7 +555,7 @@ def test_trtllm_batch_decode(
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
-    # torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
