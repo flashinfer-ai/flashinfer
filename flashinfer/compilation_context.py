@@ -23,12 +23,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class CompilationContext:
     COMMON_NVCC_FLAGS = [
         "-DFLASHINFER_ENABLE_FP8_E8M0",
         "-DFLASHINFER_ENABLE_FP4_E2M1",
     ]
-    
+
     def __init__(self):
         self.TARGET_CUDA_ARCHS = set()
         if "FLASHINFER_CUDA_ARCH_LIST" in os.environ:
@@ -44,10 +45,19 @@ class CompilationContext:
                     self.TARGET_CUDA_ARCHS.add((int(major), minor))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
-    
-    def get_nvcc_flags_list(self, supported_major_versions: list[int] = None) -> list[str]:
+
+    def get_nvcc_flags_list(
+        self, supported_major_versions: list[int] = None
+    ) -> list[str]:
         if supported_major_versions:
-            supported_cuda_archs = [major_minor_tuple for major_minor_tuple in  self.TARGET_CUDA_ARCHS if major_minor_tuple[0] in supported_major_versions]
+            supported_cuda_archs = [
+                major_minor_tuple
+                for major_minor_tuple in self.TARGET_CUDA_ARCHS
+                if major_minor_tuple[0] in supported_major_versions
+            ]
         else:
             supported_cuda_archs = self.TARGET_CUDA_ARCHS
-        return [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}" for major, minor in supported_cuda_archs] + self.COMMON_NVCC_FLAGS
+        return [
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            for major, minor in supported_cuda_archs
+        ] + self.COMMON_NVCC_FLAGS

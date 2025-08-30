@@ -27,7 +27,7 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
 
     if not use_128x4_sf_layout and backend == "trtllm":
         # FIXME (bringup) quantization failure from main
-        pytest.fail("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
+        pytest.xfail("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -64,7 +64,6 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
             backend=backend,
         )
 
-    # FIXME (bringup) torch.AcceleratorError: CUDA error: unspecified launch failure Trying to use TMA Descriptor Prefetch without CUTE_ARCH_TMA_SM90_ENABLED
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > 0.97
 

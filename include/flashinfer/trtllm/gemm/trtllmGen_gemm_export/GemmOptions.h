@@ -345,7 +345,7 @@ enum class SmVersion { Sm90a, Sm100a, Sm100f, Sm103a };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-bool isSmVersionBlackwell(SmVersion smVersion) {
+inline bool isSmVersionBlackwell(SmVersion smVersion) {
   return smVersion == SmVersion::Sm100a || smVersion == SmVersion::Sm100f ||
          smVersion == SmVersion::Sm103a;
 }

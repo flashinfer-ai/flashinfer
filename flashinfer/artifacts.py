@@ -48,12 +48,12 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 
 
 class ArtifactPath:
-    TRTLLM_GEN_FMHA: str = "405b84402aa39f9d7d6c25235994304979ee6880/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "6c74964c96684c3e674340f7e35fc20ad909a9a0/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "405b84402aa39f9d7d6c25235994304979ee6880/batched_gemm-8704aa4-40c8201/"
+        "6c74964c96684c3e674340f7e35fc20ad909a9a0/batched_gemm-8704aa4-ba3b00d/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "405b84402aa39f9d7d6c25235994304979ee6880/gemm-8704aa4-f91dc9e/"
+        "6c74964c96684c3e674340f7e35fc20ad909a9a0/gemm-8704aa4-f91dc9e/"
     )
     CUDNN_SDPA: str = "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
     DEEPGEMM: str = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
@@ -61,14 +61,14 @@ class ArtifactPath:
 
 class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
-        "033df071ce628fed635861c679e0b70358e78721413cf8c6bd093be8c54749cd"
+        "5a41a165d4d5e956d4cccd0a7d1627dbdcaccf4d07a9cfcc8055ef0cb52e0c87"
     )
     TRTLLM_GEN_BMM: str = (
-        "410899044febba9c773e7aaa7e6dc375c33e3269b47c17e3a745e8bfce615328"
+        "3edf4847059d465182779436397ece3d5fb45c3360a1d1abda3b71e35f957caa"
     )
     DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
     TRTLLM_GEN_GEMM: str = (
-        "7d61ba2846c749cdda049ea1d7b552216d412ab240a890c9be0c493034710f31"
+        "c6265cf047fc5d2208a37c54b5d720f4755b1215de5f7434ad24ffbc81c31c27"
     )
 
 

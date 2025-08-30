@@ -556,7 +556,9 @@ def main():
         raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
 
     compilation_context = CompilationContext()
-    gencode_flags_list = compilation_context.get_nvcc_flags_list(supported_major_versions=None)
+    gencode_flags_list = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=None
+    )
 
     def has_sm(compute: str, version: str) -> bool:
         if not any(compute in flag for flag in gencode_flags_list):

@@ -58,7 +58,6 @@ install_requires = [
     "torch",
     "ninja",
     "requests",
-    "cuda-python<14.0a0,>=13.0.0",
     "pynvml",
     "einops",
     "packaging>=24.2",
@@ -90,7 +89,9 @@ if enable_aot:
     aot_build_meta["cuda_minor"] = cuda_version.minor
     aot_build_meta["torch"] = torch_version
     aot_build_meta["python"] = platform.python_version()
-    aot_build_meta["FLASHINFER_CUDA_ARCH_LIST"] = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
+    aot_build_meta["FLASHINFER_CUDA_ARCH_LIST"] = os.environ.get(
+        "FLASHINFER_CUDA_ARCH_LIST"
+    )
     generate_build_meta(aot_build_meta)
 
 
