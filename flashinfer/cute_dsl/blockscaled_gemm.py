@@ -100,8 +100,8 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
 # TODO only wait once per warp?
 @cute.jit
 def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
-    # TODO disable this time check
-    repeat_count = Int64(0)
+    # # TODO disable this time check
+    # repeat_count = Int64(0)
 
     ready = Int32(0)
 
@@ -130,11 +130,11 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
-        repeat_count += 1
-        if repeat_count % 1_000_000_000 == 0:
-            tidx, _, _ = cute.arch.thread_idx()
-            if tidx % 32 == 0:
-                cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
+        # repeat_count += 1
+        # if repeat_count % 1_000_000_000 == 0:
+        #     tidx, _, _ = cute.arch.thread_idx()
+        #     if tidx % 32 == 0:
+        #         cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
 
 
 class MaskedSchedulerParams:
