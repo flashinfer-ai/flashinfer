@@ -31,6 +31,7 @@ from .jit.cubin_loader import (
 )
 
 
+import logging
 from contextlib import contextmanager
 
 
@@ -45,6 +46,44 @@ def temp_env_var(key, value):
             os.environ.pop(key, None)
         else:
             os.environ[key] = old_value
+
+
+@contextmanager
+def patch_logger_for_tqdm(logger):
+    """
+    Context manager to patch the logger so that log messages are displayed using tqdm.write,
+    preventing interference with tqdm progress bars.
+    """
+
+    class TqdmLoggingHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                tqdm.write(msg, end="\n")
+            except Exception:
+                self.handleError(record)
+
+    # Save original handlers and level
+    original_handlers = logger.handlers[:]
+    original_level = logger.level
+
+    # Remove all existing handlers to prevent duplicate output
+    for h in original_handlers:
+        logger.removeHandler(h)
+
+    # Add our tqdm-aware handler
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        # Remove tqdm handler and restore original handlers and level
+        logger.removeHandler(handler)
+        for h in original_handlers:
+            logger.addHandler(h)
+        logger.setLevel(original_level)
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
@@ -94,26 +133,30 @@ class MetaInfoHash:
     )
 
 
+def get_cubin_file_list():
+    cubin_files = [
+        (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
+    ]
+    for kernel in [
+        ArtifactPath.TRTLLM_GEN_FMHA,
+        ArtifactPath.TRTLLM_GEN_BMM,
+        ArtifactPath.TRTLLM_GEN_GEMM,
+        ArtifactPath.DEEPGEMM,
+    ]:
+        cubin_files += [
+            (kernel + name, extension)
+            for name, extension in get_available_cubin_files(
+                FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
+            )
+        ]
+    return cubin_files
+
+
 def download_artifacts():
     with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
-        cubin_files = [
-            (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
-            (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
-            (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
-        ]
-        for kernel in [
-            ArtifactPath.TRTLLM_GEN_FMHA,
-            ArtifactPath.TRTLLM_GEN_BMM,
-            ArtifactPath.TRTLLM_GEN_GEMM,
-            ArtifactPath.DEEPGEMM,
-        ]:
-            cubin_files += [
-                (kernel + name, extension)
-                for name, extension in get_available_cubin_files(
-                    FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
-                )
-            ]
-
+        cubin_files = get_cubin_file_list()
         num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
         pool = ThreadPoolExecutor(num_threads)
         futures = []
@@ -121,15 +164,38 @@ def download_artifacts():
             ret = pool.submit(get_cubin, name, "", extension)
             futures.append(ret)
         results = []
-        with tqdm(total=len(futures), desc="Downloading cubins") as pbar:
+        with (
+            patch_logger_for_tqdm(logger),
+            tqdm(total=len(futures), desc="Downloading cubins") as pbar,
+        ):
             for ret in as_completed(futures):
                 result = ret.result()
                 results.append(result)
                 pbar.update(1)
         all_success = all(results)
-
     if not all_success:
         raise RuntimeError("Failed to download cubins")
+
+
+def download_artifacts_status():
+    """
+    Check which cubins are already downloaded and return (num_downloaded, total).
+    Does not download any cubins.
+    """
+    cubin_files = get_cubin_file_list()
+    num_downloaded = 0
+    for name, extension in cubin_files:
+        # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
+        # Remove any leading slashes from name
+        rel_path = name.lstrip("/")
+        local_path = os.path.join(FLASHINFER_CUBIN_DIR, rel_path)
+        exists = os.path.isfile(local_path + extension)
+        if exists:
+            num_downloaded += 1
+        else:
+            print(f"Cubin {name}{extension} does not exist")
+    total = len(cubin_files)
+    return num_downloaded, total
 
 
 def clear_cubin():
