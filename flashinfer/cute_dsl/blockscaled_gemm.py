@@ -59,8 +59,8 @@ from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 
 
-DEBUG_EXIT_AFTER_FIRST_WAIT = True
-# DEBUG_EXIT_AFTER_FIRST_WAIT = False
+# DEBUG_EXIT_AFTER_FIRST_WAIT = True
+DEBUG_EXIT_AFTER_FIRST_WAIT = False
 
 
 sizeof_i32 = 4
