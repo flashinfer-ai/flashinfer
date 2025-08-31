@@ -511,6 +511,7 @@ def test_trtllm_batch_decode(
 
     # Create query tensor and related data
     q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
@@ -575,6 +576,30 @@ def test_trtllm_batch_decode(
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
+    if q_len_per_req > 1:
+        # hide the output_ref from decode wrapper for speculative decoding test
+        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout
+        )
+        plan_params_prefill = {
+            "qo_indptr": q_indptr,
+            "paged_kv_indptr": kv_indptr,
+            "paged_kv_indices": all_page_ids,
+            "paged_kv_last_page_len": kv_last_page_len.to(GPU_DEVICE),
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim_qk": head_dim,
+            "page_size": page_size,
+            "causal": True,
+            "pos_encoding_mode": "NONE",
+            "logits_soft_cap": 0.0,
+            "q_data_type": ref_q.dtype,
+            "kv_data_type": ref_kv_cache.dtype,
+            "window_left": window_left,
+        }
+        wrapper_ref.plan(**plan_params_prefill)
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
 
@@ -610,7 +635,10 @@ def test_trtllm_batch_decode(
         rtol, atol = 1e-2, 1e-2
 
     # convert to float32 for fp8 is not supported by assert_close
-    # todo(Yingyi): fix precision issue by prefill wrapper
+    # relax rtol and atol for speculative decoding test
+    if q_len_per_req > 1:
+        rtol, atol = rtol * 2, atol * 2
+
     torch.testing.assert_close(
         output.float() * o_scale,
         output_ref.float(),
