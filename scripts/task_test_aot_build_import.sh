@@ -2,7 +2,18 @@
 
 set -eo pipefail
 set -x
-: ${MAX_JOBS:=$(nproc)}
+
+# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
+MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
+NPROC=$(nproc)
+MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
+if (( MAX_JOBS < 1 )); then
+  MAX_JOBS=1
+fi
+if (( NPROC < MAX_JOBS )); then
+  MAX_JOBS=$NPROC
+fi
+
 : ${CUDA_VISIBLE_DEVICES:=""}
 export TORCH_CUDA_ARCH_LIST=$(python3 -c '
 import torch
