@@ -20,9 +20,30 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests  # type: ignore[import-untyped]
+import shutil
 
 from .jit.core import logger
-from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY, get_cubin
+from .jit.cubin_loader import (
+    FLASHINFER_CUBINS_REPOSITORY,
+    get_cubin,
+    FLASHINFER_CUBIN_DIR,
+)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def temp_env_var(key, value):
+    old_value = os.environ.get(key, None)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old_value
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
@@ -72,39 +93,44 @@ class MetaInfoHash:
     )
 
 
-def download_artifacts() -> bool:
-    env_backup = os.environ.get("FLASHINFER_CUBIN_CHECKSUM_DISABLED", None)
-    os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = "1"
-    cubin_files = [
-        (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
-        (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
-        (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
-    ]
-    for kernel in [
-        ArtifactPath.TRTLLM_GEN_FMHA,
-        ArtifactPath.TRTLLM_GEN_BMM,
-        ArtifactPath.TRTLLM_GEN_GEMM,
-        ArtifactPath.DEEPGEMM,
-    ]:
-        cubin_files += [
-            (kernel + name, extension)
-            for name, extension in get_available_cubin_files(
-                FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
-            )
+def download_artifacts():
+    with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
+        cubin_files = [
+            (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
+            (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
+            (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
         ]
-    pool = ThreadPoolExecutor(4)
-    futures = []
-    for name, extension in cubin_files:
-        ret = pool.submit(get_cubin, name, "", extension)
-        futures.append(ret)
-    results = []
-    for ret in as_completed(futures):
-        result = ret.result()
-        results.append(result)
-    all_success = all(results)
-    if not env_backup:
-        os.environ.pop("FLASHINFER_CUBIN_CHECKSUM_DISABLED")
-    else:
-        os.environ["FLASHINFER_CUBIN_CHECKSUM_DISABLED"] = env_backup
+        for kernel in [
+            ArtifactPath.TRTLLM_GEN_FMHA,
+            ArtifactPath.TRTLLM_GEN_BMM,
+            ArtifactPath.TRTLLM_GEN_GEMM,
+            ArtifactPath.DEEPGEMM,
+        ]:
+            cubin_files += [
+                (kernel + name, extension)
+                for name, extension in get_available_cubin_files(
+                    FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
+                )
+            ]
+        num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+        pool = ThreadPoolExecutor(num_threads)
+        futures = []
+        for name, extension in cubin_files:
+            ret = pool.submit(get_cubin, name, "", extension)
+            futures.append(ret)
+        results = []
+        for ret in as_completed(futures):
+            result = ret.result()
+            results.append(result)
+        all_success = all(results)
 
-    return all_success
+    if not all_success:
+        raise RuntimeError("Failed to download cubins")
+
+
+def clear_cubin():
+    if os.path.exists(FLASHINFER_CUBIN_DIR):
+        print(f"Clearing cubin directory: {FLASHINFER_CUBIN_DIR}")
+        shutil.rmtree(FLASHINFER_CUBIN_DIR)
+    else:
+        print(f"Cubin directory does not exist: {FLASHINFER_CUBIN_DIR}")
