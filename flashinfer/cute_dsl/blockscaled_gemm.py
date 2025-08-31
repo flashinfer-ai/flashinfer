@@ -104,44 +104,42 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
 # TODO only wait once per warp?
 @cute.jit
 def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
-    if cutlass.cute.arch.lane_idx() == 0:
-        # # TODO disable this time check
-        # repeat_count = Int64(0)
+    # # TODO disable this time check
+    # repeat_count = Int64(0)
 
-        ready = Int32(0)
+    ready = Int32(0)
 
-        # early exiting / early return is not supported in cute dsl
-        while ready != expect_value:
-            ready = Int32(
-                llvm.inline_asm(
-                    T.i32(),
-                    [addr.ir_value(loc=loc, ip=ip)],
-                    # TODO how to add `:"memory"` clobber?
-                    "ld.acquire.gpu.global.s32 $0, [$1];",
-                    "=r,l",
-                    has_side_effects=True,
-                    is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT,
-                )
-            )
-
+    # early exiting / early return is not supported in cute dsl
+    while ready != expect_value:
+        ready = Int32(
             llvm.inline_asm(
-                None,
-                [],
-                "nanosleep.u32 20;",
-                "",
+                T.i32(),
+                [addr.ir_value(loc=loc, ip=ip)],
+                # TODO how to add `:"memory"` clobber?
+                "ld.acquire.gpu.global.s32 $0, [$1];",
+                "=r,l",
                 has_side_effects=True,
                 is_align_stack=False,
                 asm_dialect=llvm.AsmDialect.AD_ATT,
             )
+        )
 
-            # repeat_count += 1
-            # if repeat_count % 1_000_000_000 == 0:
-            #     tidx, _, _ = cute.arch.thread_idx()
-            #     if tidx % 32 == 0:
-            #         cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
+        llvm.inline_asm(
+            None,
+            [],
+            "nanosleep.u32 20;",
+            "",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
 
-    cutlass.cute.arch.sync_warp()
+        # repeat_count += 1
+        # if repeat_count % 1_000_000_000 == 0:
+        #     tidx, _, _ = cute.arch.thread_idx()
+        #     if tidx % 32 == 0:
+        #         cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
+
 
 class MaskedSchedulerParams:
     def __init__(
