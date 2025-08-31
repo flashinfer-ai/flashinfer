@@ -18,6 +18,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 import requests  # type: ignore[import-untyped]
 import shutil
@@ -112,6 +113,7 @@ def download_artifacts():
                     FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
                 )
             ]
+
         num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
         pool = ThreadPoolExecutor(num_threads)
         futures = []
@@ -119,9 +121,11 @@ def download_artifacts():
             ret = pool.submit(get_cubin, name, "", extension)
             futures.append(ret)
         results = []
-        for ret in as_completed(futures):
-            result = ret.result()
-            results.append(result)
+        with tqdm(total=len(futures), desc="Downloading cubins") as pbar:
+            for ret in as_completed(futures):
+                result = ret.result()
+                results.append(result)
+                pbar.update(1)
         all_success = all(results)
 
     if not all_success:
