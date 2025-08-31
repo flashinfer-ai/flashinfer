@@ -18,7 +18,6 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 
 import requests  # type: ignore[import-untyped]
 import shutil
@@ -54,6 +53,7 @@ def patch_logger_for_tqdm(logger):
     Context manager to patch the logger so that log messages are displayed using tqdm.write,
     preventing interference with tqdm progress bars.
     """
+    import tqdm
 
     class TqdmLoggingHandler(logging.Handler):
         def emit(self, record):
@@ -155,6 +155,8 @@ def get_cubin_file_list():
 
 
 def download_artifacts():
+    import tqdm
+
     with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
         cubin_files = get_cubin_file_list()
         num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
