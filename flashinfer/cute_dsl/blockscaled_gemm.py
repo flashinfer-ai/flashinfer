@@ -110,7 +110,8 @@ def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
     ready = Int32(0)
 
     # early exiting / early return is not supported in cute dsl
-    while ready != expect_value:
+    HACK_DELTA = 500
+    while ready < expect_value - HACK_DELTA:
         ready = Int32(
             llvm.inline_asm(
                 T.i32(),
