@@ -9,8 +9,7 @@ NPROC=$(nproc)
 MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
 if (( MAX_JOBS < 1 )); then
   MAX_JOBS=1
-fi
-if (( NPROC < MAX_JOBS )); then
+elif (( NPROC < MAX_JOBS )); then
   MAX_JOBS=$NPROC
 fi
 
