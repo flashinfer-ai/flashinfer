@@ -177,25 +177,23 @@ def download_artifacts():
         raise RuntimeError("Failed to download cubins")
 
 
-def download_artifacts_status():
+def get_artifacts_status():
     """
     Check which cubins are already downloaded and return (num_downloaded, total).
     Does not download any cubins.
     """
     cubin_files = get_cubin_file_list()
-    num_downloaded = 0
+    status = []
     for name, extension in cubin_files:
         # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
         # Remove any leading slashes from name
         rel_path = name.lstrip("/")
         local_path = os.path.join(FLASHINFER_CUBIN_DIR, rel_path)
         exists = os.path.isfile(local_path + extension)
-        if exists:
-            num_downloaded += 1
-        else:
+        status.append((name, extension, exists))
+        if not exists:
             print(f"Cubin {name}{extension} does not exist")
-    total = len(cubin_files)
-    return num_downloaded, total
+    return status
 
 
 def clear_cubin():

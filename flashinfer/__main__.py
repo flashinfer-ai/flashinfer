@@ -16,12 +16,12 @@ limitations under the License.
 
 # flashinfer-cli
 import click
+from tabulate import tabulate  # type: ignore[import-untyped]
 
 from .artifacts import (
     download_artifacts,
     clear_cubin,
-    download_artifacts_status,
-    get_cubin_file_list,
+    get_artifacts_status,
 )
 from .jit import clear_cache_dir
 
@@ -63,9 +63,12 @@ def show_config_cmd():
 
     # Section: Downloaded Cubins
     click.secho("=== Downloaded Cubins ===", fg="yellow")
-    num_downloaded, total = download_artifacts_status()
-    click.secho(f"Downloaded {num_downloaded} out of {total} cubins", fg="green")
-    click.secho("", fg="white")
+
+    status = get_artifacts_status()
+    num_downloaded = sum(1 for _, _, exists in status if exists)
+    total_cubins = len(status)
+
+    click.secho(f"Downloaded {num_downloaded}/{total_cubins} cubins", fg="cyan")
 
     # Section: Compiled Kernels
     click.secho("=== Compiled Kernels ===", fg="yellow")
@@ -75,9 +78,15 @@ def show_config_cmd():
 @cli.command("list-cubins")
 def list_cubins_cmd():
     """List downloaded cubins"""
-    cubin_files = get_cubin_file_list()
-    for name, extension in cubin_files:
-        click.secho(f"{name}{extension}", fg="cyan")
+    status = get_artifacts_status()
+    table_data = []
+    for name, extension, exists in status:
+        status_str = "Downloaded" if exists else "Missing"
+        color = "green" if exists else "red"
+        table_data.append([f"{name}{extension}", click.style(status_str, fg=color)])
+
+    click.echo(tabulate(table_data, headers=["Cubin", "Status"], tablefmt="github"))
+    click.secho("", fg="white")
 
 
 @cli.command("list-compiled-kernels")
