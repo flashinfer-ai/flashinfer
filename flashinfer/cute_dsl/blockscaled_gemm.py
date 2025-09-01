@@ -3103,9 +3103,10 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")
 
-    assert dst_signals.dtype == torch.int32
-    assert dst_signals.shape == (l, ceil_div(m, mma_tiler_mn[0]))
-    assert dst_signals.is_contiguous()
+    if dst_signals is not None:
+        assert dst_signals.dtype == torch.int32
+        assert dst_signals.shape == (l, ceil_div(m, mma_tiler_mn[0]))
+        assert dst_signals.is_contiguous()
 
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
