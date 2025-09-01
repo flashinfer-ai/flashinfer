@@ -198,7 +198,7 @@ def test_blockscaled_gemm_python_interface(
         )
 
         if enable_dst_signals:
-            assert torch.all(dst_signals == sm_count), f"{dst_signals}"
+            assert torch.all(dst_signals == sm_count), f"{dst_signals=} {masked_m_tensor=}"
 
     # compute ref output
     if not fuse_alpha:
