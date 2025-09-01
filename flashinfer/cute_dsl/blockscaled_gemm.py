@@ -331,10 +331,10 @@ class MaskedScheduler:
     def _get_current_work_for_linear_idx(
         self,
         current_work_linear_idx: Int32,
-        dsm_pending_packed: Optional[Uint64],
-        dsm_counter: Optional[Uint8],
-        num_c_stage: Optional[int] = None,
-    ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
+        # dsm_pending_packed: Optional[Uint64],
+        # dsm_counter: Optional[Uint8],
+        # num_c_stage: Optional[int] = None,
+    ) -> WorkTileInfo:  # Tuple[WorkTileInfo, Optional[Uint64]]:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
@@ -351,9 +351,9 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if cutlass.const_expr((dsm_pending_packed is not None) and (self.params.dst_signals is not None)):
-                # TODO check off by one
-                dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
+            # if cutlass.const_expr((dsm_pending_packed is not None) and (self.params.dst_signals is not None)):
+            #     # TODO check off by one
+            #     dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
             if cutlass.const_expr(self.params.src_signals is not None):
                 if batch_idx < self.params.masked_m.shape[0] - 1:
                     wait_signal(
@@ -398,27 +398,28 @@ class MaskedScheduler:
             )
         )
 
-        return WorkTileInfo(cur_tile_coord, is_valid), dsm_pending_packed
+        return WorkTileInfo(cur_tile_coord, is_valid) #, dsm_pending_packed
 
     @dsl_user_op
     def get_current_work(
         self,
-        dsm_pending_packed: Optional[Uint64] = None,
-        dsm_counter: Optional[Uint8] = None,
-        num_c_stage: Optional[int] = None,
+        # dsm_pending_packed: Optional[Uint64] = None,
+        # dsm_counter: Optional[Uint8] = None,
+        # num_c_stage: Optional[int] = None,
         *, loc=None, ip=None,
-    ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
+    ) -> WorkTileInfo: # Tuple[WorkTileInfo, Optional[Uint64]]:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
-            dsm_pending_packed=dsm_pending_packed,
-            dsm_counter=dsm_counter,
-            num_c_stage=num_c_stage,
+            # dsm_pending_packed=dsm_pending_packed,
+            # dsm_counter=dsm_counter,
+            # num_c_stage=num_c_stage,
         )
 
     @dsl_user_op
     def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
-        tile_info, _ = self.get_current_work(loc=loc, ip=ip)
-        return tile_info
+        # tile_info, _ = self.get_current_work(loc=loc, ip=ip)
+        # return tile_info
+        return self.get_current_work(loc=loc, ip=ip)
 
     @dsl_user_op
     def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
@@ -1412,7 +1413,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile, _ = tile_sched.get_current_work()
+                # work_tile, _ = tile_sched.get_current_work()
+                work_tile = tile_sched.get_current_work()
 
             #
             # Wait A/B buffer empty
@@ -1616,7 +1618,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile, _ = tile_sched.get_current_work()
+                # work_tile, _ = tile_sched.get_current_work()
+                work_tile = tile_sched.get_current_work()
 
             #
             # Wait for accumulator buffer empty
@@ -1699,13 +1702,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-            if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                assert self.num_c_stage < 256, "must be representable in 1 byte"
-                num_experts = tile_sched_params.masked_m.shape[0]
-                assert num_experts <= 8, "need to be packable into a u64"
-            dsm_pending_packed = Uint64(0)
-            dsm_pending_idx = Int32(0)
-            dsm_counter = Uint8(0)
+            # if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+            #     assert self.num_c_stage < 256, "must be representable in 1 byte"
+            #     num_experts = tile_sched_params.masked_m.shape[0]
+            #     assert num_experts <= 8, "need to be packable into a u64"
+            # dsm_pending_packed = Uint64(0)
+            # dsm_pending_idx = Int32(0)
+            # dsm_counter = Uint8(0)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1848,10 +1851,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
-                work_tile, dsm_pending_packed = tile_sched.get_current_work(
-                    dsm_pending_packed=dsm_pending_packed,
-                    dsm_counter=dsm_counter,
-                    num_c_stage=self.num_c_stage,
+                # work_tile, dsm_pending_packed = tile_sched.get_current_work(
+                work_tile = tile_sched.get_current_work(
+                    # dsm_pending_packed=dsm_pending_packed,
+                    # dsm_counter=dsm_counter,
+                    # num_c_stage=self.num_c_stage,
                 )
 
             #
