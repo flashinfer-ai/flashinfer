@@ -89,11 +89,6 @@ void CutlassGemmGroupwiseScaledSM120(TensorView float_workspace_buffer, TensorVi
   cudaSetDevice(float_workspace_buffer.device().device_id);
   auto stream = get_stream(C.device());
 
-  // Ensure scales are contiguous
-  // Note: We keep the original shape and let the kernel's layout handle interpretation
-  CHECK_CONTIGUOUS(SFA);
-  CHECK_CONTIGUOUS(SFB);
-
   DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
     return DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(A.dtype(), C.dtype(), c_type_in, c_type_out, [&] {
       return DISPATCH_SCALE_GRANULARITY(
