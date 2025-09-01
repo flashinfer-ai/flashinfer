@@ -175,7 +175,7 @@ def test_blockscaled_gemm_python_interface(
 
     for _ in range(iterations):
         # dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
-        dst_signals = torch.zeros((l, ceil_div(m, mma_tiler_mn[0])), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+        dst_signals = torch.zeros((l, ceil_div(m, mma_tiler_mn[0])), dtype=torch.int32, device="cuda") if enable_dst_signals else None
 
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
