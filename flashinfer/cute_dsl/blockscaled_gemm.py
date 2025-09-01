@@ -1709,6 +1709,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # dsm_pending_packed = Uint64(0)
             # dsm_pending_idx = Int32(0)
             # dsm_counter = Uint8(0)
+            dsm_pending_block_m = Int32(-1)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1788,6 +1789,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         number_of_threads=epilog_threads,
                     )
 
+                    assert subtile_cnt >= self.num_c_stage - 1
+                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_block_m != -1)
+
                     #
                     # TMA store C to global memory
                     #
@@ -1802,10 +1806,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         c_pipeline.producer_commit()
 
                         if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                            dsm_counter = (dsm_counter + 1).to(Uint8)
-                            will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
+                            # dsm_counter = (dsm_counter + 1).to(Uint8)
+                            # dsm_will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
 
-                            if will_write_signals:
+                            if dsm_will_write_signals:
                                 # The original c_pipeline.producer_acquire()
                                 #   := PipelineTmaStore.producer_acquire()
                                 #   := TmaStoreFence.wait()
@@ -1829,16 +1833,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                         lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
-                            while (
-                                (dsm_pending_idx < num_experts) and
-                                (read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
-                            ):
+                            # while (
+                            #     (dsm_pending_idx < num_experts) and
+                            #     (read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
+                            # ):
+                            if dsm_will_write_signals:
                                 # TODO unify w/ the other branch
+                                # atomic_add_release_global(
+                                #     tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                                #     value=1,
+                                # )
+                                # dsm_pending_idx += 1
+                                offset = TODO
                                 atomic_add_release_global(
-                                    tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                                    tile_sched_params.dst_signals.toint() + sizeof_i32 * offset,
                                     value=1,
                                 )
-                                dsm_pending_idx += 1
 
                 #
                 # Async arrive accumulator buffer empty
