@@ -2801,8 +2801,8 @@ def grouped_gemm_nt_masked(
         # Note: only support deepgemm-like shape for now
         k = k * 2
 
-    mma_tiler_mn = kwargs.pop("mma_tiler_mm", (128, 128))
-    cluster_shape_mn = kwargs.pop("cluster_shape_mm", (1, 1))
+    mma_tiler_mn = kwargs.pop("mma_tiler_mn", (128, 128))
+    cluster_shape_mn = kwargs.pop("cluster_shape_mn", (1, 1))
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
 
