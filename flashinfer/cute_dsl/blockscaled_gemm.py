@@ -1804,7 +1804,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         number_of_threads=epilog_threads,
                     )
 
-                    assert subtile_cnt >= self.num_c_stage - 1
+                    if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+                        assert subtile_cnt >= self.num_c_stage - 1
                     dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_group_idx_and_m_block_idx[1] != -1)
 
                     #
