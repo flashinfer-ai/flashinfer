@@ -1713,7 +1713,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # dsm_pending_packed = Uint64(0)
             # dsm_pending_idx = Int32(0)
             # dsm_counter = Uint8(0)
-            dsm_pending_m_block_idx = Int32(-1)
+            dsm_pending_group_idx_and_m_block_idx = (Int32(-1), Int32(-1))
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1794,7 +1794,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
 
                     assert subtile_cnt >= self.num_c_stage - 1
-                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_m_block_idx != -1)
+                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_group_idx_and_m_block_idx[1] != -1)
 
                     #
                     # TMA store C to global memory
@@ -1850,7 +1850,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 # dsm_pending_idx += 1
                                 write_signal(
                                     tile_sched_params.dst_signals,
-                                    m_block_idx=dsm_pending_m_block_idx,
+                                    group_idx_and_m_block_idx=dsm_pending_group_idx_and_m_block_idx,
                                 )
 
                 #
@@ -1861,7 +1861,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 acc_consumer_state.advance()
 
                 if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                    dsm_pending_m_block_idx = work_tile.tile_idx[0]
+                    dsm_pending_group_idx_and_m_block_idx = (work_tile.tile_idx[2], work_tile.tile_idx[0])
 
                 #
                 # Advance to next tile
@@ -1915,10 +1915,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #         value=1,
                     #     )
                     #     dsm_pending_idx += 1
-                    if dsm_pending_m_block_idx != -1:
+                    if dsm_pending_group_idx_and_m_block_idx[1] != -1:
                         write_signal(
                             tile_sched_params.dst_signals,
-                            m_block_idx=dsm_pending_m_block_idx,
+                            group_idx_and_m_block_idx=dsm_pending_group_idx_and_m_block_idx,
                         )
 
             else:
