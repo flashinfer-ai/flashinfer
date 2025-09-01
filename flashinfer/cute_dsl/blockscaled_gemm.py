@@ -2809,7 +2809,7 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.pop("alpha", None)
     alpha_dtype = kwargs.pop("alpha_dtype", None)
 
-    assert len(kwargs) == 0, f"Unsupports kwargs: {kwargs}"
+    assert len(kwargs) == 0, f"Unsupported kwargs: {kwargs}"
 
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
