@@ -3096,13 +3096,15 @@ def grouped_gemm_nt_masked(
         # Note: only support deepgemm-like shape for now
         k = k * 2
 
-    mma_tiler_mn = kwargs.get("mma_tiler_mm", (128, 128))
-    cluster_shape_mn = kwargs.get("cluster_shape_mm", (1, 1))
+    mma_tiler_mn = kwargs.pop("mma_tiler_mm", (128, 128))
+    cluster_shape_mn = kwargs.pop("cluster_shape_mm", (1, 1))
     if sm_count is None:
         sm_count = get_num_sm(a_torch.device)
 
-    alpha = kwargs.get("alpha")
-    alpha_dtype = kwargs.get("alpha_dtype")
+    alpha = kwargs.pop("alpha", None)
+    alpha_dtype = kwargs.pop("alpha_dtype", None)
+
+    assert len(kwargs) == 0, f"Unsupports kwargs: {kwargs}"
 
     if dst_signals is not None:
         assert dst_signals.dtype == torch.int32
