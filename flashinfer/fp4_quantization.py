@@ -73,9 +73,13 @@ def gen_fp4_quantization_sm90_module() -> JitSpec:
 
 def gen_fp4_quantization_sm120_module() -> JitSpec:
     import os
+    import logging
     variant = os.environ.get("FLASHINFER_SM120_VARIANT", "120a")
     flags = sm120a_nvcc_flags if variant == "120a" else sm120_nvcc_flags
-    return gen_fp4_quantization_module(flags, "120")
+    device_arch = "120a" if variant == "120a" else "120"
+    if variant != "120a":
+        logging.info(f"FlashInfer: Using SM120 variant={variant} (non-default)")
+    return gen_fp4_quantization_module(flags, device_arch)
 
 
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
@@ -433,10 +437,12 @@ def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.
 def _pad_k_to_multiple_of_4(t):
     """Pad last dim (K) to a multiple of 4 with zeros.
     Returns (t_padded, original_K, pad_k). Output is contiguous."""
+    import logging
     K = t.shape[-1]
     pad_k = (-K) % 4  # How much padding needed
     if pad_k == 0:
         return t, K, 0
+    logging.debug(f"MXFP4: padded K by {pad_k} from {K} to {K+pad_k} for scale-shuffle")
     return torch.nn.functional.pad(t, (0, pad_k)).contiguous(), K, pad_k
 
 
@@ -524,8 +530,8 @@ def nvfp4_quantize(
         )
 
         epilogue_tile_m = 128
-        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
-        a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+        a_fp4 = shuffle_matrix_a(a_fp4.to(torch.uint8), epilogue_tile_m)
+        a_sf = shuffle_matrix_sf_a(a_sf.to(torch.uint8), epilogue_tile_m).reshape(
             a_sf.shape
         )
     else:
@@ -573,8 +579,8 @@ def mxfp4_dequantize(a_fp4, a_sf):
         torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
     """
     return e2m1_and_ufp8sf_scale_to_float(
-        a_fp4.cpu().view(torch.uint8),
-        a_sf.cpu().view(torch.uint8).reshape(-1),
+        a_fp4.cpu().to(torch.uint8),
+        a_sf.cpu().to(torch.uint8).reshape(-1),
         torch.tensor([1.0], device=a_fp4.device),
         32,
         0,

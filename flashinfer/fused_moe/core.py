@@ -271,6 +271,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
     # Default to SM120a; set FLASHINFER_SM120_VARIANT=120 to use sm_120
     import os
+    import logging
     variant = os.environ.get("FLASHINFER_SM120_VARIANT", "120a")
     nvcc_flags = (sm120a_nvcc_flags if variant == "120a" else sm120_nvcc_flags) + [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
@@ -280,7 +281,10 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
-    return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
+    device_arch = "120a" if variant == "120a" else "120"
+    if variant != "120a":
+        logging.info(f"FlashInfer MoE: Using SM120 variant={variant} (non-default)")
+    return gen_cutlass_fused_moe_module(nvcc_flags, device_arch, use_fast_build)
 
 
 def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
