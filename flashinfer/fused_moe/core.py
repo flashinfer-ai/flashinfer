@@ -269,7 +269,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
-    # Use SM120a if env var says so, otherwise SM120
+    # Default to SM120a; set FLASHINFER_SM120_VARIANT=120 to use sm_120
     import os
     variant = os.environ.get("FLASHINFER_SM120_VARIANT", "120a")
     nvcc_flags = (sm120a_nvcc_flags if variant == "120a" else sm120_nvcc_flags) + [

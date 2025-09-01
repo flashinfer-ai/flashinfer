@@ -23,7 +23,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags, sm120a_nvcc_flags
+from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags, sm120a_nvcc_flags, sm120_nvcc_flags
 from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
@@ -72,7 +72,10 @@ def gen_fp4_quantization_sm90_module() -> JitSpec:
 
 
 def gen_fp4_quantization_sm120_module() -> JitSpec:
-    return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
+    import os
+    variant = os.environ.get("FLASHINFER_SM120_VARIANT", "120a")
+    flags = sm120a_nvcc_flags if variant == "120a" else sm120_nvcc_flags
+    return gen_fp4_quantization_module(flags, "120")
 
 
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
