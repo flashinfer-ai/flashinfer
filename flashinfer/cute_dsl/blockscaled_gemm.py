@@ -101,14 +101,17 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
 
 @dsl_user_op
 def write_signal(
-        dst_signals: cute.Pointer,
+        tile_sched_params: "MaskedSchedulerParams",
         group_idx_and_m_block_idx,
-        shape_m,
-        block_m,
         *, loc=None, ip=None,
 ):
+    dst_signals = tile_sched_params.dst_signals
     group_idx, m_block_idx = group_idx_and_m_block_idx
+    shape_m = tile_sched_params.c.shape[0]
+    block_m = tile_sched_params.c_tiler[0]
+
     offset = group_idx * ceil_div(shape_m, block_m) + m_block_idx
+
     atomic_add_release_global(dst_signals.toint() + sizeof_i32 * offset, value=1)
 
 # TODO unify i32 or u32
@@ -1855,12 +1858,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 #     value=1,
                                 # )
                                 # dsm_pending_idx += 1
-                                write_signal(
-                                    tile_sched_params.dst_signals,
-                                    group_idx_and_m_block_idx=dsm_pending_group_idx_and_m_block_idx,
-                                    shape_m=tile_sched_params.c.shape[0],
-                                    block_m=tile_sched_params.c_tiler[0],
-                                )
+                                write_signal(tile_sched_params, dsm_pending_group_idx_and_m_block_idx)
 
                 #
                 # Async arrive accumulator buffer empty
@@ -1925,10 +1923,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #     )
                     #     dsm_pending_idx += 1
                     if dsm_pending_group_idx_and_m_block_idx[1] != -1:
-                        write_signal(
-                            tile_sched_params.dst_signals,
-                            group_idx_and_m_block_idx=dsm_pending_group_idx_and_m_block_idx,
-                        )
+                        write_signal(tile_sched_params, dsm_pending_group_idx_and_m_block_idx)
 
             else:
                 c_pipeline.producer_tail()
