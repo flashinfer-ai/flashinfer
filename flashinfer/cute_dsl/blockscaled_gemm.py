@@ -1709,7 +1709,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # dsm_pending_packed = Uint64(0)
             # dsm_pending_idx = Int32(0)
             # dsm_counter = Uint8(0)
-            dsm_pending_block_m = Int32(-1)
+            dsm_pending_block_m_idx = Int32(-1)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1790,7 +1790,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
 
                     assert subtile_cnt >= self.num_c_stage - 1
-                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_block_m != -1)
+                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_block_m_idx != -1)
 
                     #
                     # TMA store C to global memory
@@ -1856,6 +1856,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
+
+                dsm_pending_block_m_idx = work_tile.tile_idx[0]
 
                 #
                 # Advance to next tile
