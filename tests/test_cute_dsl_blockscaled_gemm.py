@@ -21,6 +21,7 @@ from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     is_cute_dsl_available,
 )
+from flashinfer.utils import ceil_div
 
 
 @pytest.mark.skipif(
@@ -173,7 +174,8 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
 
     for _ in range(iterations):
-        dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+        # dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+        dst_signals = torch.zeros((l, ceil_div(m, mma_tiler_mn[0])), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
 
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
