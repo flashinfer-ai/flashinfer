@@ -252,8 +252,10 @@ def test_blockscaled_gemm_python_interface(
 
 if __name__ == "__main__":
     test_blockscaled_gemm_python_interface(
-        lm=(1, 1024),
-        kn=(7168, 4096),
+        # lm=(1, 1024),
+        # kn=(7168, 4096),
+        lm=(6, 1024),
+        kn=(2048, 7168),
         ab_dtype="float4_e2m1fn",
         sf_dtype="float8_e8m0fnu",
         sf_vec_size=16,
