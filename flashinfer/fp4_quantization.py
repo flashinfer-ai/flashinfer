@@ -445,6 +445,12 @@ def shuffle_matrix_sf_a(
     and are in linear layout.
     This function doesn't add padding.
     """
+    
+    # Handle K not divisible by 4 (e.g., GPT-OSS-20b with intermediate_size=2880)
+    M, K = input_tensor.shape
+    if K % 4 != 0:
+        pad_k = (4 - K % 4)
+        input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_k), value=0)
 
     row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor, epilogue_tile_m)
 
