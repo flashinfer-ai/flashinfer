@@ -60,6 +60,10 @@ class CompilationContext:
             ]
         else:
             supported_cuda_archs = self.TARGET_CUDA_ARCHS
+        if len(supported_cuda_archs) == 0:
+            raise RuntimeError(
+                f"No supported CUDA architectures found for major versions {supported_major_versions}."
+            )
         return [
             f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
             for major, minor in supported_cuda_archs
