@@ -62,8 +62,7 @@ from flashinfer.utils import ceil_div
 @pytest.mark.parametrize("iterations", [3])
 # TODO enable in tests
 @pytest.mark.parametrize("enable_src_signals", [True])
-# TODO enable in tests
-@pytest.mark.parametrize("enable_dst_signals", [False])
+@pytest.mark.parametrize("enable_dst_signals", [False, True])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
