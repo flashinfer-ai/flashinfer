@@ -452,17 +452,11 @@ def shuffle_matrix_sf_a(
     num_elts_per_sf: int = 16,
 ):
     """
-    Shuffle scale-factor matrix for MXFP4. 
-    
-    This function may pad the last dim (K) to a multiple of 4. 
-    The returned tensor is the shuffled (and potentially padded) result 
-    with K % 4 == 0 guaranteed.
-    
-    The padding (if any) consists of zeros and is benign for downstream
-    operations. The original K can be recovered if needed from the caller's
-    knowledge of the unpadded shape.
-    
-    This function expects the input to be in linear layout.
+    Shuffle scale-factor matrix for MXFP4.
+
+    May pad the last dim (K) to a multiple of 4; returns the shuffled (and possibly
+    padded) tensor with K % 4 == 0. Padding is zeros and benign for downstream ops.
+    Expects input in linear layout.
     """
     
     # Ensure K is a multiple of 4 for index calc and downstream kernels
@@ -472,12 +466,8 @@ def shuffle_matrix_sf_a(
 
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
-    # 128x4
-    result = block_scale_interleave(w_shuffled)
-    
-    # Keep the padded result for consistency with downstream operations
-    # The padding is zeros, so it won't affect computations
-    return result
+    # 128x4; keep padding (zeros) by design
+    return block_scale_interleave(w_shuffled)
 
 
 class SfLayout(Enum):
