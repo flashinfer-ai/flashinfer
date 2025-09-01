@@ -35,6 +35,7 @@ class CompilationContext:
         if "FLASHINFER_CUDA_ARCH_LIST" in os.environ:
             for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
                 major, minor = arch.split(".")
+                major = int(major)
                 if major >= 9:
                     if minor.isdigit():
                         minor = str(minor) + "a"
