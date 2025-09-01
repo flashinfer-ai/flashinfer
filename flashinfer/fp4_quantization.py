@@ -23,7 +23,7 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags
+from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags, sm120a_nvcc_flags
 from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
@@ -71,6 +71,10 @@ def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
 
 
+def gen_fp4_quantization_sm120_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
+
+
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
     return gen_jit_spec(
         f"fp4_quantization_{device_arch}",
@@ -108,6 +112,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         module = gen_fp4_quantization_sm100_module().build_and_load()
     elif backend == "90":
         module = gen_fp4_quantization_sm90_module().build_and_load()
+    elif backend == "120":
+        module = gen_fp4_quantization_sm120_module().build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
