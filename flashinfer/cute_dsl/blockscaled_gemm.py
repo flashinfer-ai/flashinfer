@@ -55,7 +55,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
+from .utils import ceil_div, get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 
 
@@ -3072,6 +3072,9 @@ def grouped_gemm_nt_masked(
 
     alpha = kwargs.get("alpha")
     alpha_dtype = kwargs.get("alpha_dtype")
+
+    assert dst_signals.dtype == torch.int32
+    assert dst_signals.shape == (l, ceil_div(m, mma_tiler_mn[0]))
 
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
