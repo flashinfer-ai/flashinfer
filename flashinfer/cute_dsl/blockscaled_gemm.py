@@ -55,7 +55,8 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import ceil_div, get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
+from flashinfer.utils import ceil_div
+from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm
 from typing import Callable, List
 
 

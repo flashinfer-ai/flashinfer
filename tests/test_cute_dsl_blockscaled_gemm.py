@@ -251,30 +251,8 @@ def test_blockscaled_gemm_python_interface(
 
 
 if __name__ == "__main__":
-    # test_blockscaled_gemm_python_interface(
-    #     lm=(1, 1024),
-    #     kn=(7168, 4096),
-    #     ab_dtype="float4_e2m1fn",
-    #     sf_dtype="float8_e8m0fnu",
-    #     sf_vec_size=16,
-    #     c_dtype="float16",
-    #     a_major="k",
-    #     b_major="k",
-    #     c_major="n",
-    #     fuse_alpha=False,
-    #     alpha_dtype="float32",
-    #     mma_tiler_mn=(128, 128),
-    #     cluster_shape_mn=(2, 1),
-    #     tolerance=1e-01,
-    #     iterations=3,
-    #     sm_count=132,
-    #     enable_src_signals=False,
-    #     enable_dst_signals=True,
-    # )
-
     test_blockscaled_gemm_python_interface(
-        # TODO real value in masked_m is smaller than this m shape
-        lm=(6, 36864),
+        lm=(1, 1024),
         kn=(7168, 4096),
         ab_dtype="float4_e2m1fn",
         sf_dtype="float8_e8m0fnu",
@@ -291,5 +269,28 @@ if __name__ == "__main__":
         iterations=3,
         sm_count=132,
         enable_src_signals=False,
-        enable_dst_signals=False,
+        enable_dst_signals=True,
     )
+
+    # TODO can use this to reproduce illegal mem access
+    # test_blockscaled_gemm_python_interface(
+    #     # TODO real value in masked_m is smaller than this m shape
+    #     lm=(6, 36864),
+    #     kn=(7168, 4096),
+    #     ab_dtype="float4_e2m1fn",
+    #     sf_dtype="float8_e8m0fnu",
+    #     sf_vec_size=16,
+    #     c_dtype="float16",
+    #     a_major="k",
+    #     b_major="k",
+    #     c_major="n",
+    #     fuse_alpha=False,
+    #     alpha_dtype="float32",
+    #     mma_tiler_mn=(128, 128),
+    #     cluster_shape_mn=(2, 1),
+    #     tolerance=1e-01,
+    #     iterations=3,
+    #     sm_count=132,
+    #     enable_src_signals=False,
+    #     enable_dst_signals=False,
+    # )
