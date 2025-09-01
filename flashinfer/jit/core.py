@@ -72,6 +72,8 @@ common_nvcc_flags = [
 ]
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
+# SM120 flags - some CUDA builds accept sm_120a, others only sm_120
+sm120_nvcc_flags = ["-gencode=arch=compute_120,code=sm_120"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
 
 

@@ -31,7 +31,7 @@ from ..autotuner import (
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
+from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags, sm120a_nvcc_flags, sm120_nvcc_flags
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
@@ -268,6 +268,21 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
+def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
+    # Use SM120a if env var says so, otherwise SM120
+    import os
+    variant = os.environ.get("FLASHINFER_SM120_VARIANT", "120a")
+    nvcc_flags = (sm120a_nvcc_flags if variant == "120a" else sm120_nvcc_flags) + [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
+
+
 def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
@@ -386,6 +401,10 @@ def gen_cutlass_fused_moe_module(
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
     if backend == "100":
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
+            use_fast_build
+        ).build_and_load(class_name="FusedMoeRunner")
+    elif backend == "120":
+        FusedMoeRunner = gen_cutlass_fused_moe_sm120_module(
             use_fast_build
         ).build_and_load(class_name="FusedMoeRunner")
     elif backend == "90":
