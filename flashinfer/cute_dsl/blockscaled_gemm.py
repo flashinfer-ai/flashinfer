@@ -1857,7 +1857,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
-                dsm_pending_block_m_idx = work_tile.tile_idx[0]
+                if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+                    dsm_pending_block_m_idx = work_tile.tile_idx[0]
 
                 #
                 # Advance to next tile
