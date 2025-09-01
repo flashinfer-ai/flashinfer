@@ -430,34 +430,48 @@ def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.
     return input_tensor[row_indices.to(input_tensor.device)]
 
 
+def _pad_k_to_multiple_of_4(t):
+    """Pad last dim (K) to a multiple of 4 with zeros.
+    Returns (t_padded, original_K, pad_k). Output is contiguous."""
+    K = t.shape[-1]
+    pad_k = (-K) % 4  # How much padding needed
+    if pad_k == 0:
+        return t, K, 0
+    return torch.nn.functional.pad(t, (0, pad_k)).contiguous(), K, pad_k
+
+
 def shuffle_matrix_sf_a(
     input_tensor: torch.Tensor,
     epilogue_tile_m: int,
     num_elts_per_sf: int = 16,
 ):
     """
-    Cuda implementation of trtllm-gen `shuffleMatrixSfA` but with a caveat.
-    `shuffleMatrixSfA` expects the input to be in 128x4 layout and then
-    apply the same shuffling in `shuffleMatrixA` and writes out in 128x4
-    layout.
-    This function expects the input to be in linear layout. It's done this
-    way because the scaling factors in the NVFP4 checkpoints are quantized
-    and are in linear layout.
-    This function doesn't add padding.
+    Shuffle scale-factor matrix for MXFP4. 
+    
+    This function may pad the last dim (K) to a multiple of 4. 
+    The returned tensor is the shuffled (and potentially padded) result 
+    with K % 4 == 0 guaranteed.
+    
+    The padding (if any) consists of zeros and is benign for downstream
+    operations. The original K can be recovered if needed from the caller's
+    knowledge of the unpadded shape.
+    
+    This function expects the input to be in linear layout.
     """
     
-    # Handle K not divisible by 4 (e.g., GPT-OSS-20b with intermediate_size=2880)
-    M, K = input_tensor.shape
-    if K % 4 != 0:
-        pad_k = (4 - K % 4)
-        input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_k), value=0)
+    # Ensure K is a multiple of 4 for index calc and downstream kernels
+    input_tensor, orig_K, pad_k = _pad_k_to_multiple_of_4(input_tensor)
 
     row_indices = get_shuffle_matrix_sf_a_row_indices(input_tensor, epilogue_tile_m)
 
     w_shuffled = input_tensor[row_indices.to(input_tensor.device)]
 
     # 128x4
-    return block_scale_interleave(w_shuffled)
+    result = block_scale_interleave(w_shuffled)
+    
+    # Keep the padded result for consistency with downstream operations
+    # The padding is zeros, so it won't affect computations
+    return result
 
 
 class SfLayout(Enum):
