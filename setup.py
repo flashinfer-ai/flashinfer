@@ -106,3 +106,5 @@ setuptools.setup(
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
     distclass=AotDistribution,
 )
+
+print("DO Not Merge, only for ci testing")
