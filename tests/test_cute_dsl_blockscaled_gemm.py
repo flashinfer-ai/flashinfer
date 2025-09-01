@@ -105,6 +105,8 @@ def test_blockscaled_gemm_python_interface(
         pytest.skip(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
+    if enable_dst_signals and sf_vec_size != 16:
+        pytest.skip(f"Unsupported testcase {enable_dst_signals=} {sf_vec_size=}")
 
     if not (a_major == "k" and b_major == "k" and c_major == "n"):
         # not supported since we try to align deepgemm for now
