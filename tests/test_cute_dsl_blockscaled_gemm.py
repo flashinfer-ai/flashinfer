@@ -200,7 +200,7 @@ def test_blockscaled_gemm_python_interface(
         if enable_dst_signals:
             expect_dst_signals = torch.zeros_like(dst_signals)
             for expert_idx in range(l):
-                expect_dst_signals[l, :ceil_div(masked_m_tensor[l], mma_tiler_mn[0])] = ceil_div(k, mma_tiler_mn[1])
+                expect_dst_signals[expert_idx, :ceil_div(masked_m_tensor[expert_idx], mma_tiler_mn[0])] = ceil_div(k, mma_tiler_mn[1])
             assert torch.all(dst_signals == expect_dst_signals), f"{dst_signals=} {masked_m_tensor=}"
 
     # compute ref output
