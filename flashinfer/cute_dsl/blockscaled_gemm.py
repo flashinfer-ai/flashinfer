@@ -99,6 +99,10 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
         )
     )
 
+@dsl_user_op
+def write_signal(dst_signals: cute.Pointer, *, loc=None, ip=None):
+    offset = TODO
+    atomic_add_release_global(dst_signals.toint() + sizeof_i32 * offset, value=1)
 
 # TODO unify i32 or u32
 # TODO only wait once per warp?
@@ -1709,7 +1713,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # dsm_pending_packed = Uint64(0)
             # dsm_pending_idx = Int32(0)
             # dsm_counter = Uint8(0)
-            dsm_pending_block_m_idx = Int32(-1)
+            dsm_pending_m_block_idx = Int32(-1)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1790,7 +1794,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
 
                     assert subtile_cnt >= self.num_c_stage - 1
-                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_block_m_idx != -1)
+                    dsm_will_write_signals = (subtile_idx == self.num_c_stage - 2) and (dsm_pending_m_block_idx != -1)
 
                     #
                     # TMA store C to global memory
@@ -1844,10 +1848,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 #     value=1,
                                 # )
                                 # dsm_pending_idx += 1
-                                offset = TODO
-                                atomic_add_release_global(
-                                    tile_sched_params.dst_signals.toint() + sizeof_i32 * offset,
-                                    value=1,
+                                write_signal(
+                                    tile_sched_params.dst_signals,
+                                    m_block_idx=dsm_pending_m_block_idx,
                                 )
 
                 #
@@ -1858,7 +1861,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 acc_consumer_state.advance()
 
                 if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                    dsm_pending_block_m_idx = work_tile.tile_idx[0]
+                    dsm_pending_m_block_idx = work_tile.tile_idx[0]
 
                 #
                 # Advance to next tile
@@ -1905,13 +1908,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
-                    while dsm_pending_idx < num_experts:
-                        # TODO unify w/ the other branch
-                        atomic_add_release_global(
-                            tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
-                            value=1,
+                    # while dsm_pending_idx < num_experts:
+                    #     # TODO unify w/ the other branch
+                    #     atomic_add_release_global(
+                    #         tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                    #         value=1,
+                    #     )
+                    #     dsm_pending_idx += 1
+                    if dsm_pending_m_block_idx != -1:
+                        write_signal(
+                            tile_sched_params.dst_signals,
+                            m_block_idx=dsm_pending_m_block_idx,
                         )
-                        dsm_pending_idx += 1
 
             else:
                 c_pipeline.producer_tail()
