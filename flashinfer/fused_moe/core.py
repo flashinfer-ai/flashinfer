@@ -1008,8 +1008,17 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    # Decide a suffix purely for clarity in JIT paths (does not affect flags)
+    flags = _trtllm_nvcc_flags()
+    if any("sm_120" in str(f) for f in flags):
+        jit_name = "fused_moe_trtllm_sm120"
+    elif any("sm_100" in str(f) for f in flags):
+        jit_name = "fused_moe_trtllm_sm100"
+    else:
+        jit_name = "fused_moe_trtllm_sm90"
+
     return gen_jit_spec(
-        "fused_moe_trtllm_sm100",
+        jit_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
