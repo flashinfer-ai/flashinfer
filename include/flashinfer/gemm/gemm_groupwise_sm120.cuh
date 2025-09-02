@@ -138,102 +138,23 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(
   // Set alpha and beta for the epilogue
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
-
-  // Debug print arguments - match CUTLASS example format
-  printf("\n=== FlashInfer SM120 Kernel Configuration ===\n");
-  printf("Problem shape: m=%d, n=%d, k=%d, l=%d\n", m, n, k, l);
-  printf("Data types:\n");
-  printf("  ElementA: %s (size=%d bits)\n", typeid(ElementA).name(), cutlass::sizeof_bits<ElementA>::value);
-  printf("  ElementB: %s (size=%d bits)\n", typeid(ElementB).name(), cutlass::sizeof_bits<ElementB>::value);
-  printf("  ElementC: %s (size=%d bits)\n", typeid(ElementC).name(), cutlass::sizeof_bits<ElementC>::value);
-  printf("  ElementD: %s (size=%d bits)\n", typeid(ElementD).name(), cutlass::sizeof_bits<ElementD>::value);
-  printf("  ElementAccumulator: %s\n", typeid(ElementAccumulator).name());
-  printf("Scale Configuration:\n");
-  printf("  ScaleGranularity: M=%d, N=%d, K=%d\n", ScaleGranularityM, ScaleGranularityN, ScaleGranularityK);
-  printf("  ScaleMajorK: %s\n", ScaleMajorK ? "true" : "false");
-  printf("  SFA dimensions: %dx%d\n", m/ScaleGranularityM, k/ScaleGranularityK);
-  printf("  SFB dimensions: %dx%d\n", k/ScaleGranularityK, n/ScaleGranularityN);
-  printf("Kernel Configuration:\n");
-  printf("  MmaSM: %d\n", MmaSM);
-  printf("  TileShape: %dx%dx%d\n", MmaSM == 1 ? 128 : 64, 128, 128);
-  printf("  ClusterShape: 1x1x1\n");
-  printf("Pointers:\n");
-  printf("  A=%p, B=%p\n", A_ptr, B_ptr);
-  printf("  C=%p, D=%p\n", C_ptr, D_ptr);
-  printf("  SFA=%p, SFB=%p\n", SFA_ptr, SFB_ptr);
-  printf("Layouts and Strides:\n");
-  std::cout << "  stride_A: " << stride_A << std::endl;
-  std::cout << "  stride_B: " << stride_B << std::endl;
-  std::cout << "  stride_C: " << stride_C << std::endl;
-  std::cout << "  stride_D: " << stride_D << std::endl;
-  std::cout << "  layout_SFA: " << layout_SFA << std::endl;
-  std::cout << "  layout_SFB: " << layout_SFB << std::endl;
-  printf("Epilogue Configuration:\n");
-  printf("  alpha=%.6f, beta=%.6f\n", arguments.epilogue.thread.alpha, arguments.epilogue.thread.beta);
-  printf("  Mode: %s\n", arguments.mode == cutlass::gemm::GemmUniversalMode::kGemm ? "kGemm" : "Other");
   
-  // Print first few values to verify data
-  float h_sfa[4], h_sfb[4];
-  cutlass::float_e4m3_t h_a[4];
-  cutlass::float_e4m3_t h_b[4];
-  int sfa_count = std::min(4, (m/ScaleGranularityM)*(k/ScaleGranularityK));
-  int sfb_count = std::min(4, (k/ScaleGranularityK)*(n/ScaleGranularityN));
-  cudaMemcpy(h_sfa, SFA_ptr, sizeof(float) * sfa_count, cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_sfb, SFB_ptr, sizeof(float) * sfb_count, cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_a, A_ptr, sizeof(cutlass::float_e4m3_t) * 4, cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_b, B_ptr, sizeof(cutlass::float_e4m3_t) * 4, cudaMemcpyDeviceToHost);
-  
-  printf("Tensor Values (first 4 elements):\n");
-  printf("  A: [%.6f, %.6f, %.6f, %.6f]\n", 
-         float(h_a[0]), float(h_a[1]), float(h_a[2]), float(h_a[3]));
-  printf("  B: [%.6f, %.6f, %.6f, %.6f]\n",
-         float(h_b[0]), float(h_b[1]), float(h_b[2]), float(h_b[3]));
-  printf("  SFA: [");
-  for (int i = 0; i < sfa_count; i++) printf("%.6f%s", h_sfa[i], i < sfa_count-1 ? ", " : "");
-  printf("]\n");
-  printf("  SFB: [");
-  for (int i = 0; i < sfb_count; i++) printf("%.6f%s", h_sfb[i], i < sfb_count-1 ? ", " : "");
-  printf("]\n");
-
-  printf("===================================\n");
-
   // Check device compute capability first
   int device_id = 0;
   cudaGetDevice(&device_id);
   cudaDeviceProp props;
   cudaGetDeviceProperties(&props, device_id);
-  printf("Device: %s (SM %d.%d)\n", props.name, props.major, props.minor);
   
   Gemm gemm;
   
-  // Print kernel type info for debugging
-  printf("Kernel info: ElementA=%s, ElementB=%s, ElementC=%s\n",
-         typeid(typename Gemm::ElementA).name(),
-         typeid(typename Gemm::ElementB).name(), 
-         typeid(typename Gemm::ElementC).name());
-  // MmaTileShape depends on MmaSM value
-  if constexpr (MmaSM == 1) {
-    printf("MmaTileShape: M=128, N=128, K=128 (MmaSM=1)\n");
-  } else {
-    printf("MmaTileShape: M=64, N=128, K=128 (MmaSM=2)\n");
-  }
-  printf("CollectiveMainloop TileShape: (may not print correctly due to template instantiation)\n");
-  
   cutlass::Status status = gemm.can_implement(arguments);
-  printf("gemm.can_implement status: %d (0=success)\n", (int)status);
   if (status != cutlass::Status::kSuccess) {
-    printf("ERROR: Kernel cannot implement these arguments with status %d!\n", (int)status);
     return cudaErrorNotSupported;
   }
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   
-  printf("Workspace check: kernel needs %zu bytes, available=%zu\n", 
-         workspace_size, float_buffer_size_in_bytes);
-  
   if (workspace_size > float_buffer_size_in_bytes) {
-    printf("ERROR: Insufficient workspace. Need %zu bytes, have %zu bytes\n", 
-           workspace_size, float_buffer_size_in_bytes);
     return cudaErrorInsufficientDriver;
   }
 
@@ -243,76 +164,22 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(
     kernel_workspace = float_buffer;
   }
   
-  // Debug: print ALL arguments right before kernel initialization
-  printf("\n=== RIGHT BEFORE gemm.initialize() ===\n");
-  printf("Arguments structure size: %zu bytes\n", sizeof(arguments));
-  printf("Gemm::Arguments type: %s\n", typeid(typename Gemm::Arguments).name());
-  printf("Arguments structure:\n");
-  printf("  mode: %s\n", arguments.mode == cutlass::gemm::GemmUniversalMode::kGemm ? "kGemm" : "Other");
-  printf("  problem_shape: {%d, %d, %d, %d}\n", 
-         cute::get<0>(arguments.problem_shape), cute::get<1>(arguments.problem_shape), 
-         cute::get<2>(arguments.problem_shape), cute::get<3>(arguments.problem_shape));
-  printf("  mainloop.ptr_A: %p\n", arguments.mainloop.ptr_A);
-  printf("  mainloop.ptr_B: %p\n", arguments.mainloop.ptr_B);
-  printf("  mainloop.ptr_SFA: %p\n", arguments.mainloop.ptr_SFA);
-  printf("  mainloop.ptr_SFB: %p\n", arguments.mainloop.ptr_SFB);
-  printf("  epilogue.ptr_C: %p\n", arguments.epilogue.ptr_C);
-  printf("  epilogue.ptr_D: %p\n", arguments.epilogue.ptr_D);
-  printf("  epilogue.thread.alpha: %.6f\n", arguments.epilogue.thread.alpha);
-  printf("  epilogue.thread.beta: %.6f\n", arguments.epilogue.thread.beta);
-  printf("  kernel_workspace: %p\n", kernel_workspace);
-  printf("  workspace_size: %zu bytes\n", workspace_size);
-  printf("  float_buffer: %p (total size=%zu)\n", float_buffer, float_buffer_size_in_bytes);
-  // Note: Strides and layouts already printed earlier
-  
   status = gemm.initialize(arguments, kernel_workspace);
-  printf("gemm.initialize status: %d (0=success)\n", (int)status);
   if (status != cutlass::Status::kSuccess) {
-    printf("ERROR: Kernel initialization failed with status %d!\n", (int)status);
-    const char* error_str = "Unknown error";
-    switch(status) {
-      case cutlass::Status::kErrorMisalignedOperand: error_str = "Misaligned Operand"; break;
-      case cutlass::Status::kErrorInvalidDataType: error_str = "Invalid Data Type"; break;
-      case cutlass::Status::kErrorInvalidLayout: error_str = "Invalid Layout"; break;
-      case cutlass::Status::kErrorInvalidProblem: error_str = "Invalid Problem"; break;
-      case cutlass::Status::kErrorNotSupported: error_str = "Not Supported"; break;
-      case cutlass::Status::kErrorInternal: error_str = "Internal Error"; break;
-      case cutlass::Status::kErrorArchMismatch: error_str = "Architecture Mismatch"; break;
-      case cutlass::Status::kErrorInsufficientDriver: error_str = "Insufficient Driver"; break;
-      case cutlass::Status::kErrorMemoryAllocation: error_str = "Memory Allocation Failed"; break;
-    }
-    printf("Error details: %s\n", error_str);
-    
     // Don't continue if initialization failed
     return cudaErrorNotSupported;
   }
 
-  printf("\n=== RIGHT BEFORE gemm.run() ===\n");
-  printf("Stream: %p\n", stream);
-  printf("Gemm object address: %p\n", &gemm);
-  // Re-check key pointers to ensure nothing changed
-  printf("Verifying arguments still intact:\n");
-  printf("  mainloop.ptr_A: %p\n", arguments.mainloop.ptr_A);
-  printf("  mainloop.ptr_B: %p\n", arguments.mainloop.ptr_B);
-  printf("  mainloop.ptr_SFA: %p\n", arguments.mainloop.ptr_SFA);
-  printf("  mainloop.ptr_SFB: %p\n", arguments.mainloop.ptr_SFB);
-  printf("  epilogue.ptr_C: %p\n", arguments.epilogue.ptr_C);
-  printf("  epilogue.ptr_D: %p\n", arguments.epilogue.ptr_D);
-  
   status = gemm.run(stream);
-  printf("gemm.run status: %d (0=success)\n", (int)status);
   if (status != cutlass::Status::kSuccess) {
-    printf("ERROR: Kernel execution failed with status %d!\n", (int)status);
     return cudaErrorUnknown;
   }
   
   // Sync to ensure kernel completes
   cudaError_t cuda_err = cudaStreamSynchronize(stream);
   if (cuda_err != cudaSuccess) {
-    printf("ERROR: CUDA sync failed: %s\n", cudaGetErrorString(cuda_err));
     return cuda_err;
   }
-  printf("Kernel execution completed successfully\n");
 
   return cudaSuccess;
 #else

@@ -39,7 +39,6 @@ from .fused_moe.utils import (
 )
 from .jit.cubin_loader import get_cubin
 from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
-from .jit.core import sm121a_nvcc_flags
 
 CUDNN_AVAILABLE = False
 try:
@@ -63,7 +62,7 @@ from .jit import (
     sm100a_nvcc_flags,
     sm120a_nvcc_flags,
     sm121a_nvcc_flags,
-    current_device_nvcc_flags,
+    current_compilation_context,
 )
 from .jit import (
     gen_jit_spec,
@@ -506,12 +505,14 @@ def gen_gemm_sm120_module() -> JitSpec:
             source = f.read()
         write_if_different(dest_path, source)
 
-    print(f"Debugging SM120/SM121 NVCC flags: {sm121a_nvcc_flags}")
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12,]
+    )
 
     return gen_jit_spec(
         "gemm_sm120",
         source_paths,
-        extra_cuda_cflags=sm121a_nvcc_flags, # TODO (yongwww): fix
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
