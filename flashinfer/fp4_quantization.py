@@ -129,20 +129,19 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 
 @functools.cache
 def get_fp4_quantization_module(backend: str = "100"):
-    if backend == "121":
-        module = gen_fp4_quantization_sm121_module().build_and_load()
-    elif backend == "120":
-        module = gen_fp4_quantization_sm120_module().build_and_load()
-    elif backend == "110":
-        module = gen_fp4_quantization_sm110_module().build_and_load()
-    elif backend == "100":
-        module = gen_fp4_quantization_sm100_module().build_and_load()
-    elif backend == "103":
-        module = gen_fp4_quantization_sm103_module().build_and_load()
-    elif backend == "90":
-        module = gen_fp4_quantization_sm90_module().build_and_load()
-    else:
+    backend_modules = {
+        "121": gen_fp4_quantization_sm121_module,
+        "120": gen_fp4_quantization_sm120_module,
+        "110": gen_fp4_quantization_sm110_module,
+        "103": gen_fp4_quantization_sm103_module,
+        "100": gen_fp4_quantization_sm100_module,
+        "90": gen_fp4_quantization_sm90_module,
+    }
+
+    if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
+
+    module = backend_modules[backend]().build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",

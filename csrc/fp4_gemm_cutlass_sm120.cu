@@ -178,11 +178,8 @@ at::Tensor fp4_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor c
 }
 
 int64_t fp4_gemm_tactic_num() {
-  auto getCutlassConfigs = []() {
-    CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
-    return gemmRunner.getConfigs();
-  };
-  static int64_t totalTactics = getCutlassConfigs().size();
+  static const int64_t totalTactics =
+      CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4>{}.getConfigs().size();
   return totalTactics;
 }
 

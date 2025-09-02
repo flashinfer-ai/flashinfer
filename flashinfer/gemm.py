@@ -238,7 +238,7 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
-        # SM120/121 uses only 128x128x128 tile configuration with 1x1x1 cluster shape
+        # SM120/121 uses only 128x128x128 tile configuration with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
             (128, 128, 128),
         ]
@@ -550,9 +550,10 @@ def fp8_gemm_sm100(
 def get_gemm_module_cutlass_fp4():
     # Check if we're on SM120/121 and use the appropriate module
     major, _ = get_compute_capability(torch.device("cuda"))
-    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
     if major == 12:
         module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    else:
+        module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
 
     class CutlassFp4GemmRunner(TunableRunner):
         def __init__(self):

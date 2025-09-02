@@ -59,6 +59,25 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
       workspaceBytes, stream, occupancy);
 }
 
+/*!
+ * \brief Dispatch FP4 GEMM operation with CTA shape configuration for SM120/SM121
+ * \param D Output matrix pointer
+ * \param A Input matrix A pointer (FP4 quantized)
+ * \param B Input matrix B pointer (FP4 quantized)
+ * \param input_sf Input scale factors
+ * \param weight_sf Weight scale factors
+ * \param global_sf Global scale factor
+ * \param m Number of rows in matrix A and output matrix D
+ * \param n Number of columns in matrix B and output matrix D
+ * \param k Number of columns in matrix A and rows in matrix B
+ * \param batch_count Number of batches for batched GEMM
+ * \param gemmConfig GEMM configuration including tile size and cluster shape
+ * \param workspace Workspace buffer for temporary storage
+ * \param workspaceBytes Size of workspace buffer in bytes
+ * \param stream CUDA stream for kernel execution
+ * \param occupancy Optional pointer to store kernel occupancy
+ * \return Size of workspace required in bytes
+ */
 template <typename T>
 size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             void const* input_sf, void const* weight_sf,
