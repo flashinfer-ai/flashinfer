@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import functools
+import os
+import logging
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -401,8 +403,26 @@ def gen_cutlass_fused_moe_module(
     )
 
 
+def _resolve_backend(backend: str | None) -> str:
+    forced = os.environ.get("FLASHINFER_FORCE_SM")
+    if forced:
+        f = forced.strip().lower()
+        if f in {"120a", "120", "100", "90", "90a"}:
+            logging.info(f"FlashInfer MoE: Using forced backend={f}")
+            return "120" if f.startswith("120") else "100" if f.startswith("100") else "90"
+        logging.warning(f"FlashInfer MoE: Ignoring invalid FLASHINFER_FORCE_SM={forced}")
+    if backend and backend != "auto":
+        return backend
+    maj, _ = torch.cuda.get_device_capability()
+    if maj >= 12: return "120"
+    if maj >= 10: return "100"
+    if maj >= 9:  return "90"
+    raise RuntimeError(f"Unsupported CUDA capability {maj}.x for FlashInfer MoE.")
+
+
 @functools.cache
-def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
+def get_cutlass_fused_moe_module(backend: str = "auto", use_fast_build: bool = False):
+    backend = _resolve_backend(backend)
     if backend == "100":
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
             use_fast_build

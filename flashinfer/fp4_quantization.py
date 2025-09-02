@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import functools
+import os
+import logging
 from enum import Enum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
@@ -114,7 +116,38 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 
 
 @functools.cache
-def get_fp4_quantization_module(backend: str = "100"):
+def _resolve_backend(backend: str | None) -> str:
+    """
+    Decide target SM backend. Order:
+      1) FLASHINFER_FORCE_SM env if set (e.g., "120", "120a", "100", "90")
+      2) Auto from CUDA capability (12->"120", 10->"100", 9->"90")
+    """
+    forced = os.environ.get("FLASHINFER_FORCE_SM")
+    if forced:
+        forced_norm = forced.strip().lower()
+        if forced_norm in {"120a", "120", "100", "90", "90a"}:
+            logging.info(f"FlashInfer: Using forced backend={forced_norm}")
+            # Normalize returns to core keys used in code paths
+            return "120" if forced_norm.startswith("120") else \
+                   "100" if forced_norm.startswith("100") else \
+                   "90"
+        logging.warning(f"FlashInfer: Ignoring invalid FLASHINFER_FORCE_SM={forced}")
+
+    if backend and backend != "auto":
+        return backend
+
+    maj, _ = torch.cuda.get_device_capability()
+    if maj >= 12:
+        return "120"
+    if maj >= 10:
+        return "100"
+    if maj >= 9:
+        return "90"
+    raise RuntimeError(f"Unsupported CUDA capability {maj}.x for FlashInfer backends.")
+
+
+def get_fp4_quantization_module(backend: str = "auto"):
+    backend = _resolve_backend(backend)
     if backend == "100":
         module = gen_fp4_quantization_sm100_module().build_and_load()
     elif backend == "90":
@@ -428,7 +461,11 @@ def e2m1_and_ufp8sf_scale_to_float(
 def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     """
     PyTorch equivalent of trtllm-gen `shuffleMatrixA`
+    May pad M dimension to multiple of 128 if needed.
     """
+    # Ensure M is a multiple of 128 for row indices calculation
+    input_tensor, orig_M, pad_m = _pad_m_to_multiple_of_128(input_tensor)
+    
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return input_tensor[row_indices.to(input_tensor.device)]
@@ -446,6 +483,19 @@ def _pad_k_to_multiple_of_4(t):
     return torch.nn.functional.pad(t, (0, pad_k)).contiguous(), K, pad_k
 
 
+def _pad_m_to_multiple_of_128(t):
+    """Pad first dim (M) to a multiple of 128 with zeros. 
+    Returns (t_padded, orig_M, pad_m). Output is contiguous."""
+    import logging
+    M = t.shape[0]
+    pad_m = (-M) % 128
+    if pad_m == 0:
+        return t, M, 0
+    logging.debug(f"MXFP4: padded M by {pad_m} from {M} to {M+pad_m} for scale-shuffle")
+    # F.pad args: (left,right, top,bottom) for 2D -> (0,0, 0,pad_m)
+    return torch.nn.functional.pad(t, (0, 0, 0, pad_m)).contiguous(), M, pad_m
+
+
 def shuffle_matrix_sf_a(
     input_tensor: torch.Tensor,
     epilogue_tile_m: int,
@@ -454,10 +504,13 @@ def shuffle_matrix_sf_a(
     """
     Shuffle scale-factor matrix for MXFP4.
 
-    May pad the last dim (K) to a multiple of 4; returns the shuffled (and possibly
-    padded) tensor with K % 4 == 0. Padding is zeros and benign for downstream ops.
-    Expects input in linear layout.
+    May pad both dimensions: M to multiple of 128 and K to multiple of 4.
+    Returns the shuffled (and possibly padded) tensor with M % 128 == 0 and K % 4 == 0.
+    Padding is zeros and benign for downstream ops. Expects input in linear layout.
     """
+    
+    # Ensure M is a multiple of 128 for row indices calculation
+    input_tensor, orig_M, pad_m = _pad_m_to_multiple_of_128(input_tensor)
     
     # Ensure K is a multiple of 4 for index calc and downstream kernels
     input_tensor, orig_K, pad_k = _pad_k_to_multiple_of_4(input_tensor)
@@ -521,8 +574,13 @@ def nvfp4_quantize(
 
         epilogue_tile_m = 128
         a_fp4 = shuffle_matrix_a(a_fp4.to(torch.uint8), epilogue_tile_m)
+        # Calculate padded K dimension for reshape
+        K0 = a_sf.shape[-1]
+        Kp = ((K0 + 3) // 4) * 4
+        new_shape = list(a_sf.shape)
+        new_shape[-1] = Kp
         a_sf = shuffle_matrix_sf_a(a_sf.to(torch.uint8), epilogue_tile_m).reshape(
-            a_sf.shape
+            new_shape
         )
     else:
         # Activations with 8x4 layout for SFs (GEMM with small tileN)
