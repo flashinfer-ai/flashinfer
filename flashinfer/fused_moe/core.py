@@ -37,6 +37,8 @@ from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvc
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
+import os, re
+import torch.utils.cpp_extension as torch_cpp_ext
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
@@ -259,7 +261,7 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = sm100a_nvcc_flags + [
+    nvcc_flags = _trtllm_nvcc_flags() + [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
         "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
@@ -951,6 +953,46 @@ def cutlass_fused_moe(
 
 # trtllmgen-moe-fp8
 
+# ---- NVCC flags selector for TRTLLM MoE (SM120-aware) -----------------------
+def _sm120_flags_by_nvcc():
+    """
+    Choose between sm_120a and sm_120 depending on CUDA/NVCC support.
+    Some CUDA builds only accept sm_120, others accept sm_120a.
+    """
+    try:
+        # CUDA 12.6+ builds generally accept sm_120a
+        if is_cuda_version_at_least(12, 6):
+            return sm120a_nvcc_flags
+    except Exception:
+        pass
+    return sm120_nvcc_flags
+
+def _trtllm_nvcc_flags():
+    """
+    Select NVCC flags for TRTLLM fused MoE:
+      - Honor FLASHINFER_FORCE_SM=120 override
+      - Prefer SM120 on Blackwell
+      - Else fall back to SM100, then SM90
+    """
+    # Manual override
+    if os.environ.get("FLASHINFER_FORCE_SM") == "120":
+        return _sm120_flags_by_nvcc()
+
+    # Detect archs PyTorch wants to build for
+    try:
+        archs = []
+        for f in torch_cpp_ext._get_cuda_arch_flags():
+            m = re.search(r"compute_(\d+)", f)
+            if m:
+                archs.append(int(m.group(1)))
+        if any(a >= 120 for a in archs):
+            return _sm120_flags_by_nvcc()
+        if any(a >= 100 for a in archs):
+            return sm100a_nvcc_flags
+        return sm90a_nvcc_flags
+    except Exception:
+        return sm100a_nvcc_flags
+
 
 def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
@@ -990,7 +1032,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_FP4",
             f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
-        + sm100a_nvcc_flags,
+        + _trtllm_nvcc_flags(),
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache
