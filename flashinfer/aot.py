@@ -27,7 +27,7 @@ from .gemm import (
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
-    gen_trtllm_gemm_gen_module,
+    gen_trtllm_gen_gemm_module,
 )
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -359,7 +359,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
-            jit_specs.append(gen_trtllm_gemm_gen_module())
+            jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
 
     if add_comm:
