@@ -28,6 +28,9 @@ else
   MAX_JOBS=$BASE_MAX_JOBS
 fi
 
+# Export MAX_JOBS for PyTorch's cpp_extension to use
+export MAX_JOBS
+
 : ${CUDA_VISIBLE_DEVICES:=""}
 export TORCH_CUDA_ARCH_LIST=$(python3 -c '
 import torch
