@@ -123,26 +123,27 @@ def _resolve_backend(backend: str | None) -> str:
       2) Auto from CUDA capability (12->"120", 10->"100", 9->"90")
     """
     forced = os.environ.get("FLASHINFER_FORCE_SM")
+    print(f"[DEBUG FP4] _resolve_backend called: backend={backend}, FLASHINFER_FORCE_SM={forced}")
     if forced:
         forced_norm = forced.strip().lower()
         if forced_norm in {"120a", "120", "100", "90", "90a"}:
-            logging.info(f"FlashInfer: Using forced backend={forced_norm}")
-            # Normalize returns to core keys used in code paths
-            return "120" if forced_norm.startswith("120") else \
-                   "100" if forced_norm.startswith("100") else \
-                   "90"
+            result = "120" if forced_norm.startswith("120") else \
+                     "100" if forced_norm.startswith("100") else \
+                     "90"
+            logging.info(f"FlashInfer: Using forced backend={result} from FLASHINFER_FORCE_SM={forced}")
+            print(f"[DEBUG FP4] Returning forced backend: {result}")
+            return result
         logging.warning(f"FlashInfer: Ignoring invalid FLASHINFER_FORCE_SM={forced}")
 
     if backend and backend != "auto":
+        print(f"[DEBUG FP4] Using explicit backend: {backend}")
         return backend
 
     maj, _ = torch.cuda.get_device_capability()
-    if maj >= 12:
-        return "120"
-    if maj >= 10:
-        return "100"
-    if maj >= 9:
-        return "90"
+    result = "120" if maj >= 12 else "100" if maj >= 10 else "90" if maj >= 9 else None
+    print(f"[DEBUG FP4] Auto-detected compute capability {maj}.x -> backend={result}")
+    if result:
+        return result
     raise RuntimeError(f"Unsupported CUDA capability {maj}.x for FlashInfer backends.")
 
 
@@ -370,7 +371,7 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_fp4_quantization_module("100").fp4_quantize_sm100(
+    x_q, sf = get_fp4_quantization_module("auto").fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,
