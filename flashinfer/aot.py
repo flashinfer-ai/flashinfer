@@ -10,6 +10,7 @@ import torch.version
 from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
+from .fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .cascade import gen_cascade_module
 from .fp4_quantization import (
     gen_fp4_quantization_sm100_module,
@@ -18,8 +19,16 @@ from .fp4_quantization import (
 from .fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
 )
-from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
+from .gemm import (
+    gen_gemm_module,
+    gen_gemm_sm90_module,
+    gen_gemm_sm100_module,
+    gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_fp8,
+    gen_trtllm_gemm_gen_module,
+)
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
@@ -30,6 +39,7 @@ from .jit import (
     gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
+    gen_trtllm_gen_fmha_module,
 )
 from .mla import gen_mla_module
 from .norm import gen_norm_module
@@ -275,6 +285,9 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
+        # trtllm_gen_fmha
+        yield gen_trtllm_gen_fmha_module()
+
     # MLA
     # NOTE: fp8 kv not supported in MLA
     mla_backend_ = ["fa2"] + (["fa3"] if has_sm90 else [])
@@ -343,14 +356,23 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
+            jit_specs.append(gen_trtllm_gemm_gen_module())
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
         from .comm.nvshmem import gen_nvshmem_module
+        from .comm.trtllm_alltoall import gen_comm_alltoall_module
+        from .comm.trtllm_mnnvl_ar import gen_trtllm_mnnvl_comm_module
 
         jit_specs.append(gen_nvshmem_module())
+        jit_specs.append(gen_comm_alltoall_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
+            jit_specs.append(gen_trtllm_mnnvl_comm_module())
         jit_specs.append(gen_vllm_comm_module())
 
     if add_misc:

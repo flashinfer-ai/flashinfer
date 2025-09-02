@@ -1558,7 +1558,7 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def trtllm_gen_fmha_module():
+def gen_trtllm_gen_fmha_module():
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 

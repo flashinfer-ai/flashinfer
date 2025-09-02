@@ -349,7 +349,7 @@ def get_gemm_sm100_module():
     return module
 
 
-def trtllm_gemm_gen_module() -> JitSpec:
+def gen_trtllm_gemm_gen_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
@@ -383,7 +383,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
 
 @functools.cache
 def get_trtllm_gemm_module():
-    mod = trtllm_gemm_gen_module()
+    mod = gen_trtllm_gemm_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -1919,7 +1919,7 @@ def gemm_fp8_nt_groupwise(
 
 @functools.cache
 def get_trtllm_fp4_gemm_module():
-    mod = trtllm_gemm_gen_module()
+    mod = gen_trtllm_gemm_gen_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 

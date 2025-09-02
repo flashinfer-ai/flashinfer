@@ -45,7 +45,7 @@ from .pytorch import get_batch_prefill_uri as get_batch_prefill_uri
 from .pytorch import get_pod_uri as get_pod_uri
 from .pytorch import get_single_decode_uri as get_single_decode_uri
 from .pytorch import get_single_prefill_uri as get_single_prefill_uri
-from .pytorch import trtllm_gen_fmha_module as trtllm_gen_fmha_module
+from .pytorch import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
 from .pytorch import (
     gen_batch_prefill_attention_sink_module as gen_batch_prefill_attention_sink_module,
     get_batch_prefill_attention_sink_uri as get_batch_prefill_attention_sink_uri,

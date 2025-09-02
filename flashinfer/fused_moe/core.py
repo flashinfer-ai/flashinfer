@@ -909,7 +909,7 @@ def cutlass_fused_moe(
 # trtllmgen-moe-fp8
 
 
-def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
@@ -960,7 +960,7 @@ def trtllm_gen_fused_moe_sm100_module() -> JitSpec:
 
 @functools.cache
 def get_trtllm_moe_sm100_module():
-    module = trtllm_gen_fused_moe_sm100_module()
+    module = gen_trtllm_gen_fused_moe_sm100_module()
     moe_op = module.build_and_load()
     setup_cubin_loader(str(module.get_library_path()))
 
