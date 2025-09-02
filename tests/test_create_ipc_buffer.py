@@ -67,6 +67,11 @@ def _run_ipc_test():
 # -------------------------------
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_ipc_distributed(world_size):
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
     # Spawn self with torchrun
     script = os.path.abspath(__file__)
     result = subprocess.run(

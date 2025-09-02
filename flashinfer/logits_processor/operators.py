@@ -93,13 +93,7 @@ class SoftmaxOp(ParameterizedOp):
         if enable_pdl is None:
             enable_pdl = device_support_pdl(tensor.data.device)
 
-        workspace_buffer = _get_cache_buf(
-            "softmax_workspace", 1024 * 1024, tensor.data.device
-        )
-
-        probs = get_sampling_module().softmax(
-            workspace_buffer, tensor.data, None, 1.0, enable_pdl
-        )
+        probs = torch.softmax(tensor.data, dim=-1)
         return TaggedTensor(probs, output_type)
 
 

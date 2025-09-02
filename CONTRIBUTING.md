@@ -42,6 +42,6 @@ When incrementing a version and creating a release, follow [Semantic Versioning]
 * minor increment signals added functionality that is backwards-compatible (e.g. new kernels, new SM support, etc)
 * patch increment signals backwards-compatible bug fixes (both for functional and performance issues)
 
-Optionally, use post-releases (e.g., `X.Y.Zpost1`) for minor changes, like a documentation change.
+Optionally, use post-releases (e.g., `X.Y.Z.post1`) for minor changes, like a documentation change.
 
-[^1]: We have not followed this strictly through v0.2.13. But after v0.2.13, the versioning should follow SemVer.
+[^1]: We have not followed this strictly through v0.2.14.post1. But after v0.2.14.post1, the versioning should follow SemVer.

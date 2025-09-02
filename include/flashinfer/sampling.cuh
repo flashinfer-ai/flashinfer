@@ -405,7 +405,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   vec_t<DType, VEC_SIZE> prob_vec;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     if constexpr (CACHE_INPUT) {
-      logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
     } else {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
@@ -1889,7 +1891,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
       min_gt_low = high;
       max_le_high = low;
-#pragma unroll 2
+#pragma unroll 1
       for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
         probs_vec.fill(0);
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {

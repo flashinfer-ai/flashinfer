@@ -130,3 +130,4 @@ from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .xqa import xqa as xqa
