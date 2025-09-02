@@ -3,15 +3,33 @@
 set -eo pipefail
 set -x
 
-# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
+# Set MAX_JOBS based on architecture and available memory
+ARCH=$(uname -m)
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
-MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
-if (( MAX_JOBS < 1 )); then
-  MAX_JOBS=1
-elif (( NPROC < MAX_JOBS )); then
-  MAX_JOBS=$NPROC
+
+# Calculate base MAX_JOBS based on memory (4GB per job)
+BASE_MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
+if (( BASE_MAX_JOBS < 1 )); then
+  BASE_MAX_JOBS=1
+elif (( NPROC < BASE_MAX_JOBS )); then
+  BASE_MAX_JOBS=$NPROC
 fi
+
+# Apply architecture-specific scaling
+if [[ "$ARCH" == "aarch64" ]]; then
+  # Use half the jobs on aarch64 compared to x86_64
+  MAX_JOBS=$(( BASE_MAX_JOBS / 2 ))
+  if (( MAX_JOBS < 1 )); then
+    MAX_JOBS=1
+  fi
+else
+  # x86_64, amd64, and other architectures use full capacity
+  MAX_JOBS=$BASE_MAX_JOBS
+fi
+
+# Export MAX_JOBS for PyTorch's cpp_extension to use
+export MAX_JOBS
 
 : ${CUDA_VISIBLE_DEVICES:=""}
 export TORCH_CUDA_ARCH_LIST=$(python3 -c '
