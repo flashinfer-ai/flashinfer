@@ -16,7 +16,9 @@ workspace_size = 128 * 1024 * 1024
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize("q_len_per_request", [1, 2])
+@pytest.mark.parametrize(
+    "q_len_per_request", [1, 2]
+)  # todo(Yingyi): verify larger q_len_per_request
 @pytest.mark.parametrize("dynamic_scale", [False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_decode_mla(

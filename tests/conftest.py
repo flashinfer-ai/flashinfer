@@ -1881,3 +1881,48 @@ VARLEN_INDPTR_PARAMS = [
     [0, 1289, 2586],
     [0, 1287, 2577, 3855],
 ]
+
+
+def assert_close_with_mismatch_tolerance(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+    max_mismatched_elements: int = 0,
+):
+    """
+    Asserts that two tensors are close, allowing for a specified number of mismatched elements.
+    This function correctly implements the same logic as torch.isclose.
+    """
+    # Ensure tensors are float for comparison
+    actual_float = actual.float()
+    expected_float = expected.float()
+
+    # This is the core logic from torch.isclose
+    # A mismatch occurs if the difference is greater than the combined tolerance
+    mismatched = torch.abs(actual_float - expected_float) > (
+        atol + rtol * torch.abs(expected_float)
+    )
+
+    num_mismatched = torch.sum(mismatched).item()
+
+    if num_mismatched > max_mismatched_elements:
+        # For a helpful error message, let's find the worst offenders
+        actual_flat = actual_float.flatten()
+        expected_flat = expected_float.flatten()
+        abs_diff = torch.abs(actual_flat - expected_flat)
+
+        # Calculate relative difference only where expected is not zero to avoid division by zero
+        # Add a small epsilon to the denominator for stability
+        rel_diff = abs_diff / (torch.abs(expected_flat) + 1e-12)
+
+        total_elements = actual_flat.numel()
+
+        raise AssertionError(
+            f"Tensors are not close enough!\n"
+            f"Mismatched elements: {num_mismatched} / {total_elements} "
+            f"({100.0 * num_mismatched / total_elements:.2f}%)\n"
+            f"Allowed mismatched elements: {max_mismatched_elements}, but found {num_mismatched}.\n"
+            f"Greatest absolute difference: {torch.max(abs_diff).item():.4g} (atol={atol})\n"
+            f"Greatest relative difference: {torch.max(rel_diff).item():.4g} (rtol={rtol})"
+        )
