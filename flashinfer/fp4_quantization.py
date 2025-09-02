@@ -461,10 +461,10 @@ def e2m1_and_ufp8sf_scale_to_float(
 def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     """
     PyTorch equivalent of trtllm-gen `shuffleMatrixA`
-    May pad M dimension to multiple of 128 if needed.
+    Expects M to be a multiple of 128 - assert and let caller pad if needed.
     """
-    # Ensure M is a multiple of 128 for row indices calculation
-    input_tensor, orig_M, pad_m = _pad_m_to_multiple_of_128(input_tensor)
+    # Assert M is a multiple of 128 for row indices calculation
+    assert input_tensor.shape[0] % 128 == 0, f"Expected M to be multiple of 128, got {input_tensor.shape[0]}"
     
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
