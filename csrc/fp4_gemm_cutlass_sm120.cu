@@ -28,8 +28,8 @@
 #include "pytorch_extension_utils.h"
 
 using flashinfer::gemm::ClusterShape;
-using flashinfer::gemm::CutlassGemmConfig;
 using flashinfer::gemm::CutlassFp4GemmRunner;
+using flashinfer::gemm::CutlassGemmConfig;
 using flashinfer::gemm::CutlassTileConfigSM120;
 using flashinfer::gemm::EpilogueScheduleType;
 using flashinfer::gemm::FP4GemmType;
@@ -108,7 +108,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
   // Get dimensions
   int64_t b = 1;
   int64_t m, k_packed, n;
-  
+
   if (mat1.dim() == 2) {
     m = mat1.size(0);
     k_packed = mat1.size(1);
@@ -137,17 +137,19 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
   TORCH_CHECK(globalScale.numel() == 1, "globalScale must be a scalar tensor");
 
   // Configure the kernel
-  CutlassGemmConfig config = (tactic >= 0) ? getFp4GemmConfig(m, n, k, tactic)
-                                           : CutlassGemmConfig(CutlassTileConfigSM120::CtaShape128x128x128B,
-                                                              MainloopScheduleType::AUTO,
-                                                              EpilogueScheduleType::AUTO,
-                                                              ClusterShape::ClusterShape_1x1x1);
+  CutlassGemmConfig config =
+      (tactic >= 0) ? getFp4GemmConfig(m, n, k, tactic)
+                    : CutlassGemmConfig(CutlassTileConfigSM120::CtaShape128x128x128B,
+                                        MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                                        ClusterShape::ClusterShape_1x1x1);
 
   // Validate output dimensions
-  std::vector<int64_t> out_shape = (b > 1) ? std::vector<int64_t>{b, m, n} : std::vector<int64_t>{m, n};
+  std::vector<int64_t> out_shape =
+      (b > 1) ? std::vector<int64_t>{b, m, n} : std::vector<int64_t>{m, n};
   TORCH_CHECK(out.dim() == out_shape.size(), "out must have ", out_shape.size(), " dimensions");
   for (size_t i = 0; i < out_shape.size(); ++i) {
-    TORCH_CHECK(out.sizes()[i] == out_shape[i], "out.size(", i, "): expected ", out_shape[i], ", got ", out.sizes()[i]);
+    TORCH_CHECK(out.sizes()[i] == out_shape[i], "out.size(", i, "): expected ", out_shape[i],
+                ", got ", out.sizes()[i]);
   }
 
   c10::ScalarType out_dtype = out.scalar_type();

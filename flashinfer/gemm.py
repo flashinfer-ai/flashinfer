@@ -263,7 +263,8 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
     return gen_jit_spec(
         "fp4_gemm_cutlass_sm120",
         source_paths,
-        extra_cuda_cflags=nvcc_flags + [
+        extra_cuda_cflags=nvcc_flags
+        + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
         ],
@@ -548,7 +549,7 @@ def fp8_gemm_sm100(
 @functools.cache
 def get_gemm_module_cutlass_fp4():
     # Check if we're on SM120/121 and use the appropriate module
-    major, _ = get_compute_capability(torch.device("cuda"))    
+    major, _ = get_compute_capability(torch.device("cuda"))
     module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
     if major == 12:
         module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
