@@ -2003,7 +2003,7 @@ def get_trtllm_fp4_gemm_module():
                 alpha,
                 out,
             ) = inputs
-            op.trtllm_gemm(
+            op.trtllm_gemm.default(
                 workspace_buffer,
                 a,
                 b,
