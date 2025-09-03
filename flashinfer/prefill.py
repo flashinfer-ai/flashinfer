@@ -3197,9 +3197,9 @@ def trtllm_ragged_attention_deepseek(
     max_kv_len : int
         max key/value length
     bmm1_scale : float
-        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5), but we recommend to use bmm1_scale_log2_tensor for better cuda graph support.
     bmm2_scale : float
-        scale for bmm2, scale_v
+        scale for bmm2, scale_v, but we recommend to use bmm2_scale_tensor for better cuda graph support.
     o_sf_scale : float
         scale for output
     batch_size : int
@@ -3221,9 +3221,9 @@ def trtllm_ragged_attention_deepseek(
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None
-        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in. If provided, the bmm1_scale will be ignored.
     bmm2_scale_tensor: Optional[torch.Tensor] = None
-        The on-device fused scale tensor for bmm2 input.
+        The on-device fused scale tensor for bmm2 input. If provided, the bmm2_scale will be ignored.
     Returns
     -------
     out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -3330,9 +3330,9 @@ def trtllm_batch_context_with_kv_cache(
     max_kv_len : int
         max sequence length for kv_cache
     bmm1_scale : float
-        fused scale for bmm1 input.
+        fused scale for bmm1 input. But we recommend to use bmm1_scale_log2_tensor for better cuda graph support.
     bmm2_scale : float
-        fused scale for bmm2 input.
+        fused scale for bmm2 input. But we recommend to use bmm2_scale_tensor for better cuda graph support.
     batch_size : int
         batch size
     cum_seq_lens_q : torch.Tensor
@@ -3353,9 +3353,9 @@ def trtllm_batch_context_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None
-        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in. If provided, the bmm1_scale will be ignored.
     bmm2_scale_tensor: Optional[torch.Tensor] = None
-        The on-device fused scale tensor for bmm2 input.
+        The on-device fused scale tensor for bmm2 input. If provided, the bmm2_scale will be ignored.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
