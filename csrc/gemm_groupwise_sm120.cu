@@ -31,43 +31,45 @@ using namespace flashinfer;
                                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
                                    ...)                                                           \
   [&]() -> bool {                                                                                 \
-    constexpr int SCALE_GRANULARITY_M = 1;  /* Always 1 for SM120 */                             \
-    constexpr int SCALE_GRANULARITY_K = 128; /* Always 128 for SM120 per CUTLASS requirement */  \
-    if (scale_granularity_m != 1) {                                                              \
-      TORCH_CHECK(false, "SM120 only supports scale_granularity_m=1");                           \
+    constexpr int SCALE_GRANULARITY_M = 1;   /* Always 1 for SM120 */                             \
+    constexpr int SCALE_GRANULARITY_K = 128; /* Always 128 for SM120 per CUTLASS requirement */   \
+    if (scale_granularity_m != 1) {                                                               \
+      TORCH_CHECK(false, "SM120 only supports scale_granularity_m=1");                            \
       return false;                                                                               \
     }                                                                                             \
-    if (scale_granularity_k != 128) {                                                            \
-      TORCH_CHECK(false, "SM120 only supports scale_granularity_k=128");                         \
+    if (scale_granularity_k != 128) {                                                             \
+      TORCH_CHECK(false, "SM120 only supports scale_granularity_k=128");                          \
       return false;                                                                               \
     }                                                                                             \
-    /* Dispatch based on n granularity only */                                                   \
-    if (scale_granularity_n == 128) {                                                            \
-      constexpr int SCALE_GRANULARITY_N = 128;                                                   \
+    /* Dispatch based on n granularity only */                                                    \
+    if (scale_granularity_n == 128) {                                                             \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                    \
       return __VA_ARGS__();                                                                       \
-    } else if (scale_granularity_n == 64) {                                                      \
-      constexpr int SCALE_GRANULARITY_N = 64;                                                    \
+    } else if (scale_granularity_n == 64) {                                                       \
+      constexpr int SCALE_GRANULARITY_N = 64;                                                     \
       return __VA_ARGS__();                                                                       \
-    } else if (scale_granularity_n == 32) {                                                      \
-      constexpr int SCALE_GRANULARITY_N = 32;                                                    \
+    } else if (scale_granularity_n == 32) {                                                       \
+      constexpr int SCALE_GRANULARITY_N = 32;                                                     \
       return __VA_ARGS__();                                                                       \
-    } else if (scale_granularity_n == 16) {                                                      \
-      constexpr int SCALE_GRANULARITY_N = 16;                                                    \
+    } else if (scale_granularity_n == 16) {                                                       \
+      constexpr int SCALE_GRANULARITY_N = 16;                                                     \
       return __VA_ARGS__();                                                                       \
     }                                                                                             \
     TORCH_CHECK(false, "SM120: Unsupported scale granularity combination (", scale_granularity_m, \
-                ",", scale_granularity_n, ",", scale_granularity_k, ")");                        \
+                ",", scale_granularity_n, ",", scale_granularity_k, ")");                         \
     return false;                                                                                 \
   }()
 
-#define DISPATCH_MMA_SM(mma_sm, MMA_SM, ...)  \
-  [&]() -> bool {                             \
-    if (mma_sm == 1) {                        \
-      constexpr int MMA_SM = 1;               \
-      return __VA_ARGS__();                   \
-    }                                         \
-    TORCH_CHECK(false, "SM120 only supports MmaSM=1 (MmaSM=2 would violate Cooperative kernel tile M>=128 requirement)"); \
-    return false;                             \
+#define DISPATCH_MMA_SM(mma_sm, MMA_SM, ...)                                                  \
+  [&]() -> bool {                                                                             \
+    if (mma_sm == 1) {                                                                        \
+      constexpr int MMA_SM = 1;                                                               \
+      return __VA_ARGS__();                                                                   \
+    }                                                                                         \
+    TORCH_CHECK(false,                                                                        \
+                "SM120 only supports MmaSM=1 (MmaSM=2 would violate Cooperative kernel tile " \
+                "M>=128 requirement)");                                                       \
+    return false;                                                                             \
   }()
 
 #define DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, ...) \
@@ -103,12 +105,12 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                                      int64_t mma_sm) {
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  
+
   // Ensure scales are contiguous
   // Note: We keep the original shape and let the kernel's layout handle interpretation
   at::Tensor SFA_contig = SFA.is_contiguous() ? SFA : SFA.contiguous();
   at::Tensor SFB_contig = SFB.is_contiguous() ? SFB : SFB.contiguous();
-  
+
   DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
     return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
       return DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
@@ -118,7 +120,7 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                 SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
                   using cutlass_t_in = cutlass_dtype_t<c_type_in>;
                   using cutlass_t_out = cutlass_dtype_t<c_type_out>;
-                  
+
                   // Handle both 2D and 3D tensors (BMM)
                   int m, n, k, l;
                   if (A.dim() == 2) {
@@ -136,7 +138,7 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                   } else {
                     return false;  // Unsupported tensor dimension
                   }
-                  
+
                   auto status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120<
                       SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
                       MMA_SM>(
@@ -144,8 +146,10 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                       float_workspace_buffer.element_size() * float_workspace_buffer.numel(),
                       static_cast<cutlass_t_in*>(A.data_ptr()),
                       static_cast<cutlass_t_in*>(B.data_ptr()),
-                      static_cast<float*>(SFA_contig.data_ptr()), static_cast<float*>(SFB_contig.data_ptr()),
-                      static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l, stream);  // C is the output (D)
+                      static_cast<float*>(SFA_contig.data_ptr()),
+                      static_cast<float*>(SFB_contig.data_ptr()),
+                      static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l,
+                      stream);  // C is the output (D)
                   return status == cudaSuccess;
                 });
           });

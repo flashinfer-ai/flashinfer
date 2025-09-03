@@ -16,7 +16,15 @@
 #ifndef FLASHINFER_GROUP_GEMM_FP8_GROUPWISE_SM120_CUH_
 #define FLASHINFER_GROUP_GEMM_FP8_GROUPWISE_SM120_CUH_
 
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+
 #include <cassert>
+#include <cute/tensor.hpp>
+#include <cutlass/detail/blockwise_scale_layout.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/util/packed_stride.hpp>
 #include <iterator>
 #include <type_traits>
 
@@ -24,49 +32,41 @@
 #include "../cutlass_utils.cuh"
 #include "../utils.cuh"
 
-#include <cutlass/gemm/collective/collective_builder.hpp>
-#include <cutlass/epilogue/collective/collective_builder.hpp>
-#include <cutlass/gemm/kernel/gemm_universal.hpp>
-#include <cutlass/gemm/device/gemm_universal_adapter.h>
-#include <cutlass/util/packed_stride.hpp>
-#include <cutlass/detail/blockwise_scale_layout.hpp>
-#include <cute/tensor.hpp>
-
 namespace flashinfer {
 
 namespace group_gemm {
 
 // Kernel for argument preparation with blockwise scaling
-template <typename ScaleConfig, typename ElementA, typename ElementSF, typename ElementD, 
+template <typename ScaleConfig, typename ElementA, typename ElementSF, typename ElementD,
           typename ProblemShape, typename StrideA, typename StrideB, typename StrideD,
           typename LayoutSFA, typename LayoutSFB, bool ScaleMajorK>
 __global__ void compute_sm120_cutlass_group_gemm_args(
-    ElementA* A, ElementA* B, ElementSF* SFA, ElementSF* SFB, ElementD* D, int* m_indptr, 
-    int max_m, int n, int k, int num_groups, int scale_granularity_m, int scale_granularity_n, 
-    int scale_granularity_k, ProblemShape* problem_sizes, ElementA const** A_ptr, 
-    ElementA const** B_ptr, ElementSF const** SFA_ptr, ElementSF const** SFB_ptr, 
-    ElementD** D_ptr, StrideA* stride_A, StrideB* stride_B, StrideD* stride_D,
-    LayoutSFA* layout_SFA, LayoutSFB* layout_SFB) {
+    ElementA* A, ElementA* B, ElementSF* SFA, ElementSF* SFB, ElementD* D, int* m_indptr, int max_m,
+    int n, int k, int num_groups, int scale_granularity_m, int scale_granularity_n,
+    int scale_granularity_k, ProblemShape* problem_sizes, ElementA const** A_ptr,
+    ElementA const** B_ptr, ElementSF const** SFA_ptr, ElementSF const** SFB_ptr, ElementD** D_ptr,
+    StrideA* stride_A, StrideB* stride_B, StrideD* stride_D, LayoutSFA* layout_SFA,
+    LayoutSFB* layout_SFB) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_groups) return;
-  
+
   const int sf_n = (n + scale_granularity_n - 1) / scale_granularity_n;
   const int sf_k = (k + scale_granularity_k - 1) / scale_granularity_k;
-  
+
   int m_offset = m_indptr[i];
   int m_offset_next = m_indptr[i + 1];
   int m = m_offset_next - m_offset;
   int sf_m_offset = m_offset / scale_granularity_m;
-  
+
   problem_sizes[i] = ProblemShape(m, n, k);
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_D[i] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
-  
+
   A_ptr[i] = A + int64_t(m_offset) * int64_t(k);
   B_ptr[i] = B + int64_t(i) * int64_t(n) * int64_t(k);
   D_ptr[i] = D + int64_t(m_offset) * int64_t(n);
-  
+
   if constexpr (ScaleMajorK) {
     layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
     SFA_ptr[i] = SFA + int64_t(sf_m_offset) * int64_t(sf_k);
@@ -84,8 +84,9 @@ using namespace cute;
 // The simplified version is defined above
 
 // SM120 implementation with fixed scale granularity following CUTLASS examples
-// For SM120, only ScaleGranularityM = 1, ScaleGranularityN = 128, ScaleGranularityK = 128 are supported
-template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK, 
+// For SM120, only ScaleGranularityM = 1, ScaleGranularityN = 128, ScaleGranularityK = 128 are
+// supported
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
@@ -93,7 +94,8 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
     int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream) {
   // SM120 only supports these specific scale granularities (per CUTLASS examples)
   static_assert(ScaleGranularityM == 1, "SM120 only supports ScaleGranularityM = 1");
-  static_assert(ScaleGranularityN == 128 || ScaleGranularityN == 64 || ScaleGranularityN == 32 || ScaleGranularityN == 16,
+  static_assert(ScaleGranularityN == 128 || ScaleGranularityN == 64 || ScaleGranularityN == 32 ||
+                    ScaleGranularityN == 16,
                 "SM120 only supports ScaleGranularityN = 128, 64, 32 or 16");
   static_assert(ScaleGranularityK == 128, "SM120 only supports ScaleGranularityK = 128");
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
@@ -130,13 +132,15 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
 
   // Define blockwise scale configuration following CUTLASS pattern
   // SM120 needs explicit ScaleMajorK handling like SM100
-  using ScaleConfig = std::conditional_t<
-      ScaleMajorK,
-      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                                                  cute::UMMA::Major::K, cute::UMMA::Major::K>,
-      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN>>;
-  
+  using ScaleConfig =
+      std::conditional_t<ScaleMajorK,
+                         cutlass::detail::Sm120BlockwiseScaleConfig<
+                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+                             cute::UMMA::Major::K, cute::UMMA::Major::K>,
+                         cutlass::detail::Sm120BlockwiseScaleConfig<
+                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+                             cute::UMMA::Major::MN, cute::UMMA::Major::MN>>;
+
   // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
@@ -152,12 +156,11 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   // SM120 blockwise scaling requires at least 2 stages
   // Use fixed stage count to ensure requirement is met
   using StageCount = cutlass::gemm::collective::StageCount<MmaSM == 1 ? 2 : 3>;
-  
+
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
       cute::tuple<LayoutA*, LayoutSFA*>, AlignmentA, ElementB, cute::tuple<LayoutB*, LayoutSFB*>,
-      AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK,
-      StageCount,
+      AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK, StageCount,
       cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
@@ -171,22 +174,23 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
 
   // These static asserts may need to be adjusted for SM120
   // static_assert(
-  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA, LayoutSFA>);
+  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA,
+  //     LayoutSFA>);
   // static_assert(
-  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB, LayoutSFB>);
+  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB,
+  //     LayoutSFB>);
 
   AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);
 
   auto problem_sizes = allocator.aligned_alloc<typename ProblemShape::UnderlyingProblemShape>(
       num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape), 16,
       "sm120_groupwise_group_gemm_problem_sizes");
-  auto A_ptr = allocator.aligned_alloc<const ElementA*>(
-      num_groups * sizeof(const ElementA*), 16, "sm120_groupwise_group_gemm_A_ptr");
-  auto B_ptr = allocator.aligned_alloc<const ElementB*>(
-      num_groups * sizeof(const ElementB*), 16, "sm120_groupwise_group_gemm_B_ptr");
-  auto D_ptr = allocator.aligned_alloc<ElementD*>(
-      num_groups * sizeof(ElementD*), 16,
-      "sm120_groupwise_group_gemm_D_ptr");
+  auto A_ptr = allocator.aligned_alloc<const ElementA*>(num_groups * sizeof(const ElementA*), 16,
+                                                        "sm120_groupwise_group_gemm_A_ptr");
+  auto B_ptr = allocator.aligned_alloc<const ElementB*>(num_groups * sizeof(const ElementB*), 16,
+                                                        "sm120_groupwise_group_gemm_B_ptr");
+  auto D_ptr = allocator.aligned_alloc<ElementD*>(num_groups * sizeof(ElementD*), 16,
+                                                  "sm120_groupwise_group_gemm_D_ptr");
   auto SFA_ptr = allocator.aligned_alloc<const ElementAccumulator*>(
       num_groups * sizeof(const ElementAccumulator*), 16, "sm120_groupwise_group_gemm_SFA_ptr");
   auto SFB_ptr = allocator.aligned_alloc<const ElementAccumulator*>(
@@ -224,8 +228,8 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
 
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
       &config, prepare_args_kernel, A, B, SFA, SFB, D, m_indptr, max_m, n, k, num_groups,
-      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, problem_sizes, A_ptr, B_ptr, 
-      SFA_ptr, SFB_ptr, D_ptr, stride_A, stride_B, stride_D, layout_SFA, layout_SFB));
+      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, problem_sizes, A_ptr, B_ptr, SFA_ptr,
+      SFB_ptr, D_ptr, stride_A, stride_B, stride_D, layout_SFA, layout_SFB));
 
   thread_local int const sm_count =
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count();
