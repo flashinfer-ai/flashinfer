@@ -491,7 +491,7 @@ void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, a
       static_cast<int*>(cum_seq_lens_q.data_ptr()), static_cast<int*>(cum_seq_lens_kv.data_ptr()),
       attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale,
-      bmm1_scale_log2_ptr, bmm2_scale_ptr, bmm2_scale, o_sf_scale, batch_size, window_left,
+      bmm2_scale, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
       v_stride_keys_values, v_stride_heads, v_stride_batch, workspace_size, stream);
 }
