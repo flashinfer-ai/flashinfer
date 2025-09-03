@@ -71,13 +71,15 @@ def show_config_cmd():
 
     # Section: Torch Version Info
     click.secho("=== Torch Version Info ===", fg="yellow")
-    click.secho(f"Torch version: {torch.__version__}", fg="cyan")
+    click.secho("Torch version:", fg="magenta", nl=False)
+    click.secho(f" {torch.__version__}", fg="cyan")
     click.secho("", fg="white")
 
     # Section: Environment Variables
     click.secho("=== Environment Variables ===", fg="yellow")
     for name, value in env_variables.items():
-        click.secho(f"{name}: {value}", fg="cyan")
+        click.secho(f"{name}:", fg="magenta", nl=False)
+        click.secho(f" {value}", fg="cyan")
     click.secho("", fg="white")
 
     # Section: Artifact path
@@ -85,7 +87,8 @@ def show_config_cmd():
     # list all artifact paths
     for name, path in ArtifactPath.__dict__.items():
         if not name.startswith("__"):
-            click.secho(f"{name}: {path}", fg="cyan")
+            click.secho(f"{name}:", fg="magenta", nl=False)
+            click.secho(f" {path}", fg="cyan")
     click.secho("", fg="white")
 
     # Section: Downloaded Cubins
