@@ -207,7 +207,7 @@ class TrtllmGenGemmRunner {
         return optionsA.mUseUnrollLoop2xForMma;
       }
 
-      return true;
+      return false;
     });
 
     bool findLoop2xMma = false;
