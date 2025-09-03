@@ -25,10 +25,6 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if auto_tuning and backend == "cudnn":
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
 
-    if not use_128x4_sf_layout and backend == "trtllm":
-        # FIXME (bringup) quantization failure from main
-        pytest.xfail("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     a_sf_layout = SfLayout.layout_128x4 if use_128x4_sf_layout else SfLayout.layout_8x4
