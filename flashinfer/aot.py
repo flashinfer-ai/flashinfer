@@ -7,11 +7,13 @@ from typing import List, Tuple, Iterator
 
 import torch
 import torch.version
-from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .cascade import gen_cascade_module
-from .fp4_quantization import gen_fp4_quantization_module
+from .fp4_quantization import (
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm90_module,
+)
 from .fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
@@ -36,6 +38,7 @@ from .rope import gen_rope_module
 from .sampling import gen_sampling_module
 from .tllm_utils import get_trtllm_utils_spec
 from .utils import version_at_least
+from .compilation_context import CompilationContext
 
 
 def gen_fa2(
@@ -332,11 +335,12 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
-        jit_specs.append(gen_fp4_quantization_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
+            jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
+            jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
 
@@ -546,12 +550,16 @@ def main():
         add_misc = bool(args.add_misc)
 
     # Cuda Arch
-    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
-    gencode_flags = _get_cuda_arch_flags()
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    compilation_context = CompilationContext()
+    gencode_flags_list = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=None
+    )
 
     def has_sm(compute: str, version: str) -> bool:
-        if not any(compute in flag for flag in gencode_flags):
+        if not any(compute in flag for flag in gencode_flags_list):
             return False
         if torch.version.cuda is None:
             return True
@@ -586,7 +594,7 @@ def main():
     print("  f8_dtype:", f8_dtype_)
     print("  use_sliding_window:", use_sliding_window_)
     print("  use_logits_soft_cap:", use_logits_soft_cap_)
-    print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
+    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
     print("  add_comm:", add_comm)

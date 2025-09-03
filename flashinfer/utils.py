@@ -104,6 +104,18 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
+def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = num_tokens * top_k // num_experts
+
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+    return tile_tokens_dim
+
+
 def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
@@ -439,26 +451,31 @@ def is_sm100a_supported(device: torch.device) -> bool:
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+def is_sm110a_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 11 and version_at_least(torch.version.cuda, "13.0")
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
 
-def _check_shape_dtype_device(
+def check_shape_dtype_device(
     x: torch.Tensor,
-    expected_shape: Sequence[int],
-    expected_dtype: torch.dtype,
-    expected_device: torch.device,
+    expected_shape: Optional[Sequence[int]],
+    expected_dtype: Optional[torch.dtype],
+    expected_device: Optional[torch.device],
     name: str,
 ) -> None:
-    if x.shape != torch.Size(expected_shape):
+    if expected_shape and x.shape != torch.Size(expected_shape):
         raise ValueError(
             f"Invalid shape of {name}: expected {expected_shape}, got {x.shape}"
         )
-    if x.dtype != expected_dtype:
+    if expected_dtype and x.dtype != expected_dtype:
         raise ValueError(
             f"Invalid dtype of {name}: expected {expected_dtype}, got {x.dtype}"
         )
-    if x.device != expected_device:
+    if expected_device and x.device != expected_device:
         raise ValueError(
             f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )
@@ -501,6 +518,8 @@ def set_log_level(lvl_str: str) -> None:
 
 
 def device_support_pdl(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     major, _ = get_compute_capability(device)
     return major >= 9
 

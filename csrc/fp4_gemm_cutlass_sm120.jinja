@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,9 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
-#include "decoder_impl_common.h"
-#include "decoder_params.h"
+// Use SM120-specific dispatch template
+#include "flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h"
+
+namespace flashinfer {
+namespace gemm {
+// SM120/121 only supports 1x1x1 cluster shape
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM)
+
+}  // namespace gemm
+}  // namespace flashinfer

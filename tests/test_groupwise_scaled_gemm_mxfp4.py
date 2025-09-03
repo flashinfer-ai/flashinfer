@@ -27,6 +27,7 @@ from flashinfer.fp4_quantization import (
     get_fp4_quantization_module,
 )
 from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
+from flashinfer.utils import get_compute_capability
 
 
 class QuantMode(Enum):
@@ -64,7 +65,8 @@ def swizzle_blockscale(
         _pad_scale_factors(unswizzled_sf[i], m, n, sf_vec_size) for i in range(b)
     ]
     padded_input_sf = torch.stack(padded_input_sf_chunked)
-    out = get_fp4_quantization_module().nvfp4_block_scale_interleave_sm100(
+    major, minor = get_compute_capability(unswizzled_sf.device)
+    out = get_fp4_quantization_module(f"{major}{minor}").block_scale_interleave_sm100(
         padded_input_sf
     )
     out = out.view(padded_input_sf.shape)

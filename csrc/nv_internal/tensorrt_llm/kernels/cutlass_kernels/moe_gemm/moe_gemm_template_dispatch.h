@@ -96,7 +96,9 @@ struct genericMoeGemmKernelLauncher {
 
     static_assert(cutlass::platform::is_same<T, WeightType>::value ||
                   cutlass::platform::is_same<WeightType, uint8_t>::value ||
+#if defined(ENABLE_FP4)
                   cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value ||
+#endif
                   cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value);
 
     static_assert(arch::kMinComputeCapability < 90,
@@ -675,13 +677,18 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                        "Hopper configuration provided for non-Hopper architecture");
 
   if (sm_ >= 75 && sm_ < 80) {
+#ifdef ENABLE_FP4
     if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
       dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm75, EpilogueTag>(
           inputs, multi_processor_count_);
     } else {
       TLLM_THROW("FP4 data type is not supported on SM < 90");
     }
+#else
+    TLLM_THROW("FP4 data type is not supported on SM < 90");
+#endif
   } else if (sm_ >= 80 && sm_ < 90) {
+#ifdef ENABLE_FP4
     if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
       if constexpr (use_fp8 || use_w4afp8) {
 #if defined(ENABLE_FP8)
@@ -700,6 +707,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     } else {
       TLLM_THROW("FP4 data type is not supported on SM < 90");
     }
+#else
+    TLLM_THROW("FP4 data type is not supported on SM < 90");
+#endif
   } else if (sm_ >= 90) {
     // For SM120+ FP8 MoE, redirect to SM89 (Ada) FP8 kernel implementations.
     if constexpr (use_fp8) {
@@ -716,7 +726,12 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       // We allow both tma warp specialized and SM80 configurations to coexist because for some
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
-        TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == sm_,
+        bool is_same_sm = inputs.gemm_config.sm_version == sm_;
+        // gemm_config.sm_version indicates the kernel pipeline, which is always 100 for 100, 103,
+        // 110 below logging helps confirming the cutlass pipeline matches the device major version
+        bool is_sm110 = inputs.gemm_config.sm_version == 100 && sm_ == 110;
+        bool is_sm103 = inputs.gemm_config.sm_version == 100 && sm_ == 103;
+        TLLM_CHECK_WITH_INFO(is_same_sm || is_sm110 || is_sm103,
                              "Using SM %d configuration for SM %d device",
                              inputs.gemm_config.sm_version, sm_);
         TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,

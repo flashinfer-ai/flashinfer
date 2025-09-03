@@ -61,8 +61,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   if (use_routing_scales_on_input) {
@@ -332,8 +332,8 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float,
@@ -662,8 +662,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::Bfloat16 ||
@@ -910,7 +910,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts,
               "gemm1_weights_scale has incorrect dim 0.");
   TORCH_CHECK(intermediate_size % sf_vec_size == 0,
-              "the second dimension of weights must be a multiple of %d.", sf_vec_size);
+              "the second dimension of weights must be a multiple of ", sf_vec_size);
   TORCH_CHECK(gemm1_weights_scale.sizes()[1] == 2 * intermediate_size,
               "gemm1_weights_scale has incorrect dim 1.");
   TORCH_CHECK(gemm1_weights_scale.sizes()[2] == args.hidden_size / sf_vec_size,
@@ -918,8 +918,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   if (gemm1_bias.has_value()) {
     TORCH_CHECK(gemm1_bias.value().scalar_type() == at::ScalarType::Float,
-                "gemm1_bias must be float, got %s.",
-                c10::toString(gemm1_bias.value().scalar_type()));
+                "gemm1_bias must be float, got ", c10::toString(gemm1_bias.value().scalar_type()));
     TORCH_CHECK(gemm1_bias.value().dim() == 2, "gemm1_bias must be 2D.");
     TORCH_CHECK(gemm1_bias.value().sizes()[0] == local_num_experts,
                 "gemm1_bias has incorrect dim 0.");
@@ -929,7 +928,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   if (gemm1_alpha.has_value()) {
     TORCH_CHECK(gemm1_alpha.value().scalar_type() == at::ScalarType::Float,
-                "gemm1_alpha must be float, got %s.",
+                "gemm1_alpha must be float, got ",
                 c10::toString(gemm1_alpha.value().scalar_type()));
     TORCH_CHECK(gemm1_alpha.value().dim() == 1, "gemm1_alpha must be 1D.");
     TORCH_CHECK(gemm1_alpha.value().sizes()[0] == local_num_experts,
@@ -937,8 +936,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   }
   if (gemm1_beta.has_value()) {
     TORCH_CHECK(gemm1_beta.value().scalar_type() == at::ScalarType::Float,
-                "gemm1_beta must be float, got %s.",
-                c10::toString(gemm1_beta.value().scalar_type()));
+                "gemm1_beta must be float, got ", c10::toString(gemm1_beta.value().scalar_type()));
     TORCH_CHECK(gemm1_beta.value().dim() == 1, "gemm1_beta must be 1D.");
     TORCH_CHECK(gemm1_beta.value().sizes()[0] == local_num_experts,
                 "gemm1_beta has incorrect dim 0.");
