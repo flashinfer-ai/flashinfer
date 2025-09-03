@@ -575,13 +575,13 @@ def main():
     fa2_head_dim_ = [
         (64, 64),
         (128, 128),
-        # (256, 256),
+        (256, 256),
     ]
     fa3_head_dim_ = [
         (192, 128),
         (128, 128),
-        # (64, 64),
-        # (256, 256),
+        (64, 64),
+        (256, 256),
     ]
     f16_dtype_ = [
         torch.float16,
@@ -593,19 +593,19 @@ def main():
     ]
     use_sliding_window_ = [
         False,
-        # True,
+        True,
     ]
     use_logits_soft_cap_ = [
         False,
-        # True,
+        True,
     ]
-    add_comm = False
-    add_gemma = False
+    add_comm = True
+    add_gemma = True
     add_oai_oss = True
-    add_moe = False
-    add_act = False
+    add_moe = True
+    add_act = True
     add_misc = True
-    add_xqa = False
+    add_xqa = True
 
     # Override
     if args.out_dir:
@@ -625,19 +625,19 @@ def main():
     if args.use_logits_soft_cap:
         use_logits_soft_cap_ = [parse_bool(s) for s in args.use_logits_soft_cap]
     if args.add_comm is not None:
-        add_comm = bool(args.add_comm)
+        add_comm = args.add_comm
     if args.add_gemma is not None:
-        add_gemma = bool(args.add_gemma)
+        add_gemma = args.add_gemma
     if args.add_oai_oss is not None:
-        add_oai_oss = bool(args.add_oai_oss)
+        add_oai_oss = args.add_oai_oss
     if args.add_moe is not None:
-        add_moe = bool(args.add_moe)
+        add_moe = args.add_moe
     if args.add_act is not None:
-        add_act = bool(args.add_act)
+        add_act = args.add_act
     if args.add_misc is not None:
-        add_misc = bool(args.add_misc)
+        add_misc = args.add_misc
     if args.add_xqa is not None:
-        add_xqa = bool(args.add_xqa)
+        add_xqa = args.add_xqa
 
     # Cuda Arch
     if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
