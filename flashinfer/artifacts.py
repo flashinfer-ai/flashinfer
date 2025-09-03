@@ -179,7 +179,7 @@ def download_artifacts():
         raise RuntimeError("Failed to download cubins")
 
 
-def get_artifacts_status():
+def get_artifacts_status(verbose=False, printer=print):
     """
     Check which cubins are already downloaded and return (num_downloaded, total).
     Does not download any cubins.
@@ -193,8 +193,8 @@ def get_artifacts_status():
         local_path = os.path.join(FLASHINFER_CUBIN_DIR, rel_path)
         exists = os.path.isfile(local_path + extension)
         status.append((name, extension, exists))
-        if not exists:
-            print(f"Cubin {name}{extension} does not exist")
+        if not exists and verbose:
+            printer(f"Cubin {name}{extension} does not exist")
     return status
 
 

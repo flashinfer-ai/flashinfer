@@ -24,6 +24,7 @@ from .artifacts import (
     get_artifacts_status,
 )
 from .jit import clear_cache_dir
+from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
 
 
 def _download_cubin():
@@ -48,6 +49,13 @@ def cli(ctx, download_cubin_flag):
         click.echo(ctx.get_help())
 
 
+# list of environment variables
+env_variables = {
+    "FLASHINFER_CACHE_DIR": FLASHINFER_CACHE_DIR,
+    "FLASHINFER_CUBIN_DIR": FLASHINFER_CUBIN_DIR,
+}
+
+
 @cli.command("show-config")
 def show_config_cmd():
     """Show configuration"""
@@ -60,6 +68,9 @@ def show_config_cmd():
 
     # Section: Environment Variables
     click.secho("=== Environment Variables ===", fg="yellow")
+    for name, value in env_variables.items():
+        click.secho(f"{name}: {value}", fg="cyan")
+    click.secho("", fg="white")
 
     # Section: Downloaded Cubins
     click.secho("=== Downloaded Cubins ===", fg="yellow")
@@ -78,7 +89,7 @@ def show_config_cmd():
 @cli.command("list-cubins")
 def list_cubins_cmd():
     """List downloaded cubins"""
-    status = get_artifacts_status()
+    status = get_artifacts_status(verbose=True, printer=click.secho)
     table_data = []
     for name, extension, exists in status:
         status_str = "Downloaded" if exists else "Missing"
