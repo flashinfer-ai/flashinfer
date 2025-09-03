@@ -52,6 +52,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
   if (gpuSM == kSM_103) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_100) {
+    return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
 
   return gpuSM == kernelSM;
