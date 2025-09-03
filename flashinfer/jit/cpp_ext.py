@@ -23,6 +23,18 @@ from ..compilation_context import CompilationContext
 
 
 @functools.cache
+def get_cuda_path() -> str:
+    if CUDA_HOME is None:
+        # get output of "which nvcc"
+        result = subprocess.run(["which", "nvcc"], capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError("Could not find nvcc")
+        return result.stdout.decode("utf-8").strip()
+    else:
+        return CUDA_HOME
+
+
+@functools.cache
 def get_cuda_version() -> Version:
     if CUDA_HOME is None:
         nvcc = "nvcc"

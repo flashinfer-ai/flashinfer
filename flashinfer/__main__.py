@@ -19,12 +19,16 @@ import click
 from tabulate import tabulate  # type: ignore[import-untyped]
 
 from .artifacts import (
+    ArtifactPath,
     download_artifacts,
     clear_cubin,
     get_artifacts_status,
 )
 from .jit import clear_cache_dir
+from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
 from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
+from .jit.core import current_compilation_context
+from .jit.cpp_ext import get_cuda_path, get_cuda_version
 
 
 def _download_cubin():
@@ -53,6 +57,10 @@ def cli(ctx, download_cubin_flag):
 env_variables = {
     "FLASHINFER_CACHE_DIR": FLASHINFER_CACHE_DIR,
     "FLASHINFER_CUBIN_DIR": FLASHINFER_CUBIN_DIR,
+    "CUDA_HOME": get_cuda_path(),
+    "CUDA_VERSION": get_cuda_version(),
+    "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
+    "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
 }
 
 
@@ -72,6 +80,14 @@ def show_config_cmd():
         click.secho(f"{name}: {value}", fg="cyan")
     click.secho("", fg="white")
 
+    # Section: Artifact path
+    click.secho("=== Artifact Path ===", fg="yellow")
+    # list all artifact paths
+    for name, path in ArtifactPath.__dict__.items():
+        if not name.startswith("__"):
+            click.secho(f"{name}: {path}", fg="cyan")
+    click.secho("", fg="white")
+
     # Section: Downloaded Cubins
     click.secho("=== Downloaded Cubins ===", fg="yellow")
 
@@ -81,15 +97,11 @@ def show_config_cmd():
 
     click.secho(f"Downloaded {num_downloaded}/{total_cubins} cubins", fg="cyan")
 
-    # Section: Compiled Kernels
-    click.secho("=== Compiled Kernels ===", fg="yellow")
-    # TODO: List compiled kernels
-
 
 @cli.command("list-cubins")
 def list_cubins_cmd():
     """List downloaded cubins"""
-    status = get_artifacts_status(verbose=True, printer=click.secho)
+    status = get_artifacts_status()
     table_data = []
     for name, extension, exists in status:
         status_str = "Downloaded" if exists else "Missing"
@@ -98,12 +110,6 @@ def list_cubins_cmd():
 
     click.echo(tabulate(table_data, headers=["Cubin", "Status"], tablefmt="github"))
     click.secho("", fg="white")
-
-
-@cli.command("list-compiled-kernels")
-def list_compiled_kernels_cmd():
-    """List compiled kernels"""
-    # TODO(Zihao)
 
 
 @cli.command("download-cubin")
