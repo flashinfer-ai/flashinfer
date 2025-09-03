@@ -546,14 +546,8 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@functools.cache
-def get_gemm_module_cutlass_fp4():
-    # Check if we're on SM120/121 and use the appropriate module
-    major, _ = get_compute_capability(torch.device("cuda"))
-    if major == 12:
-        module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
-    else:
-        module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
+    """Helper function to create cutlass FP4 GEMM module."""
 
     class CutlassFp4GemmRunner(TunableRunner):
         def __init__(self):
@@ -580,7 +574,7 @@ def get_gemm_module_cutlass_fp4():
             return out
 
     @register_custom_op(
-        "flashinfer::cutlass_fp4_gemm",
+        op_name,
         mutates_args=(""),
     )
     def cutlass_fp4_gemm(
@@ -626,7 +620,7 @@ def get_gemm_module_cutlass_fp4():
 
         inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
         _, tactic = tuner.choose_one(
-            "cutlass_fp4_gemm",
+            tuner_name,
             [fp4_runner],
             tuning_config,
             inputs,
@@ -634,9 +628,26 @@ def get_gemm_module_cutlass_fp4():
 
         fp4_runner(inputs=inputs, tactic=tactic)
 
-    # Register the module
     return SimpleNamespace(
         cutlass_fp4_gemm=cutlass_fp4_gemm,
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_fp4():
+    """Get the SM100/103/110 FP4 GEMM module."""
+    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
+    )
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_fp4():
+    """Get the SM120/121 FP4 GEMM module."""
+    module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
     )
 
 
@@ -1747,7 +1758,15 @@ def mm_fp4(
             a_descale = a_descale.view(torch.uint8)
         if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
             b_descale = b_descale.view(torch.uint8)
-        get_gemm_module_cutlass_fp4().cutlass_fp4_gemm(
+
+        # Dispatch to the correct module based on device architecture
+        major, _ = get_compute_capability(a.device)
+        if major == 12:
+            gemm_module = get_gemm_sm120_module_cutlass_fp4()
+        else:
+            gemm_module = get_gemm_sm100_module_cutlass_fp4()
+
+        gemm_module.cutlass_fp4_gemm(
             a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
         )
     return out
