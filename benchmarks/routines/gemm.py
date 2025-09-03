@@ -197,10 +197,21 @@ def testGemmFp8NtGroupwise(args):
     ## Done parsing input arguments
 
     if "trtllm" in backends:
-        remove_trtllm = True
-        print("[INFO] trtllm backend testing not supported yet")
+        remove_trtllm = False
+        if scale_major_mode != "MN":
+            print(
+                "[INFO] trtllm only supports MN scale_major_mode, removing trtllm from backends"
+            )
+            remove_trtllm = True
+        if k < 256:
+            print("[INFO] trtllm only supports k >= 256, removing trtllm from backends")
+            remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
+
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return
 
     ## Prepare input tensors
     a_val = torch.randn((m, k), dtype=torch.float, device=device)
@@ -223,17 +234,6 @@ def testGemmFp8NtGroupwise(args):
     a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
     b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
-    if "trtllm" in backends:
-        a_scale_shape_trtllm = (m, k // tile_size)
-        b_scale_shape_trtllm = (k // tile_size, n // tile_size)
-
-        a_fp8_trtllm, a_scale_trtllm = quantize_fp8(
-            a_val, a_scale_shape_trtllm, a_tile_shape, "K"
-        )
-        b_fp8_trtllm, b_scale_trtllm = quantize_fp8(
-            b_val, b_scale_shape_trtllm, b_tile_shape, "MN"
-        )
-
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_fp8.shape = }")
         print(f"[VVERBOSE] {b_fp8.shape = }")
@@ -244,7 +244,7 @@ def testGemmFp8NtGroupwise(args):
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend):
-        if backend == "cutlass":
+        if backend in ["cutlass", "trtllm"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -253,18 +253,7 @@ def testGemmFp8NtGroupwise(args):
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
-                backend="cutlass",
-            )
-        elif backend == "trtllm":
-            return flashinfer.gemm.gemm_fp8_nt_groupwise(
-                a=a_fp8,
-                b=b_fp8,
-                a_scale=a_scale,
-                b_scale=b_scale,
-                scale_major_mode=None,
-                out_dtype=out_dtype,
-                mma_sm=mma_sm,
-                backend="trtllm",
+                backend=backend,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
