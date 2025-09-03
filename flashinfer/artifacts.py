@@ -135,7 +135,7 @@ class MetaInfoHash:
 
 def get_cubin_file_list():
     cubin_files = [
-        (ArtifactPath.TRTLLM_GEN_FMHA + "flashInferMetaInfo", ".h"),
+        (ArtifactPath.TRTLLM_GEN_FMHA + "include/flashInferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_BMM + "include/flashinferMetaInfo", ".h"),
     ]
