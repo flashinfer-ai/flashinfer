@@ -31,7 +31,12 @@ from ..autotuner import (
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, setup_cubin_loader, sm100a_nvcc_flags, sm90a_nvcc_flags
+from ..jit import (
+    gen_jit_spec,
+    setup_cubin_loader,
+    sm90a_nvcc_flags,
+    current_compilation_context,
+)
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cubin_loader import get_cubin
 from ..jit.cutlass_gemm.generate_kernels import generate_gemm_operations
@@ -257,7 +262,7 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = sm100a_nvcc_flags + [
+    nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
         "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
@@ -265,6 +270,11 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
+
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
@@ -384,7 +394,7 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend == "100":
+    if backend in ("100", "103", "110", "121", "122"):
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
             use_fast_build
         ).build_and_load(class_name="FusedMoeRunner")
@@ -923,6 +933,11 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    # currently only support Blackwell
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
+
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
@@ -947,7 +962,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_FP4",
             f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
-        + sm100a_nvcc_flags,
+        + nvcc_flags,
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache

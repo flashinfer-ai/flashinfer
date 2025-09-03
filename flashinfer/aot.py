@@ -7,7 +7,6 @@ from typing import List, Tuple, Iterator
 
 import torch
 import torch.version
-from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
 from .fp8_quantization import gen_mxfp8_quantization_sm100_module
@@ -50,6 +49,7 @@ from .sampling import gen_sampling_module
 from .tllm_utils import get_trtllm_utils_spec
 from .utils import version_at_least
 from .xqa import gen_xqa_module
+from .compilation_context import CompilationContext
 
 
 def gen_fa2(
@@ -640,12 +640,16 @@ def main():
         add_xqa = bool(args.add_xqa)
 
     # Cuda Arch
-    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
-    gencode_flags = _get_cuda_arch_flags()
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    compilation_context = CompilationContext()
+    gencode_flags_list = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=None
+    )
 
     def has_sm(compute: str, version: str) -> bool:
-        if not any(compute in flag for flag in gencode_flags):
+        if not any(compute in flag for flag in gencode_flags_list):
             return False
         if torch.version.cuda is None:
             return True
@@ -680,7 +684,7 @@ def main():
     print("  f8_dtype:", f8_dtype_)
     print("  use_sliding_window:", use_sliding_window_)
     print("  use_logits_soft_cap:", use_logits_soft_cap_)
-    print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
+    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
     print("  add_comm:", add_comm)

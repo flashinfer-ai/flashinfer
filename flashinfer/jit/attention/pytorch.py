@@ -22,7 +22,13 @@ import torch
 
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ..core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    current_compilation_context,
+)
 from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
@@ -1551,10 +1557,14 @@ def gen_fmha_cutlass_sm100a_module(
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
