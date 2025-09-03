@@ -23,7 +23,7 @@ from . import cubin_loader
 from . import env as env
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
-from .attention import cudnn_fmha_gen_module as cudnn_fmha_gen_module
+from .attention import gen_cudnn_fmha_module as gen_cudnn_fmha_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
@@ -76,7 +76,7 @@ from .cubin_loader import setup_cubin_loader
 
 @functools.cache
 def get_cudnn_fmha_gen_module():
-    mod = cudnn_fmha_gen_module()
+    mod = gen_cudnn_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op

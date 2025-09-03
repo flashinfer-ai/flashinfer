@@ -35,7 +35,6 @@ from .jit import (
     gen_batch_mla_module,
     gen_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
@@ -46,8 +45,8 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
-from .tllm_utils import get_trtllm_utils_spec
-from .utils import version_at_least
+from .tllm_utils import gen_trtllm_utils_module
+from .utils import gen_logging_module, version_at_least
 from .xqa import gen_xqa_module
 from .compilation_context import CompilationContext
 
@@ -427,7 +426,7 @@ def gen_all_modules(
             gen_sampling_module(),
         ]
         if has_sm90:
-            jit_specs.append(get_trtllm_utils_spec())
+            jit_specs.append(gen_trtllm_utils_module())
 
     if add_xqa:
         # Define XQA configurations to iterate over
@@ -697,18 +696,7 @@ def main():
 
     # Generate JIT specs
     print("Generating JIT specs...")
-    jit_specs = [
-        gen_jit_spec(
-            "logging",
-            [
-                jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
-            ],
-            extra_include_paths=[
-                jit_env.SPDLOG_INCLUDE_DIR,
-                jit_env.FLASHINFER_INCLUDE_DIR,
-            ],
-        )
-    ]
+    jit_specs = [gen_logging_module()]
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
