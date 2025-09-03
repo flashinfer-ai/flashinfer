@@ -228,6 +228,53 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     )
 
 
+def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm120_cutlass_fp4"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        # SM120/121 uses only 128x128x128 tile configuration with implied 1x1x1 cluster shape
+        cta_m_n_k_list = [
+            (128, 128, 128),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"fp4_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "fp4_gemm_cutlass_sm120",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
 def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp8"
     os.makedirs(gen_directory, exist_ok=True)
@@ -499,9 +546,8 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@functools.cache
-def get_gemm_sm100_module_cutlass_fp4():
-    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
+    """Helper function to create cutlass FP4 GEMM module."""
 
     class CutlassFp4GemmRunner(TunableRunner):
         def __init__(self):
@@ -528,7 +574,7 @@ def get_gemm_sm100_module_cutlass_fp4():
             return out
 
     @register_custom_op(
-        "flashinfer::cutlass_fp4_gemm",
+        op_name,
         mutates_args=(""),
     )
     def cutlass_fp4_gemm(
@@ -574,7 +620,7 @@ def get_gemm_sm100_module_cutlass_fp4():
 
         inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
         _, tactic = tuner.choose_one(
-            "cutlass_fp4_gemm",
+            tuner_name,
             [fp4_runner],
             tuning_config,
             inputs,
@@ -582,9 +628,26 @@ def get_gemm_sm100_module_cutlass_fp4():
 
         fp4_runner(inputs=inputs, tactic=tactic)
 
-    # Register the module
     return SimpleNamespace(
         cutlass_fp4_gemm=cutlass_fp4_gemm,
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_fp4():
+    """Get the SM100/103/110 FP4 GEMM module."""
+    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
+    )
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_fp4():
+    """Get the SM120/121 FP4 GEMM module."""
+    module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
     )
 
 
@@ -1695,7 +1758,15 @@ def mm_fp4(
             a_descale = a_descale.view(torch.uint8)
         if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
             b_descale = b_descale.view(torch.uint8)
-        get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm(
+
+        # Dispatch to the correct module based on device architecture
+        major, _ = get_compute_capability(a.device)
+        if major == 12:
+            gemm_module = get_gemm_sm120_module_cutlass_fp4()
+        else:
+            gemm_module = get_gemm_sm100_module_cutlass_fp4()
+
+        gemm_module.cutlass_fp4_gemm(
             a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
         )
     return out
