@@ -1330,8 +1330,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
-                bmm1_scale_log2_tensor,
-                bmm2_scale_tensor,
             ]
 
             if self._jit_module is not None:
