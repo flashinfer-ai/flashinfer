@@ -61,8 +61,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   if (use_routing_scales_on_input) {
@@ -332,8 +332,8 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float,
@@ -662,8 +662,8 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
     return std::make_tuple(major, minor);
   }();
 
-  TORCH_CHECK(std::get<0>(device_props) == 10 && std::get<1>(device_props) == 0,
-              "This kernel requires SM 100 architecture. Current device has SM ",
+  TORCH_CHECK(std::get<0>(device_props) == 10,
+              "This kernel requires 10.x architecture. Current device has SM ",
               std::get<0>(device_props), std::get<1>(device_props));
 
   TORCH_CHECK(dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::Bfloat16 ||
