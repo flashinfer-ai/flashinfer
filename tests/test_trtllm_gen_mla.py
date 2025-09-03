@@ -236,9 +236,11 @@ def test_trtllm_batch_decode_mla(
         )
     workspace_buffer = global_workspace_buffer
 
+    bmm1_scale = scale / ((128 + 64) ** 0.5)
+    bmm2_scale = 1.0
     bmm1_log2_scale_tensor = (
         torch.tensor(
-            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
+            [bmm1_scale * math.log2(math.e)],
             dtype=torch.float32,
             device=device,
         )
@@ -246,7 +248,7 @@ def test_trtllm_batch_decode_mla(
         else None
     )
     bmm2_scale_tensor = (
-        torch.tensor([1.0], dtype=torch.float32, device=device)
+        torch.tensor([bmm2_scale], dtype=torch.float32, device=device)
         if dynamic_scale
         else None
     )
@@ -262,8 +264,8 @@ def test_trtllm_batch_decode_mla(
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
-        bmm1_scale=1.0,  # should be scale / ((128 + 64) ** 0.5), just for testing dynamic in-memory scale factors
-        bmm2_scale=0.0,  # should be 1.0, just for testing dynamic in-memory scale factors
+        bmm1_scale=1.0,  # should be bmm1_scale, just for testing dynamic in-memory scale factors
+        bmm2_scale=0.0,  # should be bmm2_scale, just for testing dynamic in-memory scale factors
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
