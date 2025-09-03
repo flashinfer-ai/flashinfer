@@ -362,8 +362,8 @@ def test_moe_fp8(
 )
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] != 10,
-    reason="NVFP4 is only supported on SM100",
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="NVFP4 is only supported on SM100, SM110 and SM120",
 )
 def test_moe_nvfp4(
     batch_size,
@@ -939,8 +939,8 @@ def dequantize_block(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] != 10,
-    reason="FP8 block scaling is only supported on SM100",
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="FP8 block scaling is only supported on SM100, SM110 and SM120",
 )
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
@@ -1093,8 +1093,8 @@ def dequant_mxfp4_batches(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] != 10,
-    reason="MXFP8xMXFP4 is only supported on SM100",
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120",
 )
 def test_moe_mxfp8_mxfp4(
     batch_size,
