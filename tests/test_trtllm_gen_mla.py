@@ -102,8 +102,10 @@ def test_trtllm_gen_prefill_deepseek(
 
     bmm1_scale = scale
     bmm2_scale = 1.0
-    bmm1_scale_log2_tensor = torch.tensor([scale * math.log2(math.e)], device=device)
-    bmm2_scale_tensor = torch.tensor([1.0], device=device)
+    bmm1_scale_log2_tensor = torch.tensor(
+        [bmm1_scale * math.log2(math.e)], device=device
+    )
+    bmm2_scale_tensor = torch.tensor([bmm2_scale], device=device)
     output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
         q,
         k_cache,
@@ -112,8 +114,8 @@ def test_trtllm_gen_prefill_deepseek(
         actual_seq_lens_kv,
         s_qo,
         s_kv,
-        bmm1_scale,
-        bmm2_scale,
+        1.0,  # should be bmm1_scale, just for testing dynamic in-memory scale factors
+        0.0,  # should be bmm2_scale, just for testing dynamic in-memory scale factors
         -1,
         batch_size,
         -1,
@@ -260,8 +262,8 @@ def test_trtllm_batch_decode_mla(
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
-        bmm1_scale=scale / ((128 + 64) ** 0.5),
-        bmm2_scale=1.0,
+        bmm1_scale=1.0,  # should be scale / ((128 + 64) ** 0.5), just for testing dynamic in-memory scale factors
+        bmm2_scale=0.0,  # should be 1.0, just for testing dynamic in-memory scale factors
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
