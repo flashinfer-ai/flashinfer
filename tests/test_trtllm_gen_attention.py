@@ -558,6 +558,10 @@ def test_trtllm_batch_decode(
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale_log2_tensor = torch.tensor(
+        [sm_scale * math.log2(math.e)], device=GPU_DEVICE
+    )
+    bmm2_scale_tensor = torch.tensor([1.0], device=GPU_DEVICE)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -575,7 +579,8 @@ def test_trtllm_batch_decode(
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
-        # todo(Yingyi): add bmm1_scale_log2_tensor and bmm2_scale_tensor later
+        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
     )
 
     if o_dtype == "nvfp4":
@@ -619,7 +624,8 @@ def test_trtllm_batch_decode(
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
-            # todo(Yingyi): add bmm1_scale_log2_tensor and bmm2_scale_tensor later
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
