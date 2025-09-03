@@ -352,10 +352,12 @@ def test_trtllm_batch_prefill(
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
     bmm1_scale_log2_tensor = torch.tensor(
-        [sm_scale * math.log2(math.e)], device=GPU_DEVICE
+        [bmm1_scale * math.log2(math.e)], device=GPU_DEVICE
     )
-    bmm2_scale_tensor = torch.tensor([1.0], device=GPU_DEVICE)
+    bmm2_scale = v_scale / o_scale
+    bmm2_scale_tensor = torch.tensor([bmm2_scale], device=GPU_DEVICE)
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -364,8 +366,8 @@ def test_trtllm_batch_prefill(
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,
+        bmm2_scale,
         batch_size,
         q_indptr,
         kv_indptr,
@@ -566,10 +568,12 @@ def test_trtllm_batch_decode(
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
     bmm1_scale_log2_tensor = torch.tensor(
-        [sm_scale * math.log2(math.e)], device=GPU_DEVICE
+        [bmm1_scale * math.log2(math.e)], device=GPU_DEVICE
     )
-    bmm2_scale_tensor = torch.tensor([1.0], device=GPU_DEVICE)
+    bmm2_scale = v_scale / o_scale
+    bmm2_scale_tensor = torch.tensor([bmm2_scale], device=GPU_DEVICE)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -578,8 +582,8 @@ def test_trtllm_batch_decode(
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,  # bmm1_scale
+        bmm2_scale,  # bmm2_scale
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,
