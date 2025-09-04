@@ -226,9 +226,13 @@ def _check_cached_qkv_data_type(
         raise ValueError(
             f"The dtype of k {k.dtype} does not match the kv_data_type {dtype_kv} specified in plan function."
         )
+    
+
+def use_paddle_compatible_api() -> bool:
+    return os.environ.get("PADDLE_COMPATIBLE_API", "0").lower() in ["1", "on", "true"]
 
 
-if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
+if use_paddle_compatible_api() or IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
 
     def register_custom_op(
         name: str,

@@ -20,6 +20,7 @@ from torch.utils.cpp_extension import (
 )
 
 from . import env as jit_env
+from ..utils import use_paddle_compatible_api
 
 
 @functools.cache
@@ -63,12 +64,25 @@ def generate_ninja_build_for_op(
 ) -> str:
     system_includes = [
         sysconfig.get_path("include"),
-        "$torch_home/include",
-        "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
+    if use_paddle_compatible_api():
+        system_includes.extend(
+            [
+                "$torch_home/include",
+                "$torch_home/include/torch/csrc/api/include",
+            ]
+        )
+    else:
+        system_includes.extend(
+            [
+                "$torch_home/include",
+                "$torch_home/include/paddle/phi/api/include/compat",
+                "$torch_home/include/paddle/phi/api/include/compat/torch/csrc/api/include",
+            ]
+        )
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
     system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
@@ -113,15 +127,35 @@ def generate_ninja_build_for_op(
 
     ldflags = [
         "-shared",
-        "-L$torch_home/lib",
-        "-L$cuda_home/lib64",
-        "-lc10",
-        "-lc10_cuda",
-        "-ltorch_cpu",
-        "-ltorch_cuda",
-        "-ltorch",
         "-lcudart",
     ]
+    if use_paddle_compatible_api():
+        ldflags.extend(
+            [
+                "-L$torch_home/lib",
+                "-L$cuda_home/lib64",
+                "-lc10",
+                "-lc10_cuda",
+                "-ltorch_cpu",
+                "-ltorch_cuda",
+                "-ltorch",
+            ]
+        )
+    else:
+        ldflags.extend(
+            [
+                "-shared",
+                "-L$torch_home/libs",
+                "-L$torch_home/base",
+                "-L$cuda_home/lib64",
+                "-lpaddle",
+                "-lphi",
+                "-lphi_core",
+                "-lphi_gpu",
+                "-lcommon",
+                "-lcudart",
+            ]
+        )
 
     env_extra_ldflags = os.environ.get("FLASHINFER_EXTRA_LDFLAGS")
     if env_extra_ldflags:
