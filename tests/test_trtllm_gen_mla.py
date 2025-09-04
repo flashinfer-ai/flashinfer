@@ -114,8 +114,8 @@ def test_trtllm_gen_prefill_deepseek(
         actual_seq_lens_kv,
         s_qo,
         s_kv,
-        1.0,  # should be bmm1_scale, just for testing dynamic in-memory scale factors
-        0.0,  # should be bmm2_scale, just for testing dynamic in-memory scale factors
+        bmm1_scale,  # todo(Yingyi): disable this scale for testing dynamic in-memory scale factors
+        bmm2_scale,  # todo(Yingyi): disable this scale for testing dynamic in-memory scale factors
         -1,
         batch_size,
         -1,
@@ -125,6 +125,7 @@ def test_trtllm_gen_prefill_deepseek(
         causal,
         True,
         out=output,
+        # todo(Yingyi): enable this scale for testing dynamic in-memory scale factors
         bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
     )
@@ -264,8 +265,9 @@ def test_trtllm_batch_decode_mla(
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
-        bmm1_scale=1.0,  # should be bmm1_scale, just for testing dynamic in-memory scale factors
-        bmm2_scale=0.0,  # should be bmm2_scale, just for testing dynamic in-memory scale factors
+        bmm1_scale=bmm1_scale,  # todo(Yingyi): disable this scale for testing dynamic in-memory scale factors
+        bmm2_scale=bmm2_scale,  # todo(Yingyi): disable this scale for testing dynamic in-memory scale factors
+        # todo(Yingyi): enable this scale for testing dynamic in-memory scale factors
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
