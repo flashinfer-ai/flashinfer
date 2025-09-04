@@ -481,7 +481,7 @@ def check_shape_dtype_device(
         )
 
 
-def get_logging_module():
+def gen_logging_module():
     return gen_jit_spec(
         "logging",
         [
@@ -491,7 +491,12 @@ def get_logging_module():
             jit_env.SPDLOG_INCLUDE_DIR,
             jit_env.FLASHINFER_INCLUDE_DIR,
         ],
-    ).build_and_load()
+    )
+
+
+@functools.cache
+def get_logging_module():
+    return gen_logging_module().build_and_load()
 
 
 class LogLevel(Enum):

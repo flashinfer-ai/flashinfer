@@ -1568,7 +1568,7 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def trtllm_gen_fmha_module():
+def gen_trtllm_gen_fmha_module():
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 
@@ -1686,7 +1686,7 @@ def gen_customize_batch_attention_module(
     )
 
 
-def cudnn_fmha_gen_module():
+def gen_cudnn_fmha_module():
     return gen_jit_spec(
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],

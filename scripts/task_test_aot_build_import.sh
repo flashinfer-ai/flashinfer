@@ -33,7 +33,7 @@ print(" ".join(arches))
 ')
 
 python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
-python -m flashinfer.aot --add-comm True --add-moe True
+python -m flashinfer.aot
 python -m build --wheel
 pip install dist/*.whl
 
