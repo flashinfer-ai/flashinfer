@@ -28,6 +28,9 @@ root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
 enable_aot = aot_ops_package_dir.is_dir() and any(aot_ops_package_dir.iterdir())
 
+def use_paddle_compatible_api() -> bool:
+    return os.environ.get("PADDLE_COMPATIBLE_API", "0").lower() in ["1", "on", "true"]
+
 
 def write_if_different(path: Path, content: str) -> None:
     if path.exists() and path.read_text() == content:
@@ -55,7 +58,6 @@ ext_modules: List[setuptools.Extension] = []
 cmdclass: Mapping[str, type[setuptools.Command]] = {}
 install_requires = [
     "numpy",
-    "torch",
     "ninja",
     "requests",
     "cuda-python<=12.9",
@@ -64,9 +66,16 @@ install_requires = [
     "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
+if not use_paddle_compatible_api():
+    install_requires.append("torch")
+
 generate_build_meta({})
 
 if enable_aot:
+    if use_paddle_compatible_api():
+        import paddle
+        paddle.compat.install_torch_alias()
+
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
     from packaging.version import Version
