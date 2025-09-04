@@ -126,7 +126,6 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   using ElementCompute = float;
 
   // SM120 uses fixed 128x128x128 tile shape (Cooperative schedule)
-  // Note: PingPong schedule (64x128x128) will be supported in Phase 2
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
@@ -134,12 +133,11 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
-      cutlass::detail::Sm120BlockwiseScaleConfig<
-          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-          UMMA::Major::K, UMMA::Major::K>,
-      cutlass::detail::Sm120BlockwiseScaleConfig<
-          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-          UMMA::Major::MN, UMMA::Major::MN>>;
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                 ScaleGranularityK, UMMA::Major::MN,
+                                                 UMMA::Major::MN>>;
 
   // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
@@ -153,8 +151,8 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
       LayoutC*, AlignmentC, ElementD, LayoutD*, AlignmentD, EpilogueSchedule>::CollectiveOp;
 
-  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,

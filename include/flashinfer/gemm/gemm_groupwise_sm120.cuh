@@ -72,7 +72,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   using ElementCompute = float;
 
   // SM120 uses fixed 128x128x128 tile shape (Cooperative schedule)
-  // Note: PingPong schedule (64x128x128) will be supported in Phase 2
+  // TODO (yongwww): add PingPong schedule (64x128x128)
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
@@ -80,12 +80,11 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
-      cutlass::detail::Sm120BlockwiseScaleConfig<
-          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-          UMMA::Major::K, UMMA::Major::K>,
-      cutlass::detail::Sm120BlockwiseScaleConfig<
-          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-          UMMA::Major::MN, UMMA::Major::MN>>;
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
+                                                 ScaleGranularityK, UMMA::Major::MN,
+                                                 UMMA::Major::MN>>;
 
   // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
@@ -98,8 +97,8 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
   // SM120 uses automatic stage count with epilogue carveout
-  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,

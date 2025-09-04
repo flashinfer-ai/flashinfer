@@ -426,13 +426,11 @@ def gen_gemm_sm120_module() -> JitSpec:
     dtype_out_list = [torch.float16, torch.bfloat16]
     scale_major_k_list = ["true", "false"]
     # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
-    # Note: PingPong schedule (64x128x128) will be supported in Phase 2
-    # The mma_sm parameter is kept at 1 for template compatibility
-    mma_sm_list = [1]
+    # TODO (yongwww): add PingPong schedule (64x128x128)
     # SM120 scale granularity constraints:
-    # - ScaleGranularityM must divide tile M (128 for Cooperative, 64 for PingPong)
-    # - ScaleGranularityK must EQUAL TileK (128) per CUTLASS requirement
-    # - ScaleGranularityN must divide tile N (128)
+    # - ScaleGranularityM divides tile M (128 for Cooperative, 64 for PingPong)
+    # - ScaleGranularityK equals TileK (128)
+    # - ScaleGranularityN divides tile N (128)
     # Using M=1 ensures compatibility with both Cooperative and future PingPong schedules
     scale_granularity_configs = [
         (1, 128, 128),
@@ -452,7 +450,7 @@ def gen_gemm_sm120_module() -> JitSpec:
         dtype_in_list,
         dtype_out_list,
         scale_major_k_list,
-        mma_sm_list,
+        [1],
         scale_granularity_configs,
     ):
         name_dtype_in = filename_safe_dtype_map[dtype_in]
@@ -478,7 +476,6 @@ def gen_gemm_sm120_module() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
-    # Use the same mma_sm_list and scale_granularity_configs as regular gemm
     for dtype_in, dtype_out, scale_major_k, mma_sm, (
         scale_m,
         scale_n,
@@ -487,7 +484,7 @@ def gen_gemm_sm120_module() -> JitSpec:
         dtype_in_list,
         dtype_out_list,
         scale_major_k_list,
-        mma_sm_list,
+        [1],
         scale_granularity_configs,
     ):
         name_dtype_in = filename_safe_dtype_map[dtype_in]
