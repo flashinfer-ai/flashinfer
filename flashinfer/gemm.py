@@ -558,15 +558,8 @@ def get_gemm_sm120_module_cutlass_fp8():
                     )
 
                 scale_gran_m = 1
+                scale_gran_n = 128
                 scale_gran_k = 128
-
-                supported_n_grans = [128, 64, 32, 16]
-                scale_gran_n = 16
-                for gran in supported_n_grans:
-                    # Check if n is divisible by gran AND gran doesn't exceed n AND 128 is divisible by gran
-                    if n_dim >= gran and n_dim % gran == 0 and 128 % gran == 0:
-                        scale_gran_n = gran
-                        break
 
                 # For scalar scales, create compatible shapes for SM120
                 # SM120 requires scale tensors with specific shapes based on granularity
