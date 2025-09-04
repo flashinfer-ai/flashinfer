@@ -134,6 +134,7 @@ void trtllm_paged_attention_launcher(
   runner_params.enable_pdl = enable_pdl;
   runner_params.lsePtr = lse;
 
+  AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
@@ -150,7 +151,7 @@ void trtllm_paged_attention_launcher(
     runner_params.mTileScheduler =
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = use_multi_block;
-    AlignedAllocator float_allocator(workspace_buffer, workspace_size);
+
     size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
     size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
     size_t num_semaphores =

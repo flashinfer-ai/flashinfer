@@ -533,7 +533,7 @@ def test_trtllm_batch_decode(
     output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
 
     if q_len_per_req > 1:
-        # hide the output_ref from decode wrapper for speculative decoding test
+        # hide the output_ref, lse_ref from decode wrapper for speculative decoding test
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
