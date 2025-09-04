@@ -80,10 +80,6 @@ __global__ void compute_sm120_cutlass_group_gemm_args(
 
 using namespace cute;
 
-// Removed old compute_sm120_cutlass_group_gemm_args as it's no longer needed
-// The simplified version is defined above
-
-// SM120 implementation with fixed scale granularity following CUTLASS examples
 // SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
@@ -91,7 +87,7 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeIn* A, DTypeIn* B, float* SFA, float* SFB, DTypeOut* D,
     int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream) {
-  // SM120 only supports these specific scale granularities (per CUTLASS examples)
+  // SM120 only supports these specific scale granularities
   static_assert(ScaleGranularityM == 1 || ScaleGranularityM == 128,
                 "SM120 only supports ScaleGranularityM = 1 or 128");
   static_assert(ScaleGranularityN == 128, "SM120 only supports ScaleGranularityN = 128");
@@ -128,7 +124,7 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
-  // Define blockwise scale configuration following CUTLASS pattern
+  // Define blockwise scale configuration
   // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,

@@ -35,7 +35,6 @@
 namespace flashinfer {
 namespace gemm {
 
-// SM120 implementation with fixed scale granularity following CUTLASS examples
 // SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
@@ -43,7 +42,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
                                             int l, cudaStream_t stream) {
-  // SM120 only supports these specific scale granularities (per CUTLASS examples)
+  // SM120 only supports these specific scale granularities
   static_assert(ScaleGranularityM == 1 || ScaleGranularityM == 128,
                 "SM120 only supports ScaleGranularityM = 1 or 128");
   static_assert(ScaleGranularityN == 128, "SM120 only supports ScaleGranularityN = 128");
@@ -75,7 +74,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
-  // Define blockwise scale configuration following CUTLASS pattern
   // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
@@ -125,7 +123,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, l));
 
   // For beta=0 case, C and D can be the same buffer
-  // This avoids allocating extra memory from workspace
   DTypeOut* C_ptr = D_ptr;  // Use D as both input and output when beta=0
 
   typename Gemm::Arguments arguments{

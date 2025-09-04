@@ -716,10 +716,8 @@ def fp8_gemm_sm100(
                 get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner()
             )
         elif is_sm120_supported:
-            # Get k dimension (handling both 2D and 3D tensors)
             k_dim = a.shape[-1] if a.dim() == 2 else a.shape[2]
             if k_dim >= 128:
-                # No CUTLASS support for SM120/SM121 with k < 128 due to hardware limitations
                 runners.append(
                     get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
                 )
