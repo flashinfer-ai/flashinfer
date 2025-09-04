@@ -96,14 +96,14 @@ void compileTimeDebug(T&&) {
   static_assert(sizeof(T) == 0, "Compile time debug");
 }
 
-#define CUTLASS_CHECK(cmd)                                                                       \
-  do {                                                                                           \
-    auto status = cmd;                                                                           \
-    if (status != cutlass::Status::kSuccess) {                                                   \
-      std::ostringstream err_msg;                                                                \
-      err_msg << "cutlass " << #cmd << " failed: " << ::cutlass::cutlassGetStatusString(status); \
-      FLASHINFER_ERROR(err_msg.str());                                                           \
-    }                                                                                            \
+#define CUTLASS_CHECK(cmd)                                                            \
+  do {                                                                                \
+    auto status = cmd;                                                                \
+    if (status != cutlass::Status::kSuccess) {                                        \
+      std::ostringstream err_msg;                                                     \
+      err_msg << "cutlass " << #cmd << " failed: " << cutlassGetStatusString(status); \
+      FLASHINFER_ERROR(err_msg.str());                                                \
+    }                                                                                 \
   } while (0)
 
 }  // namespace flashinfer

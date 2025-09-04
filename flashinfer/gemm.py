@@ -74,9 +74,7 @@ from .utils import (
     get_compute_capability,
 )
 
-DEFAULT_WORKSPACE_SIZE = (
-    32 * 1024 * 1024
-)  # 32MB should be sufficient for kernel workspace
+DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
@@ -553,22 +551,17 @@ def get_gemm_sm120_module_cutlass_fp8():
                     k_dim = a.shape[2]
                     batch_size = a.shape[0]
 
-                # SM120 blockwise scaling requires k >= 128 due to CUTLASS constraint
                 # ScaleGranularityK must equal TileK (128)
                 if k_dim < 128:
-                    # Cannot use SM120 blockwise scaling kernel for k < 128
                     raise ValueError(
                         f"SM120/SM121 CUTLASS blockwise scaling requires k >= 128, got k={k_dim}. "
-                        "This is a hardware limitation that cannot be bypassed."
                     )
 
-                # Choose the appropriate scale granularity based on dimensions
-                scale_gran_m = 1  # Always 1 for SM120
-                scale_gran_k = 128  # Always 128 for SM120 per CUTLASS requirement
+                scale_gran_m = 1
+                scale_gran_k = 128
 
-                # For n dimension - choose largest granularity that divides n evenly
                 supported_n_grans = [128, 64, 32, 16]
-                scale_gran_n = 16  # Default to most flexible
+                scale_gran_n = 16
                 for gran in supported_n_grans:
                     # Check if n is divisible by gran AND gran doesn't exceed n AND 128 is divisible by gran
                     if n_dim >= gran and n_dim % gran == 0 and 128 % gran == 0:
@@ -580,7 +573,6 @@ def get_gemm_sm120_module_cutlass_fp8():
                 # Scale shape should be [m/scale_gran_m, k/scale_gran_k] for A
                 # and [n/scale_gran_n, k/scale_gran_k] for B
                 if scale_a.numel() == 1:
-                    # Calculate the expected scale dimensions
                     scale_m_count = (
                         batch_size * m_dim + scale_gran_m - 1
                     ) // scale_gran_m
@@ -631,6 +623,38 @@ def get_gemm_sm120_module_cutlass_fp8():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
+    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
+    # contains the `tllmGenGemmList` as the list of available kernels online.
+    # It is included when compiling `trtllm_gemm_runner.cu`.
+    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    header_name = "flashinferMetaInfo"
+
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}",
+        MetaInfoHash.TRTLLM_GEN_GEMM,
+        ".h",
+    )
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
+    return gen_jit_spec(
+        "trtllm_gemm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_gemm_runner.cu",
+        ],
+        extra_cuda_cflags=[
+            "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_ENABLE_CUDA",
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+        ]
+        + sm100a_nvcc_flags,
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_ldflags=["-lcuda"],
+    )
+
+
+def gen_trtllm_gen_gemm_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
@@ -2150,7 +2174,6 @@ def gemm_fp8_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
-        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
@@ -2481,7 +2504,6 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
-        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     out: Optional[torch.Tensor]
         The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
@@ -2631,7 +2653,6 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
-        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     tile_m: int
         The tile size for the M dimension, must be 128.
