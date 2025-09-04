@@ -21,13 +21,11 @@ using namespace flashinfer::gemm;
 namespace flashinfer {
 namespace gemm {
 
-// SM120 only supports ScaleGranularityM = 1, ScaleGranularityN = 128, ScaleGranularityK = 128
-// Following the CUTLASS examples pattern
+// SM120 uses Cooperative schedule with fixed 128x128x128 tiles
 template cudaError_t
 CutlassGroupwiseScaledGEMMSM120<
     {{ scale_granularity_m }}, {{ scale_granularity_n }}, {{ scale_granularity_k }},
     {{ scale_major_k }},
-    {{ mma_sm }},
     {{ dtype_in }},
     {{ dtype_out }}>(
         void* float_buffer, size_t float_buffer_size_in_bytes,

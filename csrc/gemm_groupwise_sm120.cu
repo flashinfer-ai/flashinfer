@@ -31,14 +31,27 @@ using namespace flashinfer;
                                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
                                    ...)                                                           \
   [&]() -> bool {                                                                                 \
+    /* SM120 scale granularity constraints:                                                       \
+     * - ScaleGranularityM must evenly divide the tile shape M dimension                          \
+     * - ScaleGranularityK must EQUAL the tile shape K dimension (128) - CUTLASS requirement      \
+     * - ScaleGranularityN must evenly divide the tile shape N dimension (128)                    \
+     * - Cooperative schedule: tile shape 128x128x128 (M supports 1,2,4,8,16,32,64,128)           \
+     * - Pingpong schedule: tile shape 64x128x128 (M supports 1,2,4,8,16,32,64)                   \
+     * - We use M=1 for compatibility with all tile shapes                                        \
+     * - These constraints are enforced at compile time by CUTLASS static_assert                  \
+     */                                                                                            \
     constexpr int SCALE_GRANULARITY_M = 1;   /* Always 1 for SM120 */                             \
-    constexpr int SCALE_GRANULARITY_K = 128; /* Always 128 for SM120 per CUTLASS requirement */   \
+    constexpr int SCALE_GRANULARITY_K = 128; /* Must equal tile K dimension per CUTLASS */        \
     if (scale_granularity_m != 1) {                                                               \
-      TORCH_CHECK(false, "SM120 only supports scale_granularity_m=1");                            \
+      TORCH_CHECK(false,                                                                          \
+                  "SM120 only supports scale_granularity_m=1 to ensure compatibility with all tile shapes. " \
+                  "ScaleGranularityM must divide tile M dimension (128 for cooperative, 64 for pingpong)."); \
       return false;                                                                               \
     }                                                                                             \
     if (scale_granularity_k != 128) {                                                             \
-      TORCH_CHECK(false, "SM120 only supports scale_granularity_k=128");                          \
+      TORCH_CHECK(false,                                                                          \
+                  "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must equal " \
+                  "tile shape K dimension (which is 128 for both cooperative and pingpong schedules)."); \
       return false;                                                                               \
     }                                                                                             \
     /* Dispatch based on n granularity only */                                                    \
@@ -60,18 +73,6 @@ using namespace flashinfer;
     return false;                                                                                 \
   }()
 
-#define DISPATCH_MMA_SM(mma_sm, MMA_SM, ...)                                                  \
-  [&]() -> bool {                                                                             \
-    if (mma_sm == 1) {                                                                        \
-      constexpr int MMA_SM = 1;                                                               \
-      return __VA_ARGS__();                                                                   \
-    }                                                                                         \
-    TORCH_CHECK(false,                                                                        \
-                "SM120 only supports MmaSM=1 (MmaSM=2 would violate Cooperative kernel tile " \
-                "M>=128 requirement)");                                                       \
-    return false;                                                                             \
-  }()
-
 #define DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, ...) \
   [&]() -> bool {                                                    \
     if (scale_major_mode == "K") {                                   \
@@ -89,7 +90,7 @@ namespace flashinfer {
 namespace gemm {
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          int MmaSM, typename DTypeIn, typename DTypeOut>
+          typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
@@ -101,8 +102,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tensor A, at::Tensor B,
                                      at::Tensor SFA, at::Tensor SFB, at::Tensor C,
                                      int64_t scale_granularity_m, int64_t scale_granularity_n,
-                                     int64_t scale_granularity_k, std::string scale_major_mode,
-                                     int64_t mma_sm) {
+                                     int64_t scale_granularity_k, std::string scale_major_mode) {
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -112,8 +112,7 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
   at::Tensor SFB_contig = SFB.is_contiguous() ? SFB : SFB.contiguous();
 
   DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
-    return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
-      return DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
+    return DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
           A.scalar_type(), C.scalar_type(), c_type_in, c_type_out, [&] {
             return DISPATCH_SCALE_GRANULARITY(
                 scale_granularity_m, scale_granularity_n, scale_granularity_k, SCALE_GRANULARITY_M,
@@ -140,8 +139,7 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                   }
 
                   auto status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120<
-                      SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
-                      MMA_SM>(
+                      SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K>(
                       static_cast<void*>(float_workspace_buffer.data_ptr()),
                       float_workspace_buffer.element_size() * float_workspace_buffer.numel(),
                       static_cast<cutlass_t_in*>(A.data_ptr()),
@@ -154,5 +152,4 @@ void CutlassGemmGroupwiseScaledSM120(at::Tensor float_workspace_buffer, at::Tens
                 });
           });
     });
-  });
 }

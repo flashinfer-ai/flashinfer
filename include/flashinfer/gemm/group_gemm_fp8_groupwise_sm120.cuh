@@ -84,10 +84,9 @@ using namespace cute;
 // The simplified version is defined above
 
 // SM120 implementation with fixed scale granularity following CUTLASS examples
-// For SM120, only ScaleGranularityM = 1, ScaleGranularityN = 128, ScaleGranularityK = 128 are
-// supported
+// SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          int MmaSM, typename DTypeIn, typename DTypeOut>
+          typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeIn* A, DTypeIn* B, float* SFA, float* SFB, DTypeOut* D,
@@ -126,20 +125,21 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   using ElementAccumulator = float;
   using ElementCompute = float;
 
-  // For SM120, we use fixed tile shapes
-  using MmaTileShape_MNK = Shape<cute::Int<MmaSM * 128>, _128, _128>;
-  using ClusterShape_MNK = Shape<_1, _1, _1>;  // GeForce doesn't support multicast
+  // SM120 uses fixed 128x128x128 tile shape (Cooperative schedule)
+  // Note: PingPong schedule (64x128x128) will be supported in Phase 2
+  using MmaTileShape_MNK = Shape<_128, _128, _128>;
+  using ClusterShape_MNK = Shape<_1, _1, _1>;
 
   // Define blockwise scale configuration following CUTLASS pattern
-  // SM120 needs explicit ScaleMajorK handling like SM100
-  using ScaleConfig =
-      std::conditional_t<ScaleMajorK,
-                         cutlass::detail::Sm120BlockwiseScaleConfig<
-                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                             cute::UMMA::Major::K, cute::UMMA::Major::K>,
-                         cutlass::detail::Sm120BlockwiseScaleConfig<
-                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                             cute::UMMA::Major::MN, cute::UMMA::Major::MN>>;
+  // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
+  using ScaleConfig = std::conditional_t<
+      ScaleMajorK,
+      cutlass::detail::Sm120BlockwiseScaleConfig<
+          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+          UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm120BlockwiseScaleConfig<
+          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+          UMMA::Major::MN, UMMA::Major::MN>>;
 
   // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
@@ -153,9 +153,8 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
       LayoutC*, AlignmentC, ElementD, LayoutD*, AlignmentD, EpilogueSchedule>::CollectiveOp;
 
-  // SM120 blockwise scaling requires at least 2 stages
-  // Use fixed stage count to ensure requirement is met
-  using StageCount = cutlass::gemm::collective::StageCount<MmaSM == 1 ? 2 : 3>;
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,

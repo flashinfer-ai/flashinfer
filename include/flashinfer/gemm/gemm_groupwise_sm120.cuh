@@ -36,10 +36,9 @@ namespace flashinfer {
 namespace gemm {
 
 // SM120 implementation with fixed scale granularity following CUTLASS examples
-// For SM120, only ScaleGranularityM = 1, ScaleGranularityN = 128, ScaleGranularityK = 128 are
-// supported
+// SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          int MmaSM, typename DTypeIn, typename DTypeOut>
+          typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
@@ -72,22 +71,21 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   using ElementAccumulator = float;
   using ElementCompute = float;
 
-  // Use different tile shapes based on MmaSM like CUTLASS examples
-  // MmaSM=1 uses 128x128x128, MmaSM=2 uses smaller tile to avoid register spilling
-  using MmaTileShape_MNK =
-      std::conditional_t<MmaSM == 1, Shape<_128, _128, _128>, Shape<_64, _128, _128>>;
+  // SM120 uses fixed 128x128x128 tile shape (Cooperative schedule)
+  // Note: PingPong schedule (64x128x128) will be supported in Phase 2
+  using MmaTileShape_MNK = Shape<_128, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
   // Define blockwise scale configuration following CUTLASS pattern
-  // SM120 needs explicit ScaleMajorK handling like SM100
-  using ScaleConfig =
-      std::conditional_t<ScaleMajorK,
-                         cutlass::detail::Sm120BlockwiseScaleConfig<
-                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                             cute::UMMA::Major::K, cute::UMMA::Major::K>,
-                         cutlass::detail::Sm120BlockwiseScaleConfig<
-                             ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                             cute::UMMA::Major::MN, cute::UMMA::Major::MN>>;
+  // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
+  using ScaleConfig = std::conditional_t<
+      ScaleMajorK,
+      cutlass::detail::Sm120BlockwiseScaleConfig<
+          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+          UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm120BlockwiseScaleConfig<
+          ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+          UMMA::Major::MN, UMMA::Major::MN>>;
 
   // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
@@ -99,10 +97,9 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-  // SM120 blockwise scaling uses auto stage count with epilogue carveout
-  // This matches the CUTLASS example configuration
-  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-      sizeof(typename CollectiveEpilogue::SharedStorage))>;
+  // SM120 uses automatic stage count with epilogue carveout
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,

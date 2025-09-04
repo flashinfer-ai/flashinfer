@@ -425,18 +425,20 @@ def gen_gemm_sm120_module() -> JitSpec:
     dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
     dtype_out_list = [torch.float16, torch.bfloat16]
     scale_major_k_list = ["true", "false"]
-    # SM120 Cooperative kernel requires tile M >= 128, so only MmaSM=1 is supported (gives 128x128x128 tile)
-    mma_sm_list = [
-        1
-    ]  # MmaSM=2 would give 64x128x128 tile which violates Cooperative kernel requirements
-    # SM120 supports scale granularities that divide the tile size (128)
-    # IMPORTANT: ScaleGranularityK must equal TileK (128) per CUTLASS requirement
-    # Valid values for N: 128, 64, 32, 16
+    # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
+    # Note: PingPong schedule (64x128x128) will be supported in Phase 2
+    # The mma_sm parameter is kept at 1 for template compatibility
+    mma_sm_list = [1]
+    # SM120 scale granularity constraints:
+    # - ScaleGranularityM must divide tile M (128 for Cooperative, 64 for PingPong)
+    # - ScaleGranularityK must EQUAL TileK (128) per CUTLASS requirement
+    # - ScaleGranularityN must divide tile N (128)
+    # Using M=1 ensures compatibility with both Cooperative and future PingPong schedules
     scale_granularity_configs = [
         (1, 128, 128),
         (1, 64, 128),
         (1, 32, 128),
-        (1, 16, 128),  # k must be 128
+        (1, 16, 128),
     ]
 
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
@@ -652,7 +654,6 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_gran_n,  # scale_granularity_n
                     scale_gran_k,  # scale_granularity_k (adjusted for small k)
                     "MN",  # scale_major_mode
-                    1,  # mma_sm
                 )
                 return out
 
@@ -2184,6 +2185,7 @@ def gemm_fp8_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
+        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
@@ -2253,6 +2255,7 @@ def gemm_fp8_nt_groupwise(
     if backend == "cutlass":
         assert scale_major_mode is not None
         if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+            # SM120/121 doesn't use mma_sm parameter (always uses 128x128x128 tiles)
             get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
                 workspace_buffer,
                 a,
@@ -2262,7 +2265,6 @@ def gemm_fp8_nt_groupwise(
                 out,
                 *scale_granularity_mnk,
                 scale_major_mode,
-                mma_sm,
             )
         elif is_sm100a_supported(a.device):
             get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
@@ -2514,6 +2516,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
+        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     out: Optional[torch.Tensor]
         The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
@@ -2539,9 +2542,9 @@ def group_gemm_fp8_nt_groupwise(
         raise ValueError(
             "gemm_fp8_nt_groupwise is only supported on SM100, SM120, and SM121."
         )
-    if not (_match_sm_version(a.device, ["100", "103", "110"])):
+    if not (_match_sm_version(a.device, ["100", "103", "110", "120", "121"])):
         raise ValueError(
-            "gemm_fp8_nt_groupwise is only supported on SM100, SM103 or SM110."
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121."
         )
 
     int_workspace_buffer = _get_cache_buf(
@@ -2586,6 +2589,7 @@ def group_gemm_fp8_nt_groupwise(
         assert out.dtype == out_dtype
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        # SM120/121 doesn't use mma_sm parameter (always uses 128x128x128 tiles)
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
             int_workspace_buffer,
             float_workspace_buffer,
@@ -2599,7 +2603,6 @@ def group_gemm_fp8_nt_groupwise(
             k,
             *scale_granularity_mnk,
             scale_major_mode,
-            mma_sm,
         )
     elif is_sm100a_supported(a.device):
         get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
@@ -2663,6 +2666,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
+        Note: This parameter is only used for SM100. SM120/121 always uses 128x128x128 tiles.
 
     tile_m: int
         The tile size for the M dimension, must be 128.
