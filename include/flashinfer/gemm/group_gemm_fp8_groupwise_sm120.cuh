@@ -92,10 +92,9 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
     size_t float_buffer_size_in_bytes, DTypeIn* A, DTypeIn* B, float* SFA, float* SFB, DTypeOut* D,
     int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream) {
   // SM120 only supports these specific scale granularities (per CUTLASS examples)
-  static_assert(ScaleGranularityM == 1, "SM120 only supports ScaleGranularityM = 1");
-  static_assert(ScaleGranularityN == 128 || ScaleGranularityN == 64 || ScaleGranularityN == 32 ||
-                    ScaleGranularityN == 16,
-                "SM120 only supports ScaleGranularityN = 128, 64, 32 or 16");
+  static_assert(ScaleGranularityM == 1 || ScaleGranularityM == 128,
+                "SM120 only supports ScaleGranularityM = 1 or 128");
+  static_assert(ScaleGranularityN == 128, "SM120 only supports ScaleGranularityN = 128");
   static_assert(ScaleGranularityK == 128, "SM120 only supports ScaleGranularityK = 128");
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group

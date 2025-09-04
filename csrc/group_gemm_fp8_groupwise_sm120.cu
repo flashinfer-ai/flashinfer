@@ -31,35 +31,22 @@ using namespace flashinfer;
                                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K,  \
                                    ...)                                                            \
   [&]() -> bool {                                                                                  \
-    constexpr int SCALE_GRANULARITY_M = 1;   /* Always 1 for SM120 */                              \
-    constexpr int SCALE_GRANULARITY_K = 128; /* equal tile K dimension */                          \
-    if (scale_granularity_m != 1) {                                                                \
-      TORCH_CHECK(false,                                                                           \
-                  "SM120 only supports scale_granularity_m=1 to ensure compatibility with all "    \
-                  "tile shapes. "                                                                  \
-                  "ScaleGranularityM must divide tile M dimension (128 for cooperative, 64 for "   \
-                  "pingpong).");                                                                   \
-      return false;                                                                                \
-    }                                                                                              \
+    constexpr int SCALE_GRANULARITY_K = 128;                                                       \
     if (scale_granularity_k != 128) {                                                              \
       TORCH_CHECK(                                                                                 \
           false,                                                                                   \
           "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must equal " \
-          "tile shape K dimension (which is 128 for both cooperative and pingpong schedules).");   \
+          "tile shape K dimension (128 for both Cooperative and PingPong schedules).");            \
       return false;                                                                                \
     }                                                                                              \
-    /* Dispatch based on n granularity only */                                                     \
-    if (scale_granularity_n == 128) {                                                              \
+    /* Match SM100's approach: support only (1,128,128) and (128,128,128) */                       \
+    if (scale_granularity_m == 1 && scale_granularity_n == 128) {                                  \
+      constexpr int SCALE_GRANULARITY_M = 1;                                                       \
       constexpr int SCALE_GRANULARITY_N = 128;                                                     \
       return __VA_ARGS__();                                                                        \
-    } else if (scale_granularity_n == 64) {                                                        \
-      constexpr int SCALE_GRANULARITY_N = 64;                                                      \
-      return __VA_ARGS__();                                                                        \
-    } else if (scale_granularity_n == 32) {                                                        \
-      constexpr int SCALE_GRANULARITY_N = 32;                                                      \
-      return __VA_ARGS__();                                                                        \
-    } else if (scale_granularity_n == 16) {                                                        \
-      constexpr int SCALE_GRANULARITY_N = 16;                                                      \
+    } else if (scale_granularity_m == 128 && scale_granularity_n == 128) {                         \
+      constexpr int SCALE_GRANULARITY_M = 128;                                                     \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                     \
       return __VA_ARGS__();                                                                        \
     }                                                                                              \
     TORCH_CHECK(false, "SM120: Unsupported scale granularity combination (", scale_granularity_m,  \

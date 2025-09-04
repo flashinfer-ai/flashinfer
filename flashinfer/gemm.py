@@ -420,54 +420,32 @@ def gen_gemm_sm120_module() -> JitSpec:
     gen_directory.mkdir(parents=True, exist_ok=True)
     source_paths = []
 
-    # Generate kernel instantiations - SM120 supports fixed scale granularities
+    # Generate kernel instantiations following SM100's approach
     prefix = "gemm_groupwise"
     dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
     dtype_out_list = [torch.float16, torch.bfloat16]
     scale_major_k_list = ["true", "false"]
     # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
-    # TODO (yongwww): add PingPong schedule (64x128x128)
-    # SM120 scale granularity constraints:
-    # - ScaleGranularityM divides tile M (128 for Cooperative, 64 for PingPong)
-    # - ScaleGranularityK equals TileK (128)
-    # - ScaleGranularityN divides tile N (128)
-    # Using M=1 ensures compatibility with both Cooperative and future PingPong schedules
-    scale_granularity_configs = [
-        (1, 128, 128),
-        (1, 64, 128),
-        (1, 32, 128),
-        (1, 16, 128),
-    ]
 
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
-    for dtype_in, dtype_out, scale_major_k, mma_sm, (
-        scale_m,
-        scale_n,
-        scale_k,
-    ) in product(
+    for dtype_in, dtype_out, scale_major_k in product(
         dtype_in_list,
         dtype_out_list,
         scale_major_k_list,
-        [1],
-        scale_granularity_configs,
     ):
         name_dtype_in = filename_safe_dtype_map[dtype_in]
         name_dtype_out = filename_safe_dtype_map[dtype_out]
         dest_path = (
             gen_directory
-            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_m{scale_m}_n{scale_n}_k{scale_k}_sm120.cu"
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_sm120.cu"
         )
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
             dtype_in=dtype_cutlass_map[dtype_in],
             dtype_out=dtype_cutlass_map[dtype_out],
             scale_major_k=scale_major_k,
-            mma_sm=mma_sm,
-            scale_granularity_m=scale_m,
-            scale_granularity_n=scale_n,
-            scale_granularity_k=scale_k,
         )
         write_if_different(dest_path, source)
 
@@ -476,32 +454,22 @@ def gen_gemm_sm120_module() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
-    for dtype_in, dtype_out, scale_major_k, mma_sm, (
-        scale_m,
-        scale_n,
-        scale_k,
-    ) in product(
+    for dtype_in, dtype_out, scale_major_k in product(
         dtype_in_list,
         dtype_out_list,
         scale_major_k_list,
-        [1],
-        scale_granularity_configs,
     ):
         name_dtype_in = filename_safe_dtype_map[dtype_in]
         name_dtype_out = filename_safe_dtype_map[dtype_out]
         dest_path = (
             gen_directory
-            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_mma{mma_sm}_m{scale_m}_n{scale_n}_k{scale_k}_sm120.cu"
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_sm120.cu"
         )
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
             dtype_in=dtype_cutlass_map[dtype_in],
             dtype_out=dtype_cutlass_map[dtype_out],
             scale_major_k=scale_major_k,
-            mma_sm=mma_sm,
-            scale_granularity_m=scale_m,
-            scale_granularity_n=scale_n,
-            scale_granularity_k=scale_k,
         )
         write_if_different(dest_path, source)
 

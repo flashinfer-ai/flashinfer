@@ -22,6 +22,9 @@ namespace flashinfer {
 namespace group_gemm {
 
 // SM120 uses Cooperative schedule with fixed 128x128x128 tiles
+{% for scale_granularity_m in [1, 128] %}
+{% for scale_granularity_n in [128] %}
+{% for scale_granularity_k in [128] %}
 template cudaError_t
 CutlassFP8GroupwiseScaledGroupGEMMSM120<
     {{ scale_granularity_m }}, {{ scale_granularity_n }}, {{ scale_granularity_k }},
@@ -32,6 +35,9 @@ CutlassFP8GroupwiseScaledGroupGEMMSM120<
         void* float_buffer, size_t float_buffer_size_in_bytes,
         {{ dtype_in }}* A, {{ dtype_in }}* B, float* SFA, float* SFB, {{ dtype_out }}* D,
         int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream);
+{% endfor %}
+{% endfor %}
+{% endfor %}
 
 };  // namespace group_gemm
 };  // namespace flashinfer
