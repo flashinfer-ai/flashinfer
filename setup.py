@@ -60,6 +60,9 @@ install_requires = [
     "requests",
     "pynvml",
     "einops",
+    "click",
+    "tqdm",
+    "tabulate",
     "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
