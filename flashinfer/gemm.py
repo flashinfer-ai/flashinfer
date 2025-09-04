@@ -615,38 +615,6 @@ def get_gemm_sm120_module_cutlass_fp8():
     )
 
 
-def trtllm_gemm_gen_module() -> JitSpec:
-    # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
-    # contains the `tllmGenGemmList` as the list of available kernels online.
-    # It is included when compiling `trtllm_gemm_runner.cu`.
-    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
-    header_name = "flashinferMetaInfo"
-
-    # use `get_cubin` to get "flashinferMetaInfo.h"
-    metainfo = get_cubin(
-        f"{include_path}/{header_name}",
-        MetaInfoHash.TRTLLM_GEN_GEMM,
-        ".h",
-    )
-    # make sure "flashinferMetaInfo.h" is downloaded or cached
-    assert metainfo, f"{header_name}.h not found"
-    return gen_jit_spec(
-        "trtllm_gemm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_gemm_runner.cu",
-        ],
-        extra_cuda_cflags=[
-            "-DTLLM_GEN_EXPORT_INTERFACE",
-            "-DTLLM_ENABLE_CUDA",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
-        ]
-        + sm100a_nvcc_flags,
-        # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
-        extra_ldflags=["-lcuda"],
-    )
-
-
 def gen_trtllm_gen_gemm_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
@@ -2236,7 +2204,7 @@ def gemm_fp8_nt_groupwise(
     if backend == "cutlass":
         assert scale_major_mode is not None
         if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
-            # SM120/121 doesn't use mma_sm parameter (always uses 128x128x128 tiles)
+            # SM120/121 doesn't use mma_sm parameter
             get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
                 workspace_buffer,
                 a,
@@ -2569,7 +2537,7 @@ def group_gemm_fp8_nt_groupwise(
         assert out.dtype == out_dtype
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
-        # SM120/121 doesn't use mma_sm parameter (always uses 128x128x128 tiles)
+        # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
             int_workspace_buffer,
             float_workspace_buffer,

@@ -168,14 +168,6 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
   using StrideB = typename Gemm::GemmKernel::InternalStrideB;
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
-  // These static asserts may need to be adjusted for SM120
-  // static_assert(
-  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA,
-  //     LayoutSFA>);
-  // static_assert(
-  //     cute::is_same_v<typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB,
-  //     LayoutSFB>);
-
   AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);
 
   auto problem_sizes = allocator.aligned_alloc<typename ProblemShape::UnderlyingProblemShape>(
