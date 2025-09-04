@@ -30,7 +30,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
-    trtllm_gen_fmha_module,
+    gen_trtllm_gen_fmha_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -53,6 +53,7 @@ from .utils import (
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
+    is_sm110a_supported,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -71,9 +72,10 @@ def get_fmha_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if is_sm100a_supported(torch.device("cuda")):
+    if is_sm100a_supported(device) or is_sm110a_supported(device):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -168,7 +170,7 @@ def get_customize_batch_prefill_module(
 
 @functools.cache
 def get_trtllm_gen_prefill_module():
-    mod = trtllm_gen_fmha_module()
+    mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
@@ -2680,7 +2682,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
-                self._cached_module = get_fmha_module(*get_module_args)
+                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                new_get_module_args = (
+                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                )
+                self._cached_module = get_fmha_module(*new_get_module_args)
             else:
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
@@ -3056,6 +3062,7 @@ def fmha_varlen(
         PosEncodingMode.NONE.value,
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
+        q.device,
     )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
@@ -3122,7 +3129,7 @@ def fmha_varlen(
 
 @functools.cache
 def get_trtllm_gen_fmha_module():
-    mod = trtllm_gen_fmha_module()
+    mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op

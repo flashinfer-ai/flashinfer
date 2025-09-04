@@ -23,7 +23,15 @@ import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags, sm90a_nvcc_flags
+from .jit import (
+    gen_jit_spec,
+    sm121a_nvcc_flags,
+    sm120a_nvcc_flags,
+    sm110a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm90a_nvcc_flags,
+)
 from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
@@ -31,6 +39,7 @@ from .utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 
 
@@ -67,8 +76,24 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
     return gen_fp4_quantization_module(sm100a_nvcc_flags, "100")
 
 
+def gen_fp4_quantization_sm103_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
+
+
 def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
+
+
+def gen_fp4_quantization_sm110_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm110a_nvcc_flags, "110")
+
+
+def gen_fp4_quantization_sm120_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
+
+
+def gen_fp4_quantization_sm121_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm121a_nvcc_flags, "121")
 
 
 def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
@@ -104,12 +129,19 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 
 @functools.cache
 def get_fp4_quantization_module(backend: str = "100"):
-    if backend == "100":
-        module = gen_fp4_quantization_sm100_module().build_and_load()
-    elif backend == "90":
-        module = gen_fp4_quantization_sm90_module().build_and_load()
-    else:
+    backend_modules = {
+        "121": gen_fp4_quantization_sm121_module,
+        "120": gen_fp4_quantization_sm120_module,
+        "110": gen_fp4_quantization_sm110_module,
+        "103": gen_fp4_quantization_sm103_module,
+        "100": gen_fp4_quantization_sm100_module,
+        "90": gen_fp4_quantization_sm90_module,
+    }
+
+    if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
+
+    module = backend_modules[backend]().build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
@@ -324,7 +356,9 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_fp4_quantization_module("100").fp4_quantize_sm100(
+    # get input device sm version
+    major, minor = get_compute_capability(input.device)
+    x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,

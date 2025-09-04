@@ -1,19 +1,18 @@
 import dataclasses
 import logging
 import os
-import re
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 import torch
-import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
 
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
+from ..compilation_context import CompilationContext
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -49,13 +48,16 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 def check_cuda_arch():
     # Collect all detected CUDA architectures
-    archs = []
-    for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
-        arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
-        archs.append(arch)
+    eligible = False
+    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
+        if major >= 8:
+            eligible = True
+        elif major == 7 and minor.isdigit():
+            if int(minor) >= 5:
+                eligible = True
 
     # Raise error only if all detected architectures are lower than sm75
-    if all(arch < 75 for arch in archs):
+    if not eligible:
         raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
 
 
@@ -72,6 +74,12 @@ common_nvcc_flags = [
 ]
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
+sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
+sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
+sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
+sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
+
+current_compilation_context = CompilationContext()
 
 
 @dataclasses.dataclass
