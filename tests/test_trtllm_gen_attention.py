@@ -366,8 +366,8 @@ def test_trtllm_batch_prefill(
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        bmm1_scale,
-        bmm2_scale,
+        0.0,  # should be bmm1_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
+        0.0,  # should be bmm2_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
         batch_size,
         q_indptr,
         kv_indptr,
@@ -585,8 +585,8 @@ def test_trtllm_batch_decode(
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        bmm1_scale,  # bmm1_scale
-        bmm2_scale,  # bmm2_scale
+        0.0,  # should be bmm1_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
+        0.0,  # should be bmm2_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,
