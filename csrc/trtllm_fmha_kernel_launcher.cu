@@ -329,9 +329,9 @@ void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> ou
       static_cast<int*>(seq_lens.data_ptr()),
       /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
       /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), attention_sinks_ptr,
-      nullptr, q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context, batch_size,
-      max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q,
-      head_dim_o, page_size, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
+      /*lse=*/nullptr, q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context,
+      batch_size, max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads,
+      head_dim_q, head_dim_o, page_size, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale, bmm2_scale, o_sf_scale, o_sf_vec_size, o_sf_start_index,
       window_left, sum_seq_q, sm_count, enable_pdl, workspace_size, stream);
 }
