@@ -74,7 +74,7 @@ generate_build_meta({})
 if enable_aot:
     if use_paddle_compatible_api():
         import paddle
-        paddle.compat.install_torch_alias()
+        paddle.compat.enable_torch_proxy()
 
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
