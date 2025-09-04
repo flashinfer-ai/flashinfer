@@ -407,6 +407,9 @@ def test_trtllm_batch_prefill(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
+        bmm2_scale_tensor = torch.tensor(
+            [1.0], device=GPU_DEVICE
+        )  # todo(Yingyi): wrapper accept fixed bmm2_scale as 1.0
         output_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
@@ -628,6 +631,9 @@ def test_trtllm_batch_decode(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
+        bmm2_scale_tensor = torch.tensor(
+            [1.0], device=GPU_DEVICE
+        )  # todo(Yingyi): wrapper accept fixed bmm2_scale as 1.0
         output_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
