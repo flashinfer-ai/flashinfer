@@ -166,7 +166,8 @@ void trtllm_paged_attention_launcher(
           "trtllm_gen_softmax_stats_workspace");
     }
     // scratch takes the rest of the workspace buffer
-    runner_params.multiCtasKvScratchPtr = workspace_buffer;
+    runner_params.multiCtasKvScratchPtr =
+        float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
   }
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
