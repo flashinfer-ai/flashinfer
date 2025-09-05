@@ -30,10 +30,10 @@ from flashinfer import (
     fp4_quantize,
     mxfp8_dequantize_host,
     mxfp8_quantize,
-    next_positive_power_of_2,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -46,6 +46,7 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w2_permute_indices,
     _maybe_get_cached_w3_w1_permute_indices,
 )
+from flashinfer.utils import calculate_tile_tokens_dim
 
 
 def check_cuda(err):
@@ -105,7 +106,7 @@ class CUDAGraphMoE:
         self.input_tensor = hidden_states_sample.clone()
 
         # Warmup
-        with torch.cuda.stream(torch_stream):
+        with torch.cuda.stream(torch_stream), autotune(True):
             for _ in range(1):
                 self._run_moe_computation(runtime_args)
 
@@ -1743,18 +1744,6 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         args.hidden_states_scale_global,
         **kernel_kwargs,
     )
-
-
-def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = num_tokens * top_k // num_experts
-
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-    return tile_tokens_dim
 
 
 @pytest.fixture(scope="module")

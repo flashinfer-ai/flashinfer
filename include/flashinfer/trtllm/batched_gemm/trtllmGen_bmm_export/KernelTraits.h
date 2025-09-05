@@ -22,6 +22,7 @@
 #include "Enums.h"
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/MmaDecl.h"
 
 namespace batchedGemm {
 
@@ -156,12 +157,13 @@ class KernelTraits {
 
   // The constructor.
   KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc,
-               tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, int32_t tileM,
-               int32_t tileN, int32_t tileK, int32_t epilogueTileM, int32_t epilogueTileN,
-               int32_t numStages, int32_t numStagesMma, int32_t numSlicesForSplitK,
-               int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore, bool transposeMmaOutput,
-               AllReduceAlgo allReduceAlgo, bool usePersistentScheduler, bool useDeepSeekFp8,
-               bool usePerTokenSfA, bool usePerTokenSfB, BiasType biasType)
+               tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, int32_t mmaK,
+               int32_t tileM, int32_t tileN, int32_t tileK, int32_t epilogueTileM,
+               int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
+               int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK,
+               bool useTmaStore, bool transposeMmaOutput, AllReduceAlgo allReduceAlgo,
+               bool usePersistentScheduler, bool useDeepSeekFp8, bool usePerTokenSfA,
+               bool usePerTokenSfB, BiasType biasType)
       : mMmaKind{mmaKind} {
     //
     // SMEM
@@ -463,8 +465,10 @@ class KernelTraits {
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA =
             useConstSfA
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileM, 64), 4)
-                : (useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0);
+                ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK), 4)
+                : (useBlockScalingA
+                       ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK)) * numStages
+                       : 0);
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfA = 4;
         // No need to reuse TMEM.
@@ -486,8 +490,10 @@ class KernelTraits {
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB =
             useConstSfB
-                ? tg::roundUp((tileK / 64) * 2 * tg::ceilDiv(tileN, 64), 4)
-                : (useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0);
+                ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK), 4)
+                : (useBlockScalingB
+                       ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK)) * numStages
+                       : 0);
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfB = 4;
         // No need to reuse TMEM.

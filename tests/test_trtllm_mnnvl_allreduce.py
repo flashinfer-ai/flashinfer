@@ -1,5 +1,4 @@
 # Check torch version:
-import sys
 from typing import Tuple
 
 import pytest
@@ -179,9 +178,7 @@ def test_mnnvl_allreduce_full(
 
     # Ensure we have exactly 2 ranks for this test
     if world_size < 2:
-        if rank == 0:
-            print(f"ERROR: This test requires at least 2 MPI ranks, got {world_size}")
-        sys.exit(1)
+        pytest.skip(f"This test requires at least 2 MPI ranks, got {world_size}")
 
     mapping = Mapping(
         world_size=world_size,

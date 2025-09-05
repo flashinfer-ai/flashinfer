@@ -104,6 +104,18 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
+def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = num_tokens * top_k // num_experts
+
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+
+    return tile_tokens_dim
+
+
 def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
@@ -447,6 +459,21 @@ def is_sm100a_supported(device: torch.device) -> bool:
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+def is_sm110a_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 11 and version_at_least(torch.version.cuda, "13.0")
+
+
+def is_sm120a_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
+
+
+def is_sm121a_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
@@ -472,8 +499,8 @@ def check_shape_dtype_device(
         )
 
 
-def get_logging_module():
-    return flashinfer.jit.gen_jit_spec(
+def gen_logging_module():
+    return flashinfer.jitgen_jit_spec(
         "logging",
         [
             flashinfer.jit.env.FLASHINFER_CSRC_DIR / "logging.cc",
@@ -482,7 +509,12 @@ def get_logging_module():
             flashinfer.jit.env.SPDLOG_INCLUDE_DIR,
             flashinfer.jit.env.FLASHINFER_INCLUDE_DIR,
         ],
-    ).build_and_load()
+    )
+
+
+@functools.cache
+def get_logging_module():
+    return gen_logging_module().build_and_load()
 
 
 class LogLevel(Enum):
@@ -509,6 +541,8 @@ def set_log_level(lvl_str: str) -> None:
 
 
 def device_support_pdl(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     major, _ = get_compute_capability(device)
     return major >= 9
 

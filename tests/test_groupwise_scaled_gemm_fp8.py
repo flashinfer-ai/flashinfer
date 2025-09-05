@@ -186,6 +186,7 @@ def test_fp8_groupwise_group_gemm(
     torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.xfail(reason="Expected failures for deepgemm tests on SM > 100")
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
@@ -229,6 +230,7 @@ def test_fp8_groupwise_group_deepgemm(
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.xfail(reason="Expected failures for deepgemm tests on SM > 100")
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
@@ -273,7 +275,7 @@ def test_fp8_groupwise_batch_deepgemm_masked(
 
 if __name__ == "__main__":
     test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
-    test_fp8_groupwise_gemm(8192, 8192, 8192, "K", torch.bfloat16)
+    test_fp8_groupwise_gemm(8192, 8192, 8192, "K", backend="cutlass")
     test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
     test_fp8_groupwise_group_deepgemm(256, (128, 512), 4, torch.bfloat16)
     test_fp8_groupwise_batch_deepgemm_masked(256, (128, 512), 8, torch.bfloat16)

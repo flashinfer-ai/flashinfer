@@ -14,13 +14,25 @@ import torch
 from torch.utils.cpp_extension import (
     _TORCH_PATH,
     CUDA_HOME,
-    _get_cuda_arch_flags,
     _get_num_workers,
     _get_pybind11_abi_build_flags,
 )
 
 from . import env as jit_env
 from ..utils import use_paddle_compatible_api
+from ..compilation_context import CompilationContext
+
+
+@functools.cache
+def get_cuda_path() -> str:
+    if CUDA_HOME is None:
+        # get output of "which nvcc"
+        result = subprocess.run(["which", "nvcc"], capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError("Could not find nvcc")
+        return result.stdout.decode("utf-8").strip()
+    else:
+        return CUDA_HOME
 
 
 @functools.cache
@@ -65,6 +77,7 @@ def generate_ninja_build_for_op(
     system_includes = [
         sysconfig.get_path("include"),
         "$cuda_home/include",
+        "$cuda_home/include/cccl",
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
@@ -121,9 +134,27 @@ def generate_ninja_build_for_op(
         cuda_cflags += [
             "-static-global-template-stub=false",
         ]
-    cuda_cflags += _get_cuda_arch_flags(extra_cuda_cflags)
+
+    cpp_ext_initial_compilation_context = CompilationContext()
+    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list()
     if extra_cuda_cflags is not None:
-        cuda_cflags += extra_cuda_cflags
+        # Check if module provides architecture flags
+        module_has_gencode = any(
+            flag.startswith("-gencode=") for flag in extra_cuda_cflags
+        )
+
+        if module_has_gencode:
+            # Use module's architecture flags, but keep global non-architecture flags
+            global_non_arch_flags = [
+                flag for flag in global_flags if not flag.startswith("-gencode=")
+            ]
+            cuda_cflags += global_non_arch_flags + extra_cuda_cflags
+        else:
+            # No module architecture flags, use both global and module flags
+            cuda_cflags += global_flags + extra_cuda_cflags
+    else:
+        # No module flags, use global flags
+        cuda_cflags += global_flags
 
     ldflags = [
         "-shared",

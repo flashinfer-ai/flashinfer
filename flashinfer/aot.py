@@ -7,9 +7,9 @@ from typing import List, Tuple, Iterator
 
 import torch
 import torch.version
-from torch.utils.cpp_extension import _get_cuda_arch_flags
 
 from .activation import act_func_def_str, gen_act_and_mul_module
+from .fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .cascade import gen_cascade_module
 from .fp4_quantization import (
     gen_fp4_quantization_sm100_module,
@@ -18,8 +18,16 @@ from .fp4_quantization import (
 from .fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
 )
-from .gemm import gen_gemm_module, gen_gemm_sm90_module, gen_gemm_sm100_module
+from .gemm import (
+    gen_gemm_module,
+    gen_gemm_sm90_module,
+    gen_gemm_sm100_module,
+    gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_fp8,
+    gen_trtllm_gen_gemm_module,
+)
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
@@ -27,9 +35,9 @@ from .jit import (
     gen_batch_mla_module,
     gen_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_jit_spec,
     gen_single_decode_module,
     gen_single_prefill_module,
+    gen_trtllm_gen_fmha_module,
 )
 from .mla import gen_mla_module
 from .norm import gen_norm_module
@@ -37,8 +45,10 @@ from .page import gen_page_module
 from .quantization import gen_quantization_module
 from .rope import gen_rope_module
 from .sampling import gen_sampling_module
-from .tllm_utils import get_trtllm_utils_spec
-from .utils import version_at_least
+from .tllm_utils import gen_trtllm_utils_module
+from .utils import gen_logging_module, version_at_least
+from .xqa import gen_xqa_module
+from .compilation_context import CompilationContext
 
 
 def gen_fa2(
@@ -275,6 +285,9 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
+        # trtllm_gen_fmha
+        yield gen_trtllm_gen_fmha_module()
+
     # MLA
     # NOTE: fp8 kv not supported in MLA
     mla_backend_ = ["fa2"] + (["fa3"] if has_sm90 else [])
@@ -296,6 +309,46 @@ def gen_attention(
         yield gen_mla_module()
 
 
+def gen_xqa(
+    use_fp16_: List[bool],
+    token_per_page_: List[int],
+    head_size_: List[int],
+    head_grp_size_: List[int],
+    use_sliding_window_: List[bool],
+    has_sm90: bool,
+) -> Iterator[JitSpec]:
+    """Generate XQA modules for various configurations."""
+    if not has_sm90:
+        return  # XQA requires SM90+
+
+    for (
+        use_fp16,
+        token_per_page,
+        head_size,
+        head_grp_size,
+        use_sliding_window,
+    ) in product(
+        use_fp16_,
+        token_per_page_,
+        head_size_,
+        head_grp_size_,
+        use_sliding_window_,
+    ):
+        # Skip invalid configurations
+        if head_size % 16 != 0 or head_size > 256 or head_size < 16:
+            continue
+        if token_per_page not in [16, 32, 64, 128]:
+            continue
+
+        yield gen_xqa_module(
+            use_fp16=use_fp16,
+            token_per_page=token_per_page,
+            head_size=head_size,
+            head_grp_size=head_grp_size,
+            use_sliding_window=use_sliding_window,
+        )
+
+
 def gen_all_modules(
     f16_dtype_: List[torch.dtype],
     f8_dtype_: List[torch.dtype],
@@ -311,6 +364,7 @@ def gen_all_modules(
     add_moe: bool,
     add_act: bool,
     add_misc: bool,
+    add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
 
@@ -343,14 +397,23 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
+            jit_specs.append(gen_trtllm_gen_gemm_module())
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
         from .comm.nvshmem import gen_nvshmem_module
+        from .comm.trtllm_alltoall import gen_comm_alltoall_module
+        from .comm.trtllm_mnnvl_ar import gen_trtllm_mnnvl_comm_module
 
         jit_specs.append(gen_nvshmem_module())
+        jit_specs.append(gen_comm_alltoall_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
+            jit_specs.append(gen_trtllm_mnnvl_comm_module())
         jit_specs.append(gen_vllm_comm_module())
 
     if add_misc:
@@ -363,7 +426,25 @@ def gen_all_modules(
             gen_sampling_module(),
         ]
         if has_sm90:
-            jit_specs.append(get_trtllm_utils_spec())
+            jit_specs.append(gen_trtllm_utils_module())
+
+    if add_xqa:
+        # Define XQA configurations to iterate over
+        xqa_use_fp16_ = [True, False]  # fp16 and bf16
+        xqa_token_per_page_ = [16, 32, 64, 128]
+        xqa_head_size_ = [64, 128, 256]
+        xqa_head_grp_size_ = [1, 2, 4, 8]  # Different group sizes for MQA/GQA
+
+        jit_specs += list(
+            gen_xqa(
+                xqa_use_fp16_,
+                xqa_token_per_page_,
+                xqa_head_size_,
+                xqa_head_grp_size_,
+                use_sliding_window_,
+                has_sm90,
+            )
+        )
 
     # dedup
     names = set()
@@ -479,6 +560,11 @@ def main():
         type=parse_bool,
         help="Add miscellaneous kernels",
     )
+    parser.add_argument(
+        "--add-xqa",
+        type=parse_bool,
+        help="Add XQA (Cross-Query Attention) kernels",
+    )
     args = parser.parse_args()
 
     # Default values
@@ -488,13 +574,13 @@ def main():
     fa2_head_dim_ = [
         (64, 64),
         (128, 128),
-        # (256, 256),
+        (256, 256),
     ]
     fa3_head_dim_ = [
         (192, 128),
         (128, 128),
-        # (64, 64),
-        # (256, 256),
+        (64, 64),
+        (256, 256),
     ]
     f16_dtype_ = [
         torch.float16,
@@ -506,18 +592,19 @@ def main():
     ]
     use_sliding_window_ = [
         False,
-        # True,
+        True,
     ]
     use_logits_soft_cap_ = [
         False,
-        # True,
+        True,
     ]
-    add_comm = False
-    add_gemma = False
+    add_comm = True
+    add_gemma = True
     add_oai_oss = True
-    add_moe = False
-    add_act = False
+    add_moe = True
+    add_act = True
     add_misc = True
+    add_xqa = True
 
     # Override
     if args.out_dir:
@@ -537,25 +624,31 @@ def main():
     if args.use_logits_soft_cap:
         use_logits_soft_cap_ = [parse_bool(s) for s in args.use_logits_soft_cap]
     if args.add_comm is not None:
-        add_comm = bool(args.add_comm)
+        add_comm = args.add_comm
     if args.add_gemma is not None:
-        add_gemma = bool(args.add_gemma)
+        add_gemma = args.add_gemma
     if args.add_oai_oss is not None:
-        add_oai_oss = bool(args.add_oai_oss)
+        add_oai_oss = args.add_oai_oss
     if args.add_moe is not None:
-        add_moe = bool(args.add_moe)
+        add_moe = args.add_moe
     if args.add_act is not None:
-        add_act = bool(args.add_act)
+        add_act = args.add_act
     if args.add_misc is not None:
-        add_misc = bool(args.add_misc)
+        add_misc = args.add_misc
+    if args.add_xqa is not None:
+        add_xqa = args.add_xqa
 
     # Cuda Arch
-    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var TORCH_CUDA_ARCH_LIST.")
-    gencode_flags = _get_cuda_arch_flags()
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    compilation_context = CompilationContext()
+    gencode_flags_list = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=None
+    )
 
     def has_sm(compute: str, version: str) -> bool:
-        if not any(compute in flag for flag in gencode_flags):
+        if not any(compute in flag for flag in gencode_flags_list):
             return False
         if torch.version.cuda is None:
             return True
@@ -590,7 +683,7 @@ def main():
     print("  f8_dtype:", f8_dtype_)
     print("  use_sliding_window:", use_sliding_window_)
     print("  use_logits_soft_cap:", use_logits_soft_cap_)
-    print("  TORCH_CUDA_ARCH_LIST:", os.environ["TORCH_CUDA_ARCH_LIST"])
+    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
     print("  add_comm:", add_comm)
@@ -599,21 +692,11 @@ def main():
     print("  add_moe:", add_moe)
     print("  add_act:", add_act)
     print("  add_misc:", add_misc)
+    print("  add_xqa:", add_xqa)
 
     # Generate JIT specs
     print("Generating JIT specs...")
-    jit_specs = [
-        gen_jit_spec(
-            "logging",
-            [
-                jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
-            ],
-            extra_include_paths=[
-                jit_env.SPDLOG_INCLUDE_DIR,
-                jit_env.FLASHINFER_INCLUDE_DIR,
-            ],
-        )
-    ]
+    jit_specs = [gen_logging_module()]
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
@@ -629,6 +712,7 @@ def main():
         add_moe,
         add_act,
         add_misc,
+        add_xqa,
     )
     print("Total ops:", len(jit_specs))
 

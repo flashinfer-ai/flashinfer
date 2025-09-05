@@ -30,7 +30,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
-    trtllm_gen_fmha_module,
+    gen_trtllm_gen_fmha_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -53,6 +53,7 @@ from .utils import (
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
+    is_sm110a_supported,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -71,9 +72,10 @@ def get_fmha_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if is_sm100a_supported(torch.device("cuda")):
+    if is_sm100a_supported(device) or is_sm110a_supported(device):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -168,7 +170,7 @@ def get_customize_batch_prefill_module(
 
 @functools.cache
 def get_trtllm_gen_prefill_module():
-    mod = trtllm_gen_fmha_module()
+    mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
@@ -187,6 +189,7 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         enable_pdl: bool,
+        workspace_size: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -216,6 +219,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
+            workspace_size,
             sinks,
         )
         return out
@@ -525,6 +529,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -549,6 +554,7 @@ def get_batch_prefill_module(backend, *args):
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
             assert enable_pdl is not None
+            assert workspace_size > 0, "workspace_size must be greater than 0"
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
                 paged_k_cache,
@@ -564,6 +570,7 @@ def get_batch_prefill_module(backend, *args):
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
                 enable_pdl,
+                workspace_size,
                 window_left,
                 out=o,
                 sinks=sinks,
@@ -679,6 +686,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -1398,6 +1406,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
 
         self._float_workspace_buffer = float_workspace_buffer
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
         self.device = float_workspace_buffer.device
         self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
         if backend in ["fa3", "auto", "trtllm-gen"]:
@@ -1627,7 +1639,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
-
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2138,6 +2149,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                     self._token_pos_in_items_len,
+                    self._workspace_size,
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,
@@ -2671,7 +2683,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
-                self._cached_module = get_fmha_module(*get_module_args)
+                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                new_get_module_args = (
+                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                )
+                self._cached_module = get_fmha_module(*new_get_module_args)
             else:
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
@@ -3047,6 +3063,7 @@ def fmha_varlen(
         PosEncodingMode.NONE.value,
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
+        q.device,
     )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
@@ -3113,7 +3130,7 @@ def fmha_varlen(
 
 @functools.cache
 def get_trtllm_gen_fmha_module():
-    mod = trtllm_gen_fmha_module()
+    mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -3215,6 +3232,7 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
         query,
@@ -3234,6 +3252,7 @@ def trtllm_ragged_attention_deepseek(
         sm_count,
         enable_pdl,
         is_causal,
+        workspace_size,
         attention_sinks,
         lse,
     )
@@ -3349,6 +3368,8 @@ def trtllm_batch_context_with_kv_cache(
             out_scale_factor = out.scale
             o_sf_start_index = out.scale_start_index
             out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
         elif out is None:
             fp4_out_scale_shape = (
                 round_up(query.shape[0], 128),
@@ -3362,6 +3383,7 @@ def trtllm_batch_context_with_kv_cache(
         else:
             raise ValueError(f"Invalid out: {out}")
 
+        assert out_dtype == "nvfp4"
         assert isinstance(out, torch.Tensor)
 
         # Use uint8 as the container dtype to compliant with next fp4 gemm.
@@ -3391,14 +3413,16 @@ def trtllm_batch_context_with_kv_cache(
         assert o_sf_vec_size is None
         out_scale_factor = None
         o_sf_start_index = 0
-        out_dtype = out_dtype or query.dtype
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
+        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
             raise ValueError(f"Unsupported out_dtype: {out_dtype}")
-        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
         out_scale_factor,
@@ -3421,6 +3445,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
+        workspace_size,
         sinks,
     )
     return (

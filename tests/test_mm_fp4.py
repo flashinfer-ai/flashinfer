@@ -19,14 +19,11 @@ from flashinfer import (
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if backend == "trtllm" and res_dtype == torch.float16:
-        print("Skipping test for trtllm fp4 with float16")
-        return
+        pytest.skip("Skipping test for trtllm fp4 with float16")
     if not use_128x4_sf_layout and backend != "trtllm":
-        print("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-        return
+        pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if auto_tuning and backend == "cudnn":
-        print("Skipping test for cudnn fp4 with auto_tuning=True")
-        return
+        pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
