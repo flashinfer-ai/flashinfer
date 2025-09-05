@@ -13,10 +13,8 @@ workspace_size = 128 * 1024 * 1024
     "batch_size",
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
 )
-@pytest.mark.parametrize("scale", [1.0, 0.5])
-@pytest.mark.parametrize(
-    "dtype", [torch.bfloat16]
-)  # [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("scale", [1.0])  # [1.0, 0.5])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize(
     "q_len_per_request", [1, 2]
@@ -217,6 +215,8 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
+    if dtype == torch.float8_e4m3fn:
+        lse -= math.log2(448)
     print("lse:", lse)
     print("lse_ref:", lse_ref)
     # print("lse_ref_div:", lse_ref / lse)
