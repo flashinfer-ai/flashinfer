@@ -16,12 +16,21 @@
 import ctypes
 import logging
 import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import platform
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import torch
-from cuda import cuda
+
+try:
+    from cuda import cuda
+except ImportError as e:
+    raise ImportError(
+        "Could not import the 'cuda' module. "
+        "Please install cuda-python that matches your CUDA version."
+    ) from e
 
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
@@ -129,6 +138,22 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
     return device_ptr
 
 
+class CommBackend(ABC):
+    """Abstract communication backend interface"""
+
+    @abstractmethod
+    def Get_rank(self) -> int: ...
+
+    @abstractmethod
+    def Get_size(self) -> int: ...
+
+    @abstractmethod
+    def allgather(self, data: int) -> List[int]: ...
+
+    @abstractmethod
+    def Split(self, color: int, key: int) -> "CommBackend": ...
+
+
 if IS_BUILDING_DOCS:
     # Mock classes for building docs
 
@@ -208,17 +233,65 @@ if IS_BUILDING_DOCS:
 
 else:
     import pynvml
-    from mpi4py import MPI
+
+    if TYPE_CHECKING:
+        from mpi4py import MPI  # noqa: F401
+
+    def lazy_import_mpi():
+        """Lazy import for mpi4py"""
+        try:
+            from mpi4py import MPI
+
+            return MPI
+        except ImportError as err:
+            raise ImportError("mpi4py is not installed") from err  # type: ignore[no-redef]
 
     class MpiComm:  # type: ignore[no-redef]
-        _comm: MPI.Intracomm = MPI.COMM_WORLD
+        _comm: Any = None
+        _MPI: Any = None
 
         @classmethod
-        def set_mpi_comm(cls, new_comm: MPI.Intracomm):
+        def _get_mpi(cls):
+            if cls._MPI is None:
+                cls._MPI = lazy_import_mpi()
+                cls._comm = cls._MPI.COMM_WORLD
+            return cls._MPI
+
+        @classmethod
+        def set_mpi_comm(cls, new_comm: Any):
+            cls._get_mpi()
+            # Optional: add type checking here
             cls._comm = new_comm
 
         def __getattr__(self, name):
+            if self._comm is None:
+                self._get_mpi()
             return getattr(self._comm, name)
+
+    class MPIBackend(CommBackend):
+        def __init__(self):
+            self._mpicomm = MpiComm()
+
+        def Get_rank(self) -> int:
+            return self._mpicomm.Get_rank()
+
+        def Get_size(self) -> int:
+            return self._mpicomm.Get_size()
+
+        def allgather(self, data: int) -> List[int]:
+            return self._mpicomm.allgather(data)
+
+        def Split(self, color: int, key: int) -> CommBackend:
+            self._mpicomm = self._mpicomm.Split(color, key)
+            return MPIBackend()  # Returns new adapter
+
+    @dataclass
+    class MnnvlConfig:
+        """Configuration for MNNVL memory management"""
+
+        comm_backend: Optional[CommBackend] = None
+        allocation_granularity: int = 0
+        fabric_page_size: int = 1 << 29  # 512MB
 
     class MnnvlMemory:  # type: ignore[no-redef]
         initialized: bool = False
@@ -234,12 +307,14 @@ else:
         fabric_page_size: int = 1 << 29
 
         # MPI communicator
-        comm = None
+        comm: Optional[CommBackend] = None
 
         dev_id: int = None
 
         allocated_map: Dict[int, Any] = {}
         address_refcnt: Dict[int, Any] = {}
+
+        config: Optional[MnnvlConfig] = None
 
         def __init__(self, mapping: Mapping, size: int):
             self.mapping = mapping
@@ -276,6 +351,14 @@ else:
                 MnnvlMemory.initialized = True
 
         @staticmethod
+        def set_comm_from_config(mapping: Mapping, config: MnnvlConfig = None):
+            MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())  # type: ignore[attr-defined]
+            comm = config.comm_backend.Split(
+                mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            )
+            MnnvlMemory.comm = comm  # type: ignore[assignment]
+
+        @staticmethod
         def get_comm(mapping: Mapping):
             if MnnvlMemory.comm is not None:
                 return MnnvlMemory.comm
@@ -294,9 +377,16 @@ else:
             allocation_prop.type = (
                 cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
             )
-            allocation_prop.requestedHandleTypes = (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            )
+            # TODO: We differentiate FABRIC for GB200 (aarch64) and POSIX_FILE_DESCRIPTOR for B200 (x86_64).
+            # May need to find a better way to handle this.
+            arch = platform.machine().lower()
+            is_on_aarch64 = "aarch64" in arch
+            if is_on_aarch64:
+                allocation_prop.requestedHandleTypes = (
+                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                )
+            else:
+                allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
             allocation_prop.location = location
             return allocation_prop
 
@@ -372,12 +462,48 @@ else:
             )
             exported_fabric_handle = checkCudaErrors(
                 cuda.cuMemExportToShareableHandle(
-                    allocated_mem_handle,
-                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-                    0,
+                    allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
                 )
             )
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
+            if (
+                allocation_prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            ):
+                all_handles_data = comm.allgather(exported_fabric_handle.data)
+            else:
+                all_handles_data = comm.allgather(exported_fabric_handle)
+                all_pids = comm.allgather(os.getpid())
+                libc = ctypes.CDLL(None, use_errno=True)
+                syscall = libc.syscall
+                SYS_pidfd_open = 434
+                SYS_pidfd_getfd = 438
+                pidfds = []
+                for pid in all_pids:
+                    pidfd = syscall(SYS_pidfd_open, pid, 0)
+                    if pidfd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                        )
+                    pidfds.append(pidfd)
+
+                remote_fds = []
+                for pidfd, fd in zip(pidfds, all_handles_data):
+                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                        if err == 1:  # EPERM
+                            error_msg += (
+                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                                "to your docker run command."
+                            )
+                        else:
+                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                        raise RuntimeError(error_msg)
+                    remote_fds.append(remote_fd)
+
+                all_handles_data = remote_fds
             # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
             # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -405,8 +531,7 @@ else:
                     # Fabric memory mapping
                     imported_mem_handle = checkCudaErrors(
                         cuda.cuMemImportFromShareableHandle(
-                            remote_handle_data,
-                            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                            remote_handle_data, allocation_prop.requestedHandleTypes
                         )
                     )
                     mem_handles[i] = imported_mem_handle
@@ -491,13 +616,11 @@ else:
         @staticmethod
         def supports_mnnvl() -> bool:
             # TODO:
-            # We check if it is an aarch64 platform and has all NVLink up now.
+            # We check if it has all NVLink up now.
             # But it is not equivalent to MNNVL support.
             # May need better support check.
-            arch = platform.machine().lower()
-            if "aarch64" not in arch:
-                return False
-            return MnnvlMemory.support_nvlink(True)
+            support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
+            return support_nvlink_and_all_up
 
 
 class McastDeviceMemory:

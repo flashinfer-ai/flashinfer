@@ -2,7 +2,7 @@ import functools
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
+from utils_fp4 import cast_from_fp4, ref_fp4_quant
 
 from flashinfer import (
     block_scale_interleave,
@@ -102,7 +102,7 @@ def test_fp4_quantization(
     is_swizzled: bool,
 ) -> None:
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -123,11 +123,8 @@ def test_fp4_quantization(
     else:
         out_scale = out_scale.view(torch.float8_e4m3fn).to(torch.float32)
     if is_swizzled:
-        scale_ans = recover_swizzled_scales(
-            out_scale.reshape(-1, n // sf_vec_size),
-            m,
-            n,
-            sf_vec_size,
+        scale_ans = unswizzle_sf(
+            out_scale.reshape(-1, n // sf_vec_size), m, n, sf_vec_size
         )
     else:
         scale_ans = out_scale
@@ -148,7 +145,7 @@ def test_scale_swizzling(
     device: str,
 ) -> None:
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -184,7 +181,7 @@ def test_block_scale_interleave(
 ) -> None:
     """Test the block_scale_interleave function directly."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -233,7 +230,7 @@ def test_e2m1_dequantization(
 ) -> None:
     """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -298,7 +295,7 @@ def test_e2m1_dequantization(
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 def test_mxfp4_quantize_roundtrip(device: str):
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     x = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16) / 10
 
     quant_a, sfs = mxfp4_quantize(x)
