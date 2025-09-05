@@ -181,7 +181,6 @@ def test_trtllm_batch_decode_mla(
         batch_size * q_len_per_request, num_q_heads, qk_rope_head_dim
     )
 
-    # todo: fix kv_cache
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
@@ -216,10 +215,8 @@ def test_trtllm_batch_decode_mla(
             print("o_ref:", o_ref)
             raise e
     if dtype == torch.float8_e4m3fn:
+        # NOTE(Yingyi): the logits is multipled with 448 (maximum value of fp8 e4m3) to improve numerical stability internally
         lse -= math.log2(448)
-    print("lse:", lse)
-    print("lse_ref:", lse_ref)
-    # print("lse_ref_div:", lse_ref / lse)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
 
 
