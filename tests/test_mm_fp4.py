@@ -1,4 +1,5 @@
 import pytest
+import random
 import torch
 import torch.nn.functional as F
 
@@ -43,6 +44,8 @@ def test_mm_fp4(
     do_shuffle_b = backend == "trtllm"
 
     use_nvfp4 = fp4_type == "nvfp4"
+    # For nvfp4, we only support block_size = 16, for mxfp4, we support block_size = 16 or 32
+    block_size = 16 if use_nvfp4 else random.choice([16, 32])
 
     if use_nvfp4:
         input_fp4, input_inv_s = nvfp4_quantize(
@@ -72,7 +75,7 @@ def test_mm_fp4(
             alpha if use_nvfp4 else None,
             res_dtype,
             res,
-            block_size=16 if use_nvfp4 else 32,
+            block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,
             backend=backend,
             use_nvfp4=use_nvfp4,
