@@ -5,7 +5,8 @@ import torch
 
 import flashinfer
 
-global_workspace_buffer = None
+global_workspace_buffer = None  # can.be empty initialized
+global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
@@ -96,12 +97,17 @@ def test_trtllm_batch_decode_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     bmm1_log2_scale_tensor = (
         torch.tensor(
@@ -140,7 +146,6 @@ def test_trtllm_batch_decode_mla(
     sm_scale = scale / (
         (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
-    workspace_buffer_ref = torch.empty(workspace_size, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
         backend="fa2",

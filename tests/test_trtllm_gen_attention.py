@@ -17,7 +17,8 @@ DTYPE_MAP = {
 
 GPU_DEVICE = "cuda:0"
 
-global_workspace_buffer = None
+global_workspace_buffer = None  # can.be empty initialized
+global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
@@ -320,16 +321,21 @@ def test_trtllm_batch_prefill(
             else None
         )
 
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer_ref = global_workspace_buffer
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer_ref, kv_layout
     )
     plan_params = {
         "qo_indptr": q_indptr,
@@ -505,16 +511,21 @@ def test_trtllm_batch_decode(
             else None
         )
 
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, use_tensor_cores=True
+        workspace_buffer_ref, kv_layout, use_tensor_cores=True
     )
     plan_params = {
         "indptr": kv_indptr,
@@ -699,7 +710,17 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     qo_indptr = torch.cat(
         [
@@ -722,7 +743,7 @@ def test_trtllm_gen_prefill_deepseek(
     ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
+        workspace_buffer_ref,
         kv_layout="NHD",
         backend="cutlass",
     )
