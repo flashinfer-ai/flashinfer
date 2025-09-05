@@ -42,7 +42,6 @@ from ..utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    use_paddle_compatible_api,
 )
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
