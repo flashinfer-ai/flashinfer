@@ -10,6 +10,7 @@ from packaging.version import Version
 from pathlib import Path
 from typing import List, Optional
 
+import tvm_ffi
 import torch
 from torch.utils.cpp_extension import (
     _TORCH_PATH,
@@ -79,6 +80,7 @@ def generate_ninja_build_for_op(
         "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
         "$cuda_home/include/cccl",
+        tvm_ffi.libinfo.find_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]

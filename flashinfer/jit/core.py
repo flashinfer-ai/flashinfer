@@ -2,11 +2,11 @@ import dataclasses
 import logging
 import os
 import warnings
+import tvm_ffi
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
-import torch
 from filelock import FileLock
 
 from . import env as jit_env
@@ -140,13 +140,14 @@ class JitSpec:
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def load(self, so_path: Path, class_name: str = None):
-        load_class = class_name is not None
-        loader = torch.classes if load_class else torch.ops
-        loader.load_library(so_path)
-        if load_class:
-            cls = torch._C._get_custom_class_python_wrapper(self.name, class_name)
-            return cls
-        return getattr(loader, self.name)
+        # load_class = class_name is not None
+        # loader = torch.classes if load_class else torch.ops
+        # loader.load_library(so_path)
+        # if load_class:
+        #     cls = torch._C._get_custom_class_python_wrapper(self.name, class_name)
+        #     return cls
+        # return getattr(loader, self.name)
+        return tvm_ffi.load_module(str(so_path))
 
     def build_and_load(self, class_name: str = None):
         if self.is_aot:
