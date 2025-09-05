@@ -1919,8 +1919,8 @@ def mm_fp4(
 
     if use_nvfp4 and block_size != 16:
         raise ValueError("nvfp4 only supports block_size = 16.")
-    if not use_nvfp4 and block_size not in [16, 32]:
-        raise ValueError("mxfp4 supports block_size = 16 or 32.")
+    if not use_nvfp4 and block_size != 32:
+        raise ValueError("mxfp4 supports block_size = 32.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
