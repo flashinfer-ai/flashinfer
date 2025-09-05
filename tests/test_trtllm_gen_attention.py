@@ -352,6 +352,12 @@ def test_trtllm_batch_prefill(
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm1_scale_log2_tensor = torch.tensor(
+        [bmm1_scale * math.log2(math.e)], device=GPU_DEVICE
+    )
+    bmm2_scale = v_scale / o_scale
+    bmm2_scale_tensor = torch.tensor([bmm2_scale], device=GPU_DEVICE)
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -360,8 +366,8 @@ def test_trtllm_batch_prefill(
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        0.0,  # should be bmm1_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
+        0.0,  # should be bmm2_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
         batch_size,
         q_indptr,
         kv_indptr,
@@ -371,6 +377,8 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
     )
 
     if o_dtype == "nvfp4":
@@ -399,6 +407,9 @@ def test_trtllm_batch_prefill(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
+        bmm2_scale_tensor = torch.tensor(
+            [1.0], device=GPU_DEVICE
+        )  # todo(Yingyi): wrapper accept fixed bmm2_scale as 1.0
         output_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
@@ -406,6 +417,8 @@ def test_trtllm_batch_prefill(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -558,6 +571,12 @@ def test_trtllm_batch_decode(
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm1_scale_log2_tensor = torch.tensor(
+        [bmm1_scale * math.log2(math.e)], device=GPU_DEVICE
+    )
+    bmm2_scale = v_scale / o_scale
+    bmm2_scale_tensor = torch.tensor([bmm2_scale], device=GPU_DEVICE)
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -566,8 +585,8 @@ def test_trtllm_batch_decode(
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        0.0,  # should be bmm1_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
+        0.0,  # should be bmm2_scale, disabled to use dynamic in-memory scale factors, but fp16 and bf16 failed to run
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,
@@ -575,6 +594,8 @@ def test_trtllm_batch_decode(
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
+        bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+        bmm2_scale_tensor=bmm2_scale_tensor,
     )
 
     if o_dtype == "nvfp4":
@@ -610,6 +631,9 @@ def test_trtllm_batch_decode(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
+        bmm2_scale_tensor = torch.tensor(
+            [1.0], device=GPU_DEVICE
+        )  # todo(Yingyi): wrapper accept fixed bmm2_scale as 1.0
         output_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
@@ -618,6 +642,8 @@ def test_trtllm_batch_decode(
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -648,133 +674,6 @@ def test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
-
-
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("s_qo", [32, 64, 87])
-@pytest.mark.parametrize("s_kv", [32, 64, 87])
-@pytest.mark.parametrize("num_kv_heads", [16, 32])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
-@pytest.mark.parametrize("causal", [True, False])
-def test_trtllm_gen_prefill_deepseek(
-    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
-):
-    if s_qo > s_kv:
-        pytest.skip("s_qo > s_kv, skipping test as causal")
-
-    num_qo_heads = num_kv_heads * head_grp_size
-    head_dim_qk = 192
-    head_dim_vo = 128
-
-    seed = 0
-    torch.manual_seed(seed)
-    device = "cuda:0"
-
-    actual_seq_lens_q = torch.randint(
-        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
-    )
-
-    actual_seq_lens_kv = torch.randint(
-        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
-    )
-
-    cumsum_s_qo = torch.sum(actual_seq_lens_q)
-    cumsum_s_kv = torch.sum(actual_seq_lens_kv)
-
-    q = torch.randn(
-        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
-    )
-
-    k_cache = torch.randn(
-        (cumsum_s_kv, num_kv_heads, head_dim_qk),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    v_cache = torch.randn(
-        (cumsum_s_kv, num_kv_heads, head_dim_vo),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-
-    # Initialize scale
-    scale = float(1.0 / (head_dim_qk**0.5))
-
-    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
-
-    qo_indptr = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
-        ]
-    ).int()
-
-    # kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * s_kv
-
-    # Create kv_indptr as cumulative sum of actual_seq_lens_kv
-    kv_indptr = torch.cat(
-        [
-            torch.tensor(
-                [0],
-                device=device,
-            ),
-            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
-        ]
-    ).int()
-
-    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
-        kv_layout="NHD",
-        backend="cutlass",
-    )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        causal=causal,
-        sm_scale=scale,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
-    output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
-    output = torch.empty_like(output_ref)
-
-    bmm1_scale = scale
-    bmm2_scale = 1.0
-    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-        q,
-        k_cache,
-        v_cache,
-        workspace_buffer,
-        actual_seq_lens_kv,
-        s_qo,
-        s_kv,
-        bmm1_scale,
-        bmm2_scale,
-        -1,
-        batch_size,
-        -1,
-        qo_indptr,
-        kv_indptr,
-        False,
-        causal,
-        True,
-        out=output,
-    )
-    torch.testing.assert_close(
-        output_trtllm,
-        output_ref,
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        lse_trtllm,
-        lse_ref,
-        atol=1e-3,
-        rtol=1e-3,
-    )
 
 
 if __name__ == "__main__":

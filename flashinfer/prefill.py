@@ -193,6 +193,8 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -221,6 +223,8 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
+            bmm1_scale_log2_tensor,
+            bmm2_scale_tensor,
         )
         return out
 
@@ -541,6 +545,8 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -574,9 +580,13 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
+                bmm2_scale_tensor=bmm2_scale_tensor,
             )
         elif backend == "fa2":
             assert not is_float8(q)
+            assert bmm1_scale_log2_tensor is None
+            assert bmm2_scale_tensor is None
             paged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -607,6 +617,8 @@ def get_batch_prefill_module(backend, *args):
                 token_pos_in_items_len,
             )
         else:
+            assert bmm1_scale_log2_tensor is None
+            assert bmm2_scale_tensor is None
             if not is_float8(q):
                 paged_run_func(
                     float_workspace_buffer,
@@ -1958,6 +1970,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+        bmm2_scale_tensor: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1994,6 +2008,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        bmm1_scale_log2_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in.
+        bmm2_scale_tensor : Optional[torch.Tensor]
+            The on-device fused scale tensor for bmm2 input.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2161,6 +2179,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._qo_indptr_buf,
                     self._vector_sparse_indptr_buffer,
                     sinks,
+                    bmm1_scale_log2_tensor,
+                    bmm2_scale_tensor,
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
@@ -3157,6 +3177,8 @@ def trtllm_ragged_attention_deepseek(
     attention_sinks: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -3176,9 +3198,9 @@ def trtllm_ragged_attention_deepseek(
     max_kv_len : int
         max key/value length
     bmm1_scale : float
-        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5), but we recommend to use bmm1_scale_log2_tensor for better cuda graph support.
     bmm2_scale : float
-        scale for bmm2, scale_v
+        scale for bmm2, scale_v, but we recommend to use bmm2_scale_tensor for better cuda graph support.
     o_sf_scale : float
         scale for output
     batch_size : int
@@ -3199,7 +3221,10 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
-
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None
+        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in. If provided, the bmm1_scale will be ignored.
+    bmm2_scale_tensor: Optional[torch.Tensor] = None
+        The on-device fused scale tensor for bmm2 input. If provided, the bmm2_scale will be ignored.
     Returns
     -------
     out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -3255,6 +3280,8 @@ def trtllm_ragged_attention_deepseek(
         workspace_size,
         attention_sinks,
         lse,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     if return_lse:
         return out, lse
@@ -3282,6 +3309,8 @@ def trtllm_batch_context_with_kv_cache(
     o_sf_vec_size: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3302,9 +3331,9 @@ def trtllm_batch_context_with_kv_cache(
     max_kv_len : int
         max sequence length for kv_cache
     bmm1_scale : float
-        fused scale for bmm1 input.
+        fused scale for bmm1 input. But we recommend to use bmm1_scale_log2_tensor for better cuda graph support.
     bmm2_scale : float
-        fused scale for bmm2 input.
+        fused scale for bmm2 input. But we recommend to use bmm2_scale_tensor for better cuda graph support.
     batch_size : int
         batch size
     cum_seq_lens_q : torch.Tensor
@@ -3324,7 +3353,10 @@ def trtllm_batch_context_with_kv_cache(
         vector size for nvfp4 output tensor scale factor.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None
+        The on-device fused scale tensor for bmm1 input. Must be fused with * M_LOG2E before passing in. If provided, the bmm1_scale will be ignored.
+    bmm2_scale_tensor: Optional[torch.Tensor] = None
+        The on-device fused scale tensor for bmm2 input. If provided, the bmm2_scale will be ignored.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3447,6 +3479,8 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        bmm1_scale_log2_tensor,
+        bmm2_scale_tensor,
     )
     return (
         out
