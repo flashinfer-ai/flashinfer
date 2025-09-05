@@ -28,6 +28,7 @@ root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
 enable_aot = aot_ops_package_dir.is_dir() and any(aot_ops_package_dir.iterdir())
 
+
 def use_paddle_compatible_api() -> bool:
     return os.environ.get("PADDLE_COMPATIBLE_API", "0").lower() in ["1", "on", "true"]
 
@@ -74,6 +75,7 @@ generate_build_meta({})
 if enable_aot:
     if use_paddle_compatible_api():
         import paddle
+
         paddle.compat.enable_torch_proxy()
 
     import torch
