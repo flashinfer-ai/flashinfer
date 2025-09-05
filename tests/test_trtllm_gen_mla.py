@@ -13,7 +13,7 @@ workspace_size = 128 * 1024 * 1024
     "batch_size",
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
 )
-@pytest.mark.parametrize("scale", [1.0])  # [1.0, 0.5])
+@pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize(
