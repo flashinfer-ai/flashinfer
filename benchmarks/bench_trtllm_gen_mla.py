@@ -30,6 +30,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = seq_len
+    avg_seq_len = sum(seq_lens) / len(seq_lens)
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
@@ -111,7 +112,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         * batch_size
         * num_q_heads
         * (2 * kv_lora_rank + qk_rope_head_dim)
-        * seq_len
+        * avg_seq_len
         * q_len_per_request
     )
     print(
