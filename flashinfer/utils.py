@@ -25,7 +25,7 @@ import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
-from .jit import gen_jit_spec, env as jit_env
+import flashinfer
 
 IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
@@ -473,14 +473,14 @@ def check_shape_dtype_device(
 
 
 def get_logging_module():
-    return gen_jit_spec(
+    return flashinfer.jit.gen_jit_spec(
         "logging",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
+            flashinfer.jit.env.FLASHINFER_CSRC_DIR / "logging.cc",
         ],
         extra_include_paths=[
-            jit_env.SPDLOG_INCLUDE_DIR,
-            jit_env.FLASHINFER_INCLUDE_DIR,
+            flashinfer.jit.env.SPDLOG_INCLUDE_DIR,
+            flashinfer.jit.env.FLASHINFER_INCLUDE_DIR,
         ],
     ).build_and_load()
 
