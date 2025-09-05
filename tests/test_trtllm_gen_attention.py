@@ -378,6 +378,9 @@ def test_trtllm_batch_prefill(
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -420,6 +423,9 @@ def test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
@@ -546,7 +552,7 @@ def test_trtllm_batch_decode(
     if q_len_per_req > 1:
         # hide the output_ref from decode wrapper for speculative decoding test
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
+            workspace_buffer_ref, kv_layout
         )
         plan_params_prefill = {
             "qo_indptr": q_indptr,
@@ -587,6 +593,9 @@ def test_trtllm_batch_decode(
         enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -659,6 +668,9 @@ def test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
@@ -796,6 +808,9 @@ def test_trtllm_gen_prefill_deepseek(
         atol=1e-3,
         rtol=1e-3,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 if __name__ == "__main__":
