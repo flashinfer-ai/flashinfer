@@ -500,7 +500,7 @@ def check_shape_dtype_device(
 
 
 def gen_logging_module():
-    return flashinfer.jitgen_jit_spec(
+    return flashinfer.jit.gen_jit_spec(
         "logging",
         [
             flashinfer.jit.env.FLASHINFER_CSRC_DIR / "logging.cc",
