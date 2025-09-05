@@ -141,6 +141,9 @@ def test_trtllm_batch_decode_mla(
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
