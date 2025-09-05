@@ -6,6 +6,7 @@ import torch
 import flashinfer
 
 global_workspace_buffer = None
+workspace_size = 128 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -15,7 +16,9 @@ global_workspace_buffer = None
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize("q_len_per_request", [1, 2])
+@pytest.mark.parametrize(
+    "q_len_per_request", [1, 2]
+)  # todo(Yingyi): verify larger q_len_per_request
 @pytest.mark.parametrize("dynamic_scale", [False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_trtllm_batch_decode_mla(
@@ -96,7 +99,7 @@ def test_trtllm_batch_decode_mla(
     global global_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=device
+            workspace_size, dtype=torch.int8, device=device
         )
     workspace_buffer = global_workspace_buffer
 
@@ -137,9 +140,7 @@ def test_trtllm_batch_decode_mla(
     sm_scale = scale / (
         (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
+    workspace_buffer_ref = torch.empty(workspace_size, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
         backend="fa2",

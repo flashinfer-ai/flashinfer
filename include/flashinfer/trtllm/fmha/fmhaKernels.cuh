@@ -30,6 +30,7 @@
 #include "flashInferMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "lse.cuh"
 
 #ifdef TLLM_GEN_FMHA_CUBIN_PATH
 static const std::string tllm_gen_fmha_cubin_path = std::string(TLLM_GEN_FMHA_CUBIN_PATH);
@@ -47,6 +48,16 @@ namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 }  // namespace flashinfer::trtllm_cubin_loader
 using flashinfer::trtllm_cubin_loader::getCubin;
+
+constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
+  if (gpuSM == kSM_103) {
+    return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_100) {
+    return kernelSM == kSM_100f || kernelSM == kSM_100;
+  }
+
+  return gpuSM == kernelSM;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {
@@ -68,9 +79,11 @@ class TllmGenFmhaKernel {
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
-      if (kernelMeta.mSM == mSM && kernelMeta.mDataTypeQ == mDtypeQ &&
+      IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
         // Store metadata for later use.
+        IKL_LOG_DEBUG("Adding tllmgen attention kernel %s", kernelMeta.mFuncName);
         mKernelMetaMap[hashID(kernelMeta)] = i;
       }
     }
@@ -238,6 +251,12 @@ class TllmGenFmhaKernel {
         }
       }
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+
+      if (params.lsePtr != nullptr) {
+        flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
+                                     params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
+                                     params.stream);
+      }
       // Break the while op.
       break;
     }

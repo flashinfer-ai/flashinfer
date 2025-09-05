@@ -17,19 +17,29 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm100a_nvcc_flags
+from .jit import (
+    gen_jit_spec,
+    sm121a_nvcc_flags,
+    sm120a_nvcc_flags,
+    sm110a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm90a_nvcc_flags,
+)
+from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 
 
@@ -62,9 +72,33 @@ def _pad_scale_factors(
         ).contiguous()
 
 
-def gen_fp4_quantization_module() -> JitSpec:
+def gen_fp4_quantization_sm100_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm100a_nvcc_flags, "100")
+
+
+def gen_fp4_quantization_sm103_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
+
+
+def gen_fp4_quantization_sm90_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
+
+
+def gen_fp4_quantization_sm110_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm110a_nvcc_flags, "110")
+
+
+def gen_fp4_quantization_sm120_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
+
+
+def gen_fp4_quantization_sm121_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm121a_nvcc_flags, "121")
+
+
+def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
     return gen_jit_spec(
-        "fp4_quantization",
+        f"fp4_quantization_{device_arch}",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp4Quantize.cpp",
@@ -75,16 +109,16 @@ def gen_fp4_quantization_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4",
+            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-            "-DENABLE_FP4",
+            "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
@@ -94,8 +128,20 @@ def gen_fp4_quantization_module() -> JitSpec:
 
 
 @functools.cache
-def get_fp4_quantization_module():
-    module = gen_fp4_quantization_module().build_and_load()
+def get_fp4_quantization_module(backend: str = "100"):
+    backend_modules = {
+        "121": gen_fp4_quantization_sm121_module,
+        "120": gen_fp4_quantization_sm120_module,
+        "110": gen_fp4_quantization_sm110_module,
+        "103": gen_fp4_quantization_sm103_module,
+        "100": gen_fp4_quantization_sm100_module,
+        "90": gen_fp4_quantization_sm90_module,
+    }
+
+    if backend not in backend_modules:
+        raise ValueError(f"Invalid backend: {backend}")
+
+    module = backend_modules[backend]().build_and_load()
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
@@ -310,7 +356,9 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_fp4_quantization_module().fp4_quantize_sm100(
+    # get input device sm version
+    major, minor = get_compute_capability(input.device)
+    x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(
         input,
         global_scale,
         sf_vec_size,
@@ -346,7 +394,11 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     assert unswizzled_sf.dtype == torch.uint8, (
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
     )
-    return get_fp4_quantization_module().block_scale_interleave_sm100(
+
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+
+    return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
         unswizzled_sf,
     )
 
@@ -380,7 +432,11 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-    return get_fp4_quantization_module().e2m1_and_ufp8sf_scale_to_float_sm100(
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+    return get_fp4_quantization_module(
+        device_arch
+    ).e2m1_and_ufp8sf_scale_to_float_sm100(
         e2m1_tensor,
         ufp8_scale_tensor,
         global_scale_tensor,
@@ -547,7 +603,9 @@ def mxfp4_dequantize_host(
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
     """
-    return get_fp4_quantization_module().mxfp4_dequantize_host(
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+    return get_fp4_quantization_module(device_arch).mxfp4_dequantize_host(
         weight,
         scale,
         group_size,

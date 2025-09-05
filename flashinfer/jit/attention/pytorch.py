@@ -22,7 +22,13 @@ import torch
 
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ..core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    current_compilation_context,
+)
 from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
@@ -1551,14 +1557,18 @@ def gen_fmha_cutlass_sm100a_module(
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_pybind.cu",
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
-def trtllm_gen_fmha_module():
+def gen_trtllm_gen_fmha_module():
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 
@@ -1573,7 +1583,6 @@ def trtllm_gen_fmha_module():
     return gen_jit_spec(
         "fmha_gen",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
         ],
         extra_ldflags=["-lcuda"],
@@ -1677,7 +1686,7 @@ def gen_customize_batch_attention_module(
     )
 
 
-def cudnn_fmha_gen_module():
+def gen_cudnn_fmha_module():
     return gen_jit_spec(
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],

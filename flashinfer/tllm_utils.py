@@ -4,7 +4,7 @@ from .jit import env as jit_env
 from .jit import gen_jit_spec
 
 
-def get_trtllm_utils_spec():
+def gen_trtllm_utils_module():
     return gen_jit_spec(
         "trtllm_utils",
         [
@@ -40,7 +40,7 @@ def get_trtllm_utils_spec():
 
 @functools.cache
 def get_trtllm_utils_module():
-    return get_trtllm_utils_spec().build_and_load()
+    return gen_trtllm_utils_module().build_and_load()
 
 
 def delay_kernel(stream_delay_micro_secs):

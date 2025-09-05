@@ -15,6 +15,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    is_close_stats,
 )
 
 
@@ -485,7 +486,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             )
         elif backend == "trtllm-gen-native":
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=q,
+                query=q.contiguous(),
                 kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
@@ -498,19 +499,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             raise ValueError(f"Backend {backend} not supported")
 
     has_reference_output = False
-    if run_refcheck and "fa2" in backends:
-        reference_output = (
-            backend_wrappers["fa2"]
-            .run(q, kv_cache, k_scale=k_scale, v_scale=v_scale)
-            .detach()
-        )
-        has_reference_output = True
-
     # Iterate over each backend:
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach()
-        if is_cuda_graph_compatible:
+            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            if cur_backend == "fa2":
+                has_reference_output = True
+                reference_output = outputs[cur_backend]
+        if is_cuda_graph_compatible and cur_backend != "fa2":
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
                 dry_run_iters=args.dry_run_iters,
@@ -550,8 +546,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                         reference_output, tested_outputs[i], rtol=rtol, atol=atol
                     )
                 except AssertionError as e:
+                    (
+                        num_different_elements,
+                        num_elements,
+                        num_different_elements_percentage,
+                    ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
                         print(e)
@@ -721,9 +723,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     # Check for layer-specific constraints
     layer_not_supported = False
-    if not ((head_dim_qk == 128 and head_dim_qk == head_dim_vo) or head_dim_qk == 192):
-        print("[ERROR] Head dimension must be 128 or 192")
-        layer_not_supported = True
     if layer_not_supported:
         print("[ERROR] Layer not supported. Exiting.")
         return
@@ -882,7 +881,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
                     "HND",
-                    use_cuda_graph=is_cuda_graph_compatible,
+                    use_cuda_graph=is_cuda_graph_compatible
+                    if backend != "fa2"
+                    else False,
                     qo_indptr_buf=qo_indptr,
                     paged_kv_indptr_buf=kv_indptr,
                     paged_kv_indices_buf=kv_indices,
@@ -958,17 +959,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             raise ValueError(f"Backend {backend} not supported")
 
     has_reference_output = False
-    if run_refcheck and "fa2" in backends:
-        reference_output = backend_wrappers["fa2"].run(
-            q, kv_cache, k_scale=k_scale, v_scale=v_scale
-        )
-        has_reference_output = True
-
     # Iterate over each backend:
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend)
-        if is_cuda_graph_compatible:
+            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            if cur_backend == "fa2":
+                has_reference_output = True
+                reference_output = outputs[cur_backend]
+        if is_cuda_graph_compatible and cur_backend != "fa2":
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
                 dry_run_iters=args.dry_run_iters,
@@ -1008,8 +1006,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                         reference_output, tested_outputs[i], rtol=rtol, atol=atol
                     )
                 except AssertionError as e:
+                    (
+                        num_different_elements,
+                        num_elements,
+                        num_different_elements_percentage,
+                    ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
                         print(e)
@@ -1295,7 +1299,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
                     "NHD",
-                    use_cuda_graph=is_cuda_graph_compatible,
+                    use_cuda_graph=is_cuda_graph_compatible
+                    if backend != "fa2"
+                    else False,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
                     backend=backend,
@@ -1350,15 +1356,14 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             raise ValueError(f"Backend {backend} not supported")
 
     has_reference_output = False
-    if run_refcheck and "fa2" in backends:
-        reference_output = backend_wrappers["fa2"].run_return_lse(q, k, v)[0]
-        has_reference_output = True
-
     # Iterate over each backend:
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend)
-        if is_cuda_graph_compatible:
+            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            if cur_backend == "fa2":
+                has_reference_output = True
+                reference_output = outputs[cur_backend]
+        if is_cuda_graph_compatible and cur_backend != "fa2":
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
                 dry_run_iters=args.dry_run_iters,
@@ -1398,8 +1403,14 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                         reference_output, tested_outputs[i], rtol=rtol, atol=atol
                     )
                 except AssertionError as e:
+                    (
+                        num_different_elements,
+                        num_elements,
+                        num_different_elements_percentage,
+                    ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
                         print(e)
@@ -1693,19 +1704,15 @@ def testBatchMLAPagedAttentionWrapper(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    if run_refcheck and "fa2" in backends:
-        reference_output = fi_fa2_mla_wrapper.run(
-            q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
-        )
-        has_reference_output = True
-    else:
-        has_reference_output = False
-
+    has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach()
-        if is_cuda_graph_compatible:
+            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            if cur_backend == "fa2":
+                has_reference_output = True
+                reference_output = outputs[cur_backend]
+        if is_cuda_graph_compatible and cur_backend != "fa2":
             backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
                 fn=lambda: run_backend_wrapper(cur_backend),
                 dry_run_iters=args.dry_run_iters,
@@ -1741,8 +1748,14 @@ def testBatchMLAPagedAttentionWrapper(args):
                         reference_output, tested_outputs[i], rtol=rtol, atol=atol
                     )
                 except AssertionError as e:
+                    (
+                        num_different_elements,
+                        num_elements,
+                        num_different_elements_percentage,
+                    ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
                         print(e)

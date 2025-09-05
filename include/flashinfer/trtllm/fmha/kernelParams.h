@@ -307,10 +307,19 @@ struct KernelParams {
   // Compute the strides for K and V.
   template <class FmhaOptions>
   static auto makeStrideKv(FmhaOptions const& options, bool isK) {
-    int strideKeysVals = options.kvStrideKeysValues;
-    int strideHeads = options.kvStrideHeads;
-    int strideBatch = options.kvStrideBatch;
+    int strideKeysVals = 0;
+    int strideHeads = 0;
+    int strideBatch = 0;
 
+    if (isK) {
+      strideKeysVals = options.kStrideKeysValues;
+      strideHeads = options.kStrideHeads;
+      strideBatch = options.kStrideBatch;
+    } else {
+      strideKeysVals = options.vStrideKeysValues;
+      strideHeads = options.vStrideHeads;
+      strideBatch = options.vStrideBatch;
+    }
     // The 3 strides (the other ones are 1 and 0).
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
@@ -688,7 +697,7 @@ struct KernelParams {
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
-    params.ptrSoftmaxStats = nullptr;
+    params.ptrSoftmaxStats = options.softmaxStatsPtr;
     return params;
   }
 };

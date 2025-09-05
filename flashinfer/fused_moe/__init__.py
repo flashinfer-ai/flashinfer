@@ -22,6 +22,7 @@ from .core import (
     cutlass_fused_moe,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,

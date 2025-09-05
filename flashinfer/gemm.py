@@ -38,6 +38,7 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .jit.cubin_loader import get_cubin
+from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
 
 CUDNN_AVAILABLE = False
 try:
@@ -55,7 +56,12 @@ except OSError as e:
 
 from .jit import JitSpec
 from .jit import env as jit_env
-from .jit import gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags
+from .jit import (
+    gen_jit_spec,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    current_compilation_context,
+)
 from .jit.cubin_loader import setup_cubin_loader
 from .jit.utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 from .utils import (
@@ -71,10 +77,10 @@ from .utils import (
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 
-def _match_sm_version(device: torch.device, sm_version: str):
+def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
-    return device_arch == sm_version
+    return device_arch in sm_version
 
 
 def gen_gemm_module() -> JitSpec:
@@ -205,10 +211,60 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         "fp4_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
+def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm120_cutlass_fp4"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        # SM120/121 uses only 128x128x128 tile configuration with implied 1x1x1 cluster shape
+        cta_m_n_k_list = [
+            (128, 128, 128),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"fp4_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "fp4_gemm_cutlass_sm120",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
@@ -253,10 +309,14 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+
     return gen_jit_spec(
         "fp8_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
         ],
@@ -335,10 +395,14 @@ def gen_gemm_sm100_module() -> JitSpec:
         with open(src_path, "r") as f:
             source = f.read()
         write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
@@ -349,7 +413,209 @@ def get_gemm_sm100_module():
     return module
 
 
-def trtllm_gemm_gen_module() -> JitSpec:
+def gen_gemm_sm120_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm120"
+    gen_directory.mkdir(parents=True, exist_ok=True)
+    source_paths = []
+
+    # Generate kernel instantiations following SM100's approach
+    prefix = "gemm_groupwise"
+    dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+    dtype_out_list = [torch.float16, torch.bfloat16]
+    scale_major_k_list = ["true", "false"]
+    # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    for dtype_in, dtype_out, scale_major_k in product(
+        dtype_in_list,
+        dtype_out_list,
+        scale_major_k_list,
+    ):
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_sm120.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+            scale_major_k=scale_major_k,
+        )
+        write_if_different(dest_path, source)
+
+    # Generate group gemm kernel instantiations
+    prefix = "group_gemm_fp8_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    for dtype_in, dtype_out, scale_major_k in product(
+        dtype_in_list,
+        dtype_out_list,
+        scale_major_k_list,
+    ):
+        name_dtype_in = filename_safe_dtype_map[dtype_in]
+        name_dtype_out = filename_safe_dtype_map[dtype_out]
+        dest_path = (
+            gen_directory
+            / f"{prefix}_{name_dtype_in}_{name_dtype_out}_major{scale_major_k}_sm120.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_in=dtype_cutlass_map[dtype_in],
+            dtype_out=dtype_cutlass_map[dtype_out],
+            scale_major_k=scale_major_k,
+        )
+        write_if_different(dest_path, source)
+
+    # Copy source files
+    for filename in [
+        "gemm_groupwise_sm120.cu",
+        "group_gemm_fp8_groupwise_sm120.cu",
+        "gemm_sm120_pybind.cu",
+        "group_gemm_sm120_pybind.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[
+            12,
+        ]
+    )
+
+    return gen_jit_spec(
+        "gemm_sm120",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+@functools.cache
+def get_gemm_sm120_module():
+    module = gen_gemm_sm120_module().build_and_load()
+    return module
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_fp8():
+    """Get CUTLASS FP8 runner for SM120/SM121 using the groupwise scaling kernel."""
+    module = get_gemm_sm120_module()
+
+    def cutlass_fp8_gemm_runner():
+        class CutlassFp8GemmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                # For now, return a single default tactic
+                return [-1]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+
+                # Handle both 2D (MM) and 3D (BMM) cases
+                # SM120 kernel now supports batch operations natively
+                if a.dim() == 2:
+                    # 2D case: simple matrix multiplication
+                    # Make B column-major for the kernel
+                    b_col_major = b.transpose(-2, -1)
+                else:
+                    # 3D case: batch matrix multiplication
+                    # B is already in the right format [batch, k, n] (column-major)
+                    b_col_major = b
+
+                # Determine dimensions first to know scale granularity
+                if a.dim() == 2:
+                    n_dim = b_col_major.shape[0]
+                    m_dim = a.shape[0]
+                    k_dim = a.shape[1]
+                    batch_size = 1
+                else:
+                    n_dim = b_col_major.shape[2]  # BMM case: [batch, k, n]
+                    m_dim = a.shape[1]
+                    k_dim = a.shape[2]
+                    batch_size = a.shape[0]
+
+                # ScaleGranularityK must equal TileK (128)
+                if k_dim < 128:
+                    raise ValueError(
+                        f"SM120/SM121 CUTLASS blockwise scaling requires k >= 128, got k={k_dim}. "
+                    )
+
+                scale_gran_m = 1
+                scale_gran_n = 128
+                scale_gran_k = 128
+
+                # For scalar scales, create compatible shapes for SM120
+                # SM120 requires scale tensors with specific shapes based on granularity
+                # Scale shape should be [m/scale_gran_m, k/scale_gran_k] for A
+                # and [n/scale_gran_n, k/scale_gran_k] for B
+                if scale_a.numel() == 1:
+                    scale_m_count = (
+                        batch_size * m_dim + scale_gran_m - 1
+                    ) // scale_gran_m
+                    scale_k_count = (
+                        k_dim + scale_gran_k - 1
+                    ) // scale_gran_k  # k dimension
+                    scale_a_expanded = scale_a.view(1, 1).expand(
+                        scale_m_count, scale_k_count
+                    )
+                else:
+                    scale_a_expanded = scale_a
+
+                if scale_b.numel() == 1:
+                    # Calculate the expected scale dimensions
+                    scale_n_count = (
+                        batch_size * n_dim + scale_gran_n - 1
+                    ) // scale_gran_n
+                    scale_k_count = (
+                        k_dim + scale_gran_k - 1
+                    ) // scale_gran_k  # k dimension
+                    scale_b_expanded = scale_b.view(1, 1).expand(
+                        scale_n_count, scale_k_count
+                    )
+                else:
+                    scale_b_expanded = scale_b
+
+                # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
+                module.gemm_fp8_nt_groupwise.default(
+                    workspace_buffer,
+                    a,
+                    b_col_major,
+                    scale_a_expanded,
+                    scale_b_expanded,
+                    out,
+                    scale_gran_m,  # scale_granularity_m
+                    scale_gran_n,  # scale_granularity_n
+                    scale_gran_k,  # scale_granularity_k (adjusted for small k)
+                    "MN",  # scale_major_mode
+                )
+                return out
+
+        return CutlassFp8GemmRunner()
+
+    # Register the module
+    return SimpleNamespace(
+        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+    )
+
+
+def gen_trtllm_gen_gemm_module() -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
@@ -383,7 +649,7 @@ def trtllm_gemm_gen_module() -> JitSpec:
 
 @functools.cache
 def get_trtllm_gemm_module():
-    mod = trtllm_gemm_gen_module()
+    mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -441,9 +707,20 @@ def fp8_gemm_sm100(
     runners = []
     # No e5m2 for cutlass
     is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm100 = _match_sm_version(a.device, "100")
-    if "cutlass" in runner_names and is_sm100 and not is_e5m2:
-        runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+    is_sm_supported = _match_sm_version(a.device, ["100", "103", "110"])
+    is_sm120_supported = _match_sm_version(a.device, ["120", "121"])
+
+    if "cutlass" in runner_names and not is_e5m2:
+        if is_sm_supported:
+            runners.append(
+                get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner()
+            )
+        elif is_sm120_supported:
+            k_dim = a.shape[-1] if a.dim() == 2 else a.shape[2]
+            if k_dim >= 128:
+                runners.append(
+                    get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
+                )
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if CUDNN_AVAILABLE and "cudnn" in runner_names:
@@ -483,9 +760,8 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@functools.cache
-def get_gemm_sm100_module_cutlass_fp4():
-    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
+    """Helper function to create cutlass FP4 GEMM module."""
 
     class CutlassFp4GemmRunner(TunableRunner):
         def __init__(self):
@@ -512,7 +788,7 @@ def get_gemm_sm100_module_cutlass_fp4():
             return out
 
     @register_custom_op(
-        "flashinfer::cutlass_fp4_gemm",
+        op_name,
         mutates_args=(""),
     )
     def cutlass_fp4_gemm(
@@ -558,7 +834,7 @@ def get_gemm_sm100_module_cutlass_fp4():
 
         inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
         _, tactic = tuner.choose_one(
-            "cutlass_fp4_gemm",
+            tuner_name,
             [fp4_runner],
             tuning_config,
             inputs,
@@ -566,9 +842,26 @@ def get_gemm_sm100_module_cutlass_fp4():
 
         fp4_runner(inputs=inputs, tactic=tactic)
 
-    # Register the module
     return SimpleNamespace(
         cutlass_fp4_gemm=cutlass_fp4_gemm,
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_fp4():
+    """Get the SM100/103/110 FP4 GEMM module."""
+    module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
+    )
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_fp4():
+    """Get the SM120/121 FP4 GEMM module."""
+    module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    return _create_cutlass_fp4_gemm_module(
+        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
     )
 
 
@@ -1604,6 +1897,8 @@ def mm_fp4(
         raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
+        raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1677,7 +1972,15 @@ def mm_fp4(
             a_descale = a_descale.view(torch.uint8)
         if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
             b_descale = b_descale.view(torch.uint8)
-        get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm(
+
+        # Dispatch to the correct module based on device architecture
+        major, _ = get_compute_capability(a.device)
+        if major == 12:
+            gemm_module = get_gemm_sm120_module_cutlass_fp4()
+        else:
+            gemm_module = get_gemm_sm100_module_cutlass_fp4()
+
+        gemm_module.cutlass_fp4_gemm(
             a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
         )
     return out
@@ -1850,6 +2153,9 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
+    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
+        raise ValueError("TRTLLM FP8 GEMM is not supported on SM110.")
+
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
@@ -1882,22 +2188,45 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if backend == "cutlass":
+        if not _match_sm_version(a.device, ["100", "103", "110", "120", "121"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121 in cutlass backend."
+            )
+    elif backend == "trtllm":
+        if not _match_sm_version(a.device, ["100", "103"]):
+            raise ValueError(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+            )
 
     if backend == "cutlass":
         assert scale_major_mode is not None
-        get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
-            workspace_buffer,
-            a,
-            b,
-            a_scale,
-            b_scale,
-            out,
-            *scale_granularity_mnk,
-            scale_major_mode,
-            mma_sm,
-        )
+        if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+            # SM120/121 doesn't use mma_sm parameter
+            get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
+                workspace_buffer,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                *scale_granularity_mnk,
+                scale_major_mode,
+            )
+        elif is_sm100a_supported(a.device):
+            get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+                workspace_buffer,
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                *scale_granularity_mnk,
+                scale_major_mode,
+                mma_sm,
+            )
+        else:
+            raise ValueError(f"Unsupported device for FP8 GEMM: {a.device}")
     elif backend == "trtllm":
         assert scale_granularity_mnk == (1, 128, 128)
         assert a.shape[1] >= 256
@@ -1919,7 +2248,7 @@ def gemm_fp8_nt_groupwise(
 
 @functools.cache
 def get_trtllm_fp4_gemm_module():
-    mod = trtllm_gemm_gen_module()
+    mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
@@ -2151,8 +2480,18 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if not _match_sm_version(a.device, "100"):
-        raise ValueError("gemm_fp8_nt_groupwise is only supported on SM100.")
+    if (
+        not is_sm100a_supported(a.device)
+        and not is_sm120a_supported(a.device)
+        and not is_sm121a_supported(a.device)
+    ):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM120, and SM121."
+        )
+    if not (_match_sm_version(a.device, ["100", "103", "110", "120", "121"])):
+        raise ValueError(
+            "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121."
+        )
 
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -2195,21 +2534,42 @@ def group_gemm_fp8_nt_groupwise(
         assert out.shape == out_shape
         assert out.dtype == out_dtype
 
-    get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
-        int_workspace_buffer,
-        float_workspace_buffer,
-        a,
-        b,
-        a_scale,
-        b_scale,
-        out,
-        m_indptr,
-        n,
-        k,
-        *scale_granularity_mnk,
-        scale_major_mode,
-        mma_sm,
-    )
+    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        # SM120/121 doesn't use mma_sm parameter
+        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            *scale_granularity_mnk,
+            scale_major_mode,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            *scale_granularity_mnk,
+            scale_major_mode,
+            mma_sm,
+        )
+    else:
+        raise ValueError(
+            f"group_gemm_fp8_nt_groupwise requires SM100, SM120, or SM121, but got {a.device}"
+        )
     return out
 
 

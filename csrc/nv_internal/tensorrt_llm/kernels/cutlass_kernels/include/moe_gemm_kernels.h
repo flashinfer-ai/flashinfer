@@ -32,7 +32,9 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #include <cuda_fp4.h>
+#endif
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -262,12 +264,16 @@ class MoeGemmRunner {
  public:
   MoeGemmRunner();
 
+#if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
   static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
                                       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
   static constexpr bool use_wfp4a16 =
       std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+#endif
+#else
+  static constexpr bool use_wfp4a16 = false;
 #endif
 
 #if defined(ENABLE_FP8)
