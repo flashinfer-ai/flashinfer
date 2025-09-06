@@ -1085,22 +1085,34 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      ")");
   }
 
+  // Number of iterations in K dimension after padding.
+  // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
+  // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+  //
+  //   ceil(512 / (128*3)) * (128*3) = 768
+  //
+  int const paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
+  int const perCtaK = paddedK / options.mNumSlicesForSplitK;
+  // However, number of iterations is clamped to multiples of tileK within individual CTAs
+  // E.g., K = 448, TileK = 64, numSlicesForSplitK = 4.
+  //
+  //   paddedK                        = 512
+  //   perCtaK                        = 128
+  //   clampedPerCtaK for CTA 0, 1, 2 = 128
+  //   clampedPerCtaK for CTA 3       = 64
+  int const paddingForK = paddedK - options.mK;
+  int const clampedAndPaddedPerCtaK = divUpMul(perCtaK - paddingForK, options.mTileK);
   if (options.mUseUnrollLoop2xForMma) {
-    // Number of iterations in K dimension after padding.
-    // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
-    // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+    // Check that the padded K and clamped padded K (K rounded to next multiple of tileK) is a
+    // multiple of 2*TileK when UnrollLoop2x is enabled. This is to avoid deadlock when mma runs
+    // even-numbered loop while the other warps run odd-numbered loop.
     //
-    //   ceil(512 / (128*3)) * (128*3) = 768
-    //
-    int paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
-    // Check that the padded K (K rounded to next multiple of tileK) is a multiple of 2*TileK when
-    // UnrollLoop2x is enabled. This is to avoid deadlock when mma runs even-numbered loop while the
-    // other warps run odd-numbered loop.
-    //
-    bool notSupported = (paddedK / options.mNumSlicesForSplitK) % (options.mTileK * 2) != 0;
+    bool notSupported = (perCtaK % (options.mTileK * 2) != 0) ||
+                        (clampedAndPaddedPerCtaK % (options.mTileK * 2) != 0);
     if (notSupported) {
       TLLM_LOG_WARNING("Size K / splitK must be a multiple of TileK * 2. Found TileK=",
                        options.mTileK, " and K=", options.mK, " (paddedK=", paddedK,
+                       " clampedAndPaddedPerCtaK=", clampedAndPaddedPerCtaK,
                        ") and numSlicesForSplitK=", options.mNumSlicesForSplitK,
                        ". Disabling unrollLoop2xForMma.");
       if (updateOptions) {
@@ -1109,6 +1121,11 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         return false;
       }
     }
+  }
+  if (options.mNumSlicesForSplitK > 1) {
+    TLLM_CHECK_ERROR(
+        perCtaK * (options.mNumSlicesForSplitK - 1) < options.mK,
+        "K must be greater than perCtaK * (numSlicesForSplitK - 1) to ensure each CTA has work");
   }
 
   if (!isBlackwell && options.mTileScheduler == TileScheduler::Persistent) {

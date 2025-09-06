@@ -1,0 +1,42 @@
+/*
+ * Copyright (c) 2025 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <flashinfer/gemm/gemm_groupwise_sm120.cuh>
+
+using namespace flashinfer;
+using namespace flashinfer::gemm;
+
+namespace flashinfer {
+namespace gemm {
+
+// Following SM100's approach: support (1,128,128) and (128,128,128)
+{% for scale_granularity_m in [1, 128] %}
+{% for scale_granularity_n in [128] %}
+{% for scale_granularity_k in [128] %}
+template cudaError_t
+CutlassGroupwiseScaledGEMMSM120<
+    {{ scale_granularity_m }}, {{ scale_granularity_n }}, {{ scale_granularity_k }},
+    {{ scale_major_k }},
+    {{ dtype_in }},
+    {{ dtype_out }}>(
+        void* float_buffer, size_t float_buffer_size_in_bytes,
+        {{ dtype_in }}* A_ptr, {{ dtype_in }}* B_ptr, float* SFA_ptr, float* SFB_ptr,
+        {{ dtype_out }}* D_ptr, int m, int n, int k, int l, cudaStream_t stream);
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+};  // namespace gemm
+};  // namespace flashinfer

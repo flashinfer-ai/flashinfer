@@ -1932,6 +1932,7 @@ def get_trtllm_gen_decode_module(*args):
         assert page_size is not None
         assert max_kv_len is not None
         assert enable_pdl is not None
+        assert workspace_size > 0, "workspace_size must be greater than 0"
         o = module._paged_run(
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
