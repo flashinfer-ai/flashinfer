@@ -554,6 +554,7 @@ def get_batch_prefill_module(backend, *args):
             assert cum_seq_lens_q is not None
             assert cum_seq_lens_kv is not None
             assert enable_pdl is not None
+            assert workspace_size > 0, "workspace_size must be greater than 0"
             o = paged_run_func(
                 q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
                 paged_k_cache,
@@ -2147,8 +2148,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     None,  # scale_v
                     rope_scale,
                     rope_theta,
-                    self._workspace_size,
                     self._token_pos_in_items_len,
+                    self._workspace_size,
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,

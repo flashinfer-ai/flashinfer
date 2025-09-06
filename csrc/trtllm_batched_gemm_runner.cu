@@ -104,13 +104,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         tileSize == mOptions.tileSize &&
         options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
         options.mLayoutA == mOptions.weightLayout) {
-      // FIXME: Disable split-k for swiglu for now.
-      if (static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType) ==
-              batchedGemm::gemmGatedAct::ActType::SwiGlu &&
-          options.mClusterDimZ != 1) {
-        continue;
-      }
-
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
