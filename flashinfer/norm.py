@@ -88,7 +88,7 @@ def _rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
+    get_norm_module().norm(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::rmsnorm")
