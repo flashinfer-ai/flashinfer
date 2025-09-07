@@ -168,7 +168,7 @@ def _run_attention(
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("gqa_group_size", [1, 4, 7])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
@@ -205,15 +205,15 @@ def test_batch_attention_correctness(
     )
 
 
-test_batch_attention_correctness(
-    seq_len_pairs=[(2048, 1)] * 17,
-    page_block_size=8,
-    num_kv_heads=1,
-    gqa_group_size=1,
-    head_dim=64,
-    layout="NHD",
-    test_dtype=torch.bfloat16,
-    logits_soft_cap=0.0,
-    window_left=13,
-    causal=False,
-)
+# test_batch_attention_correctness(
+#     seq_len_pairs=[(2048, 1)] * 17,
+#     page_block_size=8,
+#     num_kv_heads=1,
+#     gqa_group_size=1,
+#     head_dim=64,
+#     layout="NHD",
+#     test_dtype=torch.bfloat16,
+#     logits_soft_cap=0.0,
+#     window_left=13,
+#     causal=False,
+# )

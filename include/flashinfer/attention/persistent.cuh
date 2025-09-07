@@ -262,7 +262,7 @@ struct BlockBatchPagedAttentionPersistent {
                                      ceil_div((packed_qo_start + cluster_tile_q), gqa_group_size))
                            : kv_end),
                    CTA_TILE_KV) -
-          1 - (kv_start / CTA_TILE_KV);
+          (kv_start / CTA_TILE_KV);
 
       int mask_tile_idx =
           (CAUSAL ? min(kv_end, kv_len - q_len + ceil_div(packed_qo_start, gqa_group_size))
@@ -279,13 +279,20 @@ struct BlockBatchPagedAttentionPersistent {
       //   printf("kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d\n", kv_tile_idx,
       //   mask_tile_idx, window_tile_idx);
       // }
-      int window_tile_idx = 0;
-      if (params.window_left > 0) {
-        window_tile_idx =
-            ceil_div(
-                min(kv_end, kv_len + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size)),
-                CTA_TILE_KV) -
-            1 - (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      int window_tile_idx = kv_tile_idx;
+      // if (params.window_left > 0) {
+      //   window_tile_idx =
+      //       ceil_div(
+      //           min(kv_end, kv_len + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size)),
+      //           CTA_TILE_KV) -
+      //       1 - (q_len + params.window_left + kv_start) / CTA_TILE_KV;
+      // }
+      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        printf(
+            "work_idx: %d, kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d, q_len: %d, "
+            "packed_qo_start: %d, kv_start: %d, kv_end: %d, kv_len: %d\n",
+            work_idx, kv_tile_idx, mask_tile_idx, window_tile_idx, q_len, packed_qo_start, kv_start,
+            kv_end, kv_len);
       }
       auto mask_tile_idx_ = mask_tile_idx, window_tile_idx_ = window_tile_idx,
            kv_tile_idx_ = kv_tile_idx;
@@ -363,22 +370,22 @@ struct BlockBatchPagedAttentionPersistent {
                   (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
               q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
         }
-        // if (kv_tile_idx < window_tile_idx) { // TODO: check why adding this leads to nan
-        logits_mask<KTraits>(
-            params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
-            kv_start +
-                (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-            q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
-        // }
+        // Apply window constraint: only mask if kv_tile_idx is within the window
+        if (kv_tile_idx < window_tile_idx) {
+          logits_mask<KTraits>(
+              params, variant, /*work_idx=*/work_idx, qo_packed_idx_base,
+              kv_start +
+                  (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+              q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
+        }
         // update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         // compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
       }
       if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
         printf(
             "kv_start:%d, kv_end:%d, kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d, "
-            "o_frag: %f\n",
-            kv_start, kv_end, kv_tile_idx, mask_tile_idx_, window_tile_idx,
-            o_frag[NUM_MMA_Q - 1][NUM_MMA_KV - 1][7]);
+            "s_frag: %f\n",
+            kv_start, kv_end, kv_tile_idx, mask_tile_idx_, window_tile_idx, s_frag[0][0][0]);
       }
       __syncthreads();
 
