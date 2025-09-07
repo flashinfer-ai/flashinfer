@@ -19,12 +19,12 @@ try:
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
 
-
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .attention import BatchAttention as BatchAttention
+from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
 )
@@ -48,10 +48,34 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .fp4_quantization import fp4_quantize, fp4_swizzle_blockscale
-from .fused_moe import cutlass_fused_moe
+from .fp4_quantization import (
+    SfLayout,
+    block_scale_interleave,
+    nvfp4_block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+    fp4_quantize,
+    mxfp4_dequantize_host,
+    mxfp4_dequantize,
+    mxfp4_quantize,
+    nvfp4_quantize,
+    nvfp4_batched_quantize,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
+)
+from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .fused_moe import (
+    RoutingMethodType,
+    GatedActType,
+    cutlass_fused_moe,
+    reorder_rows_for_gated_act_gemm,
+    trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
+from .gemm import mm_fp4 as mm_fp4
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
@@ -103,3 +127,8 @@ from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_fr
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
+from .sparse import (
+    VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
+)
+from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .xqa import xqa as xqa

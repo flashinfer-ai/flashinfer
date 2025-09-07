@@ -43,6 +43,19 @@ dtype_map = {
     torch.uint64: "uint64_t",
 }
 
+dtype_cutlass_map = {
+    torch.float16: "cutlass::half_t",
+    torch.bfloat16: "cutlass::bfloat16_t",
+    torch.float8_e4m3fn: "cutlass::float_e4m3_t",
+    torch.float8_e5m2: "cutlass::float_e5m2_t",
+    torch.int8: "cutlass::int8_t",
+    torch.uint8: "cutlass::uint8_t",
+    torch.int32: "cutlass::int32_t",
+    torch.uint32: "cutlass::uint32_t",
+    torch.int64: "cutlass::int64_t",
+    torch.uint64: "cutlass::uint64_t",
+}
+
 filename_safe_dtype_map = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",

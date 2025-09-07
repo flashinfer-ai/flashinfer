@@ -1,11 +1,11 @@
-from .cuda_ipc import create_shared_buffer, free_shared_buffer
+from .cuda_ipc import CudaRTLibrary, create_shared_buffer, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
 from .trtllm_ar import AllReduceFusionPattern as AllReduceFusionPattern
 from .trtllm_ar import AllReduceStrategyConfig as AllReduceStrategyConfig
 from .trtllm_ar import AllReduceStrategyType as AllReduceStrategyType
-from .trtllm_ar import FP4QuantizationSFLayout as FP4QuantizationSFLayout
+from .trtllm_ar import QuantizationSFLayout as QuantizationSFLayout
 from .trtllm_ar import (
     compute_fp4_swizzled_layout_sf_size as compute_fp4_swizzled_layout_sf_size,
 )

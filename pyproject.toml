@@ -17,10 +17,11 @@ name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.9,<4.0"
 authors = [{ name = "FlashInfer team" }]
-# license = "Apache-2.0"
+license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
+license-files = ["LICENSE", "licenses/*"]
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]
@@ -39,6 +40,7 @@ skip = [
 [tool.setuptools]
 packages = [
     "flashinfer",
+    "flashinfer.cute_dsl",
     "flashinfer.data",
     "flashinfer.data.aot",
     "flashinfer.data.csrc",
@@ -46,12 +48,18 @@ packages = [
     "flashinfer.data.spdlog",
     "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
+    "flashinfer.fused_moe",
     "flashinfer.jit",
     "flashinfer.jit.attention",
+    "flashinfer.jit.cutlass_gemm",
+    "flashinfer.testing",
     "flashinfer.triton",
+    "flashinfer.tuning_configs",
+    "flashinfer.profiler",
     "flashinfer.triton.kernels",
     "flashinfer.comm",
     "flashinfer.cudnn",
+    "flashinfer.logits_processor",
 ]
 include-package-data = false
 
@@ -128,4 +136,8 @@ ignore = [
     "B020",
     # Return te negated condition directly
     "SIM103",
+    # Function definition does not bind loop variable
+    "B023",
 ]
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

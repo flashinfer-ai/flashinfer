@@ -16,13 +16,12 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
+#include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
-#include <cub/block/block_adjacent_difference.cuh>
-#include <cub/block/block_reduce.cuh>
-#include <cub/block/block_scan.cuh>
+#include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -34,6 +33,16 @@
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
+
+// Define reduction operators based on CUDA version
+// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
+#if CUDA_VERSION >= 12090
+using MaxReduceOp = cuda::maximum<>;
+using MinReduceOp = cuda::minimum<>;
+#else
+using MaxReduceOp = cub::Max;
+using MinReduceOp = cub::Min;
+#endif
 
 namespace flashinfer {
 
@@ -254,11 +263,11 @@ __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_dat
     }
     max_val = max(
         max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, cub::Max()));
+                     .Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
     __syncthreads();
     min_val = min(
         min_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, cub::Min()));
+                     .Reduce<VEC_SIZE>(in_data_, MinReduceOp{}));
     __syncthreads();
   }
   if (tx == 0) {
@@ -292,7 +301,7 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
     }
     max_val = max(
         max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .template Reduce<VEC_SIZE>(in_data_, cub::Max()));
+                     .template Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
     __syncthreads();
   }
   if (tx == 0) {
@@ -352,7 +361,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
       thread_max = max(thread_max, logits_vec[j]);
     }
     float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                          .Reduce(thread_max, cub::Max());
+                          .Reduce(thread_max, MaxReduceOp{});
 
     if (tx == 0) {
       temp_storage.shared_state.max_val = block_max;
@@ -396,7 +405,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   vec_t<DType, VEC_SIZE> prob_vec;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     if constexpr (CACHE_INPUT) {
-      logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        logits_vec.load(smem_vec_base + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
     } else {
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         logits_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
@@ -468,7 +479,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     }
 
     float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                          .Reduce(thread_max, cub::Max());
+                          .Reduce(thread_max, MaxReduceOp{});
 
     if (tx == 0) {
       temp_storage.shared_state.max_val = block_max;
@@ -653,7 +664,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   }
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
-          .Reduce(valid_index, cub::Max());
+          .Reduce(valid_index, MaxReduceOp{});
   if (tx == 0 && max_valid_index != -1) {
     temp_storage->last_valid_id = max_valid_index;
   }
@@ -739,8 +750,8 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
                                          REDUCE_ALGORITHM>::TempStorage;
-  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling[];
-  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling);
+  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling_logit[];
+  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
 
   vec_t<DType, VEC_SIZE> logits_vec;
   DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
@@ -1406,7 +1417,7 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset, &d};
+  void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
   DISPATCH_ALIGNED_VEC_SIZE(
@@ -1539,6 +1550,7 @@ struct RenormTempStorage {
   struct {
     float max_val;
     float min_val;
+    float row_sum;
     union {
       struct {
         float values[2];
@@ -1565,9 +1577,61 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       uint8_t smem_renorm[];
   auto& temp_storage =
       reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-  temp_storage.max_val = 0;
   vec_t<float, VEC_SIZE> probs_vec;
 
+  // Fast-path: when p >= 1.0 (e.g., p == 1.0), perform simple sum and normalization
+  if (p >= 1.0f) {
+    // Stage A: per-thread float accumulation over assigned lanes (vectorized)
+    float thread_sum = 0.0f;
+    const uint32_t num_iters = ceil_div(d, BLOCK_THREADS * VEC_SIZE);
+    for (uint32_t i = 0; i < num_iters; ++i) {
+      probs_vec.fill(0.0f);
+      const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+      if (base_idx < d) {
+        probs_vec.cast_load(probs + row_idx * d + base_idx);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        const uint32_t idx = base_idx + j;
+        if (idx < d) thread_sum += probs_vec[j];
+      }
+    }
+
+    // Block reduce (float)
+    float row_sum =
+        BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+            .Sum(thread_sum);
+    // Broadcast via shared
+    if (tx == 0) temp_storage.row_sum = row_sum;
+    __syncthreads();
+    row_sum = temp_storage.row_sum;
+
+    // Guard against zero sum
+    const float denom = (row_sum <= 1e-8f) ? 1.0f : row_sum;
+    const float normalizer = math::ptx_rcp(denom);
+
+    // Stage B: normalize and store
+    for (uint32_t i = 0; i < num_iters; ++i) {
+      probs_vec.fill(0.0f);
+      const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+      if (base_idx < d) {
+        probs_vec.cast_load(probs + row_idx * d + base_idx);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        const uint32_t idx = base_idx + j;
+        float v = probs_vec[j];
+        probs_vec[j] = (idx < d) ? (v * normalizer) : 0.0f;
+      }
+      if (base_idx < d) {
+        probs_vec.cast_store(renormed_prob + row_idx * d + base_idx);
+      }
+    }
+    return;  // Exit after fast-path processing
+  }
+
+  // Original Top-P renormalization logic
+  temp_storage.max_val = 0;
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
@@ -1621,11 +1685,11 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       __syncthreads();
     }
     min_gt_low = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce(min_gt_low, cub::Min());
+                     .Reduce(min_gt_low, MinReduceOp{});
     __syncthreads();
     max_le_high =
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-            .Reduce(max_le_high, cub::Max());
+            .Reduce(max_le_high, MaxReduceOp{});
     if (tx == 0) {
       temp_storage.block_aggregate.values[0] = aggregate_gt_pivot_0;
       temp_storage.block_aggregate.values[1] = aggregate_gt_pivot_1;
@@ -1743,11 +1807,11 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       }
       min_gt_low =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, cub::Min());
+              .Reduce(min_gt_low, MinReduceOp{});
       __syncthreads();
       max_le_high =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, cub::Max());
+              .Reduce(max_le_high, MaxReduceOp{});
       if (tx == 0) {
         temp_storage.block_aggregate.counts[0] = aggregate_gt_pivot_0;
         temp_storage.block_aggregate.counts[1] = aggregate_gt_pivot_1;
@@ -1827,7 +1891,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
       min_gt_low = high;
       max_le_high = low;
-#pragma unroll 2
+#pragma unroll 1
       for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
         probs_vec.fill(0);
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -1863,11 +1927,11 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       }
       min_gt_low =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, cub::Min());
+              .Reduce(min_gt_low, MinReduceOp{});
       __syncthreads();
       max_le_high =
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, cub::Max());
+              .Reduce(max_le_high, MaxReduceOp{});
       if (tx == 0) {
         temp_storage.block_aggregate.pairs[0] = aggregate_gt_pivot_0;
         temp_storage.block_aggregate.pairs[1] = aggregate_gt_pivot_1;
@@ -2049,7 +2113,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0);
+      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0.0f);
     }
     sum_relu_q_minus_p +=
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
@@ -2083,7 +2147,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     vec_t<float, VEC_SIZE> relu_q_minus_p_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], 0);
+      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], 0.0f);
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,

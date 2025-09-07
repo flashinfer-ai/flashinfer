@@ -30,14 +30,17 @@ FLASHINFER_BASE_DIR = pathlib.Path(
 )
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+FLASHINFER_CUBIN_DIR = pathlib.Path(
+    os.getenv("FLASHINFER_CUBIN_DIR", (FLASHINFER_CACHE_DIR / "cubins").as_posix())
+)
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
     try:
         with warnings.catch_warnings():
-            # Ignore the warning for TORCH_CUDA_ARCH_LIST not set
+            # Ignore the warning for FLASHINFER_CUDA_ARCH_LIST not set
             warnings.filterwarnings(
-                "ignore", r".*TORCH_CUDA_ARCH_LIST.*", module="torch"
+                "ignore", r".*FLASHINFER_CUDA_ARCH_LIST.*", module="torch"
             )
             flags = _get_cuda_arch_flags()
         arch = "_".join(sorted(set(re.findall(r"compute_(\d+)", "".join(flags)))))
@@ -65,15 +68,23 @@ CUTLASS_INCLUDE_DIRS = [
 SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
 
 
-def get_nvshmem_include_dir():
+def get_nvshmem_include_dirs():
+    paths = os.environ.get("NVSHMEM_INCLUDE_PATH")
+    if paths is not None:
+        return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
+
     import nvidia.nvshmem
 
     path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "include"
-    return path
+    return [path]
 
 
-def get_nvshmem_lib_dir():
+def get_nvshmem_lib_dirs():
+    paths = os.environ.get("NVSHMEM_LIBRARY_PATH")
+    if paths is not None:
+        return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
+
     import nvidia.nvshmem
 
     path = pathlib.Path(nvidia.nvshmem.__path__[0]) / "lib"
-    return path
+    return [path]

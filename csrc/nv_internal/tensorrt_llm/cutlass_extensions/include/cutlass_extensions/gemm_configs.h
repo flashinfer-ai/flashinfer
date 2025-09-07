@@ -98,8 +98,9 @@ enum class CutlassTileConfigSM90 {
   CtaShape128x128x128B,
   CtaShape128x256x128B,
 
-  // CTA configs for M=128
+  // CTA configs for M=256
   CtaShape256x128x128B,
+  CtaShape256x256x128B,
 };
 
 enum class CutlassTileConfigSM100 {
@@ -187,7 +188,9 @@ enum class TileShape {
   TileShape_128x32x128,
   TileShape_128x64x128,
   TileShape_128x128x128,
-  TileShape_128x256x128
+  TileShape_128x256x128,
+  TileShape_256x128x128,
+  TileShape_256x256x128
 };
 
 template <TileShape Shape_MNK>
@@ -215,6 +218,10 @@ constexpr auto get_tile_shape() {
     return cute::Shape<_128, _128, _128>{};
   } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x128) {
     return cute::Shape<_128, _256, _128>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_256x128x128) {
+    return cute::Shape<_256, _128, _128>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_256x256x128) {
+    return cute::Shape<_256, _256, _128>{};
   }
 }
 
@@ -241,6 +248,10 @@ static auto get_tile_shape_name(TileShape Shape_MNK) {
     return "128x128x128";
   } else if (Shape_MNK == TileShape::TileShape_128x256x128) {
     return "128x256x128";
+  } else if (Shape_MNK == TileShape::TileShape_256x128x128) {
+    return "256x128x128";
+  } else if (Shape_MNK == TileShape::TileShape_256x256x128) {
+    return "256x256x128";
   }
   return "Unknown shape";
 }
@@ -363,6 +374,7 @@ struct CutlassGemmConfig {
 
   int getTileConfigAsInt() const {
     if (sm_version == 120) return (int)tile_config_sm120;
+    if (sm_version == 110) return (int)tile_config_sm100;
     if (sm_version >= 100) return (int)tile_config_sm100;
     if (sm_version == 90) return (int)tile_config_sm90;
     if (sm_version < 90) return (int)tile_config_sm80;
@@ -400,22 +412,22 @@ struct CutlassGemmConfig {
 
 inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& config) {
   // clang-format off
-    if (config.is_tma_warp_specialized)
-    {
-        out << "tile_config_sm90_enum: " << config.getTileConfigAsInt()
-            << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
-            << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
-            << ", cluster_shape_enum: " << int(config.cluster_shape)
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
-    }
-    else
-    {
-        out << "tile_config_enum: " << config.getTileConfigAsInt()
-            << ", split_k_style_enum: " << int(config.split_k_style)
-            << ", split_k_factor: " << config.split_k_factor
-            << ", stages: " << config.stages
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
-    }
+     if (config.is_tma_warp_specialized)
+     {
+         out << "tile_config_sm90_enum: " << config.getTileConfigAsInt()
+             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
+             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
+             << ", cluster_shape_enum: " << int(config.cluster_shape)
+             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+     }
+     else
+     {
+         out << "tile_config_enum: " << config.getTileConfigAsInt()
+             << ", split_k_style_enum: " << int(config.split_k_style)
+             << ", split_k_factor: " << config.split_k_factor
+             << ", stages: " << config.stages
+             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+     }
   // clang-format on
   return out;
 }

@@ -267,6 +267,29 @@ def test_top_k_sampling(batch_size, vocab_size, k):
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    k = torch.randint(1, k + 1, (batch_size,), device="cuda:0")
+    pivot = sorted_prob[torch.arange(batch_size), k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.top_k_sampling_from_probs(normalized_prob, k)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -388,7 +411,7 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
@@ -532,18 +555,6 @@ def test_chain_speculative_sampling(
                     assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
 
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
-        batch_indices = torch.arange(batch_size, device=normalized_draft_prob.device)[
-            :, None
-        ]
-        probs_indicies = torch.arange(
-            num_speculate_tokens, device=normalized_draft_prob.device
-        )
-        selected_draft_probs = normalized_draft_prob[
-            batch_indices, probs_indicies, draft_token_ids
-        ]
-        selected_target_probs = target_onehot_prob[
-            batch_indices, probs_indicies, draft_token_ids
-        ]
 
 
 if __name__ == "__main__":

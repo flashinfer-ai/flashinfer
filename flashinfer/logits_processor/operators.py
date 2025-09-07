@@ -21,12 +21,12 @@ import torch
 from flashinfer.sampling import get_sampling_module
 from flashinfer.utils import _get_cache_buf, device_support_pdl
 
-from .op import Op, ParameterizedOp
+from .op import ParameterizedOp
 from .types import TaggedTensor, TensorType
 
 
 def _to_tensor_scalar_tuple(
-    x: Union[torch.Tensor, float, int]
+    x: Union[torch.Tensor, float, int],
 ) -> Tuple[Optional[torch.Tensor], Union[float, int]]:
     if isinstance(x, torch.Tensor):
         return (x, 0 if x.dtype == torch.int32 else 0.0)
@@ -93,13 +93,7 @@ class SoftmaxOp(ParameterizedOp):
         if enable_pdl is None:
             enable_pdl = device_support_pdl(tensor.data.device)
 
-        workspace_buffer = _get_cache_buf(
-            "softmax_workspace", 1024 * 1024, tensor.data.device
-        )
-
-        probs = get_sampling_module().softmax(
-            workspace_buffer, tensor.data, None, 1.0, enable_pdl
-        )
+        probs = torch.softmax(tensor.data, dim=-1)
         return TaggedTensor(probs, output_type)
 
 

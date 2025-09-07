@@ -39,21 +39,22 @@ __device__ __forceinline__ CostIndex get_min_cost_index(CostIndex* warp_min_cost
     other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
     cost_index = min(cost_index, other);
   }
-  if (threadIdx.x % 32 == 0) {
-    warp_min_cost[threadIdx.x / 32] = cost_index;
+  if (static_cast<int>(threadIdx.x) % 32 == 0) {
+    warp_min_cost[static_cast<int>(threadIdx.x) / 32] = cost_index;
   }
   __syncthreads();
-  if (threadIdx.x < 32) {
-    cost_index = threadIdx.x * 32 < num_buckets
+  if (static_cast<int>(threadIdx.x) < 32) {
+    cost_index = static_cast<int>(threadIdx.x) * 32 < num_buckets
                      ? warp_min_cost[threadIdx.x]
-                     : CostIndex{threadIdx.x * 32, cuda::std::numeric_limits<float>::infinity()};
+                     : CostIndex{static_cast<int>(threadIdx.x) * 32,
+                                 cuda::std::numeric_limits<float>::infinity()};
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
       CostIndex other;
       other.packed = __shfl_xor_sync(0xffffffff, cost_index.packed, offset);
       cost_index = min(cost_index, other);
     }
-    if (threadIdx.x == 0) {
+    if (static_cast<int>(threadIdx.x) == 0) {
       warp_min_cost[0] = cost_index;
     }
   }
@@ -70,9 +71,9 @@ __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, in
   using BlockScan = cub::BlockScan<int, MAX_BUCKET_SIZE>;
   __shared__ typename BlockScan::TempStorage temp_storage;
   // first round, calculate the work count for each bucket
-  CostIndex thread_local_cost_index = {threadIdx.x, 0.f};
+  CostIndex thread_local_cost_index = {static_cast<int>(threadIdx.x), 0.f};
   int thread_local_work_counter = 0;
-  if (threadIdx.x >= num_buckets) {
+  if (static_cast<int>(threadIdx.x) >= num_buckets) {
     thread_local_cost_index.cost = cuda::std::numeric_limits<float>::infinity();
   }
 
@@ -101,16 +102,16 @@ __global__ void plan_kernel(int* qo_segment_offsets, int* kv_segment_offsets, in
   int thread_local_work_indptr = 0;
   BlockScan(temp_storage).ExclusiveSum(thread_local_work_counter, thread_local_work_indptr);
   __syncthreads();
-  if (threadIdx.x < num_buckets) {
+  if (static_cast<int>(threadIdx.x) < num_buckets) {
     work_indptr[threadIdx.x] = thread_local_work_indptr;
   }
-  if (threadIdx.x + 1 == num_buckets) {
+  if (static_cast<int>(threadIdx.x) + 1 == num_buckets) {
     work_indptr[num_buckets] = thread_local_work_indptr + thread_local_work_counter;
   }
 
   // second round, write qo_tile_idx, head_idx, batch_idx to the output
   thread_local_work_counter = 0;
-  if (threadIdx.x >= num_buckets) {
+  if (static_cast<int>(threadIdx.x) >= num_buckets) {
     thread_local_cost_index.cost = cuda::std::numeric_limits<float>::infinity();
   } else {
     thread_local_cost_index.cost = 0.f;

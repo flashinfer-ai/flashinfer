@@ -20,6 +20,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <stdint.h>
 
 #if defined(ENABLE_BF16)
 #include <cuda_bf16.h>
@@ -34,14 +35,8 @@ namespace kernels {
 template <typename T_in, typename T_out = T_in>
 void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* act,
                                              T_in const* per_channel_scale, int rows, int cols,
+                                             int64_t const* num_valid_tokens_ptr = nullptr,
                                              cudaStream_t stream = 0);
-
-template <typename T_in, typename T_out = T_in>
-void apply_per_expert_scale_kernel_launcher(T_out* smoothed_act, T_in const* act,
-                                            T_in const* per_expert_scale,
-                                            int const* permuted_token_selected_experts,
-                                            int64_t const* num_valid_tokens_ptr, int rows, int cols,
-                                            cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
