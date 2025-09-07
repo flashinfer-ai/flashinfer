@@ -58,7 +58,7 @@ install_requires = [
     "torch",
     "ninja",
     "requests",
-    "pynvml",
+    "nvidia-ml-py",
     "einops",
     "click",
     "tqdm",
