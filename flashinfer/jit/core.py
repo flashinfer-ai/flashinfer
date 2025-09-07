@@ -1,7 +1,6 @@
 import dataclasses
 import logging
 import os
-import warnings
 import tvm_ffi
 from contextlib import nullcontext
 from pathlib import Path
@@ -249,28 +248,3 @@ def build_jit_specs(
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
         run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
-
-
-def load_cuda_ops(
-    name: str,
-    sources: List[Union[str, Path]],
-    extra_cflags: Optional[List[str]] = None,
-    extra_cuda_cflags: Optional[List[str]] = None,
-    extra_ldflags=None,
-    extra_include_paths=None,
-):
-    # TODO(lequn): Remove this function and use JitSpec directly.
-    warnings.warn(
-        "load_cuda_ops is deprecated. Use JitSpec directly.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    spec = gen_jit_spec(
-        name=name,
-        sources=sources,
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cuda_cflags,
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=extra_include_paths,
-    )
-    return spec.build_and_load()

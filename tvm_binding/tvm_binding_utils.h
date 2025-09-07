@@ -21,13 +21,13 @@
 #include <tvm/ffi/function.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/int_tuple.h>
-#include <tvm/runtime/ndarray.h>
+#include <tvm/runtime/tensor.h>
 
 using IdType = int32_t;
 using tvm::ffi::Array;
 using tvm::runtime::DataType;
 using tvm::runtime::IntTuple;
-using tvm::runtime::NDArray;
+using tvm::runtime::Tensor;
 
 #define DISPATCH_BOOL(expr, const_expr, ...) \
   [&]() -> bool {                            \

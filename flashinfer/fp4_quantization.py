@@ -252,6 +252,71 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::fp4_batched_quantize_sm100",
+        mutates_args=("",),
+    )
+    def fp4_batched_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a batched tensor to FP4 (E2M1x2) with per-block scale factors.
+
+        This function converts a float/bfloat16 (or FP8-quantized) input tensor into a
+        packed FP4 tensor using the E2M1 format (two 4-bit values per byte), along with
+        per-block scale factors. Scale factors are encoded as UE4M3 by default, or UE8M0
+        when requested, and an optional global scale can be applied.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
+                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
+            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
+                dtype float32.
+            sf_vec_size (int, optional): Scale-factor vector size and alignment unit along K.
+                Supported/expected values:
+                - 16 (NVFP4 path; supported)
+                - 32 (MXFP4 path; not supported yet)
+                Defaults to 16.
+            sf_use_ue8m0 (bool, optional): Scale-factor encoding type.
+                False → UE4M3 (default), True → UE8M0.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - self_fp4 (torch.Tensor): Packed FP4 tensor in E2M1x2 format of shape
+                [B, M, K // 2] with dtype torch.uint8 (two FP4 lanes per byte).
+                - self_block_scale_factors (torch.Tensor): Block scale factors with dtype
+                uint8 (UE4M3 or UE8M0), laid out as a flat buffer of shape
+                [B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4].
+
+        Notes:
+            - K must be even (because outputs pack two FP4 values per byte).
+            - For best performance, K should be a multiple of sf_vec_size; the scale-factor
+            buffer is aligned to sf_vec_size along K, pads M to multiples of 128, and
+            rounds (K / sf_vec_size) up to a multiple of 4 for storage.
+            - The batch dimension B is preserved for both outputs.
+        """
+        return module.fp4_batched_quantize(
+            input,
+            global_scale,
+            sf_vec_size,
+            sf_use_ue8m0,
+        )
+
+    @register_fake_op("flashinfer::fp4_batched_quantize_sm100")
+    def _fp4_batched_quantize_sm100(
+        input: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        sf_vec_size: int = 16,
+        sf_use_ue8m0: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        return (
+            input.new_empty([m, k // 2], dtype=torch.int64),  # float4_e2m1_x2
+            input.new_empty([m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+        )
+
+    @register_custom_op(
         "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",
         mutates_args=(""),
     )
@@ -307,6 +372,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         block_scale_interleave_sm100=block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
+        fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
     )
 
 
@@ -610,3 +676,30 @@ def mxfp4_dequantize_host(
         scale,
         group_size,
     )
+
+
+def nvfp4_batched_quantize(
+    a,
+    a_global_sf,
+    sf_vec_size=16,
+):
+    """
+    Quantize batched input tensor to NVFP4 format.
+
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
+        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    a_fp4, a_sf = get_fp4_quantization_module().fp4_batched_quantize_sm100(
+        a,
+        a_global_sf,
+        sf_vec_size,
+        False,
+    )
+    return a_fp4, a_sf
