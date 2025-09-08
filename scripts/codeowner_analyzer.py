@@ -161,19 +161,19 @@ class CodeOwnersAnalyzer:
             GitHub username if found, None otherwise
         """
         # Rate limiting based on GitHub API limits:
-        # - Authenticated: 30 requests/minute for search API
-        # - Unauthenticated: 10 requests/minute for search API
+        # - Authenticated: 5000 requests/hour = 1.39 req/sec
+        # - Unauthenticated: 60 requests/hour = 1 req/60sec
         current_time = time.time()
 
         if self.api_call_count > 0:
             time_since_last = current_time - self.last_api_call_time
 
             if self.github_token:
-                # With token: 30/minute = 2 seconds between calls
-                min_delay = 2.1
+                # With token: 5000/hour = 0.72 seconds between calls (with buffer)
+                min_delay = 0.8
             else:
-                # Without token: 10/minute = 6 seconds between calls
-                min_delay = 6.1
+                # Without token: 60/hour = 60 seconds between calls
+                min_delay = 60.1
 
             if time_since_last < min_delay:
                 time.sleep(min_delay - time_since_last)
