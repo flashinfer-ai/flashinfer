@@ -346,7 +346,7 @@ struct BlockBatchPagedAttentionPersistent {
       threadblock_sync_mdo_states<KTraits>(o_frag, smem_storage, m, d, warp_idx, lane_idx, tid);
 
       // normalize d
-      normalize_d<KTraits>(o_frag, m, d);
+      normalize_d<KTraits>(o_frag, m, d, params.v_scale);
 
       // write back to global memory
       // o_indptr (partial_o): [packed_qo_len * num_kv_chunks, num_kv_heads, head_dim]

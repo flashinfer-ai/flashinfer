@@ -1033,7 +1033,8 @@ __device__ __forceinline__ void compute_sfm_v(
 
 template <typename KTraits>
 __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
+                                            float v_scale = 1.0f) {
   using AttentionVariant = typename KTraits::AttentionVariant;
   if constexpr (AttentionVariant::use_softmax) {
     float d_rcp[KTraits::NUM_MMA_Q][2];
@@ -1056,6 +1057,9 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
               o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
+          if (v_scale != 1.0f) {
+            o_frag[mma_q][mma_d][reg_id] *= v_scale;
+          }
         }
       }
     }

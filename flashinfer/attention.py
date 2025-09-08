@@ -130,8 +130,8 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = 1.0,
-        v_scale: Optional[torch.Tensor] = 1.0,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
@@ -149,9 +149,10 @@ class BatchAttention:
         head_dim_qk = q.shape[2]
         if self._sm_scale is None:
             self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
-        if k_scale is not 1.0:
+        if k_scale is not None:
             self._sm_scale *= k_scale
-
+        if v_scale is None:
+            v_scale = 1.0
         # profiler_buffer is optional
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
 
@@ -170,15 +171,9 @@ class BatchAttention:
             self._num_qo_heads,
             self._num_kv_heads,
             self._page_size,
-            self._sm_scale,
             v_scale,
+            self._sm_scale,
             *profiler_args,
         )
-        if v_scale is not None:
-            # TODO(Zihao): fused into kernel
-            if out.itemsize == 1:
-                out = (out.to(float) * v_scale).to(out.dtype)
-            else:
-                out *= v_scale
 
         return out, lse
