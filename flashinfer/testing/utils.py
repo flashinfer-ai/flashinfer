@@ -628,6 +628,109 @@ def bench_gpu_time(
         measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
     return measured_times
 
+def bench_gpu_time_with_cupti(
+    fn,
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
+    l2_flush: bool = True,
+    l2_flush_size_mb: int = 256,
+    l2_flush_device: str = "cuda",
+    sleep_after_run: bool = False,
+):
+    """
+    Benchmark GPU time using by using CUPTI to measure the kernel execution time.
+    """
+    import warnings
+    try:
+        from cupti import cupti
+        from functools import partial
+    except ImportError:
+        warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
+        return bench_gpu_time(
+            fn, dry_run_iters, repeat_iters, dry_run_time_ms, repeat_time_ms,
+            l2_flush, l2_flush_size_mb, l2_flush_device, sleep_after_run
+        )
+
+    # CUPTI buffer callbacks
+    def func_buffer_requested():
+        buffer_size = 8 * 1024 * 1024
+        max_num_records = 0
+        return buffer_size, max_num_records
+
+    def func_buffer_completed(timings_list: list, activities: list):
+        for activity in activities:
+            if hasattr(activity, "start") and hasattr(activity, "end"):
+                name = activity.name
+                start = activity.start
+                end = activity.end
+                timings_list.append((name, start, end))
+
+    if l2_flush:
+        l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
+        buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
+
+    ## Estimate kernel execution time by running the kernel 5 times
+    measurement_iters = 5
+    torch.cuda.synchronize()
+    fn()  # Call once to exclude initial overhead
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(measurement_iters):
+        if l2_flush:
+            buffer.zero_()
+        fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
+
+    ## Set dry run and repeat iterations
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / estimated_kernel_execution_time))
+    if repeat_iters is None:
+        repeat_iters = max(1, int(repeat_time_ms / estimated_kernel_execution_time))
+
+    # Dry runs
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if l2_flush:
+            buffer.zero_()
+        fn()
+    torch.cuda.synchronize()
+
+    # CUPTI measurement
+    timings = []
+    measured_times = []
+    cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    # cupti.activity_enable(cupti.ActivityKind.KERNEL)
+    cupti.activity_register_callbacks(func_buffer_requested, partial(func_buffer_completed, timings))
+    for iter_idx in range(repeat_iters):
+        prev_len = len(timings)
+        if l2_flush:
+            buffer.zero_()
+        fn()
+        torch.cuda.synchronize()
+        if sleep_after_run:
+            sleep_after_kernel_run(estimated_kernel_execution_time)
+        cupti.activity_flush_all(0)
+        new_activities = timings[prev_len:]
+        if not new_activities:
+            raise ValueError(f"No kernel activities recorded for iteration {iter_idx}")
+        min_start = min(t[1] for t in new_activities)
+        max_end = max(t[2] for t in new_activities)
+        span_ms = (max_end - min_start) / 1e6
+        measured_times.append(span_ms)
+    cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    # cupti.activity_disable(cupti.ActivityKind.KERNEL)
+    cupti.finalize()
+
+    return measured_times
+
 
 def bench_gpu_time_with_cudagraph(
     fn,

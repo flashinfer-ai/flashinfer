@@ -17,6 +17,7 @@ from flashinfer.fused_moe import (
 from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.testing.utils import (
     bench_gpu_time,
+    bench_gpu_time_with_cupti,
     bench_gpu_time_with_cudagraph,
 )
 
@@ -733,7 +734,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time(
+        times = bench_gpu_time_with_cupti(
             fn=run_fp4_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1066,7 +1067,7 @@ def testCutlassFusedMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time(
+        times = bench_gpu_time_with_cupti(
             fn=run_cutlass,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1343,7 +1344,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time(
+        times = bench_gpu_time_with_cupti(
             fn=run_fp8_block_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1552,7 +1553,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time(
+        times = bench_gpu_time_with_cupti(
             fn=run_fp8_per_tensor_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
