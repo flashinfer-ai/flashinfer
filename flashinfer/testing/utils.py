@@ -642,12 +642,11 @@ def bench_gpu_time_with_cupti(
     """
     Benchmark GPU time using by using CUPTI to measure the kernel execution time.
     """
-    import warnings
     try:
         from cupti import cupti
         from functools import partial
     except ImportError:
-        warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
+        print("CUPTI is not installed. Falling back to bench_gpu_time.")
         return bench_gpu_time(
             fn, dry_run_iters, repeat_iters, dry_run_time_ms, repeat_time_ms,
             l2_flush, l2_flush_size_mb, l2_flush_device, sleep_after_run
