@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <flashinfer/norm.cuh>
 
-// #include "pytorch_extension_utils.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
