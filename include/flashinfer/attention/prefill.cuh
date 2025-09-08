@@ -295,7 +295,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
     for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
-        smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         *gptr += 8 * upcast_size<DTypeKV>();
       }
@@ -434,7 +434,7 @@ __device__ __forceinline__ void load_q_global_smem(
   const uint32_t lane_idx = tid.x, warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
 
   if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
-    uint32_t q_smem_offset_w = q_smem->get_permuted_offset<UPCAST_STRIDE_Q>(
+    uint32_t q_smem_offset_w = q_smem->template get_permuted_offset<UPCAST_STRIDE_Q>(
         warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
 #pragma unroll
@@ -449,8 +449,8 @@ __device__ __forceinline__ void load_q_global_smem(
 #pragma unroll
         for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_QK / 4; ++mma_do) {
           // load q fragment from gmem to smem
-          q_smem->load_128b_async<SharedMemFillMode::kNoFill>(q_smem_offset_w, q_ptr,
-                                                              q_idx < qo_upper_bound);
+          q_smem->template load_128b_async<SharedMemFillMode::kNoFill>(q_smem_offset_w, q_ptr,
+                                                                       q_idx < qo_upper_bound);
           q_smem_offset_w = q_smem->template advance_offset_by_column<8>(q_smem_offset_w, mma_do);
           q_ptr += 8 * upcast_size<DTypeQ>();
         }
@@ -1032,41 +1032,6 @@ __device__ __forceinline__ void compute_sfm_v(
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
-                                            float v_scale = 1.0f) {
-  using AttentionVariant = typename KTraits::AttentionVariant;
-  if constexpr (AttentionVariant::use_softmax) {
-    float d_rcp[KTraits::NUM_MMA_Q][2];
-    // compute reciprocal of d
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-      for (uint32_t j = 0; j < 2; ++j) {
-        d_rcp[mma_q][j] = (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf))
-                              ? math::ptx_rcp(d[mma_q][j])
-                              : 0.f;
-      }
-    }
-
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-#pragma unroll
-        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-          o_frag[mma_q][mma_d][reg_id] =
-              o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
-          if (v_scale != 1.0f) {
-            o_frag[mma_q][mma_d][reg_id] *= v_scale;
-          }
-        }
-      }
-    }
-  }
-}
-
-template <typename KTraits>
 __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant variant,
                                            typename KTraits::DTypeQKAccum (*m)[2]) {
   if constexpr (variant.use_softmax) {
@@ -1077,6 +1042,44 @@ __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant va
         if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
           m[mma_q][j] *= variant.sm_scale_log2;
         }
+      }
+    }
+  }
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void transform_output(
+    const Params& params, typename KTraits::AttentionVariant variant,
+    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::DTypeQKAccum (*m)[2],
+    float (*d)[2], const uint32_t batch_idx, const uint32_t kv_tile_idx,
+    const uint32_t qo_packed_idx_base, const uint32_t warp_idx, const uint32_t lane_idx,
+    uint32_t kv_head_idx, const uint_fastdiv group_size) {
+  uint32_t q[KTraits::NUM_MMA_Q][2], r[KTraits::NUM_MMA_Q][2];
+  float scale[KTraits::NUM_MMA_Q][2];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
+                        r[mma_q][j]);
+      uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][j];
+      // Update the m and d when attention sinks are used.
+      variant.update_m_d(params, kv_tile_idx, qo_head_idx, m[mma_q][j], d[mma_q][j],
+                         scale[mma_q][j]);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t qo_idx = q[mma_q][(reg_id % 4) / 2];
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
+        o_frag[mma_q][mma_d][reg_id] = variant.OutputTransform(
+            params, o_frag[mma_q][mma_d][reg_id], batch_idx, qo_idx, qo_head_idx,
+            m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2], scale[mma_q][(reg_id % 4) / 2]);
       }
     }
   }
@@ -1255,12 +1258,12 @@ __device__ __forceinline__ void write_o_reg_gmem(
           vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_q][mma_d]);
 
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+          uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
               (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
               mma_d * 2 + lane_idx / 16);
           o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
 #else
-          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+          uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
               (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
           ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
           ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_STRIDE_O))[lane_idx % 4] =
@@ -1272,7 +1275,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
         }
       }
 
-      uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+      uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
           warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
 #pragma unroll
@@ -1416,7 +1419,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                              ? o + chunk_idx * o_stride_n + (kv_head_idx * group_size) * o_stride_h
                              : o + (kv_head_idx * group_size) * o_stride_h;
 
-    uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
+    uint32_t q_smem_offset_r = qo_smem.template get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h,
                                 group_size, &qo_smem, tid);
@@ -1494,18 +1497,15 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/0, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+                                qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/0, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
+                             qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
       }
 
       // compute m,d states in online softmax
@@ -1534,8 +1534,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/0, chunk_idx,
+                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      group_size);
 
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -1930,18 +1932,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                             kv_head_idx);
       }
 
       // compute m,d states in online softmax
@@ -1970,10 +1970,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
-
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                                      kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
+                                      kv_head_idx, group_size);
 
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -2291,44 +2293,33 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
-
-      logits_transform<KTraits>(
-          params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+      uint32_t kv_idx_base =
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
-        logits_mask<KTraits>(
-            params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag);
+        logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
           if (iter >= mask_iteration || iter < window_iteration) {
-            logits_mask<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start +
-                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                qo_len, kv_len, chunk_end, group_size, s_frag);
+            logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
           }
         } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
           if (iter + 1 >= num_iterations_prefix) {
             logits_mask_multi_item_scoring<KTraits>(
-                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                chunk_start +
-                    (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                qo_len, kv_len, window_left, chunk_end, group_size, s_frag,
+                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
+                kv_len, window_left, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
                 maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
                 kv_head_idx);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
-              logits_mask<KTraits>(
-                  params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                  chunk_start +
-                      (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-                  qo_len, kv_len, chunk_end, group_size, s_frag);
+              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
             }
           }
         }
@@ -2362,10 +2353,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
-
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+
+    // transform output
+    transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                                      kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
+                                      kv_head_idx, group_size);
 
     // write_back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,

@@ -438,8 +438,6 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
-            FLASHINFER_CUDA_CALL(
-                cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 
             // Post-kernel stuff for split-kv prefill
             if (!(num_chunks <= 1 || tmp_p == nullptr)) {
@@ -457,11 +455,11 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                 FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
                     tmp_v, tmp_s, decode_params.merge_indptr, o_d, lse_d,
                     decode_params.max_total_num_rows, decode_params.total_num_rows, num_qo_heads,
-                    HEAD_DIM_VO, stream));
+                    HEAD_DIM_VO, enable_pdl, stream));
               } else {
                 FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                     tmp_v, decode_params.merge_indptr, o_d, decode_params.max_total_num_rows,
-                    decode_params.total_num_rows, num_qo_heads, HEAD_DIM_VO, stream));
+                    decode_params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
               }
             }
           }

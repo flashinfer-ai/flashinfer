@@ -794,7 +794,8 @@ inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int clu
     return kv_len;
   }
   int kv_len_init = kv_len - qo_len;  // right aligned
-  return min(kv_len_init + ceil_div((qo_tile_idx + 1) * cluster_tile_q, group_size), kv_len);
+  return max(min(kv_len_init + ceil_div((qo_tile_idx + 1) * cluster_tile_q, group_size), kv_len),
+             0);
 }
 
 struct PrefillPlanSM90Info {
@@ -1012,17 +1013,16 @@ struct HolisticPlanInfo {
     int64_t kv_end_offset;
     int64_t kv_head_idx_offset;
     int64_t work_indptr_offset;
-    int64_t len_kv_chunk_offset;
   } tasks[NUM_TASKS];
-
+  int64_t len_kv_chunk_offset;
   int64_t partial_o_offset;
   int64_t partial_lse_offset;
   int64_t merge_indptr_offset;
   int64_t merge_o_indices_offset;
   int64_t num_qo_len_offset;
 
-  static constexpr uint32_t NUM_TASK_ARGS = 11;
-  static constexpr uint32_t NUM_SHARED_ARGS = 7;
+  static constexpr uint32_t NUM_TASK_ARGS = 10;
+  static constexpr uint32_t NUM_SHARED_ARGS = 8;
 
   std::vector<int64_t> ToVector() const {
     std::vector<int64_t> vec;
@@ -1039,8 +1039,8 @@ struct HolisticPlanInfo {
       vec.push_back(tasks[i].kv_end_offset);
       vec.push_back(tasks[i].kv_head_idx_offset);
       vec.push_back(tasks[i].work_indptr_offset);
-      vec.push_back(tasks[i].len_kv_chunk_offset);
     }
+    vec.push_back(len_kv_chunk_offset);
     vec.push_back(partial_o_offset);
     vec.push_back(partial_lse_offset);
     vec.push_back(merge_indptr_offset);
@@ -1069,13 +1069,13 @@ struct HolisticPlanInfo {
       tasks[i].kv_end_offset = vec[2 + i * NUM_TASK_ARGS + 7];
       tasks[i].kv_head_idx_offset = vec[2 + i * NUM_TASK_ARGS + 8];
       tasks[i].work_indptr_offset = vec[2 + i * NUM_TASK_ARGS + 9];
-      tasks[i].len_kv_chunk_offset = vec[2 + i * NUM_TASK_ARGS + 10];
     }
-    partial_o_offset = vec[2 + NUM_TASKS * NUM_TASK_ARGS];
-    partial_lse_offset = vec[3 + NUM_TASKS * NUM_TASK_ARGS];
-    merge_indptr_offset = vec[4 + NUM_TASKS * NUM_TASK_ARGS];
-    merge_o_indices_offset = vec[5 + NUM_TASKS * NUM_TASK_ARGS];
-    num_qo_len_offset = vec[6 + NUM_TASKS * NUM_TASK_ARGS];
+    len_kv_chunk_offset = vec[2 + NUM_TASKS * NUM_TASK_ARGS];
+    partial_o_offset = vec[3 + NUM_TASKS * NUM_TASK_ARGS];
+    partial_lse_offset = vec[4 + NUM_TASKS * NUM_TASK_ARGS];
+    merge_indptr_offset = vec[5 + NUM_TASKS * NUM_TASK_ARGS];
+    merge_o_indices_offset = vec[6 + NUM_TASKS * NUM_TASK_ARGS];
+    num_qo_len_offset = vec[7 + NUM_TASKS * NUM_TASK_ARGS];
   }
 };
 
@@ -1145,8 +1145,8 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
 
   // NOTE(Zihao): adjust it later
-  const int max_total_num_works = 16384;
-  const int max_packed_qo_lens =
+  const int max_total_num_works = 65536;
+  const int max_num_kv_splits =
       4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
 
   // calculate kv_len_limit first, considering all workloads
@@ -1167,21 +1167,20 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   }
 
   // used for remapping the output offsets
-  // layout [packed_qo_len x num_kv_tiels, num_kv_heads, head_dim]
+  // layout [packed_qo_len x num_kv_tiles, num_kv_heads, head_dim]
   int partial_o_nnz = 0;
   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
+  std::vector<IdType> cluster_len_kv_chunk(NUM_TASKS, 0);
   merge_indptr.push_back(partial_o_nnz);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    int kv_len_limit = 0;
+    int kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
     if (cluster_tile_q >= 64) {
       // chunked-prefill workloads are much more expensive than decode
       // so we use a smaller kv_len_limit for chunked-prefill workloads
-      kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
-    } else {
-      kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
+      kv_len_limit /= std::min(num_kv_heads, 2U);
     }
-
+    cluster_len_kv_chunk[task] = kv_len_limit;
     std::vector<std::vector<IdType>> cluster_q_indptr(num_clusters, std::vector<IdType>()),
         cluster_kv_indptr(num_clusters, std::vector<IdType>()),
         cluster_q_len(num_clusters, std::vector<IdType>()),
@@ -1190,8 +1189,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         cluster_kv_start(num_clusters, std::vector<IdType>()),
         cluster_kv_end(num_clusters, std::vector<IdType>()),
         cluster_kv_head_idx(num_clusters, std::vector<IdType>()),
-        cluster_partial_indptr(num_clusters, std::vector<IdType>()),
-        cluster_len_kv_chunk(num_clusters, std::vector<IdType>());
+        cluster_partial_indptr(num_clusters, std::vector<IdType>());
 
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
@@ -1219,7 +1217,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
             cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
 
             // use kv_chunk to rematerize num_kv_tiles and kv_tile_idx
-            cluster_len_kv_chunk[cluster_idx].push_back(kv_len_limit);
             cluster_partial_indptr[cluster_idx].push_back(partial_o_nnz);
 
             cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
@@ -1238,8 +1235,11 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
           // non-split kv is directly written through
           for (int row = 0; row < row_tile_size; ++row) {
             merge_indptr.push_back(merge_indptr.back() + num_kv_tiles);
-            merge_o_indices.push_back(qo_indptr_h[i] +
-                                      (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+            // output layout: [qo_len, num_kv_heads, gqa_group_size, head_dim]
+            // merge_o_indices is the indices of `gqa_group_size` dimension
+            auto q = (qo_tile_idx * cluster_tile_q + row) / gqa_group_size,
+                 r = (qo_tile_idx * cluster_tile_q + row) % gqa_group_size;
+            merge_o_indices.push_back((qo_indptr_h[i] + q) * num_kv_heads * gqa_group_size + r);
           }
           partial_o_nnz += row_tile_size * num_kv_tiles;
         }
@@ -1251,6 +1251,12 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
       work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
     }
     int total_num_works = work_indptr_vec.back();
+    if (total_num_works > max_total_num_works) {
+      std::ostringstream err_msg;
+      err_msg << "total_num_works (#q tiles * #kv tiles) " << total_num_works
+              << " exceeds max_total_num_works " << max_total_num_works;
+      FLASHINFER_ERROR(err_msg.str());
+    }
     auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
     auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
     auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
@@ -1260,7 +1266,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
     auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
     auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
     auto kv_head_idx_vec = flatten(cluster_kv_head_idx, total_num_works);
-    auto len_kv_chunk_vec = flatten(cluster_len_kv_chunk, total_num_works);
 
     plan_info.tasks[task].q_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_indptr");
@@ -1282,8 +1287,6 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_head_idx");
     plan_info.tasks[task].work_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "work_indptr");
-    plan_info.tasks[task].len_kv_chunk_offset = int_allocator.aligned_alloc_offset(
-        sizeof(IdType) * max_total_num_works, 16, "len_kv_chunk");
 
     CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_indptr_offset,
                            q_indptr_vec);
@@ -1302,14 +1305,16 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                            kv_head_idx_vec);
     CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].work_indptr_offset,
                            work_indptr_vec);
-    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].len_kv_chunk_offset,
-                           len_kv_chunk_vec);
   }
+  plan_info.len_kv_chunk_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * NUM_TASKS, 16, "len_kv_chunk");
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.len_kv_chunk_offset,
+                         cluster_len_kv_chunk);
 
-  if (partial_o_nnz > max_packed_qo_lens) {
+  if (merge_indptr.size() > max_num_kv_splits) {
     std::ostringstream err_msg;
-    err_msg << "partial_o_nnz " << partial_o_nnz << " exceeds max_packed_qo_lens "
-            << max_packed_qo_lens;
+    err_msg << "Number of kv splits " << merge_indptr.size() << " exceeds max buffer size "
+            << max_num_kv_splits << ". Please increase the threshold.";
     FLASHINFER_ERROR(err_msg.str());
   }
 
@@ -1317,9 +1322,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
   // allocate buffer for state merge function
   plan_info.merge_indptr_offset =
-      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_packed_qo_lens, 16, "merge_indptr");
-  plan_info.merge_o_indices_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * max_packed_qo_lens, 16, "merge_o_indices");
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_indptr");
+  plan_info.merge_o_indices_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_o_indices");
   plan_info.num_qo_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
   // copy data to paged cpu buffer
@@ -1333,12 +1338,12 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                                        cudaMemcpyHostToDevice, stream));
   constexpr size_t sizeof_dtype_o = 2;  // NOTE (Yilong): assume fp16
 
-  // Note(Yilong): adjust it later
+  // Note(Yilong): times num_kv_heads as it is not counted in partial_o_nnz
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof_dtype_o * head_dim, 16, "holistic_partial_o");
+      max_num_kv_splits * sizeof_dtype_o * head_dim * num_kv_heads, 16, "holistic_partial_o");
   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
-      2 * max_packed_qo_lens * sizeof(float), 16, "holistic_partial_lse");
+      max_num_kv_splits * sizeof(float) * num_kv_heads, 16, "holistic_partial_lse");
 
   return cudaSuccess;
 }

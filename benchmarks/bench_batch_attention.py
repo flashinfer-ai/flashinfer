@@ -6,9 +6,9 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def run_bench(
@@ -65,7 +65,8 @@ def run_bench(
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
     )
-    ms_old = do_bench(lambda: wrapper_old.run(q, kv_data))
+    measurements_old = bench_gpu_time(lambda: wrapper_old.run(q, kv_data))
+    ms_old = np.mean(measurements_old)
 
     # new
     wrapper = flashinfer.BatchAttention(kv_layout="NHD")
@@ -83,7 +84,8 @@ def run_bench(
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
     )
-    ms_new = do_bench(lambda: wrapper.run(q, kv_data))
+    measurements_new = bench_gpu_time(lambda: wrapper.run(q, kv_data))
+    ms_new = np.mean(measurements_new)
 
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
@@ -100,7 +102,7 @@ def synthesize_seq_len_configs() -> List[List[Tuple[int, int]]]:
         [(8192, 1)] * 128,  # decode-only
         [(4096, 128)] * 4,  # prefill-only
         [(600, 1)] * 122 + [(10_000, 17)] * 8,  # hybird
-        [(8192, 1)] * 127 * 2 + [(2048, 512)] * 1,  # hybrid (chunked-prefill)
+        [(8192, 1)] * 127 * 2 + [(8192, 4096)] * 1,  # hybrid (chunked-prefill)
     ]
 
     def _rand_case(bsz: int, lo: int, hi: int) -> List[Tuple[int, int]]:
@@ -143,7 +145,6 @@ def main() -> None:
             sweep["num_kv_heads"],
             sweep["num_qo_heads"],
         ):
-
             ms_old, ms_new, mem_MB, bw_old, bw_new = run_bench(
                 kv_lens,
                 qo_lens,
@@ -196,6 +197,7 @@ def main() -> None:
         ],
     )
     print(df.to_markdown(index=False, floatfmt=".2f"))
+    df.to_csv("bench_batch_attention.csv", index=False)
 
 
 if __name__ == "__main__":

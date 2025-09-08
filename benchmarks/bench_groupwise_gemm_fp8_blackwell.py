@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
-from triton.testing import do_bench
 
 from flashinfer.gemm import gemm_fp8_nt_groupwise
+from flashinfer.testing.utils import bench_gpu_time
 
 
 @triton.jit
@@ -168,7 +169,10 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     out = torch.empty((m, n), dtype=out_dtype, device="cuda")
     gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out)
 
-    ms = do_bench(lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out))
+    measurements = bench_gpu_time(
+        lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out)
+    )
+    ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     print(
         f"gemm_fp8_nt_groupwise {m} {n} {k} {in_dtype} {out_dtype}: {tflops_per_second:.2f} TFLOPs/s"
@@ -177,7 +181,10 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     tl_out = torch.empty((m, n), dtype=out_dtype, device="cuda")
     a_scale = a_scale.transpose(0, 1).contiguous()
     b_scale = b_scale.transpose(0, 1).contiguous()
-    ms = do_bench(lambda: triton_w8a8_block_fp8_matmul(a, b, a_scale, b_scale, tl_out))
+    measurements = bench_gpu_time(
+        lambda: triton_w8a8_block_fp8_matmul(a, b, a_scale, b_scale, tl_out)
+    )
+    ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     print(
         f"triton_gemm_fp8_nt_groupwise {m} {n} {k} {in_dtype} {out_dtype}: {tflops_per_second:.2f} TFLOPs/s"

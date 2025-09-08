@@ -17,7 +17,6 @@ limitations under the License.
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from .nvshmem import get_nvshmem_module

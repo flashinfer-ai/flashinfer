@@ -32,7 +32,9 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #include <cuda_fp4.h>
+#endif
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -203,8 +205,10 @@ struct TmaWarpSpecializedGroupedGemmInput {
   FpXBlockScalingType fpX_block_scaling_type = FpXBlockScalingType::NONE;
 
   struct INT4GroupwiseParams {
-    constexpr static int group_size = 128;  // Unused, hard-coded to 128
+    constexpr static int int4_group_size = 128;
+    constexpr static int wfp4a16_group_size = 32;
     bool enabled = false;
+    bool use_wfp4a16 = false;
     using SFA = __nv_bfloat16;
     using SFB = __nv_bfloat16;  // Unused
     using ProblemShapeInt = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -226,6 +230,9 @@ struct TmaWarpSpecializedGroupedGemmInput {
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
 
+  // Whether to enable PDL (Programmatic Dependent Launch).
+  bool enable_pdl;
+
   static std::array<size_t, 17> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
@@ -244,7 +251,8 @@ struct TmaWarpSpecializedGroupedGemmInput {
 };
 
 constexpr bool isGatedActivation(ActivationType activation_type) {
-  return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
+  return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu ||
+         activation_type == ActivationType::SwigluBias;
 }
 
 template <typename T,                         /*The type used for activations/scales/compute*/
@@ -255,6 +263,18 @@ template <typename T,                         /*The type used for activations/sc
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
+
+#if defined(ENABLE_FP4)
+#if defined(ENABLE_BF16)
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+                                      (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+  static constexpr bool use_wfp4a16 =
+      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+#endif
+#else
+  static constexpr bool use_wfp4a16 = false;
+#endif
 
 #if defined(ENABLE_FP8)
   static constexpr bool use_fp8 =
@@ -271,6 +291,7 @@ class MoeGemmRunner {
   static constexpr bool use_w4afp8 = false;
   static constexpr bool use_wfp4afp4 = false;
 #endif
+  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)
   static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
@@ -297,8 +318,9 @@ class MoeGemmRunner {
   [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
   [[nodiscard]] bool supportsTmaWarpSpecialized() const;
   [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
-                                            bool is_gated_activation, int gemm_n, int gemm_k) const;
-  [[nodiscard]] bool supportsFusedGatedActivation(bool is_gated_activation, int gemm_n,
+                                            ActivationType activation_type, int gemm_n,
+                                            int gemm_k) const;
+  [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n,
                                                   int gemm_k) const;
 
   size_t getMaxWorkspaceSize(int num_experts) const;

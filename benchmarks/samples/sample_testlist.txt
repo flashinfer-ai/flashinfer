@@ -1,0 +1,38 @@
+## Attention Prefill
+# Llama 3.1 70B
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag "Llama-3.1-70B-1k"
+
+# DeepSeek-R1
+--routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 cutlass cudnn --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag "DeepSeek-R1-1k"
+
+## Attention Decode
+# Llama 3.1 70B
+--routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag "Llama-3.1-70B-1k"
+
+## Attention MLA
+# DeepSeek-R1
+--routine BatchMLAPagedAttentionWrapper --backends fa2 trtllm-gen-native --page_size 32 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --no_cuda_graph --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag "DeepSeek-R1-1k"
+
+## Attention FP8 Examples
+--routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --no_cuda_graph --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --generate_repro_command --case_tag "Llama-3.1-70B-1k"
+--routine BatchMLAPagedAttentionWrapper --backends fa2 trtllm-gen-native --page_size 32 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --no_cuda_graph --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --generate_repro_command --case_tag "DeepSeek-R1-1k"
+
+## GEMM
+--routine gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --no_cuda_graph --refcheck -vv --backend cutlass trtllm --scale_major_mode MN --generate_repro_command --case_tag "gemm_fp8_nt_groupwise_sample"
+--routine group_gemm_fp8_nt_groupwise --m 8192 --n 4096 --k 16384 --mma_sm 2 --group_size 2 --no_cuda_graph --scale_major_mode K --refcheck -vv --generate_repro_command --case_tag "group_gemm_fp8_nt_groupwise_sample"
+--routine bmm_fp8 --m 8192 --n 4096 --k 16384 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command --case_tag "bmm_fp8_sample"
+--routine mm_fp4 --m 8192 --n 4096 --k 16384 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --refcheck -vv --generate_repro_command --case_tag "mm_fp4_sample"
+
+## MoE
+--routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+--routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method renormalize_naive --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+--routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+--routine trtllm_fp8_per_tensor_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 1 --routed_scaling_factor 2.5 --use_routing_bias --routing_method llama4 --use_routing_scales_on_input -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+--routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 1 --routing_method renormalize --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+
+# CUTLASS MoE API
+--routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant base --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_base"
+--routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant fp8 --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_fp8_scale"
+--routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights"
+--routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights_quantized"
+--routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_ep_tp"

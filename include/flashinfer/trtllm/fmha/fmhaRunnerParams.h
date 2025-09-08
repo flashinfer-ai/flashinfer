@@ -217,18 +217,29 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
+  // The LSE buffer.
+  float* lsePtr;
+
+  // Attention sink
+  float const* ptrAttentionSinks{nullptr};
   // The output buffer.
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
 
-  // KV-Cache strides
-  // The stride between different keys/vals.
-  int kvStrideKeysValues;
-  // The stride between different heads.
-  int kvStrideHeads;
-  // The stride between different batches.
-  int kvStrideBatch;
+  // The stride between different keys.
+  int kStrideKeysValues;
+  // The stride between different heads for K.
+  int kStrideHeads;
+  // The stride between different batches for K.
+  int kStrideBatch;
+
+  // The stride between different values.
+  int vStrideKeysValues;
+  // The stride between different heads for V.
+  int vStrideHeads;
+  // The stride between different batches for V.
+  int vStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;
@@ -269,8 +280,12 @@ struct TllmGenFmhaRunnerParams {
   int mSfStartTokenIdx;
   // The SF scale for Kv.
   float mScaleSfKv;
+  // The SF scale for output.
+  float mScaleSfO;
   // The cuda stream.
   cudaStream_t stream;
+  // Whether to enable PDL (Programmatic Dependent Launch).
+  bool enable_pdl;
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {

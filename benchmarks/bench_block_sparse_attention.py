@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-import triton
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_variable_block_sparse_attention(
@@ -86,27 +87,34 @@ def bench_variable_block_sparse_attention(
         q_data_type=torch.half,
     )
 
-    sparse_ms_fa2 = triton.testing.do_bench(
+    # Benchmark sparse attention with FA2
+    measurements_fa2 = bench_gpu_time(
         lambda: sparse_wrapper_fa2.run(q, k, v),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
-    sparse_ms_fa3 = triton.testing.do_bench(
+    sparse_ms_fa2 = np.median(measurements_fa2)
+
+    # Benchmark sparse attention with FA3
+    measurements_fa3 = bench_gpu_time(
         lambda: sparse_wrapper_fa3.run(q, k, v),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    sparse_ms_fa3 = np.median(measurements_fa3)
 
     q = torch.randn(seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
     k = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.half, device="cuda")
     dense_sm80_ms, dense_sm90_ms = (
-        triton.testing.do_bench(
-            lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
-                q, k, v, causal=False, backend=backend
-            ),
-            warmup=100,
-            rep=1000,
+        np.median(
+            bench_gpu_time(
+                lambda: flashinfer.single_prefill_with_kv_cache_return_lse(
+                    q, k, v, causal=False, backend=backend
+                ),
+                dry_run_time_ms=100,
+                repeat_time_ms=1000,
+            )
         )
         for backend in ["fa2", "fa3"]
     )

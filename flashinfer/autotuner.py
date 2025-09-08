@@ -1,11 +1,13 @@
 import contextlib
 import copy
+import importlib
 import inspect
 import itertools
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Set, Tuple, Union, Optional
 
 import torch
 
@@ -15,22 +17,69 @@ from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
+# This version should be updated whenever the nvfp4_cutlass backend is changed,
+# such as when new kernels or configs are added. In such cases, the tuning configs
+# should also be updated. Currently, this process is manual, but it should be automated in the future.
+_nvfp4_cutlass_version = "0.1"
 
-@dataclass(slots=True, unsafe_hash=True)
+
+def get_config_path(is_module: bool):
+    dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
+    config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
+    if is_module:
+        return f"flashinfer.tuning_configs.{config_name}"
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "tuning_configs",
+            config_name + ".py",
+        )
+
+
+@dataclass(slots=True)
 class DynamicTensorSpec:
     """
     A specification for a dynamic tensor dimension.
     Args:
-        input_idx: The index of the input tensor.
-        dim_idx: The index of the dimension to tune.
+        input_idx: A list of the indices of the input tensors.
+        dim_idx: A list of the indices of the dimensions to tune.
+            The length of input_idx and dim_idx must be the same.
+            For every tensor mapped to the input_idx, their dimension mapped to the dim_idx must be the same.
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to valid values during inference.
+        tensor_initializers: A list of functions to initialize the tensors.
     """
 
-    input_idx: int
-    dim_idx: int
-    gen_tuning_buckets: Union[Tuple[int], Callable]
+    input_idx: Tuple[int, ...]
+    dim_idx: Tuple[int, ...]
+    gen_tuning_buckets: Union[Tuple[int, ...], Callable]
     map_to_tuning_buckets: Callable
+    tensor_initializers: List[Callable] = field(default_factory=lambda: None)
+
+    def __post_init__(self):
+        # Set default tensor_initializers if not provided
+        if self.tensor_initializers is None:
+            self.tensor_initializers = [
+                lambda shapes, dtype, device: torch.randn(shapes, device=device).to(
+                    dtype
+                )
+                for _ in range(len(self.input_idx))
+            ]
+
+    def __hash__(self) -> int:
+        # FIXME: currently not hasing tensor_initializers
+        return hash(
+            (
+                self.input_idx,
+                self.dim_idx,
+                # For gen_tuning_buckets, only hash if it's a tuple, otherwise hash its id
+                self.gen_tuning_buckets
+                if isinstance(self.gen_tuning_buckets, tuple)
+                else id(self.gen_tuning_buckets),
+                id(self.map_to_tuning_buckets),
+            )
+        )
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -64,8 +113,8 @@ class TuningConfig:
                 >>> config = TuningConfig(
                 ...     dynamic_tensor_specs=(
                 ...         DynamicTensorSpec(
-                ...             input_idx=0,
-                ...             dim_idx=1,
+                ...             input_idx=[0],
+                ...             dim_idx=[1],
                 ...             gen_tuning_buckets=(32, 64, 128),
                 ...             map_to_tuning_buckets=lambda x: ((x + 31) // 32) * 32
                 ...         ),
@@ -120,6 +169,7 @@ class OptimizationProfile:
     """Ranges of all tensors, all dimension"""
 
     shapes: List[List[Dim]]
+    tensor_initializers: List[Optional[Callable]]
 
     def get_hash_key(self):
         return self.get_opt_shapes()
@@ -142,7 +192,6 @@ class FakeTensor:
 
 
 class TunableRunner(ABC):
-
     @abstractmethod
     def get_valid_tactics(
         self, inputs: List[torch.Tensor], profile: OptimizationProfile
@@ -170,11 +219,10 @@ class TunableRunner(ABC):
     @abstractmethod
     def forward(
         self,
-        /,  # tensors are position only
         inputs: List[torch.Tensor],
-        *,  # all others are keyword args only
         tactic: int = -1,
         do_preparation: bool = False,
+        **kwargs,  # all others are keyword args only
     ) -> Any:
         """Forward pass for tunable runners.
 
@@ -257,12 +305,31 @@ class AutoTunerStatistics:
                 stats_str += f"    - Successful configs: {successful}\n"
                 stats_str += f"    - Failed profiling count: {failed}\n"
                 if failed > 0:
-                    stats_str += f"    - Failed profiling combinations:\n"
+                    stats_str += "    - Failed profiling combinations:\n"
                     for failed_key in self.failed_profiling_count[op]:
                         stats_str += f"      - {failed_key}\n"
                 stats_str += f"    - Success rate: {success_rate:.1f}%\n"
 
         return stats_str
+
+
+@lru_cache(maxsize=None)
+def load_from_file(key):
+    module_name = get_config_path(is_module=True)
+    try:
+        module = importlib.import_module(module_name)
+        best_configs = module.best_configs
+    except (ImportError, AttributeError):
+        best_configs = None
+    if best_configs is not None:
+        k = str((key[0], key[1], key[3]))
+        if k in best_configs:
+            logger.info(f"[Autotuner]: Loading configs for {k} from file.")
+            return True, best_configs[k][0], best_configs[k][1], None
+    logger.info(
+        f"[Autotuner]: Loading configs for {key} from file failed; Using default configs instead."
+    )
+    return False, 0, -1, None
 
 
 class AutoTuner:
@@ -316,11 +383,16 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
+            cache_key = AutoTuner._get_cache_key(
+                custom_op, r, input_shapes, tuning_config
+            )
             if (
-                cache_key := AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config
-                )
-            ) in self.profiling_cache:
+                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                and not self.is_tuning_mode
+            ):
+                output = load_from_file(cache_key)
+                return output
+            elif cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
         return False, 0, -1, None
@@ -378,11 +450,11 @@ class AutoTuner:
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
-        assert all(
-            [isinstance(r, TunableRunner) for r in runners]
-        ), "All Given runners must be subclass of TunableRunner"
+        assert all([isinstance(r, TunableRunner) for r in runners]), (
+            "All Given runners must be subclass of TunableRunner"
+        )
 
-        profiles = self._optimization_profiles(tuning_config, inputs)
+        profiles = self._generate_optimization_profiles(tuning_config, inputs)
         # Record the total configs to try
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
@@ -453,7 +525,6 @@ class AutoTuner:
         return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-
         # Handle None tensors for optional inputs and non-Tensor scalar values
         sizes = [
             input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
@@ -489,7 +560,8 @@ class AutoTuner:
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
         # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
         # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs)
+        if self.stream_delay_micro_secs > 0:
+            delay_kernel(self.stream_delay_micro_secs)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -508,7 +580,7 @@ class AutoTuner:
 
         return avg_time
 
-    def _optimization_profiles(
+    def _generate_optimization_profiles(
         self, tuning_config: TuningConfig, inputs: List[torch.Tensor]
     ) -> List[OptimizationProfile]:
         """Generate optimization profiles for autotuning.
@@ -536,25 +608,39 @@ class AutoTuner:
                     else [StaticDim(0)]
                 )
                 for t in inputs
-            ]
+            ],
+            [None] * len(inputs),
         )
 
         generated_profiles: List[OptimizationProfile] = []
 
-        dynamic_dims = []
+        dynamic_dims: List[Tuple[Any, ...]] = []
 
         for spec in tuning_config.dynamic_tensor_specs:
             assert inspect.isfunction(spec.gen_tuning_buckets) or isinstance(
                 spec.gen_tuning_buckets, (list, tuple)
-            ), "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            ), (
+                "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            )
+            assert len(spec.input_idx) == len(spec.dim_idx), (
+                f"The number of input indices and dimension indices must be the same, got {len(spec.input_idx)} and {len(spec.dim_idx)}"
+            )
+            assert len(spec.tensor_initializers) == len(spec.input_idx), (
+                f"The number of tensor initializers and input indices must be the same, got {len(spec.tensor_initializers)} and {len(spec.input_idx)}"
+            )
+            for i, idx in enumerate(spec.input_idx):
+                base_profile.tensor_initializers[idx] = spec.tensor_initializers[i]
+
             if inspect.isfunction(spec.gen_tuning_buckets):
                 opt_shapes = spec.gen_tuning_buckets(
-                    base_profile.shapes[spec.input_idx][spec.dim_idx].val
+                    base_profile.shapes[spec.input_idx[0]][spec.dim_idx[0]]._opt()
                 )
             else:
                 opt_shapes = spec.gen_tuning_buckets
-            opt_shapes_max = tuple(opt_shapes[1:]) + (float("inf"),)
-            opt_shapes_max = {v1: v2 for v1, v2 in zip(opt_shapes, opt_shapes_max)}
+            opt_shapes_max = {
+                v1: v2
+                for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
+            }
             dynamic_dims.append(
                 (spec.input_idx, spec.dim_idx, opt_shapes_max, opt_shapes)
             )
@@ -563,22 +649,25 @@ class AutoTuner:
         dim_grids = itertools.product(*[d[-1] for d in dynamic_dims])
         for opt_point in dim_grids:
             p = copy.deepcopy(base_profile)
-            for pos, (input_idx, dim_idx, opt_shapes_max, opt_shapes) in enumerate(
+            for pos, (input_idx, dim_idx, opt_shapes_max, _opt_shapes) in enumerate(
                 dynamic_dims
             ):
                 opt_value = opt_point[pos]
                 # TODO: fix me, how to set the min and max?
                 min_value = opt_value
                 max_value = opt_shapes_max[opt_value]
-                p.shapes[input_idx][dim_idx] = DynamicDim(
-                    min_value, opt_value, max_value
-                )
+                for i in range(len(input_idx)):
+                    p.shapes[input_idx[i]][dim_idx[i]] = DynamicDim(
+                        min_value, opt_value, max_value
+                    )
 
             # Adjust the profile to satisfy the constraints
-            for spec in tuning_config.constraint_specs:
-                min_value = opt_value = max_value = spec.infer_shape(p.get_opt_shapes())
-                p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
-                    min_value, opt_value, max_value
+            for constraint_spec in tuning_config.constraint_specs:
+                min_value = opt_value = max_value = constraint_spec.infer_shape(
+                    p.get_opt_shapes()
+                )
+                p.shapes[constraint_spec.input_idx][constraint_spec.dim_idx] = (
+                    DynamicDim(min_value, opt_value, max_value)
                 )
             generated_profiles.append(p)
             logger.debug(f"[Autotuner]: generated profile: {p}")
@@ -604,14 +693,15 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in tuning_config.dynamic_tensor_specs:
-            base_profile[spec.input_idx][spec.dim_idx] = spec.map_to_tuning_buckets(
-                base_profile[spec.input_idx][spec.dim_idx]
+            base_profile[spec.input_idx[0]][spec.dim_idx[0]] = (
+                spec.map_to_tuning_buckets(
+                    base_profile[spec.input_idx[0]][spec.dim_idx[0]]
+                )
             )
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for spec in tuning_config.constraint_specs:
-            base_profile[spec.input_idx][spec.dim_idx] = -1
-
+        for constraint_spec in tuning_config.constraint_specs:
+            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
 
     @classmethod
@@ -630,7 +720,7 @@ class AutoTuner:
         )
 
     def _create_tensor_like(
-        self, origin_tensor: torch.Tensor, dims: List[Dim]
+        self, origin_tensor: torch.Tensor, dims: List[Dim], initializer: Callable
     ) -> torch.Tensor:
         """Create a new tensor matching the properties of the original tensor.
 
@@ -655,18 +745,22 @@ class AutoTuner:
                 # TODO: how to make sure the created Tensor has the min/max info
                 assert isinstance(d, DynamicDim)
                 shapes.append(d.opt)
-        # TODO: FIXME, sometimes the content of the tensor can affect the performance, like MOE
-        # One solution is to manituplate the tensor content to make it more like the real data
-        # during the tuning process. This can by controlled in the preparation phase by the runner.
-        return torch.zeros(shapes, dtype=dtype, device=device)
+        return initializer(shapes, dtype, device)
 
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
+        default_initializer = lambda shapes, dtype, device: torch.rand(
+            shapes, device=device
+        ).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):
             if any(isinstance(d, DynamicDim) for d in p):
-                tensor = self._create_tensor_like(inputs[i], p)
+                tensor = self._create_tensor_like(
+                    inputs[i],
+                    p,
+                    profile.tensor_initializers[i] or default_initializer,
+                )
             else:
                 tensor = inputs[i]
             tensors.append(tensor)

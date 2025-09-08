@@ -63,6 +63,8 @@ __device__ bool isNegZero(float v) { return v == 0.f && signbit(v); }
 
 __device__ bool isNegZero(__nv_bfloat16 val) { return isNegZero(__bfloat162float(val)); }
 
+__device__ bool isNegZero(__nv_half val) { return isNegZero(__half2float(val)); }
+
 template <typename T>
 inline __device__ float toFloat(T val) {
   return val;
@@ -71,6 +73,11 @@ inline __device__ float toFloat(T val) {
 template <>
 inline __device__ float toFloat<__nv_bfloat16>(__nv_bfloat16 val) {
   return __bfloat162float(val);
+}
+
+template <>
+inline __device__ float toFloat<__nv_half>(__nv_half val) {
+  return __half2float(val);
 }
 
 template <typename T>
@@ -82,6 +89,68 @@ template <>
 inline __device__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float val) {
   return __float2bfloat16(val);
 }
+
+template <>
+inline __device__ __nv_half fromFloat<__nv_half>(float val) {
+  return __float2half(val);
+}
+
+inline __device__ float2 loadfloat2(void const* ptr) {
+  float2 return_value;
+  asm volatile("ld.volatile.global.v2.f32 {%0, %1}, [%2];\n"
+               : "=f"(return_value.x), "=f"(return_value.y)
+               : "l"(ptr));
+  return return_value;
+}
+
+template <typename T>
+inline __device__ T divUp(T val, T divisor) {
+  return (val + divisor - 1) / divisor;
+}
+
+__device__ struct __attribute__((aligned(32))) LamportFlags {
+  uint32_t buffer_size;
+  uint32_t input_offset;
+  uint32_t clear_offset;
+  uint32_t num_tokens_prev;
+  uint32_t* offset_access_ptr;
+  uint32_t* buffer_flags;
+
+  __device__ explicit LamportFlags(uint32_t* buffer_flags)
+      : offset_access_ptr(&buffer_flags[4]), buffer_flags(buffer_flags) {
+    uint4 flag = reinterpret_cast<uint4*>(buffer_flags)[0];
+    buffer_size = flag.z;
+    input_offset = flag.x * (buffer_size << 1U);
+    clear_offset = flag.y * (buffer_size << 1U);
+    num_tokens_prev = flag.w;
+  }
+
+  __device__ void cta_arrive() {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
+      asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1)
+                   : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      asm volatile("red.global.gpu.add.u32 [%0], %1;" ::"l"(offset_access_ptr), "r"(1) : "memory");
+#else
+      atomicAdd(offset_access_ptr, 1);
+#endif
+    }
+  }
+
+  __device__ void wait_and_update(uint32_t num_tokens) {
+    if (threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == 0) {
+      while (*reinterpret_cast<uint32_t volatile*>(offset_access_ptr) < gridDim.x * gridDim.y) {
+      }
+      uint4 flag = reinterpret_cast<uint4*>(buffer_flags)[0];
+      buffer_flags[0] = (flag.x + 1) % 3;
+      buffer_flags[1] = (flag.y + 1) % 3;
+      buffer_flags[3] = num_tokens;
+      *(offset_access_ptr) = 0;
+    }
+  }
+};
 
 template <int WORLD_SIZE, typename T>
 __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr,
@@ -96,18 +165,15 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
   cudaGridDependencySynchronize();
 #endif
 
-  uint32_t* offset_access_ptr = &buffer_flags[3];
-  // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
-  uint32_t buffer_size = (buffer_flags[2] << 1);
-  uint32_t input_offset = buffer_flags[0] * buffer_size;
-  uint32_t clear_offset = buffer_flags[1] * buffer_size;
+  LamportFlags flags(buffer_flags);
 
-  if (wait_for_results) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      atomicAdd(offset_access_ptr, 1);
-    }
-  }
+  // Capture the number of tokens in previous iteration so that we can properly clear the buffer
+  // The scatter stage will use the buffer in WORLD_SIZE granularity, thus we need to round up
+  uint32_t clr_toks_cta =
+      divUp<uint32_t>(flags.num_tokens_prev > num_tokens ? flags.num_tokens_prev : num_tokens,
+                      WORLD_SIZE) *
+      WORLD_SIZE;
+  clr_toks_cta = divUp<uint32_t>(clr_toks_cta, gridDim.x);
 
   if (elt < token_dim) {
     // Scatter token
@@ -115,28 +181,33 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     int dest_token_offset = token / WORLD_SIZE;
     T val = shard_ptr[token * token_dim + elt];
     if (isNegZero(val)) val = fromFloat<T>(0.f);
-    input_ptrs[dest_rank][input_offset + dest_token_offset * token_dim * WORLD_SIZE +
+    input_ptrs[dest_rank][flags.input_offset + dest_token_offset * token_dim * WORLD_SIZE +
                           rank * token_dim + elt] = val;
 
-    // Reduce and broadcast
+    // Clear the buffer used by the previous call. Note the number of tokens to clear could be
+    // larger than the
+    // number of tokens in the current call.
+    for (int clr_tok = 0; clr_tok < clr_toks_cta; clr_tok++) {
+      uint32_t clr_token_idx = token + clr_tok * gridDim.x;
+      if (clr_token_idx < buffer_M) {
+        input_ptrs[rank][flags.clear_offset + clr_token_idx * token_dim + elt] = fromFloat<T>(-0.f);
+      }
+    }
 
-    int global_token = token * WORLD_SIZE + rank;
-    if (global_token < num_tokens) {
+    // Reduce and broadcast
+    if ((token % WORLD_SIZE) == rank) {
+      int local_token = token / WORLD_SIZE;
       float accum = 0.f;
 
       T values[WORLD_SIZE];
-
-      for (int r = 0; r < WORLD_SIZE; r++) {
-        input_ptrs[rank][clear_offset + token * token_dim * WORLD_SIZE + r * token_dim + elt] =
-            fromFloat<T>(-0.f);
-      }
 
       while (1) {
         bool valid = true;
         for (int r = 0; r < WORLD_SIZE; r++) {
           T volatile* lamport_ptr =
-              (T volatile*)&input_ptrs[rank][input_offset + token * token_dim * WORLD_SIZE +
-                                             r * token_dim + elt];
+              (T volatile*)&input_ptrs[rank]
+                                      [flags.input_offset + local_token * token_dim * WORLD_SIZE +
+                                       r * token_dim + elt];
           values[r] = *lamport_ptr;
           valid &= !isNegZero(values[r]);
         }
@@ -145,7 +216,7 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
       for (int r = 0; r < WORLD_SIZE; r++) {
         accum += toFloat<T>(values[r]);
       }
-      mcast_ptr[input_offset + buffer_M * token_dim + global_token * token_dim + elt] =
+      mcast_ptr[flags.input_offset + buffer_M * token_dim + token * token_dim + elt] =
           fromFloat<T>(accum);
     }
   }
@@ -154,26 +225,43 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-  input_ptrs[rank][clear_offset + buffer_M * token_dim + token * token_dim + elt] =
-      fromFloat<T>(-0.f);
+  // Similarly clear broadcast buffer here
+  for (int clr_tok = 0; clr_tok < clr_toks_cta; clr_tok++) {
+    uint32_t clr_token_idx = token + clr_tok * gridDim.x;
+    if (clr_token_idx < buffer_M) {
+      input_ptrs[rank][flags.clear_offset + buffer_M * token_dim + clr_token_idx * token_dim +
+                       elt] = fromFloat<T>(-0.f);
+    }
+  }
 
   // Optionally wait for results if the next layer isn't doing the Lamport check
   if (wait_for_results) {
-    T volatile* lamport_ptr = (T volatile*)&input_ptrs[rank][input_offset + buffer_M * token_dim +
-                                                             token * token_dim + elt];
-    T val = *lamport_ptr;
-    while (isNegZero(val)) val = *lamport_ptr;
+    // Update the atomic counter to indicate the block has read the offsets
+    flags.cta_arrive();
+    // Only use a set of CTAs for lamport sync, reargange the grid
+    constexpr int ELTS_PER_LOAD = sizeof(float2) / sizeof(T);
+    // blockDim.x / ELTS_PER_LOAD should be at least the size of a warp (32)
+    if (threadIdx.x < (blockDim.x / ELTS_PER_LOAD)) {
+      uint64_t current_pos =
+          blockIdx.x * token_dim + blockIdx.y * blockDim.x + threadIdx.x * ELTS_PER_LOAD;
 
-    // Copy if requested
-    if (output_ptr) output_ptr[token * token_dim + elt] = val;
-    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-      // Make sure all blocks have finished reading the offsets, 2-D grid
-      while (*reinterpret_cast<uint32_t volatile*>(offset_access_ptr) < gridDim.x * gridDim.y) {
+      void* lamport_ptr =
+          (void*)&input_ptrs[rank][flags.input_offset + buffer_M * token_dim + current_pos];
+      // We have 2 assumptions here:
+      // 1. The write is atomic in 8B granularity -> Each buffer in the buffer group should be
+      // aligned to 8B
+      // 2. The num_token * token_dim is divisible by ELTS_PER_LOAD (4 for BF16 and 2 for FP32)
+      float2 val = loadfloat2(lamport_ptr);
+      while (isNegZero(*(T*)&val)) {
+        val = loadfloat2(lamport_ptr);
       }
-      buffer_flags[0] = (buffer_flags[0] + 1) % 3;
-      buffer_flags[1] = (buffer_flags[1] + 1) % 3;
-      *(offset_access_ptr) = 0;
+      if (output_ptr) {
+        *((float2*)&output_ptr[current_pos]) = val;
+      }
     }
+
+    // Update the buffer flags
+    flags.wait_and_update(num_tokens);
   }
 }
 
@@ -247,23 +335,23 @@ __device__ float4 loadfloat4(void const* ptr) {
   // Check alignment - ptr should be 16-byte aligned for safe float4 load
   if (reinterpret_cast<uintptr_t>(ptr) % 16 != 0) {
     // Fall back to scalar loads if not aligned
-    float return_value[4];
+    float4 return_value;
     float const* float_ptr = reinterpret_cast<float const*>(ptr);
-    return_value[0] = float_ptr[0];
-    return_value[1] = float_ptr[1];
-    return_value[2] = float_ptr[2];
-    return_value[3] = float_ptr[3];
-    return *(float4*)return_value;
+    return_value.x = float_ptr[0];
+    return_value.y = float_ptr[1];
+    return_value.z = float_ptr[2];
+    return_value.w = float_ptr[3];
+    return return_value;
   }
 
-  float return_value[4];
+  float4 return_value;
 
   asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-               : "=f"(return_value[0]), "=f"(return_value[1]), "=f"(return_value[2]),
-                 "=f"(return_value[3])
+               : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z),
+                 "=f"(return_value.w)
                : "l"(ptr));
 
-  return *(float4*)return_value;
+  return return_value;
 }
 
 // Safer version that checks bounds before loading
@@ -351,20 +439,12 @@ __global__ void __launch_bounds__(128, 1)
 
   int offsets[NUM_INPUTS][DIM / (1 * ELTS_PER_THREAD * NUM_THREADS)];
 
-  uint32_t* offset_access_ptr = &buffer_flags[3];
-  // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
-  uint32_t buffer_size = buffer_flags[2];
-  uint32_t buffer_offset = buffer_flags[0] * (buffer_size << 1);
-  T_IN const* input = &buffer_input[buffer_offset + buffer_size];
+  LamportFlags flags(buffer_flags);
+  T_IN const* input = &buffer_input[flags.input_offset + flags.buffer_size];
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
-
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    atomicAdd(offset_access_ptr, 1);
-  }
 
   for (int i = 0; i < NUM_INPUTS; i++) {
     for (int j = 0; j < DIM / (1 * ELTS_PER_THREAD * NUM_THREADS); j++) {
@@ -390,6 +470,7 @@ __global__ void __launch_bounds__(128, 1)
   }
 
   __pipeline_commit();
+  flags.cta_arrive();
 
   // Load all inputs
   bool valid = false;
@@ -414,25 +495,19 @@ __global__ void __launch_bounds__(128, 1)
         // So the actual pointer we're accessing is: input + element_offset
         // Which equals: &buffer_input[buffer_offset + buffer_size + element_offset]
 
-        // Calculate the total buffer size in elements
-        int total_buffer_elements = (buffer_size << 1) / sizeof(T_IN);  // Two buffers worth
-
-        // The maximum valid element index relative to the input pointer
-        int max_valid_element_index = total_buffer_elements - buffer_size / sizeof(T_IN);
-
         float4* src4 = (float4*)&input[element_offset];
 
         float4 value;
         // Check if we have enough elements remaining for a safe float4 load
-        if (element_offset >= 0 && element_offset + ELTS_PER_THREAD <= max_valid_element_index) {
+        if (element_offset >= 0 && element_offset + ELTS_PER_THREAD <= flags.buffer_size) {
           value = loadfloat4(src4);
         } else {
           // Use safe load for boundary cases or out-of-bounds
-          int remaining_elements = max_valid_element_index - element_offset;
+          int remaining_elements = flags.buffer_size - element_offset;
           if (remaining_elements <= 0) {
             // Completely out of bounds, return zeros
-            float return_value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            value = *(float4*)return_value;
+            float4 return_value = {0.0f, 0.0f, 0.0f, 0.0f};
+            value = return_value;
           } else {
             value = loadfloat4_safe(reinterpret_cast<T_IN const*>(src4), remaining_elements);
           }
@@ -537,15 +612,7 @@ __global__ void __launch_bounds__(128, 1)
                            threadIdx.x * ELTS_PER_THREAD] = out4;
   }
   // Update the buffer pointers
-  if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-    // Make sure all blocks have finished accessing the buffer
-    while (*reinterpret_cast<uint32_t volatile*>(offset_access_ptr) != gridDim.x * gridDim.y) {
-    }
-    buffer_flags[0] = (buffer_flags[0] + 1) % 3;
-    buffer_flags[1] = (buffer_flags[1] + 1) % 3;
-    *(offset_access_ptr) = 0;
-  }
-  __syncthreads();
+  flags.wait_and_update(batch_size);
 #endif
 }
 

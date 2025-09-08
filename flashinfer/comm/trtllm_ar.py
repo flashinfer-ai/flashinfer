@@ -16,9 +16,9 @@ limitations under the License.
 
 import functools
 import logging
-from dataclasses import dataclass
+from ctypes import c_void_p, cast
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -26,7 +26,8 @@ from torch.distributed import ProcessGroup
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, sm100a_nvcc_flags
+from ..jit import gen_jit_spec
+from ..jit import current_compilation_context
 from ..utils import register_custom_op, round_up
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
@@ -78,7 +79,7 @@ class AllReduceFusionPattern:
     kARResidualRMSNormOutFP4Quant = 5
 
 
-class FP4QuantizationSFLayout:
+class QuantizationSFLayout:
     # Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
     # blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
     # values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
@@ -89,14 +90,17 @@ class FP4QuantizationSFLayout:
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
     #
     # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-    SWIZZLED = 0
+    SWIZZLED_128x4 = 0
+    SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
     # kernels standard.
-    LINEAR = 1
+    LINEAR = 2
 
 
 def gen_trtllm_comm_module() -> JitSpec:
-    major, minor = torch.cuda.get_device_capability()
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10]
+    )
     return gen_jit_spec(
         "trtllm_comm",
         [
@@ -104,7 +108,7 @@ def gen_trtllm_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
         ],
-        extra_cuda_cflags=sm100a_nvcc_flags if major >= 10 and minor >= 0 else [],
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
@@ -258,7 +262,7 @@ def get_trtllm_comm_module():
         rms_gamma: Optional[torch.Tensor],
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
-        layout_code: Optional[FP4QuantizationSFLayout],
+        layout_code: Optional[QuantizationSFLayout],
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -325,7 +329,7 @@ def get_trtllm_comm_module():
         moe_reduction_scale_input: torch.Tensor,
         moe_reduction_active_experts_token_input: torch.Tensor,
         moe_reduction_token_input: torch.Tensor,
-        layout_code: Optional[FP4QuantizationSFLayout],
+        layout_code: Optional[QuantizationSFLayout],
         moe_allreduce_out: Optional[torch.Tensor],
         residual_out: Optional[torch.Tensor],
         norm_out: Optional[torch.Tensor],
@@ -413,7 +417,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     max_token_num: int,
     hidden_dim,
     group: Optional[ProcessGroup] = None,
-) -> List[int]:
+) -> List[List[int]]:
     """
     Parameters:
     - rank: the rank of the current process.
@@ -488,7 +492,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce(
-    workspace: List[int], group: Optional[ProcessGroup] = None
+    workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
     """
     Note:
@@ -514,7 +518,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     hidden_dim,
     use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
-) -> List[int]:
+) -> Tuple[List[List[int]], torch.Tensor]:
     """
     Parameters:
     - tp_rank: the rank of the current process.
@@ -560,7 +564,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
 
-    ipc_handles = list()
+    ipc_handles: List[List[int]] = list()
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
@@ -605,7 +609,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     cudart.cudaMemset(flag_ptr, 0, 5 * 4)
     # Set flag_ptr[3] = lamport_comm_size
     lamport_comm_size_bytes = lamport_comm_size.to_bytes(4, byteorder="little")
-    cudart.cudaMemcpy(flag_ptr.value + 3 * 4, lamport_comm_size_bytes, 4)
+    cudart.cudaMemcpy(
+        c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
+    )
     print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
@@ -624,7 +630,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
-    workspace: List[int], group: Optional[ProcessGroup] = None
+    workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
     """
     Parameters:
@@ -771,10 +777,10 @@ def trtllm_allreduce_fusion(
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
     launch_with_pdl: bool,
-    use_oneshot: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     pattern_code: AllReduceFusionPattern,
+    use_oneshot: Optional[bool],
     allreduce_out: Optional[torch.Tensor],
     residual_in: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
@@ -784,7 +790,7 @@ def trtllm_allreduce_fusion(
     rms_gamma: Optional[torch.Tensor],
     rms_eps: Optional[float],
     scale_factor: Optional[Union[torch.Tensor, float]],
-    layout_code: Optional[FP4QuantizationSFLayout],
+    layout_code: Optional[QuantizationSFLayout],
 ) -> None:
     """
     Parameters:
@@ -811,14 +817,13 @@ def trtllm_allreduce_fusion(
     - layout_code: the layout code.
 
     Note:
-    Regarding the `use_oneshot` parameter:
-
-    It should only be enabled when:
-    (1) Force to use the one-shot strategy based on your use case.
-    (2) In min-latency mode, the sequence length is less than the one-shot max token number (currently 128).
-
-    Otherwise, it should be disabled (as False).
+    Regarding the `use_oneshot` parameter, you could force to use the one-shot strategy based on your use case.
+    Otherwise, it would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode.
     """
+
+    if use_oneshot is None:
+        use_oneshot = token_num <= 128
+
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"
 
@@ -880,7 +885,7 @@ def trtllm_moe_allreduce_fusion(
     moe_reduction_scale_input: torch.Tensor,
     moe_reduction_active_experts_token_input: torch.Tensor,
     moe_reduction_token_input: torch.Tensor,
-    layout_code: Optional[FP4QuantizationSFLayout],
+    layout_code: Optional[QuantizationSFLayout],
     moe_allreduce_out: Optional[torch.Tensor],
     residual_out: Optional[torch.Tensor],
     norm_out: Optional[torch.Tensor],

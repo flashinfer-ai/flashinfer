@@ -24,9 +24,10 @@ from einops import einsum, rearrange
 
 from flashinfer.fp4_quantization import (
     _pad_scale_factors,
-    get_fp4_quantization_sm100_module,
+    get_fp4_quantization_module,
 )
 from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
+from flashinfer.utils import get_compute_capability
 
 
 class QuantMode(Enum):
@@ -53,24 +54,20 @@ def swizzle_blockscale(
     Returns:
         torch.Tensor: Swizzled tensor with the same shape as input.
     """
-    assert (
-        unswizzled_sf.dtype == torch.uint8
-    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert unswizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    )
     assert unswizzled_sf.ndim == 3, f"Input must be 3D, got {unswizzled_sf.ndim}"
-    assert (
-        unswizzled_sf.shape[0] == b
-    ), f"Batch dimension must equal b, got {unswizzled_sf.shape[0]} != {b}"
+    assert unswizzled_sf.shape[0] == b, (
+        f"Batch dimension must equal b, got {unswizzled_sf.shape[0]} != {b}"
+    )
     padded_input_sf_chunked = [
         _pad_scale_factors(unswizzled_sf[i], m, n, sf_vec_size) for i in range(b)
     ]
     padded_input_sf = torch.stack(padded_input_sf_chunked)
-    out = torch.empty_like(padded_input_sf)
-    get_fp4_quantization_sm100_module().fp4_swizzle_blockscale_sm100(
-        padded_input_sf.flatten(0, 1),
-        out.flatten(0, 1),
-        out.shape[0],
-        out.shape[1],
-        out.shape[2],
+    major, minor = get_compute_capability(unswizzled_sf.device)
+    out = get_fp4_quantization_module(f"{major}{minor}").block_scale_interleave_sm100(
+        padded_input_sf
     )
     out = out.view(padded_input_sf.shape)
     return out
@@ -134,7 +131,7 @@ def dequantize_e2m1(x):
     return x_dequant
 
 
-def gemm_mxfp4_nt_groupwise_ref(
+def gemm_mxfp8_mxfp4_nt_groupwise_ref(
     A, B, As, Bs, tile_size, n, k, output_dtype=torch.bfloat16
 ):
     r"""
@@ -249,7 +246,7 @@ def quantize_tensor(x, tile_size, n_padded, k_padded, quant_mode):
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-def test_mxfp4_groupwise_group_gemm(
+def test_mxfp8_mxfp4_groupwise_group_gemm(
     m,
     n,
     k,
@@ -315,7 +312,7 @@ def test_mxfp4_groupwise_group_gemm(
 
     out_ref = torch.empty((group_size * m, n), dtype=out_dtype, device="cuda")
     for i in range(group_size):
-        out_ref[m * i : m * (i + 1)] = gemm_mxfp4_nt_groupwise_ref(
+        out_ref[m * i : m * (i + 1)] = gemm_mxfp8_mxfp4_nt_groupwise_ref(
             a_fp8[m * i : m * (i + 1)],
             b_fp4[i],
             a_scale[m * i : m * (i + 1)],
@@ -353,4 +350,6 @@ def test_mxfp4_groupwise_group_gemm(
 if __name__ == "__main__":
     for fp8_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         for out_dtype in [torch.bfloat16, torch.float16]:
-            test_mxfp4_groupwise_group_gemm(4, 2879, 2880, 2, fp8_dtype, out_dtype)
+            test_mxfp8_mxfp4_groupwise_group_gemm(
+                4, 2879, 2880, 2, fp8_dtype, out_dtype
+            )

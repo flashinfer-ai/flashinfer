@@ -7,21 +7,22 @@ import functools
 import math
 import os
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
-from mpi4py import MPI
 
 from flashinfer.comm.mapping import Mapping
 
 from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec, sm100a_nvcc_flags
+from ..jit import gen_jit_spec
 from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer
 
 
 def mpi_barrier():
+    from mpi4py import MPI
+
     """MPI barrier - could potentially be replaced with dist.barrier()"""
     MPI.COMM_WORLD.Barrier()
 
@@ -184,9 +185,9 @@ def get_allreduce_mnnvl_workspace(
     mpi_barrier()
 
     # This is a buffer to maintain the state of this allreduce Op
-    # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
+    # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_prev, atomic access counter]
     buffer_flags = torch.tensor(
-        [0, 2, max_num_elements, 0],
+        [0, 2, max_num_elements, 0, 0],
         dtype=torch.uint32,
         device=torch.device("cuda", mapping.local_rank),
     )

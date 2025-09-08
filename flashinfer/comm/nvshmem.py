@@ -30,8 +30,6 @@ def gen_nvshmem_module() -> JitSpec:
 
 @functools.cache
 def get_nvshmem_module():
-    from pathlib import Path
-
     # Try to find libnvshmem_host.so first, fallback to libnvshmem_host.so.3
     lib_dirs = jit_env.get_nvshmem_lib_dirs()
     lib_path = None

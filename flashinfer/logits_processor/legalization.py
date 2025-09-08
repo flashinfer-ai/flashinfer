@@ -92,7 +92,9 @@ def infer_initial_type(processors: List[LogitsProcessor]) -> TensorType:
     )
 
 
-def _get_supported_types(processor: LogitsProcessor) -> bool:
+def _get_supported_types(
+    processor: LogitsProcessor,
+) -> List[TensorType]:
     valid_types = []
     for tensor_type in [TensorType.LOGITS, TensorType.PROBS]:
         try:

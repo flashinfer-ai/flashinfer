@@ -119,16 +119,16 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_vllm_custom_allreduce(world_size):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")

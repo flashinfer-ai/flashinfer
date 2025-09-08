@@ -6,6 +6,7 @@ import scipy as sp
 import torch
 
 import flashinfer
+from flashinfer.utils import is_sm90a_supported
 
 
 def per_head_symmetric_quant(
@@ -68,6 +69,9 @@ def bsr_attention_ref(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     # Prepare inputs
     o_dtype = torch.half
     num_qo_heads = num_kv_heads = num_heads
@@ -116,6 +120,9 @@ def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
 def test_block_sparse_attention(
     R, C, M, N, num_heads, head_dim, mask_inside_block, dtype
 ):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     # print args
     print(
         f"Testing block sparse attention with R={R}, C={C}, M={M}, N={N}, num_heads={num_heads}, "

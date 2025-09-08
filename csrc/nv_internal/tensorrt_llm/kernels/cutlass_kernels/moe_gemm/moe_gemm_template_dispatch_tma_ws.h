@@ -113,6 +113,7 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
   }
 #endif
   else {
+#ifdef ENABLE_FP4
     auto getFunc = [&]() {
       if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>) {
         TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type ==
@@ -131,6 +132,9 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
       }
     };
     getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+#else
+    TLLM_THROW("FP4 data type is not supported on this architecture and CUDA version");
+#endif
   }
 }
 
@@ -323,7 +327,26 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     } else {
       TLLM_THROW("Unsupported SM90 configuration requested");
     }
-  } else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 120) {
+  } else if (gemm_config.sm_version == 110) {
+    if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
+                      T, WeightType, EpilogueTag, FUSION>()) {
+      switch (gemm_config.tile_config_sm100) {
+        SHAPE_CASE(100, 64, 64, 128)
+        SHAPE_CASE(100, 64, 128, 128)
+        SHAPE_CASE(100, 64, 256, 128)
+
+        SHAPE_CASE(100, 128, 16, 128)
+        SHAPE_CASE(100, 128, 32, 128)
+        SHAPE_CASE(100, 128, 64, 128)
+        SHAPE_CASE(100, 128, 128, 128)
+        SHAPE_CASE(100, 128, 256, 128)
+
+        DEFAULT_CASE(100)
+      }
+    } else {
+      TLLM_THROW("Unsupported SM110 configuration requested");
+    }
+  } else if (gemm_config.sm_version >= 100 && gemm_config.sm_version < 110) {
     if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                       T, WeightType, EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm100) {

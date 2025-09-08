@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_groupwise_grouped_gemm_fp8_blackwell(
@@ -39,13 +40,14 @@ def bench_groupwise_grouped_gemm_fp8_blackwell(
         0, (batch_size + 1) * m, m, device="cuda:0", dtype=torch.int32
     )
 
-    ms = do_bench(
+    measurements = bench_gpu_time(
         lambda: flashinfer.gemm.group_gemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, segment_offsets, out=out, mma_sm=2
         ),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
     tflops_per_second = 2 * batch_size * m * n * k * 1e-9 / ms
     print(
         f"group_gemm_fp8_nt_groupwise batch_size={batch_size} m={m} n={n} k={k} in_dtype={in_dtype} out_dtype={out_dtype}: {tflops_per_second:.2f} TFLOPs/s"

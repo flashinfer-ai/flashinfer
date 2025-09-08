@@ -45,21 +45,7 @@ Using our PyTorch API is the easiest way to get started:
 
 ### Install from PIP
 
-We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
-
-```bash
-# For CUDA 12.6 & torch 2.6
-pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6
-# For other CUDA & torch versions, check https://docs.flashinfer.ai/installation.html
-```
-
-To try the latest features from the main branch, use our nightly-built wheels:
-
-```bash
-pip install flashinfer-python -i https://flashinfer.ai/whl/nightly/cu126/torch2.6
-```
-
-For a JIT version (compiling every kernel from scratch, [NVCC](https://developer.nvidia.com/cuda-downloads) is required), install from [PyPI](https://pypi.org/project/flashinfer-python/):
+FlashInfer is available as a Python package for Linux on PyPI. You can install it with the following command:
 
 ```bash
 pip install flashinfer-python
@@ -82,13 +68,13 @@ To pre-compile essential kernels ahead-of-time (AOT), run the following command:
 
 ```bash
 # Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
 # Build AOT kernels. Will produce AOT kernels in aot-ops/
 python -m flashinfer.aot
 # Build AOT wheel
 python -m build --no-isolation --wheel
 # Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
+python -m pip install dist/flashinfer_*.whl
 ```
 
 For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
@@ -134,23 +120,13 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
 
-## Run Benchmarks
-
-We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
-
-```bash
-mkdir build
-cp cmake/config.cmake build # you can modify the config.cmake to enable/disable benchmarks and change CUDA architectures
-cd build
-cmake ..
-make -j12
-```
-
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
-
 ## C++ API and TVM Bindings
 
 FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
+
+## GPU Support
+
+FlashInfer currently provides support for NVIDIA SM architectures 80 and higher and beta support for 103, 110, 120, and 121.
 
 ## Adoption
 

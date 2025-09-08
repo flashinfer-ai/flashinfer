@@ -25,21 +25,17 @@
 
 namespace moe::dev {
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 namespace routing {
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 namespace tg = batchedGemm::trtllm::gen;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename DataType>
 struct PackedScoreIdx {
   DataType score;
   int16_t idx;
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct DataBase {
   bool mUsePdl{false};
@@ -183,7 +179,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   int32_t mNumExpertsPerGroup = 0;
   int32_t mNumLimitedGroups = 0;
 
-  moe::dev::IntFastDiv mTopK;
+  trtllm::dev::IntFastDiv mTopK;
   float mRouteScale = 0.f;
 
   static KernelParams setKernelParams(Data const& data) {
@@ -198,7 +194,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
     params.mNumExpertGroups = data.mNumExpertGroups;
     params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
     params.mNumLimitedGroups = data.mNumLimitedGroups;
-    params.mTopK = moe::dev::IntFastDiv(data.mTopK);
+    params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
     params.mRouteScale = data.mRouteScale;
 
     return params;
@@ -254,6 +250,7 @@ struct Data : public DataBase {
 
   bool mDoSoftmaxBeforeTopK{false};
   bool mNormTopkProb{true};  // Default value is true for Qwen3 model
+  bool mApplySoftmaxAfterTopK{false};
 };
 
 template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
@@ -268,6 +265,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   int32_t mTopK = 0;
 
   bool mNormTopkProb = true;
+  bool mApplySoftmaxAfterTopK = false;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -275,6 +273,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
 
     params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
     params.mNormTopkProb = data.mNormTopkProb;
+    params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
     params.mTopK = data.mTopK;
     return params;
   }

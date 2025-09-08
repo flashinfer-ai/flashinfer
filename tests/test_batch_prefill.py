@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 
@@ -10,7 +8,7 @@ from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 def test_kv_scale_forwarding_effect(dtype):
     torch.manual_seed(42)
 
-    B, H_QO, H_KV, N_CTX, HEAD_DIM, PAGE_SIZE = 1, 1, 1, 8, 64, 16
+    H_QO, H_KV, N_CTX, HEAD_DIM, PAGE_SIZE = 1, 1, 8, 64, 16
     max_num_pages = (N_CTX + PAGE_SIZE - 1) // PAGE_SIZE
 
     # Create paged KV cache
