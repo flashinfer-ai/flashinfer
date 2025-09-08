@@ -3,7 +3,18 @@
 set -eo pipefail
 set -x
 
-pytest -s tests/test_mm_fp4.py
-pytest -s tests/test_groupwise_scaled_gemm_fp8.py
-pytest -s tests/test_groupwise_scaled_gemm_mxfp4.py
-pytest -s tests/test_cute_dsl_blockscaled_gemm.py
+EXIT_CODE=0
+
+test_scripts=(
+  test_mm_fp4.py
+  test_groupwise_scaled_gemm_fp8.py
+  test_groupwise_scaled_gemm_mxfp4.py
+  test_cute_dsl_blockscaled_gemm.py
+)
+
+for test_file in "${test_scripts[@]}"; do
+  xml_name="${test_file%.py}.xml"
+  pytest -s "tests/${test_file}" --junit-xml="${CI_WORKSPACE}/$xml_name" || EXIT_CODE=1
+done
+
+exit $EXIT_CODE

@@ -3,14 +3,21 @@
 set -eo pipefail
 set -x
 
-pytest -s tests/test_blackwell_fmha.py
-pytest -s tests/test_deepseek_mla.py
+EXIT_CODE=0
 
-# trtllm-gen
-pytest -s tests/test_trtllm_gen_attention.py
-pytest -s tests/test_trtllm_gen_mla.py
+test_scripts=(
+  "test_blackwell_fmha.py"
+  "test_deepseek_mla.py"
+  "test_trtllm_gen_attention.py"
+  "test_trtllm_gen_mla.py"
+  "test_cudnn_decode.py"
+  "test_cudnn_prefill.py"
+  "test_cudnn_prefill_deepseek.py"
+)
 
-# cudnn
-pytest -s tests/test_cudnn_decode.py
-pytest -s tests/test_cudnn_prefill.py
-pytest -s tests/test_cudnn_prefill_deepseek.py
+for test_file in "${test_scripts[@]}"; do
+  xml_name="${test_file%.py}.xml"
+  pytest -s "tests/${test_file}" --junit-xml="${CI_WORKSPACE}/$xml_name" || EXIT_CODE=1
+done
+
+exit $EXIT_CODE

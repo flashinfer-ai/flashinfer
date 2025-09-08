@@ -3,5 +3,16 @@
 set -eo pipefail
 set -x
 
-pytest -s tests/test_trtllm_gen_fused_moe.py
-pytest -s tests/test_trtllm_cutlass_fused_moe.py
+EXIT_CODE=0
+
+test_scripts=(
+  test_trtllm_gen_fused_moe.py
+  test_trtllm_cutlass_fused_moe.py
+)
+
+for test_file in "${test_scripts[@]}"; do
+  xml_name="${test_file%.py}.xml"
+  pytest -s "tests/${test_file}" --junit-xml="${CI_WORKSPACE}/$xml_name" || EXIT_CODE=1
+done
+
+exit $EXIT_CODE
