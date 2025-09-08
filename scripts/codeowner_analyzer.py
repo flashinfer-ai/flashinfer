@@ -238,22 +238,34 @@ class CodeOwnersAnalyzer:
                     self.email_to_github[email] = None
                     return None
                 else:
-                    # Other HTTP errors - don't retry
+                    # Other HTTP errors - don't retry but report them
+                    print(
+                        f"Warning: GitHub API HTTP error for {email}: {e.code} {e.reason}"
+                    )
                     # Cache the failed lookup to avoid retrying
                     self.email_to_github[email] = None
                     return None
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
                 # Network or parsing errors - retry with backoff
                 retry_delay = base_delay * (2**retry_count)
                 retry_count += 1
                 if retry_count < max_retries:
+                    print(
+                        f"GitHub API network error for {email}, retrying in {retry_delay}s... (attempt {retry_count}/{max_retries}): {type(e).__name__}"
+                    )
                     time.sleep(retry_delay)
                     continue
                 # Cache the failed lookup after all retries exhausted
+                print(
+                    f"Warning: GitHub API lookup failed for {email} after {max_retries} retries: {type(e).__name__}: {e}"
+                )
                 self.email_to_github[email] = None
                 return None
-            except Exception:
-                # Any other errors - don't retry
+            except Exception as e:
+                # Any other errors - don't retry but report them
+                print(
+                    f"Warning: Unexpected error during GitHub API lookup for {email}: {type(e).__name__}: {e}"
+                )
                 # Cache the failed lookup to avoid retrying
                 self.email_to_github[email] = None
                 return None
@@ -724,7 +736,7 @@ Examples:
     parser.add_argument(
         "--min-commits",
         type=int,
-        default=2,
+        default=1,
         help="Minimum commits to be considered owner",
     )
     parser.add_argument(
