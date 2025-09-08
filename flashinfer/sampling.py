@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -463,11 +463,25 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
-def _check_tensor_param(param, tensor):
-    if isinstance(param, torch.Tensor) and (
-        param.dim() == 0 or param.dim() > 1 or param.shape[0] != tensor.shape[0]
-    ):
-        raise ValueError("Wrong input format")
+def _check_tensor_param(param: Any, tensor: torch.Tensor) -> None:
+    """Validate sampling parameters."""
+    if isinstance(param, torch.Tensor):
+        if param.dim() == 0:
+            raise ValueError(
+                f"Expected a 1D tensor or scalar for the sampling parameter, "
+                f"but got a 0-dimensional tensor with shape {param.shape}. "
+            )
+        elif param.dim() > 1:
+            raise ValueError(
+                f"Expected a 1D tensor or scalar for the sampling parameter, "
+                f"but got a {param.dim()}D tensor with shape {param.shape}. "
+            )
+        elif param.shape[0] != tensor.shape[0]:
+            raise ValueError(
+                f"Sampling parameter tensor batch size mismatch: "
+                f"expected length {tensor.shape[0]} to match the reference tensor batch size, "
+                f"but got length {param.shape[0]} with shape {param.shape}."
+            )
 
 
 def softmax(
@@ -987,7 +1001,7 @@ def top_k_top_p_sampling_from_logits(
     top_p_sampling_from_probs
     """
     _check_tensor_param(top_k, logits)
-    _check_tensor_param(top_p, torch.softmax(logits, dim=-1))
+    _check_tensor_param(top_p, logits)
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
