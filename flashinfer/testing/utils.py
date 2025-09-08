@@ -706,8 +706,8 @@ def bench_gpu_time_with_cupti(
     # CUPTI measurement
     timings = []
     measured_times = []
+    kernel_names = None
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    # cupti.activity_enable(cupti.ActivityKind.KERNEL)
     cupti.activity_register_callbacks(func_buffer_requested, partial(func_buffer_completed, timings))
     for iter_idx in range(repeat_iters):
         prev_len = len(timings)
@@ -719,6 +719,12 @@ def bench_gpu_time_with_cupti(
             sleep_after_kernel_run(estimated_kernel_execution_time)
         cupti.activity_flush_all(0)
         new_activities = timings[prev_len:]
+        current_kernel_names = set([t[0] for t in new_activities])
+        if kernel_names is None:
+            kernel_names = current_kernel_names
+        else:
+            if kernel_names != current_kernel_names:
+                raise ValueError(f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}")
         if not new_activities:
             raise ValueError(f"No kernel activities recorded for iteration {iter_idx}")
         min_start = min(t[1] for t in new_activities)
@@ -726,8 +732,9 @@ def bench_gpu_time_with_cupti(
         span_ms = (max_end - min_start) / 1e6
         measured_times.append(span_ms)
     cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    # cupti.activity_disable(cupti.ActivityKind.KERNEL)
     cupti.finalize()
+    if kernel_names is not None:
+        print(f"Kernel names: {kernel_names}")
 
     return measured_times
 
