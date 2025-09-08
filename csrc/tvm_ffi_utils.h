@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -49,3 +50,32 @@ constexpr int64_t float32_code = encode_dlpack_dtype(DLDataType{kDLFloat, 32, 1}
         return false;                                                                    \
     }                                                                                    \
   }()
+
+inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, const char* a_name,
+                        const char* b_name) {
+  TVM_FFI_ICHECK_EQ(a->ndim, b->ndim) << a_name << "->ndim and " << b_name << "->ndim mismatch";
+  for (int i = 0; i < a->ndim; ++i) {
+    TVM_FFI_ICHECK_EQ(a->shape[i], b->shape[i])
+        << a_name << "->shape[" << i << "] and " << b_name << "->shape[" << i << "] mismatch";
+  }
+}
+
+#define CHECK_CUDA(x) \
+  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCUDA) << #x " must be a CUDA tensor";
+#define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
+#define CHECK_LAST_DIM_CONTIGUOUS(x)            \
+  TVM_FFI_ICHECK_EQ(x->strides[x->ndim - 1], 1) \
+  #x "must be contiguous at last dimension";
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_INPUT_TYPE(x, st) TORCH_CHECK(x->type == st) << "Inconsistency of Tensor type: " #x;
+#define CHECK_INPUT_AND_TYPE(x, st) \
+  CHECK_CUDA(x);                    \
+  CHECK_CONTIGUOUS(x);              \
+  CHECK_INPUT_TYPE(x, st)
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
+  CHECK_CUDA(x);                           \
+  CHECK_LAST_DIM_CONTIGUOUS(x)
+#define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x->ndim, d) << #x " must be a " #d "D tensor";
+#define CHECK_SHAPE(a, b) check_shape(a, b, #a, #b)

@@ -198,5 +198,6 @@ def test_gemma_fused_add_rmsnorm(
 
 
 if __name__ == "__main__":
-    # test_norm(1, 1024, torch.float16, False, True)
-    test_fused_add_rmsnorm(1, 16384, torch.float16, True, True)
+    # test_norm(1, 1024, torch.float16, False, True, True)
+    test_norm(19, 1024, torch.float16, False, True, False)
+    # test_fused_add_rmsnorm(1, 16384, torch.float16, True, True)

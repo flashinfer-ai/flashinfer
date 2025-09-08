@@ -17,27 +17,23 @@
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer_norm {
-void rmsnorm(DLTensor* out, DLTensor* input, DLTensor* weight, double eps, bool enable_pdl);
 
-// void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+using tvm::ffi::Tensor;
+
+void rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
+
+// void fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight, double
+// eps,
 //                        bool enable_pdl);
 
-// void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
+// void gemma_rmsnorm(ffi::Tensor& out, ffi::Tensor& input, ffi::Tensor& weight, double eps,
 //                    bool enable_pdl);
 
-// void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
+// void gemma_fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight,
 //                              double eps, bool enable_pdl);
 
-// TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-//   // Root mean square normalization
-//   m.def("rmsnorm", rmsnorm);
-//   // Fused add root mean square normalization
-//   m.def("fused_add_rmsnorm", fused_add_rmsnorm);
-//   // Gemma Root mean square normalization
-//   m.def("gemma_rmsnorm", gemma_rmsnorm);
-//   // Gemma Fused add root mean square normalization
-//   m.def("gemma_fused_add_rmsnorm", gemma_fused_add_rmsnorm);
-// }
-
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(norm, flashinfer_norm::rmsnorm);
+// TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, flashinfer_norm::fused_add_rmsnorm);
+// TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, flashinfer_norm::gemma_rmsnorm);
+// TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, flashinfer_norm::gemma_fused_add_rmsnorm);
 }  // namespace flashinfer_norm

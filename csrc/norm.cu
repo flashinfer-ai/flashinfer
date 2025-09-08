@@ -23,9 +23,20 @@ using namespace flashinfer;
 
 namespace flashinfer_norm {
 
-void rmsnorm(DLTensor* output, DLTensor* input, DLTensor* weight, double eps, bool enable_pdl) {
+using tvm::ffi::Tensor;
+
+void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  TVM_FFI_ICHECK_EQ(input->device.device_type, weight->device.device_type);
+  TVM_FFI_ICHECK_EQ(input->device.device_id, weight->device.device_id);
+  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);  // weight: (hidden_size)
+  TVM_FFI_ICHECK_EQ(input->shape[1], weight->shape[0]);
   unsigned int batch_size = input->shape[0];
   unsigned int hidden_size = input->shape[1];
+  TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
+  TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
   const cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetCurrentStream(output->device.device_type, output->device.device_id));
 
@@ -40,36 +51,8 @@ void rmsnorm(DLTensor* output, DLTensor* input, DLTensor* weight, double eps, bo
   });
 }
 
-}  // namespace flashinfer_norm
-
-// void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
-//              bool enable_pdl) {
-//   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-//   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-//   auto device = input.device();
-//   CHECK_EQ(weight.device(), device);
-//   CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
-//   CHECK_DIM(1, weight);  // weight: (hidden_size)
-//   CHECK_EQ(input.size(1), weight.size(0));
-//   unsigned int batch_size = input.size(0);
-//   unsigned int hidden_size = input.size(1);
-//   CHECK_EQ(output.size(0), batch_size);
-//   CHECK_EQ(output.size(1), hidden_size);
-
-//   const c10::cuda::OptionalCUDAGuard device_guard(device);
-//   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-//   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-//     cudaError_t status = norm::RMSNorm(
-//         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
-//         static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
-//         output.stride(0), eps, enable_pdl, stream);
-//     TORCH_CHECK(status == cudaSuccess,
-//                 "RMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
-//     return true;
-//   });
-// }
-
-// void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+// void fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight, double
+// eps,
 //                        bool enable_pdl) {
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
@@ -99,7 +82,7 @@ void rmsnorm(DLTensor* output, DLTensor* input, DLTensor* weight, double eps, bo
 //   });
 // }
 
-// void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
+// void gemma_rmsnorm(ffi::Tensor& output, ffi::Tensor& input, ffi::Tensor& weight, double eps,
 //                    bool enable_pdl) {
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -127,7 +110,7 @@ void rmsnorm(DLTensor* output, DLTensor* input, DLTensor* weight, double eps, bo
 //   });
 // }
 
-// void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
+// void gemma_fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight,
 //                              double eps, bool enable_pdl) {
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
 //   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
@@ -156,3 +139,5 @@ void rmsnorm(DLTensor* output, DLTensor* input, DLTensor* weight, double eps, bo
 //     return true;
 //   });
 // }
+
+}  // namespace flashinfer_norm
