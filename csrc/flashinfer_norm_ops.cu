@@ -22,18 +22,15 @@ using tvm::ffi::Tensor;
 
 void rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
 
-// void fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight, double
-// eps,
-//                        bool enable_pdl);
+void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, bool enable_pdl);
 
-// void gemma_rmsnorm(ffi::Tensor& out, ffi::Tensor& input, ffi::Tensor& weight, double eps,
-//                    bool enable_pdl);
+void gemma_rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
 
-// void gemma_fused_add_rmsnorm(ffi::Tensor& input, ffi::Tensor& residual, ffi::Tensor& weight,
-//                              double eps, bool enable_pdl);
+void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
+                             bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(norm, flashinfer_norm::rmsnorm);
-// TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, flashinfer_norm::fused_add_rmsnorm);
-// TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, flashinfer_norm::gemma_rmsnorm);
-// TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, flashinfer_norm::gemma_fused_add_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, flashinfer_norm::fused_add_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, flashinfer_norm::gemma_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, flashinfer_norm::gemma_fused_add_rmsnorm);
 }  // namespace flashinfer_norm

@@ -79,3 +79,6 @@ inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, co
   CHECK_LAST_DIM_CONTIGUOUS(x)
 #define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x->ndim, d) << #x " must be a " #d "D tensor";
 #define CHECK_SHAPE(a, b) check_shape(a, b, #a, #b)
+#define CHECK_DEVICE(a, b)                                         \
+  TVM_FFI_ICHECK_EQ(a->device.device_type, b->device.device_type); \
+  TVM_FFI_ICHECK_EQ(a->device.device_id, b->device.device_id);
