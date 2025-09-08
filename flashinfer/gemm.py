@@ -39,6 +39,7 @@ from .fused_moe.utils import (
 )
 from .jit.cubin_loader import get_cubin
 from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
+from packaging.version import Version
 
 CUDNN_AVAILABLE = False
 try:
@@ -1555,17 +1556,22 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
 
 def execute_cudnn_gemm_fp4_graph(
-    graph, a, b, a_descale, b_descale, alpha, c_final, workspace_buffer, use_nvfp4
+    graph,
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    c_final,
+    workspace_buffer,
+    descale_dtype,
+    use_nvfp4,
 ):
     variant_pack = {
         UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
         UIDs.B_UID.value: b.view(_get_native_fp4_dtype()),
-        UIDs.BLOCK_DESCALE_A_UID.value: a_descale.view(
-            torch.float8_e4m3fn if use_nvfp4 else torch.float8_e8m0fnu
-        ),
-        UIDs.BLOCK_DESCALE_B_UID.value: b_descale.view(
-            torch.float8_e4m3fn if use_nvfp4 else torch.float8_e8m0fnu
-        ),
+        UIDs.BLOCK_DESCALE_A_UID.value: a_descale.view(descale_dtype),
+        UIDs.BLOCK_DESCALE_B_UID.value: b_descale.view(descale_dtype),
         UIDs.O_UID.value: c_final,
     }
 
@@ -1814,7 +1820,6 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
-    use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -1833,7 +1838,7 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar.
+        Global scale tensor, float scalar in case of nvfp4 quantization. None in case of mxfp4 quantization.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16.
@@ -1842,16 +1847,13 @@ def mm_fp4(
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
 
     block_size: int
-        Block size for FP4 quantization, only 16 and 32 are supported.
+        Block size for FP4 quantization, only 16 and 32 are supported. 16 in case of nvfp4 quantization. 32 in case of mxfp4 quantization.
 
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass"]
         Backend to use, defaults to "cudnn".
-
-    use_nvfp4: bool
-        True (default) means using nvfp4 quantization, False means using mxfp4 quantization.
 
     Notes
     -----
@@ -1880,6 +1882,9 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
+    # nvfp4 quantization if alpha provided, mxfp4 quantization if no alpha provided
+    use_nvfp4 = alpha is not None
+
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
@@ -1908,9 +1913,6 @@ def mm_fp4(
     if alpha is not None and alpha.numel() != 1:
         raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
 
-    if alpha is None and use_nvfp4:
-        raise ValueError("alpha must be provided for nvfp4 quantization.")
-
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"Unsupported output dtype: {out_dtype}. "
@@ -1927,6 +1929,12 @@ def mm_fp4(
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
+    if (
+        not use_nvfp4
+        and backend == "cudnn"
+        and Version(torch.__version__).release[:2] < (2, 8)
+    ):
+        raise ValueError("mxfp4 quantization is only supported on torch >= 2.8.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1956,6 +1964,15 @@ def mm_fp4(
             _expand_block_scale_tensor_shape(b_descale, batch)
         )
 
+        descale_dtype = torch.float8_e4m3fn
+
+        if not use_nvfp4:
+            if Version(torch.__version__).release[:2] < (2, 8):
+                raise RuntimeError(
+                    f"MXFP4 quantization requires PyTorch >= 2.8.0, but found {torch.__version__}. "
+                )
+            descale_dtype = torch.float8_e8m0fnu
+
         # build the fp4 cudnn graph
         graph = build_cudnn_gemm_block_scale_dequantize_graph(
             real_a_shape,
@@ -1967,7 +1984,7 @@ def mm_fp4(
             expanded_b_descale_shape,
             expanded_b_descale_stride,
             cudnn.data_type.FP4_E2M1,
-            torch.float8_e4m3fn if use_nvfp4 else torch.float8_e8m0fnu,
+            descale_dtype,
             _torch_data_type_to_cudnn_data_type(out_dtype),
             block_size,
             a.device,
@@ -1976,7 +1993,16 @@ def mm_fp4(
 
         # execute the fp4 cudnn graph
         execute_cudnn_gemm_fp4_graph(
-            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, use_nvfp4
+            graph,
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out,
+            workspace_buffer,
+            descale_dtype,
+            use_nvfp4,
         )
     elif backend == "trtllm":
         if out_dtype != torch.bfloat16:

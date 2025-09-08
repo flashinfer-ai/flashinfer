@@ -1,7 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
+from packaging.version import Version
 from flashinfer import (
     SfLayout,
     autotune,
@@ -31,6 +31,12 @@ def test_mm_fp4(
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
     if fp4_type == "mxfp4" and backend != "cudnn":
         pytest.skip("mx_fp4 is only supported for cudnn backend")
+    if (
+        fp4_type == "mxfp4"
+        and backend == "cudnn"
+        and Version(torch.__version__).release[:2] < (2, 8)
+    ):
+        pytest.skip("mxfp4 is only supported on torch >= 2.8.0")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -44,6 +50,7 @@ def test_mm_fp4(
 
     use_nvfp4 = fp4_type == "nvfp4"
     block_size = 16 if use_nvfp4 else 32
+    alpha = None  # None in case of mxfp4
 
     if use_nvfp4:
         input_fp4, input_inv_s = nvfp4_quantize(
@@ -55,13 +62,13 @@ def test_mm_fp4(
             sfLayout=SfLayout.layout_128x4,
             do_shuffle=do_shuffle_b,
         )
+        alpha = 1.0 / (global_sf_input * global_sf_mat2)
     else:
         input_fp4, input_inv_s = mxfp4_quantize(input)
         mat2_fp4, mat2_inv_s = mxfp4_quantize(mat2)
 
     reference = torch.mm(input, mat2.T)
 
-    alpha = 1.0 / (global_sf_input * global_sf_mat2)
     res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
     with autotune(auto_tuning):
@@ -70,13 +77,12 @@ def test_mm_fp4(
             mat2_fp4.T,
             input_inv_s,
             mat2_inv_s.T,
-            alpha if use_nvfp4 else None,
+            alpha,
             res_dtype,
             res,
             block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,
             backend=backend,
-            use_nvfp4=use_nvfp4,
         )
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
