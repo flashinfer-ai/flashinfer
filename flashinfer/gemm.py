@@ -1875,10 +1875,7 @@ def mm_fp4(
     >>> b_global_sf = (448 * 6) / b.float().abs().nan_to_num().max()
     >>> a_fp4, a_sf = nvfp4_quantize(a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
     >>> b_fp4, b_sf = nvfp4_quantize(b, b_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=True)
-    >>> # Option 1: With explicit alpha
     >>> out = mm_fp4(a_fp4, b_fp4.T, a_sf, b_sf.T, 1.0/(a_global_sf * b_global_sf), torch.bfloat16, None, backend="trtllm")
-    >>> # Option 2: Without alpha
-    >>> out = mm_fp4(a_fp4, b_fp4.T, a_sf, b_sf.T, backend="cudnn", use_nvfp4=False)
     >>> out.shape
     torch.Size([48, 256])
     """
