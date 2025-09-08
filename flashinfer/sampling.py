@@ -1252,11 +1252,6 @@ def top_k_renorm_probs(
     top_k_sampling_from_probs
     sampling_from_probs
     top_p_renorm_probs
-
-    Raises
-    ------
-    ValueError
-        If top_k is not a positive integer or a 1D tensor of shape (batch_size,).
     """
     _check_tensor_param(top_k, probs)
     return get_sampling_module().top_k_renorm_probs(
