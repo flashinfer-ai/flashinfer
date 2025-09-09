@@ -535,7 +535,7 @@ def attention_tb_per_sec_with_actual_seq_lens(
     return bytes_in_tb / time_in_sec if not math.isnan(time) else 0.0
 
 
-def bench_gpu_time(
+def bench_gpu_time_with_cuda_event(
     fn,
     dry_run_iters: int = None,
     repeat_iters: int = None,
@@ -547,7 +547,7 @@ def bench_gpu_time(
     sleep_after_run: bool = False,
 ):
     """
-    Benchmark kernel execution time without using CUDA graphs.
+    Benchmark kernel execution time using CUDA events (no CUDA graphs).
     Measures kernel launch latency + actual kernel execution time for fn().
     Can flush L2 cache and sleep after the run.
 
@@ -639,9 +639,36 @@ def bench_gpu_time_with_cupti(
     l2_flush_size_mb: int = 256,
     l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
+    use_cuda_graph: bool = False,
 ):
     """
-    Benchmark GPU time using by using CUPTI to measure the kernel execution time.
+    Benchmark GPU time using CUPTI activity tracing to measure kernel execution time.
+
+    Behavior:
+    - Uses CUPTI (>=13) to capture runtime launches and concurrent kernel activities
+      and computes per-iteration GPU time from recorded activities.
+    - Supports optional CUDA Graph capture (use_cuda_graph=True). In this mode, a
+      single replay of the captured graph is timed per iteration.
+    - If CUPTI is unavailable or <13, falls back to CUDA events or CUDA graphs
+      depending on use_cuda_graph.
+    - Dry run and repeat iterations can be specified directly or derived from
+      target times (dry_run_time_ms/repeat_time_ms) using a short estimate phase.
+    - Optionally flushes L2 and sleeps after runs to reduce throttling.
+
+    Args:
+        fn: Callable to benchmark.
+        dry_run_iters: Dry-run iterations; if None, inferred from dry_run_time_ms.
+        repeat_iters: Measurement iterations; if None, inferred from repeat_time_ms.
+        dry_run_time_ms: Target dry-run duration in ms when inferring iterations.
+        repeat_time_ms: Target measurement duration in ms when inferring iterations.
+        l2_flush: Whether to flush L2 before each iteration.
+        l2_flush_size_mb: Size of the buffer used for L2 flush.
+        l2_flush_device: Device for the flush buffer.
+        sleep_after_run: Whether to sleep briefly after each iteration.
+        use_cuda_graph: If True, capture and replay a CUDA graph during timing.
+
+    Returns:
+        List[float]: Measured times in milliseconds per iteration.
     """
     # check if CUPTI is installed and its version is >= 13.0.0
     import warnings
@@ -650,17 +677,37 @@ def bench_gpu_time_with_cupti(
         from importlib.metadata import version as importlib_metadata_version
         cupti_version = importlib_metadata_version("cupti-python")
         if int(cupti_version.split(".")[0]) < 13:
-            raise Exception("CUPTI needs to be >= 13.0.0. Falling back to bench_gpu_time.")
+            raise Exception("CUPTI needs to be >= 13.0.0. Falling back to use cuda events.")
         from functools import partial
     except (ImportError, Exception) as e:
         if isinstance(e, ImportError):
-            warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
+            warnings.warn("CUPTI is not installed. Falling back to use cuda events.")
         else:
             warnings.warn(f"{e}")
-        return bench_gpu_time(
-            fn, dry_run_iters, repeat_iters, dry_run_time_ms, repeat_time_ms,
-            l2_flush, l2_flush_size_mb, l2_flush_device, sleep_after_run
-        )
+        if use_cuda_graph:
+            return bench_gpu_time_with_cudagraph(
+                fn,
+                dry_run_iters,
+                repeat_iters,
+                dry_run_time_ms,
+                repeat_time_ms,
+                l2_flush,
+                l2_flush_size_mb,
+                l2_flush_device,
+                sleep_after_run,
+            )
+        else:
+            return bench_gpu_time_with_cuda_event(
+                fn,
+                dry_run_iters,
+                repeat_iters,
+                dry_run_time_ms,
+                repeat_time_ms,
+                l2_flush,
+                l2_flush_size_mb,
+                l2_flush_device,
+                sleep_after_run,
+            )
 
     # CUPTI buffer callbacks
     def func_buffer_requested():
@@ -681,7 +728,26 @@ def bench_gpu_time_with_cupti(
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
         buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
 
-    ## Estimate kernel execution time by running the kernel 5 times
+    # Prepare runner (either direct fn or CUDA graph replay)
+    runner = fn
+    g = None
+    if use_cuda_graph:
+        # Warmup run to avoid capturing one-time inits
+        torch.cuda.synchronize()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                fn()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture kernel in graph
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        runner = g.replay
+
+    ## Estimate kernel execution time by running the runner 5 times
     measurement_iters = 5
     torch.cuda.synchronize()
     fn()  # Call once to exclude initial overhead
@@ -692,12 +758,10 @@ def bench_gpu_time_with_cupti(
     for _ in range(measurement_iters):
         if l2_flush:
             buffer.zero_()
-        fn()
+        runner()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
-    )
+    estimated_kernel_execution_time = start_event.elapsed_time(end_event) / measurement_iters
 
     ## Set dry run and repeat iterations
     if dry_run_iters is None:
@@ -710,7 +774,7 @@ def bench_gpu_time_with_cupti(
     for _ in range(dry_run_iters):
         if l2_flush:
             buffer.zero_()
-        fn()
+        runner()
     torch.cuda.synchronize()
 
     # CUPTI measurement
@@ -724,7 +788,7 @@ def bench_gpu_time_with_cupti(
         if l2_flush:
             buffer.zero_()
         start_cpu = cupti.get_timestamp()
-        fn()
+        runner()
         end_cpu = cupti.get_timestamp()
         torch.cuda.synchronize()
         iter_timestamps.append((start_cpu, end_cpu))
@@ -876,6 +940,69 @@ def bench_gpu_time_with_cudagraph(
         )
     return measured_times
 
+
+def bench_gpu_time(
+    fn,
+    dry_run_iters: int = None,
+    repeat_iters: int = None,
+    dry_run_time_ms: int = 25,
+    repeat_time_ms: int = 100,
+    l2_flush: bool = True,
+    l2_flush_size_mb: int = 256,
+    l2_flush_device: str = "cuda",
+    sleep_after_run: bool = False,
+    enable_cupti: bool = False,
+    use_cuda_graph: bool = False,
+    num_iters_within_graph: int = 10,
+):
+    """
+    Benchmark wrapper that chooses among CUPTI, CUDA events, or CUDA Graphs.
+
+    By default, uses CUDA events (enable_cupti=False, use_cuda_graph=False).
+
+    Args mirror the underlying implementations; extra control flags:
+    - enable_cupti: If True, use CUPTI to measure GPU kernel time.
+      - If use_cuda_graph is True, will capture and replay a CUDA graph during measurement.
+    - use_cuda_graph: If True (and enable_cupti is False), use CUDA graph timing.
+    - num_iters_within_graph: Iterations to run within the CUDA graph when used (non-CUPTI path only).
+    """
+    if enable_cupti:
+        return bench_gpu_time_with_cupti(
+            fn,
+            dry_run_iters,
+            repeat_iters,
+            dry_run_time_ms,
+            repeat_time_ms,
+            l2_flush,
+            l2_flush_size_mb,
+            l2_flush_device,
+            sleep_after_run,
+            use_cuda_graph,
+        )
+    if use_cuda_graph:
+        return bench_gpu_time_with_cudagraph(
+            fn,
+            dry_run_iters,
+            repeat_iters,
+            dry_run_time_ms,
+            repeat_time_ms,
+            num_iters_within_graph,
+            l2_flush,
+            l2_flush_size_mb,
+            l2_flush_device,
+            sleep_after_run,
+        )
+    return bench_gpu_time_with_cuda_event(
+        fn,
+        dry_run_iters,
+        repeat_iters,
+        dry_run_time_ms,
+        repeat_time_ms,
+        l2_flush,
+        l2_flush_size_mb,
+        l2_flush_device,
+        sleep_after_run,
+    )
 
 class empty_suppress:
     def __enter__(self):
