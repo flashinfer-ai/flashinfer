@@ -686,27 +686,27 @@ def bench_gpu_time_with_cupti(
             warnings.warn(f"{e} Falling back to use cuda events.")
         if use_cuda_graph:
             return bench_gpu_time_with_cudagraph(
-                fn,
-                dry_run_iters,
-                repeat_iters,
-                dry_run_time_ms,
-                repeat_time_ms,
-                l2_flush,
-                l2_flush_size_mb,
-                l2_flush_device,
-                sleep_after_run,
+                fn = fn,
+                dry_run_iters = dry_run_iters,
+                repeat_iters =repeat_iters,
+                dry_run_time_ms =dry_run_time_ms,
+                repeat_time_ms =repeat_time_ms,
+                l2_flush = l2_flush,
+                l2_flush_size_mb = l2_flush_size_mb,
+                l2_flush_device = l2_flush_device,
+                sleep_after_run =sleep_after_run,
             )
         else:
             return bench_gpu_time_with_cuda_event(
-                fn,
-                dry_run_iters,
-                repeat_iters,
-                dry_run_time_ms,
-                repeat_time_ms,
-                l2_flush,
-                l2_flush_size_mb,
-                l2_flush_device,
-                sleep_after_run,
+                fn =fn,
+                dry_run_iters = dry_run_iters,
+                repeat_iters = repeat_iters,
+                dry_run_time_ms = dry_run_time_ms,
+                repeat_time_ms = repeat_time_ms,
+                l2_flush = l2_flush,
+                l2_flush_size_mb = l2_flush_size_mb,
+                l2_flush_device = l2_flush_device,
+                sleep_after_run = sleep_after_run,
             )
 
     # CUPTI buffer callbacks
