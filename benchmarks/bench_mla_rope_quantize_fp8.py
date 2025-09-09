@@ -156,7 +156,7 @@ def benchmark(
             quant_scale_kv=1.0,
         )
 
-    measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
+    measurements = bench_gpu_time(execute)
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
