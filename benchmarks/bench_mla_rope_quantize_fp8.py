@@ -1,4 +1,4 @@
-from typing import Union, Optional, Tuple
+from typing import Union
 
 from torch import nn
 import flashinfer
