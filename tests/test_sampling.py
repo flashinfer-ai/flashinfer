@@ -557,18 +557,19 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
-def test_check_tensor_param():
-    torch.manual_seed(42)
+@pytest.mark.parametrize("batch_size", [1, 2, 32])
+@pytest.mark.parametrize("vocab_size", [4, 16, 128])
+@pytest.mark.parametrize("K", [1, 3, 10])
+def test_check_tensor_param(batch_size, vocab_size, K):
+    if vocab_size < K:
+        pytest.skip("K should be less than or equal to vocab_size")
 
-    K = 3
-    batch_size, vocab_size = 2, 4
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Test case 1: Scalar K should work fine
     result1 = flashinfer.sampling.top_k_renorm_probs(prob, K)
     assert result1.shape == prob.shape
-
     # Test case 2: 2D tensor should raise error
     with pytest.raises(ValueError, match="Expected a 1D tensor or scalar.*2D tensor"):
         flashinfer.sampling.top_k_renorm_probs(
@@ -577,7 +578,6 @@ def test_check_tensor_param():
                 [[K] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
             ),
         )
-
     # Test case 3: 0-dimensional tensor should raise error
     with pytest.raises(
         ValueError, match="Expected a 1D tensor or scalar.*0-dimensional tensor"
@@ -585,18 +585,17 @@ def test_check_tensor_param():
         flashinfer.sampling.top_k_renorm_probs(
             prob, torch.tensor(K, dtype=torch.int, device="cuda:0")
         )
-
     # Test case 4: 1D tensor with wrong batch size should raise error
+    wrong_batch_size = batch_size + 1  # Always different from actual batch size
     with pytest.raises(
         ValueError, match="Sampling parameter tensor batch size mismatch"
     ):
         flashinfer.sampling.top_k_renorm_probs(
-            prob, torch.tensor([K], dtype=torch.int, device="cuda:0")
+            prob, torch.tensor([K] * wrong_batch_size, dtype=torch.int, device="cuda:0")
         )
-
     # Test case 5: 1D tensor with correct batch size should work
     result5 = flashinfer.sampling.top_k_renorm_probs(
-        prob, torch.tensor([K, K], dtype=torch.int, device="cuda:0")
+        prob, torch.tensor([K] * batch_size, dtype=torch.int, device="cuda:0")
     )
     assert result5.shape == prob.shape
 
