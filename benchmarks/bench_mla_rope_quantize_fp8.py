@@ -141,12 +141,12 @@ def benchmark(
 
     def execute():
         flashinfer.rope.mla_rope_quantize_fp8(
-            q_in[..., :64],
-            k_in[..., :64],
-            q_in[..., 64:],
-            k_in[..., 64:],
-            rope_flashinfer.cos_sin_cache,
-            pos_ids,
+            q_rope=q_in[:, :, :64],
+            k_rope=k_in[:, :64],
+            q_nope=q_in[..., 64:],
+            k_nope=k_in[..., 64:],
+            cos_sin_cache=rope_flashinfer.cos_sin_cache,
+            pos_ids=pos_ids,
             is_neox=False,
             q_rope_out=q_out[..., :64],
             k_rope_out=k_out[..., :64],
