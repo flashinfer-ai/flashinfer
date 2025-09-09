@@ -85,7 +85,7 @@ class FlashInferRotaryEmbedding(nn.Module):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens"],
-        x_vals=[768] if mode_ncu else [64, 128, 256, 384, 512, 768],
+        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
         line_vals=["flashinfer"],
         line_names=["FlashInfer"],
