@@ -1,14 +1,7 @@
-from typing import Optional, Tuple, Union
-
+import flashinfer
 import numpy as np
 import torch
-import torch.nn as nn
 import triton
-from vllm.model_executor.layers.rotary_embedding import (
-    RotaryEmbedding as vLLMRotaryEmbedding,
-)
-
-from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -22,14 +15,40 @@ from flashinfer.testing.utils import bench_gpu_time
         styles=[("blue", "-")],
         ylabel="Latency (ms)",
         plot_name="rope-latency",
-        args={
-        },
+        args={},
     )
 )
 def benchmark(
     provider,
     num_tokens,
 ):
+    quant_dtype = torch.float8_e4m3fn
+
+    num_qo_heads = 128
+    q_in = torch.randn(num_tokens, num_qo_heads, 576, dtype=input_dtype, device=device)
+    k_in = torch.randn(num_tokens, 576, dtype=input_dtype, device=device)
+    pos_ids = torch.arange(num_tokens, device=device)
+
+    q_out = torch.empty_like(q_in, dtype=quant_dtype)
+    k_out = torch.empty_like(k_in, dtype=quant_dtype)
+
+    def execute():
+        flashinfer.rope.mla_rope_quantize_fp8(
+            q_in[..., :64],
+            k_in[..., :64],
+            q_in[..., 64:],
+            k_in[..., 64:],
+            rope_flashinfer.cos_sin_cache,
+            pos_ids,
+            is_neox=False,
+            q_rope_out=q_out[..., :64],
+            k_rope_out=k_out[..., :64],
+            q_nope_out=q_out[..., 64:],
+            k_nope_out=k_out[..., 64:],
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+        )
+
     measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
     # Calculate statistics to match original return values
     ms = np.median(measurements)
