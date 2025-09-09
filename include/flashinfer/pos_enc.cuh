@@ -370,7 +370,7 @@ __global__ void MLARopeQuantizeKernel(
     // 2. if not interleave
     //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
     //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if ((tx * vec_size < rotary_dim) and (by <= num_heads)) {
+    if (tx * vec_size < rotary_dim) {
       int sin_offset = rotary_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
@@ -716,7 +716,7 @@ cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     constexpr uint32_t rotary_dim = 64;
-    constexpr uint32_t vec_size = 32 / sizeof(DType);
+    constexpr uint32_t vec_size = 16 / sizeof(DType);
     constexpr uint32_t bdx = rotary_dim / vec_size;
     uint32_t num_threads = 128U;
     uint32_t bdy = num_threads / bdx;
