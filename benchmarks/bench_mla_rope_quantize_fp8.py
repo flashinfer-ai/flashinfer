@@ -113,9 +113,9 @@ def benchmark(
     k_nope = torch.randn(num_tokens, 512, dtype=input_dtype, device=device)
     pos_ids = torch.arange(num_tokens, device=device)
 
-    q_out = torch.randn(num_tokens, num_qo_heads, 576, dtype=quant_dtype, device=device)
-    k_nope_out = torch.randn(num_tokens, 64, dtype=quant_dtype, device=device)
-    k_rope_out = torch.randn(num_tokens, 512, dtype=quant_dtype, device=device)
+    q_out = torch.empty(num_tokens, num_qo_heads, 576, dtype=quant_dtype, device=device)
+    k_nope_out = torch.empty(num_tokens, 64, dtype=quant_dtype, device=device)
+    k_rope_out = torch.empty(num_tokens, 512, dtype=quant_dtype, device=device)
 
     rope_flashinfer = FlashInferRotaryEmbedding(
         head_size=576,
