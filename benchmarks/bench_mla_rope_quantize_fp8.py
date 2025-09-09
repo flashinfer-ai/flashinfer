@@ -6,7 +6,7 @@ import flashinfer
 import numpy as np
 import torch
 import triton
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
 
 mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 
@@ -128,7 +128,15 @@ def benchmark(
         dtype=input_dtype,
     ).to(device)
 
+    run_idx = 0
+
     def execute():
+        nonlocal run_idx
+        run_idx += 1
+
+        if mode_ncu and run_idx == 20:
+            torch.cuda.cudart().cudaProfilerStart()
+
         flashinfer.rope.mla_rope_quantize_fp8(
             # (bs, 128, 64), bf16, stride=(128 * 192, 192, 1)
             q_rope=q_rope,
@@ -155,7 +163,13 @@ def benchmark(
             quant_scale_kv=1.0,
         )
 
-    measurements = bench_gpu_time(execute)
+        if mode_ncu and run_idx == 20:
+            torch.cuda.cudart().cudaProfilerStop()
+
+    if mode_ncu:
+        measurements = bench_gpu_time(execute)
+    else:
+        measurements = bench_gpu_time_with_cudagraph(execute)
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
