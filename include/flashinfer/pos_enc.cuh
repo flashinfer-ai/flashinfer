@@ -456,6 +456,14 @@ __global__ void MLARopeQuantizeKernel(
       QuantType* q_nope_out_ptr =
           q_nope_out + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/64 * chunk_idx,
                                             q_nope_out_stride_n, q_nope_out_stride_h);
+
+      void* ptr = q_nope_in_ptr + tx * vec_size;
+      int4 ret_a, ret_b;
+      asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                   : "=r"(ret_a.x), "=r"(ret_a.y), "=r"(ret_a.z), "=r"(ret_a.w),
+                     "=r"(ret_b.x), "=r"(ret_b.y), "=r"(ret_b.z), "=r"(ret_b.w)
+                   : "l"(ptr));
+
       vec_t<float, vec_size> q_nope_vec;
       q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
 #pragma unroll
