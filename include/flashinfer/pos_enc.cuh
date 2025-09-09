@@ -370,7 +370,8 @@ __global__ void MLARopeQuantizeKernel(
     // 2. if not interleave
     //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
     //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if (tx * vec_size < rotary_dim) {
+//     if (tx * vec_size < rotary_dim) {
+    if ((tx * vec_size < rotary_dim) and (by <= num_heads)) {
       int sin_offset = rotary_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
