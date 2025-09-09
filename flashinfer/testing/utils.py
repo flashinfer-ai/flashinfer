@@ -677,13 +677,13 @@ def bench_gpu_time_with_cupti(
         from importlib.metadata import version as importlib_metadata_version
         cupti_version = importlib_metadata_version("cupti-python")
         if int(cupti_version.split(".")[0]) < 13:
-            raise Exception("CUPTI needs to be >= 13.0.0. Falling back to use cuda events.")
+            raise Exception("CUPTI needs to be >= 13.0.0.")
         from functools import partial
-    except (ImportError, Exception) as e:
-        if isinstance(e, ImportError):
+    except ... as e:
+        if isinstance(e, ModuleNotFoundError):
             warnings.warn("CUPTI is not installed. Falling back to use cuda events.")
         else:
-            warnings.warn(f"{e}")
+            warnings.warn(f"{e} Falling back to use cuda events.")
         if use_cuda_graph:
             return bench_gpu_time_with_cudagraph(
                 fn,
