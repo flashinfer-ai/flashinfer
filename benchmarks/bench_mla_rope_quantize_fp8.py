@@ -126,9 +126,13 @@ def benchmark(
     q_rope = torch.randn(num_tokens, num_qo_heads, 192, dtype=input_dtype, device=device)[:, :, :64]
     # TODO not 1:1 mimic yet
     k_rope = torch.randn(num_tokens, 64, dtype=input_dtype, device=device)
-    q_nope = torch.empty((num_qo_heads, num_tokens, 512), dtype=input_dtype, device=device).permute(1, 0, 2)
+    q_nope = torch.randn(num_qo_heads, num_tokens, 512, dtype=input_dtype, device=device).permute(1, 0, 2)
     k_nope = torch.randn(num_tokens, 512, dtype=input_dtype, device=device)
     pos_ids = torch.arange(num_tokens, device=device)
+
+    q_out = torch.randn(num_tokens, num_qo_heads, 576, dtype=quant_dtype, device=device)
+    k_nope_out = torch.randn(num_tokens, 64, dtype=quant_dtype, device=device)
+    k_rope_out = torch.randn(num_tokens, 512, dtype=quant_dtype, device=device)
 
     rope_flashinfer = FlashInferRotaryEmbedding(
         head_size=576,
@@ -138,9 +142,6 @@ def benchmark(
         is_neox_style=False,
         dtype=input_dtype,
     ).to(device)
-
-    q_out = torch.empty_like(q_in, dtype=quant_dtype)
-    k_out = torch.empty_like(k_in, dtype=quant_dtype)
 
     def execute():
         flashinfer.rope.mla_rope_quantize_fp8(
@@ -158,13 +159,13 @@ def benchmark(
             # q_out: (bs, 128, 576), e4m3fn, stride=(128 * 576, 576, 1)
             # q_rope_out=q_out[..., self.kv_lora_rank:]
             # q_nope_out=q_out[..., :self.kv_lora_rank]
-            q_rope_out=q_out[..., :64],
+            q_rope_out=q_out[..., 512:],
             # (bs, 64), e4m3fn, stride=(64, 1)
-            k_rope_out=k_out[..., :64],
+            k_rope_out=k_rope_out,
             # see above
-            q_nope_out=q_out[..., 64:],
+            q_nope_out=q_out[..., :512],
             # (bs, 512), stride=(512, 1)
-            k_nope_out=k_out[..., 64:],
+            k_nope_out=k_nope_out,
             quant_scale_q=1.0,
             quant_scale_kv=1.0,
         )
