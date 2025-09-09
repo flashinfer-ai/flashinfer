@@ -1,3 +1,4 @@
+import os
 from typing import Union
 
 from torch import nn
@@ -7,6 +8,7 @@ import torch
 import triton
 from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
 
+mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 
 class FlashInferRotaryEmbedding(nn.Module):
     def __init__(
@@ -83,7 +85,7 @@ class FlashInferRotaryEmbedding(nn.Module):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens"],
-        x_vals=[64, 128, 256, 384, 512, 768],
+        x_vals=[768] if mode_ncu else [64, 128, 256, 384, 512, 768],
         line_arg="provider",
         line_vals=["flashinfer"],
         line_names=["FlashInfer"],
