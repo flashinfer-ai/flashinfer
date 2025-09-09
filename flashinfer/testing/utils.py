@@ -629,6 +629,7 @@ def bench_gpu_time_with_cuda_event(
         measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
     return measured_times
 
+
 def bench_gpu_time_with_cupti(
     fn,
     dry_run_iters: int = None,
@@ -671,42 +672,50 @@ def bench_gpu_time_with_cupti(
         List[float]: Measured times in milliseconds per iteration.
     """
     # check if CUPTI is installed and its version is >= 13.0.0
-    import warnings
     try:
         from cupti import cupti
         from importlib.metadata import version as importlib_metadata_version
+
         cupti_version = importlib_metadata_version("cupti-python")
         if int(cupti_version.split(".")[0]) < 13:
             raise Exception("CUPTI needs to be >= 13.0.0.")
         from functools import partial
     except (ModuleNotFoundError, Exception) as e:
         if isinstance(e, ModuleNotFoundError):
-            warnings.warn("CUPTI is not installed. Falling back to use cuda events.")
+            warnings.warn(
+                "CUPTI is not installed. Falling back to use cuda events.",
+                category=UserWarning,
+                stacklevel=2,
+            )
         else:
-            warnings.warn(f"{e} Falling back to use cuda events.")
+            warnings.warn(
+                f"{e} Falling back to use cuda events.",
+                category=UserWarning,
+                stacklevel=2,
+            )
         if use_cuda_graph:
             return bench_gpu_time_with_cudagraph(
-                fn = fn,
-                dry_run_iters = dry_run_iters,
-                repeat_iters =repeat_iters,
-                dry_run_time_ms =dry_run_time_ms,
-                repeat_time_ms =repeat_time_ms,
-                l2_flush = l2_flush,
-                l2_flush_size_mb = l2_flush_size_mb,
-                l2_flush_device = l2_flush_device,
-                sleep_after_run =sleep_after_run,
+                fn=fn,
+                dry_run_iters=dry_run_iters,
+                repeat_iters=repeat_iters,
+                dry_run_time_ms=dry_run_time_ms,
+                repeat_time_ms=repeat_time_ms,
+                l2_flush=l2_flush,
+                l2_flush_size_mb=l2_flush_size_mb,
+                l2_flush_device=l2_flush_device,
+                sleep_after_run=sleep_after_run,
             )
         else:
             return bench_gpu_time_with_cuda_event(
-                fn =fn,
-                dry_run_iters = dry_run_iters,
-                repeat_iters = repeat_iters,
-                dry_run_time_ms = dry_run_time_ms,
-                repeat_time_ms = repeat_time_ms,
-                l2_flush = l2_flush,
-                l2_flush_size_mb = l2_flush_size_mb,
-                l2_flush_device = l2_flush_device,
-                sleep_after_run = sleep_after_run,
+                fn=fn,
+                dry_run_iters=dry_run_iters,
+                repeat_iters=repeat_iters,
+                dry_run_time_ms=dry_run_time_ms,
+                repeat_time_ms=repeat_time_ms,
+                l2_flush=l2_flush,
+                l2_flush_size_mb=l2_flush_size_mb,
+                l2_flush_device=l2_flush_device,
+                sleep_after_run=sleep_after_run,
             )
 
     # CUPTI buffer callbacks
@@ -715,11 +724,22 @@ def bench_gpu_time_with_cupti(
         max_num_records = 0
         return buffer_size, max_num_records
 
-    def func_buffer_completed(launches: list, kernels: list, activities: list):
+    def func_buffer_completed(
+        launches: list[tuple[float, float, int]],
+        kernels: list[tuple[str, float, float, int]],
+        activities: list,
+    ):
         for activity in activities:
             if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
                 # Kernel activity
-                kernels.append((activity.name, activity.start, activity.end, activity.correlation_id))
+                kernels.append(
+                    (
+                        activity.name,
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                    )
+                )
             elif activity.kind == cupti.ActivityKind.RUNTIME:
                 # Runtime activity
                 launches.append((activity.start, activity.end, activity.correlation_id))
@@ -761,7 +781,9 @@ def bench_gpu_time_with_cupti(
         runner()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = (
+        start_event.elapsed_time(end_event) / measurement_iters
+    )
 
     ## Set dry run and repeat iterations
     if dry_run_iters is None:
@@ -778,12 +800,14 @@ def bench_gpu_time_with_cupti(
     torch.cuda.synchronize()
 
     # CUPTI measurement
-    launches = []
-    kernels = []
+    launches: list[tuple[float, float, int]] = []
+    kernels: list[tuple[str, float, float, int]] = []
     iter_timestamps = []
     cupti.activity_enable(cupti.ActivityKind.RUNTIME)
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.activity_register_callbacks(func_buffer_requested, partial(func_buffer_completed, launches, kernels))
+    cupti.activity_register_callbacks(
+        func_buffer_requested, partial(func_buffer_completed, launches, kernels)
+    )
     for _ in range(repeat_iters):
         if l2_flush:
             buffer.zero_()
@@ -816,7 +840,9 @@ def bench_gpu_time_with_cupti(
             kernel_names = current_kernel_names
         else:
             if kernel_names != current_kernel_names:
-                raise ValueError(f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}")
+                raise ValueError(
+                    f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}"
+                )
         min_start = min(k[1] for k in iter_kernels)
         max_end = max(k[2] for k in iter_kernels)
         span_ms = (max_end - min_start) / 1e6  # ns to ms
@@ -1003,6 +1029,7 @@ def bench_gpu_time(
         l2_flush_device,
         sleep_after_run,
     )
+
 
 class empty_suppress:
     def __enter__(self):
