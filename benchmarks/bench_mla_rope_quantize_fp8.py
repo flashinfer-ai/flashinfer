@@ -5,7 +5,7 @@ import flashinfer
 import numpy as np
 import torch
 import triton
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import bench_gpu_time_cudagraph
 
 from synced_gitignored.flashinfer.flashinfer import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -170,7 +170,7 @@ def benchmark(
             quant_scale_kv=1.0,
         )
 
-    measurements = bench_gpu_time(execute)
+    measurements = bench_gpu_time_cudagraph(execute)
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
