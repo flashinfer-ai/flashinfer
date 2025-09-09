@@ -197,6 +197,10 @@ def gen_jit_spec(
         # non debug mode
         cuda_cflags += ["-DNDEBUG"]
 
+    # useful for ncu
+    if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
+        cuda_cflags += ["-lineinfo"]
+
     if extra_cflags is not None:
         cflags += extra_cflags
     if extra_cuda_cflags is not None:
