@@ -572,7 +572,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     const int64_t packed_qo_len = packed_qo_len_arr[request_idx];
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
-    const int64_t num_tiles_kv = ceil_div(cliped_kv_len_arr[request_idx], kv_chunk_size);
+    const int64_t kv_len = std::max(int(cliped_kv_len_arr[request_idx]), 1);
+    const int64_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
