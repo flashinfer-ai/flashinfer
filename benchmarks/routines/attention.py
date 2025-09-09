@@ -1350,7 +1350,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             l2_flush=True,
             l2_flush_size_mb=256,
             l2_flush_device=device,
-            sleep_after_run=False,
+            sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
         )
