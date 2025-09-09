@@ -6,7 +6,7 @@ import flashinfer
 import numpy as np
 import torch
 import triton
-from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time
 
 mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 
@@ -155,7 +155,7 @@ def benchmark(
             quant_scale_kv=1.0,
         )
 
-    measurements = bench_gpu_time_with_cudagraph(execute)
+    measurements = bench_gpu_time(execute)
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
