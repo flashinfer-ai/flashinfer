@@ -734,7 +734,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time_with_cupti(
+        times = bench_gpu_time(
             fn=run_fp4_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1067,7 +1067,7 @@ def testCutlassFusedMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time_with_cupti(
+        times = bench_gpu_time(
             fn=run_cutlass,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1344,7 +1344,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time_with_cupti(
+        times = bench_gpu_time(
             fn=run_fp8_block_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -1553,7 +1553,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             sleep_after_run=False,
         )
     else:
-        times = bench_gpu_time_with_cupti(
+        times = bench_gpu_time(
             fn=run_fp8_per_tensor_moe,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,

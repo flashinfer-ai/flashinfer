@@ -643,12 +643,20 @@ def bench_gpu_time_with_cupti(
     """
     Benchmark GPU time using by using CUPTI to measure the kernel execution time.
     """
+    # check if CUPTI is installed and its version is >= 13.0.0
     import warnings
     try:
         from cupti import cupti
+        from importlib.metadata import version as importlib_metadata_version
+        cupti_version = importlib_metadata_version("cupti-python")
+        if int(cupti_version.split(".")[0]) < 13:
+            raise Exception("CUPTI needs to be >= 13.0.0. Falling back to bench_gpu_time.")
         from functools import partial
-    except ImportError:
-        warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
+    except (ImportError, Exception) as e:
+        if isinstance(e, ImportError):
+            warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
+        else:
+            warnings.warn(f"{e}")
         return bench_gpu_time(
             fn, dry_run_iters, repeat_iters, dry_run_time_ms, repeat_time_ms,
             l2_flush, l2_flush_size_mb, l2_flush_device, sleep_after_run
@@ -731,12 +739,15 @@ def bench_gpu_time_with_cupti(
     measured_times = []
     kernel_names = None
     for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
+        # find all launches of kernels that happened within the iteration
         iter_launches = [l for l in launches if l[0] >= start_cpu and l[0] <= end_cpu]
         corr_ids = set(l[2] for l in iter_launches)
+        # find all GPU kernels that happened within the iteration
         iter_kernels = [k for k in kernels if k[3] in corr_ids]
         if not iter_kernels:
             raise ValueError(f"No kernel activities recorded for iteration {idx}")
         current_kernel_names = set(k[0] for k in iter_kernels)
+        # check if the kernel names are consistent
         if kernel_names is None:
             kernel_names = current_kernel_names
         else:
