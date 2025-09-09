@@ -5,7 +5,7 @@ import flashinfer
 import numpy as np
 import torch
 import triton
-from flashinfer.testing.utils import bench_gpu_time_cudagraph
+from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
 
 from synced_gitignored.flashinfer.flashinfer import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -123,10 +123,14 @@ def benchmark(
     quant_dtype = torch.float8_e4m3fn
 
     num_qo_heads = 128
-    q_rope = torch.randn(num_tokens, num_qo_heads, 192, dtype=input_dtype, device=device)[:, :, :64]
+    q_rope = torch.randn(
+        num_tokens, num_qo_heads, 192, dtype=input_dtype, device=device
+    )[:, :, :64]
     # TODO not 1:1 mimic yet
     k_rope = torch.randn(num_tokens, 64, dtype=input_dtype, device=device)
-    q_nope = torch.randn(num_qo_heads, num_tokens, 512, dtype=input_dtype, device=device).permute(1, 0, 2)
+    q_nope = torch.randn(
+        num_qo_heads, num_tokens, 512, dtype=input_dtype, device=device
+    ).permute(1, 0, 2)
     k_nope = torch.randn(num_tokens, 512, dtype=input_dtype, device=device)
     pos_ids = torch.arange(num_tokens, device=device)
 
@@ -170,7 +174,7 @@ def benchmark(
             quant_scale_kv=1.0,
         )
 
-    measurements = bench_gpu_time_cudagraph(execute)
+    measurements = bench_gpu_time_with_cudagraph(execute)
     # Calculate statistics to match original return values
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
