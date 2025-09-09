@@ -21,6 +21,7 @@ from typing import Tuple, Any
 
 import os
 import sys
+import warnings
 
 import numpy as np
 import torch
@@ -642,11 +643,12 @@ def bench_gpu_time_with_cupti(
     """
     Benchmark GPU time using by using CUPTI to measure the kernel execution time.
     """
+    import warnings
     try:
         from cupti import cupti
         from functools import partial
     except ImportError:
-        print("CUPTI is not installed. Falling back to bench_gpu_time.")
+        warnings.warn("CUPTI is not installed. Falling back to bench_gpu_time.")
         return bench_gpu_time(
             fn, dry_run_iters, repeat_iters, dry_run_time_ms, repeat_time_ms,
             l2_flush, l2_flush_size_mb, l2_flush_device, sleep_after_run
@@ -658,13 +660,14 @@ def bench_gpu_time_with_cupti(
         max_num_records = 0
         return buffer_size, max_num_records
 
-    def func_buffer_completed(timings_list: list, activities: list):
+    def func_buffer_completed(launches: list, kernels: list, activities: list):
         for activity in activities:
-            if hasattr(activity, "start") and hasattr(activity, "end"):
-                name = activity.name
-                start = activity.start
-                end = activity.end
-                timings_list.append((name, start, end))
+            if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+                # Kernel activity
+                kernels.append((activity.name, activity.start, activity.end, activity.correlation_id))
+            elif activity.kind == cupti.ActivityKind.RUNTIME:
+                # Runtime activity
+                launches.append((activity.start, activity.end, activity.correlation_id))
 
     if l2_flush:
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
@@ -703,38 +706,46 @@ def bench_gpu_time_with_cupti(
     torch.cuda.synchronize()
 
     # CUPTI measurement
-    timings = []
-    measured_times = []
-    kernel_names = None
+    launches = []
+    kernels = []
+    iter_timestamps = []
+    cupti.activity_enable(cupti.ActivityKind.RUNTIME)
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.activity_register_callbacks(func_buffer_requested, partial(func_buffer_completed, timings))
-    for iter_idx in range(repeat_iters):
-        prev_len = len(timings)
+    cupti.activity_register_callbacks(func_buffer_requested, partial(func_buffer_completed, launches, kernels))
+    for _ in range(repeat_iters):
         if l2_flush:
             buffer.zero_()
+        start_cpu = cupti.get_timestamp()
         fn()
+        end_cpu = cupti.get_timestamp()
         torch.cuda.synchronize()
+        iter_timestamps.append((start_cpu, end_cpu))
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
-        cupti.activity_flush_all(0)
-        new_activities = timings[prev_len:]
-        current_kernel_names = set([t[0] for t in new_activities])
+    cupti.activity_flush_all(0)
+    cupti.activity_disable(cupti.ActivityKind.RUNTIME)
+    cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    cupti.finalize()
+
+    # Process activities
+    measured_times = []
+    kernel_names = None
+    for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
+        iter_launches = [l for l in launches if l[0] >= start_cpu and l[0] <= end_cpu]
+        corr_ids = set(l[2] for l in iter_launches)
+        iter_kernels = [k for k in kernels if k[3] in corr_ids]
+        if not iter_kernels:
+            raise ValueError(f"No kernel activities recorded for iteration {idx}")
+        current_kernel_names = set(k[0] for k in iter_kernels)
         if kernel_names is None:
             kernel_names = current_kernel_names
         else:
             if kernel_names != current_kernel_names:
                 raise ValueError(f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}")
-        if not new_activities:
-            raise ValueError(f"No kernel activities recorded for iteration {iter_idx}")
-        min_start = min(t[1] for t in new_activities)
-        max_end = max(t[2] for t in new_activities)
-        span_ms = (max_end - min_start) / 1e6
+        min_start = min(k[1] for k in iter_kernels)
+        max_end = max(k[2] for k in iter_kernels)
+        span_ms = (max_end - min_start) / 1e6  # ns to ms
         measured_times.append(span_ms)
-    cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
-    cupti.finalize()
-    if kernel_names is not None:
-        print(f"Kernel names: {kernel_names}")
-
     return measured_times
 
 
