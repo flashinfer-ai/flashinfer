@@ -385,8 +385,6 @@ __global__ void MLARopeQuantizeKernel(
     }
 
     if (by < num_heads) {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 48;")
-
       // Query RoPE, 64 dim
       // allocate (num_heads,) blocks on blockDim.y
       uint32_t q_head_idx = by;
@@ -410,8 +408,6 @@ __global__ void MLARopeQuantizeKernel(
       }
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
     } else if (by == num_heads) {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 48;")
-
       // k/v RoPE, 64 dim
       // allocate (1,) blocks on blockDim.y
       DType* k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/0,
@@ -433,8 +429,6 @@ __global__ void MLARopeQuantizeKernel(
       }
       k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
     } else if (by <= num_heads + 8) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 20;");
-
       // K/v Non-RoPE part, 512 dim
       // allocate (8,) blocks on blockDim.y
       uint32_t chunk_idx = (by - num_heads - 1);
@@ -452,8 +446,6 @@ __global__ void MLARopeQuantizeKernel(
       }
       k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
     } else {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 20;");
-
       // Query Non-RoPE part, 512 dim
       // allocate (num_heads * 8,) blocks on blockDim.y
       uint32_t q_head_idx = (by - num_heads - 8 - 1) / 8;
