@@ -7,18 +7,20 @@ import torch
 import triton
 from flashinfer.testing.utils import bench_gpu_time
 
-from synced_gitignored.flashinfer.flashinfer import apply_rope_with_cos_sin_cache_inplace
+from synced_gitignored.flashinfer.flashinfer import (
+    apply_rope_with_cos_sin_cache_inplace,
+)
 
 
 class FlashInferRotaryEmbedding(nn.Module):
     def __init__(
-            self,
-            head_size: int,
-            rotary_dim: int,
-            max_position_embeddings: int,
-            base: int,
-            is_neox_style: bool,
-            dtype: torch.dtype,
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -34,10 +36,10 @@ class FlashInferRotaryEmbedding(nn.Module):
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         inv_freq = 1.0 / (
-                base
-                ** (
-                        torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
-                )
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
         )
         return inv_freq
 
@@ -53,11 +55,11 @@ class FlashInferRotaryEmbedding(nn.Module):
         return cache
 
     def _apply_rotary_emb(
-            self,
-            x: torch.Tensor,
-            cos: torch.Tensor,
-            sin: torch.Tensor,
-            is_neox_style: bool,
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        is_neox_style: bool,
     ) -> torch.Tensor:
         """
         Args:
@@ -82,11 +84,11 @@ class FlashInferRotaryEmbedding(nn.Module):
             return torch.stack((o1, o2), dim=-1).flatten(-2)
 
     def forward_cuda(
-            self,
-            positions: torch.Tensor,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            offsets: Optional[torch.Tensor] = None,
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
@@ -116,12 +118,23 @@ def benchmark(
     provider,
     num_tokens,
 ):
+    input_dtype = torch.bfloat16
+    device = "cuda"
     quant_dtype = torch.float8_e4m3fn
 
     num_qo_heads = 128
     q_in = torch.randn(num_tokens, num_qo_heads, 576, dtype=input_dtype, device=device)
     k_in = torch.randn(num_tokens, 576, dtype=input_dtype, device=device)
     pos_ids = torch.arange(num_tokens, device=device)
+
+    rope_flashinfer = FlashInferRotaryEmbedding(
+        head_size=576,
+        rotary_dim=64,
+        max_position_embeddings=4096,
+        base=10000,
+        is_neox_style=False,
+        dtype=input_dtype,
+    ).to(device)
 
     q_out = torch.empty_like(q_in, dtype=quant_dtype)
     k_out = torch.empty_like(k_in, dtype=quant_dtype)
