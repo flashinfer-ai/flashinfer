@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from packaging.version import Version
 from flashinfer import (
     SfLayout,
     autotune,
@@ -31,12 +30,6 @@ def test_mm_fp4(
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
     if fp4_type == "mxfp4" and backend != "cudnn":
         pytest.skip("mx_fp4 is only supported for cudnn backend")
-    if (
-        fp4_type == "mxfp4"
-        and backend == "cudnn"
-        and Version(torch.__version__).release[:2] < (2, 8)
-    ):
-        pytest.skip("mxfp4 is only supported on torch >= 2.8.0")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
