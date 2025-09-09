@@ -344,6 +344,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
           typename QuantType>
+__maxnreg__(32)
 __global__ void MLARopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
