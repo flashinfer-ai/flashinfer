@@ -7,10 +7,6 @@ import torch
 import triton
 from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
 
-from synced_gitignored.flashinfer.flashinfer import (
-    apply_rope_with_cos_sin_cache_inplace,
-)
-
 
 class FlashInferRotaryEmbedding(nn.Module):
     def __init__(
@@ -82,23 +78,6 @@ class FlashInferRotaryEmbedding(nn.Module):
             return torch.cat((o1, o2), dim=-1)
         else:
             return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-    def forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self.cos_sin_cache,
-            is_neox=self.is_neox_style,
-        )
-        return query, key
 
 
 @triton.testing.perf_report(
