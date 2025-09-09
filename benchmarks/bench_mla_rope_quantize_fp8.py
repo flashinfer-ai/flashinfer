@@ -10,6 +10,7 @@ from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagra
 
 mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 
+
 class FlashInferRotaryEmbedding(nn.Module):
     def __init__(
         self,
