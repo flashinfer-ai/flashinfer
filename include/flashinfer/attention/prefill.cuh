@@ -1385,21 +1385,17 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<KTraits>(tid.y, tid.z);
     const uint32_t num_qo_heads = num_kv_heads * group_size;
 
-    auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
-    AttentionVariant variant(params, /*batch_idx=*/0, smem);
-
-    const uint32_t window_left = variant.window_left;
-    const uint32_t kv_start_idx =
-        sub_if_greater_or_zero(kv_len + (bx * CTA_TILE_Q) / group_size, qo_len + window_left);
-    const uint32_t max_chunk_size =
-        partition_kv ? ceil_div(kv_len - kv_start_idx, num_chunks) : kv_len - kv_start_idx;
-    const uint32_t chunk_start =
-        partition_kv ? min(chunk_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
+    const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
+    const uint32_t chunk_start = partition_kv ? chunk_idx * max_chunk_size : 0;
     const uint32_t chunk_end =
-        partition_kv ? min((chunk_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+        partition_kv ? min((chunk_idx + 1) * max_chunk_size, kv_len) : kv_len;
     const uint32_t chunk_size = chunk_end - chunk_start;
 
     auto block = cg::this_thread_block();
+    auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
+    AttentionVariant variant(params, /*batch_idx=*/0, smem);
+    const uint32_t window_left = variant.window_left;
+
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -1599,10 +1595,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint32_t qo_len = params.qo_len;
   const uint32_t kv_len = params.kv_len;
-
-  // reducing launch CTAs
-  uint32_t window_left = min((params.window_left >= 0) ? params.window_left : kv_len, kv_len);
-
   if (kv_len < qo_len && MASK_MODE == MaskMode::kCausal) {
     std::ostringstream err_msg;
     err_msg << "When mask_mode is set to MaskMode::kCausal, kv_len must be greater than or equal "
@@ -1680,9 +1672,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                      (num_kv_heads * ceil_div(qo_len * group_size, CTA_TILE_Q));
         uint32_t num_chunks;
         if (max_num_kv_chunks > 0) {
-          // Add CTA_TILE_Q to launch enough CTAs to cover the causal mask
-          uint32_t chunk_size = max(ceil_div(window_left + CTA_TILE_Q, max_num_kv_chunks), 256);
-          num_chunks = ceil_div(window_left + CTA_TILE_Q, chunk_size);
+          uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
+          num_chunks = ceil_div(kv_len, chunk_size);
         } else {
           num_chunks = 0;
         }
