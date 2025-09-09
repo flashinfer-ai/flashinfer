@@ -141,16 +141,26 @@ def benchmark(
 
     def execute():
         flashinfer.rope.mla_rope_quantize_fp8(
+            # (bs, 128, 64), bf16, stride=(128 * 192, 192, 1)
             q_rope=q_in[:, :, :64],
+            # (bs, 64), bf16, stride=(2112, 1)
             k_rope=k_in[:, :64],
+            # (bs, 128, 512), bf16, stride=(512, 512 * bs, 1)
             q_nope=q_in[..., 64:],
+            # (bs, 512), bf16, stride=(512, 1)
             k_nope=k_in[..., 64:],
             cos_sin_cache=rope_flashinfer.cos_sin_cache,
             pos_ids=pos_ids,
             is_neox=False,
+            # q_out: (bs, 128, 576), e4m3fn, stride=(128 * 576, 576, 1)
+            # q_rope_out=q_out[..., self.kv_lora_rank:]
+            # q_nope_out=q_out[..., :self.kv_lora_rank]
             q_rope_out=q_out[..., :64],
+            # (bs, 64), e4m3fn, stride=(64, 1)
             k_rope_out=k_out[..., :64],
+            # see above
             q_nope_out=q_out[..., 64:],
+            # (bs, 512), stride=(512, 1)
             k_nope_out=k_out[..., 64:],
             quant_scale_q=1.0,
             quant_scale_kv=1.0,
