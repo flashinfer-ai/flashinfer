@@ -19,7 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
-#include "flashinfer/trtllm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaBf16Wrapper.h"
 
 namespace tensorrt_llm {
 namespace common {
