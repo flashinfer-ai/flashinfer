@@ -896,10 +896,7 @@ def gen_gemm_sm100_module_tgv_bf16() -> JitSpec:
         dest_path = gen_directory / f"tgv_gemm_bf16_{cta_m}x{cta_n}_{dma_stage}.cu"
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
-            cta_m=cta_m,
-            cta_n=cta_n,
-            dma_stage=dma_stage,
-            dtype="bf16"
+            cta_m=cta_m, cta_n=cta_n, dma_stage=dma_stage, dtype="bf16"
         )
         write_if_different(dest_path, source)
 
@@ -907,7 +904,10 @@ def gen_gemm_sm100_module_tgv_bf16() -> JitSpec:
         "tgv_gemm",
         source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,
-        extra_include_paths=[jit_env.FLASHINFER_INCLUDE_DIR, jit_env.FLASHINFER_CSRC_DIR],
+        extra_include_paths=[
+            jit_env.FLASHINFER_INCLUDE_DIR,
+            jit_env.FLASHINFER_CSRC_DIR,
+        ],
     )
 
 
@@ -924,19 +924,17 @@ def get_gemm_sm100_module_tgv_bf16():
             ) -> List[int]:
                 # Return all available TGV configurations
                 # Based on the configurations in tgv_gemm_configs.h
-                return list(range(module.bf16_gemm_tactic_num())) 
+                return list(range(module.bf16_gemm_tactic_num()))
 
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                *,
                 tactic: int = -1,
-                pdl: bool = False,
                 do_preparation: bool = False,
+                **kwargs,
             ) -> torch.Tensor:
-                
                 a, b, bias = inputs
-
+                pdl = kwargs.get("pdl", False)
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
@@ -957,15 +955,14 @@ def tgv_gemm_bf16_sm100(
     bias: torch.Tensor,
     pdl: bool = False,
 ) -> torch.Tensor:
-    
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103", "110"]):
         raise ValueError("TGV BF16 GEMM requires SM100, SM103, or SM110 architecture")
-    
+
     runners = []
-    
+
     runners.append(get_gemm_sm100_module_tgv_bf16().tgv_bf16_gemm_runner())
-    
+
     tuner = AutoTuner.get()
     a_tensor_index = 0
     tuning_config = TuningConfig(
@@ -987,7 +984,7 @@ def tgv_gemm_bf16_sm100(
         tuning_config,
         inputs,
     )
-    
+
     return runner(inputs=inputs, tactic=tactic, pdl=pdl)
 
 
