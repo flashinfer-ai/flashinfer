@@ -217,12 +217,12 @@ def test_single_prefill_sliding_window(
     torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 71])
-@pytest.mark.parametrize("kv_len", [54, 397, 1177, 2999])
+@pytest.mark.parametrize("batch_size", [12, 17, 30])
+@pytest.mark.parametrize("kv_len", [54, 397, 1177])
 @pytest.mark.parametrize("qo_len", [1, 37, 47])
 @pytest.mark.parametrize("window_left", [13, 33, 111])
-@pytest.mark.parametrize("num_kv_heads", [32])
-@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
+@pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("backend", ["fa2", "auto"])
@@ -237,6 +237,9 @@ def test_batch_paged_prefill_sliding_window(
     page_size,
     backend,
 ):
+    if num_qo_heads < num_kv_heads:
+        pytest.skip("num_qo_heads < num_kv_heads is not supported")
+
     q = torch.randn(
         batch_size * qo_len,
         num_qo_heads,

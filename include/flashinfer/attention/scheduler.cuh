@@ -555,24 +555,24 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
 
   // Calculate the actual needed CTA when considering sliding window
-  std::vector<int64_t> cliped_kv_len_arr(batch_size);
+  std::vector<int64_t> effective_kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
     // pad CTA_TILE_Q to consider the causal kv-len
-    cliped_kv_len_arr[i] =
+    effective_kv_len_arr[i] =
         std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
                  kv_len_arr[i]);
   }
 
   auto [split_kv, kv_chunk_size] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
-                                     cliped_kv_len_arr, cta_tile_q, min_kv_chunk_size);
+                                     effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
 
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     const int64_t packed_qo_len = packed_qo_len_arr[request_idx];
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
-    const int64_t kv_len = std::max(int(cliped_kv_len_arr[request_idx]), 1);
+    const int64_t kv_len = std::max(int(effective_kv_len_arr[request_idx]), 1);
     const int64_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
