@@ -173,8 +173,17 @@ def bench_cutlass_fused_moe(
                 output=flash_output,
                 tune_max_num_tokens=16384,
             )
-    ms_list = bench_gpu_time(
-        lambda: fused_moe.cutlass_fused_moe(
+
+    counter = 0
+
+    def f():
+        nonlocal counter
+        counter += 1
+
+        if counter == 20:
+            torch.cuda.cudart().cudaProfilerStart()
+
+        fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
             routing_weights,
@@ -184,8 +193,12 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-        ),
-    )
+        )
+
+        if counter == 20:
+            torch.cuda.cudart().cudaProfilerStop()
+
+    ms_list = bench_gpu_time(f)
     median_ms = np.median(ms_list)
     print(f"{'input':<15} {'weight1':<20} {'weight2':<20} {'time(ms)'}")
     print(
