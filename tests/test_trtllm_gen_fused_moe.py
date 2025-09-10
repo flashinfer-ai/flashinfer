@@ -698,8 +698,6 @@ class FP8BlockScaleMoe(Moe):
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
-        num_tokens = kwargs["num_tokens"]
-        hidden_size = kwargs["hidden_size"]
         top_k = kwargs["top_k"]
         n_groups = kwargs["n_groups"]
         top_k_groups = kwargs["top_k_groups"]
@@ -708,13 +706,10 @@ class FP8BlockScaleMoe(Moe):
         routing_method_type = kwargs["routing_method_type"]
         tile_tokens_dim = kwargs["tile_tokens_dim"]
         enable_pdl = kwargs.get("enable_pdl")
+        hidden_states_scale = kwargs["hidden_states_scale"]
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_orig.to(torch.float8_e4m3fn)
-        # Use deterministic scales for testing consistency
-        hidden_states_scale = 2.0 * torch.ones(
-            (hidden_size // 128, num_tokens), device="cuda", dtype=torch.float
-        )
 
         output = trtllm_fp8_block_scale_moe(
             expert_logits,
@@ -1005,6 +1000,7 @@ class moe_args_dequant:
         permute_info,
         use_routing_scales_on_input,
         gated_act_type,
+        hidden_states_scale=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1019,6 +1015,7 @@ class moe_args_dequant:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gated_act_type = gated_act_type
+        self.hidden_states_scale = hidden_states_scale
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -1630,7 +1627,7 @@ def run_moe_reference_dsfp8(args):
     """FP8 block-scale reference implementation."""
     # Generate block scales at runtime for FP8 block scaling
     # Use deterministic scales for testing consistency
-    hidden_states_scale = 2.0 * torch.ones(
+    hidden_states_scale = 2.0 * torch.rand(
         (args.hidden_size // 128, args.num_tokens), device="cuda", dtype=torch.float
     )
 
@@ -1664,6 +1661,7 @@ def run_moe_reference_dsfp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         GatedActType.SwiGlu.value,  # gated_act_type
+        hidden_states_scale,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -1736,6 +1734,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "tile_tokens_dim": kwargs["tile_tokens_dim"],
         "do_finalize": True,
         "gated_act_type": args.gated_act_type,
+        "hidden_states_scale": args_dequant.hidden_states_scale,
     }
 
     return moe_impl.call_moe(
