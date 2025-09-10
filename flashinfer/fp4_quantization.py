@@ -696,7 +696,9 @@ def nvfp4_batched_quantize(
             - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
-    a_fp4, a_sf = get_fp4_quantization_module().fp4_batched_quantize_sm100(
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+    a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(
         a,
         a_global_sf,
         sf_vec_size,
