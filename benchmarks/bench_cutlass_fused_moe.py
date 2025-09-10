@@ -222,7 +222,7 @@ if __name__ == "__main__":
         help="Update the config file with the new profiling results",
     )
     parser.add_argument(
-        "--num-tokens", type=int, default=32768, help="Number of tokens to profile"
+        "--num-tokens", type=int, default=16384, help="Number of tokens to profile"
     )
     parser.add_argument("--skip-autotune", action="store_true", help="Skip autotuning")
     args = parser.parse_args()
