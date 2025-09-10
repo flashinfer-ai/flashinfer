@@ -870,6 +870,12 @@ def cutlass_fused_moe(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
 
+    print(
+        "hi flashinfer cutlass_fused_moe "
+        f"{input.shape=} {input.dtype=} "
+        f"{token_selected_experts.shape=}"
+    )
+
     num_rows = input.shape[0]
     if min_latency_mode:
         num_rows *= fc2_expert_weights.shape[0]
@@ -1988,13 +1994,6 @@ def trtllm_fp4_block_scale_routed_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-
-    print(
-        "hi trtllm_fp4_block_scale_routed_moe "
-        f"{hidden_states.shape=} {hidden_states.dtype=} "
-        f"{topk_ids.shape=}"
-    )
-
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,
         topk_ids,
