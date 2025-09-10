@@ -164,7 +164,7 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-            tune_max_num_tokens=16384,
+            tune_max_num_tokens=32768,
         )
 
     if not skip_autotune:
@@ -179,7 +179,7 @@ def bench_cutlass_fused_moe(
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=flash_output,
-                tune_max_num_tokens=16384,
+                tune_max_num_tokens=32768,
             )
 
     counter = 0
