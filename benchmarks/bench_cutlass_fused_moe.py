@@ -39,11 +39,15 @@ test_configs = [
     # },
     {
         "hidden_size": 7168,
-        # "num_experts": 256,  # 1gpu
-        "num_experts": 256 // 4,  # 4gpu
+        "num_experts": num_experts,
         "top_k": 8,
         "intermediate_size": 2048,
-    },
+    }
+    for num_experts in [
+        256,
+        256 // 2,
+        256 // 4,
+    ]
 ]
 
 
