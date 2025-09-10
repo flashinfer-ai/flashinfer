@@ -31,15 +31,15 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 test_configs = [
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 256,
+    #     "top_k": 8,
+    #     "intermediate_size": 256,
+    # },
     {
         "hidden_size": 7168,
-        "num_experts": 256,
-        "top_k": 8,
-        "intermediate_size": 256,
-    },
-    {
-        "hidden_size": 7168,
-        "num_experts": 32,
+        "num_experts": 288,  # 1gpu
         "top_k": 8,
         "intermediate_size": 2048,
     },
@@ -201,7 +201,7 @@ if __name__ == "__main__":
         help="Update the config file with the new profiling results",
     )
     parser.add_argument(
-        "--num-tokens", type=int, default=32, help="Number of tokens to profile"
+        "--num-tokens", type=int, default=16384, help="Number of tokens to profile"
     )
     parser.add_argument("--skip-autotune", action="store_true", help="Skip autotuning")
     args = parser.parse_args()
