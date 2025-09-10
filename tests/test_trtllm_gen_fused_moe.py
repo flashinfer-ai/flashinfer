@@ -1626,7 +1626,6 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
 def run_moe_reference_dsfp8(args):
     """FP8 block-scale reference implementation."""
     # Generate block scales at runtime for FP8 block scaling
-    # Use deterministic scales for testing consistency
     hidden_states_scale = 2.0 * torch.rand(
         (args.hidden_size // 128, args.num_tokens), device="cuda", dtype=torch.float
     )
