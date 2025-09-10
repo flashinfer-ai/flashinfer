@@ -679,13 +679,13 @@ def bench_gpu_time_with_cupti(
         cupti_version = importlib_metadata_version("cupti-python")
         if int(cupti_version.split(".")[0]) < 13:
             raise Exception(
-                "CUPTI needs to be >= 13.0.0. Try: pip install -U cupti-python"
+                "CUPTI needs to be >= 13.0.0. Try 'pip install -U cupti-python'."
             )
         from functools import partial
     except (ModuleNotFoundError, Exception) as e:
         if isinstance(e, ModuleNotFoundError):
             warnings.warn(
-                "CUPTI is not installed. Try pip install -U cupti-python. Falling back to CUDA events for benchmarking.",
+                "CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.",
                 category=UserWarning,
                 stacklevel=2,
             )
