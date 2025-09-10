@@ -2252,7 +2252,7 @@ __device__ __forceinline__ int getBinId(const float& a) {
 }
 
 template <uint32_t BLOCK_THREADS, int LEFT, int RIGHT>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     countBinKernel(const float* dataIn, const int* taskLenPtr, int* histPtr, const int stride,
                    const int taskNum) {
   constexpr int histLen = 1 << (8 * sizeof(float) - RIGHT);
@@ -2285,7 +2285,7 @@ __global__ void __launch_bounds__(1024)
 
 template <uint32_t BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T,
           typename IdType>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     countBinExKernel(const T* dataIn, const int* taskLenPtr, int* histPtr, const int stride,
                      const int taskNum, IdType* indices) {
   using CompT = typename ComputeT<T>::type;
@@ -2330,7 +2330,7 @@ struct SelectBinTempStorage {
 };
 
 template <int BLOCK_THREADS, int HISTLEN>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     selectBinKernel(const int* histPtr, int* binIdPtr, int* kPtr, int* taskLenPtr) {
   static_assert(HISTLEN % BLOCK_THREADS == 0, "HISTLEN % BLOCK_THREADS != 0");
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -2380,7 +2380,7 @@ __global__ void __launch_bounds__(1024)
 }
 
 template <int BLOCK_THREADS, int LEFT, int RIGHT>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     selectCandidateKernel(float* dataIn, float* dataOut, int* globalCountPtr, const int* binIdPtr,
                           const int* taskLenPtr, const int stride) {
   // TODO: Optimize kernel with double Block Buffer
@@ -2422,7 +2422,7 @@ __global__ void __launch_bounds__(1024)
 }
 
 template <int BLOCK_THREADS, int LEFT, int RIGHT, uint32_t VEC_SIZE, typename T, typename IdType>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     selectCandidateExKernel(T* dataIn, T* dataOut, int* globalCountPtr, const int* binIdPtr,
                             const int* taskLenPtr, const int stride, IdType* indices) {
   // TODO: Optimize kernel with double Block Buffer
@@ -2437,7 +2437,6 @@ __global__ void __launch_bounds__(1024)
   __shared__ int blockCount[1];
   __shared__ T blockCache[BLOCK_THREADS * VEC_SIZE];
 
-#pragma unroll 2
   if (tx == 0) {
     blockCount[0] = 0;
   }
@@ -2476,7 +2475,7 @@ __global__ void __launch_bounds__(1024)
 }
 
 template <int BLOCK_THREADS, int VEC_SIZE, int CACHE_SIZE, typename IdxType, typename ValType>
-__global__ void __launch_bounds__(1024)
+__global__ void __launch_bounds__(BLOCK_THREADS)
     filterKernel(const ValType* dataIn, const typename ComputeT<ValType>::type* kThElePtr,
                  ValType* valOut, IdxType* idxOut, int* globalCount, const int* top_k_arr,
                  const int* taskLenPtr, const int stride, const int max_top_k_val,
@@ -2516,9 +2515,6 @@ __global__ void __launch_bounds__(1024)
   } else {
     // N > K, filter by k-th element
     const CompT kThElem = *(kThElePtr + taskId * stride);
-    // if (tx == 0) {
-    //   printf("task%d kThElem: %.14f\n", taskId, kThElem);
-    // }
 
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(taskLen, BLOCK_THREADS * VEC_SIZE); i++) {
@@ -2671,8 +2667,6 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
 
   size_t workSpaceSize = 0;
   getRadixSelectWorkSpaceSize<T, IdType>(max_top_k_val, d, batch_size, &workSpaceSize);
-  //   printf("workSpaceSize: %zuGB\n", workSpaceSize / 1024 / 1024 / 1024);
-  //   printf("batch_size: %d\n", batch_size);
   void* workSpace = 0;
   bool workspace_allocated = false;
   if (workSpaceSize > workspace_buffer_size_in_bytes) {
@@ -2690,18 +2684,20 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
   int* taskLenPtr[2]{globalCountPtr + batch_size, globalCountPtr + 2 * batch_size};
   std::vector<int> tmpTaskLen(2 * batch_size, d);
 
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
-                                       sizeof(int) * batch_size * 2, cudaMemcpyDefault, stream));
-
   int* kPtr = taskLenPtr[1] + batch_size;
-  FLASHINFER_CUDA_CALL(
-      cudaMemcpyAsync(kPtr, tmpK.data(), sizeof(int) * batch_size, cudaMemcpyDefault, stream));
 
   int* binIdPtr = kPtr + batch_size;
   T* top_k_select_result = reinterpret_cast<T*>(binIdPtr + batch_size);
   IdType* top_k_select_idx =
       reinterpret_cast<IdType*>(top_k_select_result + batch_size * max_top_k_val);
   std::vector<int> taskLenHost(batch_size);
+
+  // TODO: use a standalone kernel to initialize taskLenPtr, kPtr, histPtr...
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(taskLenPtr[0], tmpTaskLen.data(),
+                                       sizeof(int) * batch_size * 2, cudaMemcpyDefault, stream));
+
+  FLASHINFER_CUDA_CALL(
+      cudaMemcpyAsync(kPtr, tmpK.data(), sizeof(int) * batch_size, cudaMemcpyDefault, stream));
 
   // clear hist and globalCount
   FLASHINFER_CUDA_CALL(

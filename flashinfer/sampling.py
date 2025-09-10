@@ -833,6 +833,20 @@ def top_k_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+
+    if (isinstance(top_k, int) and top_k <= 100) or (
+        isinstance(top_k, torch.Tensor) and top_k.max() <= 100
+    ):
+        return radik_sampling_from_probs(
+            probs,
+            top_k,
+            indices,
+            deterministic,
+            generator,
+            selected_probs=None,
+            check_nan=check_nan,
+        )
+
     return get_sampling_module().top_k_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(top_k), deterministic, generator
     )
