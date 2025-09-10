@@ -4,7 +4,7 @@ set -eo pipefail
 set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
-: ${CI_WORKSPACE:=.}
+: ${JUNIT_DIR:=$(realpath ./junit)}
 
 pip install -e . -v
 pip install --upgrade nvidia-cudnn-cu12
