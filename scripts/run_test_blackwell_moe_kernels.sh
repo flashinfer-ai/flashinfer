@@ -7,8 +7,8 @@ set -x
 EXIT_CODE=0
 
 test_scripts=(
-  test_trtllm_gen_fused_moe.py
-  test_trtllm_cutlass_fused_moe.py
+  "test_trtllm_gen_fused_moe.py"
+  "test_trtllm_cutlass_fused_moe.py"
 )
 
 for test_file in "${test_scripts[@]}"; do
