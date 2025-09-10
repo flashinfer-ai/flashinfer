@@ -39,8 +39,8 @@ test_configs = [
     # },
     {
         "hidden_size": 7168,
-        # "num_experts": 288,  # 1gpu
-        "num_experts": 288 // 4,  # 4gpu
+        # "num_experts": 256,  # 1gpu
+        "num_experts": 256 // 4,  # 4gpu
         "top_k": 8,
         "intermediate_size": 2048,
     },
