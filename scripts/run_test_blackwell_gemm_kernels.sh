@@ -2,6 +2,7 @@
 
 set -eo pipefail
 set -x
+: ${JUNIT_DIR:=$(realpath ./junit)}
 
 EXIT_CODE=0
 
@@ -14,7 +15,7 @@ test_scripts=(
 
 for test_file in "${test_scripts[@]}"; do
   xml_name="${test_file%.py}.xml"
-  pytest -s "tests/${test_file}" --junit-xml="${CI_WORKSPACE}/$xml_name" || EXIT_CODE=1
+  pytest -s "tests/${test_file}" --junit-xml="${JUNIT_DIR}/$xml_name" || EXIT_CODE=1
 done
 
 exit $EXIT_CODE
