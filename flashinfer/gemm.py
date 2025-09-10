@@ -987,7 +987,7 @@ def tgv_gemm_bf16_sm100(
         tuning_config,
         inputs,
     )
-    #print(f"chosen tactic: {tactic}")
+    
     return runner(inputs=inputs, tactic=tactic, pdl=pdl)
 
 
