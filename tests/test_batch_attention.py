@@ -90,6 +90,7 @@ def _run_attention(
     num_kv_heads=1,
     num_qo_heads=1,
     head_dim=128,
+    v_scale=None,
     layout="NHD",
     test_dtype=torch.bfloat16,
     logits_soft_cap=0.0,
@@ -140,7 +141,7 @@ def _run_attention(
 
     # --------- old scheduler --------- #
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev),
+        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev),
         kv_layout=layout,
         backend="fa2",
     )
@@ -159,7 +160,7 @@ def _run_attention(
         kv_data_type=test_dtype,
         logits_soft_cap=logits_soft_cap,
     )
-    out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True)
+    out_old, lse_old = wrapper_old.run(q, kv_data, return_lse=True, v_scale=v_scale)
 
     # --------- new / mixed scheduler --------- #
     wrapper = flashinfer.BatchAttention(kv_layout=layout)
@@ -178,7 +179,9 @@ def _run_attention(
         kv_data_type=test_dtype,
         logits_soft_cap=logits_soft_cap,
     )
-    out_new, lse_new = wrapper.run(q, kv_data, logits_soft_cap=logits_soft_cap)
+    out_new, lse_new = wrapper.run(
+        q, kv_data, v_scale=v_scale, logits_soft_cap=logits_soft_cap
+    )
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out_old, out_new, rtol=1e-2, atol=1e-2)
@@ -191,6 +194,7 @@ def _run_attention(
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("gqa_group_size", [1, 4, 7, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("v_scale", [2.0, None])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
@@ -201,6 +205,7 @@ def test_batch_attention_correctness(
     num_kv_heads,
     gqa_group_size,
     head_dim,
+    v_scale,
     causal,
     layout,
     test_dtype,
@@ -217,6 +222,7 @@ def test_batch_attention_correctness(
         num_kv_heads=num_kv_heads,
         num_qo_heads=num_qo_heads,
         head_dim=head_dim,
+        v_scale=v_scale,
         causal=causal,
         layout=layout,
         test_dtype=test_dtype,

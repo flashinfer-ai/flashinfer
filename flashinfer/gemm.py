@@ -1462,14 +1462,16 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
     b_descale_shape,
     b_descale_stride,
     ab_type,
-    scale_type,
     o_type,
     block_size,
     device,
+    use_nvfp4,
 ):
     _check_cudnn_availability()
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+        scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
+
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=ab_type
         )
@@ -1490,12 +1492,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
             data_type=scale_type,
             reordering_type=cudnn.tensor_reordering.F8_128x4,
         )
-        global_scale_cudnn_tensor = graph.tensor(
-            name="global_scale",
-            dim=(1, 1, 1),
-            stride=(1, 1, 1),
-            data_type=cudnn.data_type.FLOAT,
-        )
+
         dequant_a_tensor = graph.block_scale_dequantize(
             a_cudnn_tensor,
             block_descale_a_cudnn_tensor,
@@ -1518,19 +1515,30 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
         )
         c_tensor.set_data_type(cudnn.data_type.FLOAT)
 
-        c_final_cudnn_tensor = graph.mul(
-            name="scale_mul",
-            a=c_tensor,
-            b=global_scale_cudnn_tensor,
-            compute_data_type=cudnn.data_type.FLOAT,
-        )
+        c_final_cudnn_tensor = c_tensor
+
+        # if use_nvfp4 is True, we need to multiply the output by the global scale
+        if use_nvfp4:
+            global_scale_cudnn_tensor = graph.tensor(
+                name="global_scale",
+                dim=(1, 1, 1),
+                stride=(1, 1, 1),
+                data_type=cudnn.data_type.FLOAT,
+            )
+            c_final_cudnn_tensor = graph.mul(
+                name="scale_mul",
+                a=c_tensor,
+                b=global_scale_cudnn_tensor,
+                compute_data_type=cudnn.data_type.FLOAT,
+            )
+            global_scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
+
         c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
         block_descale_a_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_A_UID.value)
         block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
-        global_scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
         c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
         graph.validate()
@@ -1539,7 +1547,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
         # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
         # in older cuDNN versions, so we deselect it.
-        if not _is_cublas_fp4_available_in_cudnn():
+        if use_nvfp4 and not _is_cublas_fp4_available_in_cudnn():
             graph.deselect_engines(["eng0"])
         graph.check_support()
         graph.build_plans()
@@ -1548,16 +1556,18 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
 
 def execute_cudnn_gemm_fp4_graph(
-    graph, a, b, a_descale, b_descale, alpha, c_final, workspace_buffer
+    graph, a, b, a_descale, b_descale, alpha, c_final, workspace_buffer, use_nvfp4
 ):
     variant_pack = {
         UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
         UIDs.B_UID.value: b.view(_get_native_fp4_dtype()),
-        UIDs.BLOCK_DESCALE_A_UID.value: a_descale.view(torch.float8_e4m3fn),
-        UIDs.BLOCK_DESCALE_B_UID.value: b_descale.view(torch.float8_e4m3fn),
-        UIDs.ALPHA_UID.value: alpha.view(torch.float),
+        UIDs.BLOCK_DESCALE_A_UID.value: a_descale,
+        UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
         UIDs.O_UID.value: c_final,
     }
+
+    if use_nvfp4:
+        variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
     if workspace_buffer.numel() < graph.get_workspace_size():
         workspace_buffer = torch.empty(
@@ -1795,8 +1805,8 @@ def mm_fp4(
     b: torch.Tensor,
     a_descale: torch.Tensor,
     b_descale: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
@@ -1818,8 +1828,8 @@ def mm_fp4(
     b_descale: torch.Tensor
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
-    alpha: torch.Tensor
-        Global scale tensor, float scalar.
+    alpha: Optional[torch.Tensor]
+        Global scale tensor, float scalar in case of nvfp4 quantization. None in case of mxfp4 quantization.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16.
@@ -1828,7 +1838,7 @@ def mm_fp4(
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
 
     block_size: int
-        Block size for FP4 quantization, only 16 is supported.
+        Block size for FP4 quantization, only 16 and 32 are supported. 16 in case of nvfp4 quantization. 32 in case of mxfp4 quantization.
 
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
@@ -1860,6 +1870,9 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
+    # nvfp4 quantization if alpha provided, mxfp4 quantization if no alpha provided
+    use_nvfp4 = alpha is not None
+
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
@@ -1883,9 +1896,9 @@ def mm_fp4(
             f"a_descale and b_descale must have float8_e4m3fnx2 packed into uint8. "
             f"Got {a_descale.dtype} and {b_descale.dtype}."
         )
-    if alpha.dtype != torch.float:
+    if alpha is not None and alpha.dtype != torch.float:
         raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
-    if alpha.numel() != 1:
+    if alpha is not None and alpha.numel() != 1:
         raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
 
     if out_dtype not in (torch.bfloat16, torch.float16):
@@ -1893,12 +1906,17 @@ def mm_fp4(
             f"Unsupported output dtype: {out_dtype}. "
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
-    if block_size != 16:
-        raise ValueError("Only block_size = 16 is supported for FP4 GEMM operations.")
+
+    if use_nvfp4 and block_size != 16:
+        raise ValueError("nvfp4 only supports block_size = 16.")
+    if not use_nvfp4 and block_size != 32:
+        raise ValueError("mxfp4 supports block_size = 32.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
+    if backend != "cudnn" and not use_nvfp4:
+        raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
 
     # allocate the output tensor if not provided
     if out is None:
@@ -1939,15 +1957,15 @@ def mm_fp4(
             expanded_b_descale_shape,
             expanded_b_descale_stride,
             cudnn.data_type.FP4_E2M1,
-            torch.float8_e4m3fn,
             _torch_data_type_to_cudnn_data_type(out_dtype),
             block_size,
             a.device,
+            use_nvfp4,
         )
 
         # execute the fp4 cudnn graph
         execute_cudnn_gemm_fp4_graph(
-            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer
+            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, use_nvfp4
         )
     elif backend == "trtllm":
         if out_dtype != torch.bfloat16:
