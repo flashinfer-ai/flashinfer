@@ -7,7 +7,7 @@ set -x
 EXIT_CODE=0
 
 test_scripts=(
-  test_fp4_quantize.py
+  "test_fp4_quantize.py"
 )
 
 for test_file in "${test_scripts[@]}"; do

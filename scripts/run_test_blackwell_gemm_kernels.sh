@@ -7,10 +7,10 @@ set -x
 EXIT_CODE=0
 
 test_scripts=(
-  test_mm_fp4.py
-  test_groupwise_scaled_gemm_fp8.py
-  test_groupwise_scaled_gemm_mxfp4.py
-  test_cute_dsl_blockscaled_gemm.py
+  "test_mm_fp4.py"
+  "test_groupwise_scaled_gemm_fp8.py"
+  "test_groupwise_scaled_gemm_mxfp4.py"
+  "test_cute_dsl_blockscaled_gemm.py"
 )
 
 for test_file in "${test_scripts[@]}"; do
