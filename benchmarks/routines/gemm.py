@@ -17,6 +17,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    is_close_stats,
 )
 
 
@@ -295,17 +296,21 @@ def testGemmFp8NtGroupwise(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    torch.testing.assert_close(
-                        reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
-                    )
-                except AssertionError as e:
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
 
     res = []
     for backend in backends:
@@ -477,17 +482,21 @@ def testGroupGemmFp8NtGroupwise(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    torch.testing.assert_close(
-                        reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
-                    )
-                except AssertionError as e:
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
 
     res = []
     for backend in backends:
@@ -659,20 +668,19 @@ def testBmmFp8(args):
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
             for i in range(len(tested_backends)):
-                try:
-                    cos_sim = F.cosine_similarity(
-                        reference_output.reshape(-1),
-                        tested_outputs[i].reshape(-1),
-                        dim=0,
-                    )
-                    assert cos_sim > 0.99
-                except AssertionError as e:
+                cos_sim = F.cosine_similarity(
+                    reference_output.reshape(-1),
+                    tested_outputs[i].reshape(-1),
+                    dim=0,
+                )
+                if cos_sim < 0.99:
                     print(
                         f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                        )
 
     res = []
     for backend in backends:
@@ -871,20 +879,19 @@ def testMmFp4(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    cos_sim = F.cosine_similarity(
-                        reference_output.reshape(-1),
-                        tested_outputs[i].reshape(-1),
-                        dim=0,
-                    )
-                    assert cos_sim > 0.97
-                except AssertionError as e:
+                cos_sim = F.cosine_similarity(
+                    reference_output.reshape(-1),
+                    tested_outputs[i].reshape(-1),
+                    dim=0,
+                )
+                if cos_sim < 0.97:
                     print(
                         f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                        )
 
     res = []
     for backend in backends:
