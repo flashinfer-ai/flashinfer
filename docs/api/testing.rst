@@ -46,4 +46,6 @@ GPU Benchmarking
     :toctree: ../generated
 
     bench_gpu_time
+    bench_gpu_time_with_cuda_event
     bench_gpu_time_with_cudagraph
+    bench_gpu_time_with_cupti
