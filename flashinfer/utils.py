@@ -25,7 +25,7 @@ import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
-from .jit import gen_jit_spec, env as jit_env
+import flashinfer
 
 IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
@@ -240,7 +240,15 @@ def _check_cached_qkv_data_type(
         )
 
 
-if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
+def use_paddle_compatible_api() -> bool:
+    return os.environ.get("PADDLE_COMPATIBLE_API", "0").lower() in ["1", "on", "true"]
+
+
+if (
+    use_paddle_compatible_api()
+    or IS_BUILDING_DOCS
+    or TorchVersion(torch_version) < TorchVersion("2.4")
+):
 
     def register_custom_op(
         name: str,
@@ -492,14 +500,14 @@ def check_shape_dtype_device(
 
 
 def gen_logging_module():
-    return gen_jit_spec(
+    return flashinfer.jit.gen_jit_spec(
         "logging",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
+            flashinfer.jit.env.FLASHINFER_CSRC_DIR / "logging.cc",
         ],
         extra_include_paths=[
-            jit_env.SPDLOG_INCLUDE_DIR,
-            jit_env.FLASHINFER_INCLUDE_DIR,
+            flashinfer.jit.env.SPDLOG_INCLUDE_DIR,
+            flashinfer.jit.env.FLASHINFER_INCLUDE_DIR,
         ],
     )
 
