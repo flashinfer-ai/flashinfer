@@ -568,9 +568,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   if (fixed_split_size > 0) {
     kv_chunk_size = fixed_split_size;
   } else {
-    split_kv, kv_chunk_size = PrefillBinarySearchKVChunkSize(
-                  enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
-                  effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
+    std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
+        enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
+        cta_tile_q, min_kv_chunk_size);
   }
 
   // step 3: split qo_indptr and kv_indptr
