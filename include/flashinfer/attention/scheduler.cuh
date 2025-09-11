@@ -497,7 +497,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
-                                   bool enable_cuda_graph, int32_t window_left) {
+                                   bool enable_cuda_graph, int32_t window_left,
+                                   int32_t fixed_split_size) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -562,10 +563,15 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
                  kv_len_arr[i]);
   }
-
-  auto [split_kv, kv_chunk_size] =
-      PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
-                                     effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
+  bool split_kv = false;
+  int64_t kv_chunk_size;
+  if (fixed_split_size > 0) {
+    kv_chunk_size = fixed_split_size;
+  } else {
+    split_kv, kv_chunk_size = PrefillBinarySearchKVChunkSize(
+                  enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
+                  effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
+  }
 
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
@@ -574,7 +580,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
     const int64_t kv_len = std::max(int(effective_kv_len_arr[request_idx]), 1);
     const int64_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
-
+    if (fixed_split_size > 0) {
+      split_kv = split_kv || num_tiles_kv > 1;
+    }
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         new_batch_size += 1;
@@ -594,7 +602,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   const size_t padded_batch_size =
       enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
   FLASHINFER_CHECK(new_batch_size <= padded_batch_size,
-                   "new batch size should not exceed padded batch size");
+                   "new batch size should not exceed padded batch size. If you are using fixed "
+                   "split size, please consider disabling cuda graph.");
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
@@ -690,7 +699,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
-                               cudaStream_t stream) {
+                               int32_t fixed_split_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -712,7 +721,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left);
+                             enable_cuda_graph, window_left, fixed_split_size);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;

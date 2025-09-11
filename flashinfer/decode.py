@@ -826,6 +826,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         non_blocking: bool = True,
         block_tables: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -834,7 +835,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``
@@ -873,7 +874,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
-
+        fixed_split_size : Optional[int],
+            The fixed split size for split-kv decode in pages. Only supported by tensor core decode for now. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
 
         Note
         ----
@@ -943,6 +949,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if fixed_split_size is not None and self.use_tensor_cores:
+            raise ValueError(
+                "fixed_split_size is only supported by tensor core decode for now."
+            )
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -1048,8 +1060,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                 )
-
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1065,6 +1076,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 torch.empty(0, dtype=q_data_type),
                 torch.empty(0, dtype=kv_data_type),
+            ]
+            if self.use_tensor_cores:
+                args.append(fixed_split_size)
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._pos_encoding_mode = pos_encoding_mode

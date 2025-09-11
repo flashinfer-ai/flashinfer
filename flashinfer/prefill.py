@@ -1540,6 +1540,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1550,7 +1551,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -1639,6 +1640,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+        fixed_split_size : Optional[int],
+            The fixed split size for split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1660,6 +1667,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -1874,6 +1883,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                fixed_split_size,
             )
 
         self._causal = causal
