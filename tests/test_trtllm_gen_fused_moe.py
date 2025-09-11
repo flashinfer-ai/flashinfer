@@ -1274,6 +1274,8 @@ def check_accuracy(a, b, atol, rtol, percent):
     count = torch.sum(left > right)
     mismatch_percent = count / a.numel()
     if mismatch_percent > 1 - percent:
+        print(a)
+        print(b)
         raise Exception(
             f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
             f"(threshold: {1 - percent:.4f})"
@@ -2197,8 +2199,8 @@ if __name__ == "__main__":
         "compatible_moe_impls": [FP8BlockScaleMoe],
     }
     test_moe_quantization_classes(
-        num_tokens=1,
-        hidden_size=1024,
+        num_tokens=16,
+        hidden_size=256,
         intermediate_size=1024,
         moe_impl=FP8BlockScaleMoe(),
         routing_config=routing_config,
