@@ -767,6 +767,9 @@ class FP8BlockScaleMoe(Moe):
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
+        assert not torch.isnan(hidden_states_fp8.float()).any(), (
+            "NaN detected in hidden_states_fp8"
+        )
 
         output = trtllm_fp8_block_scale_moe(
             expert_logits,
