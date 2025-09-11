@@ -457,9 +457,9 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
         AssertionError: If input dtype is not uint8.
     """
     # TODO(shuw): check input dtype is uint8
-    assert unswizzled_sf.dtype == torch.uint8, (
-        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    )
+    assert (
+        unswizzled_sf.dtype == torch.uint8
+    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
@@ -498,7 +498,10 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-    major, minor = get_compute_capability(e2m1_tensor.device)
+    # NOTE(Zihao): this is another cpu op, should decouple it from cuda ops in the future
+    major, minor = get_compute_capability(
+        torch.device("cuda:0")
+    )  # select any cuda device to get a compute capability
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch
@@ -669,7 +672,10 @@ def mxfp4_dequantize_host(
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
     """
-    major, minor = get_compute_capability(weight.device)
+    # NOTE(Zihao): the cpu op should be decouplied from cuda ops because it's device independent, should refactor this in the future
+    major, minor = get_compute_capability(
+        torch.device("cuda:0")
+    )  # use any cuda device to get a compute capability
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(device_arch).mxfp4_dequantize_host(
         weight,
