@@ -147,13 +147,13 @@ def test_batch_decode_tensor_cores(
         q[:invariant_bs], kv_data, return_lse=True
     )
     torch.testing.assert_close(
-        o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-6, atol=1e-6
+        o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-7, atol=1e-7
     )
     torch.testing.assert_close(
         lse_tensor_cores[:invariant_bs],
         lse_tensor_cores_invariant,
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
     )
 
     # test that without fixed split size, precision is different
@@ -172,10 +172,10 @@ def test_batch_decode_tensor_cores(
     # )
     # try:
     #     torch.testing.assert_close(
-    #         o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-6, atol=1e-6
+    #         o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-7, atol=1e-7
     #     )
     #     torch.testing.assert_close(
-    #         lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant, rtol=1e-6, atol=1e-6
+    #         lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant, rtol=1e-7, atol=1e-7
     #     )
     # except AssertionError:
     #     pass
