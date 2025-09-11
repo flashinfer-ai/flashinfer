@@ -49,7 +49,7 @@ def warmup_jit():
 @pytest.mark.parametrize("batch_size", [5, 10, 20])
 @pytest.mark.parametrize("invariant_bs", [4])
 @pytest.mark.parametrize("kv_len", [4096, 8192])
-@pytest.mark.parametrize("fixed_split_size", [4096, 8192])
+@pytest.mark.parametrize("fixed_split_size", [2048])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
