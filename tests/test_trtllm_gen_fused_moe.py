@@ -597,26 +597,36 @@ class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style)."""
 
     def to_float8_blockwise(
-        self, x, block_size_m=128, block_size_n=128, dtype=torch.float8_e4m3fn
+        self,
+        x,
+        block_size_m=128,
+        block_size_n=128,
+        dtype=torch.float8_e4m3fn,
+        transpose_scale=True,
+        is_blockm=False,
+        is_blockn=True,
     ):
         assert x.dtype == torch.bfloat16
         x = x.contiguous()
         assert x.dim() == 2
         m, n = x.shape
-        num_blocks_m = (m + block_size_m - 1) // block_size_m
-        num_blocks_n = (n + block_size_n - 1) // block_size_n
+
+        m_tile = block_size_m if is_blockm else 1
+        n_tile = block_size_n if is_blockn else 1
+        num_blocks_m = m // m_tile
+        num_blocks_n = n // n_tile
 
         # Initialize output tensors
-        quantized_x = torch.empty_like(x, dtype=dtype)
-        scales = torch.empty((num_blocks_m, num_blocks_n), dtype=torch.float32)
+        quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
+        scales = torch.empty((num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device)
 
         # Quantize tensor in blocks
         finfo = torch.finfo(dtype)
         for i in range(num_blocks_m):
             for j in range(num_blocks_n):
                 # Determine block slices
-                start_m, end_m = i * block_size_m, min((i + 1) * block_size_m, m)
-                start_n, end_n = j * block_size_n, min((j + 1) * block_size_n, n)
+                start_m, end_m = i * m_tile, min((i + 1) * m_tile, m)
+                start_n, end_n = j * n_tile, min((j + 1) * n_tile, n)
 
                 # Extract the block
                 block = x[start_m:end_m, start_n:end_n]
@@ -630,6 +640,9 @@ class FP8BlockScaleMoe(Moe):
                 quantized_block = (block * scale).clamp(min=finfo.min, max=finfo.max)
                 quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(dtype)
                 scales[i, j] = scale.float().reciprocal()
+        
+        if transpose_scale:
+            scales = scales.t()
 
         return quantized_x, scales
 
