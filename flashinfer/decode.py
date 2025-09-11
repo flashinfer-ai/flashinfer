@@ -1031,6 +1031,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 head_dim,
                 False,  # causal
+                window_left,
             )
         else:
             if self._jit_module is not None:

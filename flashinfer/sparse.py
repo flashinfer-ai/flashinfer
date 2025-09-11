@@ -468,6 +468,7 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                -1,  # window_left
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1051,6 +1052,7 @@ class VariableBlockSparseAttentionWrapper:
             head_dim,
             head_dim,
             causal,
+            -1,  # window_left
         )
 
         self._pos_encoding_mode = pos_encoding_mode
