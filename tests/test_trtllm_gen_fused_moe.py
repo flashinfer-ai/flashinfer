@@ -618,7 +618,9 @@ class FP8BlockScaleMoe(Moe):
 
         # Initialize output tensors
         quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
-        scales = torch.empty((num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device)
+        scales = torch.empty(
+            (num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device
+        )
 
         # Quantize tensor in blocks
         finfo = torch.finfo(dtype)
@@ -640,7 +642,7 @@ class FP8BlockScaleMoe(Moe):
                 quantized_block = (block * scale).clamp(min=finfo.min, max=finfo.max)
                 quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(dtype)
                 scales[i, j] = scale.float().reciprocal()
-        
+
         if transpose_scale:
             scales = scales.t()
 
@@ -679,9 +681,11 @@ class FP8BlockScaleMoe(Moe):
     def quantize_inputs(self, hidden_states: torch.Tensor, hidden_states_scale_global):
         """For FP8 block scaling, no pre-quantization - everything happens at runtime."""
         # todo(Yingyi):quantize bf16 to fp8
-        hidden_states_fp8, hidden_states_scale = self.to_float8_blockwise(hidden_states)
+        hidden_states_quant, hidden_states_scale = self.to_float8_blockwise(
+            hidden_states
+        )
         return {
-            "hidden_states": hidden_states_fp8,
+            "hidden_states": hidden_states_quant,
             "hidden_states_scale": hidden_states_scale,
         }
 
@@ -759,9 +763,10 @@ class FP8BlockScaleMoe(Moe):
         tile_tokens_dim = kwargs["tile_tokens_dim"]
         enable_pdl = kwargs.get("enable_pdl")
         hidden_states_scale = kwargs["hidden_states_scale"]
+        hidden_states_quant = kwargs["hidden_states_quant"]
 
         # Generate block scales and quantize hidden states at runtime
-        hidden_states_fp8 = hidden_states_orig.to(torch.float8_e4m3fn)
+        hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
 
         output = trtllm_fp8_block_scale_moe(
             expert_logits,
@@ -1783,6 +1788,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "do_finalize": True,
         "gated_act_type": args.gated_act_type,
         "hidden_states_scale": args.hidden_states_scale,
+        "hidden_states_quant": kwargs["hidden_states_quant"],
     }
 
     return moe_impl.call_moe(
@@ -2151,6 +2157,9 @@ def test_moe_quantization_classes(
         tile_tokens_dim=tile_tokens_dim,
         weight_processing=weight_processing,
         enable_pdl=True,
+        hidden_states_quant=inputs_data[
+            "hidden_states"
+        ],  # NOTE(yingyi): only for fp8 block scale for now, refactor later
     )
 
     # Compare outputs using moe_impl-specific tolerances
