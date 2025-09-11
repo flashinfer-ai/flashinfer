@@ -158,6 +158,7 @@ def test_batch_decode_tensor_cores(
 
     # test that without fixed split size, precision is different
     # TODO: this works for the first 29 cases, but then fails with "illegal memory access"..?
+
     # wrapper_tensor_cores.plan(
     #     kv_indptr,
     #     kv_indices,
@@ -179,6 +180,5 @@ def test_batch_decode_tensor_cores(
     #     )
     # except AssertionError:
     #     pass
-    #     breakpoint()
     # else:
     #     raise AssertionError("Precision is the same without fixed split size")
