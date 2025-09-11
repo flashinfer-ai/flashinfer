@@ -949,7 +949,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
-        if fixed_split_size is not None and self.use_tensor_cores:
+        if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
             )
@@ -1044,6 +1044,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 False,  # causal
                 window_left,
+                fixed_split_size,
             )
         else:
             if self._jit_module is not None:
@@ -1060,7 +1061,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                 )
-            args = [
+            self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1076,11 +1077,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 torch.empty(0, dtype=q_data_type),
                 torch.empty(0, dtype=kv_data_type),
-            ]
-            if self.use_tensor_cores:
-                args.append(fixed_split_size)
-            self._plan_info = self._cached_module.plan(
-                *args,
             )
 
         self._pos_encoding_mode = pos_encoding_mode

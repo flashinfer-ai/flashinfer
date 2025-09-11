@@ -128,7 +128,7 @@ def test_batch_decode_tensor_cores(
         q, kv_data, return_lse=True
     )
 
-    kv_indptr_invariant = kv_indptr[: invariant_bs * num_pages_per_seq]
+    kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
     kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
     wrapper_tensor_cores.plan(
         kv_indptr_invariant,
@@ -144,14 +144,41 @@ def test_batch_decode_tensor_cores(
         fixed_split_size=fixed_split_size,
     )
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
-        q, kv_data, return_lse=True
+        q[:invariant_bs], kv_data, return_lse=True
     )
     torch.testing.assert_close(
-        o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-5, atol=1e-5
+        o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-6, atol=1e-6
     )
     torch.testing.assert_close(
         lse_tensor_cores[:invariant_bs],
         lse_tensor_cores_invariant,
-        rtol=1e-5,
-        atol=1e-5,
+        rtol=1e-6,
+        atol=1e-6,
     )
+
+    # test that without fixed split size, precision is different
+    # TODO: this works for the first 29 cases, but then fails with "illegal memory access"..?
+    # wrapper_tensor_cores.plan(
+    #     kv_indptr,
+    #     kv_indices,
+    #     kv_last_page_len,
+    #     num_qo_heads,
+    #     num_kv_heads,
+    #     head_dim,
+    #     page_size,
+    # )
+    # o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
+    #     q[:invariant_bs], kv_data, return_lse=True
+    # )
+    # try:
+    #     torch.testing.assert_close(
+    #         o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-6, atol=1e-6
+    #     )
+    #     torch.testing.assert_close(
+    #         lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant, rtol=1e-6, atol=1e-6
+    #     )
+    # except AssertionError:
+    #     pass
+    #     breakpoint()
+    # else:
+    #     raise AssertionError("Precision is the same without fixed split size")
