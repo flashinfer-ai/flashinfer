@@ -1,18 +1,17 @@
 # ---------------------------------------------
 # Stage 1: Build Flashinfer and generate artifacts
 # ---------------------------------------------
-ARG ROCM_VERSION=6.3
-
-FROM rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.4.0 as flashinfer_base
-
-ARG ROCM_VERSION=6.3
+ARG ROCM_VERSION=6.4.1
+ARG UBUNTU_VERSION=24.04
 ARG PY_VERSION=3.12
-ARG TORCH_VERSION=2.4
+ARG TORCH_VERSION=2.7.1
 
-# RUN apt-get install cmake
-WORKDIR /root/
+FROM rocm/pytorch:rocm${ROCM_VERSION}_ubuntu${UBUNTU_VERSION}_py${PY_VERSION}_pytorch_release_${TORCH_VERSION} AS flashinfer_base
 
-COPY . /root/flashinfer/
+# Consume the build arguments in the build stage
+ARG ROCM_VERSION
+ARG PY_VERSION
+ARG TORCH_VERSION
 
 ARG GFX_ARCH=gfx942
 ARG GPU_TARGETS=${GFX_ARCH}
@@ -22,6 +21,11 @@ ENV HIP_ARCHITECTURES=${GFX_ARCH}
 ENV PYTORCH_ROCM_ARCH=${GFX_ARCH}
 
 ARG MAMBA_ENV_NAME=flashinfer-py${PY_VERSION}-torch${TORCH_VERSION}-rocm${ROCM_VERSION}
+
+# RUN apt-get install cmake
+WORKDIR /root/
+
+COPY . /root/flashinfer/
 
 RUN curl -L micro.mamba.pm/install.sh | bash
 
@@ -39,7 +43,7 @@ RUN /bin/bash -c "eval \"\$(~/.local/bin/micromamba shell hook --shell bash)\" &
 # ---------------------------------------------
 # Stage 2: Build Test Dependencies - For CI
 # ---------------------------------------------
-FROM rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.4.0 as flashinfer_tester
+FROM rocm/pytorch:rocm${ROCM_VERSION}_ubuntu${UBUNTU_VERSION}_py${PY_VERSION}_pytorch_release_${TORCH_VERSION} AS flashinfer_tester
 
 ARG GFX_ARCH=gfx942
 ENV HIP_ARCHITECTURES=${GFX_ARCH}
@@ -52,12 +56,13 @@ ENV AMDGPU_TARGETS=${GFX_ARCH}
 WORKDIR /root/
 
 COPY . /root/flashinfer/
+
 RUN cd /root/ && \
-    wget https://download.pytorch.org/libtorch/rocm6.3/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Brocm6.3.zip && \
-    unzip libtorch-cxx11-abi-shared-with-deps-2.7.1+rocm6.3.zip && \
-    rm libtorch-cxx11-abi-shared-with-deps-2.7.1+rocm6.3.zip
+    wget https://download.pytorch.org/libtorch/rocm6.4/libtorch-shared-with-deps-2.8.0%2Brocm6.4.zip && \
+    unzip libtorch-shared-with-deps-2.8.0+rocm6.4.zip && \
+    rm libtorch-shared-with-deps-2.8.0+rocm6.4.zip
 
 RUN cd /root/flashinfer/libflashinfer/tests/hip/ && \
-    mkdir build && cd build && \
+    mkdir -p build && cd build && \
     cmake -DCMAKE_PREFIX_PATH=/root/libtorch/ -DCMAKE_CXX_COMPILER:PATH=/opt/rocm/bin/amdclang++ -DFLASHINFER_INCLUDE_DIRS=/root/flashinfer/libflashinfer/include -DCMAKE_HIP_ARCHITECTURES=${GFX_ARCH} -DHIP_ARCHITECTURES=${GFX_ARCH} -DGPU_TARGETS=${GFX_ARCH} -DAMDGPU_TARGETS=${GFX_ARCH} .. && \
     make
