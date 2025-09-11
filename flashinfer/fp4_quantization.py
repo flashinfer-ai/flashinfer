@@ -461,7 +461,7 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
         f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
     )
 
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
 
     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
@@ -498,7 +498,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(e2m1_tensor.device)
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch
@@ -669,7 +669,7 @@ def mxfp4_dequantize_host(
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with dtype float.
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(weight.device)
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(device_arch).mxfp4_dequantize_host(
         weight,
@@ -696,7 +696,7 @@ def nvfp4_batched_quantize(
             - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(
         a,
