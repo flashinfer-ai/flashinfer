@@ -280,13 +280,6 @@ struct BlockBatchPagedAttentionPersistent {
       //   mask_tile_idx, window_tile_idx);
       // }
       int window_tile_idx = kv_tile_idx;
-      // if (params.window_left > 0) {
-      //   window_tile_idx =
-      //       ceil_div(
-      //           min(kv_end, kv_len + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size)),
-      //           CTA_TILE_KV) -
-      //       1 - (q_len + params.window_left + kv_start) / CTA_TILE_KV;
-      // }
       if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
         printf(
             "work_idx: %d, kv_tile_idx: %d, mask_tile_idx: %d, window_tile_idx: %d, q_len: %d, "
