@@ -357,9 +357,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
                                       tx, ty, tz);
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    st_local.o[i] = variant.OutputTransform(
-        params, st_local.o[i], /*batch_idx=*/0, /*qo_idx=*/0, qo_head_idx,
-        st_local.m, st_local.d, /*scale=*/1.0f);
+    st_local.o[i] = variant.OutputTransform(params, st_local.o[i], /*batch_idx=*/0, /*qo_idx=*/0,
+                                            qo_head_idx, st_local.m, st_local.d, /*scale=*/1.0f);
   }
 
   st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
@@ -592,9 +591,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
                                       tz);
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    st.o[i] = variant.OutputTransform(
-        params, st.o[i], bx, /*qo_idx=*/0, qo_head_idx,
-        st.m, st.d, /*scale=*/1.0f);
+    st.o[i] = variant.OutputTransform(params, st.o[i], bx, /*qo_idx=*/0, qo_head_idx, st.m, st.d,
+                                      /*scale=*/1.0f);
   }
 
   if (tz == 0) {
@@ -1078,9 +1076,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
       if (qo_head_idx[i] < num_qo_heads) {
 #pragma unroll
         for (size_t j = 0; j < vec_size_ckv; ++j) {
-          st[i].o[j] = variant.OutputTransform(
-              params, st[i].o[j], batch_idx, /*qo_idx=*/0, qo_head_idx[i],
-              st[i].m, st[i].d, /*scale=*/1.0f);
+          st[i].o[j] = variant.OutputTransform(params, st[i].o[j], batch_idx, /*qo_idx=*/0,
+                                               qo_head_idx[i], st[i].m, st[i].d, /*scale=*/1.0f);
         }
         st[i].o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_ckv +
                            tx * vec_size_ckv);
