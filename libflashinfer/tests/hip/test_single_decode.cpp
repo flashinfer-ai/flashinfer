@@ -104,13 +104,11 @@ nan_detection_and_accuracy(const std::vector<DType> &cpu_results,
         float gpu_result =
             fi::con::explicit_casting<DType, float>(gpu_results[i]);
 
-        if (std::is_same_v<DType, __half>) {
-            if (isnan(gpu_result)) {
-                nan_detected = true;
-            }
-            num_result_errors_atol_1e_3_rtol_1e_3 +=
-                (!utils::isclose(gpu_result, cpu_result, 1e-2, 1e-2));
+        if (isnan(gpu_result)) {
+            nan_detected = true;
         }
+        num_result_errors_atol_1e_3_rtol_1e_3 +=
+            (!utils::isclose(gpu_result, cpu_result, 1e-2, 1e-2));
     }
 
     float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
@@ -203,19 +201,20 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads,
     hipFree(tmp);
 }
 
-// Potential issue:
-// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access
-// memory beyond the largest legal address. code: 0x29 Please look at
-// https://github.com/AMD-AIOSS/flashinfer/issues/33
 template <typename DTypeQO, typename DTypeKV>
 void TestSingleDecodeKernelCorrectness()
 {
     for (size_t num_qo_heads : {32}) {
         for (size_t num_kv_heads : {4, 8, 32}) {
-            for (size_t seq_len : {64, 128, 256}) {
+            for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048,
+                                   4096, 8192, 16384, 32768})
+            {
                 for (size_t head_dim : {64, 128, 256}) {
                     for (unsigned int kv_layout : {0U, 1U}) {
                         for (unsigned int pos_encoding_mode : {0U, 1U}) {
+                            if (std::is_same<DTypeQO, __hip_bfloat16>::value) {
+                                pos_encoding_mode = 0U;
+                            }
                             _TestDecodingKernelCorrectness<DTypeQO, DTypeKV>(
                                 num_qo_heads, num_kv_heads, seq_len, head_dim,
                                 QKVLayout(kv_layout),
@@ -230,7 +229,7 @@ void TestSingleDecodeKernelCorrectness()
 
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16)
 {
-    TestSingleDecodeKernelCorrectness<__hip_bfloat16, __half>();
+    TestSingleDecodeKernelCorrectness<__half, __half>();
 }
 
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16)

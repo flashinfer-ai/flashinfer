@@ -828,86 +828,110 @@ gpuError_t SingleDecodeWithKVCacheDispatched(Params params,
         std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     auto compute_capacity = GetCudaComputeCapability();
-    static_assert(bdx <= 32U);
+    static_assert(bdx <= 64U);
+
     DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
         constexpr uint32_t bdy = GROUP_SIZE;
+
+        // For AMD CDNA3, use fewer threads to reduce shared memory usage
         constexpr uint32_t num_threads = std::max(
             get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
+
         constexpr uint32_t bdz = num_threads / (bdx * bdy);
+
+        // Use smaller tile size for AMD to reduce shared memory requirements
         constexpr uint32_t tile_size_per_bdx =
-            GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
+            GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
+
         DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(
-            compute_capacity, NUM_STAGES_SMEM, {
-                const uint32_t smem_size = 2U * NUM_STAGES_SMEM * bdy *
+            compute_capacity, BASE_NUM_STAGES_SMEM, {
+                constexpr uint32_t NUM_STAGES_SMEM =
+                    std::min(BASE_NUM_STAGES_SMEM, 2U);
+                const uint64_t smem_size = 2U * NUM_STAGES_SMEM * bdy *
                                                tile_size_per_bdx * bdz *
                                                HEAD_DIM * sizeof(DTypeKV) +
                                            2U * bdy * bdz * sizeof(float);
+
+                // For AMD, ensure we don't exceed 64KB shared memory
+                const uint64_t max_smem = 65536U;
+                const uint64_t safe_smem_size =
+                    std::min(smem_size, max_smem - 1024U); // Leave some buffer
+
                 auto kernel = SingleDecodeWithKVCacheKernel<
                     POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
                     vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+
                 FI_GPU_CALL(gpuFuncSetAttribute(
                     (void *)kernel, gpuFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_size));
-                if (seq_len <= 256 || tmp == nullptr) {
-                    // no need to use partition-kv kernel
-                    dim3 nblks = dim3(1, num_kv_heads);
-                    dim3 nthrs = dim3(bdx, bdy, bdz);
-                    params.kv_chunk_size = seq_len;
-                    void *args[] = {(void *)&params};
-                    SingleDecodeWithKVCacheKernel<
-                        POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>
-                        <<<nblks, nthrs, smem_size, stream>>>(params);
-                }
-                else {
-                    // use partition-kv kernel
-                    int num_blocks_per_sm = 0;
-                    int num_sm = 0;
-                    int dev_id = 0;
-                    FI_GPU_CALL(gpuGetDevice(&dev_id));
-                    FI_GPU_CALL(gpuDeviceGetAttribute(
-                        &num_sm, gpuDevAttrMultiProcessorCount, dev_id));
-                    FI_GPU_CALL(gpuOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &num_blocks_per_sm, kernel, num_threads, smem_size));
-                    uint32_t max_grid_size =
-                        num_blocks_per_sm != 0
-                            ? uint32_t(num_blocks_per_sm) * uint32_t(num_sm)
-                            : uint32_t(8) * uint32_t(num_sm);
-                    uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                    uint32_t kv_chunk_size =
-                        max(ceil_div(seq_len, max_num_kv_chunks), 256);
-                    uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
-                    dim3 nblks = dim3(num_chunks, num_kv_heads);
-                    if (nblks.x == 0 || nblks.y == 0) {
-                        std::ostringstream err_msg;
-                        err_msg << "Invalid kernel configuration: nblks=("
-                                << nblks.x << "," << nblks.y << ")";
-                        FLASHINFER_ERROR(err_msg.str());
-                    }
-                    dim3 nthrs = dim3(bdx, bdy, bdz);
-                    float *tmp_lse =
-                        (float *)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
-                    auto o = params.o;
-                    auto lse = params.lse;
-                    params.o = tmp;
-                    params.lse = tmp_lse;
-                    params.kv_chunk_size = kv_chunk_size;
-                    void *args[] = {(void *)&params};
-                    SingleDecodeWithKVCacheKernel<
-                        POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>
-                        <<<nblks, nthrs, smem_size, stream>>>(params);
-                    if constexpr (AttentionVariant::use_softmax) {
-                        FI_GPU_CALL(MergeStates(tmp, tmp_lse, o, lse,
-                                                num_chunks, 1, num_qo_heads,
-                                                HEAD_DIM, stream));
+                    safe_smem_size));
+
+#if defined(PLATFORM_HIP_DEVICE)
+                // For CDNA we have shared memory allocaion disabled for now.
+                // TODO: Fix this for better performance
+                dim3 nblks = dim3(1, num_kv_heads);
+                dim3 nthrs = dim3(bdx, bdy, bdz);
+                params.kv_chunk_size = seq_len;
+                void *args[] = {(void *)&params};
+                FI_GPU_CALL(gpuLaunchKernel((void *)kernel, nblks, nthrs, args,
+                                            safe_smem_size, stream));
+
+#else
+
+                    if (seq_len <= 256 || tmp == nullptr) {
+                        // No need to use partition-kv kernel
+                        dim3 nblks = dim3(1, num_kv_heads);
+                        dim3 nthrs = dim3(bdx, bdy, bdz);
+                        params.kv_chunk_size = seq_len;
+                        void *args[] = {(void *)&params};
+                        FI_GPU_CALL(gpuLaunchKernel((void *)kernel, nblks, nthrs,
+                                                    args, safe_smem_size, stream));
                     }
                     else {
-                        FI_GPU_CALL(AttentionSum(tmp, o, num_chunks, 1,
-                                                 num_qo_heads, HEAD_DIM,
-                                                 stream));
+                        // Use partition-kv kernel with AMD-specific tuning
+                        int num_blocks_per_sm = 0;
+                        int num_sm = 0;
+                        int dev_id = 0;
+                        FI_GPU_CALL(gpuGetDevice(&dev_id));
+                        FI_GPU_CALL(gpuDeviceGetAttribute(
+                            &num_sm, gpuDevAttrMultiProcessorCount, dev_id));
+
+                        // For AMD hardware, limit to 1 block per CU to avoid shared
+                        // memory issues
+                        num_blocks_per_sm = 1;
+
+                        uint32_t max_grid_size =
+                            uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
+                        uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
+
+                        // For AMD, use smaller chunk size to fit in memory
+                        uint32_t kv_chunk_size =
+                            max(ceil_div(seq_len, max_num_kv_chunks), 256U);
+                        uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
+
+                        dim3 nblks = dim3(num_chunks, num_kv_heads);
+                        dim3 nthrs = dim3(bdx, bdy, bdz);
+
+                        float *tmp_lse =
+                            (float *)(tmp + num_chunks * num_qo_heads * HEAD_DIM);
+                        auto o = params.o;
+                        params.o = tmp;
+                        params.lse = tmp_lse;
+                        params.kv_chunk_size = kv_chunk_size;
+                        void *args[] = {(void *)&params};
+
+                        FI_GPU_CALL(gpuLaunchKernel((void *)kernel, nblks, nthrs,
+                                                    args, safe_smem_size, stream));
+
+                        if constexpr (AttentionVariant::use_softmax) {
+                            FI_GPU_CALL(
+                            MergeStates(tmp, tmp_lse, o, nullptr, num_chunks,
+                            1, num_qo_heads, HEAD_DIM, stream));
+                        } else {
+                            FI_GPU_CALL(AttentionSum(tmp, o, num_chunks, 1,
+                            num_qo_heads, HEAD_DIM, stream));
+                        }
                     }
-                }
+#endif
             });
     });
     return gpuSuccess;
