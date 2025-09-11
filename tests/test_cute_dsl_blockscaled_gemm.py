@@ -21,6 +21,7 @@ from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     is_cute_dsl_available,
 )
+from flashinfer.utils import ceil_div
 
 
 @pytest.mark.skipif(
@@ -59,6 +60,9 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
+# TODO enable in tests
+@pytest.mark.parametrize("enable_src_signals", [True])
+@pytest.mark.parametrize("enable_dst_signals", [False, True])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
@@ -76,6 +80,8 @@ def test_blockscaled_gemm_python_interface(
     sm_count: int,
     tolerance: float,
     iterations: int,
+    enable_src_signals: int,
+    enable_dst_signals: int,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda:0")
@@ -107,6 +113,8 @@ def test_blockscaled_gemm_python_interface(
         pytest.skip(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
+    if enable_dst_signals and sf_vec_size != 16:
+        pytest.skip(f"Unsupported testcase {enable_dst_signals=} {sf_vec_size=}")
 
     if not (a_major == "k" and b_major == "k" and c_major == "n"):
         # not supported since we try to align deepgemm for now
@@ -175,6 +183,9 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
 
     for _ in range(iterations):
+        # dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+        dst_signals = torch.zeros((l, ceil_div(m, mma_tiler_mn[0])), dtype=torch.int32, device="cuda") if enable_dst_signals else None
+
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
             (a_torch, sfa_torch),
@@ -190,7 +201,16 @@ def test_blockscaled_gemm_python_interface(
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
             sm_count=sm_count,
+            src_signals=torch.ones((l,), dtype=torch.uint32, device="cuda") if enable_src_signals else None,
+            src_signal_expect_value=1 if enable_src_signals else 0,
+            dst_signals=dst_signals,
         )
+
+        if enable_dst_signals:
+            expect_dst_signals = torch.zeros_like(dst_signals)
+            for expert_idx in range(l):
+                expect_dst_signals[expert_idx, :ceil_div(masked_m_tensor[expert_idx], mma_tiler_mn[0])] = ceil_div(n, mma_tiler_mn[1])
+            assert torch.all(dst_signals == expect_dst_signals), f"{dst_signals=} {expect_dst_signals=} {masked_m_tensor=}"
 
     # compute ref output
     if not fuse_alpha:
@@ -244,8 +264,10 @@ def test_blockscaled_gemm_python_interface(
 
 if __name__ == "__main__":
     test_blockscaled_gemm_python_interface(
-        lm=(1, 1024),
-        kn=(7168, 4096),
+        # lm=(1, 1024),
+        # kn=(7168, 4096),
+        lm=(6, 1024),
+        kn=(2048, 7168),
         ab_dtype="float4_e2m1fn",
         sf_dtype="float8_e8m0fnu",
         sf_vec_size=16,
@@ -260,4 +282,29 @@ if __name__ == "__main__":
         tolerance=1e-01,
         iterations=3,
         sm_count=132,
+        enable_src_signals=False,
+        enable_dst_signals=True,
     )
+
+    # TODO can use this to reproduce illegal mem access
+    # test_blockscaled_gemm_python_interface(
+    #     # TODO real value in masked_m is smaller than this m shape
+    #     lm=(6, 36864),
+    #     kn=(7168, 4096),
+    #     ab_dtype="float4_e2m1fn",
+    #     sf_dtype="float8_e8m0fnu",
+    #     sf_vec_size=16,
+    #     c_dtype="float16",
+    #     a_major="k",
+    #     b_major="k",
+    #     c_major="n",
+    #     fuse_alpha=False,
+    #     alpha_dtype="float32",
+    #     mma_tiler_mn=(128, 128),
+    #     cluster_shape_mn=(2, 1),
+    #     tolerance=1e-01,
+    #     iterations=3,
+    #     sm_count=132,
+    #     enable_src_signals=False,
+    #     enable_dst_signals=False,
+    # )
