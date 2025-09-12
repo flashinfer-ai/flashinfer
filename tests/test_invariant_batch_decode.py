@@ -146,15 +146,8 @@ def test_batch_decode_tensor_cores(
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
         q[:invariant_bs], kv_data, return_lse=True
     )
-    torch.testing.assert_close(
-        o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-7, atol=1e-7
-    )
-    torch.testing.assert_close(
-        lse_tensor_cores[:invariant_bs],
-        lse_tensor_cores_invariant,
-        rtol=1e-7,
-        atol=1e-7,
-    )
+    assert torch.equal(o_tensor_cores[:invariant_bs], o_tensor_cores_invariant)
+    assert torch.equal(lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant)
 
     # test that without fixed split size, precision is different
     # TODO: this works for the first 29 cases, but then fails with "illegal memory access"..?
