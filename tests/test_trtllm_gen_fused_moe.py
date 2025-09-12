@@ -596,58 +596,6 @@ class FP4Moe(Moe):
 class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style)."""
 
-    def to_float8_blockwise(
-        self,
-        x,
-        block_size_m=128,
-        block_size_n=128,
-        dtype=torch.float8_e4m3fn,
-        transpose_scale=True,
-        is_blockm=False,
-        is_blockn=True,
-    ):
-        assert x.dtype == torch.bfloat16
-        x = x.contiguous()
-        assert x.dim() == 2
-        m, n = x.shape
-
-        m_tile = block_size_m if is_blockm else 1
-        n_tile = block_size_n if is_blockn else 1
-        num_blocks_m = m // m_tile
-        num_blocks_n = n // n_tile
-
-        # Initialize output tensors
-        quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
-        scales = torch.empty(
-            (num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device
-        )
-
-        # Quantize tensor in blocks
-        finfo = torch.finfo(dtype)
-        for i in range(num_blocks_m):
-            for j in range(num_blocks_n):
-                # Determine block slices
-                start_m, end_m = i * m_tile, min((i + 1) * m_tile, m)
-                start_n, end_n = j * n_tile, min((j + 1) * n_tile, n)
-
-                # Extract the block
-                block = x[start_m:end_m, start_n:end_n]
-
-                # Per-block quantization logic
-                min_val, max_val = block.aminmax()
-                amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-                scale = finfo.max / amax
-
-                # Quantize the block and store the scale
-                quantized_block = (block * scale).clamp(min=finfo.min, max=finfo.max)
-                quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(dtype)
-                scales[i, j] = scale.float().reciprocal()
-
-        if transpose_scale:
-            scales = scales.t()
-
-        return quantized_x, scales
-
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
         num_experts = gemm1_weights.shape[0]
@@ -680,10 +628,64 @@ class FP8BlockScaleMoe(Moe):
 
     def quantize_inputs(self, hidden_states: torch.Tensor, hidden_states_scale_global):
         """For FP8 block scaling, no pre-quantization - everything happens at runtime."""
+
+        def to_float8_blockwise(
+            x,
+            block_size_m=128,
+            block_size_n=128,
+            dtype=torch.float8_e4m3fn,
+            transpose_scale=True,
+            is_blockm=False,
+            is_blockn=True,
+        ):
+            assert x.dtype == torch.bfloat16
+            x = x.contiguous()
+            assert x.dim() == 2
+            m, n = x.shape
+
+            m_tile = block_size_m if is_blockm else 1
+            n_tile = block_size_n if is_blockn else 1
+            num_blocks_m = m // m_tile
+            num_blocks_n = n // n_tile
+
+            # Initialize output tensors
+            quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
+            scales = torch.empty(
+                (num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device
+            )
+
+            # Quantize tensor in blocks
+            finfo = torch.finfo(dtype)
+            for i in range(num_blocks_m):
+                for j in range(num_blocks_n):
+                    # Determine block slices
+                    start_m, end_m = i * m_tile, min((i + 1) * m_tile, m)
+                    start_n, end_n = j * n_tile, min((j + 1) * n_tile, n)
+
+                    # Extract the block
+                    block = x[start_m:end_m, start_n:end_n]
+
+                    # Per-block quantization logic
+                    min_val, max_val = block.aminmax()
+                    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+                    scale = finfo.max / amax
+
+                    # Quantize the block and store the scale
+                    quantized_block = (block * scale).clamp(
+                        min=finfo.min, max=finfo.max
+                    )
+                    quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(
+                        dtype
+                    )
+                    scales[i, j] = scale.float().reciprocal()
+
+            if transpose_scale:
+                scales = scales.t()
+
+            return quantized_x, scales
+
         # todo(Yingyi):quantize bf16 to fp8
-        hidden_states_quant, hidden_states_scale = self.to_float8_blockwise(
-            hidden_states
-        )
+        hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
         return {
             "hidden_states": hidden_states_quant,
             "hidden_states_scale": hidden_states_scale,
@@ -1688,6 +1690,31 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
 def run_moe_reference_dsfp8(args):
     """FP8 block-scale reference implementation."""
     # Generate block scales at runtime for FP8 block scaling
+
+    def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
+        """Reference FP8 block-scale dequantization."""
+        input = input.to(torch.float)
+        scale = scale.to(torch.float)
+        if transpose_scale:
+            scale = scale.t()
+
+        m, n = input.shape
+        m_tile = 128 if block_m else 1
+        n_tile = 128 if block_n else 1
+
+        assert m % m_tile == 0
+        assert n % n_tile == 0
+        assert scale.shape == (m // m_tile, n // n_tile)
+
+        # Expand scale to match input dimensions using tensor operations
+        if m_tile > 1:
+            scale = torch.repeat_interleave(scale, m_tile, dim=0)
+        if n_tile > 1:
+            scale = torch.repeat_interleave(scale, n_tile, dim=1)
+
+        # Element-wise multiplication (equivalent to the nested loop logic)
+        output = input * scale
+        return output
 
     # todo(Yingyi): use original hidden_states??
     hidden_states_dequant = dequant_reference_dsfp8(
