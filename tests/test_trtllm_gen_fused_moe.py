@@ -773,10 +773,6 @@ class FP8BlockScaleMoe(Moe):
             "NaN detected in hidden_states_fp8"
         )
 
-        # debug-only
-        print("hidden_states_fp8", hidden_states_fp8)
-        print("hidden_states_scale", hidden_states_scale)
-
         output = trtllm_fp8_block_scale_moe(
             expert_logits,
             routing_bias,
@@ -809,7 +805,7 @@ class FP8BlockScaleMoe(Moe):
 
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
-        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.8}
 
 
 # ====================================================================================
@@ -1026,7 +1022,6 @@ class moe_args:
         permute_info,
         use_routing_scales_on_input,
         gated_act_type,
-        hidden_states_orig=None,  # debug-only
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1047,8 +1042,6 @@ class moe_args:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gated_act_type = gated_act_type
-        # debug-only
-        self.hidden_states_orig = hidden_states_orig
 
 
 class moe_args_dequant:
@@ -1728,19 +1721,6 @@ def run_moe_reference_dsfp8(args):
         args.hidden_states, args.hidden_states_scale, True, False, True
     )
 
-    # debug-only
-    print("hidden_states", args.hidden_states)
-    print("hidden_states_scale", args.hidden_states_scale)
-    print("hidden_states_dequant", hidden_states_dequant)
-    tolerances = FP8BlockScaleMoe().get_tolerances()
-    check_accuracy(
-        args.hidden_states_orig,
-        hidden_states_dequant,
-        atol=tolerances["atol"],
-        rtol=tolerances["rtol"],
-        percent=tolerances["percent"],
-    )
-
     gemm1_weights_dequant = {}
     for i in range(args.num_experts):
         gemm1_weights_dequant[i] = dequant_reference_dsfp8(
@@ -2108,8 +2088,6 @@ def test_moe_quantization_classes(
         dtype=torch.bfloat16,
     )
 
-    print("original hidden_states", hidden_states)
-
     # Generate routing info
     use_routing_scales_on_input = routing_method_type == RoutingMethodType.Llama4
 
@@ -2186,7 +2164,6 @@ def test_moe_quantization_classes(
         permute_info,
         use_routing_scales_on_input,
         gated_act_type,
-        hidden_states_orig=hidden_states,
     )
 
     # Compute reference output using the moe_impl
