@@ -1541,6 +1541,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1641,11 +1642,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
         fixed_split_size : Optional[int],
-            The fixed split size for split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            The fixed split size for FA2 split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
             When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
             batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1866,7 +1869,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     block_id += num_blocks_needed
 
         if self._cached_module is not None:
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1883,7 +1886,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
-                fixed_split_size,
+            ]
+            if self._backend == "fa2":
+                args.append(-1)  # fixed_split_size
+                args.append(False)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._causal = causal
@@ -2491,6 +2499,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2580,6 +2589,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2718,7 +2729,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         else:
             assert self._cached_module is not None, "cached module is not initialized"
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -2735,7 +2746,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
-                fixed_split_size,
+            ]
+            if self._backend == "fa2":
+                args.append(-1)  # fixed_split_size
+                args.append(False)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._causal = causal

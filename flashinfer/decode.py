@@ -827,6 +827,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -880,7 +881,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
-
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1045,6 +1047,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # causal
                 window_left,
                 fixed_split_size,
+                disable_split_kv,
             )
         else:
             if self._jit_module is not None:
