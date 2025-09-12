@@ -2490,6 +2490,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2573,7 +2574,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
-
+        fixed_split_size : Optional[int],
+            The fixed split size for split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2592,7 +2598,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-
+        if fixed_split_size is None:
+            fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
@@ -2728,6 +2735,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                fixed_split_size,
             )
 
         self._causal = causal
