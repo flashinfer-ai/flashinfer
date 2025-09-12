@@ -81,6 +81,7 @@ def generate_ninja_build_for_op(
         "$cuda_home/include",
         "$cuda_home/include/cccl",
         tvm_ffi.libinfo.find_include_path(),
+        tvm_ffi.libinfo.find_dlpack_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]

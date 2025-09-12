@@ -35,6 +35,7 @@ void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable
   unsigned int hidden_size = input->shape[1];
   TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
+  cudaSetDevice(input->device.device_id);
   const cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetCurrentStream(output->device.device_type, output->device.device_id));
 
@@ -63,6 +64,7 @@ void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
   TVM_FFI_ICHECK_EQ(residual->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(residual->shape[1], hidden_size);
   TVM_FFI_ICHECK_EQ(weight->shape[0], hidden_size);
+  cudaSetDevice(input->device.device_id);
   const cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetCurrentStream(residual->device.device_type, residual->device.device_id));
 
@@ -89,6 +91,7 @@ void gemma_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool 
   unsigned int hidden_size = input->shape[1];
   TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
+  cudaSetDevice(input->device.device_id);
   const cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetCurrentStream(output->device.device_type, output->device.device_id));
 
@@ -118,6 +121,7 @@ void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, doubl
   TVM_FFI_ICHECK_EQ(residual->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(residual->shape[1], hidden_size);
   TVM_FFI_ICHECK_EQ(weight->shape[0], hidden_size);
+  cudaSetDevice(input->device.device_id);
   const cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetCurrentStream(residual->device.device_type, residual->device.device_id));
 
