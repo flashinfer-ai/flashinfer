@@ -2575,7 +2575,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
         fixed_split_size : Optional[int],
-            The fixed split size for split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            The fixed split size for split-kv FA2 prefill/decode, in pages. Recommend setting to the average sequence length of your workload.
             When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
             batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
