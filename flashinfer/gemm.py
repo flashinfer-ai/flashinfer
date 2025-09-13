@@ -952,7 +952,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
             ) -> List[int]:
                 # Return all available TGV configurations
                 # Based on the configurations in tgv_gemm_configs.h
-                tactic_fn = getattr(module, f"tgv_gemm_tactic_num")
+                tactic_fn = module.tgv_gemm_tactic_num
                 return list(range(tactic_fn()))
 
             def forward(
@@ -967,7 +967,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
-                gemm_fn = getattr(module, f"tgv_gemm")
+                gemm_fn = module.tgv_gemm
                 out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
                 return out.t()
 
@@ -987,9 +987,9 @@ def tgv_gemm_sm100(
 ) -> torch.Tensor:
     """
     Perform TGV GEMM on SM100 architecture with automatic dtype detection.
-    
+
     Computes: A @ B + bias
-    
+
     Args:
         a: First input tensor of shape (M, K) in row-major layout
         b: Second input tensor of shape (K, N) in column-major layout
@@ -998,11 +998,11 @@ def tgv_gemm_sm100(
 
     Returns:
         Output tensor of shape (M, N)
-        
+
     Supported dtypes:
         - torch.bfloat16
         - torch.float16
-        
+
     Note:
         - Requires SM100, SM103, or SM110 architecture
         - Input tensors a and b must have the same dtype
