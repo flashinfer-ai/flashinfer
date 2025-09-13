@@ -865,6 +865,193 @@ def get_gemm_sm120_module_cutlass_fp4():
     )
 
 
+def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+    """
+    Generate TGV GEMM module for SM100 architecture.
+
+    Args:
+        dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+
+    Returns:
+        JitSpec for the TGV GEMM module
+    """
+    if dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported dtype {dtype}. Only bfloat16 and float16 are supported."
+        )
+
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+    module_name = f"tgv_gemm_{dtype_str}"
+
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / f"gen_tgv_gemm_{dtype_str}"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "tgv_gemm.cu",
+    ]
+
+    # Read the Jinja template
+    with open(jit_env.FLASHINFER_CSRC_DIR / "tgv_gemm.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    # Define tile size configurations (cta_m, cta_n, dma_stages)
+    cta_m_n_dma_list = [
+        (64, 8, 6),
+        (64, 8, 8),
+        (64, 8, 10),
+        (64, 8, 12),
+        (64, 16, 6),
+        (64, 16, 8),
+        (64, 16, 10),
+        (64, 32, 6),
+        (64, 32, 8),
+        (64, 64, 6),
+        (128, 64, 6),
+    ]
+
+    # Generate instances for the specified dtype
+    for cta_m, cta_n, dma_stage in cta_m_n_dma_list:
+        dest_path = (
+            gen_directory / f"tgv_gemm_{dtype_str}_{cta_m}x{cta_n}_{dma_stage}.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            cta_m=cta_m, cta_n=cta_n, dma_stage=dma_stage, dtype=dtype_str
+        )
+        write_if_different(dest_path, source)
+
+    return gen_jit_spec(
+        module_name,
+        source_paths,
+        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_INCLUDE_DIR,
+            jit_env.FLASHINFER_CSRC_DIR,
+        ],
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
+    """
+    Get and build the TGV GEMM module for the specified dtype.
+
+    Args:
+        dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+
+    Returns:
+        SimpleNamespace with the runner function
+    """
+    module = gen_gemm_sm100_module_tgv(dtype).build_and_load()
+
+    def tgv_gemm_runner():
+        class TGVGemmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                # Return all available TGV configurations
+                # Based on the configurations in tgv_gemm_configs.h
+                tactic_fn = module.tgv_gemm_tactic_num
+                return list(range(tactic_fn()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, bias = inputs
+                pdl = kwargs.get("pdl", False)
+                # swap gemm m and n by swapping b and a
+                # tgv_gemm takes mat1 as weights and mat2 as input tensor
+                # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
+                gemm_fn = module.tgv_gemm
+                out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
+                return out.t()
+
+        return TGVGemmRunner()
+
+    # Register the module
+    return SimpleNamespace(
+        tgv_gemm_runner=tgv_gemm_runner,
+    )
+
+
+def tgv_gemm_sm100(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    pdl: bool = False,
+) -> torch.Tensor:
+    """
+    Perform TGV GEMM on SM100 architecture with automatic dtype detection.
+
+    Computes: A @ B + bias
+
+    Args:
+        a: First input tensor of shape (M, K) in row-major layout
+        b: Second input tensor of shape (K, N) in column-major layout
+        bias: Bias tensor of shape (N,)
+        pdl: Whether to use PDL (persistent data loader), defaults to False
+
+    Returns:
+        Output tensor of shape (M, N)
+
+    Supported dtypes:
+        - torch.bfloat16
+        - torch.float16
+
+    Note:
+        - Requires SM100, SM103, or SM110 architecture
+        - Input tensors a and b must have the same dtype
+        - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
+    """
+    # Verify SM100 architecture support
+    if not _match_sm_version(a.device, ["100", "103", "110"]):
+        raise ValueError("TGV GEMM requires SM100, SM103, or SM110 architecture")
+
+    # Verify dtype support
+    if a.dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported dtype {a.dtype}. Only bfloat16 and float16 are supported."
+        )
+
+    if a.dtype != b.dtype:
+        raise ValueError(
+            f"Input tensors must have the same dtype. Got {a.dtype} and {b.dtype}."
+        )
+
+    runners = []
+    runners.append(get_gemm_sm100_module_tgv(a.dtype).tgv_gemm_runner())
+
+    tuner = AutoTuner.get()
+    a_tensor_index = 0
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (a_tensor_index,),
+                (-2,),
+                get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2,
+            ),
+        ),
+        constraint_specs=(),
+    )
+
+    inputs = [a, b, bias]
+    dtype_str = "bf16" if a.dtype == torch.bfloat16 else "fp16"
+    runner, tactic = tuner.choose_one(
+        f"{dtype_str}_tgv_gemm",
+        runners,
+        tuning_config,
+        inputs,
+    )
+
+    return runner(inputs=inputs, tactic=tactic, pdl=pdl)
+
+
 def gen_gemm_sm90_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm90"
     os.makedirs(gen_directory, exist_ok=True)
