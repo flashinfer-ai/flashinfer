@@ -351,13 +351,13 @@ inline auto DecodeSplitKVIndptr(IdType* indptr_h, uint32_t batch_size, uint32_t 
   o_indptr.push_back(0);
 
   for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
-    uint32_t num_tiles_kv = ceil_div(
+    uint32_t num_chunks_kv = ceil_div(
         std::max<uint32_t>(indptr_h[batch_idx + 1] - indptr_h[batch_idx], 1U), kv_chunk_size);
-    for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
+    for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_chunks_kv; ++kv_tile_idx) {
       request_indices.push_back(batch_idx);
       kv_tile_indices.push_back(kv_tile_idx);
     }
-    o_indptr.push_back(o_indptr.back() + num_tiles_kv);
+    o_indptr.push_back(o_indptr.back() + num_chunks_kv);
   }
 
   return std::make_tuple(request_indices, kv_tile_indices, o_indptr);
@@ -581,12 +581,12 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     const int64_t packed_qo_len = packed_qo_len_arr[request_idx];
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
     const int64_t kv_len = std::max(int(effective_kv_len_arr[request_idx]), 1);
-    const int64_t num_tiles_kv = disable_split_kv ? 1 : ceil_div(kv_len, kv_chunk_size);
+    const int64_t num_chunks_kv = disable_split_kv ? 1 : ceil_div(kv_len, kv_chunk_size);
     if (fixed_split_size > 0 && !disable_split_kv) {
-      split_kv = split_kv || num_tiles_kv > 1;
+      split_kv = split_kv || num_chunks_kv > 1;
     }
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
-      for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
+      for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_chunks_kv; ++kv_tile_idx) {
         new_batch_size += 1;
         request_indices.push_back(request_idx);
         qo_tile_indices.push_back(q_tile_idx);
@@ -596,9 +596,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
     int64_t qo_len = packed_qo_len / gqa_group_size;
     for (uint32_t row = 0; row < qo_len; ++row) {
-      merge_indptr.push_back(merge_indptr.back() + num_tiles_kv);
+      merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
     }
-    o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
+    o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
   }
 
   const size_t padded_batch_size =
