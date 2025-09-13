@@ -46,8 +46,8 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("seq_len", [1, 3, 19, 99, 199, 1999])
-@pytest.mark.parametrize("window_left", [3, 13, 23, 43])
+@pytest.mark.parametrize("seq_len", [1, 3, 19, 99, 199, 1177, 1999])
+@pytest.mark.parametrize("window_left", [3, 13, 23, 37, 43])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -78,8 +78,16 @@ def test_single_decode_sliding_window(
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_batch_decode_sliding_window(
-    batch_size, kv_len, window_left, num_kv_heads, num_qo_heads, head_dim, page_size
+    batch_size,
+    kv_len,
+    window_left,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    page_size,
+    backend,
 ):
     q = torch.randn(
         batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0"
@@ -112,7 +120,9 @@ def test_batch_decode_sliding_window(
     )
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend=backend
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -207,14 +217,15 @@ def test_single_prefill_sliding_window(
     torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 397])
-@pytest.mark.parametrize("qo_len", [37, 47])
-@pytest.mark.parametrize("window_left", [13, 33])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("batch_size", [12, 17, 30])
+@pytest.mark.parametrize("kv_len", [54, 397, 1177])
+@pytest.mark.parametrize("qo_len", [1, 37, 47])
+@pytest.mark.parametrize("window_left", [13, 33, 111])
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_batch_paged_prefill_sliding_window(
     batch_size,
     kv_len,
@@ -224,7 +235,11 @@ def test_batch_paged_prefill_sliding_window(
     num_qo_heads,
     head_dim,
     page_size,
+    backend,
 ):
+    if num_qo_heads < num_kv_heads:
+        pytest.skip("num_qo_heads < num_kv_heads is not supported")
+
     q = torch.randn(
         batch_size * qo_len,
         num_qo_heads,
@@ -263,7 +278,9 @@ def test_batch_paged_prefill_sliding_window(
     )
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend=backend
+    )
     wrapper.plan(
         q_indptr,
         kv_indptr,
@@ -315,8 +332,16 @@ def test_batch_paged_prefill_sliding_window(
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_batch_ragged_prefill_sliding_window(
-    batch_size, kv_len, qo_len, window_left, num_kv_heads, num_qo_heads, head_dim
+    batch_size,
+    kv_len,
+    qo_len,
+    window_left,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    backend,
 ):
     q = torch.randn(
         batch_size * qo_len,
@@ -346,7 +371,9 @@ def test_batch_ragged_prefill_sliding_window(
         torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
     )
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend=backend
+    )
     wrapper.plan(
         q_indptr,
         kv_indptr,

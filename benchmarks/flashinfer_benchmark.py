@@ -76,6 +76,12 @@ def parse_args(line=sys.argv[1:]):
         help="Disable CUDA graph to execute kernels outside of the graph.",
     )
     parser.add_argument(
+        "--use_cupti",
+        action="store_true",
+        default=False,
+        help="Use CUPTI for timing GPU kernels when available.",
+    )
+    parser.add_argument(
         "--refcheck",
         action="store_true",
         default=False,
