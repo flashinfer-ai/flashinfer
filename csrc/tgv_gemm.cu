@@ -221,7 +221,4 @@ int64_t bf16_gemm_tactic_num() { return tgv_gemm_tactic_num(); }
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("tgv_gemm", &torch_ext::tgv_gemm);
   m.def("tgv_gemm_tactic_num", &torch_ext::tgv_gemm_tactic_num);
-  // Keep backward compatibility
-  m.def("bf16_gemm", &torch_ext::bf16_gemm);
-  m.def("bf16_gemm_tactic_num", &torch_ext::bf16_gemm_tactic_num);
 }

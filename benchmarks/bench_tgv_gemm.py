@@ -9,7 +9,7 @@ import csv
 import torch
 import torch.nn.functional as F
 
-from flashinfer import tgv_gemm_bf16_sm100, autotune
+from flashinfer import tgv_gemm_sm100, autotune
 
 
 def test_tgv_gemm_bf16_sm100_perf():
@@ -104,7 +104,7 @@ def test_tgv_gemm_bf16_sm100_perf():
         # Warmup
         with autotune(tune_mode=True):
             for _ in range(3):
-                _ = tgv_gemm_bf16_sm100(A, B, bias)
+                _ = tgv_gemm_sm100(A, B, bias)
 
         torch.cuda.synchronize()
 
@@ -113,7 +113,7 @@ def test_tgv_gemm_bf16_sm100_perf():
         # Start graph capture
         with torch.cuda.graph(tgv_graph):
             for _ in range(100):
-                _ = tgv_gemm_bf16_sm100(A, B, bias)
+                _ = tgv_gemm_sm100(A, B, bias)
 
         # Warmup the graph
         tgv_graph.replay()
@@ -136,7 +136,7 @@ def test_tgv_gemm_bf16_sm100_perf():
         pdl_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(pdl_graph):
             for _ in range(100):
-                _ = tgv_gemm_bf16_sm100(A, B, bias, pdl=True)
+                _ = tgv_gemm_sm100(A, B, bias, pdl=True)
 
         # Warmup the graph
         pdl_graph.replay()
@@ -195,7 +195,7 @@ def test_tgv_gemm_bf16_sm100_correctness():
     reference = torch.matmul(A, B) + bias.unsqueeze(0)
 
     # Test with TGV runner
-    out = tgv_gemm_bf16_sm100(A, B, bias)
+    out = tgv_gemm_sm100(A, B, bias)
 
     # Check correctness
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)

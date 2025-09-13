@@ -942,7 +942,6 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
         SimpleNamespace with the runner function
     """
     module = gen_gemm_sm100_module_tgv(dtype).build_and_load()
-    dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
 
     def tgv_gemm_runner():
         class TGVGemmRunner(TunableRunner):
@@ -953,7 +952,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
             ) -> List[int]:
                 # Return all available TGV configurations
                 # Based on the configurations in tgv_gemm_configs.h
-                tactic_fn = getattr(module, f"{dtype_str}_gemm_tactic_num")
+                tactic_fn = getattr(module, f"tgv_gemm_tactic_num")
                 return list(range(tactic_fn()))
 
             def forward(
@@ -968,7 +967,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
-                gemm_fn = getattr(module, f"{dtype_str}_gemm")
+                gemm_fn = getattr(module, f"tgv_gemm")
                 out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
                 return out.t()
 
@@ -988,15 +987,26 @@ def tgv_gemm_sm100(
 ) -> torch.Tensor:
     """
     Perform TGV GEMM on SM100 architecture with automatic dtype detection.
-
+    
+    Computes: A @ B + bias
+    
     Args:
-        a: First input tensor (M x K)
-        b: Second input tensor (K x N)
-        bias: Bias tensor (N,)
-        pdl: Whether to use PDL (persistent data loader)
+        a: First input tensor of shape (M, K) in row-major layout
+        b: Second input tensor of shape (K, N) in column-major layout
+        bias: Bias tensor of shape (N,)
+        pdl: Whether to use PDL (persistent data loader), defaults to False
 
     Returns:
-        Output tensor (M x N)
+        Output tensor of shape (M, N)
+        
+    Supported dtypes:
+        - torch.bfloat16
+        - torch.float16
+        
+    Note:
+        - Requires SM100, SM103, or SM110 architecture
+        - Input tensors a and b must have the same dtype
+        - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103", "110"]):
