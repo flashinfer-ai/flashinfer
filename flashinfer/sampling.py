@@ -468,7 +468,7 @@ def _check_tensor_param(param: Any, tensor: torch.Tensor) -> None:
     if isinstance(param, torch.Tensor):
         if param.dim() == 0:
             raise ValueError(
-                f"Expected a 1D tensor or scalar for the sampling parameter, "
+                f"Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
                 f"but got a 0-dimensional tensor with shape {param.shape}. "
             )
         elif param.dim() > 1:
@@ -686,8 +686,8 @@ def top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
-        If a scalar, the same threshold is used for all requests.
+        Either a float or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        If a float, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
