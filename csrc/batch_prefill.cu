@@ -55,7 +55,7 @@ at::Tensor BatchPrefillWithKVCachePlan(
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
   PrefillPlanInfo plan_info;
-  printf("disable_split_kv: %d\n", disable_split_kv);
+
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   cudaError_t status = PrefillPlan<IdType>(
@@ -299,7 +299,6 @@ void BatchPrefillWithPagedKVCacheRun(
         params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
         params.kv_chunk_size_ptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
-        printf("plan_info.split_kv: %d\n", plan_info.split_kv);
         if (plan_info.split_kv) {
           params.merge_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
