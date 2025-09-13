@@ -565,7 +565,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
   bool split_kv = false;
   int64_t kv_chunk_size;
-  if (!disable_split_kv && fixed_split_size > 0) {
+  if (disable_split_kv) {
+    kv_chunk_size = std::numeric_limits<int64_t>::max();
+  } else if (!disable_split_kv && fixed_split_size > 0) {
     kv_chunk_size = fixed_split_size;
   } else {
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
