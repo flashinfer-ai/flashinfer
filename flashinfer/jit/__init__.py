@@ -63,6 +63,9 @@ from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
 from .core import JitSpec as JitSpec
+from .core import JitSpecStatus as JitSpecStatus
+from .core import JitSpecRegistry as JitSpecRegistry
+from .core import jit_spec_registry as jit_spec_registry
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec

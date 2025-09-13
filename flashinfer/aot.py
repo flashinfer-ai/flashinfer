@@ -484,163 +484,49 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
     return qo, kv
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Ahead-of-Time (AOT) build all modules"
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        help="Output directory",
-    )
-    parser.add_argument(
-        "--build-dir",
-        type=Path,
-        help="Build directory",
-    )
-    parser.add_argument(
-        "--fa2-head-dim",
-        nargs="*",
-        help="FA2 head dim pair of qk and vo, separated by comma",
-    )
-    parser.add_argument(
-        "--fa3-head-dim",
-        nargs="*",
-        help="FA3 head dim pair of qk and vo, separated by comma",
-    )
-    parser.add_argument(
-        "--f16-dtype",
-        nargs="*",
-        choices=["float16", "bfloat16"],
-        help="16-bit data type",
-    )
-    parser.add_argument(
-        "--f8-dtype",
-        nargs="*",
-        choices=["float8_e4m3fn", "float8_e5m2"],
-        help="8-bit data type",
-    )
-    parser.add_argument(
-        "--use-sliding-window",
-        nargs="*",
-        help="Use sliding window attention",
-    )
-    parser.add_argument(
-        "--use-logits-soft-cap",
-        nargs="*",
-        help="Use logits soft cap",
-    )
-    parser.add_argument(
-        "--add-comm",
-        type=parse_bool,
-        help="Add communication kernels (trtllm_comm, vllm_comm)",
-    )
-    parser.add_argument(
-        "--add-gemma",
-        type=parse_bool,
-        help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)",
-    )
-    parser.add_argument(
-        "--add-oai-oss",
-        type=parse_bool,
-        help="Add kernels for OAI OSS Model (head_dim=64, use_sliding_window)",
-    )
-    parser.add_argument(
-        "--add-moe",
-        type=parse_bool,
-        help="Add MoE kernels",
-    )
-    parser.add_argument(
-        "--add-act",
-        type=parse_bool,
-        help="Add activation kernels",
-    )
-    parser.add_argument(
-        "--add-misc",
-        type=parse_bool,
-        help="Add miscellaneous kernels",
-    )
-    parser.add_argument(
-        "--add-xqa",
-        type=parse_bool,
-        help="Add XQA (Cross-Query Attention) kernels",
-    )
-    args = parser.parse_args()
+def get_default_config():
+    """Get default AOT configuration"""
+    return {
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
+        "f16_dtype": [torch.float16, torch.bfloat16],
+        "f8_dtype": [torch.float8_e4m3fn],
+        "use_sliding_window": [False, True],
+        "use_logits_soft_cap": [False, True],
+        "add_comm": True,
+        "add_gemma": True,
+        "add_oai_oss": True,
+        "add_moe": True,
+        "add_act": True,
+        "add_misc": True,
+        "add_xqa": True,
+    }
 
-    # Default values
-    project_root = Path(__file__).resolve().parents[1]
-    out_dir = project_root / "aot-ops"
-    build_dir = project_root / "build" / "aot"
-    fa2_head_dim_ = [
-        (64, 64),
-        (128, 128),
-        (256, 256),
-    ]
-    fa3_head_dim_ = [
-        (192, 128),
-        (128, 128),
-        (64, 64),
-        (256, 256),
-    ]
-    f16_dtype_ = [
-        torch.float16,
-        torch.bfloat16,
-    ]
-    f8_dtype_ = [
-        torch.float8_e4m3fn,
-        # torch.float8_e5m2,
-    ]
-    use_sliding_window_ = [
-        False,
-        True,
-    ]
-    use_logits_soft_cap_ = [
-        False,
-        True,
-    ]
-    add_comm = True
-    add_gemma = True
-    add_oai_oss = True
-    add_moe = True
-    add_act = True
-    add_misc = True
-    add_xqa = True
 
-    # Override
-    if args.out_dir:
-        out_dir = Path(args.out_dir)
-    if args.build_dir:
-        build_dir = Path(args.build_dir)
-    if args.fa2_head_dim:
-        fa2_head_dim_ = [parse_head_dim(dim) for dim in args.fa2_head_dim]
-    if args.fa3_head_dim:
-        fa3_head_dim_ = [parse_head_dim(dim) for dim in args.fa3_head_dim]
-    if args.f16_dtype:
-        f16_dtype_ = [getattr(torch, dtype) for dtype in args.f16_dtype]
-    if args.f8_dtype:
-        f8_dtype_ = [getattr(torch, dtype) for dtype in args.f8_dtype]
-    if args.use_sliding_window:
-        use_sliding_window_ = [parse_bool(s) for s in args.use_sliding_window]
-    if args.use_logits_soft_cap:
-        use_logits_soft_cap_ = [parse_bool(s) for s in args.use_logits_soft_cap]
-    if args.add_comm is not None:
-        add_comm = args.add_comm
-    if args.add_gemma is not None:
-        add_gemma = args.add_gemma
-    if args.add_oai_oss is not None:
-        add_oai_oss = args.add_oai_oss
-    if args.add_moe is not None:
-        add_moe = args.add_moe
-    if args.add_act is not None:
-        add_act = args.add_act
-    if args.add_misc is not None:
-        add_misc = args.add_misc
-    if args.add_xqa is not None:
-        add_xqa = args.add_xqa
+def get_minimal_config():
+    """Get minimal configuration for registration"""
+    return {
+        "fa2_head_dim": [(128, 128)],
+        "fa3_head_dim": [(128, 128)],
+        "f16_dtype": [torch.float16, torch.bfloat16],
+        "f8_dtype": [torch.float8_e4m3fn],
+        "use_sliding_window": [False],
+        "use_logits_soft_cap": [False],
+        "add_comm": False,
+        "add_gemma": False,
+        "add_oai_oss": False,
+        "add_moe": True,
+        "add_act": True,
+        "add_misc": True,
+        "add_xqa": False,
+    }
 
-    # Cuda Arch
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+def detect_sm_capabilities():
+    """Detect SM capabilities"""
+    from .compilation_context import CompilationContext
+    from .utils import version_at_least
+    import torch.version
 
     compilation_context = CompilationContext()
     gencode_flags_list = compilation_context.get_nvcc_flags_list(
@@ -654,8 +540,89 @@ def main():
             return True
         return version_at_least(torch.version.cuda, version)
 
-    has_sm90 = has_sm("compute_90", "12.3")
-    has_sm100 = has_sm("compute_100", "12.8")
+    return has_sm("compute_90", "12.3"), has_sm("compute_100", "12.8")
+
+
+def register_minimal_modules() -> int:
+    """Register a minimal set of modules for CLI introspection"""
+    config = get_minimal_config()
+    has_sm90, has_sm100 = detect_sm_capabilities()
+
+    jit_specs = gen_all_modules(
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
+        has_sm90,
+        has_sm100,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
+    )
+    return len(jit_specs)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ahead-of-Time (AOT) build all modules"
+    )
+    parser.add_argument("--out-dir", type=Path, help="Output directory")
+    parser.add_argument("--build-dir", type=Path, help="Build directory")
+    parser.add_argument("--fa2-head-dim", nargs="*", help="FA2 head dim pair of qk and vo, separated by comma")
+    parser.add_argument("--fa3-head-dim", nargs="*", help="FA3 head dim pair of qk and vo, separated by comma")
+    parser.add_argument("--f16-dtype", nargs="*", choices=["float16", "bfloat16"], help="16-bit data type")
+    parser.add_argument("--f8-dtype", nargs="*", choices=["float8_e4m3fn", "float8_e5m2"], help="8-bit data type")
+    parser.add_argument("--use-sliding-window", nargs="*", help="Use sliding window attention")
+    parser.add_argument("--use-logits-soft-cap", nargs="*", help="Use logits soft cap")
+    parser.add_argument("--add-comm", type=parse_bool, help="Add communication kernels (trtllm_comm, vllm_comm)")
+    parser.add_argument("--add-gemma", type=parse_bool, help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)")
+    parser.add_argument("--add-oai-oss", type=parse_bool, help="Add kernels for OAI OSS Model (head_dim=64, use_sliding_window)")
+    parser.add_argument("--add-moe", type=parse_bool, help="Add MoE kernels")
+    parser.add_argument("--add-act", type=parse_bool, help="Add activation kernels")
+    parser.add_argument("--add-misc", type=parse_bool, help="Add miscellaneous kernels")
+    parser.add_argument("--add-xqa", type=parse_bool, help="Add XQA (Cross-Query Attention) kernels")
+    args = parser.parse_args()
+
+    # Start with default configuration
+    project_root = Path(__file__).resolve().parents[1]
+    config = get_default_config()
+    out_dir = project_root / "aot-ops"
+    build_dir = project_root / "build" / "aot"
+
+    # Override with command line arguments
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    if args.build_dir:
+        build_dir = Path(args.build_dir)
+    if args.fa2_head_dim:
+        config["fa2_head_dim"] = [parse_head_dim(dim) for dim in args.fa2_head_dim]
+    if args.fa3_head_dim:
+        config["fa3_head_dim"] = [parse_head_dim(dim) for dim in args.fa3_head_dim]
+    if args.f16_dtype:
+        config["f16_dtype"] = [getattr(torch, dtype) for dtype in args.f16_dtype]
+    if args.f8_dtype:
+        config["f8_dtype"] = [getattr(torch, dtype) for dtype in args.f8_dtype]
+    if args.use_sliding_window:
+        config["use_sliding_window"] = [parse_bool(s) for s in args.use_sliding_window]
+    if args.use_logits_soft_cap:
+        config["use_logits_soft_cap"] = [parse_bool(s) for s in args.use_logits_soft_cap]
+
+    for key in ["add_comm", "add_gemma", "add_oai_oss", "add_moe", "add_act", "add_misc", "add_xqa"]:
+        arg_value = getattr(args, key, None)
+        if arg_value is not None:
+            config[key] = arg_value
+
+    # Cuda Arch
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    has_sm90, has_sm100 = detect_sm_capabilities()
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
@@ -677,42 +644,37 @@ def main():
     print("AOT build summary:")
     print("  out_dir:", out_dir)
     print("  build_dir:", build_dir)
-    print("  fa2_head_dim:", fa2_head_dim_)
-    print("  fa3_head_dim:", fa3_head_dim_)
-    print("  f16_dtype:", f16_dtype_)
-    print("  f8_dtype:", f8_dtype_)
-    print("  use_sliding_window:", use_sliding_window_)
-    print("  use_logits_soft_cap:", use_logits_soft_cap_)
+    print("  fa2_head_dim:", config["fa2_head_dim"])
+    print("  fa3_head_dim:", config["fa3_head_dim"])
+    print("  f16_dtype:", config["f16_dtype"])
+    print("  f8_dtype:", config["f8_dtype"])
+    print("  use_sliding_window:", config["use_sliding_window"])
+    print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
     print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
-    print("  add_comm:", add_comm)
-    print("  add_gemma:", add_gemma)
-    print("  add_oai_oss:", add_oai_oss)
-    print("  add_moe:", add_moe)
-    print("  add_act:", add_act)
-    print("  add_misc:", add_misc)
-    print("  add_xqa:", add_xqa)
+    for key in ["add_comm", "add_gemma", "add_oai_oss", "add_moe", "add_act", "add_misc", "add_xqa"]:
+        print(f"  {key}:", config[key])
 
     # Generate JIT specs
     print("Generating JIT specs...")
     jit_specs = [gen_logging_module()]
     jit_specs += gen_all_modules(
-        f16_dtype_,
-        f8_dtype_,
-        fa2_head_dim_,
-        fa3_head_dim_,
-        use_sliding_window_,
-        use_logits_soft_cap_,
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
         has_sm90,
         has_sm100,
-        add_comm,
-        add_gemma,
-        add_oai_oss,
-        add_moe,
-        add_act,
-        add_misc,
-        add_xqa,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
     )
     print("Total ops:", len(jit_specs))
 
