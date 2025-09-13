@@ -193,8 +193,7 @@ def test_batch_decode_tensor_cores(
 @pytest.mark.parametrize("group_size", [1, 4, 8])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-# @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 def test_batch_prefill_tensor_cores(
     batch_size: int,
     invariant_bs: int,
