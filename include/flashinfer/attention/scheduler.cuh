@@ -574,7 +574,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
         cta_tile_q, min_kv_chunk_size);
   }
-
+  printf("disable_split_kv: %d\n", disable_split_kv);
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
