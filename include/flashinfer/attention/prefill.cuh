@@ -2115,10 +2115,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t chunk_end =
         partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
     const uint32_t chunk_size = chunk_end - chunk_start;
-    // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-    // printf("chunk_start: %d, chunk_end: %d, chunk_size: %d, partition_kv: %d\n", chunk_start,
-    // chunk_end, chunk_size, partition_kv);
-    // }
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];

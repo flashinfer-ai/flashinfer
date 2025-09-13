@@ -574,7 +574,6 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
         cta_tile_q, min_kv_chunk_size);
   }
-  printf("disable_split_kv: %d\n", disable_split_kv);
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
@@ -609,7 +608,6 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
-
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
                          std::move(request_indices), std::move(qo_tile_indices),
                          std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
@@ -766,8 +764,6 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
   std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
   std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-  kv_chunk_size_ptr_h[0] = kv_chunk_size;
-
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(

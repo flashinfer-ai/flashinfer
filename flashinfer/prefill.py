@@ -1888,8 +1888,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left,
             ]
             if self._backend == "fa2":
-                args.append(-1)  # fixed_split_size
-                args.append(False)  # disable_split_kv
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2748,8 +2748,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 window_left,
             ]
             if self._backend == "fa2":
-                args.append(-1)  # fixed_split_size
-                args.append(False)  # disable_split_kv
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
             self._plan_info = self._cached_module.plan(
                 *args,
             )
