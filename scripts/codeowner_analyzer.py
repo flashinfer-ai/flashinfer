@@ -177,9 +177,12 @@ class CodeOwnersAnalyzer:
 
             if time_since_last < min_delay:
                 time.sleep(min_delay - time_since_last)
+            print(
+                f"GitHub API rate limit hit, retrying in {min_delay - time_since_last}s... (attempt {self.api_call_count + 1})"
+            )
 
         retry_count = 0
-        max_retries = 3
+        max_retries = 10
         base_delay = 1
 
         while retry_count < max_retries:

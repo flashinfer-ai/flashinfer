@@ -19,23 +19,27 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
-#include "flashinfer/gemm/tgv_gemm.cuh"
 
+#include "flashinfer/gemm/tgv_gemm.cuh"
 
 namespace flashinfer {
 namespace gemm {
 
-#define INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, dtype, out_dtype, UmmaMajorA, UmmaMajorB)                       \
-    template void tgv_gemm_host<dtype, dtype, out_dtype, float, out_dtype, CTA_M, CTA_N, 128, DMA_Stage,                     \
-        UmmaMajorA, UmmaMajorB>(dtype* device_ptr_A, dtype* device_ptr_B,                                   \
-        out_dtype* device_ptr_C, out_dtype* device_ptr_Bias, int Gemm_M, int Gemm_N, int Gemm_K, int Gemm_L,      \
-        int stride_A_M, int stride_A_K, int stride_A_L, int stride_B_N, int stride_B_K, int stride_B_L,                 \
-        int stride_C_M, int stride_C_N, int stride_C_L, bool pdl, int pdl_count, cudaStream_t stream);
+#define INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, dtype, out_dtype, UmmaMajorA,           \
+                                  UmmaMajorB)                                                      \
+  template void tgv_gemm_host<dtype, dtype, out_dtype, float, out_dtype, CTA_M, CTA_N, 128,        \
+                              DMA_Stage, UmmaMajorA, UmmaMajorB>(                                  \
+      dtype * device_ptr_A, dtype * device_ptr_B, out_dtype * device_ptr_C,                        \
+      out_dtype * device_ptr_Bias, int Gemm_M, int Gemm_N, int Gemm_K, int Gemm_L, int stride_A_M, \
+      int stride_A_K, int stride_A_L, int stride_B_N, int stride_B_K, int stride_B_L,              \
+      int stride_C_M, int stride_C_N, int stride_C_L, bool pdl, int pdl_count,                     \
+      cudaStream_t stream);
 
-#define INSTANTIATE_TGV_GEMM_HOST_BF16_BF16(CTA_M, CTA_N, DMA_Stage) \
-    INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, cutlass::bfloat16_t, cutlass::bfloat16_t, cute::UMMA::Major::K, cute::UMMA::Major::K)
+#define INSTANTIATE_TGV_GEMM_HOST_BF16_BF16(CTA_M, CTA_N, DMA_Stage)                           \
+  INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, cutlass::bfloat16_t, cutlass::bfloat16_t, \
+                            cute::UMMA::Major::K, cute::UMMA::Major::K)
 
 }  // namespace gemm
 }  // namespace flashinfer
 
-#endif 
+#endif

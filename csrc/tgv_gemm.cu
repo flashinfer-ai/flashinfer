@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "cuda_runtime.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <cuda_fp16.h>
 
@@ -24,6 +23,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "cuda_runtime.h"
 #include "flashinfer/gemm/tgv_gemm.cuh"
 #include "flashinfer/gemm/tgv_gemm_configs.h"
 #include "pytorch_extension_utils.h"
@@ -32,66 +32,58 @@
 #include <cutlass/numeric_types.h>
 
 #define SUPPORTED_TGV_GEMM_CONFIGS \
-    TGV_GEMM_CONFIG(64, 8, 6)  \
-    TGV_GEMM_CONFIG(64, 8, 8) \
-    TGV_GEMM_CONFIG(64, 8, 10) \
-    TGV_GEMM_CONFIG(64, 8, 12) \
-    TGV_GEMM_CONFIG(64, 16, 6) \
-    TGV_GEMM_CONFIG(64, 16, 8) \
-    TGV_GEMM_CONFIG(64, 16, 10) \
-    TGV_GEMM_CONFIG(64, 32, 6) \
-    TGV_GEMM_CONFIG(64, 32, 8) \
-    TGV_GEMM_CONFIG(64, 64, 6) \
-    TGV_GEMM_CONFIG(128, 16, 6) 
-    
+  TGV_GEMM_CONFIG(64, 8, 6)        \
+  TGV_GEMM_CONFIG(64, 8, 8)        \
+  TGV_GEMM_CONFIG(64, 8, 10)       \
+  TGV_GEMM_CONFIG(64, 8, 12)       \
+  TGV_GEMM_CONFIG(64, 16, 6)       \
+  TGV_GEMM_CONFIG(64, 16, 8)       \
+  TGV_GEMM_CONFIG(64, 16, 10)      \
+  TGV_GEMM_CONFIG(64, 32, 6)       \
+  TGV_GEMM_CONFIG(64, 32, 8)       \
+  TGV_GEMM_CONFIG(64, 64, 6)       \
+  TGV_GEMM_CONFIG(128, 16, 6)
 
-#define TGV_GEMM_CONFIG(CTA_M, CTA_N, DMA_STAGE) \
-    if (cta_m == CTA_M && cta_n == CTA_N && dma_stage == DMA_STAGE) { \
-        *func_ptr = &flashinfer::gemm::tgv_gemm_host<TypeA, TypeB, TypeC, AccType, TypeBias, CTA_M, CTA_N, 128, DMA_STAGE, UmmaMajorA, UmmaMajorB>; \
-        return; \
-    }
+#define TGV_GEMM_CONFIG(CTA_M, CTA_N, DMA_STAGE)                                                 \
+  if (cta_m == CTA_M && cta_n == CTA_N && dma_stage == DMA_STAGE) {                              \
+    *func_ptr = &flashinfer::gemm::tgv_gemm_host<TypeA, TypeB, TypeC, AccType, TypeBias, CTA_M,  \
+                                                 CTA_N, 128, DMA_STAGE, UmmaMajorA, UmmaMajorB>; \
+    return;                                                                                      \
+  }
 
-template <typename TypeA, typename TypeB, typename TypeC,
-          typename AccType, typename TypeBias>
-using GemmFuncPtr = void (*)(TypeA*, TypeB*, TypeC*, TypeBias*,
-                             int, int, int, int,
-                             int, int, int,
-                             int, int, int,
-                             int, int, int,
-                             bool, int, cudaStream_t);
-							 
-template<typename TypeA, typename TypeB, typename TypeC, typename AccType, typename TypeBias, 
-         cute::UMMA::Major UmmaMajorA, cute::UMMA::Major UmmaMajorB>
-void dispatch_kernel(int cta_m, int cta_n, int cta_k, int dma_stage, 
+template <typename TypeA, typename TypeB, typename TypeC, typename AccType, typename TypeBias>
+using GemmFuncPtr = void (*)(TypeA*, TypeB*, TypeC*, TypeBias*, int, int, int, int, int, int, int,
+                             int, int, int, int, int, int, bool, int, cudaStream_t);
+
+template <typename TypeA, typename TypeB, typename TypeC, typename AccType, typename TypeBias,
+          cute::UMMA::Major UmmaMajorA, cute::UMMA::Major UmmaMajorB>
+void dispatch_kernel(int cta_m, int cta_n, int cta_k, int dma_stage,
                      GemmFuncPtr<TypeA, TypeB, TypeC, AccType, TypeBias>* func_ptr) {
-    SUPPORTED_TGV_GEMM_CONFIGS
-        
-    TORCH_CHECK(false, "Unsupported tile configuration: cta_m=" + std::to_string(cta_m) + 
-                ", cta_n=" + std::to_string(cta_n) + ", cta_k=" + std::to_string(cta_k)); 
+  SUPPORTED_TGV_GEMM_CONFIGS
+
+  TORCH_CHECK(false, "Unsupported tile configuration: cta_m=" + std::to_string(cta_m) +
+                         ", cta_n=" + std::to_string(cta_n) + ", cta_k=" + std::to_string(cta_k));
 }
-#undef TGV_GEMM_CONFIG				
+#undef TGV_GEMM_CONFIG
 
 namespace torch_ext {
 
 namespace {
 // Use the shared function from the header file
 
-
-using flashinfer::gemm::TGVGemmConfig;
 using flashinfer::gemm::getAllTgvConfigs;
+using flashinfer::gemm::TGVGemmConfig;
 
 TGVGemmConfig getBf16GemmConfig(int64_t tactic) {
   auto globalConfigs = getAllTgvConfigs();
-  
+
   TORCH_CHECK(tactic >= 0 && tactic < globalConfigs.size(), "tactic must be between 0 and ",
               globalConfigs.size());
   return globalConfigs[tactic];
 }
 
-
-at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, 
+at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
                           std::optional<at::Tensor> bias, int64_t tactic, bool pdl) {
-  
   // No heuristic for now, we use 128x8 with 6 DMA stages as the default tactic.
   if (tactic == -1) {
     tactic = 0;
@@ -112,14 +104,14 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
   // Get tile parameters from config
   int cta_m, cta_n, dma_stage;
   config.getTileParams(cta_m, cta_n, dma_stage);
-  
+
   // Validate DMA_Stage
-  TORCH_CHECK(dma_stage == 6 || dma_stage == 8 || dma_stage == 10 || dma_stage == 12, 
+  TORCH_CHECK(dma_stage == 6 || dma_stage == 8 || dma_stage == 10 || dma_stage == 12,
               "dma_stage must be one of: 6, 8, 10, 12");
 
   // Validate tile sizes
   TORCH_CHECK(cta_m == 64 || cta_m == 128, "cta_m must be one of: 64, 128");
-  static constexpr int CTA_K = 128; // Fixed for now
+  static constexpr int CTA_K = 128;  // Fixed for now
 
   // Get dimensions
   int M = mat1.size(0);
@@ -127,7 +119,8 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
   int N = mat2.size(1);
 
   // Create output tensor [N, M] row major
-  at::Tensor C = at::detail::empty_cuda({N, M}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+  at::Tensor C =
+      at::detail::empty_cuda({N, M}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
 
   // manually calculate the L stride
   // A [M, K] row major
@@ -148,7 +141,8 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
     TORCH_CHECK(bias.value().is_cuda(), "Bias tensor must be on CUDA");
     TORCH_CHECK(bias.value().dim() == 1, "Bias tensor must be 1D (M,)");
     TORCH_CHECK(bias.value().size(0) == M, "Bias tensor must have M elements");
-    TORCH_CHECK(bias.value().scalar_type() == at::ScalarType::BFloat16, "Bias tensor must be bfloat16");
+    TORCH_CHECK(bias.value().scalar_type() == at::ScalarType::BFloat16,
+                "Bias tensor must be bfloat16");
     TORCH_CHECK(bias.value().stride(0) == 1, "Bias tensor must be M contiguous");
   }
 
@@ -170,18 +164,16 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
   // Function pointer for the selected template instantiation
   GemmFuncPtr<TypeA, TypeB, TypeC, AccType, TypeBias> func_ptr = nullptr;
 
-  dispatch_kernel<TypeA, TypeB, TypeC, AccType, TypeBias, UmmaMajorA, UmmaMajorB>(cta_m, cta_n, CTA_K, dma_stage, &func_ptr);
+  dispatch_kernel<TypeA, TypeB, TypeC, AccType, TypeBias, UmmaMajorA, UmmaMajorB>(
+      cta_m, cta_n, CTA_K, dma_stage, &func_ptr);
 
   // Call the selected function
-  func_ptr(reinterpret_cast<TypeA*>(mat1.data_ptr<at::BFloat16>()), 
-          reinterpret_cast<TypeB*>(mat2.data_ptr<at::BFloat16>()), 
-          reinterpret_cast<TypeC*>(C.data_ptr<at::BFloat16>()), 
-          reinterpret_cast<TypeBias*>(bias_ptr),
-          M, N, K, 1, 
-          stride_A_M, stride_A_K, stride_A_L,
-          stride_B_N, stride_B_K, stride_B_L,
-          stride_C_M, stride_C_N, stride_C_L,
-          pdl, -1, stream); // pdl_count=-1 for gemm
+  func_ptr(reinterpret_cast<TypeA*>(mat1.data_ptr<at::BFloat16>()),
+           reinterpret_cast<TypeB*>(mat2.data_ptr<at::BFloat16>()),
+           reinterpret_cast<TypeC*>(C.data_ptr<at::BFloat16>()),
+           reinterpret_cast<TypeBias*>(bias_ptr), M, N, K, 1, stride_A_M, stride_A_K, stride_A_L,
+           stride_B_N, stride_B_K, stride_B_L, stride_C_M, stride_C_N, stride_C_L, pdl, -1,
+           stream);  // pdl_count=-1 for gemm
 
   // original C is [N, M] row major
   // after transpose, it's [M, N] column major
@@ -191,8 +183,8 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
 
 }  // namespace
 
-at::Tensor bf16_gemm(at::Tensor const& mat1, at::Tensor const& mat2, 
-                     std::optional<at::Tensor> bias, int64_t tactic, bool pdl) {
+at::Tensor bf16_gemm(at::Tensor const& mat1, at::Tensor const& mat2, std::optional<at::Tensor> bias,
+                     int64_t tactic, bool pdl) {
   return bf16_gemm_impl(mat1, mat2, bias, tactic, pdl);
 }
 
@@ -203,8 +195,7 @@ int64_t bf16_gemm_tactic_num() {
 
 }  // namespace torch_ext
 
-
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-    m.def("bf16_gemm", &torch_ext::bf16_gemm);
-    m.def("bf16_gemm_tactic_num", &torch_ext::bf16_gemm_tactic_num);
+  m.def("bf16_gemm", &torch_ext::bf16_gemm);
+  m.def("bf16_gemm_tactic_num", &torch_ext::bf16_gemm_tactic_num);
 }

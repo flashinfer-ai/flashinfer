@@ -39,16 +39,16 @@ enum class TGVGemmConfigSM100 {
   CtaShape64x8_DMA8,
   CtaShape64x8_DMA10,
   CtaShape64x8_DMA12,
-  
+
   CtaShape64x16_DMA6,
   CtaShape64x16_DMA8,
   CtaShape64x16_DMA10,
-  
+
   CtaShape64x32_DMA6,
   CtaShape64x32_DMA8,
-  
+
   CtaShape64x64_DMA6,
-  
+
   // CTA_M = 128 configurations
   CtaShape128x16_DMA6,
 };
@@ -64,33 +64,77 @@ struct TGVGemmConfig {
   TGVGemmConfig(TGVGemmConfigSM100 tile_config, int sm_version = 100)
       : tile_config_sm100(tile_config), sm_version(sm_version) {}
 
-  int getTileConfigAsInt() const {
-    return (int)tile_config_sm100;
-  }
+  int getTileConfigAsInt() const { return (int)tile_config_sm100; }
 
   // Helper function to get CTA_M, CTA_N, and DMA_STAGE from config
   void getTileParams(int& cta_m, int& cta_n, int& dma_stage) const {
     switch (tile_config_sm100) {
       // CTA_M = 64 cases
-      case TGVGemmConfigSM100::CtaShape64x8_DMA6:   cta_m = 64; cta_n = 8;  dma_stage = 6; break;
-      case TGVGemmConfigSM100::CtaShape64x8_DMA8:   cta_m = 64; cta_n = 8;  dma_stage = 8; break;
-      case TGVGemmConfigSM100::CtaShape64x8_DMA10:  cta_m = 64; cta_n = 8;  dma_stage = 10; break;
-      case TGVGemmConfigSM100::CtaShape64x8_DMA12:  cta_m = 64; cta_n = 8;  dma_stage = 12; break;
-      
-      case TGVGemmConfigSM100::CtaShape64x16_DMA6:  cta_m = 64; cta_n = 16; dma_stage = 6; break;
-      case TGVGemmConfigSM100::CtaShape64x16_DMA8:  cta_m = 64; cta_n = 16; dma_stage = 8; break;
-      case TGVGemmConfigSM100::CtaShape64x16_DMA10: cta_m = 64; cta_n = 16; dma_stage = 10; break;
-      
-      case TGVGemmConfigSM100::CtaShape64x32_DMA6:  cta_m = 64; cta_n = 32; dma_stage = 6; break;
-      case TGVGemmConfigSM100::CtaShape64x32_DMA8:  cta_m = 64; cta_n = 32; dma_stage = 8; break;
-      
-      case TGVGemmConfigSM100::CtaShape64x64_DMA6:  cta_m = 64; cta_n = 64; dma_stage = 6; break;
-      
+      case TGVGemmConfigSM100::CtaShape64x8_DMA6:
+        cta_m = 64;
+        cta_n = 8;
+        dma_stage = 6;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x8_DMA8:
+        cta_m = 64;
+        cta_n = 8;
+        dma_stage = 8;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x8_DMA10:
+        cta_m = 64;
+        cta_n = 8;
+        dma_stage = 10;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x8_DMA12:
+        cta_m = 64;
+        cta_n = 8;
+        dma_stage = 12;
+        break;
+
+      case TGVGemmConfigSM100::CtaShape64x16_DMA6:
+        cta_m = 64;
+        cta_n = 16;
+        dma_stage = 6;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x16_DMA8:
+        cta_m = 64;
+        cta_n = 16;
+        dma_stage = 8;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x16_DMA10:
+        cta_m = 64;
+        cta_n = 16;
+        dma_stage = 10;
+        break;
+
+      case TGVGemmConfigSM100::CtaShape64x32_DMA6:
+        cta_m = 64;
+        cta_n = 32;
+        dma_stage = 6;
+        break;
+      case TGVGemmConfigSM100::CtaShape64x32_DMA8:
+        cta_m = 64;
+        cta_n = 32;
+        dma_stage = 8;
+        break;
+
+      case TGVGemmConfigSM100::CtaShape64x64_DMA6:
+        cta_m = 64;
+        cta_n = 64;
+        dma_stage = 6;
+        break;
+
       // CTA_M = 128 cases
-      case TGVGemmConfigSM100::CtaShape128x16_DMA6:  cta_m = 128; cta_n = 16; dma_stage = 6; break;
-      
+      case TGVGemmConfigSM100::CtaShape128x16_DMA6:
+        cta_m = 128;
+        cta_n = 16;
+        dma_stage = 6;
+        break;
+
       default:
-        cta_m = -1; cta_n = -1; dma_stage = -1;
+        cta_m = -1;
+        cta_n = -1;
+        dma_stage = -1;
         break;
     }
   }
@@ -98,12 +142,11 @@ struct TGVGemmConfig {
   std::string toString() const {
     std::stringstream tactic;
     tactic << "TGV GEMM Tactic";
-    if (tile_config_sm100 != TGVGemmConfigSM100::ChooseWithHeuristic && 
+    if (tile_config_sm100 != TGVGemmConfigSM100::ChooseWithHeuristic &&
         tile_config_sm100 != TGVGemmConfigSM100::Undefined) {
       int cta_m, cta_n, dma_stage;
       getTileParams(cta_m, cta_n, dma_stage);
-      tactic << "\n\tsm: " << sm_version 
-             << "\n\ttile shape: " << cta_m << "x" << cta_n
+      tactic << "\n\tsm: " << sm_version << "\n\ttile shape: " << cta_m << "x" << cta_n
              << "\n\tDMA stage: " << dma_stage
              << "\n\tenable cuda kernel: " << (enable_cuda_kernel ? "true" : "false");
     } else {
@@ -117,21 +160,21 @@ struct TGVGemmConfig {
 // Helper function to get all available TGV configurations
 inline std::vector<TGVGemmConfig> getAllTgvConfigs() {
   return {
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA6), //0
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA8), //1
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA10), //2
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA12), //3
-    
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA6), //4
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA8), //5
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA10), //6
-    
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x32_DMA6), //7
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x32_DMA8), //8
-    
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x64_DMA6), //9
-    
-    TGVGemmConfig(TGVGemmConfigSM100::CtaShape128x16_DMA6), //10
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA6),   // 0
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA8),   // 1
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA10),  // 2
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x8_DMA12),  // 3
+
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA6),   // 4
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA8),   // 5
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x16_DMA10),  // 6
+
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x32_DMA6),  // 7
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x32_DMA8),  // 8
+
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape64x64_DMA6),  // 9
+
+      TGVGemmConfig(TGVGemmConfigSM100::CtaShape128x16_DMA6),  // 10
   };
 }
 
