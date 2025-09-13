@@ -13,26 +13,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+// #include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
+namespace flashinfer_norm {
 
-void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
-                       bool enable_pdl);
+using tvm::ffi::Tensor;
 
-void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
-                   bool enable_pdl);
+void rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
 
-void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
-                             double eps, bool enable_pdl);
+void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, bool enable_pdl);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Root mean square normalization
-  m.def("rmsnorm", rmsnorm);
-  // Fused add root mean square normalization
-  m.def("fused_add_rmsnorm", fused_add_rmsnorm);
-  // Gemma Root mean square normalization
-  m.def("gemma_rmsnorm", gemma_rmsnorm);
-  // Gemma Fused add root mean square normalization
-  m.def("gemma_fused_add_rmsnorm", gemma_fused_add_rmsnorm);
-}
+void gemma_rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
+
+void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
+                             bool enable_pdl);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(norm, flashinfer_norm::rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, flashinfer_norm::fused_add_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, flashinfer_norm::gemma_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, flashinfer_norm::gemma_fused_add_rmsnorm);
+}  // namespace flashinfer_norm
