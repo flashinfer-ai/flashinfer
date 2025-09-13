@@ -49,7 +49,8 @@ def warmup_jit():
 @pytest.mark.parametrize("batch_size", [5, 10, 20])
 @pytest.mark.parametrize("invariant_bs", [4])
 @pytest.mark.parametrize("kv_len", [4096, 8192])
-@pytest.mark.parametrize("fixed_split_size", [2048, -1])
+@pytest.mark.parametrize("fixed_split_size", [2048])
+@pytest.mark.parametrize("disable_split_kv", [True, False])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
@@ -61,6 +62,7 @@ def test_batch_decode_tensor_cores(
     invariant_bs: int,
     kv_len: int,
     fixed_split_size: int,
+    disable_split_kv: bool,
     page_size: int,
     num_kv_heads: int,
     group_size: int,
@@ -122,9 +124,8 @@ def test_batch_decode_tensor_cores(
         pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=fixed_split_size
-        == -1,  # just for convenient testing, in reality fixed_split_size=-1 doesn't mean disable
+        fixed_split_size=fixed_split_size if not disable_split_kv else None,
+        disable_split_kv=disable_split_kv,
     )
     o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
         q, kv_data, return_lse=True
@@ -143,8 +144,8 @@ def test_batch_decode_tensor_cores(
         pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=fixed_split_size == -1,
+        fixed_split_size=fixed_split_size if not disable_split_kv else None,
+        disable_split_kv=disable_split_kv,
     )
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
         q[:invariant_bs], kv_data, return_lse=True
