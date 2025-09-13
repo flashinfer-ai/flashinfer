@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "cuda_runtime.h"
+#include "flashinfer/cutlass_utils.cuh"
 #include "flashinfer/gemm/tgv_gemm.cuh"
 #include "flashinfer/gemm/tgv_gemm_configs.h"
 #include "pytorch_extension_utils.h"
@@ -74,7 +75,7 @@ namespace {
 using flashinfer::gemm::getAllTgvConfigs;
 using flashinfer::gemm::TGVGemmConfig;
 
-TGVGemmConfig getBf16GemmConfig(int64_t tactic) {
+TGVGemmConfig getTgvGemmConfig(int64_t tactic) {
   auto globalConfigs = getAllTgvConfigs();
 
   TORCH_CHECK(tactic >= 0 && tactic < globalConfigs.size(), "tactic must be between 0 and ",
@@ -82,24 +83,52 @@ TGVGemmConfig getBf16GemmConfig(int64_t tactic) {
   return globalConfigs[tactic];
 }
 
-at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
-                          std::optional<at::Tensor> bias, int64_t tactic, bool pdl) {
-  // No heuristic for now, we use 128x8 with 6 DMA stages as the default tactic.
-  if (tactic == -1) {
-    tactic = 0;
-  }
-  auto config = getBf16GemmConfig(tactic);
+template <typename input_type, typename output_type>
+void tgv_gemm_impl(input_type* mat1_ptr, input_type* mat2_ptr, output_type* output_ptr,
+                   output_type* bias_ptr, int M, int N, int K, int stride_A_M, int stride_A_K,
+                   int stride_A_L, int stride_B_N, int stride_B_K, int stride_B_L, int stride_C_M,
+                   int stride_C_N, int stride_C_L, int cta_m, int cta_n, int dma_stage, bool pdl,
+                   cudaStream_t stream) {
+  // Kernel config constants
+  using TypeA = input_type;
+  using TypeB = input_type;
+  using TypeC = output_type;
+  using AccType = float;
+  using TypeBias = TypeC;
+  // only supports K major now
+  static constexpr cute::UMMA::Major UmmaMajorA = cute::UMMA::Major::K;
+  static constexpr cute::UMMA::Major UmmaMajorB = cute::UMMA::Major::K;
+  static constexpr int CTA_K = 128;  // Fixed for now
 
+  // Function pointer for the selected template instantiation
+  GemmFuncPtr<TypeA, TypeB, TypeC, AccType, TypeBias> func_ptr = nullptr;
+
+  dispatch_kernel<TypeA, TypeB, TypeC, AccType, TypeBias, UmmaMajorA, UmmaMajorB>(
+      cta_m, cta_n, CTA_K, dma_stage, &func_ptr);
+
+  // Call the selected function
+  func_ptr(mat1_ptr, mat2_ptr, output_ptr, bias_ptr, M, N, K, 1, stride_A_M, stride_A_K, stride_A_L,
+           stride_B_N, stride_B_K, stride_B_L, stride_C_M, stride_C_N, stride_C_L, pdl, -1,
+           stream);  // pdl_count=-1 for gemm
+}
+
+}  // namespace
+
+at::Tensor tgv_gemm(at::Tensor const& mat1, at::Tensor const& mat2, std::optional<at::Tensor> bias,
+                    int64_t tactic, bool pdl) {
   // Input validation
   TORCH_CHECK(mat1.is_cuda(), "mat1 tensor must be on CUDA");
   TORCH_CHECK(mat2.is_cuda(), "mat2 tensor must be on CUDA");
   TORCH_CHECK(mat1.dim() == 2, "mat1 tensor must be 2D (M, K)");
   TORCH_CHECK(mat2.dim() == 2, "mat2 tensor must be 2D (K, N)");
   TORCH_CHECK(mat1.size(1) == mat2.size(0), "mat1.K must match mat2.K");
+  TORCH_CHECK(mat1.scalar_type() == mat2.scalar_type(), "mat1 and mat2 must have the same dtype");
 
-  // Check data types - only support bfloat16
-  TORCH_CHECK(mat1.scalar_type() == at::ScalarType::BFloat16, "mat1 tensor must be bfloat16");
-  TORCH_CHECK(mat2.scalar_type() == at::ScalarType::BFloat16, "mat2 tensor must be bfloat16");
+  // No heuristic for now, we use 128x8 with 6 DMA stages as the default tactic.
+  if (tactic == -1) {
+    tactic = 0;
+  }
+  auto config = getTgvGemmConfig(tactic);
 
   // Get tile parameters from config
   int cta_m, cta_n, dma_stage;
@@ -111,16 +140,24 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
 
   // Validate tile sizes
   TORCH_CHECK(cta_m == 64 || cta_m == 128, "cta_m must be one of: 64, 128");
-  static constexpr int CTA_K = 128;  // Fixed for now
 
   // Get dimensions
   int M = mat1.size(0);
   int K = mat1.size(1);
   int N = mat2.size(1);
 
+  // validity check for bias
+  if (bias.has_value()) {
+    TORCH_CHECK(bias.value().is_cuda(), "Bias tensor must be on CUDA");
+    TORCH_CHECK(bias.value().dim() == 1, "Bias tensor must be 1D (M,)");
+    TORCH_CHECK(bias.value().size(0) == M, "Bias tensor must have M elements");
+    TORCH_CHECK(bias.value().scalar_type() == mat1.scalar_type(),
+                "Bias tensor must have the same dtype as input matrices");
+    TORCH_CHECK(bias.value().stride(0) == 1, "Bias tensor must be M contiguous");
+  }
+
   // Create output tensor [N, M] row major
-  at::Tensor C =
-      at::detail::empty_cuda({N, M}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+  at::Tensor C = at::detail::empty_cuda({N, M}, mat1.scalar_type(), mat1.device(), std::nullopt);
 
   // manually calculate the L stride
   // A [M, K] row major
@@ -136,44 +173,26 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
   int stride_C_N = C.stride(0);
   int stride_C_L = M * N;
 
-  // validity check for bias
-  if (bias.has_value()) {
-    TORCH_CHECK(bias.value().is_cuda(), "Bias tensor must be on CUDA");
-    TORCH_CHECK(bias.value().dim() == 1, "Bias tensor must be 1D (M,)");
-    TORCH_CHECK(bias.value().size(0) == M, "Bias tensor must have M elements");
-    TORCH_CHECK(bias.value().scalar_type() == at::ScalarType::BFloat16,
-                "Bias tensor must be bfloat16");
-    TORCH_CHECK(bias.value().stride(0) == 1, "Bias tensor must be M contiguous");
-  }
-
   // Get CUDA stream
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  // Kernel config constants
-  using TypeA = cutlass::bfloat16_t;
-  using TypeB = cutlass::bfloat16_t;
-  using TypeC = cutlass::bfloat16_t;
-  using AccType = float;
-  using TypeBias = TypeC;
-  // only supports K major now
-  static constexpr cute::UMMA::Major UmmaMajorA = cute::UMMA::Major::K;
-  static constexpr cute::UMMA::Major UmmaMajorB = cute::UMMA::Major::K;
+  // Dispatch based on dtype
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(mat1.scalar_type(), c_type, [&] {
+    using cutlass_input_type = flashinfer::cutlass_dtype_t<c_type>;
+    using cutlass_output_type = flashinfer::cutlass_dtype_t<c_type>;
 
-  auto bias_ptr = bias.has_value() ? bias->data_ptr<at::BFloat16>() : nullptr;
+    cutlass_input_type* mat1_ptr = static_cast<cutlass_input_type*>(mat1.data_ptr());
+    cutlass_input_type* mat2_ptr = static_cast<cutlass_input_type*>(mat2.data_ptr());
+    cutlass_output_type* output_ptr = static_cast<cutlass_output_type*>(C.data_ptr());
+    cutlass_output_type* bias_ptr =
+        bias.has_value() ? static_cast<cutlass_output_type*>(bias->data_ptr()) : nullptr;
 
-  // Function pointer for the selected template instantiation
-  GemmFuncPtr<TypeA, TypeB, TypeC, AccType, TypeBias> func_ptr = nullptr;
-
-  dispatch_kernel<TypeA, TypeB, TypeC, AccType, TypeBias, UmmaMajorA, UmmaMajorB>(
-      cta_m, cta_n, CTA_K, dma_stage, &func_ptr);
-
-  // Call the selected function
-  func_ptr(reinterpret_cast<TypeA*>(mat1.data_ptr<at::BFloat16>()),
-           reinterpret_cast<TypeB*>(mat2.data_ptr<at::BFloat16>()),
-           reinterpret_cast<TypeC*>(C.data_ptr<at::BFloat16>()),
-           reinterpret_cast<TypeBias*>(bias_ptr), M, N, K, 1, stride_A_M, stride_A_K, stride_A_L,
-           stride_B_N, stride_B_K, stride_B_L, stride_C_M, stride_C_N, stride_C_L, pdl, -1,
-           stream);  // pdl_count=-1 for gemm
+    tgv_gemm_impl<cutlass_input_type, cutlass_output_type>(
+        mat1_ptr, mat2_ptr, output_ptr, bias_ptr, M, N, K, stride_A_M, stride_A_K, stride_A_L,
+        stride_B_N, stride_B_K, stride_B_L, stride_C_M, stride_C_N, stride_C_L, cta_m, cta_n,
+        dma_stage, pdl, stream);
+    return true;
+  });
 
   // original C is [N, M] row major
   // after transpose, it's [M, N] column major
@@ -181,21 +200,28 @@ at::Tensor bf16_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2,
   return C.t();
 }
 
-}  // namespace
-
+// Keep backward compatibility functions
 at::Tensor bf16_gemm(at::Tensor const& mat1, at::Tensor const& mat2, std::optional<at::Tensor> bias,
                      int64_t tactic, bool pdl) {
-  return bf16_gemm_impl(mat1, mat2, bias, tactic, pdl);
+  // Check that inputs are bfloat16 for backward compatibility
+  TORCH_CHECK(mat1.scalar_type() == at::ScalarType::BFloat16, "mat1 tensor must be bfloat16");
+  TORCH_CHECK(mat2.scalar_type() == at::ScalarType::BFloat16, "mat2 tensor must be bfloat16");
+  return tgv_gemm(mat1, mat2, bias, tactic, pdl);
 }
 
-int64_t bf16_gemm_tactic_num() {
+int64_t tgv_gemm_tactic_num() {
   static int64_t totalTactics = getAllTgvConfigs().size();
   return totalTactics;
 }
 
+int64_t bf16_gemm_tactic_num() { return tgv_gemm_tactic_num(); }
+
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("tgv_gemm", &torch_ext::tgv_gemm);
+  m.def("tgv_gemm_tactic_num", &torch_ext::tgv_gemm_tactic_num);
+  // Keep backward compatibility
   m.def("bf16_gemm", &torch_ext::bf16_gemm);
   m.def("bf16_gemm_tactic_num", &torch_ext::bf16_gemm_tactic_num);
 }

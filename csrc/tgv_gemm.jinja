@@ -18,8 +18,12 @@
 
 namespace flashinfer {
 namespace gemm {
-    // Generate BF16 instance for specific tile size and DMA stage
+    // Generate instance for specific dtype, tile size and DMA stage
+    {% if dtype == "bf16" %}
     INSTANTIATE_TGV_GEMM_HOST_BF16_BF16({{ cta_m }}, {{ cta_n }}, {{ dma_stage }});
+    {% elif dtype == "fp16" %}
+    INSTANTIATE_TGV_GEMM_HOST_FP16_FP16({{ cta_m }}, {{ cta_n }}, {{ dma_stage }});
+    {% endif %}
 
 }  // namespace gemm
 }  // namespace flashinfer

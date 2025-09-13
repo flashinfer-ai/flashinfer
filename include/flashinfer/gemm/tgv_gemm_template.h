@@ -39,6 +39,10 @@ namespace gemm {
   INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, cutlass::bfloat16_t, cutlass::bfloat16_t, \
                             cute::UMMA::Major::K, cute::UMMA::Major::K)
 
+#define INSTANTIATE_TGV_GEMM_HOST_FP16_FP16(CTA_M, CTA_N, DMA_Stage)                   \
+  INSTANTIATE_TGV_GEMM_HOST(CTA_M, CTA_N, DMA_Stage, cutlass::half_t, cutlass::half_t, \
+                            cute::UMMA::Major::K, cute::UMMA::Major::K)
+
 }  // namespace gemm
 }  // namespace flashinfer
 

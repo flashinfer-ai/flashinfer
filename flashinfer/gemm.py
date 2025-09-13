@@ -865,8 +865,25 @@ def get_gemm_sm120_module_cutlass_fp4():
     )
 
 
-def gen_gemm_sm100_module_tgv_bf16() -> JitSpec:
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_tgv_gemm"
+def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+    """
+    Generate TGV GEMM module for SM100 architecture.
+
+    Args:
+        dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+
+    Returns:
+        JitSpec for the TGV GEMM module
+    """
+    if dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported dtype {dtype}. Only bfloat16 and float16 are supported."
+        )
+
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+    module_name = f"tgv_gemm_{dtype_str}"
+
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / f"gen_tgv_gemm_{dtype_str}"
     os.makedirs(gen_directory, exist_ok=True)
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / "tgv_gemm.cu",
@@ -891,17 +908,19 @@ def gen_gemm_sm100_module_tgv_bf16() -> JitSpec:
         (128, 64, 6),
     ]
 
-    # Generate BF16 instances
+    # Generate instances for the specified dtype
     for cta_m, cta_n, dma_stage in cta_m_n_dma_list:
-        dest_path = gen_directory / f"tgv_gemm_bf16_{cta_m}x{cta_n}_{dma_stage}.cu"
+        dest_path = (
+            gen_directory / f"tgv_gemm_{dtype_str}_{cta_m}x{cta_n}_{dma_stage}.cu"
+        )
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
-            cta_m=cta_m, cta_n=cta_n, dma_stage=dma_stage, dtype="bf16"
+            cta_m=cta_m, cta_n=cta_n, dma_stage=dma_stage, dtype=dtype_str
         )
         write_if_different(dest_path, source)
 
     return gen_jit_spec(
-        "tgv_gemm",
+        module_name,
         source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags,
         extra_include_paths=[
@@ -912,11 +931,21 @@ def gen_gemm_sm100_module_tgv_bf16() -> JitSpec:
 
 
 @functools.cache
-def get_gemm_sm100_module_tgv_bf16():
-    module = gen_gemm_sm100_module_tgv_bf16().build_and_load()
+def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
+    """
+    Get and build the TGV GEMM module for the specified dtype.
 
-    def tgv_bf16_gemm_runner():
-        class TGVBf16GemmRunner(TunableRunner):
+    Args:
+        dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+
+    Returns:
+        SimpleNamespace with the runner function
+    """
+    module = gen_gemm_sm100_module_tgv(dtype).build_and_load()
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+
+    def tgv_gemm_runner():
+        class TGVGemmRunner(TunableRunner):
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -924,7 +953,8 @@ def get_gemm_sm100_module_tgv_bf16():
             ) -> List[int]:
                 # Return all available TGV configurations
                 # Based on the configurations in tgv_gemm_configs.h
-                return list(range(module.bf16_gemm_tactic_num()))
+                tactic_fn = getattr(module, f"{dtype_str}_gemm_tactic_num")
+                return list(range(tactic_fn()))
 
             def forward(
                 self,
@@ -938,30 +968,53 @@ def get_gemm_sm100_module_tgv_bf16():
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
-                out = module.bf16_gemm.default(b.t(), a.t(), bias, tactic, pdl)
+                gemm_fn = getattr(module, f"{dtype_str}_gemm")
+                out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
                 return out.t()
 
-        return TGVBf16GemmRunner()
+        return TGVGemmRunner()
 
     # Register the module
     return SimpleNamespace(
-        tgv_bf16_gemm_runner=tgv_bf16_gemm_runner,
+        tgv_gemm_runner=tgv_gemm_runner,
     )
 
 
-def tgv_gemm_bf16_sm100(
+def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: torch.Tensor,
     pdl: bool = False,
 ) -> torch.Tensor:
+    """
+    Perform TGV GEMM on SM100 architecture with automatic dtype detection.
+
+    Args:
+        a: First input tensor (M x K)
+        b: Second input tensor (K x N)
+        bias: Bias tensor (N,)
+        pdl: Whether to use PDL (persistent data loader)
+
+    Returns:
+        Output tensor (M x N)
+    """
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103", "110"]):
-        raise ValueError("TGV BF16 GEMM requires SM100, SM103, or SM110 architecture")
+        raise ValueError("TGV GEMM requires SM100, SM103, or SM110 architecture")
+
+    # Verify dtype support
+    if a.dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported dtype {a.dtype}. Only bfloat16 and float16 are supported."
+        )
+
+    if a.dtype != b.dtype:
+        raise ValueError(
+            f"Input tensors must have the same dtype. Got {a.dtype} and {b.dtype}."
+        )
 
     runners = []
-
-    runners.append(get_gemm_sm100_module_tgv_bf16().tgv_bf16_gemm_runner())
+    runners.append(get_gemm_sm100_module_tgv(a.dtype).tgv_gemm_runner())
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
@@ -978,8 +1031,9 @@ def tgv_gemm_bf16_sm100(
     )
 
     inputs = [a, b, bias]
+    dtype_str = "bf16" if a.dtype == torch.bfloat16 else "fp16"
     runner, tactic = tuner.choose_one(
-        "bf16_tgv_gemm",
+        f"{dtype_str}_tgv_gemm",
         runners,
         tuning_config,
         inputs,
