@@ -71,6 +71,7 @@ output_column_dict = {
     "general": [
         "refcheck",
         "no_cuda_graph",
+        "use_cupti",
         "allow_output_mismatch",
         "random_seed",
         "case_tag",

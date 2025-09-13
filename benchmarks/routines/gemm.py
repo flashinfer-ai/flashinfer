@@ -8,7 +8,6 @@ from einops import einsum
 import flashinfer
 from flashinfer.testing.utils import (
     bench_gpu_time,
-    bench_gpu_time_with_cudagraph,
     dequantize_fp8,
     quantize_fp8,
 )
@@ -270,26 +269,17 @@ def testGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
@@ -456,26 +446,17 @@ def testGroupGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
@@ -635,27 +616,17 @@ def testBmmFp8(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
@@ -852,27 +823,17 @@ def testMmFp4(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())

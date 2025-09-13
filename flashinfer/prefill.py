@@ -1873,6 +1873,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
+                window_left,
             )
 
         self._causal = causal
@@ -2716,6 +2717,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
+                window_left,
             )
 
         self._causal = causal

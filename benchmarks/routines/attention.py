@@ -8,7 +8,6 @@ from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
     bench_gpu_time,
-    bench_gpu_time_with_cudagraph,
 )
 
 from .flashinfer_benchmark_utils import (
@@ -511,27 +510,18 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
-        if is_cuda_graph_compatible and cur_backend != "fa2":
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
+        # Unified benchmark entry: prefer graph if compatible and not using CUPTI
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend_wrapper(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+        )
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -991,27 +981,17 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
-        if is_cuda_graph_compatible and cur_backend != "fa2":
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend_wrapper(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+        )
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -1410,27 +1390,17 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
-        if is_cuda_graph_compatible and cur_backend != "fa2":
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend_wrapper(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+        )
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -1759,27 +1729,17 @@ def testBatchMLAPagedAttentionWrapper(args):
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
-        if is_cuda_graph_compatible and cur_backend != "fa2":
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend_wrapper(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=False,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend_wrapper(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+        )
 
     # Perform reference check
     tested_backends = list(outputs.keys())
