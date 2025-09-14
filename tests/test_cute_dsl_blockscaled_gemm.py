@@ -59,10 +59,7 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
-# TODO enable in tests
-@pytest.mark.parametrize("enable_src_signals", [True])
-# TODO enable in tests
-@pytest.mark.parametrize("enable_dst_signals", [False])
+@pytest.mark.parametrize("enable_dst_signals", [False, True])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
@@ -80,7 +77,6 @@ def test_blockscaled_gemm_python_interface(
     sm_count: int,
     tolerance: float,
     iterations: int,
-    enable_src_signals: int,
     enable_dst_signals: int,
 ):
     torch.manual_seed(42)
@@ -202,10 +198,6 @@ def test_blockscaled_gemm_python_interface(
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
             sm_count=sm_count,
-            src_signals=torch.ones((l,), dtype=torch.uint32, device="cuda")
-            if enable_src_signals
-            else None,
-            src_signal_expect_value=1 if enable_src_signals else 0,
             dst_signals=dst_signals,
         )
 
@@ -263,30 +255,8 @@ def test_blockscaled_gemm_python_interface(
 
 
 if __name__ == "__main__":
-    # test_blockscaled_gemm_python_interface(
-    #     lm=(1, 1024),
-    #     kn=(7168, 4096),
-    #     ab_dtype="float4_e2m1fn",
-    #     sf_dtype="float8_e8m0fnu",
-    #     sf_vec_size=16,
-    #     c_dtype="float16",
-    #     a_major="k",
-    #     b_major="k",
-    #     c_major="n",
-    #     fuse_alpha=False,
-    #     alpha_dtype="float32",
-    #     mma_tiler_mn=(128, 128),
-    #     cluster_shape_mn=(2, 1),
-    #     tolerance=1e-01,
-    #     iterations=3,
-    #     sm_count=132,
-    #     enable_src_signals=False,
-    #     enable_dst_signals=True,
-    # )
-
     test_blockscaled_gemm_python_interface(
-        # TODO real value in masked_m is smaller than this m shape
-        lm=(6, 36864),
+        lm=(1, 1024),
         kn=(7168, 4096),
         ab_dtype="float4_e2m1fn",
         sf_dtype="float8_e8m0fnu",
@@ -302,6 +272,5 @@ if __name__ == "__main__":
         tolerance=1e-01,
         iterations=3,
         sm_count=132,
-        enable_src_signals=False,
-        enable_dst_signals=False,
+        enable_dst_signals=True,
     )
