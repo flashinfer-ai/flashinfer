@@ -63,11 +63,9 @@ from typing import Callable, List
 
 
 sizeof_i32 = 4
-sizeof_u64 = 8
 
 @dsl_user_op
 def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
-    # assert index >= 0 and index < sizeof_u64
     obj &= ~(0xff << (index * 8))
     obj |= value << (index * 8)
     assert isinstance(obj, Uint64), f"{obj=}"
@@ -76,11 +74,9 @@ def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> 
 
 @dsl_user_op
 def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
-    # assert index >= 0 and index < sizeof_u64
     return ((obj >> (index * 8)) & 0xFF).to(Uint8)
 
 
-# TODO unify i32 (here) and the signal buffer (u32)
 @dsl_user_op
 def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
@@ -304,7 +300,6 @@ class MaskedScheduler:
             and batch_idx < self.params.masked_m.shape[0]
         ):
             if cutlass.const_expr((dsm_pending_packed is not None) and (self.params.dst_signals is not None)):
-                # TODO check off by one
                 dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
 
             accum_tile_m += cute.ceil_div(
@@ -1765,7 +1760,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 (dsm_pending_idx < num_experts) and
                                 (read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
                             ):
-                                # TODO unify w/ the other branch
                                 atomic_add_release_global(
                                     tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
                                     value=1,
@@ -1824,7 +1818,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
-                        # TODO unify w/ the other branch
                         atomic_add_release_global(
                             tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
                             value=1,
