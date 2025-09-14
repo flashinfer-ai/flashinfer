@@ -24,7 +24,7 @@ from .artifacts import (
     clear_cubin,
     get_artifacts_status,
 )
-from .jit import clear_cache_dir
+from .jit import clear_cache_dir, jit_spec_registry
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
 from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
 from .jit.core import current_compilation_context
@@ -38,6 +38,22 @@ def _download_cubin():
         click.secho("✅ All cubin download tasks completed successfully.", fg="green")
     except Exception as e:
         click.secho(f"❌ Cubin download failed: {e}", fg="red")
+
+
+def _ensure_modules_registered():
+    """Helper function to ensure modules are registered"""
+    statuses = jit_spec_registry.get_all_statuses()
+    if not statuses:
+        click.secho("No modules found. Registering default modules...", fg="yellow")
+        try:
+            from .aot import register_default_modules
+
+            num_registered = register_default_modules()
+            click.secho(f"✅ Registered {num_registered} modules", fg="green")
+            statuses = jit_spec_registry.get_all_statuses()
+        except Exception as e:
+            click.secho(f"❌ Module registration failed: {e}", fg="red")
+    return statuses
 
 
 @click.group(invoke_without_command=True)
@@ -99,6 +115,18 @@ def show_config_cmd():
     total_cubins = len(status)
 
     click.secho(f"Downloaded {num_downloaded}/{total_cubins} cubins", fg="cyan")
+    click.secho("", fg="white")
+
+    # Section: Module Status
+    click.secho("=== Module Status ===", fg="yellow")
+
+    module_statuses = _ensure_modules_registered()
+    if module_statuses:
+        stats = jit_spec_registry.get_stats()
+        click.secho(f"Total modules: {stats['total']}", fg="cyan")
+        click.secho(f"AOT compiled: {stats['aot_compiled']}", fg="green")
+        click.secho(f"JIT compiled: {stats['jit_compiled']}", fg="magenta")
+        click.secho(f"Not compiled: {stats['not_compiled']}", fg="red")
 
 
 @cli.command("list-cubins")
@@ -139,6 +167,129 @@ def clear_cubin_cmd():
         click.secho("✅ Cubin cleared successfully.", fg="green")
     except Exception as e:
         click.secho(f"❌ Cubin clear failed: {e}", fg="red")
+
+
+@cli.command("module-status")
+@click.option("--detailed", is_flag=True, help="Show detailed information")
+@click.option(
+    "--filter",
+    type=click.Choice(["all", "aot", "jit", "compiled", "not-compiled"]),
+    default="all",
+    help="Filter modules by compilation type or status",
+)
+def module_status_cmd(detailed, filter):
+    """Show module compilation status"""
+    statuses = _ensure_modules_registered()
+    if not statuses:
+        return
+
+    # Apply filter
+    filter_map = {
+        "aot": lambda s: s.is_aot,
+        "jit": lambda s: not s.is_aot,
+        "compiled": lambda s: s.is_compiled,
+        "not-compiled": lambda s: not s.is_compiled,
+    }
+    if filter in filter_map:
+        statuses = [s for s in statuses if filter_map[filter](s)]
+
+    # Sort by name for consistent output
+    statuses.sort(key=lambda x: x.name)
+
+    if detailed:
+        # Detailed view
+        for status in statuses:
+            click.secho(f"Module: {status.name}", fg="cyan", bold=True)
+            click.secho(f"  Type: {status.compilation_type}", fg="white")
+            click.secho(
+                f"  Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}"
+            )
+            if status.library_path:
+                click.secho(f"  Library: {status.library_path}", fg="white")
+            click.secho(f"  Sources: {len(status.sources)} file(s)", fg="white")
+            if status.needs_device_linking:
+                click.secho("  Device Linking: Required", fg="yellow")
+            click.secho(
+                f"  Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                fg="white",
+            )
+            click.echo()
+    else:
+        # Table view
+        table_data = []
+        for status in statuses:
+            status_color = "green" if status.is_compiled else "red"
+            type_color = "blue" if status.is_aot else "magenta"
+            table_data.append(
+                [
+                    status.name,
+                    click.style(status.compilation_type, fg=type_color),
+                    click.style(status.status, fg=status_color),
+                    len(status.sources),
+                    "Yes" if status.needs_device_linking else "No",
+                ]
+            )
+
+        headers = ["Module Name", "Type", "Status", "Sources", "Device Linking"]
+        click.echo(tabulate(table_data, headers=headers, tablefmt="github"))
+
+    # Show summary statistics
+    stats = jit_spec_registry.get_stats()
+    click.echo()
+    click.secho("=== Summary ===", fg="yellow")
+    click.secho(f"Total modules: {stats['total']}", fg="cyan")
+    click.secho(f"AOT compiled: {stats['aot_compiled']}", fg="blue")
+    click.secho(f"JIT compiled: {stats['jit_compiled']}", fg="magenta")
+    click.secho(f"Not compiled: {stats['not_compiled']}", fg="red")
+
+
+@cli.command("list-modules")
+@click.argument("module_name", required=False)
+def list_modules_cmd(module_name):
+    """List or inspect compilation modules"""
+    # Register default modules if none exist
+    statuses = _ensure_modules_registered()
+    if not statuses:
+        return
+
+    if module_name:
+        # Show specific module
+        status = jit_spec_registry.get_spec_status(module_name)
+        if not status:
+            click.secho(f"Module '{module_name}' not found.", fg="red")
+            return
+
+        click.secho(f"Module: {status.name}", fg="cyan", bold=True)
+        click.secho(f"Type: {status.compilation_type}", fg="white")
+        click.secho(
+            f"Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}"
+        )
+        if status.library_path:
+            click.secho(f"Library Path: {status.library_path}", fg="white")
+        click.secho(
+            f"Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}", fg="white"
+        )
+        click.secho(
+            f"Device Linking: {'Required' if status.needs_device_linking else 'Not required'}",
+            fg="white",
+        )
+        click.secho("Source Files:", fg="white")
+        for i, source in enumerate(status.sources, 1):
+            click.secho(f"  {i}. {source}", fg="white")
+    else:
+        # List all modules
+        statuses = _ensure_modules_registered()
+        if not statuses:
+            return
+
+        statuses.sort(key=lambda x: x.name)
+        click.secho("Available compilation modules:", fg="cyan", bold=True)
+        for status in statuses:
+            status_color = "green" if status.is_compiled else "red"
+            type_indicator = "[AOT]" if status.is_aot else "[JIT]"
+            click.secho(
+                f"  {status.name} {type_indicator} - {click.style(status.status, fg=status_color)}"
+            )
 
 
 if __name__ == "__main__":
