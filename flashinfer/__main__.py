@@ -161,14 +161,14 @@ def module_status_cmd(detailed, filter):
             return
 
     # Apply filter
-    if filter == "aot":
-        statuses = [s for s in statuses if s.is_aot]
-    elif filter == "jit":
-        statuses = [s for s in statuses if not s.is_aot]
-    elif filter == "compiled":
-        statuses = [s for s in statuses if s.is_compiled]
-    elif filter == "not-compiled":
-        statuses = [s for s in statuses if not s.is_compiled]
+    filter_map = {
+        "aot": lambda s: s.is_aot,
+        "jit": lambda s: not s.is_aot,
+        "compiled": lambda s: s.is_compiled,
+        "not-compiled": lambda s: not s.is_compiled,
+    }
+    if filter in filter_map:
+        statuses = [s for s in statuses if filter_map[filter](s)]
 
     # Sort by name for consistent output
     statuses.sort(key=lambda x: x.name)
