@@ -2764,7 +2764,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(9)]
+            ) = [16 for _ in range(8)]
 
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
