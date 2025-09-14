@@ -4,7 +4,6 @@ import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
-from collections import defaultdict
 from datetime import datetime
 
 import torch
@@ -86,6 +85,7 @@ current_compilation_context = CompilationContext()
 @dataclasses.dataclass
 class JitSpecStatus:
     """Status information for a JitSpec"""
+
     name: str
     created_at: datetime
     is_aot: bool
@@ -113,13 +113,13 @@ class JitSpecRegistry:
         self._specs: Dict[str, JitSpec] = {}
         self._creation_times: Dict[str, datetime] = {}
 
-    def register(self, spec: 'JitSpec') -> None:
+    def register(self, spec: "JitSpec") -> None:
         """Register a new JitSpec"""
         if spec.name not in self._specs:
             self._specs[spec.name] = spec
             self._creation_times[spec.name] = datetime.now()
 
-    def get_all_specs(self) -> Dict[str, 'JitSpec']:
+    def get_all_specs(self) -> Dict[str, "JitSpec"]:
         """Get all registered JitSpecs"""
         return self._specs.copy()
 
@@ -129,7 +129,11 @@ class JitSpecRegistry:
             return None
 
         spec = self._specs[name]
-        library_path = spec.get_library_path() if (spec.is_aot or spec.jit_library_path.exists()) else None
+        library_path = (
+            spec.get_library_path()
+            if (spec.is_aot or spec.jit_library_path.exists())
+            else None
+        )
 
         return JitSpecStatus(
             name=spec.name,

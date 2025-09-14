@@ -503,29 +503,8 @@ def get_default_config():
     }
 
 
-def get_minimal_config():
-    """Get minimal configuration for registration"""
-    return {
-        "fa2_head_dim": [(128, 128)],
-        "fa3_head_dim": [(128, 128)],
-        "f16_dtype": [torch.float16, torch.bfloat16],
-        "f8_dtype": [torch.float8_e4m3fn],
-        "use_sliding_window": [False],
-        "use_logits_soft_cap": [False],
-        "add_comm": False,
-        "add_gemma": False,
-        "add_oai_oss": False,
-        "add_moe": True,
-        "add_act": True,
-        "add_misc": True,
-        "add_xqa": False,
-    }
-
-
 def detect_sm_capabilities():
     """Detect SM capabilities"""
-    from .compilation_context import CompilationContext
-    from .utils import version_at_least
     import torch.version
 
     compilation_context = CompilationContext()
@@ -541,31 +520,6 @@ def detect_sm_capabilities():
         return version_at_least(torch.version.cuda, version)
 
     return has_sm("compute_90", "12.3"), has_sm("compute_100", "12.8")
-
-
-def register_minimal_modules() -> int:
-    """Register a minimal set of modules for CLI introspection"""
-    config = get_minimal_config()
-    has_sm90, has_sm100 = detect_sm_capabilities()
-
-    jit_specs = gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
-        has_sm90,
-        has_sm100,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
-    )
-    return len(jit_specs)
 
 
 def register_default_modules() -> int:
@@ -599,19 +553,53 @@ def main():
     )
     parser.add_argument("--out-dir", type=Path, help="Output directory")
     parser.add_argument("--build-dir", type=Path, help="Build directory")
-    parser.add_argument("--fa2-head-dim", nargs="*", help="FA2 head dim pair of qk and vo, separated by comma")
-    parser.add_argument("--fa3-head-dim", nargs="*", help="FA3 head dim pair of qk and vo, separated by comma")
-    parser.add_argument("--f16-dtype", nargs="*", choices=["float16", "bfloat16"], help="16-bit data type")
-    parser.add_argument("--f8-dtype", nargs="*", choices=["float8_e4m3fn", "float8_e5m2"], help="8-bit data type")
-    parser.add_argument("--use-sliding-window", nargs="*", help="Use sliding window attention")
+    parser.add_argument(
+        "--fa2-head-dim",
+        nargs="*",
+        help="FA2 head dim pair of qk and vo, separated by comma",
+    )
+    parser.add_argument(
+        "--fa3-head-dim",
+        nargs="*",
+        help="FA3 head dim pair of qk and vo, separated by comma",
+    )
+    parser.add_argument(
+        "--f16-dtype",
+        nargs="*",
+        choices=["float16", "bfloat16"],
+        help="16-bit data type",
+    )
+    parser.add_argument(
+        "--f8-dtype",
+        nargs="*",
+        choices=["float8_e4m3fn", "float8_e5m2"],
+        help="8-bit data type",
+    )
+    parser.add_argument(
+        "--use-sliding-window", nargs="*", help="Use sliding window attention"
+    )
     parser.add_argument("--use-logits-soft-cap", nargs="*", help="Use logits soft cap")
-    parser.add_argument("--add-comm", type=parse_bool, help="Add communication kernels (trtllm_comm, vllm_comm)")
-    parser.add_argument("--add-gemma", type=parse_bool, help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)")
-    parser.add_argument("--add-oai-oss", type=parse_bool, help="Add kernels for OAI OSS Model (head_dim=64, use_sliding_window)")
+    parser.add_argument(
+        "--add-comm",
+        type=parse_bool,
+        help="Add communication kernels (trtllm_comm, vllm_comm)",
+    )
+    parser.add_argument(
+        "--add-gemma",
+        type=parse_bool,
+        help="Add kernels for Gemma Model (head_dim=256, use_sliding_window, use_logits_soft_cap)",
+    )
+    parser.add_argument(
+        "--add-oai-oss",
+        type=parse_bool,
+        help="Add kernels for OAI OSS Model (head_dim=64, use_sliding_window)",
+    )
     parser.add_argument("--add-moe", type=parse_bool, help="Add MoE kernels")
     parser.add_argument("--add-act", type=parse_bool, help="Add activation kernels")
     parser.add_argument("--add-misc", type=parse_bool, help="Add miscellaneous kernels")
-    parser.add_argument("--add-xqa", type=parse_bool, help="Add XQA (Cross-Query Attention) kernels")
+    parser.add_argument(
+        "--add-xqa", type=parse_bool, help="Add XQA (Cross-Query Attention) kernels"
+    )
     args = parser.parse_args()
 
     # Start with default configuration
@@ -636,9 +624,19 @@ def main():
     if args.use_sliding_window:
         config["use_sliding_window"] = [parse_bool(s) for s in args.use_sliding_window]
     if args.use_logits_soft_cap:
-        config["use_logits_soft_cap"] = [parse_bool(s) for s in args.use_logits_soft_cap]
+        config["use_logits_soft_cap"] = [
+            parse_bool(s) for s in args.use_logits_soft_cap
+        ]
 
-    for key in ["add_comm", "add_gemma", "add_oai_oss", "add_moe", "add_act", "add_misc", "add_xqa"]:
+    for key in [
+        "add_comm",
+        "add_gemma",
+        "add_oai_oss",
+        "add_moe",
+        "add_act",
+        "add_misc",
+        "add_xqa",
+    ]:
         arg_value = getattr(args, key, None)
         if arg_value is not None:
             config[key] = arg_value
@@ -678,7 +676,15 @@ def main():
     print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
     print("  has_sm90:", has_sm90)
     print("  has_sm100:", has_sm100)
-    for key in ["add_comm", "add_gemma", "add_oai_oss", "add_moe", "add_act", "add_misc", "add_xqa"]:
+    for key in [
+        "add_comm",
+        "add_gemma",
+        "add_oai_oss",
+        "add_moe",
+        "add_act",
+        "add_misc",
+        "add_xqa",
+    ]:
         print(f"  {key}:", config[key])
 
     # Generate JIT specs

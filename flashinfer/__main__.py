@@ -143,8 +143,12 @@ def clear_cubin_cmd():
 
 @cli.command("module-status")
 @click.option("--detailed", is_flag=True, help="Show detailed information")
-@click.option("--filter", type=click.Choice(["all", "aot", "jit", "compiled", "not-compiled"]),
-              default="all", help="Filter modules by compilation type or status")
+@click.option(
+    "--filter",
+    type=click.Choice(["all", "aot", "jit", "compiled", "not-compiled"]),
+    default="all",
+    help="Filter modules by compilation type or status",
+)
 def module_status_cmd(detailed, filter):
     """Show module compilation status"""
     statuses = jit_spec_registry.get_all_statuses()
@@ -153,6 +157,7 @@ def module_status_cmd(detailed, filter):
         click.secho("No modules found. Registering default modules...", fg="yellow")
         try:
             from .aot import register_default_modules
+
             num_registered = register_default_modules()
             click.secho(f"✅ Registered {num_registered} modules", fg="green")
             statuses = jit_spec_registry.get_all_statuses()
@@ -178,13 +183,18 @@ def module_status_cmd(detailed, filter):
         for status in statuses:
             click.secho(f"Module: {status.name}", fg="cyan", bold=True)
             click.secho(f"  Type: {status.compilation_type}", fg="white")
-            click.secho(f"  Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}")
+            click.secho(
+                f"  Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}"
+            )
             if status.library_path:
                 click.secho(f"  Library: {status.library_path}", fg="white")
             click.secho(f"  Sources: {len(status.sources)} file(s)", fg="white")
             if status.needs_device_linking:
-                click.secho(f"  Device Linking: Required", fg="yellow")
-            click.secho(f"  Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}", fg="white")
+                click.secho("  Device Linking: Required", fg="yellow")
+            click.secho(
+                f"  Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                fg="white",
+            )
             click.echo()
     else:
         # Table view
@@ -192,13 +202,15 @@ def module_status_cmd(detailed, filter):
         for status in statuses:
             status_color = "green" if status.is_compiled else "red"
             type_color = "blue" if status.is_aot else "magenta"
-            table_data.append([
-                status.name,
-                click.style(status.compilation_type, fg=type_color),
-                click.style(status.status, fg=status_color),
-                len(status.sources),
-                "Yes" if status.needs_device_linking else "No"
-            ])
+            table_data.append(
+                [
+                    status.name,
+                    click.style(status.compilation_type, fg=type_color),
+                    click.style(status.status, fg=status_color),
+                    len(status.sources),
+                    "Yes" if status.needs_device_linking else "No",
+                ]
+            )
 
         headers = ["Module Name", "Type", "Status", "Sources", "Device Linking"]
         click.echo(tabulate(table_data, headers=headers, tablefmt="github"))
@@ -223,6 +235,7 @@ def list_modules_cmd(module_name):
         click.secho("No modules found. Registering default modules...", fg="yellow")
         try:
             from .aot import register_default_modules
+
             num_registered = register_default_modules()
             click.secho(f"✅ Registered {num_registered} modules", fg="green")
         except Exception as e:
@@ -238,12 +251,19 @@ def list_modules_cmd(module_name):
 
         click.secho(f"Module: {status.name}", fg="cyan", bold=True)
         click.secho(f"Type: {status.compilation_type}", fg="white")
-        click.secho(f"Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}")
+        click.secho(
+            f"Status: {click.style(status.status, fg='green' if status.is_compiled else 'red')}"
+        )
         if status.library_path:
             click.secho(f"Library Path: {status.library_path}", fg="white")
-        click.secho(f"Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}", fg="white")
-        click.secho(f"Device Linking: {'Required' if status.needs_device_linking else 'Not required'}", fg="white")
-        click.secho(f"Source Files:", fg="white")
+        click.secho(
+            f"Created: {status.created_at.strftime('%Y-%m-%d %H:%M:%S')}", fg="white"
+        )
+        click.secho(
+            f"Device Linking: {'Required' if status.needs_device_linking else 'Not required'}",
+            fg="white",
+        )
+        click.secho("Source Files:", fg="white")
         for i, source in enumerate(status.sources, 1):
             click.secho(f"  {i}. {source}", fg="white")
     else:
@@ -253,6 +273,7 @@ def list_modules_cmd(module_name):
             click.secho("No modules found. Registering default modules...", fg="yellow")
             try:
                 from .aot import register_default_modules
+
                 num_registered = register_default_modules()
                 click.secho(f"✅ Registered {num_registered} modules", fg="green")
                 statuses = jit_spec_registry.get_all_statuses()
@@ -265,7 +286,9 @@ def list_modules_cmd(module_name):
         for status in statuses:
             status_color = "green" if status.is_compiled else "red"
             type_indicator = "[AOT]" if status.is_aot else "[JIT]"
-            click.secho(f"  {status.name} {type_indicator} - {click.style(status.status, fg=status_color)}")
+            click.secho(
+                f"  {status.name} {type_indicator} - {click.style(status.status, fg=status_color)}"
+            )
 
 
 if __name__ == "__main__":
