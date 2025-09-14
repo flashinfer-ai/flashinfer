@@ -8,7 +8,6 @@ from einops import einsum
 import flashinfer
 from flashinfer.testing.utils import (
     bench_gpu_time,
-    bench_gpu_time_with_cudagraph,
     dequantize_fp8,
     quantize_fp8,
 )
@@ -17,6 +16,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    is_close_stats,
 )
 
 
@@ -197,10 +197,21 @@ def testGemmFp8NtGroupwise(args):
     ## Done parsing input arguments
 
     if "trtllm" in backends:
-        remove_trtllm = True
-        print("[INFO] trtllm backend testing not supported yet")
+        remove_trtllm = False
+        if scale_major_mode != "MN":
+            print(
+                "[INFO] trtllm only supports MN scale_major_mode, removing trtllm from backends"
+            )
+            remove_trtllm = True
+        if k < 256:
+            print("[INFO] trtllm only supports k >= 256, removing trtllm from backends")
+            remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
+
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return
 
     ## Prepare input tensors
     a_val = torch.randn((m, k), dtype=torch.float, device=device)
@@ -223,17 +234,6 @@ def testGemmFp8NtGroupwise(args):
     a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
     b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
-    if "trtllm" in backends:
-        a_scale_shape_trtllm = (m, k // tile_size)
-        b_scale_shape_trtllm = (k // tile_size, n // tile_size)
-
-        a_fp8_trtllm, a_scale_trtllm = quantize_fp8(
-            a_val, a_scale_shape_trtllm, a_tile_shape, "K"
-        )
-        b_fp8_trtllm, b_scale_trtllm = quantize_fp8(
-            b_val, b_scale_shape_trtllm, b_tile_shape, "MN"
-        )
-
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_fp8.shape = }")
         print(f"[VVERBOSE] {b_fp8.shape = }")
@@ -244,7 +244,7 @@ def testGemmFp8NtGroupwise(args):
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend):
-        if backend == "cutlass":
+        if backend in ["cutlass", "trtllm"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -253,18 +253,7 @@ def testGemmFp8NtGroupwise(args):
                 scale_major_mode=scale_major_mode,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
-                backend="cutlass",
-            )
-        elif backend == "trtllm":
-            return flashinfer.gemm.gemm_fp8_nt_groupwise(
-                a=a_fp8,
-                b=b_fp8,
-                a_scale=a_scale,
-                b_scale=b_scale,
-                scale_major_mode=None,
-                out_dtype=out_dtype,
-                mma_sm=mma_sm,
-                backend="trtllm",
+                backend=backend,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -280,43 +269,38 @@ def testGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    torch.testing.assert_close(
-                        reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
-                    )
-                except AssertionError as e:
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
 
     res = []
     for backend in backends:
@@ -462,43 +446,38 @@ def testGroupGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    torch.testing.assert_close(
-                        reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
-                    )
-                except AssertionError as e:
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
 
     res = []
     for backend in backends:
@@ -637,27 +616,17 @@ def testBmmFp8(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
@@ -670,20 +639,19 @@ def testBmmFp8(args):
                 reference_output = reference_output.to(torch.float32)
                 tested_outputs = [output.to(torch.float32) for output in tested_outputs]
             for i in range(len(tested_backends)):
-                try:
-                    cos_sim = F.cosine_similarity(
-                        reference_output.reshape(-1),
-                        tested_outputs[i].reshape(-1),
-                        dim=0,
-                    )
-                    assert cos_sim > 0.99
-                except AssertionError as e:
+                cos_sim = F.cosine_similarity(
+                    reference_output.reshape(-1),
+                    tested_outputs[i].reshape(-1),
+                    dim=0,
+                )
+                if cos_sim < 0.99:
                     print(
                         f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                        )
 
     res = []
     for backend in backends:
@@ -855,47 +823,36 @@ def testMmFp4(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend).detach()
-        if is_cuda_graph_compatible:
-            backend_times[cur_backend] = bench_gpu_time_with_cudagraph(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                num_iters_within_graph=20,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
-        else:
-            backend_times[cur_backend] = bench_gpu_time(
-                fn=lambda: run_backend(cur_backend),
-                dry_run_iters=args.dry_run_iters,
-                repeat_iters=args.num_iters,
-                l2_flush=True,
-                l2_flush_size_mb=256,
-                l2_flush_device=device,
-                sleep_after_run=True,
-            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=lambda: run_backend(cur_backend),
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            l2_flush=True,
+            l2_flush_size_mb=256,
+            l2_flush_device=device,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+        )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                try:
-                    cos_sim = F.cosine_similarity(
-                        reference_output.reshape(-1),
-                        tested_outputs[i].reshape(-1),
-                        dim=0,
-                    )
-                    assert cos_sim > 0.97
-                except AssertionError as e:
+                cos_sim = F.cosine_similarity(
+                    reference_output.reshape(-1),
+                    tested_outputs[i].reshape(-1),
+                    dim=0,
+                )
+                if cos_sim < 0.97:
                     print(
                         f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
-                        print(e)
-                        raise
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                        )
 
     res = []
     for backend in backends:

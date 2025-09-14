@@ -71,6 +71,7 @@ output_column_dict = {
     "general": [
         "refcheck",
         "no_cuda_graph",
+        "use_cupti",
         "allow_output_mismatch",
         "random_seed",
         "case_tag",
@@ -117,12 +118,26 @@ def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
 
 
 def get_device(args):
+    # Synchronize to ensure that the device is ready after previous tests
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     set_seed(args.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gpu_name = torch.cuda.get_device_name(torch.cuda.current_device()).replace(" ", "_")
     if args.verbose >= 2:
         print(f"[VVERBOSE] {gpu_name = }")
     return device
+
+
+def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
+    close_tensor = torch.isclose(input, other, rtol=rtol, atol=atol)
+    num_elements = close_tensor.numel()
+    num_different_elements = num_elements - close_tensor.sum().item()
+    return (
+        num_different_elements,  # number of different elements
+        num_elements,  # total number of elements in tensor
+        num_different_elements / num_elements * 100.0,
+    )
 
 
 def dtype_str_to_torch_dtype(dtype_str):

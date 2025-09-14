@@ -22,6 +22,8 @@ from .utils import (
     attention_tflops_per_sec,
     attention_tflops_per_sec_with_actual_seq_lens,
     bench_gpu_time,
+    bench_gpu_time_with_cupti,
+    bench_gpu_time_with_cuda_event,
     bench_gpu_time_with_cudagraph,
     set_seed,
     sleep_after_kernel_run,

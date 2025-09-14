@@ -24,6 +24,7 @@
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/common.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 
 namespace tensorrt_llm {
@@ -103,13 +104,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         tileSize == mOptions.tileSize &&
         options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
         options.mLayoutA == mOptions.weightLayout) {
-      // FIXME: Disable split-k for swiglu for now.
-      if (static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType) ==
-              batchedGemm::gemmGatedAct::ActType::SwiGlu &&
-          options.mClusterDimZ != 1) {
-        continue;
-      }
-
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -244,8 +238,9 @@ void TrtllmGenBatchedGemmRunner::run(
 
   TORCH_CHECK(err == 0,
               "Error occurred when running GEMM!"
-              " (numBatches: %d, GemmMNK: %d %d %d, Kernel: %s)",
-              numBatches, m, n, k, config.mFunctionName);
+              " (numBatches: ",
+              numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
+              ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -305,6 +300,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
+  int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+
   BatchedGemmData gemmData;
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
@@ -321,67 +318,57 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
-  // Tier 0: K < tileK, prefer higher efficiency.
-  auto cmpTier0 = [&configs, &gemmData](int64_t idx0, int64_t idx1) {
+  auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
     auto const& optionsB = configs[idx1].mOptions;
     int32_t sizeK = gemmData.mProblemDimensions.mK;
-    // Both waste computation, prefer higher efficiency.
-    if (sizeK <= optionsA.mTileK && sizeK <= optionsB.mTileK) {
-      double eff_a = (double)sizeK / optionsA.mTileK;
-      double eff_b = (double)sizeK / optionsB.mTileK;
-      return eff_a > eff_b;
-    }
-    // If either can be utilized, sort by tileK.
-    else {
-      return optionsA.mTileK > optionsB.mTileK;
-    }
-  };
-  // Tier 1: When tileK is the same, prefer unroll loop 2x for mma.
-  auto cmpTier1 = [&configs](int64_t idx0, int64_t idx1) {
-    auto const& optionsA = configs[idx0].mOptions;
-    auto const& optionsB = configs[idx1].mOptions;
-    if (optionsA.mTileK == optionsB.mTileK) {
-      return optionsA.mUseUnrollLoop2xForMma;
-    }
-    return false;
-  };
-  // Tier 2+: When previous comparators are the same, prefer higher tileM.
-  auto cmpTier2 = [&configs](int64_t idx0, int64_t idx1) {
-    auto const& optionsA = configs[idx0].mOptions;
-    auto const& optionsB = configs[idx1].mOptions;
-    if (optionsA.mTileK == optionsB.mTileK &&
-        optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma) {
-      return optionsA.mTileM > optionsB.mTileM;
-    }
-    return false;
-  };
-  // Tier 2+: When previous comparators are the same, and when number of estimated CTAs is on the
-  // larger side, prefer persistent tile scheduler. The threshold is hardcoded as >148 CTAs at the
-  // moment.
-  auto cmpTier3 = [&configs, &gemmData](int64_t idx0, int64_t idx1) {
-    int32_t sizeM = gemmData.mProblemDimensions.mM;
-    int32_t sizeN = gemmData.mProblemDimensions.mN;
-    auto const& optionsA = configs[idx0].mOptions;
-    auto const& optionsB = configs[idx1].mOptions;
-    if (optionsA.mTileK == optionsB.mTileK &&
-        optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma &&
-        optionsA.mTileM == optionsB.mTileM) {
-      int64_t numTilesM = batchedGemm::gemm::divUp(sizeM, optionsA.mTileM);
-      int64_t numTilesN = batchedGemm::gemm::divUp(sizeN, optionsA.mTileN);
-      if (numTilesM * numTilesN > 148) {
-        return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+
+    // Tier 0: K < tileK, prefer higher efficiency.
+    if (optionsA.mTileK != optionsB.mTileK) {
+      // Both waste computation, prefer higher efficiency.
+      if (sizeK <= optionsA.mTileK && sizeK <= optionsB.mTileK) {
+        double eff_a = (double)sizeK / optionsA.mTileK;
+        double eff_b = (double)sizeK / optionsB.mTileK;
+        return eff_a > eff_b;
+      }
+      // If either can be utilized, sort by tileK.
+      else {
+        return optionsA.mTileK > optionsB.mTileK;
       }
     }
+
+    // Tier 1: When tileK is the same, prefer unroll loop 2x for mma.
+    if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma) {
+      return optionsA.mUseUnrollLoop2xForMma;
+    }
+
+    // Tier 2+: When previous comparators are the same, prefer higher tileM.
+    if (optionsA.mTileM != optionsB.mTileM) {
+      return optionsA.mTileM > optionsB.mTileM;
+    }
+
+    // Tier 2+: When previous comparators are the same, prefer higher tileN.
+    if (optionsA.mTileN != optionsB.mTileN) {
+      return optionsA.mTileN > optionsB.mTileN;
+    }
+
+    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
+    // the larger side, prefer persistent tile scheduler.
+    if (optionsA.mTileScheduler != optionsB.mTileScheduler) {
+      auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
+      auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+      if (numCtas > multiProcessorCount) {
+        return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+      } else {
+        return optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+      }
+    }
+
     return false;
   };
-
   // Sort configs by options.
   std::vector<int64_t> sortedIndices = mPassingConfigIndices;
-  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier0);
-  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier1);
-  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier2);
-  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpTier3);
+  std::sort(sortedIndices.begin(), sortedIndices.end(), cmpFunc);
 
   // Special rules for corner cases, if applicable.
   std::vector<int64_t> prioritizedIndices =

@@ -108,10 +108,9 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
     ms = np.median(measurements)
     flops = (
         2
-        * batch_size
         * num_q_heads
         * (2 * kv_lora_rank + qk_rope_head_dim)
-        * seq_len
+        * sum(seq_lens)
         * q_len_per_request
     )
     print(

@@ -109,7 +109,8 @@ struct PersistentParams {
   uint32_t v_stride_n;
 
   float sm_scale;
-  double logits_soft_cap;
+  float logits_soft_cap;
+  float v_scale;
   {{ additional_params_decl }}
 
   PROFILER_PARAMS_DECL

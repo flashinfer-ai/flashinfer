@@ -30,10 +30,10 @@ from flashinfer import (
     fp4_quantize,
     mxfp8_dequantize_host,
     mxfp8_quantize,
-    next_positive_power_of_2,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -46,6 +46,7 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w2_permute_indices,
     _maybe_get_cached_w3_w1_permute_indices,
 )
+from flashinfer.utils import calculate_tile_tokens_dim
 
 
 def check_cuda(err):
@@ -105,7 +106,7 @@ class CUDAGraphMoE:
         self.input_tensor = hidden_states_sample.clone()
 
         # Warmup
-        with torch.cuda.stream(torch_stream):
+        with torch.cuda.stream(torch_stream), autotune(True):
             for _ in range(1):
                 self._run_moe_computation(runtime_args)
 
@@ -697,8 +698,6 @@ class FP8BlockScaleMoe(Moe):
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
-        num_tokens = kwargs["num_tokens"]
-        hidden_size = kwargs["hidden_size"]
         top_k = kwargs["top_k"]
         n_groups = kwargs["n_groups"]
         top_k_groups = kwargs["top_k_groups"]
@@ -707,13 +706,10 @@ class FP8BlockScaleMoe(Moe):
         routing_method_type = kwargs["routing_method_type"]
         tile_tokens_dim = kwargs["tile_tokens_dim"]
         enable_pdl = kwargs.get("enable_pdl")
+        hidden_states_scale = kwargs["hidden_states_scale"]
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_orig.to(torch.float8_e4m3fn)
-        # Use deterministic scales for testing consistency
-        hidden_states_scale = 2.0 * torch.ones(
-            (hidden_size // 128, num_tokens), device="cuda", dtype=torch.float
-        )
 
         output = trtllm_fp8_block_scale_moe(
             expert_logits,
@@ -1004,6 +1000,7 @@ class moe_args_dequant:
         permute_info,
         use_routing_scales_on_input,
         gated_act_type,
+        hidden_states_scale=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1018,6 +1015,7 @@ class moe_args_dequant:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gated_act_type = gated_act_type
+        self.hidden_states_scale = hidden_states_scale
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -1628,8 +1626,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
 def run_moe_reference_dsfp8(args):
     """FP8 block-scale reference implementation."""
     # Generate block scales at runtime for FP8 block scaling
-    # Use deterministic scales for testing consistency
-    hidden_states_scale = 2.0 * torch.ones(
+    hidden_states_scale = 2.0 * torch.rand(
         (args.hidden_size // 128, args.num_tokens), device="cuda", dtype=torch.float
     )
 
@@ -1663,6 +1660,7 @@ def run_moe_reference_dsfp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         GatedActType.SwiGlu.value,  # gated_act_type
+        hidden_states_scale,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -1735,6 +1733,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "tile_tokens_dim": kwargs["tile_tokens_dim"],
         "do_finalize": True,
         "gated_act_type": args.gated_act_type,
+        "hidden_states_scale": args_dequant.hidden_states_scale,
     }
 
     return moe_impl.call_moe(
@@ -1743,18 +1742,6 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         args.hidden_states_scale_global,
         **kernel_kwargs,
     )
-
-
-def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = num_tokens * top_k // num_experts
-
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-    return tile_tokens_dim
 
 
 @pytest.fixture(scope="module")

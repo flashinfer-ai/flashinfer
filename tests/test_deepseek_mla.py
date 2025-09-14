@@ -27,7 +27,11 @@ from flashinfer.jit.attention import (
     gen_batch_prefill_module,
     gen_single_prefill_module,
 )
-from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -162,6 +166,8 @@ def test_single_prefill_with_kv_cache(
     clear_cuda_cache(device)
     if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
+    if is_sm110a_supported(device) and num_heads * kv_len > 700000:
+        pytest.skip("skip large tests on Thor due to memory limit")
     torch.manual_seed(42)
     head_dim_qk = 192
     head_dim_vo = 128
@@ -636,7 +642,7 @@ def test_batch_mla_page_attention(
 def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     device = torch.device("cuda:0")
     clear_cuda_cache(device)
-    if not is_sm100a_supported(device):
+    if not is_sm100a_supported(device) and not is_sm110a_supported(device):
         pytest.skip("Cutlass MLA is not supported on this device")
 
     torch.manual_seed(42)

@@ -140,7 +140,8 @@ __device__ __forceinline__ void write_o_(float (*o_frag)[KTraits::NUM_MMA_D_VO][
 
 template <typename KTraits>
 __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
+                                            float v_scale = 1.0f) {
   using AttentionVariant = typename KTraits::AttentionVariant;
   if constexpr (AttentionVariant::use_softmax) {
     float d_rcp[KTraits::NUM_MMA_Q][2];
@@ -163,6 +164,9 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
               o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id >> 1) & 1];
+          if (v_scale != 1.0f) {
+            o_frag[mma_q][mma_d][reg_id] *= v_scale;
+          }
         }
       }
     }
@@ -269,7 +273,8 @@ struct BlockBatchPagedAttentionPersistent {
       const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
       const uint32_t num_kv_chunks = ceil_div(
           CAUSAL
-              ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
+              ? min((kv_len - q_len) + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
+                    kv_len)
               : kv_len,
           len_kv_chunk);
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
@@ -390,7 +395,7 @@ struct BlockBatchPagedAttentionPersistent {
       threadblock_sync_mdo_states<KTraits>(o_frag, smem_storage, m, d, warp_idx, lane_idx, tid);
 
       // normalize d
-      normalize_d<KTraits>(o_frag, m, d);
+      normalize_d<KTraits>(o_frag, m, d, params.v_scale);
 
       // write back to global memory
       // o_indptr (partial_o): [packed_qo_len * num_kv_chunks, num_kv_heads, head_dim]
@@ -517,6 +522,7 @@ struct BlockBatchReductionPersistent {
 
       // remap workload
       uint32_t packed_qo_idx = i / num_kv_heads;
+      uint32_t kv_head_idx = i % num_kv_heads;
       const uint32_t num_index_sets = indptr[packed_qo_idx + 1] - indptr[packed_qo_idx];
       if (num_index_sets == 0 || num_index_sets == 1) {
         // already write through, bypass
@@ -524,16 +530,13 @@ struct BlockBatchReductionPersistent {
         continue;
       }
 
-      uint32_t kv_head_idx = i % num_kv_heads;
-      uint32_t qo_head_idx = packed_qo_idx % gqa_group_size;
-
       // index calculation
       auto partial_idx_to_offset = [&](uint32_t off) {
         return (indptr[packed_qo_idx] + off) * num_kv_heads + kv_head_idx;
       };
       auto merge_idx_to_offset = [&]() {
-        return (o_indices[packed_qo_idx] * num_kv_heads + kv_head_idx) * gqa_group_size +
-               qo_head_idx;
+        // NOTE (Yilong): qo_head_idx has been calculated in schedule.plan
+        return o_indices[packed_qo_idx] + kv_head_idx * gqa_group_size;
       };
 
       state_t<vec_size> st;

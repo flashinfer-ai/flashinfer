@@ -58,6 +58,7 @@ from .fp4_quantization import (
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,
+    nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
@@ -75,6 +76,7 @@ from .fused_moe import (
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
@@ -130,3 +132,4 @@ from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .xqa import xqa as xqa

@@ -127,6 +127,9 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -185,6 +188,9 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
@@ -462,6 +468,7 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                -1,  # window_left
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -655,6 +662,7 @@ class BlockSparseAttentionWrapper:
                 rope_scale,
                 rope_theta,
                 0,  # token_pos_in_items_len
+                self._workspace_size,  # workspace_size
             )
         else:
             self._cached_module.run(
@@ -740,6 +748,9 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -789,6 +800,9 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
@@ -1038,6 +1052,7 @@ class VariableBlockSparseAttentionWrapper:
             head_dim,
             head_dim,
             causal,
+            -1,  # window_left
         )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1223,6 +1238,7 @@ class VariableBlockSparseAttentionWrapper:
             rope_scale,
             rope_theta,
             0,  # token_pos_in_items_len
+            self._workspace_size,
         )
 
         # [qo_len * num_kv_heads, gqa_group_size, head_dim] -> HND

@@ -726,7 +726,12 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       // We allow both tma warp specialized and SM80 configurations to coexist because for some
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
-        TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == sm_,
+        bool is_same_sm = inputs.gemm_config.sm_version == sm_;
+        // gemm_config.sm_version indicates the kernel pipeline, which is always 100 for 100, 103,
+        // 110 below logging helps confirming the cutlass pipeline matches the device major version
+        bool is_sm110 = inputs.gemm_config.sm_version == 100 && sm_ == 110;
+        bool is_sm103 = inputs.gemm_config.sm_version == 100 && sm_ == 103;
+        TLLM_CHECK_WITH_INFO(is_same_sm || is_sm110 || is_sm103,
                              "Using SM %d configuration for SM %d device",
                              inputs.gemm_config.sm_version, sm_);
         TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,

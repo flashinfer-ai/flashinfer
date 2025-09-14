@@ -61,9 +61,7 @@ struct DefaultAttention : AttentionVariantBase {
         custom_mask_ptr = params.maybe_custom_mask;
       }
     }
-    if constexpr (use_sliding_window) {
-      window_left = (params.window_left >= 0) ? params.window_left : kv_len;
-    }
+    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
   }
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {

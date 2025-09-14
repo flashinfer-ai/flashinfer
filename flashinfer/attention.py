@@ -109,7 +109,6 @@ class BatchAttention:
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
-        self._sm_scale = sm_scale
         self._use_profiler = use_profiler
 
         # No addtional buf allocated for CUDA graph tensor
@@ -135,6 +134,8 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
         logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -157,9 +158,13 @@ class BatchAttention:
                 q.shape[0], q.shape[1], device=q.device, dtype=torch.float32
             )
         head_dim_qk = q.shape[2]
-        if self._sm_scale is None:
-            self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
-
+        sm_scale = self._sm_scale
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(head_dim_qk)
+        if k_scale is not None:
+            sm_scale *= k_scale
+        if v_scale is None:
+            v_scale = 1.0
         # profiler_buffer is optional
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
 
@@ -178,7 +183,8 @@ class BatchAttention:
             self._num_qo_heads,
             self._num_kv_heads,
             self._page_size,
-            self._sm_scale,
+            v_scale,
+            sm_scale,
             logits_soft_cap,
             # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS

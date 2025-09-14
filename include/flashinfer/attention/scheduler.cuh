@@ -497,7 +497,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
-                                   bool enable_cuda_graph) {
+                                   bool enable_cuda_graph, int32_t window_left) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -554,16 +554,25 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
   }
 
+  // Calculate the actual needed CTA when considering sliding window
+  std::vector<int64_t> effective_kv_len_arr(batch_size);
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    // pad CTA_TILE_Q to consider the causal kv-len
+    effective_kv_len_arr[i] =
+        std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
+                 kv_len_arr[i]);
+  }
+
   auto [split_kv, kv_chunk_size] =
       PrefillBinarySearchKVChunkSize(enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr,
-                                     kv_len_arr, cta_tile_q, min_kv_chunk_size);
+                                     effective_kv_len_arr, cta_tile_q, min_kv_chunk_size);
 
   // step 3: split qo_indptr and kv_indptr
   uint32_t new_batch_size = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     const int64_t packed_qo_len = packed_qo_len_arr[request_idx];
-    const int64_t kv_len = std::max(int(kv_len_arr[request_idx]), 1);
     const int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q);
+    const int64_t kv_len = std::max(int(effective_kv_len_arr[request_idx]), 1);
     const int64_t num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
 
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
@@ -680,7 +689,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
-                               bool enable_cuda_graph, uint32_t sizeof_dtype_o,
+                               bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
                                cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -703,7 +712,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph);
+                             enable_cuda_graph, window_left);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -1235,8 +1244,11 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
           // non-split kv is directly written through
           for (int row = 0; row < row_tile_size; ++row) {
             merge_indptr.push_back(merge_indptr.back() + num_kv_tiles);
-            merge_o_indices.push_back(qo_indptr_h[i] +
-                                      (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+            // output layout: [qo_len, num_kv_heads, gqa_group_size, head_dim]
+            // merge_o_indices is the indices of `gqa_group_size` dimension
+            auto q = (qo_tile_idx * cluster_tile_q + row) / gqa_group_size,
+                 r = (qo_tile_idx * cluster_tile_q + row) % gqa_group_size;
+            merge_o_indices.push_back((qo_indptr_h[i] + q) * num_kv_heads * gqa_group_size + r);
           }
           partial_o_nnz += row_tile_size * num_kv_tiles;
         }
