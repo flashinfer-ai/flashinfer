@@ -150,10 +150,10 @@ def module_status_cmd(detailed, filter):
     statuses = jit_spec_registry.get_all_statuses()
 
     if not statuses:
-        click.secho("No modules found. Registering minimal modules...", fg="yellow")
+        click.secho("No modules found. Registering default modules...", fg="yellow")
         try:
-            from .aot import register_minimal_modules
-            num_registered = register_minimal_modules()
+            from .aot import register_default_modules
+            num_registered = register_default_modules()
             click.secho(f"✅ Registered {num_registered} modules", fg="green")
             statuses = jit_spec_registry.get_all_statuses()
         except Exception as e:
@@ -217,6 +217,18 @@ def module_status_cmd(detailed, filter):
 @click.argument("module_name", required=False)
 def list_modules_cmd(module_name):
     """List or inspect compilation modules"""
+    # Register default modules if none exist
+    statuses = jit_spec_registry.get_all_statuses()
+    if not statuses:
+        click.secho("No modules found. Registering default modules...", fg="yellow")
+        try:
+            from .aot import register_default_modules
+            num_registered = register_default_modules()
+            click.secho(f"✅ Registered {num_registered} modules", fg="green")
+        except Exception as e:
+            click.secho(f"❌ Module registration failed: {e}", fg="red")
+            return
+
     if module_name:
         # Show specific module
         status = jit_spec_registry.get_spec_status(module_name)
@@ -238,8 +250,15 @@ def list_modules_cmd(module_name):
         # List all modules
         statuses = jit_spec_registry.get_all_statuses()
         if not statuses:
-            click.secho("No modules found. Try importing flashinfer modules first.", fg="yellow")
-            return
+            click.secho("No modules found. Registering default modules...", fg="yellow")
+            try:
+                from .aot import register_default_modules
+                num_registered = register_default_modules()
+                click.secho(f"✅ Registered {num_registered} modules", fg="green")
+                statuses = jit_spec_registry.get_all_statuses()
+            except Exception as e:
+                click.secho(f"❌ Module registration failed: {e}", fg="red")
+                return
 
         statuses.sort(key=lambda x: x.name)
         click.secho("Available compilation modules:", fg="cyan", bold=True)

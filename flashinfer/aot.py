@@ -568,6 +568,31 @@ def register_minimal_modules() -> int:
     return len(jit_specs)
 
 
+def register_default_modules() -> int:
+    """Register the default set of modules"""
+    config = get_default_config()
+    has_sm90, has_sm100 = detect_sm_capabilities()
+
+    jit_specs = gen_all_modules(
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
+        has_sm90,
+        has_sm100,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
+    )
+    return len(jit_specs)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Ahead-of-Time (AOT) build all modules"
