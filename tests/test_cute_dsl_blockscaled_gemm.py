@@ -85,6 +85,8 @@ def test_blockscaled_gemm_python_interface(
 
     if not (major == 10 and minor == 0):
         pytest.skip("Cute-dsl backend is only supported on SM100.")
+    if enable_dst_signals and (sm_count is None):
+        pytest.skip("dst_signals require sm_count")
 
     l, m = lm
     k, n = kn
