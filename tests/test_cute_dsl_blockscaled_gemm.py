@@ -181,7 +181,11 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
 
     for _ in range(iterations):
-        dst_signals = torch.zeros((l,), dtype=torch.uint32, device="cuda") if enable_dst_signals else None
+        dst_signals = (
+            torch.zeros((l,), dtype=torch.uint32, device="cuda")
+            if enable_dst_signals
+            else None
+        )
 
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
@@ -198,7 +202,9 @@ def test_blockscaled_gemm_python_interface(
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
             sm_count=sm_count,
-            src_signals=torch.ones((l,), dtype=torch.uint32, device="cuda") if enable_src_signals else None,
+            src_signals=torch.ones((l,), dtype=torch.uint32, device="cuda")
+            if enable_src_signals
+            else None,
             src_signal_expect_value=1 if enable_src_signals else 0,
             dst_signals=dst_signals,
         )

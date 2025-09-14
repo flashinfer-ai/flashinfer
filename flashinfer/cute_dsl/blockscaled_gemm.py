@@ -45,7 +45,6 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import (
     Int32,
     Int64,
-    Uint32,
     Uint8,
     Uint64,
     T,
@@ -61,12 +60,12 @@ from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_p
 from typing import Callable, List
 
 
-
 sizeof_i32 = 4
+
 
 @dsl_user_op
 def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
-    obj &= ~(0xff << (index * 8))
+    obj &= ~(0xFF << (index * 8))
     obj |= value << (index * 8)
     assert isinstance(obj, Uint64), f"{obj=}"
     return obj
@@ -147,7 +146,13 @@ class MaskedSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.masked_m, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
+            [
+                self.masked_m,
+                self.dst_signals,
+                self.c,
+                self.c_tiler,
+                self._cluster_shape_mnk,
+            ],
             self._values_pos,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
@@ -299,8 +304,15 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if cutlass.const_expr((dsm_pending_packed is not None) and (self.params.dst_signals is not None)):
-                dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
+            if cutlass.const_expr(
+                (dsm_pending_packed is not None)
+                and (self.params.dst_signals is not None)
+            ):
+                dsm_pending_packed = with_byte(
+                    dsm_pending_packed,
+                    index=batch_idx,
+                    value=dsm_counter + (num_c_stage - 1),
+                )
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
@@ -347,7 +359,9 @@ class MaskedScheduler:
         dsm_pending_packed: Optional[Uint64] = None,
         dsm_counter: Optional[Uint8] = None,
         num_c_stage: Optional[int] = None,
-        *, loc=None, ip=None,
+        *,
+        loc=None,
+        ip=None,
     ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
@@ -1728,9 +1742,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
 
-                        if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+                        if cutlass.const_expr(
+                            tile_sched_params.dst_signals is not None
+                        ):
                             dsm_counter = (dsm_counter + 1).to(Uint8)
-                            will_write_signals = read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter
+                            will_write_signals = (
+                                read_byte(dsm_pending_packed, dsm_pending_idx)
+                                == dsm_counter
+                            )
 
                             if will_write_signals:
                                 # The original c_pipeline.producer_acquire()
@@ -1756,12 +1775,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                         lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
-                            while (
-                                (dsm_pending_idx < num_experts) and
-                                (read_byte(dsm_pending_packed, dsm_pending_idx) == dsm_counter)
+                            while (dsm_pending_idx < num_experts) and (
+                                read_byte(dsm_pending_packed, dsm_pending_idx)
+                                == dsm_counter
                             ):
                                 atomic_add_release_global(
-                                    tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                                    tile_sched_params.dst_signals.toint()
+                                    + sizeof_i32 * dsm_pending_idx,
                                     value=1,
                                 )
                                 dsm_pending_idx += 1
@@ -1819,7 +1839,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
                         atomic_add_release_global(
-                            tile_sched_params.dst_signals.toint() + sizeof_i32 * dsm_pending_idx,
+                            tile_sched_params.dst_signals.toint()
+                            + sizeof_i32 * dsm_pending_idx,
                             value=1,
                         )
                         dsm_pending_idx += 1
@@ -2778,7 +2799,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_tensor_gpu.data_ptr(),
                 c_tensor_gpu.data_ptr(),
                 masked_m_tensor_gpu.data_ptr(),
-                dst_signals_tensor_gpu.data_ptr() if dst_signals_tensor_gpu is not None else None,
+                dst_signals_tensor_gpu.data_ptr()
+                if dst_signals_tensor_gpu is not None
+                else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
             )
 
@@ -2839,7 +2862,16 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             else None
         )
 
-        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, dst_signals_ptr, alpha_ptr]
+        return [
+            a_ptr,
+            b_ptr,
+            sfa_ptr,
+            sfb_ptr,
+            c_ptr,
+            masked_m_ptr,
+            dst_signals_ptr,
+            alpha_ptr,
+        ]
 
     kernel = cute.compile(
         MaskedBatchedMatmulCuteDSL(
