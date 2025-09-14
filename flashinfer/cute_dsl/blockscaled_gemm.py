@@ -61,9 +61,6 @@ from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_p
 from typing import Callable, List
 
 
-# DEBUG_EXIT_AFTER_FIRST_WAIT = True
-DEBUG_EXIT_AFTER_FIRST_WAIT = False
-
 
 sizeof_i32 = 4
 sizeof_u64 = 8
@@ -102,53 +99,10 @@ def atomic_add_release_global(addr: Int64, value: Int32, *, loc=None, ip=None) -
     )
 
 
-# TODO unify i32 or u32
-# TODO only wait once per warp?
-@cute.jit
-def wait_signal(addr: Int64, expect_value: int, *, loc=None, ip=None):
-    # # TODO disable this time check
-    # repeat_count = Int64(0)
-
-    ready = Int32(0)
-
-    # early exiting / early return is not supported in cute dsl
-    while ready != expect_value:
-        ready = Int32(
-            llvm.inline_asm(
-                T.i32(),
-                [addr.ir_value(loc=loc, ip=ip)],
-                # TODO how to add `:"memory"` clobber?
-                "ld.acquire.gpu.global.s32 $0, [$1];",
-                "=r,l",
-                has_side_effects=True,
-                is_align_stack=False,
-                asm_dialect=llvm.AsmDialect.AD_ATT,
-            )
-        )
-
-        llvm.inline_asm(
-            None,
-            [],
-            "nanosleep.u32 20;",
-            "",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-
-        # repeat_count += 1
-        # if repeat_count % 1_000_000_000 == 0:
-        #     tidx, _, _ = cute.arch.thread_idx()
-        #     if tidx % 32 == 0:
-        #         cute.printf("wait_signal STUCK addr={} tidx={} actual_value={}", addr, tidx, ready)
-
-
 class MaskedSchedulerParams:
     def __init__(
         self,
         masked_m: cute.Tensor,
-        src_signals: Optional[cute.Pointer],
-        src_signal_expect_value: int,
         dst_signals: Optional[cute.Pointer],
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
@@ -163,8 +117,6 @@ class MaskedSchedulerParams:
         gc = cute.zipped_divide(c, tiler=c_tiler)
         problem_shape_ntile_mnl = gc[(0, (None, None, None))].shape
         self.masked_m = masked_m
-        self.src_signals = src_signals
-        self.src_signal_expect_value = src_signal_expect_value
         self.dst_signals = dst_signals
         self.c = c
         self.c_tiler = c_tiler
@@ -186,8 +138,6 @@ class MaskedSchedulerParams:
         values, self._values_pos = [], []
         for obj in [
             self.masked_m,
-            self.src_signals,
-            self.src_signal_expect_value,
             self.dst_signals,
             self.c,
             self.c_tiler,
@@ -201,7 +151,7 @@ class MaskedSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.masked_m, self.src_signals, self.src_signal_expect_value, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
+            [self.masked_m, self.dst_signals, self.c, self.c_tiler, self._cluster_shape_mnk],
             self._values_pos,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
@@ -356,12 +306,6 @@ class MaskedScheduler:
             if cutlass.const_expr((dsm_pending_packed is not None) and (self.params.dst_signals is not None)):
                 # TODO check off by one
                 dsm_pending_packed = with_byte(dsm_pending_packed, index=batch_idx, value=dsm_counter + (num_c_stage - 1))
-            if cutlass.const_expr(self.params.src_signals is not None):
-                if batch_idx < self.params.masked_m.shape[0] - 1:
-                    wait_signal(
-                        self.params.src_signals.toint() + sizeof_i32 * (batch_idx + 1),
-                        expect_value=self.params.src_signal_expect_value,
-                    )
 
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
@@ -554,7 +498,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         sm_version: str,
-        src_signal_expect_value: int,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -585,7 +528,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.src_signal_expect_value = src_signal_expect_value
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -763,7 +705,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         masked_m_tensor: cute.Tensor,
-        src_signals: Optional[cute.Pointer],
         dst_signals: Optional[cute.Pointer],
         alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
@@ -928,8 +869,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
             masked_m_tensor,  # add masked layout
-            src_signals,
-            self.src_signal_expect_value,
             dst_signals,
             c_tensor,
             self.cta_tile_shape_mnk,
@@ -1303,16 +1242,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.arch.barrier(
                 barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta
             )
-
-        # TODO may optimize if too slow
-        if cutlass.const_expr(tile_sched_params.src_signals is not None):
-            wait_signal(
-                tile_sched_params.src_signals.toint() + sizeof_i32 * 0,
-                expect_value=tile_sched_params.src_signal_expect_value,
-            )
-
-            if cutlass.const_expr(DEBUG_EXIT_AFTER_FIRST_WAIT):
-                return
 
         #
         # Specialized TMA load warp
@@ -2215,8 +2144,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @staticmethod
     def _compute_grid(
         masked_m_tensor: cute.Tensor,
-        src_signals: Optional[cute.Pointer],
-        src_signals_expect_value: int,
         dst_signals: Optional[cute.Pointer],
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
@@ -2243,7 +2170,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, src_signals, src_signals_expect_value, dst_signals, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor, dst_signals, c, c_tiler, cluster_shape_mnl
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -2633,7 +2560,6 @@ class MaskedBatchedMatmulCuteDSL:
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
         sm_version: str,
-        src_signal_expect_value: int,
     ):
         self._m = m
         self._n = n
@@ -2649,7 +2575,6 @@ class MaskedBatchedMatmulCuteDSL:
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
-        self._src_signal_expect_value = src_signal_expect_value
 
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
@@ -2689,7 +2614,6 @@ class MaskedBatchedMatmulCuteDSL:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         masked_m_ptr: cute.Pointer,
-        src_signals_ptr: Optional[cute.Pointer],
         dst_signals_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
@@ -2779,7 +2703,6 @@ class MaskedBatchedMatmulCuteDSL:
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
             sm_version=self._sm_version,
-            src_signal_expect_value=self._src_signal_expect_value,
         )(
             a_tensor,
             b_tensor,
@@ -2787,7 +2710,6 @@ class MaskedBatchedMatmulCuteDSL:
             sfb_tensor,
             c_tensor,
             masked_m_tensor,
-            src_signals_ptr,
             dst_signals_ptr,
             alpha_tensor,
             self._max_active_clusters,
@@ -2813,8 +2735,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
     sm_version: str,
-    src_signal_expect_value: int,
-    enable_src_signals: bool,
     enable_dst_signals: bool,
 ) -> Callable:
     def get_cute_pointers(
@@ -2828,13 +2748,10 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_data_ptr,
                 c_data_ptr,
                 masked_m_data_ptr,
-                src_signals_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
             ) = [16 for _ in range(9)]
 
-            if not enable_src_signals:
-                src_signals_data_ptr = None
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
 
@@ -2846,12 +2763,10 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_tensor_gpu,
                 c_tensor_gpu,
                 masked_m_tensor_gpu,
-                src_signals_tensor_gpu,
                 dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
             ) = input_tensors
 
-            assert enable_src_signals == (src_signals_tensor_gpu is not None)
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
 
             (
@@ -2861,7 +2776,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_data_ptr,
                 c_data_ptr,
                 masked_m_data_ptr,
-                src_signals_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
             ) = (
@@ -2871,7 +2785,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 sfb_tensor_gpu.data_ptr(),
                 c_tensor_gpu.data_ptr(),
                 masked_m_tensor_gpu.data_ptr(),
-                src_signals_tensor_gpu.data_ptr() if src_signals_tensor_gpu is not None else None,
                 dst_signals_tensor_gpu.data_ptr() if dst_signals_tensor_gpu is not None else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
             )
@@ -2912,16 +2825,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        src_signals_ptr = (
-            make_ptr(
-                cutlass.Uint32,
-                src_signals_data_ptr,
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            if src_signals_data_ptr is not None
-            else None
-        )
         dst_signals_ptr = (
             make_ptr(
                 cutlass.Uint32,
@@ -2943,7 +2846,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             else None
         )
 
-        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, src_signals_ptr, dst_signals_ptr, alpha_ptr]
+        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, masked_m_ptr, dst_signals_ptr, alpha_ptr]
 
     kernel = cute.compile(
         MaskedBatchedMatmulCuteDSL(
@@ -2963,7 +2866,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
             sm_version=sm_version,
-            src_signal_expect_value=src_signal_expect_value,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2975,7 +2877,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         sfa_tensor_gpu: torch.Tensor,
         sfb_tensor_gpu: torch.Tensor,
         masked_m_tensor_gpu: torch.Tensor,
-        src_signals_tensor_gpu: torch.Tensor,
         dst_signals_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
@@ -3001,7 +2902,6 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     sfb_tensor_gpu,
                     c_tensor_gpu,
                     masked_m_tensor_gpu,
-                    src_signals_tensor_gpu,
                     dst_signals_tensor_gpu,
                     alpha_tensor_gpu,
                 ]
@@ -3024,8 +2924,6 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
-    src_signals: Optional[torch.Tensor] = None,
-    src_signal_expect_value: int = 0,
     dst_signals: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
     **kwargs,
@@ -3107,8 +3005,6 @@ def grouped_gemm_nt_masked(
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
         sm_version=f"sm_{major}{minor}",
-        src_signal_expect_value=src_signal_expect_value,
-        enable_src_signals=src_signals is not None,
         enable_dst_signals=dst_signals is not None,
     )(
         a_tensor_gpu=a_torch,
@@ -3117,7 +3013,6 @@ def grouped_gemm_nt_masked(
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=c_torch,
         masked_m_tensor_gpu=masked_m,
-        src_signals_tensor_gpu=src_signals,
         dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
     )
