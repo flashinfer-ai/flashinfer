@@ -40,6 +40,22 @@ def _download_cubin():
         click.secho(f"❌ Cubin download failed: {e}", fg="red")
 
 
+def _ensure_modules_registered():
+    """Helper function to ensure modules are registered"""
+    statuses = jit_spec_registry.get_all_statuses()
+    if not statuses:
+        click.secho("No modules found. Registering default modules...", fg="yellow")
+        try:
+            from .aot import register_default_modules
+
+            num_registered = register_default_modules()
+            click.secho(f"✅ Registered {num_registered} modules", fg="green")
+            statuses = jit_spec_registry.get_all_statuses()
+        except Exception as e:
+            click.secho(f"❌ Module registration failed: {e}", fg="red")
+    return statuses
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--download-cubin", "download_cubin_flag", is_flag=True, help="Download artifacts"
@@ -99,6 +115,18 @@ def show_config_cmd():
     total_cubins = len(status)
 
     click.secho(f"Downloaded {num_downloaded}/{total_cubins} cubins", fg="cyan")
+    click.secho("", fg="white")
+
+    # Section: Module Status
+    click.secho("=== Module Status ===", fg="yellow")
+
+    module_statuses = _ensure_modules_registered()
+    if module_statuses:
+        stats = jit_spec_registry.get_stats()
+        click.secho(f"Total modules: {stats['total']}", fg="cyan")
+        click.secho(f"AOT compiled: {stats['aot_compiled']}", fg="green")
+        click.secho(f"JIT compiled: {stats['jit_compiled']}", fg="magenta")
+        click.secho(f"Not compiled: {stats['not_compiled']}", fg="red")
 
 
 @cli.command("list-cubins")
@@ -151,19 +179,9 @@ def clear_cubin_cmd():
 )
 def module_status_cmd(detailed, filter):
     """Show module compilation status"""
-    statuses = jit_spec_registry.get_all_statuses()
-
+    statuses = _ensure_modules_registered()
     if not statuses:
-        click.secho("No modules found. Registering default modules...", fg="yellow")
-        try:
-            from .aot import register_default_modules
-
-            num_registered = register_default_modules()
-            click.secho(f"✅ Registered {num_registered} modules", fg="green")
-            statuses = jit_spec_registry.get_all_statuses()
-        except Exception as e:
-            click.secho(f"❌ Module registration failed: {e}", fg="red")
-            return
+        return
 
     # Apply filter
     filter_map = {
@@ -230,17 +248,9 @@ def module_status_cmd(detailed, filter):
 def list_modules_cmd(module_name):
     """List or inspect compilation modules"""
     # Register default modules if none exist
-    statuses = jit_spec_registry.get_all_statuses()
+    statuses = _ensure_modules_registered()
     if not statuses:
-        click.secho("No modules found. Registering default modules...", fg="yellow")
-        try:
-            from .aot import register_default_modules
-
-            num_registered = register_default_modules()
-            click.secho(f"✅ Registered {num_registered} modules", fg="green")
-        except Exception as e:
-            click.secho(f"❌ Module registration failed: {e}", fg="red")
-            return
+        return
 
     if module_name:
         # Show specific module
@@ -268,18 +278,9 @@ def list_modules_cmd(module_name):
             click.secho(f"  {i}. {source}", fg="white")
     else:
         # List all modules
-        statuses = jit_spec_registry.get_all_statuses()
+        statuses = _ensure_modules_registered()
         if not statuses:
-            click.secho("No modules found. Registering default modules...", fg="yellow")
-            try:
-                from .aot import register_default_modules
-
-                num_registered = register_default_modules()
-                click.secho(f"✅ Registered {num_registered} modules", fg="green")
-                statuses = jit_spec_registry.get_all_statuses()
-            except Exception as e:
-                click.secho(f"❌ Module registration failed: {e}", fg="red")
-                return
+            return
 
         statuses.sort(key=lambda x: x.name)
         click.secho("Available compilation modules:", fg="cyan", bold=True)
