@@ -41,7 +41,8 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
   })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    return output;
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    return output * d_rcp;
   })
 };
 """

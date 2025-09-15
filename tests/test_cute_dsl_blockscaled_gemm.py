@@ -59,6 +59,7 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
+@pytest.mark.parametrize("enable_dst_signals", [False, True])
 def test_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
@@ -76,6 +77,7 @@ def test_blockscaled_gemm_python_interface(
     sm_count: int,
     tolerance: float,
     iterations: int,
+    enable_dst_signals: int,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda:0")
@@ -83,6 +85,8 @@ def test_blockscaled_gemm_python_interface(
 
     if not (major == 10 and minor == 0):
         pytest.skip("Cute-dsl backend is only supported on SM100.")
+    if enable_dst_signals and (sm_count is None):
+        pytest.skip("dst_signals require sm_count")
 
     l, m = lm
     k, n = kn
@@ -175,6 +179,12 @@ def test_blockscaled_gemm_python_interface(
     masked_m_tensor = torch.randint(0, m, (l,), dtype=torch.int32, device=device)
 
     for _ in range(iterations):
+        dst_signals = (
+            torch.zeros((l,), dtype=torch.uint32, device="cuda")
+            if enable_dst_signals
+            else None
+        )
+
         # deepgemm-like python interface: fp4 packed, for DLFW integration
         grouped_gemm_nt_masked(
             (a_torch, sfa_torch),
@@ -190,7 +200,11 @@ def test_blockscaled_gemm_python_interface(
             alpha=alpha_tensor,
             alpha_dtype=alpha_dtype,
             sm_count=sm_count,
+            dst_signals=dst_signals,
         )
+
+        if enable_dst_signals:
+            assert torch.all(dst_signals == sm_count), f"{dst_signals}"
 
     # compute ref output
     if not fuse_alpha:
@@ -260,4 +274,5 @@ if __name__ == "__main__":
         tolerance=1e-01,
         iterations=3,
         sm_count=132,
+        enable_dst_signals=True,
     )

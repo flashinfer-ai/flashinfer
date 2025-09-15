@@ -66,7 +66,8 @@ IntTuple BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(IdType),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, window_left, stream);
+      /*sizeof_dtype_o=*/2, window_left, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
+      stream);
 
   CHECK(status == cudaSuccess) << "Failed to plan prefill with error: "
                                << cudaGetErrorString(status);
