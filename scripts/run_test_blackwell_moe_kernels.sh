@@ -14,6 +14,9 @@ test_scripts=(
 for test_file in "${test_scripts[@]}"; do
   xml_name="${test_file%.py}.xml"
   pytest -s "tests/${test_file}" --junit-xml="${JUNIT_DIR}/$xml_name" || EXIT_CODE=1
+  if [[ -z "${RUN_TO_COMPLETION}" && $EXIT_CODE -ne 0 ]]; then
+    exit $EXIT_CODE
+  fi
 done
 
 exit $EXIT_CODE

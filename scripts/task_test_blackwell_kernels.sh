@@ -19,6 +19,9 @@ scripts_to_run=(
 )
 for script in "${scripts_to_run[@]}"; do
   bash "scripts/$script" || EXIT_CODE=1
+  if [[ -z "${RUN_TO_COMPLETION}" && $EXIT_CODE -ne 0 ]]; then
+    exit $EXIT_CODE
+  fi
 done
 
 exit $EXIT_CODE
