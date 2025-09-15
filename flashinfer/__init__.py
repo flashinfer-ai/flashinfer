@@ -24,6 +24,9 @@ from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .attention import BatchAttention as BatchAttention
+from .attention import (
+    BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+)
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
