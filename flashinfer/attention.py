@@ -218,6 +218,7 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
         head_dim_qk: int = 128,
@@ -231,7 +232,7 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             backend = determine_attention_backend(
                 float_workspace_buffer.device,
                 PosEncodingMode[pos_encoding_mode].value,
-                False,  # use_fp16_qk_reduction
+                use_fp16_qk_reduction,  # use_fp16_qk_reduction
                 custom_mask_buf is not None,  # use_custom_mask
                 q_data_type,
                 kv_data_type,
@@ -254,6 +255,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         ]
         jit_kwargs = {
             "use_sliding_window": window_left >= 0,
+            "use_fp16_qk_reduction": use_fp16_qk_reduction,
+            "pos_encoding_mode": PosEncodingMode[pos_encoding_mode].value,
         }
 
         super().__init__(
