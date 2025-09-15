@@ -905,7 +905,7 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
         (64, 32, 6),
         (64, 32, 8),
         (64, 64, 6),
-        (128, 64, 6),
+        (128, 16, 6),
     ]
 
     # Generate instances for the specified dtype
