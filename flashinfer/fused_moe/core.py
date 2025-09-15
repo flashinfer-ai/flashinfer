@@ -395,7 +395,7 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("100", "103", "110", "121", "122"):
+    if backend in ("100", "103", "110", "120", "121"):
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
             use_fast_build
         ).build_and_load(class_name="FusedMoeRunner")
