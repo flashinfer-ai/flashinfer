@@ -872,12 +872,6 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
   //     printf("[%d, %d, %d] gemm_device\n", blockIdx.x, blockIdx.y, blockIdx.z);
   // }
 
-  // Inline PTX knobs
-  // cutlass::global_knob_trywait_sel_sb_dep();
-  // cutlass::global_knob_demote_to_pred_blockidx_limit();
-  // cutlass::global_knob_ldc_ldcu_hoisting();
-  // cutlass::global_knob_mbarrier_init_mapping();
-
   // WorkTileInfo, for non persistent static scheduler, cta id is the work tile info
   WorkTileInfo work_tile_info{.M_idx = (int32_t)blockIdx.x,
                               .N_idx = (int32_t)blockIdx.y,
