@@ -254,7 +254,8 @@ struct Data : public DataBase {
   bool mApplySoftmaxAfterTopK{false};
 };
 
-template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, int NumExperts_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, int NumExperts_,
+          bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, NumExperts_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;

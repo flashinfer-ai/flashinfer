@@ -204,8 +204,8 @@ __global__ void routingMainKernel(KernelParams params) {
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(KernelParams::NumExperts)
-    routingIndicesClusterKernel(KernelParams params) {
+__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
+    __launch_bounds__(KernelParams::NumExperts) routingIndicesClusterKernel(KernelParams params) {
   using OutputT = typename KernelParams::OutputT;
   static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
@@ -232,7 +232,8 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __launch_bounds__(KernelParams::NumExperts) routingIndicesCoopKernel(KernelParams params) {
+__global__ void __launch_bounds__(KernelParams::NumExperts)
+    routingIndicesCoopKernel(KernelParams params) {
   static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
   // number of experts is bounded by number of threads
@@ -334,7 +335,8 @@ __global__ void __launch_bounds__(KernelParams::NumExperts) routingIndicesCoopKe
   grid.sync();
 
   // Get total count for this expert.
-  int32_t count = (threadIdx.x < KernelParams::NumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+  int32_t count =
+      (threadIdx.x < KernelParams::NumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
 
   // Note: the scan is redundant in all CTAs, but doing it in only 1 CTA would be worse for latency.
 
@@ -496,19 +498,17 @@ void runImpl(Data& data, void* stream) {
 
   if (data.mPtrPermutedIdxSize != nullptr) {
     if (useSingleCluster) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesClusterKernel,
-                                     NumBlocksPerCluster, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true,
-                                     NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
+          data,
+          /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
+          /*smemSize=*/0,  // No dynamic smem
+          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
     } else if (data.mNumTokens <= maxTokensCoop) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                     NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true,
-                                     NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
+          data,
+          /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, NumThreads,
+          /*smemSize=*/0,  // No dynamic smem
+          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
     } else {
       const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
@@ -523,18 +523,16 @@ void runImpl(Data& data, void* stream) {
       int const numBlocksOffsets =
           std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesHistogramKernel,
-                                     numBlocksHistogram, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true,
-                                     NumExperts);
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesOffsetsKernel,
-                                     numBlocksOffsets, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true,
-                                     NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
+          data,
+          /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreads,
+          /*smemSize=*/0,  // No dynamic smem
+          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
+          data,
+          /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreads,
+          /*smemSize=*/0,  // No dynamic smem
+          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
     }
   }
 }

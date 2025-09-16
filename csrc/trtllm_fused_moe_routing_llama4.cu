@@ -388,9 +388,8 @@ __global__ void __launch_bounds__(NumThreadsHist)
 template <int NumExperts>
 void runImpl(Data const& data, void* stream) {
   // Validate that the runtime value matches the template parameter
-  TORCH_CHECK(data.mNumExperts == NumExperts,
-              "Llama4 routing kernel expects #experts ", data.mNumExperts,
-              " to match template parameter ", NumExperts);
+  TORCH_CHECK(data.mNumExperts == NumExperts, "Llama4 routing kernel expects #experts ",
+              data.mNumExperts, " to match template parameter ", NumExperts);
 
   TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr,
               "Routing kernel requires at least one input parameter");
@@ -399,8 +398,8 @@ void runImpl(Data const& data, void* stream) {
               "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
   TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
               "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
-  TORCH_CHECK(NumExperts <= MaxNumExperts, "Routing kernel expects #experts ",
-              NumExperts, " to be at most max #experts ", MaxNumExperts);
+  TORCH_CHECK(NumExperts <= MaxNumExperts, "Routing kernel expects #experts ", NumExperts,
+              " to be at most max #experts ", MaxNumExperts);
   static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
   static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
   TORCH_CHECK(NumExperts % 4 == 0, "Routing kernel expects #experts ", NumExperts,
@@ -423,15 +422,15 @@ void runImpl(Data const& data, void* stream) {
 
   if (useSingleWarp) {
     LAUNCH_ROUTING(data,
-                       /*coopLaunch=*/false, routingIndicesWarpKernel, 1, WarpSize,
-                       /*smemSize=*/0,  // No dynamic smem
-                       stream, NumExperts);
+                   /*coopLaunch=*/false, routingIndicesWarpKernel, 1, WarpSize,
+                   /*smemSize=*/0,  // No dynamic smem
+                   stream, NumExperts);
   } else if (useSingleCluster) {
     LAUNCH_ROUTING(data,
-                       /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster,
-                       NumThreads,
-                       /*smemSize=*/0,  // No dynamic smem
-                       stream, NumExperts);
+                   /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster,
+                   NumThreads,
+                   /*smemSize=*/0,  // No dynamic smem
+                   stream, NumExperts);
   } else {
     const uint32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
@@ -448,10 +447,10 @@ void runImpl(Data const& data, void* stream) {
 
     if (data.mPtrScores != nullptr) {
       LAUNCH_ROUTING(data,
-                         /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks,
-                         NumThreadsHist,
-                         /*smemSize=*/0,  // No dynamic smem
-                         stream, NumExperts);
+                     /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks,
+                     NumThreadsHist,
+                     /*smemSize=*/0,  // No dynamic smem
+                     stream, NumExperts);
     } else {
       // Reset the global histograms.
       CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
@@ -459,15 +458,15 @@ void runImpl(Data const& data, void* stream) {
                                        (cudaStream_t)stream));
     }
     LAUNCH_ROUTING(data,
-                       /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram,
-                       NumThreadsHist,
-                       /*smemSize=*/0,  // No dynamic smem
-                       stream, NumExperts);
+                   /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram,
+                   NumThreadsHist,
+                   /*smemSize=*/0,  // No dynamic smem
+                   stream, NumExperts);
     LAUNCH_ROUTING(data,
-                       /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets,
-                       NumThreadsHist,
-                       /*smemSize=*/0,  // No dynamic smem
-                       stream, NumExperts);
+                   /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets,
+                   NumThreadsHist,
+                   /*smemSize=*/0,  // No dynamic smem
+                   stream, NumExperts);
   }
 }
 
