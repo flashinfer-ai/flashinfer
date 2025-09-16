@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import subprocess
+import sysconfig
 from pathlib import Path
 from typing import List, Mapping
 
@@ -103,11 +104,15 @@ class AotDistribution(Distribution):
         return enable_aot
 
 
+bdist_wheel_options = {}
+if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+    bdist_wheel_options["py_limited_api"] = "cp39"
+
 setuptools.setup(
     version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    options={"bdist_wheel": bdist_wheel_options},
     distclass=AotDistribution,
 )
