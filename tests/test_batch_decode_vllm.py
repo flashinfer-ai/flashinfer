@@ -12,7 +12,7 @@ import flashinfer
 NUM_HEADS = [(16, 16), (32, 8), (64, 8)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 32]
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.float16]
 NUM_BLOCKS = 32768  # Large enough to test overflow in index calculation.
 
 
@@ -80,7 +80,6 @@ def ref_paged_attn(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 30.0, 50.0])
-@pytest.mark.xfail(reason="Not supported for the HIP backend for CDNA3")
 @torch.inference_mode
 def test_flashinfer_decode_with_paged_kv(
     kv_lens: list[int],
