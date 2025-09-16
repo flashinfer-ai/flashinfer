@@ -230,10 +230,6 @@ void runImpl(Data const& data, void* stream) {
               "Renormalize routing kernel expects #experts ", data.mNumExperts,
               " to match template parameter ", NumExperts);
 
-  static constexpr int NumThreads = DefaultNumThreads;
-  static constexpr int NumWarps = NumThreads / WarpSize;
-  static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
-  static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
   TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr,
               "Routing kernel requires at least one input parameter");
   TORCH_CHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
@@ -243,7 +239,7 @@ void runImpl(Data const& data, void* stream) {
               "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
   TORCH_CHECK(NumExperts <= MaxNumExperts, "Routing kernel expects #experts ",
               NumExperts, " to be at most max #experts ", MaxNumExperts);
-  static_assert(MaxNumExperts <= DefaultNumThreads, "#experts must be bounded by #threads");
+  static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
   static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
   TORCH_CHECK(NumExperts % 4 == 0, "Routing kernel expects #experts ", NumExperts,
               " to be a multiple of 4.");
@@ -262,10 +258,10 @@ void runImpl(Data const& data, void* stream) {
   }
 
   if (useSingleCluster) {
-    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, NumExperts, false, routingIndicesClusterKernel, NumBlocksPerCluster,
+    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesClusterKernel, NumBlocksPerCluster,
                                    NumThreads,
                                    /*smemSize=*/0,  // No dynamic smem
-                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
+                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false, NumExperts);
   } else {
     uint32_t const expandedIdxSize = data.mNumTokens * data.mTopK;
 
@@ -281,24 +277,24 @@ void runImpl(Data const& data, void* stream) {
         std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
     if (data.mPtrScores != nullptr) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, NumExperts, false, routingIndicesHistogramScoresKernel, maxNumBlocks,
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramScoresKernel, maxNumBlocks,
                                      NumThreadsHist,
                                      /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
+                                     stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false, NumExperts);
     } else {
       // Reset the global histograms.
       CHECK_CUDA_ERROR(cudaMemsetAsync(data.mPtrExpertCounts, 0,
                                        static_cast<size_t>(2 * NumExperts) * sizeof(int32_t),
                                        (cudaStream_t)stream));
     }
-    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, NumExperts, false, routingIndicesHistogramKernel, numBlocksHistogram,
+    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramKernel, numBlocksHistogram,
                                    NumThreadsHist,
                                    /*smemSize=*/0,  // No dynamic smem
-                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
-    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, NumExperts, false, routingIndicesOffsetsKernel, numBlocksOffsets,
+                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false, NumExperts);
+    LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesOffsetsKernel, numBlocksOffsets,
                                    NumThreadsHist,
                                    /*smemSize=*/0,  // No dynamic smem
-                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
+                                   stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false, NumExperts);
   }
 }
 
