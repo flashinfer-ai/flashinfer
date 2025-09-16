@@ -13,14 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cstdint>
 #include <flashinfer/norm.cuh>
 
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
-
-namespace flashinfer_norm {
 
 using tvm::ffi::Tensor;
 
@@ -135,5 +132,3 @@ void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, doubl
     return true;
   });
 }
-
-}  // namespace flashinfer_norm
