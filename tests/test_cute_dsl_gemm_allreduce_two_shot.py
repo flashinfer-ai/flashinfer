@@ -421,7 +421,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
             iterations=1,
             skip_ref_check=False,
             use_cold_l2=False,
-            all_reduce=True,
+            all_reduce="two_shot",
         )
     except Exception as e:
         print(f"Rank {rank_id}: Exception during test: {e}")
