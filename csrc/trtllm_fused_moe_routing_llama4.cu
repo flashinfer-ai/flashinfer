@@ -483,14 +483,15 @@ void run(Data const& data, void* stream) {
 
   // Dispatch to the appropriate template instantiation based on the number of experts
   switch (data.mNumExperts) {
-    if (data.mNumExperts == 16) {
+    case 16:
       runImpl<16>(data, stream);
-    } else if (data.mNumExperts == 128) {
+      break;
+    case 128:
       runImpl<128>(data, stream);
-    } else {
+      break;
+    default:
       TORCH_CHECK(false, "Unsupported number of experts: ", data.mNumExperts,
                   ". Supported values are: 16, 128");
-    }
   }
 }
 

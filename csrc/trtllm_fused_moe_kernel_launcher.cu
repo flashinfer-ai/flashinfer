@@ -811,7 +811,7 @@ std::vector<at::Tensor> trtllm_fp4_block_scale_moe_launcher(
   int constexpr MAX_NUM_EXPERTS = 384;
   at::Tensor expert_count_histogram = at::detail::empty_cuda(
       {2 * MAX_NUM_EXPERTS},
-      at::ScalarType::Int,  // 256 is the max number of threads per block and max number of experts
+      at::ScalarType::Int,  // 384 is the max number of threads per block and max number of experts
       hidden_states.device(), std::nullopt);
 
   auto const sf_vec_size = dtype_weights == btg::Dtype::MxE2m1 ? 32 : 16;
