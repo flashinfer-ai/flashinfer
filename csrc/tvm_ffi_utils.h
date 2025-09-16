@@ -31,8 +31,8 @@ constexpr int64_t bfloat16_code = encode_dlpack_dtype(DLDataType{kDLBfloat, 16, 
 constexpr int64_t float32_code = encode_dlpack_dtype(DLDataType{kDLFloat, 32, 1});
 constexpr int64_t int32_code = encode_dlpack_dtype(DLDataType{kDLInt, 32, 1});
 constexpr int64_t int64_code = encode_dlpack_dtype(DLDataType{kDLInt, 64, 1});
-constexpr int64_t float8e4m3fn_code = encode_dlpack_dtype(DLDataType{kDLFloat8_e4m3fn, 32, 1});
-constexpr int64_t float8e5m2_code = encode_dlpack_dtype(DLDataType{kDLFloat8_e5m2, 64, 1});
+constexpr int64_t float8e4m3fn_code = encode_dlpack_dtype(DLDataType{kDLFloat8_e4m3fn, 8, 1});
+constexpr int64_t float8e5m2_code = encode_dlpack_dtype(DLDataType{kDLFloat8_e5m2, 8, 1});
 
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
@@ -83,6 +83,38 @@ constexpr int64_t float8e5m2_code = encode_dlpack_dtype(DLDataType{kDLFloat8_e5m
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
       _DISPATCH_CASE_I32(c_type, __VA_ARGS__)                                            \
       _DISPATCH_CASE_I64(c_type, __VA_ARGS__)                                            \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
+#define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
+  case float8e4m3fn_code: {                  \
+    using c_type = __nv_fp8_e4m3;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP8_E4M3(c_type, ...)
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
+#define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
+  case float8e5m2_code: {                    \
+    using c_type = __nv_fp8_e5m2;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
+#endif
+
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(dlpack_dtype, c_type, ...)                    \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
       default:                                                                           \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
                               << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
