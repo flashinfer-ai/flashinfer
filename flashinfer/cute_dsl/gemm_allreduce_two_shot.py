@@ -1,31 +1,24 @@
-import argparse
-import ctypes
-import os
-from math import prod
-from functools import partial
 from typing import Optional, Tuple, Type, Union
 
 import torch
-import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed as dist
 from cuda import cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.distributed_helpers as distributed_helpers
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Pointer, Int32, Float16, BFloat16, Float32
-
-from cutlass.cutlass_dsl import dsl_user_op
-
-from cutlass._mlir.dialects import llvm
-import cutlass._mlir.ir as ir
+from cutlass.cute.typing import (
+    Int32,
+    Float16,
+    BFloat16,
+    Float32,
+    Float8E4M3FN,
+    Float8E5M2,
+)
 
 
 """
@@ -57,7 +50,7 @@ This GEMM works as follows:
 4. All reduce epilogue:
     - Load and reduce the 128bit data from all ranks by multimem instructions.
     - Broadcast the reduced data to all ranks by multimem instructions.
-    - current implementation only supports two_shot all-reduce which means each rank only computes a portion of 
+    - current implementation only supports two_shot all-reduce which means each rank only computes a portion of
       the output tensor and broadcast the result to all ranks.
     - the all-reduce epilogue is only supported when use_tma_store is True.
     - the all-reduce epilogue is only supported when c_dtype is Float16, Float32, BFloat16, Float8E4M3FN, Float8E5M2.
@@ -225,7 +218,7 @@ class PersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.all_reduce_warp_id = ()
+        self.all_reduce_warp_id: Tuple[int, ...] = ()
         self.all_reduce = "none"
         if all_reduce != "none":
             self.all_reduce = all_reduce
@@ -823,7 +816,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -938,7 +931,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_tile in range(k_tile_cnt):
+                for k_tile in range(k_tile_cnt):  # noqa
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(
@@ -1230,7 +1223,8 @@ class PersistentDenseGemmKernel:
                 if cutlass.const_expr(self.all_reduce == "two_shot"):
                     tile_id = Int32(
                         tile_sched._current_work_linear_idx
-                        * cute.size(self.cluster_shape_mn) + cute.arch.block_idx_in_cluster()
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
                     )
                     if warp_idx == self.epilog_warp_id[0]:
                         cute.arch.cp_async_bulk_wait_group(0, read=False)
@@ -1282,7 +1276,7 @@ class PersistentDenseGemmKernel:
 
                 rank_id = self.rank_id
                 num_ranks = Int32(self.num_ranks)
-                lane_id = cute.arch.lane_idx()
+                lane_id = cute.arch.lane_idx()  # noqa
 
                 tile_sched = utils.StaticPersistentTileScheduler.create(
                     tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -1292,20 +1286,30 @@ class PersistentDenseGemmKernel:
                 # we want 128bit ld/st for better performance
                 atom_val = 128 // c_mc.element_type.width
                 atom_thr_n = self.mma_tiler[1] // atom_val
-                atom_thr_m = len(self.all_reduce_warp_id) * (cute.arch.WARP_SIZE // atom_thr_n)
-                thr_layout = cute.make_layout((atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1))
+                atom_thr_m = len(self.all_reduce_warp_id) * (
+                    cute.arch.WARP_SIZE // atom_thr_n
+                )
+                thr_layout = cute.make_layout(
+                    (atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1)
+                )
                 val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
 
-                copy_atom_load = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_mc.element_type)
-                tiled_copy_fake = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
-                thr_copy_fake = tiled_copy_fake.get_slice(tidx-self.all_reduce_warp_id[0]*32)
+                copy_atom_load = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), c_mc.element_type
+                )
+                tiled_copy_fake = cute.make_tiled_copy_tv(
+                    copy_atom_load, thr_layout, val_layout
+                )
+                thr_copy_fake = tiled_copy_fake.get_slice(
+                    tidx - self.all_reduce_warp_id[0] * 32
+                )
 
                 while work_tile.is_valid_tile:
-
                     cur_tile_coord = work_tile.tile_idx
                     tile_id = Int32(
                         tile_sched._current_work_linear_idx
-                        * cute.size(self.cluster_shape_mn) + cute.arch.block_idx_in_cluster()
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
                     )
                     mma_tile_coord_mnl = (
                         cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1326,17 +1330,25 @@ class PersistentDenseGemmKernel:
                     )
                     # partition and slice at tile level
                     gC_mc = cute.local_tile(
-                        c_mc, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                        c_mc,
+                        cute.slice_(self.mma_tiler, (None, None, 0)),
+                        (None, None, None),
                     )
                     tCgC_mc = thr_mma.partition_C(gC_mc)
                     tCgC_mc_slice = tCgC_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
 
                     # partition based on the number of GPUs
-                    cta_mma_tile_m = self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape)
+                    cta_mma_tile_m = self.mma_tiler[0] // cute.size(
+                        tiled_mma.thr_id.shape
+                    )
                     m_local_rank = int(cta_mma_tile_m / self.num_ranks)
-                    tCgC_mc_slice_partitioned = cute.zipped_divide(tCgC_mc_slice, (m_local_rank, self.mma_tiler[1]))
-                    tCgC_mc_local_rank = cute.slice_(tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0)))
-                    
+                    tCgC_mc_slice_partitioned = cute.zipped_divide(
+                        tCgC_mc_slice, (m_local_rank, self.mma_tiler[1])
+                    )
+                    tCgC_mc_local_rank = cute.slice_(
+                        tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0))
+                    )
+
                     # partition at thread level
                     frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
                     atom, loop_m, loop_n = frgC_mc.shape
@@ -1345,15 +1357,31 @@ class PersistentDenseGemmKernel:
                             mc_ptr = frgC_mc[None, i, j].iterator
                             x, y, z, w = 0, 0, 0, 0
                             if cutlass.const_expr(self.c_dtype == Float16):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float32):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                )
                             elif cutlass.const_expr(self.c_dtype == BFloat16):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_8xbf16(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xbf16(
+                                        mc_ptr
+                                    )
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_16xe4m3(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
+                                        mc_ptr
+                                    )
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float8E5M2):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_16xe5m2(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
+                                        mc_ptr
+                                    )
+                                )
                             distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
                     tile_sched.advance_to_next_work()
@@ -1369,8 +1397,11 @@ class PersistentDenseGemmKernel:
                 ) * cute.size(self.cluster_shape_mn)
                 if warp_idx == self.all_reduce_warp_id[0]:
                     with cute.arch.elect_one():
-                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(barrier_flag.iterator + last_flag_idx, barrier_flag_mc.iterator + last_flag_idx, self.num_ranks)
-
+                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(
+                            barrier_flag.iterator + last_flag_idx,
+                            barrier_flag_mc.iterator + last_flag_idx,
+                            self.num_ranks,
+                        )
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -1702,7 +1733,7 @@ class PersistentDenseGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
-        all_reduce: str="none",
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the dtypes are valid
@@ -1769,7 +1800,17 @@ class PersistentDenseGemmKernel:
         ):
             is_valid = False
         # check if c_dtype is supported by multimem all-reduce
-        if cutlass.const_expr(all_reduce != "none" and c_dtype not in {cutlass.Float16, cutlass.Float32, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2}):
+        if cutlass.const_expr(
+            all_reduce != "none"
+            and c_dtype
+            not in {
+                cutlass.Float16,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E5M2,
+            }
+        ):
             is_valid = False
 
         return is_valid
@@ -1817,7 +1858,6 @@ class PersistentDenseGemmKernel:
             is_valid = False
         return is_valid
 
-
     @staticmethod
     def is_valid_tensor_alignment(
         m: int,
@@ -1829,7 +1869,7 @@ class PersistentDenseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        all_reduce: str="none",
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -1869,12 +1909,8 @@ class PersistentDenseGemmKernel:
             or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
         ):
-            is_valid = False        
-        if (
-            all_reduce != "none" 
-            and m % 128 != 0
-            and n % 128 != 0
-        ):
+            is_valid = False
+        if all_reduce != "none" and m % 128 != 0 and n % 128 != 0:
             is_valid = False
 
         return is_valid
@@ -1932,7 +1968,7 @@ class PersistentDenseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
-        all_reduce: str="none",
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the gemm can be implemented

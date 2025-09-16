@@ -1,7 +1,5 @@
-import argparse
 import logging
 import multiprocessing as mp
-import os
 import pytest
 import socket
 from typing import Any, Tuple, Type
@@ -188,7 +186,7 @@ def run(
     :return: Execution time of the GEMM kernel
     :rtype: float
     """
-    print(f"Running Blackwell Persistent Dense GEMM test with:")
+    print("Running Blackwell Persistent Dense GEMM test with:")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}")
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
@@ -406,25 +404,25 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
     rank_id = torch.distributed.get_rank()
 
     try:
-      run(
-          mnkl=(2048,2048,4096,1),
-          ab_dtype=cutlass.TFloat32,
-          c_dtype=cutlass.Float32,
-          acc_dtype=cutlass.Float32,
-          a_major="k",
-          b_major="k",
-          c_major="n",
-          mma_tiler_mn=(128, 128),
-          cluster_shape_mn=(1, 1),
-          use_2cta_instrs=False,
-          use_tma_store=False,
-          tolerance=1e-01,
-          warmup_iterations=10,
-          iterations=50,
-          skip_ref_check=False,
-          use_cold_l2=False,
-          all_reduce=True,
-      )
+        run(
+            mnkl=(2048, 2048, 4096, 1),
+            ab_dtype=cutlass.TFloat32,
+            c_dtype=cutlass.Float32,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            use_2cta_instrs=False,
+            use_tma_store=False,
+            tolerance=1e-01,
+            warmup_iterations=10,
+            iterations=50,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            all_reduce=True,
+        )
     except Exception as e:
         print(f"Rank {rank_id}: Exception during test: {e}")
         raise
@@ -459,9 +457,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [8])
