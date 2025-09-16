@@ -12,4 +12,4 @@
 #include "attention/default_decode_params.hip.h"
 #include "attention/variants.hip.h"
 
-#endif // FLASHINFER_ATTENTION_IMPL_CUH_
+#endif  // FLASHINFER_ATTENTION_IMPL_CUH_

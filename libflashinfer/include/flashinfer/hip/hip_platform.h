@@ -18,13 +18,12 @@
 #include <hip/hip_fp8.h>
 #endif
 
-#define FI_GPU_CALL(call)                                                      \
-    do {                                                                       \
-        hipError_t err = (call);                                               \
-        if (err != hipSuccess) {                                               \
-            std::ostringstream err_msg;                                        \
-            err_msg << "GPU error: " << hipGetErrorString(err) << " at "       \
-                    << __FILE__ << ":" << __LINE__;                            \
-            throw std::runtime_error(err_msg.str());                           \
-        }                                                                      \
-    } while (0)
+#define FI_GPU_CALL(call)                                                                          \
+  do {                                                                                             \
+    hipError_t err = (call);                                                                       \
+    if (err != hipSuccess) {                                                                       \
+      std::ostringstream err_msg;                                                                  \
+      err_msg << "GPU error: " << hipGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__; \
+      throw std::runtime_error(err_msg.str());                                                     \
+    }                                                                                              \
+  } while (0)

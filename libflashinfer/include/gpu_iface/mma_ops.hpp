@@ -15,12 +15,9 @@ namespace mma_detail = flashinfer::gpu_iface::mma_impl::cuda;
 namespace mma_detail = flashinfer::gpu_iface::mma_impl::hip;
 #endif
 
-namespace flashinfer
-{
-namespace gpu_iface
-{
-namespace mma
-{
+namespace flashinfer {
+namespace gpu_iface {
+namespace mma {
 
 /*!
  * \brief Loads data from shared memory to fragment
@@ -32,26 +29,23 @@ namespace mma
 // inside mma there is impl of load
 
 template <typename T>
-__device__ __forceinline__ void load_fragment(uint32_t *R, const T *smem_ptr)
-{
-    mma_detail::load_fragment<T>(R, smem_ptr);
+__device__ __forceinline__ void load_fragment(uint32_t* R, const T* smem_ptr) {
+  mma_detail::load_fragment<T>(R, smem_ptr);
 }
 
 template <typename T>
-__device__ __forceinline__ void
-load_fragment_transpose(uint32_t *R, const T *smem_ptr, uint32_t stride)
-{
-    mma_detail::load_fragment_transpose<T>(R, smem_ptr, stride);
+__device__ __forceinline__ void load_fragment_transpose(uint32_t* R, const T* smem_ptr,
+                                                        uint32_t stride) {
+  mma_detail::load_fragment_transpose<T>(R, smem_ptr, stride);
 }
 
 #if defined(PLATFORM_HIP_DEVICE) && defined(__gfx942__)
 template <typename T>
-__device__ __forceinline__ void
-load_fragment_transpose_4x4_half_registers(uint32_t *R, const T *smem_ptr)
-{
-    static_assert(std::is_same<T, int>::value,
-                  "Only __half is supported for the 4x4 register transpose");
-    mma_detail::load_fragment_4x4_half_registers<half>(R, smem_ptr);
+__device__ __forceinline__ void load_fragment_transpose_4x4_half_registers(uint32_t* R,
+                                                                           const T* smem_ptr) {
+  static_assert(std::is_same<T, int>::value,
+                "Only __half is supported for the 4x4 register transpose");
+  mma_detail::load_fragment_4x4_half_registers<half>(R, smem_ptr);
 }
 #endif
 
@@ -66,18 +60,16 @@ load_fragment_transpose_4x4_half_registers(uint32_t *R, const T *smem_ptr)
  * \param B pointer to the fragment of matrix B
  */
 template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
-__device__ __forceinline__ void
-mma_sync_m16n16k16_row_col_f16f16f32(float *C, uint32_t *A, uint32_t *B)
-{
-    mma_detail::mma_sync_m16n16k16_row_col_f16f16f32<T, mma_mode>(C, A, B);
+__device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
+                                                                     uint32_t* B) {
+  mma_detail::mma_sync_m16n16k16_row_col_f16f16f32<T, mma_mode>(C, A, B);
 }
 
 template <typename DType>
-__device__ __forceinline__ void m16k16_rowsum_f16f16f32(float *d, DType *s)
-{
-    mma_detail::m16k16_rowsum_f16f16f32<DType>(d, s);
+__device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
+  mma_detail::m16k16_rowsum_f16f16f32<DType>(d, s);
 }
 
-} // namespace mma
-} // namespace gpu_iface
-} // namespace flashinfer
+}  // namespace mma
+}  // namespace gpu_iface
+}  // namespace flashinfer

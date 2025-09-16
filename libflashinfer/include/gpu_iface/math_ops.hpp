@@ -12,12 +12,9 @@
 #include "backend/hip/math_hip.h"
 #endif
 
-namespace flashinfer
-{
-namespace gpu_iface
-{
-namespace math
-{
+namespace flashinfer {
+namespace gpu_iface {
+namespace math {
 #if defined(PLATFORM_CUDA_DEVICE)
 // Re-export CUDA math functions with same names
 using flashinfer::math::half2_as_uint32;
@@ -48,6 +45,6 @@ using flashinfer::math::tanh;
 // Add other functions as needed
 #endif
 
-} // namespace math
-} // namespace gpu_iface
-} // namespace flashinfer
+}  // namespace math
+}  // namespace gpu_iface
+}  // namespace flashinfer

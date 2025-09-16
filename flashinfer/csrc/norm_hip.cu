@@ -20,140 +20,116 @@
 
 using namespace flashinfer;
 
-void rmsnorm(at::Tensor &output,
-             at::Tensor &input,
-             at::Tensor &weight,
-             double eps,
-             bool enable_pdl)
-{
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-    auto device = input.device();
-    CHECK_EQ(weight.device(), device);
-    CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
-    CHECK_DIM(1, weight); // weight: (hidden_size)
-    CHECK_EQ(input.size(1), weight.size(0));
-    unsigned int batch_size = input.size(0);
-    unsigned int hidden_size = input.size(1);
-    CHECK_EQ(output.size(0), batch_size);
-    CHECK_EQ(output.size(1), hidden_size);
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
+             bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  auto device = input.device();
+  CHECK_EQ(weight.device(), device);
+  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);  // weight: (hidden_size)
+  CHECK_EQ(input.size(1), weight.size(0));
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  CHECK_EQ(output.size(0), batch_size);
+  CHECK_EQ(output.size(1), hidden_size);
 
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-        hipError_t status = norm::RMSNorm(
-            static_cast<c_type *>(input.data_ptr()),
-            static_cast<c_type *>(weight.data_ptr()),
-            static_cast<c_type *>(output.data_ptr()), batch_size, hidden_size,
-            input.stride(0), output.stride(0), eps, enable_pdl, stream);
-        TORCH_CHECK(status == hipSuccess,
-                    "RMSNorm failed with error code " +
-                        std::string(hipGetErrorString(status)));
-        return true;
-    });
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+    hipError_t status = norm::RMSNorm(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
+        static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
+        output.stride(0), eps, enable_pdl, stream);
+    TORCH_CHECK(status == hipSuccess,
+                "RMSNorm failed with error code " + std::string(hipGetErrorString(status)));
+    return true;
+  });
 }
 
-void fused_add_rmsnorm(at::Tensor &input,
-                       at::Tensor &residual,
-                       at::Tensor &weight,
-                       double eps,
-                       bool enable_pdl)
-{
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-    auto device = input.device();
-    CHECK_EQ(residual.device(), device);
-    CHECK_EQ(weight.device(), device);
-    CHECK_DIM(2, input);    // input: (batch_size, hidden_size)
-    CHECK_DIM(2, residual); // residual: (batch_size, hidden_size)
-    CHECK_DIM(1, weight);   // weight: (hidden_size)
-    CHECK_EQ(input.size(0), residual.size(0));
-    CHECK_EQ(input.size(1), residual.size(1));
-    CHECK_EQ(input.size(1), weight.size(0));
-    unsigned int batch_size = input.size(0);
-    unsigned int hidden_size = input.size(1);
+void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+                       bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  auto device = input.device();
+  CHECK_EQ(residual.device(), device);
+  CHECK_EQ(weight.device(), device);
+  CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
+  CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);    // weight: (hidden_size)
+  CHECK_EQ(input.size(0), residual.size(0));
+  CHECK_EQ(input.size(1), residual.size(1));
+  CHECK_EQ(input.size(1), weight.size(0));
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
 
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-        hipError_t status = norm::FusedAddRMSNorm(
-            static_cast<c_type *>(input.data_ptr()),
-            static_cast<c_type *>(residual.data_ptr()),
-            static_cast<c_type *>(weight.data_ptr()), batch_size, hidden_size,
-            input.stride(0), residual.stride(0), eps, enable_pdl, stream);
-        TORCH_CHECK(status == hipSuccess,
-                    "FusedAddRMSNorm failed with error code " +
-                        std::string(hipGetErrorString(status)));
-        return true;
-    });
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+    hipError_t status = norm::FusedAddRMSNorm(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
+        static_cast<c_type*>(weight.data_ptr()), batch_size, hidden_size, input.stride(0),
+        residual.stride(0), eps, enable_pdl, stream);
+    TORCH_CHECK(status == hipSuccess,
+                "FusedAddRMSNorm failed with error code " + std::string(hipGetErrorString(status)));
+    return true;
+  });
 }
 
-void gemma_rmsnorm(at::Tensor &output,
-                   at::Tensor &input,
-                   at::Tensor &weight,
-                   double eps,
-                   bool enable_pdl)
-{
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-    auto device = input.device();
-    CHECK_EQ(weight.device(), device);
-    CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
-    CHECK_DIM(1, weight); // weight: (hidden_size)
-    CHECK_EQ(input.size(1), weight.size(0));
-    unsigned int batch_size = input.size(0);
-    unsigned int hidden_size = input.size(1);
-    CHECK_EQ(output.size(0), batch_size);
-    CHECK_EQ(output.size(1), hidden_size);
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
+                   bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  auto device = input.device();
+  CHECK_EQ(weight.device(), device);
+  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);  // weight: (hidden_size)
+  CHECK_EQ(input.size(1), weight.size(0));
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  CHECK_EQ(output.size(0), batch_size);
+  CHECK_EQ(output.size(1), hidden_size);
 
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-        hipError_t status = norm::GemmaRMSNorm(
-            static_cast<c_type *>(input.data_ptr()),
-            static_cast<c_type *>(weight.data_ptr()),
-            static_cast<c_type *>(output.data_ptr()), batch_size, hidden_size,
-            input.stride(0), output.stride(0), eps, enable_pdl, stream);
-        TORCH_CHECK(status == hipSuccess,
-                    "GemmaRMSNorm failed with error code " +
-                        std::string(hipGetErrorString(status)));
-        return true;
-    });
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+    hipError_t status = norm::GemmaRMSNorm(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
+        static_cast<c_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
+        output.stride(0), eps, enable_pdl, stream);
+    TORCH_CHECK(status == hipSuccess,
+                "GemmaRMSNorm failed with error code " + std::string(hipGetErrorString(status)));
+    return true;
+  });
 }
 
-void gemma_fused_add_rmsnorm(at::Tensor &input,
-                             at::Tensor &residual,
-                             at::Tensor &weight,
-                             double eps,
-                             bool enable_pdl)
-{
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-    auto device = input.device();
-    CHECK_EQ(residual.device(), device);
-    CHECK_EQ(weight.device(), device);
-    CHECK_DIM(2, input);    // input: (batch_size, hidden_size)
-    CHECK_DIM(2, residual); // residual: (batch_size, hidden_size)
-    CHECK_DIM(1, weight);   // weight: (hidden_size)
-    CHECK_EQ(input.size(0), residual.size(0));
-    CHECK_EQ(input.size(1), residual.size(1));
-    CHECK_EQ(input.size(1), weight.size(0));
-    unsigned int batch_size = input.size(0);
-    unsigned int hidden_size = input.size(1);
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
+                             double eps, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  auto device = input.device();
+  CHECK_EQ(residual.device(), device);
+  CHECK_EQ(weight.device(), device);
+  CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
+  CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);    // weight: (hidden_size)
+  CHECK_EQ(input.size(0), residual.size(0));
+  CHECK_EQ(input.size(1), residual.size(1));
+  CHECK_EQ(input.size(1), weight.size(0));
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
 
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-        hipError_t status = norm::GemmaFusedAddRMSNorm(
-            static_cast<c_type *>(input.data_ptr()),
-            static_cast<c_type *>(residual.data_ptr()),
-            static_cast<c_type *>(weight.data_ptr()), batch_size, hidden_size,
-            input.stride(0), residual.stride(0), eps, enable_pdl, stream);
-        TORCH_CHECK(status == hipSuccess,
-                    "GemmaFusedAddRMSNorm failed with error code " +
-                        std::string(hipGetErrorString(status)));
-        return true;
-    });
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device);
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+    hipError_t status = norm::GemmaFusedAddRMSNorm(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
+        static_cast<c_type*>(weight.data_ptr()), batch_size, hidden_size, input.stride(0),
+        residual.stride(0), eps, enable_pdl, stream);
+    TORCH_CHECK(status == hipSuccess, "GemmaFusedAddRMSNorm failed with error code " +
+                                          std::string(hipGetErrorString(status)));
+    return true;
+  });
 }

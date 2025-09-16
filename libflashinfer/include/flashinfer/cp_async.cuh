@@ -20,22 +20,18 @@
 
 #include <cstdint>
 
-namespace flashinfer
-{
+namespace flashinfer {
 
-namespace cp_async
-{
+namespace cp_async {
 
-enum class SharedMemFillMode
-{
-    kFillZero, // Fill zero to shared memory when predicate is false
-    kNoFill    // Do not fill zero to shared memory when predicate is false
+enum class SharedMemFillMode {
+  kFillZero,  // Fill zero to shared memory when predicate is false
+  kNoFill     // Do not fill zero to shared memory when predicate is false
 };
 
-enum class PrefetchMode
-{
-    kNoPrefetch, // Do not fetch additional data from global memory to L2
-    kPrefetch    // Fetch additional data from global memory to L2
+enum class PrefetchMode {
+  kNoPrefetch,  // Do not fetch additional data from global memory to L2
+  kPrefetch     // Fetch additional data from global memory to L2
 };
 
 #if (__CUDACC_VER_MAJOR__ >= 11)
@@ -48,10 +44,9 @@ enum class PrefetchMode
  * \brief Wrapper of PTX cp.async.commit_group instruction, commit all prior
  * uncommitted cp.async instructions to a group
  */
-__device__ __forceinline__ void commit_group()
-{
+__device__ __forceinline__ void commit_group() {
 #ifdef FLASHINFER_CP_ASYNC_ENABLED
-    asm volatile("cp.async.commit_group;\n" ::);
+  asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
 
@@ -59,10 +54,10 @@ __device__ __forceinline__ void commit_group()
  * \brief Wrapper of PTX cp.async.wait_group instruction
  * \tparam n Wait till most recent n groups are committed
  */
-template <size_t n> __device__ __forceinline__ void wait_group()
-{
+template <size_t n>
+__device__ __forceinline__ void wait_group() {
 #ifdef FLASHINFER_CP_ASYNC_ENABLED
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 #endif
 }
 
@@ -76,24 +71,18 @@ template <size_t n> __device__ __forceinline__ void wait_group()
  * \param gmem_ptr Pointer to global memory
  */
 template <PrefetchMode prefetch_mode, typename T>
-__device__ __forceinline__ void load_128b(T *smem_ptr, const T *gmem_ptr)
-{
+__device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 #ifdef FLASHINFER_CP_ASYNC_ENABLED
-    uint32_t smem_int_ptr =
-        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-        asm volatile(
-            "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(
-                smem_int_ptr),
-            "l"(gmem_ptr), "n"(16), "r"(16));
-    }
-    else {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(
-                         smem_int_ptr),
-                     "l"(gmem_ptr), "n"(16), "r"(16));
-    }
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem_ptr), "n"(16), "r"(16));
+  } else {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem_ptr), "n"(16), "r"(16));
+  }
 #else
-    *((uint4 *)smem_ptr) = *((uint4 *)gmem_ptr);
+  *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
 #endif
 }
 
@@ -111,55 +100,45 @@ __device__ __forceinline__ void load_128b(T *smem_ptr, const T *gmem_ptr)
  * \note fill zero is slower than not fill zero
  */
 template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
-__device__ __forceinline__ void
-pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
-{
+__device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
 #ifdef FLASHINFER_CP_ASYNC_ENABLED
-    uint32_t smem_int_ptr =
-        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
-        int src_in_bytes = predicate ? 16 : 0;
-        if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-            asm volatile(
-                "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::
-                    "r"(smem_int_ptr),
-                "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
-        }
-        else {
-            asm volatile(
-                "cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(
-                    smem_int_ptr),
-                "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
-        }
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    int src_in_bytes = predicate ? 16 : 0;
+    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+      asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                   "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+    } else {
+      asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                   "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
     }
-    else {
-        if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
-            asm volatile(
-                "{\n"
-                " .reg .pred p;\n"
-                " setp.ne.b32 p, %0, 0;\n"
-                " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
-                "}\n" ::"r"((int)predicate),
-                "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
-        }
-        else {
-            asm volatile("{\n"
-                         " .reg .pred p;\n"
-                         " setp.ne.b32 p, %0, 0;\n"
-                         " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-                         "}\n" ::"r"((int)predicate),
-                         "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
-        }
+  } else {
+    if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+      asm volatile(
+          "{\n"
+          " .reg .pred p;\n"
+          " setp.ne.b32 p, %0, 0;\n"
+          " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
+          "}\n" ::"r"((int)predicate),
+          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
+    } else {
+      asm volatile(
+          "{\n"
+          " .reg .pred p;\n"
+          " setp.ne.b32 p, %0, 0;\n"
+          " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+          "}\n" ::"r"((int)predicate),
+          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
     }
+  }
 #else
-    if (predicate) {
-        *((uint4 *)smem_ptr) = *((uint4 *)gmem_ptr);
+  if (predicate) {
+    *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+  } else {
+    if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+      *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
     }
-    else {
-        if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
-            *((uint4 *)smem_ptr) = make_uint4(0, 0, 0, 0);
-        }
-    }
+  }
 #endif
 }
 
@@ -174,18 +153,14 @@ pred_load_128b(T *smem_ptr, const T *gmem_ptr, bool predicate)
  * \param gmem_ptr Pointer to global memory
  */
 template <size_t num_bits, PrefetchMode prefetch_mode, typename T>
-__device__ __forceinline__ void load(T *smem_ptr, const T *gmem_ptr)
-{
-    static_assert(num_bits == 128 || num_bits == 256,
-                  "num_bits must be 128 or 256");
-    if constexpr (num_bits == 128) {
-        load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
-    }
-    else {
-        load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
-        load_128b<prefetch_mode>(smem_ptr + 16 / sizeof(T),
-                                 gmem_ptr + 16 / sizeof(T));
-    }
+__device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
+  static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
+  if constexpr (num_bits == 128) {
+    load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
+  } else {
+    load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
+    load_128b<prefetch_mode>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T));
+  }
 }
 
 /*!
@@ -202,27 +177,20 @@ __device__ __forceinline__ void load(T *smem_ptr, const T *gmem_ptr)
  * \param predicate Predicate value
  * \note fill zero is slower than not fill zero
  */
-template <size_t num_bits,
-          PrefetchMode prefetch_mode,
-          SharedMemFillMode fill_mode,
-          typename T>
-__device__ __forceinline__ void
-pred_load(T *smem_ptr, const T *gmem_ptr, bool predicate)
-{
-    static_assert(num_bits == 128 || num_bits == 256,
-                  "num_bits must be 128 or 256");
-    if constexpr (num_bits == 128) {
-        pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
-    }
-    else {
-        pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
-        pred_load_128b<prefetch_mode, fill_mode>(
-            smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T), predicate);
-    }
+template <size_t num_bits, PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
+__device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool predicate) {
+  static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
+  if constexpr (num_bits == 128) {
+    pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
+  } else {
+    pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
+    pred_load_128b<prefetch_mode, fill_mode>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T),
+                                             predicate);
+  }
 }
 
-} // namespace cp_async
+}  // namespace cp_async
 
-} // namespace flashinfer
+}  // namespace flashinfer
 
-#endif // FLASHINFER_CP_ASYNC_CUH_
+#endif  // FLASHINFER_CP_ASYNC_CUH_

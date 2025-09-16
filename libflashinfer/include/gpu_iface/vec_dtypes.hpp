@@ -3,16 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
-#include "platform.hpp"
 #include <float.h>
 #include <math.h>
 
-namespace flashinfer
-{
-namespace gpu_iface
-{
-namespace vec_dtypes
-{
+#include "platform.hpp"
+
+namespace flashinfer {
+namespace gpu_iface {
+namespace vec_dtypes {
 
 // Include the appropriate backend implementation
 #if defined(PLATFORM_CUDA_DEVICE)
@@ -28,6 +26,6 @@ namespace detail_t = flashinfer::gpu_iface::vec_dtypes::detail::hip;
 // This allows code to use flashinfer::gpu_iface::vec_dtypes::vec_t<float, 4>
 using detail_t::vec_t;
 
-} // namespace vec_dtypes
-} // namespace gpu_iface
-} // namespace flashinfer
+}  // namespace vec_dtypes
+}  // namespace gpu_iface
+}  // namespace flashinfer

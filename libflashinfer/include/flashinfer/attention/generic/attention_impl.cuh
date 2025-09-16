@@ -16,4 +16,4 @@
 // #include "default_prefill_params.cuh"
 // #include "prefill.cuh"
 
-#endif // FLASHINFER_ATTENTION_IMPL_CUH_
+#endif  // FLASHINFER_ATTENTION_IMPL_CUH_

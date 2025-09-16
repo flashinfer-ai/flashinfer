@@ -61,30 +61,22 @@
 
 // Function attribute enums (these have different names)
 #if defined(PLATFORM_CUDA_DEVICE)
-#define gpuFuncAttributeMaxDynamicSharedMemorySize                             \
-    cudaFuncAttributeMaxDynamicSharedMemorySize
-#define gpuFuncAttributePreferredSharedMemoryCarveout                          \
-    cudaFuncAttributePreferredSharedMemoryCarveout
+#define gpuFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
+#define gpuFuncAttributePreferredSharedMemoryCarveout cudaFuncAttributePreferredSharedMemoryCarveout
 #elif defined(PLATFORM_HIP_DEVICE)
-#define gpuFuncAttributeMaxDynamicSharedMemorySize                             \
-    hipFuncAttributeMaxDynamicSharedMemorySize
-#define gpuFuncAttributePreferredSharedMemoryCarveout                          \
-    hipFuncAttributePreferredSharedMemoryCarveout
+#define gpuFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define gpuFuncAttributePreferredSharedMemoryCarveout hipFuncAttributePreferredSharedMemoryCarveout
 #endif
 
 // Device attribute enums (different names)
 #if defined(PLATFORM_CUDA_DEVICE)
 #define gpuDevAttrMultiProcessorCount cudaDevAttrMultiProcessorCount
-#define gpuDevAttrMaxSharedMemoryPerMultiProcessor                             \
-    cudaDevAttrMaxSharedMemoryPerMultiprocessor
-#define gpuOccupancyMaxActiveBlocksPerMultiprocessor                           \
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define gpuDevAttrMaxSharedMemoryPerMultiProcessor cudaDevAttrMaxSharedMemoryPerMultiprocessor
+#define gpuOccupancyMaxActiveBlocksPerMultiprocessor cudaOccupancyMaxActiveBlocksPerMultiprocessor
 #elif defined(PLATFORM_HIP_DEVICE)
 #define gpuDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
-#define gpuDevAttrMaxSharedMemoryPerMultiProcessor                             \
-    hipDeviceAttributeMaxSharedMemPerMultiprocessor
-#define gpuOccupancyMaxActiveBlocksPerMultiprocessor                           \
-    hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define gpuDevAttrMaxSharedMemoryPerMultiProcessor hipDeviceAttributeMaxSharedMemPerMultiprocessor
+#define gpuOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #endif
 
 // Error handling (for FI_GPU_CALL)
@@ -104,13 +96,12 @@
 #define gpuLaunchAttribute hipLaunchAttribute
 #endif
 // CUDA error checking macro (replaces FLASHINFER_CUDA_CALL)
-#define FI_GPU_CALL(call)                                                      \
-    do {                                                                       \
-        gpuError_t err = (call);                                               \
-        if (err != gpuSuccess) {                                               \
-            std::ostringstream err_msg;                                        \
-            err_msg << "GPU error: " << gpuGetErrorString(err) << " at "       \
-                    << __FILE__ << ":" << __LINE__;                            \
-            throw std::runtime_error(err_msg.str());                           \
-        }                                                                      \
-    } while (0)
+#define FI_GPU_CALL(call)                                                                          \
+  do {                                                                                             \
+    gpuError_t err = (call);                                                                       \
+    if (err != gpuSuccess) {                                                                       \
+      std::ostringstream err_msg;                                                                  \
+      err_msg << "GPU error: " << gpuGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__; \
+      throw std::runtime_error(err_msg.str());                                                     \
+    }                                                                                              \
+  } while (0)
