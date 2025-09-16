@@ -4,19 +4,24 @@ set -eo pipefail
 set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
+: ${JUNIT_DIR:=$(realpath ./junit)}
 
 pip install -e . -v
 pip install --upgrade nvidia-cudnn-cu12
 pip install --upgrade cuda-python==12.*
 
-# run task_blackwell_utils_kernels.sh
-bash scripts/run_test_blackwell_utils_kernels.sh
+EXIT_CODE=0
+scripts_to_run=(
+  "run_test_blackwell_utils_kernels.sh"
+  "run_test_blackwell_attention_kernels.sh"
+  "run_test_blackwell_gemm_kernels.sh"
+  "run_test_blackwell_moe_kernels.sh"
+)
+for script in "${scripts_to_run[@]}"; do
+  bash "scripts/$script" || EXIT_CODE=1
+  if [[ -z "${RUN_TO_COMPLETION}" && $EXIT_CODE -ne 0 ]]; then
+    exit $EXIT_CODE
+  fi
+done
 
-# run task_blackwell_attention_kernels.sh
-bash scripts/run_test_blackwell_attention_kernels.sh
-
-# gemm kernels
-bash scripts/run_test_blackwell_gemm_kernels.sh
-
-# moe kernels
-bash scripts/run_test_blackwell_moe_kernels.sh
+exit $EXIT_CODE
