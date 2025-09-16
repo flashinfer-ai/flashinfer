@@ -1469,7 +1469,7 @@ struct vec_t<__hip_bfloat16, vec_size> {
   }
   FLASHINFER_INLINE __hip_bfloat16* ptr() { return reinterpret_cast<__hip_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(__hip_bfloat16 val) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       *(__hip_bfloat162*)(&(data[i].x)) = make_bfloat162(val, val);
       *(__hip_bfloat162*)(&(data[i].y)) = make_bfloat162(val, val);
@@ -1478,13 +1478,13 @@ struct vec_t<__hip_bfloat16, vec_size> {
     }
   }
   FLASHINFER_INLINE void load(const __hip_bfloat16* ptr) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ((uint4*)ptr)[i];
     }
   }
   FLASHINFER_INLINE void store(__hip_bfloat16* ptr) const {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((uint4*)ptr)[i] = data[i];
     }
@@ -1502,7 +1502,7 @@ struct vec_t<__hip_bfloat16, vec_size> {
     cast_store_impl(ptr, *this);
   }
   FLASHINFER_INLINE static void memcpy(__hip_bfloat16* dst, const __hip_bfloat16* src) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((uint4*)dst)[i] = ((uint4*)src)[i];
     }

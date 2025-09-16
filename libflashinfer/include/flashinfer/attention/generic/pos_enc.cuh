@@ -41,10 +41,10 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
 }
 
 __device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num_heads) {
-  int n = gpu_iface::math::ptx_exp2((int)gpu_iface::math::ptx_log2(num_heads));
+  int n = (int)gpu_iface::math::ptx_exp2(gpu_iface::math::ptx_log2(float(num_heads)));
   return head_idx < n
-             ? gpu_iface::math::ptx_exp2(-8. * float(head_idx + 1) / float(n))
-             : gpu_iface::math::ptx_exp2(-4. * float((head_idx + 1 - n) * 2 - 1) / float(n));
+             ? gpu_iface::math::ptx_exp2(-8.f * float(head_idx + 1) / float(n))
+             : gpu_iface::math::ptx_exp2(-4.f * float((head_idx + 1 - n) * 2 - 1) / float(n));
 }
 
 /*!
