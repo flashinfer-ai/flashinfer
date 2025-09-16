@@ -13,6 +13,7 @@
 
 #include "gpu_iface/dispatch.cuh"
 #include "gpu_iface/enums.hpp"
+#include "gpu_iface/gpu_runtime_compat.hpp"
 #include "gpu_iface/layout.cuh"
 #include "gpu_iface/macros.hpp"
 #include "gpu_iface/math_ops.hpp"

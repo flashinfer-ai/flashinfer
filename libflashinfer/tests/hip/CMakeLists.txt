@@ -40,9 +40,6 @@ include_directories("/opt/rocm/include") # Add this explicit include path
 include_directories(${FLASHINFER_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-find_package(Torch REQUIRED)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-
 # find_package(GTest REQUIRED)
 include_directories(${GTEST_INCLUDE_DIRS})
 
@@ -59,13 +56,12 @@ add_library(cascade STATIC
             ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/cascade.cuh)
 add_library(decode STATIC
             ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/decode.cuh)
-add_library(page STATIC
-            ${FLASHINFER_INCLUDE_DIRS}/flashinfer/attention/generic/page.cuh)
+
 add_library(mma_ops STATIC ${FLASHINFER_INCLUDE_DIRS}/gpu_iface/mma_ops.hpp)
 
 set(CMAKE_HIP_FLAGS
-    "${CMAKE_HIP_FLAGS} -O3 -g -D__HIP_PLATFORM_AMD__ -D__HIP_NO_HALF_OPERATORS__=0 -D__HIP_NO_HALF_CONVERSIONS__=0"
-    -DPLATFORM_HIP_DEVICE)
+    "${CMAKE_HIP_FLAGS} -O3 -g -D__HIP_PLATFORM_AMD__ -D__HIP_NO_HALF_OPERATORS__=0 -D__HIP_NO_HALF_CONVERSIONS__=0 -DPLATFORM_HIP_DEVICE -DHIP_ENABLE_WARP_SYNC_BUILTINS=1"
+)
 
 set_target_properties(
   math
@@ -104,12 +100,6 @@ set_target_properties(
              LINKER_LANGUAGE HIP)
 
 set_target_properties(
-  page
-  PROPERTIES HIP_SOURCES_PROPERTY_FORMAT 1
-             HIP_SEPARABLE_COMPILATION ON
-             LINKER_LANGUAGE HIP)
-
-set_target_properties(
   mma_ops
   PROPERTIES HIP_SOURCES_PROPERTY_FORMAT 1
              HIP_SEPARABLE_COMPILATION ON
@@ -120,7 +110,6 @@ target_link_libraries(layout PUBLIC hip::host hip::device)
 target_link_libraries(pos_enc PUBLIC hip::host hip::device)
 target_link_libraries(state PUBLIC hip::host hip::device)
 target_link_libraries(cascade PUBLIC hip::host hip::device)
-target_link_libraries(page PUBLIC hip::host hip::device)
 target_link_libraries(
   decode
   PUBLIC hip::host
@@ -136,53 +125,42 @@ target_link_libraries(mma_ops PUBLIC hip::host hip::device)
 message("CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_executable(test_math ${CMAKE_CURRENT_SOURCE_DIR}/test_math.cpp)
-target_link_libraries(test_math PRIVATE math "${TORCH_LIBRARIES}" gtest
-                                        gtest_main pthread)
+target_link_libraries(test_math PRIVATE math gtest gtest_main pthread)
 
 add_executable(test_pos_enc ${CMAKE_CURRENT_SOURCE_DIR}/test_pos_enc.cpp)
-target_link_libraries(test_pos_enc PRIVATE pos_enc "${TORCH_LIBRARIES}" gtest
-                                           gtest_main pthread)
+target_link_libraries(test_pos_enc PRIVATE pos_enc gtest gtest_main pthread)
 
 add_executable(test_cascade ${CMAKE_CURRENT_SOURCE_DIR}/test_cascade.cpp)
-target_link_libraries(test_cascade PRIVATE state cascade "${TORCH_LIBRARIES}"
-                                           gtest gtest_main pthread)
-
-add_executable(test_page ${CMAKE_CURRENT_SOURCE_DIR}/test_page.cpp)
-target_link_libraries(test_page PRIVATE page "${TORCH_LIBRARIES}" layout gtest
-                                        gtest_main pthread)
+target_link_libraries(test_cascade PRIVATE state cascade gtest gtest_main
+                                           pthread)
 
 add_executable(test_single_decode
                ${CMAKE_CURRENT_SOURCE_DIR}/test_single_decode.cpp)
-target_link_libraries(test_single_decode PRIVATE decode "${TORCH_LIBRARIES}"
-                                                 gtest gtest_main pthread)
+target_link_libraries(test_single_decode PRIVATE decode gtest gtest_main
+                                                 pthread)
 
 add_executable(test_batch_decode
                ${CMAKE_CURRENT_SOURCE_DIR}/test_batch_decode.cpp)
-target_link_libraries(test_batch_decode PRIVATE decode "${TORCH_LIBRARIES}"
-                                                gtest gtest_main pthread)
+target_link_libraries(test_batch_decode PRIVATE decode gtest gtest_main pthread)
 
 add_executable(test_mfma_fp32_16x16x16fp16
                ${CMAKE_CURRENT_SOURCE_DIR}/test_mfma_fp32_16x16x16fp16.cpp)
-target_link_libraries(
-  test_mfma_fp32_16x16x16fp16 PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
-                                      gtest_main pthread)
+target_link_libraries(test_mfma_fp32_16x16x16fp16 PRIVATE mma_ops gtest
+                                                          gtest_main pthread)
 
 add_executable(test_rowsum ${CMAKE_CURRENT_SOURCE_DIR}/test_rowsum.cpp)
-target_link_libraries(test_rowsum PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
-                                          gtest_main pthread)
+target_link_libraries(test_rowsum PRIVATE mma_ops gtest gtest_main pthread)
 
 add_executable(
   test_transpose_4x4_half_registers
   ${CMAKE_CURRENT_SOURCE_DIR}/test_transpose_4x4_half_registers.cpp)
-target_link_libraries(
-  test_transpose_4x4_half_registers PRIVATE mma_ops "${TORCH_LIBRARIES}" gtest
-                                            gtest_main pthread)
+target_link_libraries(test_transpose_4x4_half_registers
+                      PRIVATE mma_ops gtest gtest_main pthread)
 
 if(HIP_FOUND)
   set_target_properties(test_math PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_pos_enc PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_cascade PROPERTIES HIP_SEPARABLE_COMPILATION ON)
-  set_target_properties(test_page PROPERTIES HIP_SEPARABLE_COMPILATION ON)
   set_target_properties(test_single_decode PROPERTIES HIP_SEPARABLE_COMPILATION
                                                       ON)
   set_target_properties(test_batch_decode PROPERTIES HIP_SEPARABLE_COMPILATION
@@ -198,7 +176,6 @@ enable_testing()
 add_test(NAME MathTest COMMAND test_math)
 add_test(NAME PosEncTest COMMAND test_pos_enc)
 add_test(NAME CascadeTest COMMAND test_cascade)
-add_test(NAME PageTest COMMAND test_page)
 add_test(NAME SingleDecodeTest COMMAND test_single_decode)
 add_test(NAME BatchDecodeTest COMMAND test_batch_decode)
 add_test(NAME test_mfma_fp32_16x16x16fp16 COMMAND test_mfma_fp32_16x16x16fp16)
