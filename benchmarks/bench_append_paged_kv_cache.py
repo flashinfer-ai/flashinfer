@@ -1,6 +1,6 @@
 import argparse
 import dataclasses
-from typing import Tuple, cast
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -139,10 +139,10 @@ def main():
             print(
                 f"model: {model_name:8}",
                 f"seqlens: {seqlens!r:{seqlen_strlen}}",
-                f"convert: {convert_latency_ms*1e3:2.0f}us",
-                f"1layer: {latency_ms*1e3:2.0f}us",
-                f"{model.num_layers}layers: {all_layers_latency_ms*1e3:3.0f}us",
-                f"throughput: {throughput*1e-9:8.3f}GB/s",
+                f"convert: {convert_latency_ms * 1e3:2.0f}us",
+                f"1layer: {latency_ms * 1e3:2.0f}us",
+                f"{model.num_layers}layers: {all_layers_latency_ms * 1e3:3.0f}us",
+                f"throughput: {throughput * 1e-9:8.3f}GB/s",
             )
         print("---")
 

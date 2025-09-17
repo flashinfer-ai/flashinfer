@@ -23,7 +23,7 @@ from .validators import CompileError, ValidityCheck, get_default_validity_checks
 
 
 class Compiler:
-    def __init__(self):
+    def __init__(self) -> None:
         self.fusion_rules: List[FusionRule] = []
         self.validity_checks: List[ValidityCheck] = []
         self._install_defaults()
@@ -88,7 +88,6 @@ class Compiler:
                 window = ops[i : i + span]
 
                 if self._pattern_matches(window, rule.pattern) and rule.guard(window):
-
                     fused_op = rule.build(window)
                     ops[i : i + span] = [fused_op]
 

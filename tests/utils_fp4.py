@@ -69,14 +69,18 @@ def get_reciprocal(x):
         raise TypeError("Input must be a float, int, or a torch.Tensor.")
 
 
-def ref_nvfp4_quant(x, global_scale, block_size):
+def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
     assert isinstance(global_scale, (float, int)) or global_scale.dtype == torch.float32
 
     sliced_shape = x.shape[:-1] + (x.shape[-1] // block_size, block_size)
     sliced_x = torch.reshape(x, sliced_shape)
     vec_max = torch.max(torch.abs(sliced_x), dim=-1, keepdim=True)[0].to(torch.float32)
     scale = global_scale * (vec_max * get_reciprocal(FLOAT4_E2M1_MAX))
-    scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
+    if sf_use_ue8m0:
+        scale = (scale.view(torch.int32) + 0x007FFFFF) & 0x7F800000
+        scale = scale.view(torch.float32)
+    else:
+        scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
     output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
 
     scaled_x = sliced_x.to(torch.float32) * output_scale
@@ -86,11 +90,11 @@ def ref_nvfp4_quant(x, global_scale, block_size):
 
 def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
     assert sf_start_index + m <= scale.shape[0]
-    rounded_m = utils.round_up(m, 128)
+    full_m = scale.shape[0]
     scale_n = n // block_size
     rounded_n = utils.round_up(scale_n, 4)
     # Recover the swizzled scaling factor to linear layout
-    tmp = torch.reshape(scale, (1, rounded_m // 128, rounded_n // 4, 32, 4, 4))
+    tmp = torch.reshape(scale, (1, full_m // 128, rounded_n // 4, 32, 4, 4))
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-    result = torch.reshape(tmp, (rounded_m, rounded_n)).to(torch.float32)
+    result = torch.reshape(tmp, (full_m, rounded_n)).to(torch.float32)
     return result[sf_start_index : sf_start_index + m, :scale_n]

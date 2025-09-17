@@ -15,94 +15,14 @@ Prerequisites
 
 - Python: 3.8, 3.9, 3.10, 3.11, 3.12
 
-- PyTorch: 2.2/2.3/2.4/2.5 with CUDA 11.8/12.1/12.4 (only for torch 2.4 or later)
-
-  - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
-
-- Supported GPU architectures: ``sm75``, ``sm80``, ``sm86``, ``sm89``, ``sm90``.
-
 Quick Start
 ^^^^^^^^^^^
 
-The easiest way to install FlashInfer is via pip, we host wheels with indexed URL for different PyTorch versions and CUDA versions. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
+The easiest way to install FlashInfer is via pip. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
 
-.. tabs::
-    .. tab:: PyTorch 2.6
+.. code-block:: bash
 
-        .. tabs::
-
-            .. tab:: CUDA 12.6
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6/
-
-            .. tab:: CUDA 12.4
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.6/
-
-    .. tab:: PyTorch 2.5
-
-        .. tabs::
-
-            .. tab:: CUDA 12.4
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.5/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.5/
-
-    .. tab:: PyTorch 2.4
-
-        .. tabs::
-
-            .. tab:: CUDA 12.4
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.4/
-
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.4/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.4/
-
-    .. tab:: PyTorch 2.3
-
-        .. tabs::
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.3/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.3/
+    pip install flashinfer-python
 
 
 .. _install-from-source:
@@ -160,7 +80,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer
-               export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
                python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
                python -m pip install --no-build-isolation --verbose .
 
@@ -189,7 +109,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer
-               export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
                python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
                python -m build --no-isolation --wheel
                ls -la dist/

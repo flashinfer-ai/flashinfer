@@ -16,6 +16,8 @@
 #ifndef FLASHINFER_CUTLASS_UTILS_CUH_
 #define FLASHINFER_CUTLASS_UTILS_CUH_
 
+#include <cuda_fp8.h>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -39,9 +41,10 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-
 #if defined(FLASHINFER_ENABLE_FP4_E2M1)
+#if (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 12080)
 #include <cuda_fp4.h>
+#endif
 #endif
 
 namespace flashinfer {
@@ -71,7 +74,7 @@ struct cutlass_dtype<__nv_fp8_e5m2> {
   using type = cutlass::float_e5m2_t;
 };
 
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 template <>
 struct cutlass_dtype<__nv_fp8_e8m0> {
   using type = cutlass::float_ue8m0_t;

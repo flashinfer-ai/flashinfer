@@ -36,7 +36,7 @@ def main():
                 gumbel_distribution(0.1),
                 gumbel_distribution(1),
             ]:
-                for p in [0.1, 0.5, 0.9]:
+                for p in [0.1, 0.5, 0.9, 1.0]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
                     measurements = bench_gpu_time(
@@ -49,7 +49,7 @@ def main():
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, p: {p}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, p: {p}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
     print("---")
@@ -75,7 +75,7 @@ def main():
                     io = (probs.numel() * probs.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
     print("---")
@@ -100,7 +100,7 @@ def main():
                     io = (logits.numel() * logits.element_size()) * 2
                     bandwidth = io * 1e-6 / ms
                     print(
-                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms*1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
+                        f"vocab_size: {vocab_size}, batch_size: {batch_size}, distrib: {distrib.__name__}, k: {k}, duration: {ms * 1e3:.2f} us, effective bandwidth: {bandwidth:.2f} GB/s"
                     )
 
 

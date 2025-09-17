@@ -1,9 +1,12 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
+import functools
 import os
+import re
 import subprocess
 import sys
 import sysconfig
+from packaging.version import Version
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,12 +14,43 @@ import torch
 from torch.utils.cpp_extension import (
     _TORCH_PATH,
     CUDA_HOME,
-    _get_cuda_arch_flags,
     _get_num_workers,
     _get_pybind11_abi_build_flags,
 )
 
 from . import env as jit_env
+from ..compilation_context import CompilationContext
+
+
+@functools.cache
+def get_cuda_path() -> str:
+    if CUDA_HOME is None:
+        # get output of "which nvcc"
+        result = subprocess.run(["which", "nvcc"], capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError("Could not find nvcc")
+        return result.stdout.decode("utf-8").strip()
+    else:
+        return CUDA_HOME
+
+
+@functools.cache
+def get_cuda_version() -> Version:
+    if CUDA_HOME is None:
+        nvcc = "nvcc"
+    else:
+        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    matches = re.findall(r"release (\d+\.\d+),", txt)
+    if not matches:
+        raise RuntimeError(
+            f"Could not parse CUDA version from nvcc --version output: {txt}"
+        )
+    return Version(matches[0])
+
+
+def is_cuda_version_at_least(version_str: str) -> bool:
+    return get_cuda_version() >= Version(version_str)
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
@@ -44,6 +78,7 @@ def generate_ninja_build_for_op(
         "$torch_home/include",
         "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
+        "$cuda_home/include/cccl",
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
@@ -53,15 +88,16 @@ def generate_ninja_build_for_op(
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
         "-DTORCH_API_INCLUDE_EXTENSION_H",
-        "-DPy_LIMITED_API=0x03090000",
     ]
+    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        common_cflags.append("-DPy_LIMITED_API=0x03090000")
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
-        for dir in extra_include_dirs:
-            common_cflags.append(f"-I{dir.resolve()}")
-    for dir in system_includes:
-        common_cflags.append(f"-isystem {dir}")
+        for extra_dir in extra_include_dirs:
+            common_cflags.append(f"-I{extra_dir.resolve()}")
+    for sys_dir in system_includes:
+        common_cflags.append(f"-isystem {sys_dir}")
 
     cflags = [
         "$common_cflags",
@@ -79,19 +115,43 @@ def generate_ninja_build_for_op(
         "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
     ]
-    cuda_cflags += _get_cuda_arch_flags(extra_cuda_cflags)
+    cuda_version = get_cuda_version()
+    # enable -static-global-template-stub when cuda version >= 12.8
+    if cuda_version >= Version("12.8"):
+        cuda_cflags += [
+            "-static-global-template-stub=false",
+        ]
+
+    cpp_ext_initial_compilation_context = CompilationContext()
+    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list()
     if extra_cuda_cflags is not None:
-        cuda_cflags += extra_cuda_cflags
+        # Check if module provides architecture flags
+        module_has_gencode = any(
+            flag.startswith("-gencode=") for flag in extra_cuda_cflags
+        )
+
+        if module_has_gencode:
+            # Use module's architecture flags, but keep global non-architecture flags
+            global_non_arch_flags = [
+                flag for flag in global_flags if not flag.startswith("-gencode=")
+            ]
+            cuda_cflags += global_non_arch_flags + extra_cuda_cflags
+        else:
+            # No module architecture flags, use both global and module flags
+            cuda_cflags += global_flags + extra_cuda_cflags
+    else:
+        # No module flags, use global flags
+        cuda_cflags += global_flags
 
     ldflags = [
         "-shared",
         "-L$torch_home/lib",
+        "-L$cuda_home/lib64",
         "-lc10",
         "-lc10_cuda",
         "-ltorch_cpu",
         "-ltorch_cuda",
         "-ltorch",
-        "-L$cuda_home/lib64",
         "-lcudart",
     ]
 

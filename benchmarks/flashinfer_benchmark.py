@@ -2,8 +2,13 @@ import argparse
 import sys
 
 from routines.attention import parse_attention_args, run_attention_test
-from routines.flashinfer_benchmark_utils import full_output_columns, output_column_dict
+from routines.flashinfer_benchmark_utils import (
+    benchmark_apis,
+    full_output_columns,
+    output_column_dict,
+)
 from routines.gemm import parse_gemm_args, run_gemm_test
+from routines.moe import parse_moe_args, run_moe_test
 
 
 def run_test(args):
@@ -15,17 +20,12 @@ def run_test(args):
     """
 
     ## Depending on routine type, route to corresponding test routine
-    if args.routine in [
-        "BatchDecodeWithPagedKVCacheWrapper",
-        "BatchPrefillWithPagedKVCacheWrapper",
-        "BatchPrefillWithRaggedKVCacheWrapper",
-    ]:
+    if args.routine in benchmark_apis["attention"]:
         res = run_attention_test(args)
-    elif args.routine in [
-        "gemm_fp8_nt_groupwise",
-        "group_gemm_fp8_nt_groupwise",
-    ]:
+    elif args.routine in benchmark_apis["gemm"]:
         res = run_gemm_test(args)
+    elif args.routine in benchmark_apis["moe"]:
+        res = run_moe_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -63,13 +63,9 @@ def parse_args(line=sys.argv[1:]):
         "-R",
         type=str,
         required=True,
-        choices=[
-            "BatchDecodeWithPagedKVCacheWrapper",
-            "BatchPrefillWithPagedKVCacheWrapper",
-            "BatchPrefillWithRaggedKVCacheWrapper",
-            "gemm_fp8_nt_groupwise",
-            "group_gemm_fp8_nt_groupwise",
-        ],
+        choices=list(benchmark_apis["attention"])
+        + list(benchmark_apis["gemm"])
+        + list(benchmark_apis["moe"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -78,6 +74,12 @@ def parse_args(line=sys.argv[1:]):
         action="store_true",
         default=False,
         help="Disable CUDA graph to execute kernels outside of the graph.",
+    )
+    parser.add_argument(
+        "--use_cupti",
+        action="store_true",
+        default=False,
+        help="Use CUPTI for timing GPU kernels when available.",
     )
     parser.add_argument(
         "--refcheck",
@@ -120,22 +122,39 @@ def parse_args(line=sys.argv[1:]):
         default=5,
         help="Number of dry runs.",
     )
+    parser.add_argument(
+        "--case_tag",
+        type=str,
+        required=False,
+        default=None,
+        help="Optional tag for the test case for annotating output.",
+    )
+    parser.add_argument(
+        "--generate_repro_command",
+        action="store_true",
+        default=False,
+        help="If set, will print reproducer command and store it to output csv.",
+    )
+    parser.add_argument(
+        "--repro_command",
+        type=str,
+        required=False,
+        default="",
+        help="Placeholder for generated reproducer command for the test case. Not to be used directly.",
+    )
 
     ## Check routine and pass on to routine-specific argument parser
-    if args.routine in [
-        "BatchDecodeWithPagedKVCacheWrapper",
-        "BatchPrefillWithPagedKVCacheWrapper",
-        "BatchPrefillWithRaggedKVCacheWrapper",
-    ]:
+    if args.routine in benchmark_apis["attention"]:
         args = parse_attention_args(line, parser)
-    elif args.routine in [
-        "gemm_fp8_nt_groupwise",
-        "group_gemm_fp8_nt_groupwise",
-    ]:
+    elif args.routine in benchmark_apis["gemm"]:
         args = parse_gemm_args(line, parser)
+    elif args.routine in benchmark_apis["moe"]:
+        args = parse_moe_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
+    if args.generate_repro_command:
+        args.repro_command = "python3 flashinfer_benchmark.py " + " ".join(line)
     return args
 
 

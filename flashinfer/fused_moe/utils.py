@@ -2,7 +2,7 @@ import contextlib
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -10,14 +10,13 @@ from ..utils import ceil_div, round_up
 
 is_torch_compiling_flag = False
 
-aux_stream_name_list = ["Attention", "MoeShared", "MoeChunkingOverlap"]
 AuxStreamType = Enum(
     "AuxStreamType",
-    aux_stream_name_list,
+    ["Attention", "MoeShared", "MoeChunkingOverlap"],
 )
 EventType = Enum(
     "EventType",
-    ["Main", *aux_stream_name_list],
+    ["Main", "Attention", "MoeShared", "MoeChunkingOverlap"],
     start=0,
 )
 
@@ -57,9 +56,7 @@ def model_extra_attrs(attrs: Dict):
 
 
 def with_model_extra_attrs(get_attrs):
-
     def decorator(func):
-
         def wrapper(self, *args, **kwargs):
             with model_extra_attrs(get_attrs(self)):
                 return func(self, *args, **kwargs)
@@ -67,26 +64,6 @@ def with_model_extra_attrs(get_attrs):
         return wrapper
 
     return decorator
-
-
-def make_weak_ref(x):
-
-    if isinstance(x, torch.Tensor):
-        return (
-            convert_to_torch_tensor(TensorWrapper(x.data_ptr(), x.dtype, x.shape))
-            if x.is_cuda
-            else x
-        )
-    elif isinstance(x, tuple):
-        return tuple(make_weak_ref(i) for i in x)
-    elif isinstance(x, list):
-        return [make_weak_ref(i) for i in x]
-    elif isinstance(x, dict):
-        return {k: make_weak_ref(v) for k, v in x.items()}
-    elif isinstance(x, (int, float, bool)):
-        return x
-    else:
-        raise TypeError(f"Invalid type {type(x)} to make weak ref")
 
 
 @dataclass
@@ -118,7 +95,7 @@ def swizzle_sf(sf: torch.Tensor, rows: int, cols: int, scaling_vector_size: int 
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave(sf)
+    return torch.ops.trtllm.block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor, rows: int, cols: int, scaling_vector_size: int = 16):
@@ -133,7 +110,7 @@ def unswizzle_sf(sf: torch.Tensor, rows: int, cols: int, scaling_vector_size: in
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(sf).view(-1, sf_cols)
+    return torch.ops.trtllm.block_scale_interleave_reverse(sf).view(-1, sf_cols)
 
 
 @torch.library.custom_op("trtllm::reswizzle_sf", mutates_args=())
@@ -215,7 +192,7 @@ def nearest_in_buckets(x: int, buckets: List[int]) -> int:
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
 
 
-def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
     max_num_tokens = next_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
@@ -226,11 +203,13 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets)
 
 
-def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
+def get_last_power_of_2_num_tokens_buckets(
+    max_num_tokens, min_num_tokens=1
+) -> Tuple[int]:
     max_num_tokens = last_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
-    while m >= 1:
+    while m >= min_num_tokens:
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets)

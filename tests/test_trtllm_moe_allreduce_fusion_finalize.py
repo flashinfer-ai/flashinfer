@@ -1,12 +1,11 @@
 import multiprocessing as mp
 import socket
-from typing import Any, Optional, Tuple, Union
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-from torch import nn
 
 import flashinfer.comm as comm
 
@@ -34,7 +33,6 @@ def _run_correctness_worker(
     expanded_idx_to_permuted_idx,
     residual,
 ):
-
     def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
         y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
         if weight is not None:
@@ -91,10 +89,6 @@ def _run_correctness_worker(
 
                     # make clone
                     fc2_output_clone = fc2_output.clone()
-                    scale_clone = scale.clone()
-                    expanded_idx_to_permuted_idx_clone = (
-                        expanded_idx_to_permuted_idx.clone()
-                    )
                     norm_weight = torch.randn(
                         (HIDDEN_SIZE,), dtype=dtype, device=device
                     )
@@ -272,9 +266,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -285,7 +279,7 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")

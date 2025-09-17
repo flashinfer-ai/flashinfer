@@ -46,8 +46,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
         candidate_active_expert_num = [8, 12, 16]
         # candidate_active_expert_num = [1]  # debug-only
         swizzled_layout_codes = [
-            comm.FP4QuantizationSFLayout.LINEAR,
-            comm.FP4QuantizationSFLayout.SWIZZLED,
+            comm.QuantizationSFLayout.LINEAR,
+            comm.QuantizationSFLayout.SWIZZLED_128x4,
+            comm.QuantizationSFLayout.SWIZZLED_8x4,
         ]
         launch_with_pdls = [True, False]
 
@@ -89,12 +90,12 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             )  # quant: fp16/bf16 -> fp4, reference: cpp/tensorrt_llm/thop/allreduceOp.cpp:L487
 
                             scale_out = None
-                            assert (
-                                HIDDEN_SIZE % SF_VEC_SIZE == 0
-                            ), "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            assert HIDDEN_SIZE % SF_VEC_SIZE == 0, (
+                                "HIDDEN_SIZE must be divisible by SF_VEC_SIZE"
+                            )
                             if (
                                 swizzled_layout_code
-                                == comm.FP4QuantizationSFLayout.SWIZZLED
+                                == comm.QuantizationSFLayout.SWIZZLED_128x4
                             ):
                                 padded_message_size = (
                                     comm.compute_fp4_swizzled_layout_sf_size(
@@ -439,9 +440,9 @@ def multi_process_parallel(
 
     for i in range(world_size):
         procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -452,7 +453,7 @@ def test_trtllm_moe_allreduce_fusion(world_size, dtype):
     torch.cuda.manual_seed_all(42)
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")

@@ -22,6 +22,7 @@ import torch
 from .compiler import compile_pipeline
 from .fusion_rules import FusionRule
 from .legalization import LegalizationError, infer_initial_type, legalize_processors
+from .op import Op
 from .processors import LogitsProcessor
 from .types import TaggedTensor, TensorType
 from .validators import CompileError, ValidityCheck
@@ -111,10 +112,9 @@ class LogitsPipe:
             self.ops = legalize_processors(self.processors, self._initial_type)
 
             # Step 3: Compilation - type check, validate, and fuse ops
+            self.compiled_ops: Optional[List[Op]] = None
             if compile:
                 self.compile(custom_fusion_rules, custom_validity_checks)
-            else:
-                self.compiled_ops = None
 
         except (LegalizationError, CompileError) as e:
             raise ValueError(f"Pipeline creation failed: {e}") from e

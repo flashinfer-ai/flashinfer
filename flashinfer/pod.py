@@ -175,7 +175,7 @@ class PODWithPagedKVCacheWrapper:
         """
         # Override options. Only tensor core version is performant.
         use_tensor_cores = True
-        self._jit_module = None
+        self._jit_module: SimpleNamespace = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -323,10 +323,8 @@ class PODWithPagedKVCacheWrapper:
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         # Logits soft cap is not supported currently
-        logits_soft_cap = False
         batch_size = len(last_page_len)
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
+        logits_soft_cap = 0.0
 
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if self.is_cuda_graph_enabled:
@@ -395,6 +393,7 @@ class PODWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             )
+
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -411,6 +410,9 @@ class PODWithPagedKVCacheWrapper:
             head_dim,
             head_dim,
             False,  # causal
+            window_left,
+            -1,  # fixed_split_size
+            False,  # disable_split_kv
         )
 
         self._indptr_type = indptr.dtype

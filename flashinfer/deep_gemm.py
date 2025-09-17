@@ -24,7 +24,6 @@ SOFTWARE.
 
 # Imported and adapted from DeepGEMM.
 
-
 import ctypes
 import enum
 import functools
@@ -32,13 +31,20 @@ import hashlib
 import json
 from typing import Any, Dict, Optional, Tuple
 
-import cuda.bindings.driver as cbd
+try:
+    import cuda.bindings.driver as cbd
+except ImportError as e:
+    raise ImportError(
+        "Could not import the 'cuda' module. "
+        "Please install cuda-python that matches your CUDA version."
+    ) from e
+
 import torch
 
 from .artifacts import ArtifactPath, MetaInfoHash
 from .cuda_utils import checkCudaErrors
 from .jit.cubin_loader import get_cubin
-from .jit.env import FLASHINFER_CACHE_DIR
+from .jit.env import FLASHINFER_CUBIN_DIR
 from .utils import ceil_div, round_up
 
 
@@ -80,9 +86,9 @@ class MajorTypeCD(enum.Enum):
 def major_check(t: torch.Tensor):
     assert t.dim() in (2, 3)
     if t.dim() == 3:
-        assert t.stride(0) == t.size(-2) * t.size(
-            -1
-        ), "Grouped dimension cannot have abnormal stride"
+        assert t.stride(0) == t.size(-2) * t.size(-1), (
+            "Grouped dimension cannot have abnormal stride"
+        )
     assert t.stride(-2) == 1 or t.stride(-1) == 1
 
 
@@ -187,8 +193,14 @@ def transform_sf_into_required_layout(
     gran = (recipe[0 if is_sfa else 1], recipe[2])
 
     should_skip_transform = (
-        sf.dtype == torch.int and gran == (1, 128) and get_device_arch() == "100a"
-    ) or (sf.dtype == torch.int and gran == (128, 128) and get_device_arch() == "100a")
+        sf.dtype == torch.int
+        and gran == (1, 128)
+        and get_device_arch() in ("100a", "103a")
+    ) or (
+        sf.dtype == torch.int
+        and gran == (128, 128)
+        and get_device_arch() in ("100a", "103a")
+    )
 
     if not should_skip_transform:
         # Pre-transform checks
@@ -196,10 +208,14 @@ def transform_sf_into_required_layout(
 
     # (FP32, 1, 128) on Hopper: transform to TMA-aligned and MN-major
     if sf.dtype == torch.float and gran == (1, 128) and get_device_arch() == "90a":
-        raise NotImplemented
+        raise NotImplementedError
 
     # (FP32, 1, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
-    if sf.dtype == torch.float and gran == (1, 128) and get_device_arch() == "100a":
+    if (
+        sf.dtype == torch.float
+        and gran == (1, 128)
+        and get_device_arch() in ("100a", "103a")
+    ):
         sf = get_col_major_tma_aligned_packed_tensor(sf)
         return check_sf_layout(
             sf,
@@ -213,10 +229,14 @@ def transform_sf_into_required_layout(
 
     # (FP32, 128, 128) on Hopper: no need to transform, check shape and whatever-major
     if sf.dtype == torch.float and gran == (128, 128) and get_device_arch() == "90a":
-        raise NotImplemented
+        raise NotImplementedError
 
     # (FP32, 128, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
-    if sf.dtype == torch.float and gran == (128, 128) and get_device_arch() == "100a":
+    if (
+        sf.dtype == torch.float
+        and gran == (128, 128)
+        and get_device_arch() in ("100a", "103a")
+    ):
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
         sf = get_col_major_tma_aligned_packed_tensor(sf)
         return check_sf_layout(
@@ -241,7 +261,9 @@ def transform_sf_into_required_layout(
             type_check=torch.int,
         )
 
-    assert False, f"Unknown cases: {sf.dtype=}, {gran=}, arch={get_device_arch()}"
+    raise AssertionError(
+        f"Unknown cases: {sf.dtype=}, {gran=}, arch={get_device_arch()}"
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -262,6 +284,7 @@ def must_be_k_major() -> bool:
     return {
         "90a": True,
         "100a": False,
+        "103a": False,
     }[get_device_arch()]
 
 
@@ -274,6 +297,8 @@ def get_default_recipe(
         ("90a", torch.float): (1, 128, 128),
         ("100a", torch.float): (1, 128, 128),
         ("100a", torch.int): (1, 1, 128),
+        ("103a", torch.float): (1, 128, 128),
+        ("103a", torch.int): (1, 1, 128),
     }[(get_device_arch(), sfb_dtype)]
 
 
@@ -334,7 +359,8 @@ def get_swizzle_mode(block_size: int, elem_size: int) -> int:
     for mode_bytes in (128, 64, 32, 16):
         if (block_size * elem_size) % mode_bytes == 0:
             return mode_bytes
-    assert False, "Invalid mode"
+    AssertionError("Invalid mode")
+    return 0
 
 
 def get_sf_aligned_block_sizes(block_m: int, block_n: int, ab_dtype: torch.dtype):
@@ -439,6 +465,7 @@ def get_best_configs(
     assert cd_dtype in (torch.bfloat16, torch.float)
 
     # `BLOCK_M` and `BLOCK_N` are selected according to MMA instructions
+    block_ms: Tuple[int, ...] = None
     if gemm_type == GemmType.GroupedContiguous:
         block_ms = (get_m_alignment_for_contiguous_layout(),)
     else:
@@ -469,12 +496,15 @@ def get_best_configs(
     for block_m in block_ms:
         for block_n in block_ns:
             success = False
-            num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(
-                best_block_m, best_block_n
+            num_waves, best_num_waves = (
+                get_num_waves(block_m, block_n),
+                get_num_waves(best_block_m, best_block_n),
             )
-            if best_block_m is None or best_block_n is None:
-                success = True
-            elif num_waves < best_num_waves:
+            if (
+                best_block_m is None
+                or best_block_n is None
+                or num_waves < best_num_waves
+            ):
                 success = True
             elif num_waves == best_num_waves:
                 # Check last wave utilization
@@ -651,10 +681,17 @@ def make_tma_a_desc(
 ) -> cbd.CUtensorMap:
     if num_groups > 1:
         assert major_type == MajorTypeAB.KMajor
+
+    gmem_inner_dim, gmem_outer_dim = (shape_k, shape_m * num_groups)[
+        :: major_type.shape_direction()
+    ]
+    smem_inner_dim, smem_outer_dim = (block_k, block_m)[:: major_type.shape_direction()]
     return make_tma_2d_desc(
         t,
-        *(shape_k, shape_m * num_groups)[:: major_type.shape_direction()],
-        *(block_k, block_m)[:: major_type.shape_direction()],
+        gmem_inner_dim,
+        gmem_outer_dim,
+        smem_inner_dim,
+        smem_outer_dim,
         outer_stride,
         swizzle_mode,
     )
@@ -673,12 +710,15 @@ def make_tma_b_desc(
 ) -> cbd.CUtensorMap:
     # `num_groups` is always applied into the outer dimensions
     io_shapes = (shape_k, shape_n)[:: major_type.shape_direction()]
-    io_shapes = (io_shapes[0], io_shapes[1] * num_groups)
+    gmem_inner_dim, gmem_outer_dim = (io_shapes[0], io_shapes[1] * num_groups)
+    smem_inner_dim, smem_outer_dim = (block_k, block_n)[:: major_type.shape_direction()]
 
     return make_tma_2d_desc(
         t,
-        *io_shapes,
-        *(block_k, block_n)[:: major_type.shape_direction()],
+        gmem_inner_dim,
+        gmem_outer_dim,
+        smem_inner_dim,
+        smem_outer_dim,
         outer_stride,
         swizzle_mode,
     )
@@ -763,7 +803,6 @@ class SM100FP8GemmRuntime:
     def __call__(self, **kwargs) -> cbd.CUresult:
         # Load CUBIN
         if self.kernel is None:
-
             # Load CUBIN
             path = bytes(self.path, encoding="utf-8")
             self.lib = checkCudaErrors(
@@ -778,11 +817,13 @@ class SM100FP8GemmRuntime:
 
     def __del__(self) -> None:
         if self.lib is not None:
-            try:
-                checkCudaErrors(self._cleanup_func(self.lib))
-            except:
-                # Ignore any errors during shutdown
-                pass
+            cleanup = getattr(self, "_cleanup_func", None)
+            if callable(cleanup):
+                try:
+                    cleanup(self.lib)
+                except Exception as e:
+                    # Ignore any errors during shutdown
+                    print(f"Failed to delete SM100FP8GemmRuntime with exception: {e}")
 
     @staticmethod
     def generate(kwargs: Dict[str, Any]) -> str:
@@ -801,27 +842,27 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_fp8_gemm_1d1d_impl<
-        {kwargs['MAJOR_A']},
-        {kwargs['MAJOR_B']},
-        {kwargs['M'] if 'm' in kwargs['COMPILED_DIMS'] else 0},
-        {kwargs['N'] if 'n' in kwargs['COMPILED_DIMS'] else 0},
-        {kwargs['K'] if 'k' in kwargs['COMPILED_DIMS'] else 0},
-        {kwargs['BLOCK_M']},
-        {kwargs['BLOCK_N']},
-        {kwargs['BLOCK_K']},
-        {kwargs['NUM_GROUPS']},
-        {kwargs['SWIZZLE_A_MODE']},
-        {kwargs['SWIZZLE_B_MODE']},
-        {kwargs['SWIZZLE_CD_MODE']},
-        {kwargs['NUM_STAGES']},
-        {kwargs['NUM_LAST_STAGES']},
-        {kwargs['NUM_NON_EPILOGUE_THREADS']},
-        {kwargs['NUM_EPILOGUE_THREADS']},
-        {kwargs['NUM_MULTICAST']},
-        {pytypes_to_ctypes[kwargs['IS_MULTICAST_ON_A']]},
-        {kwargs['GEMM_TYPE']},
-        {pytypes_to_ctypes[kwargs['WITH_ACCUMULATION']]},
-        {pytypes_to_ctypes[kwargs['CD_DTYPE_T']]}
+        {kwargs["MAJOR_A"]},
+        {kwargs["MAJOR_B"]},
+        {kwargs["M"] if "m" in kwargs["COMPILED_DIMS"] else 0},
+        {kwargs["N"] if "n" in kwargs["COMPILED_DIMS"] else 0},
+        {kwargs["K"] if "k" in kwargs["COMPILED_DIMS"] else 0},
+        {kwargs["BLOCK_M"]},
+        {kwargs["BLOCK_N"]},
+        {kwargs["BLOCK_K"]},
+        {kwargs["NUM_GROUPS"]},
+        {kwargs["SWIZZLE_A_MODE"]},
+        {kwargs["SWIZZLE_B_MODE"]},
+        {kwargs["SWIZZLE_CD_MODE"]},
+        {kwargs["NUM_STAGES"]},
+        {kwargs["NUM_LAST_STAGES"]},
+        {kwargs["NUM_NON_EPILOGUE_THREADS"]},
+        {kwargs["NUM_EPILOGUE_THREADS"]},
+        {kwargs["NUM_MULTICAST"]},
+        {pytypes_to_ctypes[kwargs["IS_MULTICAST_ON_A"]]},
+        {kwargs["GEMM_TYPE"]},
+        {pytypes_to_ctypes[kwargs["WITH_ACCUMULATION"]]},
+        {pytypes_to_ctypes[kwargs["CD_DTYPE_T"]]}
       >);
 }};
 """
@@ -894,11 +935,7 @@ def load_all():
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
         get_cubin(ArtifactPath.DEEPGEMM + cubin_name, sha256)
-        path = (
-            FLASHINFER_CACHE_DIR
-            / "cubins"
-            / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
-        )
+        path = FLASHINFER_CUBIN_DIR / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
         assert path.exists()
         RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
 
@@ -907,14 +944,12 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     signature = f"{name}$${code}"
     cubin_name = f"kernel.{name}.{hash_to_hex(signature)}"
     if cubin_name not in KERNEL_MAP:
-        raise ValueError("cubin not registered")
+        raise ValueError(f"cubin not registered: {cubin_name}")
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
     get_cubin(ArtifactPath.DEEPGEMM + cubin_name, sha256)
-    path = (
-        FLASHINFER_CACHE_DIR / "cubins" / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
-    )
+    path = FLASHINFER_CUBIN_DIR / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
     assert path.exists()
     RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
     return RUNTIME_CACHE[cubin_name]
@@ -1003,14 +1038,17 @@ def m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
     # K must be aligned to 128
     aligned_k = round_up(k, 128)
     (
-        num_sms,
-        block_m,
-        block_n,
-        block_k,
-        num_stages,
-        multicast_config,
-        smem_config,
-    ), static_kwargs = m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(
+        (
+            num_sms,
+            block_m,
+            block_n,
+            block_k,
+            num_stages,
+            multicast_config,
+            smem_config,
+        ),
+        static_kwargs,
+    ) = m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(
         m,
         n,
         k,
@@ -1094,7 +1132,7 @@ def m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
     return static_kwargs, all_kwargs
 
 
-def m_grouped_fp8_gemm_nt_contiguous_sm100(
+def m_grouped_fp8_gemm_nt_contiguous_sm10x(
     a: torch.Tensor,
     sfa: torch.Tensor,
     b: torch.Tensor,
@@ -1202,14 +1240,17 @@ def m_grouped_fp8_gemm_nt_masked_kwargs_gen(
     # K must be aligned to 128
     aligned_k = round_up(k, 128)
     (
-        num_sms,
-        block_m,
-        block_n,
-        block_k,
-        num_stages,
-        multicast_config,
-        smem_config,
-    ), static_kwargs = m_grouped_fp8_gemm_nt_masked_static_kwargs_gen(
+        (
+            num_sms,
+            block_m,
+            block_n,
+            block_k,
+            num_stages,
+            multicast_config,
+            smem_config,
+        ),
+        static_kwargs,
+    ) = m_grouped_fp8_gemm_nt_masked_static_kwargs_gen(
         m,
         n,
         k,
@@ -1294,7 +1335,7 @@ def m_grouped_fp8_gemm_nt_masked_kwargs_gen(
     return static_kwargs, all_kwargs
 
 
-def m_grouped_fp8_gemm_nt_masked_sm100(
+def m_grouped_fp8_gemm_nt_masked_sm10x(
     a: torch.Tensor,
     sfa: torch.Tensor,
     b: torch.Tensor,
@@ -1306,7 +1347,6 @@ def m_grouped_fp8_gemm_nt_masked_sm100(
     major_b: MajorTypeAB,
     compiled_dims: str,
 ) -> None:
-
     static_kwargs, all_kwargs = m_grouped_fp8_gemm_nt_masked_kwargs_gen(
         a, sfa, b, sfb, d, masked_m, expected_m, major_a, major_b, compiled_dims
     )
@@ -1317,8 +1357,8 @@ def m_grouped_fp8_gemm_nt_masked_sm100(
 
 
 def m_grouped_fp8_gemm_nt_contiguous(
-    a: Tuple[torch.Tensor, torch.Tensor],
-    b: Tuple[torch.Tensor, torch.Tensor],
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    b_fp8: Tuple[torch.Tensor, torch.Tensor],
     d: torch.Tensor,
     m_indices: torch.Tensor,
     recipe: Optional[Tuple[int, int, int]] = None,
@@ -1328,15 +1368,15 @@ def m_grouped_fp8_gemm_nt_contiguous(
     compiled_dims = compiled_dims.lower()
 
     # NOTES: shape must be `[M, K] @ [G, N, K].mT`
-    major_a = get_major_type_ab(a[0])
-    major_b = get_major_type_ab(b[0])
+    major_a = get_major_type_ab(a_fp8[0])
+    major_b = get_major_type_ab(b_fp8[0])
     assert major_a == MajorTypeAB.KMajor
     if must_be_k_major():
         assert major_b == MajorTypeAB.KMajor
     assert m_indices.is_contiguous()
 
-    a, sfa = a
-    b, sfb = b
+    a, sfa = a_fp8
+    b, sfb = b_fp8
     m, k = a.shape
     num_groups, n, k_ = b.shape
     m_, n_ = d.shape
@@ -1366,18 +1406,24 @@ def m_grouped_fp8_gemm_nt_contiguous(
 
     impl = {
         "100a": functools.partial(
-            m_grouped_fp8_gemm_nt_contiguous_sm100,
+            m_grouped_fp8_gemm_nt_contiguous_sm10x,
             major_a=major_a,
             major_b=major_b,
             compiled_dims=compiled_dims,
-        )
+        ),
+        "103a": functools.partial(
+            m_grouped_fp8_gemm_nt_contiguous_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, m_indices)
 
 
 def m_grouped_fp8_gemm_nt_masked(
-    a: Tuple[torch.Tensor, torch.Tensor],
-    b: Tuple[torch.Tensor, torch.Tensor],
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    b_fp8: Tuple[torch.Tensor, torch.Tensor],
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
@@ -1388,13 +1434,13 @@ def m_grouped_fp8_gemm_nt_masked(
     compiled_dims = compiled_dims.lower()
 
     # NOTES: shape must be `[G, M, K] @ [G, N, K].mT`
-    major_a = get_major_type_ab(a[0])
-    major_b = get_major_type_ab(b[0])
+    major_a = get_major_type_ab(a_fp8[0])
+    major_b = get_major_type_ab(b_fp8[0])
     assert major_a == major_b == MajorTypeAB.KMajor
     assert masked_m.is_contiguous()
 
-    a, sfa = a
-    b, sfb = b
+    a, sfa = a_fp8
+    b, sfb = b_fp8
     num_groups, m, k = a.shape
     num_groups_, n, k_ = b.shape
     num_groups__, m_, n_ = d.shape
@@ -1423,11 +1469,17 @@ def m_grouped_fp8_gemm_nt_masked(
 
     impl = {
         "100a": functools.partial(
-            m_grouped_fp8_gemm_nt_masked_sm100,
+            m_grouped_fp8_gemm_nt_masked_sm10x,
             major_a=major_a,
             major_b=major_b,
             compiled_dims=compiled_dims,
-        )
+        ),
+        "103a": functools.partial(
+            m_grouped_fp8_gemm_nt_masked_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, masked_m, expected_m)
 
@@ -1439,10 +1491,10 @@ class KernelMap:
 
     def init_indices(self):
         indice_path = ArtifactPath.DEEPGEMM + "kernel_map"
-        assert get_cubin(
-            indice_path, self.sha256, file_extension=".json"
-        ), "cubin kernel map file not found, nor downloaded with matched sha256"
-        path = FLASHINFER_CACHE_DIR / "cubins" / f"{indice_path}.json"
+        assert get_cubin(indice_path, self.sha256, file_extension=".json"), (
+            "cubin kernel map file not found, nor downloaded with matched sha256"
+        )
+        path = FLASHINFER_CUBIN_DIR / f"{indice_path}.json"
         assert path.exists()
         with open(path, "r") as f:
             self.indice = json.load(f)

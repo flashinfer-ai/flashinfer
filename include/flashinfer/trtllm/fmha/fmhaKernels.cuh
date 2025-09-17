@@ -26,10 +26,11 @@
 
 #include "../../utils.cuh"
 #include "../common.h"
-#include "cubin/kernelMetaInfo.h"
 #include "cuda_runtime_api.h"
+#include "flashInferMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "lse.cuh"
 
 #ifdef TLLM_GEN_FMHA_CUBIN_PATH
 static const std::string tllm_gen_fmha_cubin_path = std::string(TLLM_GEN_FMHA_CUBIN_PATH);
@@ -45,16 +46,23 @@ static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when comp
 
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
-std::string getMetaInfo(const std::string& name, const std::string& sha256,
-                        const std::string& extension);
 }  // namespace flashinfer::trtllm_cubin_loader
 using flashinfer::trtllm_cubin_loader::getCubin;
-using flashinfer::trtllm_cubin_loader::getMetaInfo;
+
+constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
+  if (gpuSM == kSM_103) {
+    return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_100) {
+    return kernelSM == kSM_100f || kernelSM == kSM_100;
+  }
+
+  return gpuSM == kernelSM;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {
  public:
-  using KernelMeta = TllmGenFmhaKernelMetaInfo;
+  using KernelMeta = tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo;
   using RunnerParams = TllmGenFmhaRunnerParams;
   using SelectKernelParams = TllmGenSelectKernelParams;
 
@@ -71,9 +79,11 @@ class TllmGenFmhaKernel {
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
-      if (kernelMeta.mSM == mSM && kernelMeta.mDataTypeQ == mDtypeQ &&
+      IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
         // Store metadata for later use.
+        IKL_LOG_DEBUG("Adding tllmgen attention kernel %s", kernelMeta.mFuncName);
         mKernelMetaMap[hashID(kernelMeta)] = i;
       }
     }
@@ -214,7 +224,7 @@ class TllmGenFmhaKernel {
           clusterDimX > 1 ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD
                           : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
       launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-      launch_attribute[2].value.programmaticStreamSerializationAllowed = getEnvEnablePDL();
+      launch_attribute[2].value.programmaticStreamSerializationAllowed = params.enable_pdl;
 
       launch_config.attrs = launch_attribute;
       launch_config.numAttrs = 3;
@@ -241,6 +251,12 @@ class TllmGenFmhaKernel {
         }
       }
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+
+      if (params.lsePtr != nullptr) {
+        flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
+                                     params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
+                                     params.stream);
+      }
       // Break the while op.
       break;
     }
@@ -591,23 +607,16 @@ class TllmFmhaKernelFactory {
  public:
   using KernelType = TllmGenFmhaKernel;
 
-  KernelType const* getKernels(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
-                               unsigned int sm) {
+  KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
+                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv,
+                               Data_type dtypeOut, unsigned int sm) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
-
-    if (!metainfo_loaded) {
-      std::string metainfo_raw = getMetaInfo(tllm_gen_fmha_cubin_path + "flashInferMetaInfo",
-                                             tllm_gen_fmha_metainfo_hash, ".h");
-      metainfo = KernelType::KernelMeta::loadFromMetaInfoRaw(metainfo_raw);
-      metainfo_loaded = true;
-    }
 
     auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
-      KernelType* newKernel =
-          new KernelType{metainfo.data(), metainfo.size(), dtypeQ, dtypeKv, dtypeOut, sm};
+      KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
@@ -640,14 +649,16 @@ class TllmFmhaKernelFactory {
   }
 
   std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
-  std::vector<KernelType::KernelMeta> metainfo;
-  bool metainfo_loaded = false;
 };
 
 inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
                                                    Data_type dtypeOut, unsigned int sm) {
 #ifndef EXCLUDE_SM_100
-  return TllmFmhaKernelFactory::Get().getKernels(dtypeQ, dtypeKv, dtypeOut, sm);
+  return TllmFmhaKernelFactory::Get().getKernels(
+      tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
+      sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) /
+          sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),
+      dtypeQ, dtypeKv, dtypeOut, sm);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100

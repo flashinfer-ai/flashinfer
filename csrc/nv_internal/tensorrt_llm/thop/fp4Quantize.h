@@ -18,12 +18,18 @@
 #include <ATen/cuda/EmptyTensor.h>
 
 #include <cstdint>
+#include <optional>
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
-                                                at::Tensor const& globalScale, int64_t sfVecSize,
-                                                bool sfUseUE8M0, bool isSfSwizzledLayout,
-                                                bool isSf8x4Layout);
+                                                std::optional<at::Tensor> const& globalScale,
+                                                int64_t sfVecSize, bool sfUseUE8M0,
+                                                bool isSfSwizzledLayout, bool isSf8x4Layout,
+                                                bool enable_pdl);
+
+std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
+                                                        at::Tensor const& globalScale,
+                                                        int64_t sfVecSize, bool sfUseUE8M0);
 }  // namespace torch_ext

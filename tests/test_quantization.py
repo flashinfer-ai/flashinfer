@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Literal
+
 import numpy
 import pytest
 import torch
@@ -21,7 +23,7 @@ import torch
 import flashinfer
 
 
-def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: str):
+def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: Literal["big", "little"]):
     x_np = x_cpu.numpy()
     x_packed = numpy.packbits(x_np, bitorder=bitorder)
     return torch.tensor(x_packed)

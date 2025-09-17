@@ -45,9 +45,9 @@ class TestMnnvlMemory:
         self.local_world_size = local_ntasks_per_node
         self.local_rank = self.rank % self.local_world_size
         local_dev_count = torch.cuda.device_count()
-        assert (
-            self.local_world_size <= local_dev_count
-        ), "ntasks_per_node should be less than local device count"
+        assert self.local_world_size <= local_dev_count, (
+            "ntasks_per_node should be less than local device count"
+        )
         torch.cuda.set_device(self.local_rank)
         MnnvlMemory.initialize()
         self.mapping = Mapping(
@@ -124,9 +124,9 @@ class TestMnnvlMemory:
     def test_moe_alltoall_multi_rank_single_gpu(self):
         torch.cuda.set_device(self.rank)
         max_world_size = 8
-        assert (
-            self.world_size <= max_world_size
-        ), f"should run with world_size at most {max_world_size}"
+        assert self.world_size <= max_world_size, (
+            f"should run with world_size at most {max_world_size}"
+        )
         torch.manual_seed(self.world_size)
         input_entry_per_rank, vector_dim, dtype = 128, 256, torch.float16
 
@@ -181,9 +181,9 @@ class TestMnnvlMemory:
                 padded_sorted_local_target_rank_ids, return_counts=True
             )
             local_send_counts = local_send_counts.to(torch.int32)
-            assert (
-                unique_target_rank_ids.numel() == self.world_size
-            ), "unique_target_rank_ids must be equal to world_size"
+            assert unique_target_rank_ids.numel() == self.world_size, (
+                "unique_target_rank_ids must be equal to world_size"
+            )
             local_send_counts -= 1  # remove padding
             local_send_cumsum = torch.cumsum(local_send_counts, dim=0).to(torch.int32)
             send_ids_all_ranks.append(local_send_id)

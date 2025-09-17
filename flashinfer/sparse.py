@@ -28,7 +28,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -127,6 +127,9 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -185,6 +188,9 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
@@ -446,7 +452,7 @@ class BlockSparseAttentionWrapper:
                     ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                     kv_indptr_host = vector_sparse_indptr_host
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -462,6 +468,13 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                -1,  # window_left
+            ]
+            if self._backend == "fa2":
+                args.append(-1)  # fixed_split_size
+                args.append(False)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -577,14 +590,14 @@ class BlockSparseAttentionWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q, dtype=self._o_dtype)
         else:
-            _check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
 
         if is_float8(q):
             assert q.dtype == k.dtype == v.dtype
@@ -655,6 +668,7 @@ class BlockSparseAttentionWrapper:
                 rope_scale,
                 rope_theta,
                 0,  # token_pos_in_items_len
+                self._workspace_size,  # workspace_size
             )
         else:
             self._cached_module.run(
@@ -740,6 +754,9 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -789,6 +806,9 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
@@ -971,13 +991,13 @@ class VariableBlockSparseAttentionWrapper:
         self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
 
         # Sanity check
-        assert (
-            num_qo_heads % num_kv_heads == 0
-        ), "num_qo_heads must be a multiple of num_kv_heads"
+        assert num_qo_heads % num_kv_heads == 0, (
+            "num_qo_heads must be a multiple of num_kv_heads"
+        )
         assert num_blocks_row * num_kv_heads + 1 == kv_indptr_host.shape[0]
-        assert (
-            kv_indptr_host[-1].item() == kv_indices_host.shape[0]
-        ), f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        assert kv_indptr_host[-1].item() == kv_indices_host.shape[0], (
+            f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        )
         assert num_kv_heads == block_mask_map.shape[0]
         assert num_kv_heads == block_row_sz.shape[0]
         assert num_kv_heads == block_col_sz.shape[0]
@@ -1021,8 +1041,7 @@ class VariableBlockSparseAttentionWrapper:
             self._vector_sparse_indptr_buffer[: len(kv_indptr)].copy_(
                 kv_indptr, non_blocking=non_blocking
             )
-
-        self._plan_info = self._cached_module.plan(
+        args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
@@ -1038,6 +1057,13 @@ class VariableBlockSparseAttentionWrapper:
             head_dim,
             head_dim,
             causal,
+            -1,  # window_left
+        ]
+        if self._backend == "fa2":
+            args.append(-1)  # fixed_split_size
+            args.append(False)  # disable_split_kv
+        self._plan_info = self._cached_module.plan(
+            *args,
         )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1157,14 +1183,14 @@ class VariableBlockSparseAttentionWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q, dtype=self._o_dtype)
         else:
-            _check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
 
         if self._backend == "fa3":
             if (
@@ -1223,6 +1249,7 @@ class VariableBlockSparseAttentionWrapper:
             rope_scale,
             rope_theta,
             0,  # token_pos_in_items_len
+            self._workspace_size,
         )
 
         # [qo_len * num_kv_heads, gqa_group_size, head_dim] -> HND

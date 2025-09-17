@@ -1,6 +1,5 @@
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -21,7 +20,6 @@ def test_cudnn_decode(
     num_qo_heads,
     is_cuda_graph_compatible,
 ):
-
     # test set up basics
     seed = 0
     torch.manual_seed(seed)

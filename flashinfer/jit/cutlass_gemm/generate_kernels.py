@@ -1,10 +1,23 @@
-import argparse
 import enum
 import os
-import sys
-from itertools import product
+from itertools import chain, product
 
-from .cutlass_library import *
+from .cutlass_library import (
+    enum_auto,
+    DataTypeNames,
+    DataTypeSize,
+    DataType,
+    DataTypeTag,
+    GemmKind,
+    GemmKindNames,
+    KernelScheduleType,
+    KernelScheduleTag,
+    KernelScheduleSuffixes,
+    EpilogueScheduleType,
+    EpilogueScheduleTag,
+    EpilogueScheduleSuffixes,
+)
+from ..cpp_ext import is_cuda_version_at_least
 
 
 ################################################################################
@@ -103,13 +116,15 @@ CudaTypeName = {
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half",
     DataType.f32: "float",
+    DataType.e2m1: "__nv_fp4_e2m1",
+    DataType.ue8m0: "cutlass::float_ue8m0_t",
+    DataType.u4: "cutlass::uint4b_t",
 }
 
 
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
 class TrtLlm_GemmLauncher:
-
     def __init__(
         self,
         gemm_kind,
@@ -220,7 +235,7 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
             operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
         ):
             # Mixed MoE GEMM
-            weight_tag = DataTypeTag[operation.weight_type]
+            weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
 {epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
@@ -250,16 +265,8 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 DataType.e4m3: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)",
             }
-            guard_act = (
-                guard_map[operation.act_type]
-                if operation.act_type in guard_map
-                else "1"
-            )
-            guard_weight = (
-                guard_map[operation.weight_type]
-                if operation.weight_type in guard_map
-                else "1"
-            )
+            guard_act = guard_map.get(operation.act_type, "1")
+            guard_weight = guard_map.get(operation.weight_type, "1")
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -325,7 +332,7 @@ namespace cutlass_kernels
 
 def clean_leftover_files(output_dir, generated_files):
     """Remove leftover generated files that weren't created in this run."""
-    for root, dirs, files in os.walk(output_dir):
+    for root, _dirs, files in os.walk(output_dir):
         for file in files:
             file_path = os.path.join(root, file)
             if file_path not in generated_files:
@@ -588,10 +595,26 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 90
-    supported_dtypes = [
+
+    # act_type, weight_type, scalezero_type, bias_type, output_type
+    supported_dtypes_int4 = [
         (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16, DataType.bf16),
     ]
+
+    if is_cuda_version_at_least("12.8"):
+        supported_dtypes_fp4 = [
+            (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
+            (
+                DataType.bf16,
+                DataType.e2m1,
+                DataType.ue8m0,
+                DataType.bf16,
+                DataType.bf16,
+            ),
+        ]
+    else:
+        supported_dtypes_fp4 = []
 
     quant_ops = [TrtLlm_QuantOp.finegrained_scale_only]
 
@@ -600,16 +623,26 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128]
     K_TILES = [128, 256, 512]
-    cta_shapes_mnk = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_int4 = list(product(M_TILES, N_TILES, K_TILES))
+
+    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
+    N_TILES = [16, 32, 64]
+    K_TILES = [128, 256]
+    cta_shapes_mnk_fp4 = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_fp4.append((128, 128, 128))
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
 
-    cga_shapes = product([1, 2], [1, 2], [1])
+    cga_shapes = list(product([1, 2], [1, 2], [1]))
 
-    partial_args = product(
-        supported_dtypes, quant_ops, epi_tags, cta_shapes_mnk, cga_shapes
+    partial_args_int4 = product(
+        supported_dtypes_int4, quant_ops, epi_tags, cta_shapes_mnk_int4, cga_shapes
     )
+    partial_args_fp4 = product(
+        supported_dtypes_fp4, quant_ops, epi_tags, cta_shapes_mnk_fp4, cga_shapes
+    )
+    partial_args = chain(partial_args_int4, partial_args_fp4)
 
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
@@ -666,7 +699,6 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 
 
 def generate_sm120_grouped_gemm_operations(is_arch_enabled):
-
     if not is_arch_enabled:
         return []
     arch = 120
@@ -817,7 +849,6 @@ def generate_sm100_operations(is_arch_enabled):
 
 
 class GemmSm80LauncherConfig:
-
     def __init__(self, gemm_kind, arch, dtype, epi_tag, cta_shape, stage):
         self.gemm_kind = gemm_kind
         self.arch = arch

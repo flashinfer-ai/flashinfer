@@ -321,6 +321,18 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
   }
 }
 
+inline int UpPowerOfTwo(int x) {
+  // Returns the smallest power of two greater than or equal to x
+  if (x <= 0) return 1;
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
+}
+
 #define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
   {                                                    \
     _Pragma("unroll 1") for (; (COND1); (iter) -= 1) { \
