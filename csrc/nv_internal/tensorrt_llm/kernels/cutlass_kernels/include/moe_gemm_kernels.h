@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -32,7 +33,7 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 #endif
