@@ -254,6 +254,10 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
     fp8_dtype,
     out_dtype,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    # TODO: We need to add gemm_mxfp4_nt_groupwise support for sm120/121 at some point.
+    if compute_capability[0] == 12:
+        pytest.skip("gemm_mxfp4_nt_groupwise is not supported in SM120/SM121.")
     torch.random.manual_seed(0)
     tile_size = 32
     alignment_n = 8
