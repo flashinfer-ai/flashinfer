@@ -15,11 +15,16 @@
  */
 #ifndef FLASHINFER_UTILS_CUH_
 #define FLASHINFER_UTILS_CUH_
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_device_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#if CUDA_VERSION >= 12080
+#include <cuda_fp4.h>
+#endif
 
 #include <cstdint>
 #include <iostream>
@@ -287,6 +292,26 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
   return std::make_pair(major, minor);
+}
+
+/*!
+ * \brief Calculate the vector size for 128-bit alignment given data type T.
+ * \tparam T The data type
+ * \return The vector size (number of elements of type T that make up 128 bits)
+ * \note For most types, this is 16 / sizeof(T). Special case: __nv_fp4_e2m1
+ *       is a subbyte type padded to 1 byte, so we return 32 (128 bits / 4 bits per element).
+ */
+template <typename T>
+__host__ __device__ __forceinline__ constexpr size_t get_vec_size_128b() {
+#if CUDA_VERSION >= 12080
+  if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) {
+    return 32;  // 128 bits / 4 bits per element = 32 elements
+  } else {
+    return 16 / sizeof(T);
+  }
+#else
+  return 16 / sizeof(T);
+#endif
 }
 
 template <typename T>
