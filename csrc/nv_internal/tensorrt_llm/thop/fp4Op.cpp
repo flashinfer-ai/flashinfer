@@ -17,7 +17,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 #include "tvm/ffi/container/array.h"
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)

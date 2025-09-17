@@ -20,7 +20,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 
 using tvm::ffi::Tensor;
 using tvm::ffi::Tuple;

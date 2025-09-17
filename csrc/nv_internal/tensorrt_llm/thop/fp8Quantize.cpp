@@ -19,7 +19,7 @@
 #include <cstdint>
 
 #include "cutlass/numeric_types.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 #include "tvm/ffi/error.h"
 
 // input: [M, K], fp32/fp16/bf16/fp8_quantized

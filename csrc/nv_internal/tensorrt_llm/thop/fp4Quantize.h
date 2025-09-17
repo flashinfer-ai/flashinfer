@@ -22,7 +22,7 @@
 #include <optional>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 
 using tvm::ffi::Optional;
 using tvm::ffi::Tensor;

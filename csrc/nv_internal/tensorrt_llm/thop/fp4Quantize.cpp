@@ -21,7 +21,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 
 // self: [M, K], fp16/bf16/fp8_quantized
 // globalScale: [1] float, = (448 * 6) / self.abs().max()
