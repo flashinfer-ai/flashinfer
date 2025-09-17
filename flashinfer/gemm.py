@@ -676,7 +676,7 @@ def get_gemm_sm100_module_cutlass_fp8():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.fp8_gemm.default(
+                module.fp8_gemm(
                     a,
                     b.transpose(-2, -1),
                     scale_a,
