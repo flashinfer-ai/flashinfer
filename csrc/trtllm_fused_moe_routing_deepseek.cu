@@ -24,7 +24,7 @@ namespace routingDeepSeek {
 
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
-static constexpr int MaxNumTopGroups = 12;
+static constexpr int MaxNumTopGroups = 16;
 
 template <typename KernelParams>
 __global__ void routingMainKernel(KernelParams params) {
