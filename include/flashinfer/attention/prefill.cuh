@@ -1379,7 +1379,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint32_t k_stride_h = params.k_stride_h;
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -1768,7 +1767,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t k_stride_h = params.k_stride_h;
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -1790,13 +1788,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-    const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
+
+    // skip out-of-window kv tile by add non-zero kv_start_idx offset
+    const uint32_t kv_start_idx = sub_if_greater_or_zero(
+        kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
+    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    const uint32_t chunk_start =
+        partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
+    const uint32_t chunk_end =
+        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
@@ -1970,8 +1973,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
-
+    const uint32_t num_kv_chunks =
+        ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
                                       kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
@@ -2065,7 +2068,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     bool* block_valid_mask = params.block_valid_mask;
     const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     uint32_t* maybe_prefix_len_ptr = nullptr;
@@ -2102,14 +2104,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-    const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
+    const uint32_t kv_start_idx = sub_if_greater_or_zero(
+        kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
+    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    const uint32_t chunk_start =
+        partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
+    const uint32_t chunk_end =
+        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2353,7 +2358,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+    const uint32_t num_kv_chunks =
+        ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,

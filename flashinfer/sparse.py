@@ -452,7 +452,7 @@ class BlockSparseAttentionWrapper:
                     ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                     kv_indptr_host = vector_sparse_indptr_host
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -468,6 +468,13 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                -1,  # window_left
+            ]
+            if self._backend == "fa2":
+                args.append(-1)  # fixed_split_size
+                args.append(False)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1034,8 +1041,7 @@ class VariableBlockSparseAttentionWrapper:
             self._vector_sparse_indptr_buffer[: len(kv_indptr)].copy_(
                 kv_indptr, non_blocking=non_blocking
             )
-
-        self._plan_info = self._cached_module.plan(
+        args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
@@ -1051,6 +1057,13 @@ class VariableBlockSparseAttentionWrapper:
             head_dim,
             head_dim,
             causal,
+            -1,  # window_left
+        ]
+        if self._backend == "fa2":
+            args.append(-1)  # fixed_split_size
+            args.append(False)  # disable_split_kv
+        self._plan_info = self._cached_module.plan(
+            *args,
         )
 
         self._pos_encoding_mode = pos_encoding_mode

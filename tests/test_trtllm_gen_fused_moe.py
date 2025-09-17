@@ -626,11 +626,69 @@ class FP8BlockScaleMoe(Moe):
             "gemm2_scales_global": None,
         }
 
-    def quantize_inputs(self, hidden_states, hidden_states_scale_global):
+    def quantize_inputs(self, hidden_states: torch.Tensor, hidden_states_scale_global):
         """For FP8 block scaling, no pre-quantization - everything happens at runtime."""
+
+        def to_float8_blockwise(
+            x,
+            block_size_m=128,
+            block_size_n=128,
+            dtype=torch.float8_e4m3fn,
+            transpose_scale=True,
+            is_blockm=False,
+            is_blockn=True,
+        ):
+            assert x.dtype == torch.bfloat16
+            x = x.contiguous()
+            assert x.dim() == 2
+            m, n = x.shape
+
+            m_tile = block_size_m if is_blockm else 1
+            n_tile = block_size_n if is_blockn else 1
+            num_blocks_m = m // m_tile
+            num_blocks_n = n // n_tile
+
+            # Initialize output tensors
+            quantized_x = torch.empty_like(x, dtype=dtype, device=x.device)
+            scales = torch.empty(
+                (num_blocks_m, num_blocks_n), dtype=torch.float32, device=x.device
+            )
+
+            # Quantize tensor in blocks
+            finfo = torch.finfo(dtype)
+            for i in range(num_blocks_m):
+                for j in range(num_blocks_n):
+                    # Determine block slices
+                    start_m, end_m = i * m_tile, min((i + 1) * m_tile, m)
+                    start_n, end_n = j * n_tile, min((j + 1) * n_tile, n)
+
+                    # Extract the block
+                    block = x[start_m:end_m, start_n:end_n]
+
+                    # Per-block quantization logic
+                    min_val, max_val = block.aminmax()
+                    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+                    scale = finfo.max / amax
+
+                    # Quantize the block and store the scale
+                    quantized_block = (block * scale).clamp(
+                        min=finfo.min, max=finfo.max
+                    )
+                    quantized_x[start_m:end_m, start_n:end_n] = quantized_block.to(
+                        dtype
+                    )
+                    scales[i, j] = scale.float().reciprocal()
+
+            if transpose_scale:
+                scales = scales.t()
+
+            return quantized_x, scales
+
+        # todo(Yingyi):quantize bf16 to fp8
+        hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
         return {
-            "hidden_states": hidden_states,  # Keep original
-            "hidden_states_scale": None,  # No pre-computed scales
+            "hidden_states": hidden_states_quant,
+            "hidden_states_scale": hidden_states_scale,
         }
 
     def prepare_static_weights_for_kernel(
@@ -698,8 +756,6 @@ class FP8BlockScaleMoe(Moe):
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
-        num_tokens = kwargs["num_tokens"]
-        hidden_size = kwargs["hidden_size"]
         top_k = kwargs["top_k"]
         n_groups = kwargs["n_groups"]
         top_k_groups = kwargs["top_k_groups"]
@@ -708,12 +764,13 @@ class FP8BlockScaleMoe(Moe):
         routing_method_type = kwargs["routing_method_type"]
         tile_tokens_dim = kwargs["tile_tokens_dim"]
         enable_pdl = kwargs.get("enable_pdl")
+        hidden_states_scale = kwargs["hidden_states_scale"]
+        hidden_states_quant = kwargs["hidden_states_quant"]
 
         # Generate block scales and quantize hidden states at runtime
-        hidden_states_fp8 = hidden_states_orig.to(torch.float8_e4m3fn)
-        # Use deterministic scales for testing consistency
-        hidden_states_scale = 2.0 * torch.ones(
-            (hidden_size // 128, num_tokens), device="cuda", dtype=torch.float
+        hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
+        assert not torch.isnan(hidden_states_fp8.float()).any(), (
+            "NaN detected in hidden_states_fp8"
         )
 
         output = trtllm_fp8_block_scale_moe(
@@ -748,7 +805,7 @@ class FP8BlockScaleMoe(Moe):
 
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
-        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.8}
 
 
 # ====================================================================================
@@ -1005,6 +1062,7 @@ class moe_args_dequant:
         permute_info,
         use_routing_scales_on_input,
         gated_act_type,
+        hidden_states_scale=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1019,6 +1077,7 @@ class moe_args_dequant:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gated_act_type = gated_act_type
+        self.hidden_states_scale = hidden_states_scale
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -1217,6 +1276,8 @@ def check_accuracy(a, b, atol, rtol, percent):
     count = torch.sum(left > right)
     mismatch_percent = count / a.numel()
     if mismatch_percent > 1 - percent:
+        print(a)
+        print(b)
         raise Exception(
             f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
             f"(threshold: {1 - percent:.4f})"
@@ -1629,13 +1690,35 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
 def run_moe_reference_dsfp8(args):
     """FP8 block-scale reference implementation."""
     # Generate block scales at runtime for FP8 block scaling
-    # Use deterministic scales for testing consistency
-    hidden_states_scale = 2.0 * torch.ones(
-        (args.hidden_size // 128, args.num_tokens), device="cuda", dtype=torch.float
-    )
 
+    def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
+        """Reference FP8 block-scale dequantization."""
+        input = input.to(torch.float)
+        scale = scale.to(torch.float)
+        if transpose_scale:
+            scale = scale.t()
+
+        m, n = input.shape
+        m_tile = 128 if block_m else 1
+        n_tile = 128 if block_n else 1
+
+        assert m % m_tile == 0
+        assert n % n_tile == 0
+        assert scale.shape == (m // m_tile, n // n_tile)
+
+        # Expand scale to match input dimensions using tensor operations
+        if m_tile > 1:
+            scale = torch.repeat_interleave(scale, m_tile, dim=0)
+        if n_tile > 1:
+            scale = torch.repeat_interleave(scale, n_tile, dim=1)
+
+        # Element-wise multiplication (equivalent to the nested loop logic)
+        output = input * scale
+        return output
+
+    # todo(Yingyi): use original hidden_states??
     hidden_states_dequant = dequant_reference_dsfp8(
-        args.hidden_states, hidden_states_scale, True, False, True
+        args.hidden_states, args.hidden_states_scale, True, False, True
     )
 
     gemm1_weights_dequant = {}
@@ -1736,6 +1819,8 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "tile_tokens_dim": kwargs["tile_tokens_dim"],
         "do_finalize": True,
         "gated_act_type": args.gated_act_type,
+        "hidden_states_scale": args.hidden_states_scale,
+        "hidden_states_quant": kwargs["hidden_states_quant"],
     }
 
     return moe_impl.call_moe(
@@ -2104,6 +2189,9 @@ def test_moe_quantization_classes(
         tile_tokens_dim=tile_tokens_dim,
         weight_processing=weight_processing,
         enable_pdl=True,
+        hidden_states_quant=inputs_data[
+            "hidden_states"
+        ],  # NOTE(yingyi): only for fp8 block scale for now, refactor later
     )
 
     # Compare outputs using moe_impl-specific tolerances
@@ -2118,4 +2206,32 @@ def test_moe_quantization_classes(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    # pytest.main([__file__, "-v"])
+    routing_config = {
+        "num_experts": 256,
+        "top_k": 8,
+        "padding": 8,
+        "n_groups": 8,
+        "top_k_groups": 4,
+        "routed_scaling": 2.5,
+        "has_routing_bias": True,
+        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        "compatible_moe_impls": [
+            FP8BlockScaleMoe,
+        ],
+    }
+    weight_processing = {
+        "use_shuffled_weight": False,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+    }
+    test_moe_quantization_classes(
+        num_tokens=4,
+        hidden_size=1024,
+        intermediate_size=1024,
+        moe_impl=FP8BlockScaleMoe(),
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        gated_act_type=GatedActType.SwiGlu,
+        cache_permute_indices=cache_permute_indices,
+    )

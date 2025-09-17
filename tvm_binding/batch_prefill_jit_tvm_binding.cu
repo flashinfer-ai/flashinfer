@@ -23,7 +23,8 @@ IntTuple BatchPrefillWithKVCachePlan(DLTensor* float_workspace_buffer,
                                      int64_t total_num_rows, int64_t batch_size,
                                      int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
                                      bool enable_cuda_graph, int64_t head_dim_qk,
-                                     int64_t head_dim_vo, bool causal, TVMStreamHandle cuda_stream);
+                                     int64_t head_dim_vo, bool causal, int64_t window_left,
+                                     int64_t fixed_split_size, TVMStreamHandle cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
                                       DLTensor* int_workspace_buffer, IntTuple plan_info_vec,
