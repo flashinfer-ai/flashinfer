@@ -2756,7 +2756,7 @@ def group_gemm_fp8_nt_groupwise(
             scale_major_mode,
         )
     elif is_sm100a_supported(a.device):
-        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
             float_workspace_buffer,
             a,
