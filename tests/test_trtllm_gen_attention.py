@@ -466,7 +466,7 @@ def test_trtllm_batch_decode(
     enable_pdl,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [100, 103]:
+    if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
     if o_dtype == "nvfp4" and q_len_per_req > 1:
