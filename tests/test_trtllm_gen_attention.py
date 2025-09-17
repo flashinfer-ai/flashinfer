@@ -19,7 +19,7 @@ GPU_DEVICE = "cuda:0"
 
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
-workspace_size = 128 * 1024 * 1024
+workspace_size = 256 * 1024 * 1024
 
 
 def flip_coin(*args, **kwargs):
