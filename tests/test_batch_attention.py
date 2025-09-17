@@ -190,6 +190,10 @@ def _run_attention(
 
 
 # -------------------------  PyTest test case  ----------------------------- #
+@pytest.mark.xfail(
+    get_compute_capability(torch.device(device="cuda"))[0] == 12,
+    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
+)
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @pytest.mark.parametrize("page_block_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
@@ -212,10 +216,6 @@ def test_batch_attention_correctness(
     test_dtype,
     logits_soft_cap,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    # TODO(P1): Most of these tests pass on SM120 and SM121 GPUs. We need triage these at some point.
-    if compute_capability[0] == 12:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
     qo_lens = [p[1] for p in seq_len_pairs]
@@ -243,7 +243,6 @@ if __name__ == "__main__":
         num_kv_heads=4,
         gqa_group_size=7,
         head_dim=128,
-        v_scale=2.0,
         causal=True,
         layout="NHD",
         test_dtype=torch.bfloat16,
