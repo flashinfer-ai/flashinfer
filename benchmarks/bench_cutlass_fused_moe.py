@@ -188,7 +188,7 @@ def bench_cutlass_fused_moe(
         nonlocal counter
         counter += 1
 
-        if counter == 20:
+        if counter == 10:
             print("hi call cudaProfilerStart")
             torch.cuda.cudart().cudaProfilerStart()
 
@@ -204,7 +204,7 @@ def bench_cutlass_fused_moe(
             output=flash_output,
         )
 
-        if counter == 20:
+        if counter == 10:
             print("hi call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
 
