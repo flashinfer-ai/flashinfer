@@ -22,6 +22,7 @@
 // #include "tensorrt_llm/common/logger.h"
 // #include "tensorrt_llm/common/tllmException.h"
 
+#include <c10/util/Exception.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -31,12 +32,14 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+
 // #ifndef _WIN32 // Linux
 // #include <sys/sysinfo.h>
 // #endif         // not WIN32
@@ -94,7 +97,7 @@ namespace tensorrt_llm::common {
 inline std::optional<bool> isCudaLaunchBlocking() {
   thread_local bool firstCall = true;
   thread_local std::optional<bool> result = std::nullopt;
-  if (!firstCall) {
+  if (firstCall) {
     char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
     if (env != nullptr && std::string(env) == "1") {
       result = true;
