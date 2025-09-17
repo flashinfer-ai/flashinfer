@@ -20,6 +20,7 @@ import torch
 from sink_attention_reference import sink_attention_unified
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -38,6 +39,9 @@ def test_blackwell_trtllm_gen_decode_attention_sink(
     num_kv_heads,
     head_dim,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     seed = 0
     torch.manual_seed(seed)
     device = "cuda:0"
@@ -136,6 +140,9 @@ def test_blackwell_trtllm_gen_context_attention_sink(
     num_kv_heads,
     head_dim,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     seed = 0
     torch.manual_seed(seed)
     device = "cuda:0"

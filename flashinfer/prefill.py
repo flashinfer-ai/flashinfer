@@ -54,6 +54,8 @@ from .utils import (
     is_float8,
     is_sm100a_supported,
     is_sm110a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -75,7 +77,12 @@ def get_fmha_module(
     device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if is_sm100a_supported(device) or is_sm110a_supported(device):
+    if (
+        is_sm100a_supported(device)
+        or is_sm110a_supported(device)
+        or is_sm120a_supported(device)
+        or is_sm121a_supported(device)
+    ):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,

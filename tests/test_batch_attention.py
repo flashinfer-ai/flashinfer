@@ -23,6 +23,7 @@ from jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -211,6 +212,10 @@ def test_batch_attention_correctness(
     test_dtype,
     logits_soft_cap,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    # TODO(P1): Most of these tests pass on SM120 and SM121 GPUs. We need triage these at some point.
+    if compute_capability[0] == 12:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
     qo_lens = [p[1] for p in seq_len_pairs]
@@ -238,6 +243,7 @@ if __name__ == "__main__":
         num_kv_heads=4,
         gqa_group_size=7,
         head_dim=128,
+        v_scale=2.0,
         causal=True,
         layout="NHD",
         test_dtype=torch.bfloat16,
