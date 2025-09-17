@@ -189,6 +189,7 @@ def bench_cutlass_fused_moe(
         counter += 1
 
         if counter == 20:
+            print("hi call cudaProfilerStart")
             torch.cuda.cudart().cudaProfilerStart()
 
         fused_moe.cutlass_fused_moe(
@@ -204,6 +205,7 @@ def bench_cutlass_fused_moe(
         )
 
         if counter == 20:
+            print("hi call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
 
     ms_list = bench_gpu_time(f)
