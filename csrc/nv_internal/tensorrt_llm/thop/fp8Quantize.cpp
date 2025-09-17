@@ -57,9 +57,7 @@ void mxfp8_quantize(Tensor input, Tensor valMxFP8, Tensor scaleFP8SF, bool isSfS
   tensorrt_llm::kernels::invokeMxFP8Quantization(                                               \
       1, m, k, padded_k, reinterpret_cast<T*>(input->data),                                     \
       reinterpret_cast<int64_t*>(valMxFP8->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      layout, mMultiProcessorCount, enable_pdl,                                                 \
-      static_cast<cudaStream_t>(                                                                \
-          TVMFFIEnvGetStream(input->device.device_type, input->device.device_id)));
+      layout, mMultiProcessorCount, enable_pdl, get_stream(input->device));
 
   if (input->dtype == HALF) {
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)

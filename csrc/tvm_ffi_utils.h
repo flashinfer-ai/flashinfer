@@ -205,6 +205,12 @@ inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, co
   TVM_FFI_ICHECK_EQ(a->device.device_type, b->device.device_type); \
   TVM_FFI_ICHECK_EQ(a->device.device_id, b->device.device_id);
 
+inline cudaStream_t get_current_stream() {
+  int device;
+  cudaGetDevice(&device);
+  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
+}
+
 inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }

@@ -89,8 +89,7 @@ void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_
   TVM_FFI_ICHECK_EQ(append_value->shape[2], head_dim);
 
   cudaSetDevice(append_key->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(paged_k_cache->device.device_type, paged_k_cache->device.device_id));
+  const cudaStream_t stream = get_stream(append_key->device);
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(paged_k_cache->dtype, c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
@@ -123,8 +122,7 @@ void block_sparse_indices_to_vector_sparse_offsets(Tensor block_sparse_indices,
   CHECK_INPUT(kv_len_arr);
 
   cudaSetDevice(block_sparse_indices->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(
-      block_sparse_indptr->device.device_type, block_sparse_indptr->device.device_id));
+  const cudaStream_t stream = get_stream(block_sparse_indices->device);
 
   cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
       static_cast<int32_t*>(block_sparse_indices->data),
@@ -190,8 +188,7 @@ void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe, Tensor batc
   TVM_FFI_ICHECK_EQ(append_kpe->shape[1], kpe_dim);
 
   cudaSetDevice(append_ckv->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(ckv_cache->device.device_type, ckv_cache->device.device_id));
+  const cudaStream_t stream = get_stream(append_ckv->device);
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(ckv_cache->dtype, c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(
         page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache->data), ckv_strides,

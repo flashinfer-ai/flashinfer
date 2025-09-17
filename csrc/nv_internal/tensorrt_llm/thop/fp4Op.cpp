@@ -165,8 +165,7 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
-    const cudaStream_t stream = static_cast<cudaStream_t>(
-        TVMFFIEnvGetStream(blockScale->device.device_type, blockScale->device.device_id));
+    const cudaStream_t stream = get_stream(blockScale->device);
 
     tensorrt_llm::kernels::invokeBlockScaleInterleave(
         num_experts, rows, rows_padded, cols, cols_padded, static_cast<uint8_t*>(blockScale->data),
@@ -219,8 +218,7 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
-    const cudaStream_t stream = static_cast<cudaStream_t>(
-        TVMFFIEnvGetStream(blockScale->device.device_type, blockScale->device.device_id));
+    const cudaStream_t stream = get_stream(blockScale->device);
     tensorrt_llm::kernels::invokeBlockScaleInterleaveReverse(
         num_experts, rows, cols, static_cast<uint8_t*>(blockScale->data),
         static_cast<uint8_t*>(reversedBlockScale->data), smCount, stream);

@@ -51,8 +51,7 @@ void apply_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr,
   TVM_FFI_ICHECK_EQ(indptr->dtype, offsets->dtype);
 
   cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(q->device.device_type, q->device.device_id));
+  const cudaStream_t stream = get_stream(q->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q->dtype, c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(indptr->dtype, c_idtype, [&] {
       cudaError_t status = BatchQKApplyRotary(
@@ -94,8 +93,7 @@ void apply_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor
   size_t k_rope_stride_h = k_rope->strides[1];
 
   cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(q->device.device_type, q->device.device_id));
+  const cudaStream_t stream = get_stream(q->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q->dtype, c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids->dtype, c_idtype, [&] {
       cudaError_t status = BatchQKApplyRotaryPosIds(
@@ -144,8 +142,7 @@ void apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor 
   size_t k_rope_stride_h = k_rope->strides[1];
 
   cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(q->device.device_type, q->device.device_id));
+  const cudaStream_t stream = get_stream(q->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q->dtype, c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids->dtype, c_idtype, [&] {
       cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
@@ -197,8 +194,7 @@ void apply_llama31_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor
   TVM_FFI_ICHECK_EQ(indptr->dtype, offsets->dtype);
 
   cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(q->device.device_type, q->device.device_id));
+  const cudaStream_t stream = get_stream(q->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q->dtype, c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(indptr->dtype, c_idtype, [&] {
       cudaError_t status = BatchQKApplyLlama31Rotary(
@@ -244,8 +240,7 @@ void apply_llama31_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope
   size_t k_rope_stride_h = k_rope->strides[1];
 
   cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream =
-      static_cast<cudaStream_t>(TVMFFIEnvGetStream(q->device.device_type, q->device.device_id));
+  const cudaStream_t stream = get_stream(q->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q->dtype, c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids->dtype, c_idtype, [&] {
       cudaError_t status = BatchQKApplyLlama31RotaryPosIds(
@@ -329,9 +324,7 @@ void mla_rope_quantize(Tensor q_rope_in, Tensor k_rope_in, Tensor q_nope_in, Ten
   const uint32_t k_nope_out_stride = k_nope_out->strides[0];
 
   cudaSetDevice(q_rope_in->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(q_rope_in->device.device_type, q_rope_in->device.device_id));
-
+  const cudaStream_t stream = get_stream(q_rope_in->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in->dtype, c_type, [&] {
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(q_rope_out->dtype, c_quant_type, [&] {
       return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids->dtype, c_idtype, [&] {

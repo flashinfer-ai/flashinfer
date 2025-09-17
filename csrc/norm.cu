@@ -33,8 +33,7 @@ void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable
   TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
   cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(output->device.device_type, output->device.device_id));
+  const cudaStream_t stream = get_stream(input->device);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
     cudaError_t status =
@@ -62,8 +61,7 @@ void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
   TVM_FFI_ICHECK_EQ(residual->shape[1], hidden_size);
   TVM_FFI_ICHECK_EQ(weight->shape[0], hidden_size);
   cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(residual->device.device_type, residual->device.device_id));
+  const cudaStream_t stream = get_stream(input->device);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
     cudaError_t status = norm::FusedAddRMSNorm(
@@ -89,8 +87,7 @@ void gemma_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool 
   TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
   TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
   cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(output->device.device_type, output->device.device_id));
+  const cudaStream_t stream = get_stream(input->device);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
     cudaError_t status =
@@ -119,8 +116,7 @@ void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, doubl
   TVM_FFI_ICHECK_EQ(residual->shape[1], hidden_size);
   TVM_FFI_ICHECK_EQ(weight->shape[0], hidden_size);
   cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(residual->device.device_type, residual->device.device_id));
+  const cudaStream_t stream = get_stream(input->device);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
     cudaError_t status = norm::GemmaFusedAddRMSNorm(
