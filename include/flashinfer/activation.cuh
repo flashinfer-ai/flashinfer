@@ -27,7 +27,7 @@ namespace activation {
 
 template <typename T, float (*Activation)(const float&)>
 __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ input, const int d) {
-  constexpr uint32_t vec_size = 16 / sizeof(T);
+  constexpr uint32_t vec_size = get_vec_size_128b<T>();
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
   const int64_t stride = blockDim.x;

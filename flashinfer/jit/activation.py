@@ -41,7 +41,7 @@ void {{ func_name }}(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   const c10::cuda::OptionalCUDAGuard device_guard(out.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
-    uint32_t vec_size = 16 / sizeof(c_type);
+    uint32_t vec_size = get_vec_size_128b<c_type>();
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
