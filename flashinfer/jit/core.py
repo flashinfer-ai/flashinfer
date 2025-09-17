@@ -18,6 +18,9 @@ os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
+# TODO(Zihao): register torch tensor allocator here
+
+
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
