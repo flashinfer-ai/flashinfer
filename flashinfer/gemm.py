@@ -2741,7 +2741,7 @@ def group_gemm_fp8_nt_groupwise(
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
-        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
+        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
             float_workspace_buffer,
             a,
