@@ -538,7 +538,9 @@ void runImpl(Data& data, void* stream) {
 }
 
 void run(Data& data, void* stream) {
-  if (data.mNumExperts == 256) {
+  if (data.mNumExperts == 72) {
+    runImpl<72>(data, stream);
+  } else if (data.mNumExperts == 256) {
     runImpl<256>(data, stream);
   } else if (data.mNumExperts == 384) {
     runImpl<384>(data, stream);
