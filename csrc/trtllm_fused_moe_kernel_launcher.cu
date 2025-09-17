@@ -34,7 +34,7 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
-#include "nv_internal/tensorrt_llm/thop/thUtils.h"
+#include "nv_internal/tensorrt_llm/thop/utils.h"
 
 namespace flashinfer {
 
