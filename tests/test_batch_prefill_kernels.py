@@ -512,7 +512,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
-@pytest.mark.parametrize("qo_len", [37, 17, 127])  # , 577])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
@@ -536,6 +536,8 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     return_lse,
     contiguous_kv,
 ):
+    if qo_len > kv_len:
+        pytest.skip("qo_len > kv_len is not supported for custom mask test")
     q = torch.randn(
         batch_size * qo_len,
         num_qo_heads,
