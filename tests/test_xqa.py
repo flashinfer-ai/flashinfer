@@ -287,26 +287,20 @@ def test_xqa(
     scratch_buf = torch.zeros(scratch_size, dtype=torch.uint8, device="cuda")
 
     xqa(
-        use_fp16,
-        tokens_per_page,
-        valid_elems_per_head,
-        head_grp_size,
-        use_sliding_window,
-        sliding_win_size,
-        sm_count,
-        nb_k_heads,
-        q_scale,
-        output,
         q_heads,
-        attention_sinks,
         cache_heads,
         page_list_arg,
-        max_seq_len,
         seq_len_list,
-        batch_size,
-        kv_cache_scale,
-        semaphores,
+        output,
         scratch_buf,
+        semaphores,
+        nb_k_heads,
+        tokens_per_page,
+        sinks=attention_sinks,
+        q_scale=q_scale,
+        kv_scale=kv_cache_scale,
+        sliding_win_size=sliding_win_size,
+        sm_count=sm_count,
     )
 
     for req in range(batch_size):
