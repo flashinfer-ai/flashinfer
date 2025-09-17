@@ -21,11 +21,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "dlpack/dlpack.h"
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 #include "flashinfer/gemm/fp8_gemm_cutlass.h"
 #include "flashinfer/gemm/fp8_gemm_cutlass_template.h"
-#include "tvm/ffi/error.h"
 #include "tvm_ffi_utils.h"
 
 using flashinfer::gemm::ClusterShape;

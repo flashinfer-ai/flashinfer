@@ -59,9 +59,9 @@ void mxfp8_quantize(Tensor input, Tensor valMxFP8, Tensor scaleFP8SF, bool isSfS
       reinterpret_cast<int64_t*>(valMxFP8->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
       layout, mMultiProcessorCount, enable_pdl, get_stream(input->device));
 
-  if (input->dtype == HALF) {
+  if (input->dtype == dl_float16) {
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
-  } else if (input->dtype == BFLOAT16) {
+  } else if (input->dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
     LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
@@ -141,8 +141,8 @@ void mxfp8_quantize_host(Tensor x_fp32, Tensor fp8_tensor, Tensor scale_tensor,
 void mxfp8_dequantize_host(Tensor value_e4m3, Tensor scale_ue8m08sf, Tensor float_tensor,
                            bool is_sf_swizzled_layout) {
   int32_t const sf_vec_size = 32;
-  CHECK_INPUT_TYPE(value_e4m3, BYTE);
-  CHECK_INPUT_TYPE(scale_ue8m08sf, SF_DTYPE);
+  CHECK_INPUT_TYPE(value_e4m3, dl_uint8);
+  CHECK_INPUT_TYPE(scale_ue8m08sf, dl_uint8);
   auto data_shape = value_e4m3.shape();
   auto scale_shape = scale_ue8m08sf.shape();
   TVM_FFI_ICHECK_EQ(data_shape.size(), 2) << "value_e4m3 should be 2D tensor.";

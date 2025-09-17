@@ -75,16 +75,16 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
       sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, get_stream(self->device));
 
   if (sfUseUE8M0) {
-    if (self->dtype == HALF) {
+    if (self->dtype == dl_float16) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 32)
-    } else if (self->dtype == BFLOAT16) {
+    } else if (self->dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 32)
 #else
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-    } else if (self->dtype == FLOAT8_E4M3) {
+    } else if (self->dtype == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 32)
 #else
@@ -96,16 +96,16 @@ void fp4_quantize(Tensor self, Optional<Tensor> const& globalScale, Tensor value
           << "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.";
     }
   } else {
-    if (self->dtype == HALF) {
+    if (self->dtype == dl_float16) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
-    } else if (self->dtype == BFLOAT16) {
+    } else if (self->dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
 #else
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-    } else if (self->dtype == FLOAT8_E4M3) {
+    } else if (self->dtype == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
 #else
@@ -161,16 +161,16 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
       sfUseUE8M0, layout, mMultiProcessorCount, get_stream(self->device));
 
-  if (self->dtype == HALF) {
+  if (self->dtype == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
-  } else if (self->dtype == BFLOAT16) {
+  } else if (self->dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
     LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-  } else if (self->dtype == FLOAT8_E4M3) {
+  } else if (self->dtype == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
     LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
 #else

@@ -149,7 +149,7 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
     CHECK_CPU(blockScale);
   }
   CHECK_CONTIGUOUS(blockScale);
-  CHECK_INPUT_TYPE(blockScale, SF_DTYPE);
+  CHECK_INPUT_TYPE(blockScale, dl_uint8);
   auto blockScaleShape = blockScale.shape();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
@@ -203,7 +203,7 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
     CHECK_CPU(blockScale);
   }
   CHECK_CONTIGUOUS(blockScale);
-  CHECK_INPUT_TYPE(blockScale, SF_DTYPE);
+  CHECK_INPUT_TYPE(blockScale, dl_uint8);
   auto blockScaleShape = blockScale.shape();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
@@ -214,7 +214,7 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
   TVM_FFI_ICHECK(cols % 4 == 0) << "cols of Interleaved block scales should be multiple of 4.";
   auto expert_out_size = rows * cols;
   // Tensor reversedBlockScale = at::empty(
-  //     blockScaleShape, at::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
+  //     blockScaleShape, at::dtype(dl_uint8).device(blockScale.device()).requires_grad(false));
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -250,8 +250,8 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
 void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<Tensor> globalScale,
                                  Tensor floatTensor, int64_t sfVecSize, int64_t sfType,
                                  bool isSfSwizzledLayout = true) {
-  CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
-  CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
+  CHECK_CPU_INPUT(valueE2M1, dl_uint8);
+  CHECK_CPU_INPUT(scaleFP8SF, dl_uint8);
   auto packedShape = valueE2M1.shape();
   auto scaleShape = scaleFP8SF.shape();
   TVM_FFI_ICHECK_EQ(packedShape.size(), 2) << "valueE2M1 should be 2D tensor.";
@@ -306,13 +306,13 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   // weight (n, k / 2)
   // scale (n, k / group_size)
 
-  CHECK_CPU_INPUT(weight, FLOAT4_E2M1X2);
-  CHECK_CPU_INPUT(scale, SF_DTYPE);
+  CHECK_CPU_INPUT(weight, dl_uint8);
+  CHECK_CPU_INPUT(scale, dl_uint8);
   CHECK_CONTIGUOUS(weight);
   CHECK_CONTIGUOUS(scale);
   TVM_FFI_ICHECK_NE(weight.shape()->Product(), 0) << "weight should not be empty tensor";
-  CHECK_INPUT_TYPE(weight, BYTE);
-  CHECK_INPUT_TYPE(scale, BYTE);
+  CHECK_INPUT_TYPE(weight, dl_uint8);
+  CHECK_INPUT_TYPE(scale, dl_uint8);
 
   int const n = weight->shape[0];
   int const k = weight->shape[1] * 2;

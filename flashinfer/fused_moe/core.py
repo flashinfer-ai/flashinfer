@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import tvm_ffi
 
 from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
@@ -1318,6 +1319,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
+        output: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: int,
@@ -1335,7 +1337,7 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function for block scale MoE
-        output = moe_op.trtllm_fp8_block_scale_moe(
+        moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1344,6 +1346,7 @@ def get_trtllm_moe_sm100_module():
             gemm1_weights_scale,
             gemm2_weights,
             gemm2_weights_scale,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1371,6 +1374,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
+        output: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: int,
@@ -1562,7 +1566,11 @@ def get_trtllm_moe_sm100_module():
             output,
             tactic,
         )
-
+        if isinstance(output, tvm_ffi.Array):
+            output = list(output)
+            for i in range(len(output)):
+                if isinstance(output[i], tvm_ffi.Tensor):
+                    output[i] = torch.from_dlpack(output[i])
         return output
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
@@ -1734,6 +1742,9 @@ def trtllm_fp8_block_scale_moe(
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
+    output = torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
         routing_bias,
@@ -1743,6 +1754,7 @@ def trtllm_fp8_block_scale_moe(
         gemm1_weights_scale,
         gemm2_weights,
         gemm2_weights_scale,
+        output,
         num_experts,
         top_k,
         n_group,
