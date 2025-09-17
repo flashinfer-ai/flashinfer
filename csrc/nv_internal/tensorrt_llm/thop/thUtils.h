@@ -16,36 +16,53 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <tvm/ffi/container/tensor.h>
 
-#define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
-#define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CPU(x) TORCH_CHECK(!x.is_cuda(), #x " must be a CPU tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#include "../../../tvm_ffi_utils.h"
 
+#define CHECK_CPU(x) TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCPU) << #x " must be a CPU tensor";
 #define CHECK_CPU_INPUT(x, st) \
-  CHECK_CPU(x);                \
-  CHECK_CONTIGUOUS(x);         \
-  CHECK_TYPE(x, st)
-#define CHECK_OPTIONAL_INPUT(x, st) \
-  if (x.has_value()) {              \
-    CHECK_INPUT(x.value(), st);     \
-  }
-#define CHECK_OPTIONAL_CPU_INPUT(x, st) \
-  if (x.has_value()) {                  \
-    CHECK_CPU_INPUT(x.value(), st);     \
-  }
-#define PRINT_TENSOR(x) std::cout << #x << ":\n" << x << std::endl
-#define PRINT_TENSOR_SIZE(x) std::cout << "size of " << #x << ": " << x.sizes() << std::endl
+  CHECK_CPU(x)                 \
+  CHECK_CONTIGUOUS(x)          \
+  CHECK_INPUT_TYPE(x, st)
 
-namespace torch_ext {
+constexpr auto SF_DTYPE = DLDataType{kDLUInt, 8, 1};
+constexpr auto FLOAT4_E2M1X2 = DLDataType{kDLUInt, 8, 1};
+constexpr auto BYTE = DLDataType{kDLUInt, 8, 1};
+constexpr auto HALF = DLDataType{kDLFloat, 16, 1};
+constexpr auto BFLOAT16 = DLDataType{kDLBfloat, 16, 1};
+constexpr auto FLOAT8_E4M3 = DLDataType{kDLFloat8_e4m3fn, 8, 1};
 
-// // TODO: switch to use torch native fp4 dtype when ready
-constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;  // uint8_t
-constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
+// #include <ATen/cuda/CUDAContext.h>
+// #include <cuda_fp16.h>
+// #include <cuda_runtime.h>
 
-constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = at::ScalarType::Float;
+// #define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
+// #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+// #define CHECK_CPU(x) TORCH_CHECK(!x.is_cuda(), #x " must be a CPU tensor")
+// #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-}  // namespace torch_ext
+// #define CHECK_CPU_INPUT(x, st) \
+//   CHECK_CPU(x);                \
+//   CHECK_CONTIGUOUS(x);         \
+//   CHECK_TYPE(x, st)
+// #define CHECK_OPTIONAL_INPUT(x, st) \
+//   if (x.has_value()) {              \
+//     CHECK_INPUT(x.value(), st);     \
+//   }
+// #define CHECK_OPTIONAL_CPU_INPUT(x, st) \
+//   if (x.has_value()) {                  \
+//     CHECK_CPU_INPUT(x.value(), st);     \
+//   }
+// #define PRINT_TENSOR(x) std::cout << #x << ":\n" << x << std::endl
+// #define PRINT_TENSOR_SIZE(x) std::cout << "size of " << #x << ": " << x.sizes() << std::endl
+
+// namespace torch_ext {
+
+// // // TODO: switch to use torch native fp4 dtype when ready
+// constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;  // uint8_t
+// constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
+
+// constexpr auto FP8_BLOCK_SCALING_SF_DTYPE = at::ScalarType::Float;
+
+// }  // namespace torch_ext
