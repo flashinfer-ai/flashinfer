@@ -316,18 +316,39 @@ void run(Data const& data, void* stream) {
     case 16:
       runImpl<16>(data, stream);
       break;
+    case 24:
+      runImpl<24>(data, stream);
+      break;
     case 32:
       runImpl<32>(data, stream);
+      break;
+    case 48:
+      runImpl<48>(data, stream);
       break;
     case 64:
       runImpl<64>(data, stream);
       break;
+    case 72:
+      runImpl<72>(data, stream);
+      break;
+    case 96:
+      runImpl<96>(data, stream);
+      break;
     case 128:
       runImpl<128>(data, stream);
       break;
+    case 192:
+      runImpl<192>(data, stream);
+      break;
+    case 256:
+      runImpl<256>(data, stream);
+      break;
+    case 384:
+      runImpl<384>(data, stream);
+      break;
     default:
       TORCH_CHECK(false, "Unsupported number of experts: ", data.mNumExperts,
-                  ". Supported values are: 8, 16, 32, 64, 128");
+                  ". Supported values are: 8, 16, 24, 32, 48, 64, 72, 96, 128, 192, 256, 384");
   }
 }
 
