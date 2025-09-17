@@ -516,9 +516,9 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
         AssertionError: If input dtype is not uint8.
     """
     # TODO(shuw): check input dtype is uint8
-    assert (
-        unswizzled_sf.dtype == torch.uint8
-    ), f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    assert unswizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
+    )
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"

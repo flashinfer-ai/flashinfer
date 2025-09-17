@@ -146,7 +146,7 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     }                                                                                    \
   }()
 
-#if defined(FLASHINFER_ENABLE_FP4_E2M1) &&   \
+#if defined(FLASHINFER_ENABLE_FP4_E2M1) && \
     (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
   case float4_e2m1fn_code: {                 \

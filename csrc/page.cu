@@ -73,7 +73,8 @@ void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_
   auto k_strides = paged_k_cache->strides;
   auto v_strides = paged_v_cache->strides;
   auto k_dim = paged_k_cache->ndim;
-  TVM_FFI_ICHECK(std::equal(k_strides, k_strides + k_dim, v_strides)) << "k/v strides must be identical";
+  TVM_FFI_ICHECK(std::equal(k_strides, k_strides + k_dim, v_strides))
+      << "k/v strides must be identical";
 
   auto append_k_strides = append_key->strides;
   auto append_k_stride_n = append_k_strides[0];
@@ -93,28 +94,28 @@ void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(paged_k_cache->dtype, c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
-        static_cast<c_type*>(paged_k_cache->data),
-        static_cast<c_type*>(paged_v_cache->data), k_strides,
-        static_cast<int32_t*>(kv_indices->data), static_cast<int32_t*>(kv_indptr->data),
+        static_cast<c_type*>(paged_k_cache->data), static_cast<c_type*>(paged_v_cache->data),
+        k_strides, static_cast<int32_t*>(kv_indices->data), static_cast<int32_t*>(kv_indptr->data),
         static_cast<int32_t*>(kv_last_page_len->data));
-    cudaError_t status =
-        AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key->data),
-                           static_cast<c_type*>(append_value->data),
-                           static_cast<int32_t*>(batch_indices->data),
-                           static_cast<int32_t*>(positions->data), nnz, append_k_stride_n,
-                           append_k_stride_h, append_v_stride_n, append_v_stride_h, stream);
+    cudaError_t status = AppendPagedKVCache(
+        paged_kv, static_cast<c_type*>(append_key->data), static_cast<c_type*>(append_value->data),
+        static_cast<int32_t*>(batch_indices->data), static_cast<int32_t*>(positions->data), nnz,
+        append_k_stride_n, append_k_stride_h, append_v_stride_n, append_v_stride_h, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "AppendPagedKVCache failed with error: " << cudaGetErrorString(status);
     return true;
   });
 
-  TVM_FFI_ICHECK(success) << "AppendPagedKVCache failed to dispatch with dtype " << paged_k_cache->dtype;
+  TVM_FFI_ICHECK(success) << "AppendPagedKVCache failed to dispatch with dtype "
+                          << paged_k_cache->dtype;
 }
 
-void block_sparse_indices_to_vector_sparse_offsets(
-    Tensor block_sparse_indices, Tensor block_sparse_indptr,
-    Tensor vector_sparse_offsets, Tensor vector_sparse_indptr, Tensor kv_len_arr,
-    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size) {
+void block_sparse_indices_to_vector_sparse_offsets(Tensor block_sparse_indices,
+                                                   Tensor block_sparse_indptr,
+                                                   Tensor vector_sparse_offsets,
+                                                   Tensor vector_sparse_indptr, Tensor kv_len_arr,
+                                                   int64_t stride_block, int64_t stride_n,
+                                                   int64_t batch_size, int64_t block_size) {
   CHECK_INPUT(block_sparse_indices);
   CHECK_INPUT(block_sparse_indptr);
   CHECK_INPUT(vector_sparse_offsets);
@@ -122,25 +123,23 @@ void block_sparse_indices_to_vector_sparse_offsets(
   CHECK_INPUT(kv_len_arr);
 
   cudaSetDevice(block_sparse_indices->device.device_id);
-  const cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(block_sparse_indptr->device.device_type, block_sparse_indptr->device.device_id));
+  const cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(
+      block_sparse_indptr->device.device_type, block_sparse_indptr->device.device_id));
 
   cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
       static_cast<int32_t*>(block_sparse_indices->data),
       static_cast<int32_t*>(block_sparse_indptr->data),
       static_cast<int32_t*>(vector_sparse_offsets->data),
-      static_cast<int32_t*>(vector_sparse_indptr->data),
-      static_cast<int32_t*>(kv_len_arr->data), stride_block, stride_n, batch_size, block_size,
-      stream);
+      static_cast<int32_t*>(vector_sparse_indptr->data), static_cast<int32_t*>(kv_len_arr->data),
+      stride_block, stride_n, batch_size, block_size, stream);
 
-  TVM_FFI_ICHECK(status == cudaSuccess) << "BlockSparseIndicesToVectorSparseOffset failed with error: "
-              << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "BlockSparseIndicesToVectorSparseOffset failed with error: " << cudaGetErrorString(status);
 }
 
-void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe,
-                               Tensor batch_indices, Tensor positions, Tensor ckv_cache,
-                               Tensor kpe_cache, Tensor kv_indices, Tensor kv_indptr,
-                               Tensor kv_last_page_len) {
+void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe, Tensor batch_indices,
+                               Tensor positions, Tensor ckv_cache, Tensor kpe_cache,
+                               Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len) {
   CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
   CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
   CHECK_INPUT(batch_indices);
@@ -195,20 +194,19 @@ void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe,
       TVMFFIEnvGetStream(ckv_cache->device.device_type, ckv_cache->device.device_id));
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(ckv_cache->dtype, c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(
-        page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache->data),
-        ckv_strides, static_cast<c_type*>(kpe_cache->data), kpe_strides,
-        static_cast<int32_t*>(kv_indices->data), static_cast<int32_t*>(kv_indptr->data),
-        static_cast<int32_t*>(kv_last_page_len->data));
-    cudaError_t status =
-        AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv->data),
-                              static_cast<c_type*>(append_kpe->data),
-                              static_cast<int32_t*>(batch_indices->data),
-                              static_cast<int32_t*>(positions->data), nnz, append_ckv_stride_n,
-                              append_kpe_stride_n, stream);
+        page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache->data), ckv_strides,
+        static_cast<c_type*>(kpe_cache->data), kpe_strides, static_cast<int32_t*>(kv_indices->data),
+        static_cast<int32_t*>(kv_indptr->data), static_cast<int32_t*>(kv_last_page_len->data));
+    cudaError_t status = AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv->data),
+                                               static_cast<c_type*>(append_kpe->data),
+                                               static_cast<int32_t*>(batch_indices->data),
+                                               static_cast<int32_t*>(positions->data), nnz,
+                                               append_ckv_stride_n, append_kpe_stride_n, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
-                << "AppendPagedKVMlaCache failed with error: " << cudaGetErrorString(status);
+        << "AppendPagedKVMlaCache failed with error: " << cudaGetErrorString(status);
     return true;
   });
 
-  TVM_FFI_ICHECK(success) << "AppendPagedKVMlaCache failed to dispatch with dtype " << ckv_cache->dtype;
+  TVM_FFI_ICHECK(success) << "AppendPagedKVMlaCache failed to dispatch with dtype "
+                          << ckv_cache->dtype;
 }
