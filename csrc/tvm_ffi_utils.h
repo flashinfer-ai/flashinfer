@@ -177,14 +177,14 @@ inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, co
   TVM_FFI_ICHECK_EQ(a->device.device_type, b->device.device_type); \
   TVM_FFI_ICHECK_EQ(a->device.device_id, b->device.device_id);
 
-cudaStream_t get_stream(DLDevice device) {
+inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }
 
-int64_t get_element_size(Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
+inline int64_t get_element_size(Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
 
-int64_t get_numel(Tensor x) { return x.shape().Product(); }
+inline int64_t get_numel(Tensor x) { return x.shape().Product(); }
 
-Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
+inline Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
   return ffi::Tensor::FromDLPackAlloc(TVMFFIEnvGetTensorAllocator(), shape, dtype, device);
 }
