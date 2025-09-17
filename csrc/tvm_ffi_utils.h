@@ -50,6 +50,7 @@ constexpr DLDataType dl_bool = DLDataType{kDLBool, 8, 1};
 constexpr int64_t float16_code = encode_dlpack_dtype(dl_float16);
 constexpr int64_t bfloat16_code = encode_dlpack_dtype(dl_bfloat16);
 constexpr int64_t float32_code = encode_dlpack_dtype(dl_float32);
+constexpr int64_t uint8_code = encode_dlpack_dtype(dl_uint8);
 constexpr int64_t int32_code = encode_dlpack_dtype(dl_int32);
 constexpr int64_t int64_code = encode_dlpack_dtype(dl_int64);
 constexpr int64_t float8_e4m3fn_code = encode_dlpack_dtype(dl_float8_e4m3fn);

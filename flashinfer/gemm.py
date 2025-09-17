@@ -782,7 +782,7 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
             **kwargs,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
-            module.fp4_gemm.default(
+            module.fp4_gemm(
                 a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
             )
             return out
