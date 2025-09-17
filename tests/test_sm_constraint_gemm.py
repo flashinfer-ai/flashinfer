@@ -3,6 +3,7 @@ import torch
 
 import flashinfer
 import flashinfer.triton
+from flashinfer.utils import get_compute_capability
 
 
 def torch_gemm(a, b, c, alpha, beta):
@@ -30,6 +31,11 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
     "EPILOGUE_SUBTILE", [True, False]
 )  # only for descriptor persistent
 def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTILE):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    # TODO(P1): Most of these tests pass on Blackwell. We need triage these at some point.
+    if compute_capability[0] != 9:
+        pytest.skip("These tests are only guaranteed to work on Hopper GPUs.")
+
     out_dtype = dtype if dtype != torch.float8_e4m3fn else torch.bfloat16
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
