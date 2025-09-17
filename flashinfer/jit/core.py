@@ -52,7 +52,7 @@ def check_cuda_arch():
     for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
         if major >= 8:
             eligible = True
-        elif major == 7 and minor.isdigit():
+        elif major == 7:
             if int(minor) >= 5:
                 eligible = True
 
