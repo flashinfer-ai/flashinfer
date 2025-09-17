@@ -39,14 +39,14 @@ class CompilationContext:
                 if major >= 9:
                     if minor.isdigit():
                         minor = str(minor) + "a"
-                self.TARGET_CUDA_ARCHS.add((int(major), minor))
+                self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
         else:
             try:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
                     if major >= 9:
                         minor = str(minor) + "a"
-                    self.TARGET_CUDA_ARCHS.add((int(major), minor))
+                    self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
 
