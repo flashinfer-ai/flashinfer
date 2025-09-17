@@ -15,13 +15,15 @@
  */
 #include <flashinfer/page.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
-                           at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
-                           at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
+using tvm::ffi::Tensor;
+
+void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_indices,
+                           Tensor positions, Tensor paged_k_cache, Tensor paged_v_cache,
+                           Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len,
                            int64_t layout) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
@@ -42,79 +44,76 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
   CHECK_DIM(1, kv_indices);
   CHECK_DIM(1, kv_indptr);
   CHECK_DIM(1, kv_last_page_len);
-  unsigned int nnz = append_key.size(0);
-  unsigned int batch_size = kv_last_page_len.size(0);
-  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(batch_indices.size(0), nnz);
-  CHECK_EQ(positions.size(0), nnz);
-  auto device = append_key.device();
-  CHECK_EQ(append_key.device(), device);
-  CHECK_EQ(append_value.device(), device);
-  CHECK_EQ(paged_k_cache.device(), device);
-  CHECK_EQ(paged_v_cache.device(), device);
-  CHECK_EQ(kv_indices.device(), device);
-  CHECK_EQ(kv_indptr.device(), device);
-  CHECK_EQ(kv_last_page_len.device(), device);
+  unsigned int nnz = append_key->shape[0];
+  unsigned int batch_size = kv_last_page_len->shape[0];
+  TVM_FFI_ICHECK_EQ(kv_indptr->shape[0], batch_size + 1);
+  TVM_FFI_ICHECK_EQ(batch_indices->shape[0], nnz);
+  TVM_FFI_ICHECK_EQ(positions->shape[0], nnz);
+  CHECK_DEVICE(append_key, append_key);
+  CHECK_DEVICE(append_value, append_key);
+  CHECK_DEVICE(paged_k_cache, append_key);
+  CHECK_DEVICE(paged_v_cache, append_key);
+  CHECK_DEVICE(kv_indices, append_key);
+  CHECK_DEVICE(kv_indptr, append_key);
+  CHECK_DEVICE(kv_last_page_len, append_key);
 
   QKVLayout kv_layout = QKVLayout(layout);
 
   unsigned int num_heads, page_size, head_dim;
-  head_dim = paged_k_cache.size(3);
+  head_dim = paged_k_cache->shape[3];
   if (kv_layout == QKVLayout::kHND) {
-    num_heads = paged_k_cache.size(1);
-    page_size = paged_k_cache.size(2);
+    num_heads = paged_k_cache->shape[1];
+    page_size = paged_k_cache->shape[2];
   } else {
-    page_size = paged_k_cache.size(1);
-    num_heads = paged_k_cache.size(2);
+    page_size = paged_k_cache->shape[1];
+    num_heads = paged_k_cache->shape[2];
   }
 
   // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
-  auto k_strides = paged_k_cache.strides();
-  auto v_strides = paged_v_cache.strides();
-  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
-  kv_cache_strides = k_strides.data();
+  auto k_strides = paged_k_cache->strides;
+  auto v_strides = paged_v_cache->strides;
+  auto k_dim = paged_k_cache->ndim;
+  TVM_FFI_ICHECK(std::equal(k_strides, k_strides + k_dim, v_strides)) << "k/v strides must be identical";
 
-  auto append_k_strides = append_key.strides();
+  auto append_k_strides = append_key->strides;
   auto append_k_stride_n = append_k_strides[0];
   auto append_k_stride_h = append_k_strides[1];
-  auto append_v_strides = append_value.strides();
+  auto append_v_strides = append_value->strides;
   auto append_v_stride_n = append_v_strides[0];
   auto append_v_stride_h = append_v_strides[1];
 
-  CHECK_EQ(append_key.size(1), num_heads);
-  CHECK_EQ(append_key.size(2), head_dim);
-  CHECK_EQ(append_value.size(1), num_heads);
-  CHECK_EQ(append_value.size(2), head_dim);
+  TVM_FFI_ICHECK_EQ(append_key->shape[1], num_heads);
+  TVM_FFI_ICHECK_EQ(append_key->shape[2], head_dim);
+  TVM_FFI_ICHECK_EQ(append_value->shape[1], num_heads);
+  TVM_FFI_ICHECK_EQ(append_value->shape[2], head_dim);
 
-  auto kv_scalar_dtype = paged_k_cache.scalar_type();
-
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
+  cudaSetDevice(append_key->device.device_id);
+  const cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(paged_k_cache->device.device_type, paged_k_cache->device.device_id));
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(paged_k_cache->dtype, c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
-        static_cast<c_type*>(paged_k_cache.data_ptr()),
-        static_cast<c_type*>(paged_v_cache.data_ptr()), kv_cache_strides,
-        static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
-        static_cast<int32_t*>(kv_last_page_len.data_ptr()));
+        static_cast<c_type*>(paged_k_cache->data),
+        static_cast<c_type*>(paged_v_cache->data), k_strides,
+        static_cast<int32_t*>(kv_indices->data), static_cast<int32_t*>(kv_indptr->data),
+        static_cast<int32_t*>(kv_last_page_len->data));
     cudaError_t status =
-        AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
-                           static_cast<c_type*>(append_value.data_ptr()),
-                           static_cast<int32_t*>(batch_indices.data_ptr()),
-                           static_cast<int32_t*>(positions.data_ptr()), nnz, append_k_stride_n,
+        AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key->data),
+                           static_cast<c_type*>(append_value->data),
+                           static_cast<int32_t*>(batch_indices->data),
+                           static_cast<int32_t*>(positions->data), nnz, append_k_stride_n,
                            append_k_stride_h, append_v_stride_n, append_v_stride_h, stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "AppendPagedKVCache failed with error: " << cudaGetErrorString(status);
     return true;
   });
 
-  TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
+  TVM_FFI_ICHECK(success) << "AppendPagedKVCache failed to dispatch with dtype " << paged_k_cache->dtype;
 }
 
 void block_sparse_indices_to_vector_sparse_offsets(
-    at::Tensor block_sparse_indices, at::Tensor block_sparse_indptr,
-    at::Tensor vector_sparse_offsets, at::Tensor vector_sparse_indptr, at::Tensor kv_len_arr,
+    Tensor block_sparse_indices, Tensor block_sparse_indptr,
+    Tensor vector_sparse_offsets, Tensor vector_sparse_indptr, Tensor kv_len_arr,
     int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size) {
   CHECK_INPUT(block_sparse_indices);
   CHECK_INPUT(block_sparse_indptr);
@@ -122,25 +121,26 @@ void block_sparse_indices_to_vector_sparse_offsets(
   CHECK_INPUT(vector_sparse_indptr);
   CHECK_INPUT(kv_len_arr);
 
-  const c10::cuda::OptionalCUDAGuard device_guard(block_sparse_indices.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaSetDevice(block_sparse_indices->device.device_id);
+  const cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(block_sparse_indptr->device.device_type, block_sparse_indptr->device.device_id));
 
   cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
-      static_cast<int32_t*>(block_sparse_indices.data_ptr()),
-      static_cast<int32_t*>(block_sparse_indptr.data_ptr()),
-      static_cast<int32_t*>(vector_sparse_offsets.data_ptr()),
-      static_cast<int32_t*>(vector_sparse_indptr.data_ptr()),
-      static_cast<int32_t*>(kv_len_arr.data_ptr()), stride_block, stride_n, batch_size, block_size,
+      static_cast<int32_t*>(block_sparse_indices->data),
+      static_cast<int32_t*>(block_sparse_indptr->data),
+      static_cast<int32_t*>(vector_sparse_offsets->data),
+      static_cast<int32_t*>(vector_sparse_indptr->data),
+      static_cast<int32_t*>(kv_len_arr->data), stride_block, stride_n, batch_size, block_size,
       stream);
 
-  TORCH_CHECK(status == cudaSuccess, "BlockSparseIndicesToVectorSparseOffset failed with error: ",
-              cudaGetErrorString(status));
+  TVM_FFI_ICHECK(status == cudaSuccess) << "BlockSparseIndicesToVectorSparseOffset failed with error: "
+              << cudaGetErrorString(status);
 }
 
-void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
-                               at::Tensor batch_indices, at::Tensor positions, at::Tensor ckv_cache,
-                               at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor kv_indptr,
-                               at::Tensor kv_last_page_len) {
+void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe,
+                               Tensor batch_indices, Tensor positions, Tensor ckv_cache,
+                               Tensor kpe_cache, Tensor kv_indices, Tensor kv_indptr,
+                               Tensor kv_last_page_len) {
   CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
   CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
   CHECK_INPUT(batch_indices);
@@ -160,57 +160,55 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
   CHECK_DIM(1, kv_indices);
   CHECK_DIM(1, kv_indptr);
   CHECK_DIM(1, kv_last_page_len);
-  unsigned int nnz = append_ckv.size(0);
-  unsigned int batch_size = kv_last_page_len.size(0);
-  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(batch_indices.size(0), nnz);
-  CHECK_EQ(positions.size(0), nnz);
-  auto device = append_ckv.device();
-  CHECK_EQ(append_ckv.device(), device);
-  CHECK_EQ(append_kpe.device(), device);
-  CHECK_EQ(ckv_cache.device(), device);
+  unsigned int nnz = append_ckv->shape[0];
+  unsigned int batch_size = kv_last_page_len->shape[0];
+  TVM_FFI_ICHECK_EQ(kv_indptr->shape[0], batch_size + 1);
+  TVM_FFI_ICHECK_EQ(batch_indices->shape[0], nnz);
+  TVM_FFI_ICHECK_EQ(positions->shape[0], nnz);
+  CHECK_DEVICE(append_ckv, append_ckv);
+  CHECK_DEVICE(append_kpe, append_ckv);
+  CHECK_DEVICE(ckv_cache, append_ckv);
 
-  CHECK_EQ(kv_indices.device(), device);
-  CHECK_EQ(kv_indptr.device(), device);
-  CHECK_EQ(kv_last_page_len.device(), device);
+  CHECK_DEVICE(kv_indices, append_ckv);
+  CHECK_DEVICE(kv_indptr, append_ckv);
+  CHECK_DEVICE(kv_last_page_len, append_ckv);
 
   unsigned int page_size, ckv_dim, kpe_dim;
-  page_size = ckv_cache.size(1);
-  ckv_dim = ckv_cache.size(2);
-  kpe_dim = kpe_cache.size(2);
+  page_size = ckv_cache->shape[1];
+  ckv_dim = ckv_cache->shape[2];
+  kpe_dim = kpe_cache->shape[2];
 
   // get kv_cache_strides
-  const int64_t* ckv_strides = ckv_cache.strides().data();
-  const int64_t* kpe_strides = kpe_cache.strides().data();
+  auto ckv_strides = ckv_cache->strides;
+  auto kpe_strides = kpe_cache->strides;
 
-  auto append_ckv_strides = append_ckv.strides();
+  auto append_ckv_strides = append_ckv->strides;
   auto append_ckv_stride_n = append_ckv_strides[0];
-  auto append_kpe_strides = append_kpe.strides();
+  auto append_kpe_strides = append_kpe->strides;
   auto append_kpe_stride_n = append_kpe_strides[0];
 
-  CHECK_EQ(append_ckv.size(1), ckv_dim);
-  CHECK_EQ(append_kpe.size(1), kpe_dim);
+  TVM_FFI_ICHECK_EQ(append_ckv->shape[1], ckv_dim);
+  TVM_FFI_ICHECK_EQ(append_kpe->shape[1], kpe_dim);
 
-  auto kv_scalar_dtype = ckv_cache.scalar_type();
-
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  auto stream = at::cuda::getCurrentCUDAStream();
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
+  cudaSetDevice(append_ckv->device.device_id);
+  const cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(ckv_cache->device.device_type, ckv_cache->device.device_id));
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(ckv_cache->dtype, c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(
-        page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache.data_ptr()),
-        ckv_strides, static_cast<c_type*>(kpe_cache.data_ptr()), kpe_strides,
-        static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
-        static_cast<int32_t*>(kv_last_page_len.data_ptr()));
+        page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache->data),
+        ckv_strides, static_cast<c_type*>(kpe_cache->data), kpe_strides,
+        static_cast<int32_t*>(kv_indices->data), static_cast<int32_t*>(kv_indptr->data),
+        static_cast<int32_t*>(kv_last_page_len->data));
     cudaError_t status =
-        AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv.data_ptr()),
-                              static_cast<c_type*>(append_kpe.data_ptr()),
-                              static_cast<int32_t*>(batch_indices.data_ptr()),
-                              static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n,
+        AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv->data),
+                              static_cast<c_type*>(append_kpe->data),
+                              static_cast<int32_t*>(batch_indices->data),
+                              static_cast<int32_t*>(positions->data), nnz, append_ckv_stride_n,
                               append_kpe_stride_n, stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "AppendPagedKVMlaCache failed with error: ", cudaGetErrorString(status));
+    TVM_FFI_ICHECK(status == cudaSuccess)
+                << "AppendPagedKVMlaCache failed with error: " << cudaGetErrorString(status);
     return true;
   });
 
-  TORCH_CHECK(success, "AppendPagedKVMlaCache failed to dispatch with dtype ", kv_scalar_dtype);
+  TVM_FFI_ICHECK(success) << "AppendPagedKVMlaCache failed to dispatch with dtype " << ckv_cache->dtype;
 }

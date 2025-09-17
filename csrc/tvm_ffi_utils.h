@@ -42,9 +42,10 @@ constexpr DLDataType dl_float32 = DLDataType{kDLFloat, 32, 1};
 constexpr DLDataType dl_float64 = DLDataType{kDLFloat, 64, 1};
 constexpr DLDataType dl_float8_e4m3fn = DLDataType{kDLFloat8_e4m3fn, 8, 1};
 constexpr DLDataType dl_float8_e5m2 = DLDataType{kDLFloat8_e5m2, 8, 1};
+constexpr DLDataType dl_float4_e2m1fn = DLDataType{kDLFloat4_e2m1fn, 4, 1};
+constexpr DLDataType dl_float4_e2m1fn_x2 = DLDataType{kDLFloat4_e2m1fn, 4, 2};
 constexpr DLDataType dl_bfloat16 = DLDataType{kDLBfloat, 16, 1};
 constexpr DLDataType dl_bool = DLDataType{kDLBool, 8, 1};
-constexpr DLDataType dl_float4_e2m1fn_x2 = DLDataType{kDLFloat4_e2m1fn, 4, 2};
 
 constexpr int64_t float16_code = encode_dlpack_dtype(dl_float16);
 constexpr int64_t bfloat16_code = encode_dlpack_dtype(dl_bfloat16);
@@ -53,6 +54,7 @@ constexpr int64_t int32_code = encode_dlpack_dtype(dl_int32);
 constexpr int64_t int64_code = encode_dlpack_dtype(dl_int64);
 constexpr int64_t float8_e4m3fn_code = encode_dlpack_dtype(dl_float8_e4m3fn);
 constexpr int64_t float8_e5m2_code = encode_dlpack_dtype(dl_float8_e5m2);
+constexpr int64_t float4_e2m1fn_code = encode_dlpack_dtype(dl_float4_e2m1fn);
 
 constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
@@ -137,6 +139,32 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
       _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
       _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
+#if defined(FLASHINFER_ENABLE_FP4_E2M1) &&   \
+    (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
+  case float4_e2m1fn_code: {                 \
+    using c_type = __nv_fp4_e2m1;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP4_E2M1(c_type, ...)
+#endif
+
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE(dlpack_dtype, c_type, ...)                        \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP4_E2M1(c_type, __VA_ARGS__)                                       \
       default:                                                                           \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
                               << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
