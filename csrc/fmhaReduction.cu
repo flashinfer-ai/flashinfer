@@ -273,7 +273,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
-                      int32_t multiProcessorCount, cudaStream_t stream, bool enable_pdl) {
+                      int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream) {
   // Skip the kernel if not using the separate reduction kernel.
   if (!isGmemReductionWithSeparateKernel(
           static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))) {

@@ -254,8 +254,8 @@ class TllmGenFmhaKernel {
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
       // Run the separate reduction kernel if needed.
-      runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream,
-                       params.enable_pdl);
+      runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.enable_pdl,
+                       params.stream);
 
       if (params.lsePtr != nullptr) {
         flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
