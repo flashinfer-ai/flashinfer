@@ -149,9 +149,9 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
 #ifdef FLASHINFER_ENABLE_F32
 #define _DISPATCH_CASE_F32(c_type, ...) \
-  case float32_code: {                 \
-    using c_type = float;            \
-    return __VA_ARGS__();                    \
+  case float32_code: {                  \
+    using c_type = float;               \
+    return __VA_ARGS__();               \
   }
 #else
 #define _DISPATCH_CASE_F32(c_type, ...)
@@ -160,31 +160,31 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 #if defined(FLASHINFER_ENABLE_FP8_E8M0) && \
     (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...) \
-  case uint8_code: {                 \
-    using c_type = __nv_fp8_e8m0;            \
-    return __VA_ARGS__();                    \
+  case uint8_code: {                            \
+    using c_type = __nv_fp8_e8m0;               \
+    return __VA_ARGS__();                       \
   }
 #else
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)
 #endif
 
-#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(dlpack_dtype, c_type, ...)                     \
-  [&]() -> bool {                                                                        \
-    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
-      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                            \
-      _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                                    \
-      default:                                                                           \
-        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                     \
-                              << " failed to dispatch scaling factor data type "         \
-                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
-        return false;                                                                    \
-    }                                                                                    \
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(dlpack_dtype, c_type, ...)                \
+  [&]() -> bool {                                                                   \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
+      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                               \
+      default:                                                                      \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
+                              << " failed to dispatch scaling factor data type "    \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits; \
+        return false;                                                               \
+    }                                                                               \
   }()
 
 #if defined(FLASHINFER_ENABLE_FP4_E2M1) && \
     (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #define _DISPATCH_CASE_FP4_E2M1(c_type, ...) \
-  case uint8_code: {                 \
+  case uint8_code: {                         \
     using c_type = __nv_fp4_e2m1;            \
     return __VA_ARGS__();                    \
   }
@@ -205,6 +205,17 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
                               << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
         return false;                                                                    \
     }                                                                                    \
+  }()
+
+#define DISPATCH_BOOL(expr, const_expr, ...) \
+  [&]() -> bool {                            \
+    if (expr) {                              \
+      constexpr bool const_expr = true;      \
+      return __VA_ARGS__();                  \
+    } else {                                 \
+      constexpr bool const_expr = false;     \
+      return __VA_ARGS__();                  \
+    }                                        \
   }()
 
 inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, const char* a_name,
