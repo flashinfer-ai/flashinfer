@@ -23,6 +23,7 @@ from jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -189,6 +190,10 @@ def _run_attention(
 
 
 # -------------------------  PyTest test case  ----------------------------- #
+@pytest.mark.xfail(
+    get_compute_capability(torch.device(device="cuda"))[0] == 12,
+    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
+)
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @pytest.mark.parametrize("page_block_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
