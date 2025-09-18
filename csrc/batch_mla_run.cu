@@ -13,68 +13,66 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <flashinfer/attention/mla.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/fastdiv.cuh>
 #include <optional>
 
 #include "batch_mla_config.inc"
-#include "pytorch_conversion_utils.h"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                               at::Tensor plan_info_vec, at::Tensor q_nope, at::Tensor q_pe,
-                               at::Tensor ckv_cache, at::Tensor kpe_cache, at::Tensor kv_indices,
-                               at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                               int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
-                               double sm_scale) {
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+void BatchMLAPagedAttentionRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                               Array<int64_t> plan_info_vec, Tensor q_nope, Tensor q_pe,
+                               Tensor ckv_cache, Tensor kpe_cache, Tensor kv_indices, Tensor o,
+                               Optional<Tensor> maybe_lse, int64_t mask_mode_code,
+                               int64_t num_heads, int64_t page_size, double sm_scale) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
   MLAPlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
-  auto device = q_nope.device();
-
-  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
-  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
+  void* float_buffer_ptr = float_workspace_buffer->data;
+  void* int_buffer_ptr = int_workspace_buffer->data;
 
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  auto q_scalar_type = q_nope.scalar_type();
-  auto kv_scalar_type = ckv_cache.scalar_type();
+  unsigned int q_nope_stride_n = q_nope->strides[0];
+  unsigned int q_nope_stride_h = q_nope->strides[1];
+  unsigned int q_pe_stride_n = q_pe->strides[0];
+  unsigned int q_pe_stride_h = q_pe->strides[1];
+  unsigned int ckv_stride_page = ckv_cache->strides[0];
+  unsigned int ckv_stride_n = ckv_cache->strides[1];
+  unsigned int kpe_stride_page = kpe_cache->strides[0];
+  unsigned int kpe_stride_n = kpe_cache->strides[1];
+  unsigned int o_stride_n = o->strides[0];
+  unsigned int o_stride_h = o->strides[1];
 
-  unsigned int q_nope_stride_n = q_nope.stride(0);
-  unsigned int q_nope_stride_h = q_nope.stride(1);
-  unsigned int q_pe_stride_n = q_pe.stride(0);
-  unsigned int q_pe_stride_h = q_pe.stride(1);
-  unsigned int ckv_stride_page = ckv_cache.stride(0);
-  unsigned int ckv_stride_n = ckv_cache.stride(1);
-  unsigned int kpe_stride_page = kpe_cache.stride(0);
-  unsigned int kpe_stride_n = kpe_cache.stride(1);
-  unsigned int o_stride_n = o.stride(0);
-  unsigned int o_stride_h = o.stride(1);
-
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  cudaSetDevice(q_nope->device.device_id);
+  const cudaStream_t stream = get_stream(q_nope->device);
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, Params, [&] {
         Params params;
 
-        params.q_nope = static_cast<DTypeQ*>(q_nope.data_ptr());
-        params.q_pe = static_cast<DTypeQ*>(q_pe.data_ptr());
-        params.ckv = static_cast<DTypeKV*>(ckv_cache.data_ptr());
-        params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
+        params.q_nope = static_cast<DTypeQ*>(q_nope->data);
+        params.q_pe = static_cast<DTypeQ*>(q_pe->data);
+        params.ckv = static_cast<DTypeKV*>(ckv_cache->data);
+        params.kpe = static_cast<DTypeKV*>(kpe_cache->data);
 
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
         params.partial_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.partial_indptr_offset);
-        params.kv_indices = static_cast<IdType*>(kv_indices.data_ptr());
+        params.kv_indices = static_cast<IdType*>(kv_indices->data);
         params.q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_offset);
         params.kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
         params.q_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_offset);
@@ -92,9 +90,9 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
             int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
         params.merge_partial_stride =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
-        params.final_o = static_cast<DTypeO*>(o.data_ptr());
+        params.final_o = static_cast<DTypeO*>(o->data);
         params.final_lse =
-            maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+            maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
         params.partial_o =
             GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
         params.partial_lse =
@@ -119,7 +117,7 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
         cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
             params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 
-        TORCH_CHECK(status == cudaSuccess,
-                    "Failed to run MLA, error: ", cudaGetErrorString(status));
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "Failed to run MLA, error: " << cudaGetErrorString(status);
       });
 }
