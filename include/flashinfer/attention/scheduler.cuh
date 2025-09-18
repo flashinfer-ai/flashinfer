@@ -601,8 +601,6 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
   const size_t padded_batch_size =
       enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
-  printf("new_batch_size: %d, total_num_tiles_q: %d, padded_batch_size: %d, kv_chunk_size: %ld\n",
-         new_batch_size, total_num_tiles_q, padded_batch_size, kv_chunk_size);
   FLASHINFER_CHECK(new_batch_size <= padded_batch_size,
                    "new batch size should not exceed padded batch size. If you are using fixed "
                    "split size, please consider disabling cuda graph.");

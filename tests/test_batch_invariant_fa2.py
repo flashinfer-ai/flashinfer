@@ -145,11 +145,11 @@ def test_batch_decode_tensor_cores(
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
     )
-    o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tcore.run(
+    o_invariant, lse_invariant = wrapper_tcore.run(
         q[:invariant_bs], kv_data, return_lse=True
     )
-    assert torch.equal(o_tensor_cores[:invariant_bs], o_tensor_cores_invariant)
-    assert torch.equal(lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant)
+    assert torch.equal(o_tensor_cores[:invariant_bs], o_invariant)
+    assert torch.equal(lse_tensor_cores[:invariant_bs], lse_invariant)
 
 
 # test that without fixed split size, precision is different
@@ -164,15 +164,15 @@ def test_batch_decode_tensor_cores(
 #     head_dim,
 #     page_size,
 # )
-# o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tcore.run(
+# o_invariant, lse_invariant = wrapper_tcore.run(
 #     q[:invariant_bs], kv_data, return_lse=True
 # )
 # try:
 #     torch.testing.assert_close(
-#         o_tensor_cores[:invariant_bs], o_tensor_cores_invariant, rtol=1e-7, atol=1e-7
+#         o_tensor_cores[:invariant_bs], o_invariant, rtol=1e-7, atol=1e-7
 #     )
 #     torch.testing.assert_close(
-#         lse_tensor_cores[:invariant_bs], lse_tensor_cores_invariant, rtol=1e-7, atol=1e-7
+#         lse_tensor_cores[:invariant_bs], lse_invariant, rtol=1e-7, atol=1e-7
 #     )
 # except AssertionError:
 #     pass
@@ -258,85 +258,8 @@ def test_batch_prefill_tensor_cores(
     wrapper_tcore = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    wrapper_tcore.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        q_data_type=torch.float16,
-        kv_data_type=torch.float16,
-        fixed_split_size=fixed_split_size if not disable_split_kv else None,
-        disable_split_kv=disable_split_kv,
-    )
-    o_tensor_cores, lse_tensor_cores = wrapper_tcore.run(q, kv_data, return_lse=True)
 
-    # Test invariant batch size
-    q_indptr_invariant = q_indptr[: invariant_bs + 1]
-    kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
-    kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
-    wrapper_tcore.plan(
-        q_indptr_invariant,
-        kv_indptr_invariant,
-        kv_indices,
-        kv_last_page_len_invariant,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        q_data_type=torch.float16,
-        kv_data_type=torch.float16,
-        fixed_split_size=fixed_split_size if not disable_split_kv else None,
-        disable_split_kv=disable_split_kv,
-    )
-    o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tcore.run(
-        q[: invariant_bs * qo_len], kv_data, return_lse=True
-    )
-
-    # Compare outputs for the invariant batch size
-    assert torch.equal(
-        o_tensor_cores[: invariant_bs * qo_len], o_tensor_cores_invariant
-    )
-    assert torch.equal(
-        lse_tensor_cores[: invariant_bs * qo_len], lse_tensor_cores_invariant
-    )
-
-    if disable_split_kv:
-        # Test cuda graph
-        del o_tensor_cores_invariant, lse_tensor_cores_invariant
-        g_invariant = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g_invariant):
-            o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tcore.run(
-                q[: invariant_bs * qo_len], kv_data, return_lse=True
-            )
-        wrapper_tcore.plan(
-            q_indptr_invariant,
-            kv_indptr_invariant,
-            kv_indices,
-            kv_last_page_len_invariant,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode=pos_encoding_mode,
-            q_data_type=torch.float16,
-            kv_data_type=torch.float16,
-            disable_split_kv=True,
-        )
-        g_invariant.replay()
-
-        # capture for full batch
-        del o_tensor_cores, lse_tensor_cores
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            o_tensor_cores, lse_tensor_cores = wrapper_tcore.run(
-                q, kv_data, return_lse=True
-            )
+    def default_plan():
         wrapper_tcore.plan(
             q_indptr,
             kv_indptr,
@@ -349,13 +272,66 @@ def test_batch_prefill_tensor_cores(
             pos_encoding_mode=pos_encoding_mode,
             q_data_type=torch.float16,
             kv_data_type=torch.float16,
-            disable_split_kv=True,
+            fixed_split_size=fixed_split_size if not disable_split_kv else None,
+            disable_split_kv=disable_split_kv,
         )
+
+    def invariant_plan():
+        wrapper_tcore.plan(
+            q_indptr_invariant,
+            kv_indptr_invariant,
+            kv_indices,
+            kv_last_page_len_invariant,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            fixed_split_size=fixed_split_size if not disable_split_kv else None,
+            disable_split_kv=disable_split_kv,
+        )
+
+    default_plan()
+    o_tensor_cores, lse_tensor_cores = wrapper_tcore.run(q, kv_data, return_lse=True)
+
+    # Test invariant batch size
+    q_indptr_invariant = q_indptr[: invariant_bs + 1]
+    kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
+    kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
+
+    invariant_plan()
+    o_invariant, lse_invariant = wrapper_tcore.run(
+        q[: invariant_bs * qo_len], kv_data, return_lse=True
+    )
+
+    # Compare outputs for the invariant batch size
+    assert torch.equal(o_tensor_cores[: invariant_bs * qo_len], o_invariant)
+    assert torch.equal(lse_tensor_cores[: invariant_bs * qo_len], lse_invariant)
+
+    if disable_split_kv:
+        # Test cuda graph
+        del o_invariant, lse_invariant
+        g_invariant = torch.cuda.CUDAGraph()
+        invariant_plan()
+        with torch.cuda.graph(g_invariant):
+            o_invariant, lse_invariant = wrapper_tcore.run(
+                q[: invariant_bs * qo_len], kv_data, return_lse=True
+            )
+        invariant_plan()
+        g_invariant.replay()
+
+        # capture for full batch
+        del o_tensor_cores, lse_tensor_cores
+        g = torch.cuda.CUDAGraph()
+        default_plan()
+        with torch.cuda.graph(g):
+            o_tensor_cores, lse_tensor_cores = wrapper_tcore.run(
+                q, kv_data, return_lse=True
+            )
+        default_plan()
         g.replay()
         # compare outputs
-        assert torch.equal(
-            o_tensor_cores_invariant, o_tensor_cores[: invariant_bs * qo_len]
-        )
-        assert torch.equal(
-            lse_tensor_cores_invariant, lse_tensor_cores[: invariant_bs * qo_len]
-        )
+        assert torch.equal(o_invariant, o_tensor_cores[: invariant_bs * qo_len])
+        assert torch.equal(lse_invariant, lse_tensor_cores[: invariant_bs * qo_len])
