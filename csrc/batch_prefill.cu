@@ -77,7 +77,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
 void BatchPrefillWithRaggedKVCacheRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
                                       Array<int64_t> plan_info_vec, Tensor q, Tensor k, Tensor v,
                                       Tensor qo_indptr, Tensor kv_indptr, Tensor o,
-                                      std::optional<Tensor> maybe_lse, int64_t mask_mode_code,
+                                      Optional<Tensor> maybe_lse, int64_t mask_mode_code,
                                       int64_t layout, int64_t window_left,
                                       bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
@@ -201,8 +201,8 @@ void BatchPrefillWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_w
                                      Array<int64_t> plan_info_vec, Tensor q, Tensor paged_k_cache,
                                      Tensor paged_v_cache, Tensor qo_indptr, Tensor paged_kv_indptr,
                                      Tensor paged_kv_indices, Tensor paged_kv_last_page_len,
-                                     Tensor o, std::optional<Tensor> maybe_lse,
-                                     int64_t mask_mode_code, int64_t layout, int64_t window_left,
+                                     Tensor o, Optional<Tensor> maybe_lse, int64_t mask_mode_code,
+                                     int64_t layout, int64_t window_left,
                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
