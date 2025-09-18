@@ -20,9 +20,9 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 
-#include "flashinfer/trtllm/common/cudaBf16Fallbacks.cuh"
-#include "flashinfer/trtllm/common/cudaBf16Wrapper.h"
-#include "flashinfer/trtllm/common/cudaFp8Utils.h"
+#include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
+#include "tensorrt_llm/common/cudaBf16Wrapper.h"
+#include "tensorrt_llm/common/cudaFp8Utils.h"
 #if ENABLE_BF16
 #include <cuda_bf16.h>
 #endif
