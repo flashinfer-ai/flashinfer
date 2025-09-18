@@ -29,6 +29,7 @@ from flashinfer.testing.utils import bench_gpu_time
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
+num_ranks = 2
 
 test_configs = [
     # {
@@ -44,12 +45,7 @@ test_configs = [
         "intermediate_size": 2048,
     }
     for num_experts in [
-        # 256,
-        256 // 2,
-        # 256 // 4,
-        # 256 // 8,
-        # 256 // 16,
-        # 256 // 32,
+        256 // num_ranks,
     ]
 ]
 
@@ -139,6 +135,10 @@ def bench_cutlass_fused_moe(
     router_logits = torch.randn(m, e, dtype=otype).cuda()
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
+    if 1:
+        print("HACK: mask some selected_experts")
+        selected_experts[torch.randn(selected_experts.shape) > 1 / num_ranks] = 9999999
+
     flash_output = torch.zeros_like(x)
 
     quant_scales = [
@@ -151,6 +151,7 @@ def bench_cutlass_fused_moe(
     ]
     hidden_states = x
     hidden_states, input_sf = fp4_quantize(x, a1_gs)
+    print(f"{hidden_states.shape=}")
 
     # Warmup
     for _ in range(3):
@@ -224,7 +225,7 @@ if __name__ == "__main__":
         help="Update the config file with the new profiling results",
     )
     parser.add_argument(
-        "--num-tokens", type=int, default=32768, help="Number of tokens to profile"
+        "--num-tokens", type=int, default=32768 * num_ranks, help="Number of tokens to profile"
     )
     parser.add_argument("--skip-autotune", action="store_true", help="Skip autotuning")
     args = parser.parse_args()
