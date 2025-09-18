@@ -915,7 +915,7 @@ def dequantize_block(
 
     if x_quant.dim() == 2:  # For activation tensors [batch_size, hidden_size]
         batch_size, hidden_size = x_quant.shape
-        num_blocks = (hidden_size + block_size_n - 1) // block_size_n
+        num_blocks = ceil_div(hidden_size, block_size_n)
         scales = (
             scales.view(batch_size, num_blocks, 1)
             .expand(-1, -1, block_size_n)
