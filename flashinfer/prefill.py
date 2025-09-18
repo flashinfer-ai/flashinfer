@@ -245,7 +245,7 @@ def get_trtllm_gen_prefill_module():
 def get_single_prefill_module(backend, *args):
     uri = get_single_prefill_uri(backend, *args)
     module = gen_single_prefill_module(backend, *args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_prefill_with_kv_cache
 
@@ -359,9 +359,9 @@ def get_batch_prefill_module(backend, *args):
     else:
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
-        plan_func = module.plan.default
-        ragged_run_func = module.ragged_run.default
-        paged_run_func = module.paged_run.default
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
 
     # torch library for ragged_run
 
@@ -713,9 +713,9 @@ def get_batch_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    ragged_run_func = jit_module.ragged_run.default
-    paged_run_func = jit_module.paged_run.default
+    plan_func = jit_module.plan
+    ragged_run_func = jit_module.ragged_run
+    paged_run_func = jit_module.paged_run
 
     # torch library for ragged_run
     @register_custom_op(
@@ -879,7 +879,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     lse = None
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=device)
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
