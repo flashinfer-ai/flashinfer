@@ -147,10 +147,10 @@ def ref_attention(
 
     return out
 
-# @pytest.mark.skipif(
-#     get_compute_capability(torch.device(device="cuda"))[0] != 9,
-#     reason="XQA is only supported on SM90 GPUs",
-# )
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] != 9,
+    reason="XQA is only supported on SM90 GPUs",
+)
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("use_fp16", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
