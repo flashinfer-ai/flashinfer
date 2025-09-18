@@ -94,6 +94,11 @@ show_error_context = true
 follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
+exclude = [
+    "flashinfer-cubin/",
+    "3rdparty/",
+    "flashinfer/data/cutlass/",
+]
 
 
 [tool.ruff.lint]
