@@ -13,13 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor lse,
-                              at::Tensor q_nope_pe, at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
-                              at::Tensor page_table);
+void CutlassMLAPagedAttention(Tensor workspace, Tensor out, Tensor lse, Tensor q_nope_pe,
+                              Tensor ckv_kpe_cache, Tensor kv_lens, Tensor page_table);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // "Cutlass MLA Paged Attention"
-  m.def("cutlass_mla_paged_attention", CutlassMLAPagedAttention);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_mla_paged_attention, CutlassMLAPagedAttention);

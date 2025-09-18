@@ -15,31 +15,31 @@
  */
 #include <flashinfer/attention/cutlass_mla.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 using namespace flashinfer::attention;
 
-void CutlassMLAPagedAttention(at::Tensor workspace, at::Tensor out, at::Tensor lse,
-                              at::Tensor q_nope_pe, at::Tensor ckv_kpe_cache, at::Tensor kv_lens,
-                              at::Tensor page_table) {
-  const c10::cuda::OptionalCUDAGuard device_guard(q_nope_pe.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+void CutlassMLAPagedAttention(Tensor workspace, Tensor out, Tensor lse, Tensor q_nope_pe,
+                              Tensor ckv_kpe_cache, Tensor kv_lens, Tensor page_table) {
+  cudaSetDevice(q_nope_pe->device.device_id);
+  const cudaStream_t stream = get_stream(q_nope_pe->device);
 
-  int device_index = q_nope_pe.device().index();
-  int batches = q_nope_pe.sizes()[0];
-  int page_count_per_seq = page_table.sizes()[1];
-  int page_count_total = ckv_kpe_cache.sizes()[0];
-  int page_size = ckv_kpe_cache.sizes()[1];
+  int device_index = q_nope_pe->device.device_id;
+  int batches = q_nope_pe->shape[0];
+  int page_count_per_seq = page_table->shape[1];
+  int page_count_total = ckv_kpe_cache->shape[0];
+  int page_size = ckv_kpe_cache->shape[1];
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_nope_pe.scalar_type(), c_type, [&] {
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_nope_pe->dtype, c_type, [&] {
     using cutlass_t = cutlass_dtype_t<c_type>;
-    auto status = runMla<cutlass_t>(
-        workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
-        ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
-        page_count_per_seq, page_count_total, page_size, device_index, stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "Failed to run CutlassMLAPagedAttention: ", cudaGetErrorString(status));
+    auto status =
+        runMla<cutlass_t>(workspace->data, out->data, lse->data, q_nope_pe->data,
+                          ckv_kpe_cache->data, kv_lens->data, page_table->data, batches,
+                          page_count_per_seq, page_count_total, page_size, device_index, stream);
+
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
     return true;
   });
 }
