@@ -911,15 +911,17 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices
 
 template <class T>
 __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, int64_t const arr_length, T const target) {
+    return findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
+
 //     return findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
 
-    int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
-    int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
-    if (out_v1 != out_v2) {
-        printf("different output! v1=%lld v2=%lld\n", out_v1, out_v2);
-        asm("trap;");
-    }
-    return out_v1;
+//     int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
+//     int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
+//     if (out_v1 != out_v2) {
+//         printf("different output! v1=%lld v2=%lld\n", out_v1, out_v2);
+//         asm("trap;");
+//     }
+//     return out_v1;
 }
 
 template <class T>
