@@ -186,8 +186,8 @@ def xqa(
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
-    if get_compute_capability(q.device)[0] != 9:
-        raise RuntimeError("XQA is only supported on SM90")
+    if get_compute_capability(torch.device(device="cuda"))[0] != 9:
+        raise RuntimeError("XQA is only supported on SM90 GPUs")
     xqa_module = get_xqa_module(
         use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
     )
