@@ -119,7 +119,7 @@ def get_gemm_module():
             ) -> torch.Tensor:
                 cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.bmm_fp8.default(
+                module.bmm_fp8(
                     a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
                 )
                 return out
@@ -142,7 +142,7 @@ def get_gemm_module():
         empty_x_data: torch.Tensor,
         weight_column_major: bool,
     ) -> None:
-        module.cutlass_segment_gemm.default(
+        module.cutlass_segment_gemm(
             workspace_buffer,
             all_problems,
             x_data,
@@ -593,7 +593,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_b_expanded = scale_b
 
                 # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
-                module.gemm_fp8_nt_groupwise.default(
+                module.gemm_fp8_nt_groupwise(
                     workspace_buffer,
                     a,
                     b_col_major,
@@ -968,7 +968,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
                 gemm_fn = module.tgv_gemm
-                out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
+                out = gemm_fn(b.t(), a.t(), bias, tactic, pdl)
                 return out.t()
 
         return TGVGemmRunner()
@@ -1119,7 +1119,7 @@ def get_gemm_sm90_module():
         empty_y_data: torch.Tensor,
         weight_column_major: bool,
     ) -> None:
-        module.cutlass_segment_gemm_sm90.default(
+        module.cutlass_segment_gemm_sm90(
             workspace_buffer,
             int_workspace_buffer,
             all_problems,
@@ -2417,7 +2417,7 @@ def gemm_fp8_nt_groupwise(
         assert scale_major_mode is not None
         if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
-            get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
+            get_gemm_sm120_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
                 a,
                 b,
@@ -2428,7 +2428,7 @@ def gemm_fp8_nt_groupwise(
                 scale_major_mode,
             )
         elif is_sm100a_supported(a.device):
-            get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+            get_gemm_sm100_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
                 a,
                 b,
@@ -2517,7 +2517,7 @@ def get_trtllm_fp4_gemm_module():
                 alpha,
                 out,
             ) = inputs
-            op.trtllm_gemm.default(
+            op.trtllm_gemm(
                 workspace_buffer,
                 a,
                 b,
