@@ -865,7 +865,7 @@ void threeStepBuildExpertMapsSortFirstToken(
 // ============================== Infer GEMM sizes =================================
 // TODO Could linear search be better for small # experts
 template <class T>
-__device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices,
+__device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices,
                                                       int64_t const arr_length, T const target) {
   int64_t low = 0, high = arr_length - 1, target_location = -1;
   while (low <= high) {
@@ -879,6 +879,47 @@ __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices,
     }
   }
   return target_location + 1;
+}
+
+template <class T>
+__device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices, int64_t const arr_length, T const target) {
+  constexpr int ARR_LENGTH_CONST = 128;
+  if (arr_length != ARR_LENGTH_CONST) {
+      asm("trap;");
+  }
+
+  constexpr unsigned full_mask = 0xffffffffu;
+  constexpr int WARP_SZ = 32;
+  const int lane_id = threadIdx.x & (WARP_SZ - 1);
+
+  int local_count = 0;
+#pragma unroll
+  for (int k = 0; k < ARR_LENGTH_CONST / WARP_SZ; ++k) {
+    const int idx = lane_id + k * WARP_SZ;
+    T v = sorted_indices[idx];
+    local_count += (v < target) ? 1 : 0;
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_count += __shfl_down_sync(full_mask, local_count, offset);
+  }
+  int total = __shfl_sync(full_mask, local_count, 0);
+
+  return (int64_t)total;
+}
+
+template <class T>
+__device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, int64_t const arr_length, T const target) {
+    return findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
+
+//     int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
+//     int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
+//     if (out_v1 != out_v2) {
+//         printf("different output! v1=%lld v2=%lld\n", out_v1, out_v2);
+//         asm("trap");
+//     }
+//     return out_v1;
 }
 
 template <class T>
