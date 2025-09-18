@@ -170,7 +170,7 @@ def test_xqa(
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 9:
-        pytest.skip("These tests are only guaranteed to work on Hopper.")
+        pytest.skip("XQA only supports on Hopper at this moment")
     set_random_seed(42)
 
     nb_v_heads = nb_k_heads
