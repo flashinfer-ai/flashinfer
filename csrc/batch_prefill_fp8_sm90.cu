@@ -23,6 +23,7 @@
 #include "batch_prefill_sm90_config.inc"
 #include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 namespace flashinfer {
 
@@ -35,41 +36,43 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enabl
 
 using namespace flashinfer;
 
-at::Tensor BatchPrefillWithKVCacheSM90Plan(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
-    int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t window_left) {
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
+    Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+    Tensor page_locked_int_workspace_buffer, Tensor qo_indptr, Tensor kv_indptr, Tensor kv_len_arr,
+    int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
+    bool causal, int64_t window_left) {
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+      float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+      int_workspace_buffer->shape[0] * get_element_size(int_workspace_buffer);
 
   flashinfer::PrefillPlanSM90Info plan_info;
 
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  cudaSetDevice(float_workspace_buffer->device.device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
 
-  cudaError_t status =
-      PrefillSM90Plan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-                      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-                      int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
-                      kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
-                      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+  cudaError_t status = PrefillSM90Plan(
+      float_workspace_buffer->data, float_workspace_size_in_bytes, int_workspace_buffer->data,
+      page_locked_int_workspace_buffer->data, int_workspace_size_in_bytes, plan_info,
+      static_cast<IdType*>(qo_indptr->data), static_cast<IdType*>(kv_indptr->data),
+      static_cast<IdType*>(kv_len_arr->data), total_num_rows, batch_size, num_qo_heads,
+      num_kv_heads, head_dim_qk, head_dim_vo, page_size, causal, enable_cuda_graph,
+      /*sizeof_dtype_o=*/2, stream);
 
-  TORCH_CHECK(status == cudaSuccess,
-              "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "PrefillSM90Plan failed with error: " << cudaGetErrorString(status);
 
-  return vec_to_tensor(plan_info.ToVector());
+  return Array(plan_info.ToVector());
 }
 
-void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
-                                          at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-                                          at::Tensor q, at::Tensor k, at::Tensor v,
-                                          at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
-                                          std::optional<at::Tensor> maybe_lse,
+void BatchPrefillWithRaggedKVCacheSM90Run(Tensor float_workspace_buffer,
+                                          Tensor int_workspace_buffer, Array<int64_t> plan_info_vec,
+                                          Tensor q, Tensor k, Tensor v, Tensor qo_indptr,
+                                          Tensor kv_indptr, Tensor o, Optional<Tensor> maybe_lse,
                                           int64_t mask_mode_code, int64_t layout,
                                           int64_t window_left,
                                           bool enable_pdl  // placeholder
@@ -78,39 +81,36 @@ void BatchPrefillWithRaggedKVCacheSM90Run(at::Tensor float_workspace_buffer,
 }
 
 void BatchPrefillWithPagedKVCacheSM90Run(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
-    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+    Tensor float_workspace_buffer, Tensor int_workspace_buffer, Array<int64_t> plan_info_vec,
+    Tensor q, Tensor paged_k_cache, Tensor paged_v_cache, Tensor qo_indptr, Tensor paged_kv_indptr,
+    Tensor paged_kv_indices, Tensor paged_kv_last_page_len, Tensor o, Optional<Tensor> maybe_lse,
+    int64_t mask_mode_code, int64_t layout, int64_t window_left,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanSM90Info plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
-    TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
+    TORCH_CHECK(lse->shape[0] == q->shape[0], lse->shape[0], q->shape[0]);
+    TORCH_CHECK(lse->shape[1] == q->shape[1], lse->shape[1], q->shape[1]);
   }
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   int64_t num_kv_heads, page_size;
-  int64_t head_dim_qk = q.size(2);
-  int64_t head_dim_vo = paged_v_cache.size(3);
+  int64_t head_dim_qk = q->shape[2];
+  int64_t head_dim_vo = paged_v_cache->shape[3];
   if (kv_layout == QKVLayout::kHND) {
-    num_kv_heads = paged_k_cache.size(1);
-    page_size = paged_k_cache.size(2);
+    num_kv_heads = paged_k_cache->shape[1];
+    page_size = paged_k_cache->shape[2];
   } else {
-    page_size = paged_k_cache.size(1);
-    num_kv_heads = paged_k_cache.size(2);
+    page_size = paged_k_cache->shape[1];
+    num_kv_heads = paged_k_cache->shape[2];
   }
 
-  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
-  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
+  void* float_buffer_ptr = float_workspace_buffer->data;
+  void* int_buffer_ptr = int_workspace_buffer->data;
 
-  auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = paged_k_cache.scalar_type();
-
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  cudaSetDevice(float_workspace_buffer->device.device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;
 
@@ -119,30 +119,30 @@ void BatchPrefillWithPagedKVCacheSM90Run(
       USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
         PagedParams params;
 
-        params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
-        params.k_ptr = static_cast<DTypeKV*>(paged_k_cache.data_ptr());
-        params.v_ptr = static_cast<DTypeKV*>(paged_v_cache.data_ptr());
-        params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
-        params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
-        params.q_stride_n = q.stride(0);
-        params.q_stride_h = q.stride(1);
-        params.o_stride_n = o.stride(0);
-        params.o_stride_h = o.stride(1);
+        params.q_ptr = static_cast<DTypeQ*>(q->data);
+        params.k_ptr = static_cast<DTypeKV*>(paged_k_cache->data);
+        params.v_ptr = static_cast<DTypeKV*>(paged_v_cache->data);
+        params.o_ptr = static_cast<DTypeO*>(o->data);
+        params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
+        params.q_stride_n = q->strides[0];
+        params.q_stride_h = q->strides[1];
+        params.o_stride_n = o->strides[0];
+        params.o_stride_h = o->strides[1];
         if (kv_layout == QKVLayout::kNHD) {
           // (num_pages, page_size, num_heads, head_dim)
-          params.k_stride_n = paged_k_cache.stride(1);
-          params.k_stride_h = paged_k_cache.stride(2);
-          params.v_stride_n = paged_v_cache.stride(1);
-          params.v_stride_h = paged_v_cache.stride(2);
+          params.k_stride_n = paged_k_cache->strides[1];
+          params.k_stride_h = paged_k_cache->strides[2];
+          params.v_stride_n = paged_v_cache->strides[1];
+          params.v_stride_h = paged_v_cache->strides[2];
         } else {
           // (num_pages, num_heads, page_size, head_dim)
-          params.k_stride_h = paged_k_cache.stride(1);
-          params.k_stride_n = paged_k_cache.stride(2);
-          params.v_stride_h = paged_v_cache.stride(1);
-          params.v_stride_n = paged_v_cache.stride(2);
+          params.k_stride_h = paged_k_cache->strides[1];
+          params.k_stride_n = paged_k_cache->strides[2];
+          params.v_stride_h = paged_v_cache->strides[1];
+          params.v_stride_n = paged_v_cache->strides[2];
         }
-        params.nnz_qo = q.size(0);
-        params.num_qo_heads = q.size(1);
+        params.nnz_qo = q->shape[0];
+        params.num_qo_heads = q->shape[1];
         params.num_kv_heads = num_kv_heads;
         params.group_size = params.num_qo_heads / num_kv_heads;
         params.page_size = page_size;
@@ -160,7 +160,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
-        params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
+        params.kv_indices = static_cast<IdType*>(paged_kv_indices->data);
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -176,9 +176,10 @@ void BatchPrefillWithPagedKVCacheSM90Run(
                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
                                                         AttentionVariant>(params, enable_pdl,
                                                                           stream);
-          TORCH_CHECK(status == cudaSuccess,
-                      "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
-                      cudaGetErrorString(status));
+
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "BatchPrefillWithPagedKVCacheSM90Run failed with error: "
+              << cudaGetErrorString(status);
           return true;
         });
       });
