@@ -84,8 +84,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(Tensor float_workspace_buffer,
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TORCH_CHECK(lse->shape[0] == q->shape[0], lse->shape[0], q->shape[0]);
-    TORCH_CHECK(lse->shape[1] == q->shape[1], lse->shape[1], q->shape[1]);
+    TVM_FFI_ICHECK(lse->shape[0] == q->shape[0] && lse->shape[0], q->shape[0]);
+    TVM_FFI_ICHECK(lse->shape[1] == q->shape[1] && lse->shape[1], q->shape[1]);
   }
 
   void* float_buffer_ptr = float_workspace_buffer->data;
@@ -173,8 +173,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TORCH_CHECK(lse->shape[0] == q->shape[0], lse->shape[0], q->shape[0]);
-    TORCH_CHECK(lse->shape[1] == q->shape[1], lse->shape[1], q->shape[1]);
+    TVM_FFI_ICHECK(lse->shape[0] == q->shape[0] && lse->shape[0], q->shape[0]);
+    TVM_FFI_ICHECK(lse->shape[1] == q->shape[1] && lse->shape[1], q->shape[1]);
   }
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   int64_t num_kv_heads, page_size;
