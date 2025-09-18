@@ -20,6 +20,7 @@
 
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
+#include "tvm/ffi/error.h"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -235,11 +236,12 @@ void BatchPrefillWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_w
   const auto q_stride_h = q->strides[1];
 
   // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
-  auto k_strides = paged_k_cache.strides();
-  auto v_strides = paged_v_cache.strides();
-  TVM_FFI_ICHECK_EQ(k_strides, v_strides) << "k/v strides must be identical";
-  kv_cache_strides = k_strides.data();
+  const int64_t* kv_cache_strides = paged_k_cache.strides().data();
+  TVM_FFI_ICHECK_EQ(paged_k_cache->ndim, paged_v_cache->ndim);
+  for (int i = 0; i < paged_k_cache->ndim; ++i) {
+    TVM_FFI_ICHECK_EQ(paged_k_cache->strides[i], paged_v_cache->strides[i])
+        << "k/v strides differs at " << i;
+  }
 
   cudaSetDevice(float_workspace_buffer->device.device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer->device);

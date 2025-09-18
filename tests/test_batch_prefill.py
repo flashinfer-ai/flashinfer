@@ -99,8 +99,8 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
     )
 
     # ---------------- scale factors ----------------
-    k_scale = torch.tensor(0.5, dtype=torch.float32, device="cuda")
-    v_scale = torch.tensor(2.0, dtype=torch.float32, device="cuda")
+    k_scale = 0.5
+    v_scale = 2.0
 
     # -------- case 1: k_scale only ----------
     out1, _ = wrapper.forward_return_lse(q, paged_kv_cache, k_scale=k_scale)
