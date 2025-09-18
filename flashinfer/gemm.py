@@ -2892,7 +2892,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         assert out.shape == out_shape
         assert out.dtype == out_dtype
 
-    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise.default(
+    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
         a,
