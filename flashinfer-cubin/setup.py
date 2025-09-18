@@ -17,7 +17,7 @@ limitations under the License.
 import os
 import sys
 from pathlib import Path
-from setuptools import setup, find_packages
+from setuptools import setup
 from setuptools.command.build_py import build_py
 from setuptools.command.sdist import sdist
 
@@ -119,40 +119,13 @@ class CustomSdist(sdist):
         super().run()
 
 
-setup(
-    name="flashinfer-cubin",
-    version=get_version(),
-    description="Pre-compiled CUDA kernels (cubins) for FlashInfer",
-    long_description="This package contains pre-compiled CUDA kernels (cubins) for FlashInfer. "
-    "It provides all necessary cubin files downloaded from the FlashInfer artifactory.",
-    long_description_content_type="text/plain",
-    author="FlashInfer team",
-    url="https://github.com/flashinfer-ai/flashinfer",
-    packages=find_packages(),
-    package_data={
-        "flashinfer_cubin": ["cubins/**/*"],
-    },
-    include_package_data=True,
-    python_requires=">=3.8",
-    install_requires=[
-        "requests",
-        "filelock",
-    ],
-    cmdclass={
-        "build_py": DownloadAndBuildPy,
-        "sdist": CustomSdist,
-    },
-    classifiers=[
-        "Development Status :: 4 - Beta",
-        "Intended Audience :: Developers",
-        "License :: OSI Approved :: Apache Software License",
-        "Operating System :: OS Independent",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
-        "Topic :: Software Development :: Libraries :: Python Modules",
-    ],
-)
+# Minimal setup() call - configuration is now in pyproject.toml
+# This is kept for backward compatibility and to register custom cmdclass
+if __name__ == "__main__":
+    setup(
+        version=get_version(),
+        cmdclass={
+            "build_py": DownloadAndBuildPy,
+            "sdist": CustomSdist,
+        },
+    )
