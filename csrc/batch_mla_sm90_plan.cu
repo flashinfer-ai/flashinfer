@@ -21,6 +21,8 @@
 
 using namespace flashinfer;
 
+using tvm::ffi::Array;
+
 Array<int64_t> BatchMLAPagedAttentionSM90Plan(Tensor float_workspace_buffer,
                                               Tensor int_workspace_buffer,
                                               Tensor page_locked_int_workspace_buffer,
