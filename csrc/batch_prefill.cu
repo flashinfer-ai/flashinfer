@@ -103,8 +103,8 @@ void BatchPrefillWithRaggedKVCacheRun(Tensor float_workspace_buffer, Tensor int_
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TVM_FFI_ICHECK(lse->shape[0] == q->shape[0] && lse->shape[0], q->shape[0]);
-    TVM_FFI_ICHECK(lse->shape[1] == q->shape[1] && lse->shape[1], q->shape[1]);
+    TVM_FFI_ICHECK_EQ(lse->shape[0], q->shape[0]);
+    TVM_FFI_ICHECK_EQ(lse->shape[1], q->shape[1]);
   }
 
   void* float_buffer_ptr = float_workspace_buffer->data;
@@ -221,8 +221,8 @@ void BatchPrefillWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_w
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TVM_FFI_ICHECK(lse->shape[0] == q->shape[0] && lse->shape[0], q->shape[0]);
-    TVM_FFI_ICHECK(lse->shape[1] == q->shape[1] && lse->shape[1], q->shape[1]);
+    TVM_FFI_ICHECK_EQ(lse->shape[0], q->shape[0]);
+    TVM_FFI_ICHECK_EQ(lse->shape[1], q->shape[1]);
   }
 
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer->data);
@@ -238,7 +238,7 @@ void BatchPrefillWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_w
   const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
-  TVM_FFI_ICHECK(k_strides == v_strides) << "k/v strides must be identical";
+  TVM_FFI_ICHECK_EQ(k_strides, v_strides) << "k/v strides must be identical";
   kv_cache_strides = k_strides.data();
 
   cudaSetDevice(float_workspace_buffer->device.device_id);
