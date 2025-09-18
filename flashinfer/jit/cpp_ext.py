@@ -15,11 +15,22 @@ from torch.utils.cpp_extension import (
     _TORCH_PATH,
     CUDA_HOME,
     _get_num_workers,
-    _get_pybind11_abi_build_flags,
 )
 
 from . import env as jit_env
 from ..compilation_context import CompilationContext
+
+
+def torch_get_pybind11_abi_build_flags() -> List[str]:
+    if Version(torch.__version__) >= Version("2.9"):
+        return []
+    else:
+        abi_cflags = []
+        for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
+            pval = getattr(torch._C, f"_PYBIND11_{pname}")
+            if pval is not None:
+                abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
+        return abi_cflags
 
 
 @functools.cache
@@ -91,7 +102,7 @@ def generate_ninja_build_for_op(
     ]
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         common_cflags.append("-DPy_LIMITED_API=0x03090000")
-    common_cflags += _get_pybind11_abi_build_flags()
+    common_cflags += torch_get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
