@@ -894,6 +894,7 @@ def dequantize_block(
         scales: Block scaling factors
         dtype: Target dtype for dequantization
         original_shape: Original shape of the tensor before padding
+        block_size_n: Block size
 
     Returns:
         torch.Tensor: Dequantized tensor
