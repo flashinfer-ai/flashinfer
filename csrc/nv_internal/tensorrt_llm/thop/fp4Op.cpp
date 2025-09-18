@@ -20,7 +20,7 @@
 #include "tensorrt_llm/thop/utils.h"
 #include "tvm/ffi/container/array.h"
 
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 #include <cuda_fp8.h>
@@ -321,11 +321,10 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   TVM_FFI_ICHECK_EQ(k, scale->shape[1] * group_size)
       << "weight and scale must have the same number of columns";
 
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
   uint8_t* weight_packed_ptr = static_cast<uint8_t*>(weight->data);
   __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(static_cast<uint8_t*>(scale->data));
   float* dequant_weight_ptr = static_cast<float*>(dequant_weight->data);
-
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
 

@@ -91,8 +91,9 @@ def generate_ninja_build_for_op(
     common_cflags = [
         "-DTORCH_EXTENSION_NAME=$name",
         "-DTORCH_API_INCLUDE_EXTENSION_H",
-        "-DPy_LIMITED_API=0x03090000",
     ]
+    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        common_cflags.append("-DPy_LIMITED_API=0x03090000")
     common_cflags += _get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:

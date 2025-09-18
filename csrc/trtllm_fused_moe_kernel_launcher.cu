@@ -774,8 +774,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   //     {args.num_tokens, args.top_k}, routing_bias_dtype, hidden_states->device);
   // Tensor expert_indexes = alloc_tensor(
   //     {args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
+  int constexpr MAX_NUM_EXPERTS = 384;
   Tensor expert_count_histogram = alloc_tensor(
-      {2 * 256},
+      {2 * MAX_NUM_EXPERTS},
       dl_int32,  // 256 is the max number of threads per block and max number of experts
       hidden_states->device);
 

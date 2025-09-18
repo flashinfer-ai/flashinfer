@@ -124,9 +124,9 @@ at::Tensor tgv_gemm(at::Tensor const& mat1, at::Tensor const& mat2, std::optiona
   TORCH_CHECK(mat1.size(1) == mat2.size(0), "mat1.K must match mat2.K");
   TORCH_CHECK(mat1.scalar_type() == mat2.scalar_type(), "mat1 and mat2 must have the same dtype");
 
-  // No heuristic for now, we use 128x8 with 6 DMA stages as the default tactic.
+  // No heuristic for now, we use 64x8 with 8 DMA stages as the default tactic.
   if (tactic == -1) {
-    tactic = 0;
+    tactic = 1;
   }
   auto config = getTgvGemmConfig(tactic);
 

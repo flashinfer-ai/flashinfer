@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
 #include <cuda_fp8.h>
@@ -93,7 +94,7 @@ struct TllmToCutlassTypeAdapter<__nv_fp8_e5m2> {
 #endif
 
 #if defined(ENABLE_FP4)
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 template <>
 struct TllmToCutlassTypeAdapter<__nv_fp4_e2m1> {
   using type = cutlass::float_e2m1_t;
@@ -134,7 +135,7 @@ struct CutlassToTllmTypeAdapter<cutlass::float_e5m2_t> {
 #endif
 
 #if defined(ENABLE_FP4)
-#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if CUDA_VERSION >= 12080
 template <>
 struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t> {
   using type = __nv_fp4_e2m1;

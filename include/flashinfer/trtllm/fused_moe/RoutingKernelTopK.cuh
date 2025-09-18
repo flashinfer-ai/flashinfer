@@ -136,6 +136,160 @@ struct Sort<4, RedType> {
   }
 };
 
+// For N > 4, use a generic bubble sort approach for simplicity
+// This is not the most efficient but adequate for small N
+template <typename RedType>
+struct Sort<5, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+      for (int j = 0; j < 4 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<6, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+#pragma unroll
+      for (int j = 0; j < 5 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<7, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 6; ++i) {
+#pragma unroll
+      for (int j = 0; j < 6 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<8, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+#pragma unroll
+      for (int j = 0; j < 7 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<9, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+#pragma unroll
+      for (int j = 0; j < 8 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<10, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+#pragma unroll
+      for (int j = 0; j < 9 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<11, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 10; ++i) {
+#pragma unroll
+      for (int j = 0; j < 10 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
+template <typename RedType>
+struct Sort<12, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 11; ++i) {
+#pragma unroll
+      for (int j = 0; j < 11 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+template <typename RedType>
+struct Sort<13, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 12; ++i) {
+#pragma unroll
+      for (int j = 0; j < 12 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+template <typename RedType>
+struct Sort<14, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 13; ++i) {
+#pragma unroll
+      for (int j = 0; j < 13 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+template <typename RedType>
+struct Sort<15, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 14; ++i) {
+#pragma unroll
+      for (int j = 0; j < 14 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+template <typename RedType>
+struct Sort<16, RedType> {
+  static __device__ void run(RedType* topK) {
+#pragma unroll
+    for (int i = 0; i < 15; ++i) {
+#pragma unroll
+      for (int j = 0; j < 15 - i; ++j) {
+        TOPK_SWAP(j, j + 1);
+      }
+    }
+  }
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int K, typename Type>
@@ -165,7 +319,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
   static_assert(K > 0, "Top K must have K > 0");
   static_assert(K < WarpSize, "Top K must have K < WarpSize");
   static_assert(N > 0, "Top K must have N > 0");
-  static_assert(N < 5, "Only support candidates number less than or equal to 128");
+  static_assert(N <= 16, "Only support candidates number less than or equal to 128");
   using RedType = TopKRedType<Type>;
   RedType topK[N];
 #pragma unroll

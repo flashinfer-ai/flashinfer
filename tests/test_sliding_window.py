@@ -277,7 +277,7 @@ def test_batch_paged_prefill_sliding_window(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, "NHD", backend=backend
     )

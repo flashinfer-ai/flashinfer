@@ -60,6 +60,9 @@ ENV PATH="/usr/lib/llvm-19/bin:$PATH"
 ENV PATH="/home/devuser/conda/bin:$PATH"
 ENV PATH="/home/devuser/conda/envs/py312/bin:$PATH"
 
+# Triton
+ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+
 # Install python packages
 COPY install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh
