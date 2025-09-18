@@ -139,6 +139,9 @@ def bench_cutlass_fused_moe(
         print("HACK: mask some selected_experts")
         selected_experts[torch.randn(selected_experts.shape) > 1 / num_ranks] = 9999999
 
+        tune_max_num_tokens = batch_size
+        print(f"HACK: {tune_max_num_tokens=}")
+
     flash_output = torch.zeros_like(x)
 
     quant_scales = [
@@ -165,7 +168,7 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-            tune_max_num_tokens=32768,
+            tune_max_num_tokens=tune_max_num_tokens,
         )
 
     if not skip_autotune:
@@ -180,7 +183,7 @@ def bench_cutlass_fused_moe(
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=flash_output,
-                tune_max_num_tokens=32768,
+                tune_max_num_tokens=tune_max_num_tokens,
             )
 
     counter = 0
