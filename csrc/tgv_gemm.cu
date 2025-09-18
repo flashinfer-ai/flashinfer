@@ -31,6 +31,8 @@
 // CUTLASS type includes
 #include <cutlass/numeric_types.h>
 
+using tvm::ffi::Optional;
+
 #define SUPPORTED_TGV_GEMM_CONFIGS \
   TGV_GEMM_CONFIG(64, 8, 6)        \
   TGV_GEMM_CONFIG(64, 8, 8)        \
@@ -62,7 +64,8 @@ void dispatch_kernel(int cta_m, int cta_n, int cta_k, int dma_stage,
   SUPPORTED_TGV_GEMM_CONFIGS
 
   TVM_FFI_ICHECK(false) << "Unsupported tile configuration: cta_m=" << std::to_string(cta_m)
-                        << ", cta_n=" << std::to_string(cta_n) << ", cta_k=" << std::to_string(cta_k);
+                        << ", cta_n=" << std::to_string(cta_n)
+                        << ", cta_k=" << std::to_string(cta_k);
 }
 #undef TGV_GEMM_CONFIG
 
@@ -77,8 +80,8 @@ using flashinfer::gemm::TGVGemmConfig;
 TGVGemmConfig getTgvGemmConfig(int64_t tactic) {
   auto globalConfigs = getAllTgvConfigs();
 
-  TVM_FFI_ICHECK(tactic >= 0 && tactic < globalConfigs.size()) << "tactic must be between 0 and "
-              << globalConfigs.size();
+  TVM_FFI_ICHECK(tactic >= 0 && tactic < globalConfigs.size())
+      << "tactic must be between 0 and " << globalConfigs.size();
   return globalConfigs[tactic];
 }
 
@@ -113,8 +116,8 @@ void tgv_gemm_impl(input_type* mat1_ptr, input_type* mat2_ptr, output_type* outp
 
 }  // namespace
 
-Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bias,
-                    int64_t tactic, bool pdl) {
+Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, int64_t tactic,
+                bool pdl) {
   // Input validation
   TVM_FFI_ICHECK_EQ(mat1->device.device_type, kDLCUDA) << "mat1 tensor must be on CUDA";
   TVM_FFI_ICHECK_EQ(mat2->device.device_type, kDLCUDA) << "mat2 tensor must be on CUDA";
@@ -135,7 +138,7 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bi
 
   // Validate DMA_Stage
   TVM_FFI_ICHECK(dma_stage == 6 || dma_stage == 8 || dma_stage == 10 || dma_stage == 12)
-              << "dma_stage must be one of: 6, 8, 10, 12";
+      << "dma_stage must be one of: 6, 8, 10, 12";
 
   // Validate tile sizes
   TVM_FFI_ICHECK(cta_m == 64 || cta_m == 128) << "cta_m must be one of: 64, 128";
@@ -151,7 +154,7 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bi
     TVM_FFI_ICHECK_EQ(bias.value()->ndim, 1) << "Bias tensor must be 1D (M,)";
     TVM_FFI_ICHECK_EQ(bias.value()->shape[0], M) << "Bias tensor must have M elements";
     TVM_FFI_ICHECK_EQ(bias.value()->dtype, mat1->dtype)
-                << "Bias tensor must have the same dtype as input matrices";
+        << "Bias tensor must have the same dtype as input matrices";
     TVM_FFI_ICHECK_EQ(bias.value()->strides[0], 1) << "Bias tensor must be M contiguous";
   }
 
@@ -196,12 +199,14 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bi
   // original C is [N, M] row major
   // after transpose, it's [M, N] column major
   // the storage is unchanged, only the logical coordinates are changed
-  return C.t();
+  std::swap(C->shape[0], C->shape[1]);
+  std::swap(C->strides[0], C->strides[1]);
+  return C;
 }
 
 // Keep backward compatibility functions
-Tensor bf16_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bias,
-                     int64_t tactic, bool pdl) {
+Tensor bf16_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bias, int64_t tactic,
+                 bool pdl) {
   // Check that inputs are bfloat16 for backward compatibility
   TVM_FFI_ICHECK_EQ(mat1->dtype, dl_bfloat16) << "mat1 tensor must be bfloat16";
   TVM_FFI_ICHECK_EQ(mat2->dtype, dl_bfloat16) << "mat2 tensor must be bfloat16";
