@@ -168,7 +168,7 @@ def download_artifacts():
         results = []
         with (
             patch_logger_for_tqdm(logger),
-            tqdm(total=len(futures), desc="Downloading cubins") as pbar,
+            tqdm.tqdm(total=len(futures), desc="Downloading cubins") as pbar,
         ):
             for ret in as_completed(futures):
                 result = ret.result()

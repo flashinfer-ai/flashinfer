@@ -30,9 +30,33 @@ FLASHINFER_BASE_DIR = pathlib.Path(
 )
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
-FLASHINFER_CUBIN_DIR = pathlib.Path(
-    os.getenv("FLASHINFER_CUBIN_DIR", (FLASHINFER_CACHE_DIR / "cubins").as_posix())
-)
+
+
+def _get_cubin_dir():
+    """
+    Get the cubin directory path with the following priority:
+    1. flashinfer-cubin package if installed
+    2. Environment variable FLASHINFER_CUBIN_DIR
+    3. Default cache directory
+    """
+    # First check if flashinfer-cubin package is installed
+    try:
+        import flashinfer_cubin
+
+        return pathlib.Path(flashinfer_cubin.get_cubin_dir())
+    except ImportError:
+        pass
+
+    # Then check environment variable
+    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
+    if env_dir:
+        return pathlib.Path(env_dir)
+
+    # Fall back to default cache directory
+    return FLASHINFER_CACHE_DIR / "cubins"
+
+
+FLASHINFER_CUBIN_DIR = _get_cubin_dir()
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
