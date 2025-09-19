@@ -882,9 +882,8 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices
   return target_location + 1;
 }
 
-template <class T>
+template <class T, int ARR_LENGTH_CONST>
 __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices, int64_t const arr_length, T const target) {
-  constexpr int ARR_LENGTH_CONST = 128;
   if (arr_length != ARR_LENGTH_CONST) {
       asm("trap;");
   }
@@ -910,11 +909,11 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices
   return (int64_t)total;
 }
 
-template <class T>
+template <class T, int ARR_LENGTH_CONST = 128>
 __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, int64_t const arr_length, T const target) {
 //     return findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
 
-    return findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
+    return findTotalEltsLessThanTarget_v2<ARR_LENGTH_CONST>(sorted_indices, arr_length, target);
 
 //     int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
 //     int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
@@ -1462,7 +1461,7 @@ constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
-          bool PRE_QUANT_AWQ>
+          bool PRE_QUANT_AWQ, int NUM_EXPERTS_PER_NODE_CONST = 128>
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
@@ -1557,7 +1556,7 @@ __global__ void expandInputRowsKernel(
 
     if constexpr (is_nvfp4 || is_mxfp8) {
       static_assert(ELEM_PER_THREAD == 8, "Expecting 8 elements per thread for quantized types");
-      int64_t expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
+      int64_t expert = findTotalEltsLessThanTarget<NUM_EXPERTS_PER_NODE_CONST>(expert_first_token_offset, num_experts_per_node,
                                                    (int64_t)permuted_row + 1) -
                        1;
 
@@ -2207,7 +2206,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 // ============================== Activation =================================
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
-          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
+          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int NUM_EXPERTS_PER_NODE_CONST = 128>
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
@@ -2270,7 +2269,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         activation_params.swiglu_limit) {
       // TODO this is almost certainly faster as a linear scan
       expert =
-          findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) -
+          findTotalEltsLessThanTarget<NUM_EXPERTS_PER_NODE_CONST>(expert_first_token_offset, num_experts_per_node, token + 1) -
           1;
       gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
       gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
