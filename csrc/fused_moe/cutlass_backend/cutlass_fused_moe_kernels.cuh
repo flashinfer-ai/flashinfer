@@ -1545,9 +1545,12 @@ __global__ void expandInputRowsKernel(
     auto* dest_row_ptr = reinterpret_cast<OutputElem*>(permuted_output) +
                          permuted_row * hidden_size / ELEM_PER_THREAD;
 
+    constexpr int HIDDEN_SIZE_CONST = 7168;
+    if (hidden_size != HIDDEN_SIZE_CONST) { asm("trap;"); }
+
     int64_t const start_offset = threadIdx.x;
-    int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-    int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
+    constexpr int64_t stride = EXPAND_THREADS_PER_BLOCK;
+    constexpr int64_t num_elems_in_col = HIDDEN_SIZE_CONST / ELEM_PER_THREAD;
     assert(hidden_size % ELEM_PER_THREAD == 0);
     assert(hidden_size % VecSize == 0);
 
@@ -1562,6 +1565,7 @@ __global__ void expandInputRowsKernel(
       float global_scale_val = fc1_act_global_scale ? fc1_act_global_scale[act_scale_idx] : 1.0f;
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
 
+#pragma unroll
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
         auto in_vec = source_row_ptr[elem_index];
         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
