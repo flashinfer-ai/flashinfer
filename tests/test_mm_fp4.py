@@ -8,6 +8,7 @@ from flashinfer import (
     nvfp4_quantize,
     mxfp4_quantize,
 )
+from flashinfer.utils import get_compute_capability
 
 
 # TODO: Consdier splitting this function up for the various backends
@@ -24,8 +25,12 @@ def test_mm_fp4(
 ):
     use_nvfp4 = fp4_type == "nvfp4"
 
-    if backend == "trtllm" and res_dtype == torch.float16:
-        pytest.skip("Skipping test for trtllm fp4 with float16")
+    if backend == "trtllm":
+        if res_dtype == torch.float16:
+            pytest.skip("Skipping test for trtllm fp4 with float16")
+        compute_capability = get_compute_capability(torch.device(device="cuda"))
+        if compute_capability[0] in [11, 12]:
+            pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if auto_tuning and backend == "cudnn":

@@ -6,7 +6,7 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up
+from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
 
 DTYPE_MAP = {
     "fp16": torch.float16,
@@ -269,6 +269,9 @@ def test_trtllm_batch_prefill(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
@@ -462,6 +465,10 @@ def test_trtllm_batch_decode(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
@@ -682,6 +689,9 @@ def test_trtllm_batch_decode(
 def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 

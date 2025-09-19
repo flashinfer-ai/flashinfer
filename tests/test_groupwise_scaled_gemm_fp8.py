@@ -28,6 +28,7 @@ from flashinfer.gemm import (
     group_gemm_fp8_nt_groupwise,
 )
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
@@ -83,6 +84,11 @@ def test_fp8_groupwise_gemm(
     backend,
 ):
     if backend == "trtllm":
+        compute_capability = get_compute_capability(torch.device(device="cuda"))
+        if compute_capability[0] != 10:
+            pytest.skip(
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+            )
         if scale_major_mode != "MN":
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:

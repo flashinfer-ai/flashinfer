@@ -21,7 +21,7 @@ Currently supports testing most attention, gemm, and fused MOE APIs:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
-    - `mm_fp4` - Maxtrix multiplication with NVFP4 inputs.
+    - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
