@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import flashinfer
-
+from rope_reference import apply_rotary_emb, precompute_freqs_cis
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):
     sum_abs_error = (preds - target).abs().sum().detach().item()
@@ -14,7 +14,7 @@ def wmape(target: torch.Tensor, preds: torch.Tensor):
     return sum_abs_error / sum_scale
 
 
-from .rope_reference import *
+
 
 class DeepseekV2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
