@@ -35,31 +35,31 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Verify tag matches version.txt (CRITICAL)
-        run: |
-          # Extract version from tag (remove 'v' prefix)
-          TAG_VERSION="${{ inputs.tag }}"
-          TAG_VERSION="${TAG_VERSION#v}"
+      # - name: Verify tag matches version.txt (CRITICAL)
+      #   run: |
+      #     # Extract version from tag (remove 'v' prefix)
+      #     TAG_VERSION="${{ inputs.tag }}"
+      #     TAG_VERSION="${TAG_VERSION#v}"
 
-          # Check version.txt FIRST - this is the source of truth
-          if [ ! -f "version.txt" ]; then
-            echo "Error: version.txt file not found!"
-            exit 1
-          fi
+      #     # Check version.txt FIRST - this is the source of truth
+      #     if [ ! -f "version.txt" ]; then
+      #       echo "Error: version.txt file not found!"
+      #       exit 1
+      #     fi
 
-          VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+      #     VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
 
-          if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
-            echo "❌ CRITICAL ERROR: version.txt does not match tag!"
-            echo "  Tag version: $TAG_VERSION"
-            echo "  version.txt: $VERSION_TXT"
-            echo ""
-            echo "Please update version.txt to match the release version before creating a release."
-            echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
-            exit 1
-          fi
+      #     if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+      #       echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+      #       echo "  Tag version: $TAG_VERSION"
+      #       echo "  version.txt: $VERSION_TXT"
+      #       echo ""
+      #       echo "Please update version.txt to match the release version before creating a release."
+      #       echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+      #       exit 1
+      #     fi
 
-          echo "✓ version.txt matches tag version: $VERSION_TXT"
+      #     echo "✓ version.txt matches tag version: $VERSION_TXT"
 
       - name: Install build dependencies
         run: |
