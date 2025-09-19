@@ -1457,7 +1457,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // (k-1)*rows_in_input all map to row 0 in the original matrix. Thus, to know where to read in the
 // source matrix, we simply take the modulus of the expanded index.
 
-constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1697,7 +1697,7 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 16, std::max(num_rows * k, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -1813,6 +1813,10 @@ void finalizeMoeRoutingKernel(
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
     int const num_experts_per_node, int const start_expert_id) {
+if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_same_v<OutputType, __nv_bfloat16>)) {
+  printf("finalizeMoeRoutingKernel see unsupported dtype\n");
+  asm("trap;");
+} else {
   constexpr int experts_per_token = 8;
   if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
 
@@ -1847,15 +1851,18 @@ void finalizeMoeRoutingKernel(
   for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem thread_output;
     thread_output.fill(0);
+
+#pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
-      if (expert_id < 0 || expert_id >= num_experts_per_node) {
-        continue;
-      }
 
       int64_t const expanded_original_row = original_row + k_idx * num_rows;
       int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+      if (expert_id < 0 || expert_id >= num_experts_per_node) {
+        continue;
+      }
 
       int64_t expanded_rows = num_rows * experts_per_token;
       if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
@@ -1883,6 +1890,7 @@ void finalizeMoeRoutingKernel(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+}
 }
 
 // Final kernel to unpermute and scale
