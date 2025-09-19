@@ -1841,6 +1841,7 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
     thread_output.fill(0);
 
     int4 input_val_buf[experts_per_token];
+    bool enable_input_buf[experts_per_token];
 
 #pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
@@ -1851,11 +1852,13 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
       int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
 
       if (expert_id < 0 || expert_id >= num_experts_per_node) {
+        enable_input_buf[k_idx] = false;
         continue;
       }
 
       int64_t expanded_rows = num_rows * experts_per_token;
       if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+        enable_input_buf[k_idx] = false;
         continue;
       }
 
@@ -1866,16 +1869,16 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
 //           arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
       static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
       input_val_buf[k_idx] = *reinterpret_cast<const int4*>(expanded_permuted_rows_row_ptr + elem_index);
+      enable_input_buf[k_idx] = true;
     }
 
 #pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      if (!enable_input_buf[k_idx]) continue;
+
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
 
-      // TODO
-      // TODO incorrect! need to skip some cases
-      // TODO
       int4 input_val = input_val_buf[k_idx];
       ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<const InputElem*>(&input_val));
 //       if (bias) {
