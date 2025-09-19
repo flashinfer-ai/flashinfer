@@ -30,7 +30,6 @@ from .jit.cubin_loader import (
 )
 
 
-import logging
 from contextlib import contextmanager
 
 
@@ -45,45 +44,6 @@ def temp_env_var(key, value):
             os.environ.pop(key, None)
         else:
             os.environ[key] = old_value
-
-
-@contextmanager
-def patch_logger_for_tqdm(logger):
-    """
-    Context manager to patch the logger so that log messages are displayed using tqdm.write,
-    preventing interference with tqdm progress bars.
-    """
-    import tqdm
-
-    class TqdmLoggingHandler(logging.Handler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-                tqdm.write(msg, end="\n")
-            except Exception:
-                self.handleError(record)
-
-    # Save original handlers and level
-    original_handlers = logger.handlers[:]
-    original_level = logger.level
-
-    # Remove all existing handlers to prevent duplicate output
-    for h in original_handlers:
-        logger.removeHandler(h)
-
-    # Add our tqdm-aware handler
-    handler = TqdmLoggingHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    try:
-        yield
-    finally:
-        # Remove tqdm handler and restore original handlers and level
-        logger.removeHandler(handler)
-        for h in original_handlers:
-            logger.addHandler(h)
-        logger.setLevel(original_level)
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
@@ -155,25 +115,31 @@ def get_cubin_file_list():
 
 
 def download_artifacts():
-    import tqdm
+    from tqdm.contrib.logging import tqdm_logging_redirect
+
+    # use a shared session to make use of HTTP keep-alive and reuse of
+    # HTTPS connections.
+    session = requests.Session()
 
     with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
         cubin_files = get_cubin_file_list()
         num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-        pool = ThreadPoolExecutor(num_threads)
-        futures = []
-        for name, extension in cubin_files:
-            ret = pool.submit(get_cubin, name, "", extension)
-            futures.append(ret)
-        results = []
-        with (
-            patch_logger_for_tqdm(logger),
-            tqdm(total=len(futures), desc="Downloading cubins") as pbar,
-        ):
-            for ret in as_completed(futures):
-                result = ret.result()
-                results.append(result)
+        with tqdm_logging_redirect(
+            total=len(cubin_files), desc="Downloading cubins"
+        ) as pbar:
+
+            def update_pbar_cb(_) -> None:
                 pbar.update(1)
+
+            with ThreadPoolExecutor(num_threads) as pool:
+                futures = []
+                for name, extension in cubin_files:
+                    fut = pool.submit(get_cubin, name, "", extension, session)
+                    fut.add_done_callback(update_pbar_cb)
+                    futures.append(fut)
+
+                results = [fut.result() for fut in as_completed(futures)]
+
         all_success = all(results)
     if not all_success:
         raise RuntimeError("Failed to download cubins")
