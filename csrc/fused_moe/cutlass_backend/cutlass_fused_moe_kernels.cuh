@@ -1867,10 +1867,10 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
       static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
       const int4 input_val = *reinterpret_cast<const int4*>(expanded_permuted_rows_row_ptr + elem_index);
       ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<const InputElem*>(&input_val));
-      if (bias) {
-        auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
-        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
-      }
+//       if (bias) {
+//         auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
+//         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+//       }
 
       thread_output = thread_output + row_scale * expert_result;
     }
