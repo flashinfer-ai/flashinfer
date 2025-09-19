@@ -14,8 +14,7 @@ def wmape(target: torch.Tensor, preds: torch.Tensor):
     return sum_abs_error / sum_scale
 
 
-from rope_reference import *
-
+from .rope_reference import *
 
 class DeepseekV2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
