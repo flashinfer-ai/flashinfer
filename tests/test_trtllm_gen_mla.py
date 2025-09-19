@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
@@ -31,6 +32,9 @@ def test_trtllm_batch_decode_mla(
     dynamic_scale: bool,
     enable_pdl: bool,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 

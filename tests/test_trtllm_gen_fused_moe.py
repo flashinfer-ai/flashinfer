@@ -46,7 +46,7 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w2_permute_indices,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from flashinfer.utils import calculate_tile_tokens_dim
+from flashinfer.utils import calculate_tile_tokens_dim, get_compute_capability
 
 
 def check_cuda(err):
@@ -2003,6 +2003,9 @@ def test_moe_quantization_classes(
 
     Each quantization class clearly shows which precision is being used.
     """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     # Skip incompatible combinations
     if gated_act_type == GatedActType.GeGlu and (
         type(moe_impl) is not FP4Moe
