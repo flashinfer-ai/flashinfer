@@ -47,7 +47,7 @@ include-package-data = true
 version = {attr = "flashinfer_cubin.__version__"}
 
 [tool.setuptools.package-data]
-flashinfer_cubin = ["cubins/**/*"]
+flashinfer_cubin = ["flashinfer_cubin/cubins/**/*"]
 
 [tool.setuptools.cmdclass]
 build_py = "setup.DownloadAndBuildPy"
