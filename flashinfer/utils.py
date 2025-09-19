@@ -50,6 +50,14 @@ class TensorLayout(Enum):
 
 log2e = 1.44269504088896340736
 
+class GPUArchitectureError(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(self.msg)
+    def __str__(self):
+        return self.msg
+    def __repr__(self):
+        return self.msg
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if x.ndim not in [4, 5]:

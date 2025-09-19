@@ -1,7 +1,7 @@
 from typing import List
 
 import torch
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, GPUArchitectureError
 
 
 def check_input(x: torch.Tensor):
@@ -27,8 +27,9 @@ def check_device(tensors: List[torch.Tensor], major:List[int] = [], minor:List[i
         assert t.device == device, (
             f"All tensors should be on the same device, but got {device} and {t.device}"
         )
-
-    if len(major) > 0:
-        assert get_compute_capability(device)[0] in major, f"Device major should be {major}, but got {get_compute_capability(device)[0]}"
-    if len(minor) > 0:
-        assert get_compute_capability(device)[1] in minor, f"Device minor should be {minor}, but got {get_compute_capability(device)[1]}"
+    if len(major) > 0 or len(minor) > 0:
+        major, minor = get_compute_capability(device)
+        if len(major) > 0 and major not in major:
+            raise GPUArchitectureError(f"Device major should be in {major}, but got {major}")
+        if len(minor) > 0 and minor not in minor:
+            raise GPUArchitectureError(f"Device minor should be in {minor}, but got {minor}")
