@@ -24,7 +24,6 @@
 #include <numeric>
 #include <random>
 #include <sstream>
-#include <type_traits>
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -866,7 +865,7 @@ void threeStepBuildExpertMapsSortFirstToken(
 // ============================== Infer GEMM sizes =================================
 // TODO Could linear search be better for small # experts
 template <class T>
-__device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices,
+__device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices,
                                                       int64_t const arr_length, T const target) {
   int64_t low = 0, high = arr_length - 1, target_location = -1;
   while (low <= high) {
@@ -880,49 +879,6 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices
     }
   }
   return target_location + 1;
-}
-
-template <class T>
-__device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices, int64_t const arr_length, T const target) {
-  constexpr int ARR_LENGTH_CONST = 128;
-  if (arr_length != ARR_LENGTH_CONST) {
-      asm("trap;");
-  }
-
-  constexpr unsigned full_mask = 0xffffffffu;
-  constexpr int WARP_SZ = 32;
-  const int lane_id = threadIdx.x & (WARP_SZ - 1);
-
-  int local_count = 0;
-#pragma unroll
-  for (int k = 0; k < ARR_LENGTH_CONST / WARP_SZ; ++k) {
-    const int idx = lane_id + k * WARP_SZ;
-    T v = sorted_indices[idx];
-    local_count += (v < target) ? 1 : 0;
-  }
-
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local_count += __shfl_down_sync(full_mask, local_count, offset);
-  }
-  int total = __shfl_sync(full_mask, local_count, 0);
-
-  return (int64_t)total;
-}
-
-template <class T>
-__device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, int64_t const arr_length, T const target) {
-//     return findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
-
-    return findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
-
-//     int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
-//     int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
-//     if (out_v1 != out_v2) {
-//         printf("different output! v1=%lld v2=%lld\n", out_v1, out_v2);
-//         asm("trap;");
-//     }
-//     return out_v1;
 }
 
 template <class T>
@@ -1458,7 +1414,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // (k-1)*rows_in_input all map to row 0 in the original matrix. Thus, to know where to read in the
 // source matrix, we simply take the modulus of the expanded index.
 
-constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1466,15 +1422,12 @@ template <class InputActivationsType, class ExpandedActivationsType,
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
-    int const* permuted_row_to_unpermuted_row, int64_t const num_tokens, int64_t const hidden_size_real_,
+    int const* permuted_row_to_unpermuted_row, int64_t const num_tokens, int64_t const hidden_size,
     int64_t const k, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
     int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
     int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr) {
-  constexpr int hidden_size = 7168;
-  if (hidden_size != hidden_size_real_) { asm("trap;"); }
-
   static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE ||
                     !PRE_QUANT_AWQ,
                 "AWQ and Block Scaling are mutually exclusive");
@@ -1550,8 +1503,8 @@ __global__ void expandInputRowsKernel(
                          permuted_row * hidden_size / ELEM_PER_THREAD;
 
     int64_t const start_offset = threadIdx.x;
-    constexpr int64_t stride = EXPAND_THREADS_PER_BLOCK;
-    constexpr int64_t num_elems_in_col = hidden_size / ELEM_PER_THREAD;
+    int64_t const stride = EXPAND_THREADS_PER_BLOCK;
+    int64_t const num_elems_in_col = hidden_size / ELEM_PER_THREAD;
     assert(hidden_size % ELEM_PER_THREAD == 0);
     assert(hidden_size % VecSize == 0);
 
@@ -1566,7 +1519,6 @@ __global__ void expandInputRowsKernel(
       float global_scale_val = fc1_act_global_scale ? fc1_act_global_scale[act_scale_idx] : 1.0f;
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
 
-#pragma unroll
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
         auto in_vec = source_row_ptr[elem_index];
         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
@@ -1698,7 +1650,7 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 16, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -1796,20 +1748,11 @@ constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
 // connection.
 template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
-__global__
-__maxnreg__(64)
-void finalizeMoeRoutingKernel(
+__global__ void finalizeMoeRoutingKernel(
     GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
-    int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
+    int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token,
     int const num_experts_per_node, int const start_expert_id) {
-if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_same_v<OutputType, __nv_bfloat16>)) {
-  printf("finalizeMoeRoutingKernel see unsupported dtype\n");
-  asm("trap;");
-} else {
-  constexpr int experts_per_token = 8;
-  if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
-
   int64_t const original_row = blockIdx.x;
   int64_t const num_rows = gridDim.x;
   auto const offset = original_row * orig_cols;
@@ -1841,66 +1784,42 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
   for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem thread_output;
     thread_output.fill(0);
-
-    int4 input_val_buf[experts_per_token];
-    uint32_t enable_input_buf = 0;
-
-#pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
-
-      int64_t const expanded_original_row = original_row + k_idx * num_rows;
-      int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
-
       if (expert_id < 0 || expert_id >= num_experts_per_node) {
         continue;
       }
+
+      int64_t const expanded_original_row = original_row + k_idx * num_rows;
+      int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
 
       int64_t expanded_rows = num_rows * experts_per_token;
       if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
         continue;
       }
 
+      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
       auto const* expanded_permuted_rows_row_ptr =
           expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
-//       ComputeElem expert_result =
-//           arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
-      static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
-      input_val_buf[k_idx] = *reinterpret_cast<const int4*>(expanded_permuted_rows_row_ptr + elem_index);
-      enable_input_buf |= 1 << k_idx;
-    }
-
-#pragma unroll
-    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
-      if (not (enable_input_buf & (1 << k_idx))) continue;
-
-      int64_t const k_offset = original_row * experts_per_token + k_idx;
-      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
-
-      int4 input_val = input_val_buf[k_idx];
-      ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<const InputElem*>(&input_val));
-//       if (bias) {
-//         auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
-//         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
-//       }
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      if (bias) {
+        auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
+        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+      }
 
       thread_output = thread_output + row_scale * expert_result;
     }
 
-//     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
-//     reduced_row_ptr_v[elem_index] = output_elem;
-    // TODO alignment issue?
-    __align__(16) OutputElem output_elem_original = arrayConvert<ComputeElem, OutputElem>(thread_output);
-    int4 output_elem = *reinterpret_cast<int4*>(&output_elem_original);
-    static_assert(sizeof(reduced_row_ptr_v[0]) == sizeof(int4));
-    *reinterpret_cast<int4*>(reduced_row_ptr_v + elem_index) = output_elem;
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-}
 }
 
 // Final kernel to unpermute and scale
@@ -2211,13 +2130,10 @@ template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
-                                   int num_experts_per_node, int64_t inter_size_real_,
+                                   int num_experts_per_node, int64_t inter_size,
                                    float const* fc2_act_global_scale, bool use_per_expert_act_scale,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
                                    ActivationParams activation_params) {
-  constexpr int inter_size = 2048;
-  if (inter_size != inter_size_real_) { asm("trap;"); }
-
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       std::is_same_v<T, __nv_fp4_e2m1> &&
@@ -2302,9 +2218,9 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
     auto bias_ptr_vec = reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset);
     int64_t const start_offset = tid;
-    constexpr int64_t stride = ACTIVATION_THREADS_PER_BLOCK;
+    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
-    constexpr int64_t num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
+    int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
@@ -2312,8 +2228,6 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     fn.alpha = gate_alpha;
     fn.beta = gate_beta;
     fn.limit = gate_limit;
-
-#pragma unroll
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
