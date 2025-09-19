@@ -1082,51 +1082,6 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
   }
 }
 
-template <int VecSize, int ElementsPerThread>
-__device__ TmaWarpSpecializedGroupedGemmInput::ElementSF writeSF_v2_read(int64_t num_tokens_before_expert, int64_t expert_id,
-                        int64_t source_token_id, int64_t token_id, int64_t elem_idx,
-                        int64_t num_cols,
-                        TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-                        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf) {
-  static constexpr int NumThreadsPerSF = VecSize / ElementsPerThread;
-  assert(input_sf != nullptr);
-  // TODO correct?
-  auto const sf_in = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
-                                                 NumThreadsPerSF>(
-      std::nullopt /* batchIdx */, source_token_id, elem_idx, std::nullopt /* numRows */,
-      num_cols / VecSize, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-      QuantizationSFLayout::SWIZZLED_128x4);
-  return *sf_in;
-}
-
-template <int VecSize, int ElementsPerThread>
-__device__ void writeSF_v2_write(int64_t num_tokens_before_expert, int64_t expert_id,
-                        int64_t source_token_id, int64_t token_id, int64_t elem_idx,
-                        int64_t num_cols,
-                        TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-                        TmaWarpSpecializedGroupedGemmInput::ElementSF value_to_write) {
-  static constexpr int NumThreadsPerSF = VecSize / ElementsPerThread;
-
-  // We need to offset into the scaling factors for just this expert
-  auto act_sf_expert =
-      act_sf_flat + getOffsetActivationSF(
-                        expert_id, num_tokens_before_expert, num_cols,
-                        (VecSize == TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize)
-                            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
-
-  // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this
-  // expert
-  auto sf_out =
-      cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
-          std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
-          std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert,
-          QuantizationSFLayout::SWIZZLED_128x4);
-  if (sf_out) {
-    *sf_out = value_to_write;
-  }
-}
-
 // ====================== Compute FP8 dequant scale only ===============================
 __global__ void computeFP8DequantScaleKernel(float const** alpha_scale_ptr_array,
                                              int64_t const num_experts_per_node,
@@ -1502,8 +1457,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // (k-1)*rows_in_input all map to row 0 in the original matrix. Thus, to know where to read in the
 // source matrix, we simply take the modulus of the expanded index.
 
-// constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
-constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1567,18 +1521,10 @@ __global__ void expandInputRowsKernel(
   int64_t const padded_hidden_size =
       TmaWarpSpecializedGroupedGemmInput::alignToSfDim(hidden_size, min_k_dim_alignment);
 
-  int64_t unpermuted_row_next = permuted_row_to_unpermuted_row[blockIdx.x];
-
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
   for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens;
        permuted_row += gridDim.x) {
-    int64_t const unpermuted_row = unpermuted_row_next;
-    {
-        int64_t idx = permuted_row + gridDim.x;
-        if (idx < num_valid_tokens) {
-            unpermuted_row_next = permuted_row_to_unpermuted_row[idx];
-        }
-    }
+    int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
 
     // Load 128-bits per thread
 
@@ -1619,56 +1565,28 @@ __global__ void expandInputRowsKernel(
       float global_scale_val = fc1_act_global_scale ? fc1_act_global_scale[act_scale_idx] : 1.0f;
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
 
-      if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
-         asm("trap;");
-      } else {
+#pragma unroll
+      for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
+        auto in_vec = source_row_ptr[elem_index];
+        if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
+          auto res = quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem,
+                                            VecSize>(
+              in_vec, global_scale_val, num_tokens_before_expert, expert, permuted_row, elem_index,
+              padded_hidden_size, fc1_act_sf_flat,
+              is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                       : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+          static_assert(sizeof(res) == sizeof(*dest_row_ptr),
+                        "Quantized value must be the same size as the output");
+          dest_row_ptr[elem_index] = res;
+        } else {
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
-
-          constexpr int BUF_SIZE = 7;
-          static_assert(ceilDiv(num_elems_in_col, stride) == BUF_SIZE);
-          DataElem data_buf[BUF_SIZE];
-          TmaWarpSpecializedGroupedGemmInput::ElementSF sf_buf[BUF_SIZE];
-
-#pragma unroll
-          for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
-              data_buf[idx] = source_row_ptr[elem_index];
-              sf_buf[idx] = writeSF_v2_read<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
+          writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf);
-          }
-
-#pragma unroll
-          for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
-              writeSF_v2_write<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
-                                            permuted_row, elem_index, padded_hidden_size,
-                                            fc1_act_sf_flat, sf_buf[idx]);
-              dest_row_ptr[elem_index] = data_buf[idx];
-          }
+          dest_row_ptr[elem_index] = in_vec;
+        }
       }
-
-// #pragma unroll
-//       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-//         auto in_vec = source_row_ptr[elem_index];
-//         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
-//           auto res = quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem,
-//                                             VecSize>(
-//               in_vec, global_scale_val, num_tokens_before_expert, expert, permuted_row, elem_index,
-//               padded_hidden_size, fc1_act_sf_flat,
-//               is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-//                        : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
-//           static_assert(sizeof(res) == sizeof(*dest_row_ptr),
-//                         "Quantized value must be the same size as the output");
-//           dest_row_ptr[elem_index] = res;
-//         } else {
-//           assert(act_scale_idx == 0 &&
-//                  "Cannot use per-expert act scale for pre-quantized activations");
-//           writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
-//                                             permuted_row, elem_index, padded_hidden_size,
-//                                             fc1_act_sf_flat, input_sf);
-//           dest_row_ptr[elem_index] = in_vec;
-//         }
-//       }
 
       // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
       // values in the padded SF atom Use VecSize per thread since we are just writing out zeros so
@@ -1779,7 +1697,7 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 16, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
