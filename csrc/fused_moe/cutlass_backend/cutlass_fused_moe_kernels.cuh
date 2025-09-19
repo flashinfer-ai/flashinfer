@@ -882,9 +882,8 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices
   return target_location + 1;
 }
 
-template <class T>
+template <int ARR_LENGTH_CONST, class T>
 __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices, int64_t const arr_length, T const target) {
-  constexpr int ARR_LENGTH_CONST = 128;
   if (arr_length != ARR_LENGTH_CONST) {
       asm("trap;");
   }
@@ -910,11 +909,11 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices
   return (int64_t)total;
 }
 
-template <class T>
+template <int ARR_LENGTH_CONST, class T>
 __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices, int64_t const arr_length, T const target) {
 //     return findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
 
-    return findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
+    return findTotalEltsLessThanTarget_v2<ARR_LENGTH_CONST>(sorted_indices, arr_length, target);
 
 //     int64_t out_v1 = findTotalEltsLessThanTarget_v1(sorted_indices, arr_length, target);
 //     int64_t out_v2 = findTotalEltsLessThanTarget_v2(sorted_indices, arr_length, target);
@@ -1462,7 +1461,7 @@ constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
-          bool PRE_QUANT_AWQ>
+          bool PRE_QUANT_AWQ, int NUM_EXPERTS_PER_NODE_CONST = 128>
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
@@ -1557,7 +1556,7 @@ __global__ void expandInputRowsKernel(
 
     if constexpr (is_nvfp4 || is_mxfp8) {
       static_assert(ELEM_PER_THREAD == 8, "Expecting 8 elements per thread for quantized types");
-      int64_t expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
+      int64_t expert = findTotalEltsLessThanTarget<NUM_EXPERTS_PER_NODE_CONST>(expert_first_token_offset, num_experts_per_node,
                                                    (int64_t)permuted_row + 1) -
                        1;
 
@@ -1735,9 +1734,20 @@ void expandInputRowsKernelLauncher(
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc1.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
-      return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
+      if (num_experts_per_node == 128) {
+        constexpr int NUM_EXPERTS_PER_NODE_CONST = 128;
+        return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
                                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
-                                    false>;
+                                    false, NUM_EXPERTS_PER_NODE_CONST>;
+      }
+      if (num_experts_per_node == 64) {
+        constexpr int NUM_EXPERTS_PER_NODE_CONST = 64;
+        return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
+                                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
+                                    false, NUM_EXPERTS_PER_NODE_CONST>;
+      }
+      printf("unsupported num_experts_per_node\n");
+      exit(1);
     } else
 #endif
     {
@@ -2159,7 +2169,7 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   float gate_bias = 0.0f;
   float gate_limit = std::numeric_limits<float>::infinity();
   if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit) {
-    int expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
+    int expert = findTotalEltsLessThanTarget<128>(expert_first_token_offset, num_experts_per_node,
                                              (int64_t)token + 1) -
                  1;
     gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
@@ -2207,7 +2217,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 // ============================== Activation =================================
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
-          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
+          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType, int NUM_EXPERTS_PER_NODE_CONST = 128>
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
@@ -2270,7 +2280,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         activation_params.swiglu_limit) {
       // TODO this is almost certainly faster as a linear scan
       expert =
-          findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) -
+          findTotalEltsLessThanTarget<NUM_EXPERTS_PER_NODE_CONST>(expert_first_token_offset, num_experts_per_node, token + 1) -
           1;
       gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
       gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
@@ -2444,30 +2454,62 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type) {
-      auto fn_list = std::array{
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-                              decltype(block_scaling_type)::value>,  // Gelu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                              decltype(block_scaling_type)::value>,  // Relu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-                              decltype(block_scaling_type)::value>,  // Silu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                              decltype(block_scaling_type)::value>,  // Swiglu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              GLUAdaptor<cutlass::epilogue::thread::GELU>,
-                              decltype(block_scaling_type)::value>,  // Geglu
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                              decltype(block_scaling_type)::value>,  // SwigluBias
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                              IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                              decltype(block_scaling_type)::value>  // Identity
+      if (num_experts_per_node == 128) {
+        constexpr int NUM_EXPERTS_PER_NODE_CONST = 128;
+        auto fn_list = std::array{
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::GELU>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Gelu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Relu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Silu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                GLUAdaptor<cutlass::epilogue::thread::SiLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Swiglu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                GLUAdaptor<cutlass::epilogue::thread::GELU>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Geglu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // SwigluBias
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::Identity>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>  // Identity
 
-      };
-      return fn_list[static_cast<int>(activation_type.activation_type)];
+        };
+        return fn_list[static_cast<int>(activation_type.activation_type)];
+      }
+      if (num_experts_per_node == 64) {
+        constexpr int NUM_EXPERTS_PER_NODE_CONST = 128;
+        auto fn_list = std::array{
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::GELU>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Gelu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Relu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Silu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                GLUAdaptor<cutlass::epilogue::thread::SiLu>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Swiglu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                GLUAdaptor<cutlass::epilogue::thread::GELU>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // Geglu
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST>,  // SwigluBias
+            &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                                IdentityAdaptor<cutlass::epilogue::thread::Identity>,
+                                decltype(block_scaling_type)::value, NUM_EXPERTS_PER_NODE_CONST> // Identity
+
+        };
+        return fn_list[static_cast<int>(activation_type.activation_type)];
+      }
+      printf("unsupported num_experts_per_node\n");
+      exit(1);
     };
     auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
