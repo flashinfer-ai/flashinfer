@@ -656,6 +656,7 @@ def main():
     import importlib
 
     if importlib.util.find_spec("flashinfer") is None:
+        # NOTE(Zihao): this script can run before or after flashinfer is installed, if flashinfer is not installed, use the local paths
         jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
         jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
         jit_env.CUTLASS_INCLUDE_DIRS = [
