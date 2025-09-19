@@ -1795,9 +1795,7 @@ constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
 // connection.
 template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
-__global__
-__maxnreg__(32)
-void finalizeMoeRoutingKernel(
+__global__ void finalizeMoeRoutingKernel(
     GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
