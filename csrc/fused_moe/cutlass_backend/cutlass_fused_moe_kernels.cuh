@@ -1457,7 +1457,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // (k-1)*rows_in_input all map to row 0 in the original matrix. Thus, to know where to read in the
 // source matrix, we simply take the modulus of the expanded index.
 
-constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 64;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1697,7 +1697,7 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 16, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 32, std::max(num_rows * k, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
