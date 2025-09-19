@@ -1702,46 +1702,46 @@ __global__ void expandInputRowsKernel(
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (is_nvfp4 || is_mxfp8) {
-    int64_t const start_offset = threadIdx.x;
-    int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-    // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    // whole vector
-    int64_t const padded_num_elems_in_col = padded_hidden_size / VecSize;
-    assert(padded_hidden_size % VecSize == 0);
-
-    constexpr int min_num_tokens_alignment =
-        is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                 : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-    static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
-                  "Min num tokens alignment must be a power of two");
-    // Since we don't know a priori how much padding is needed we assume the max per expert
-    // NOTE: we don't use (min_num_tokens_alignment-1) to be able to do power of two divisions
-    int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-
-    for (int64_t padding_token = blockIdx.x; padding_token < num_padding_tokens;
-         padding_token += gridDim.x) {
-      int64_t expert = padding_token / min_num_tokens_alignment;
-      int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-      int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-      int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      int64_t padding_to_expert = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                                      tokens_to_expert, min_num_tokens_alignment) -
-                                  tokens_to_expert;
-      int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-      if (expert_pad_idx < padding_to_expert) {
-        for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
-             elem_index += stride) {
-          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                    num_tokens_after_expert + expert_pad_idx, elem_index,
-                                    padded_hidden_size, fc1_act_sf_flat,
-                                    /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
-        }
-      }
-    }
-  }
+//   // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
+//   // in the padded SF atom
+//   if constexpr (is_nvfp4 || is_mxfp8) {
+//     int64_t const start_offset = threadIdx.x;
+//     int64_t const stride = EXPAND_THREADS_PER_BLOCK;
+//     // Use VecSize per thread since we are just writing out zeros so every thread can process a
+//     // whole vector
+//     int64_t const padded_num_elems_in_col = padded_hidden_size / VecSize;
+//     assert(padded_hidden_size % VecSize == 0);
+//
+//     constexpr int min_num_tokens_alignment =
+//         is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
+//                  : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
+//     static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
+//                   "Min num tokens alignment must be a power of two");
+//     // Since we don't know a priori how much padding is needed we assume the max per expert
+//     // NOTE: we don't use (min_num_tokens_alignment-1) to be able to do power of two divisions
+//     int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
+//
+//     for (int64_t padding_token = blockIdx.x; padding_token < num_padding_tokens;
+//          padding_token += gridDim.x) {
+//       int64_t expert = padding_token / min_num_tokens_alignment;
+//       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
+//       int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
+//       int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
+//       int64_t padding_to_expert = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+//                                       tokens_to_expert, min_num_tokens_alignment) -
+//                                   tokens_to_expert;
+//       int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
+//       if (expert_pad_idx < padding_to_expert) {
+//         for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
+//              elem_index += stride) {
+//           writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
+//                                     num_tokens_after_expert + expert_pad_idx, elem_index,
+//                                     padded_hidden_size, fc1_act_sf_flat,
+//                                     /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
+//         }
+//       }
+//     }
+//   }
 }
 
 template <class InputActivationsType, class ExpandedActivationsType>
