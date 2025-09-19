@@ -24,7 +24,14 @@ namespace routingDeepSeek {
 
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
-static constexpr int MaxNumTopGroups = 16;
+
+__host__ __device__ int constexpr getMaxNumTopGroups(const bool useGroups, const int numExperts) {
+  if (useGroups || numExperts <= 256) {
+    return 4;
+  } else {
+    return 16;
+  }
+}
 
 template <typename KernelParams>
 __global__ void routingMainKernel(KernelParams params) {
@@ -33,6 +40,8 @@ __global__ void routingMainKernel(KernelParams params) {
   using InputT = typename KernelParams::InputT;
   static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
+  constexpr int MaxNumTopGroups =
+      getMaxNumTopGroups(KernelParams::UseGroups, KernelParams::NumExperts);
 
   // declare shared memory structure
   // number of experts is bounded by number of threads
@@ -418,6 +427,7 @@ template <int NumExperts>
 void runImpl(Data& data, void* stream) {
   static constexpr int NumThreads = NumExperts;  // DeepSeek: 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
+  const int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, NumExperts);
 
   // Validate that the template parameter matches the data
   TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
