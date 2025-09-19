@@ -26,6 +26,7 @@ static constexpr int NumThreads = 256;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroupsDefault = 16;
 
 __host__ __device__ int getMaxNumTopGroups(const bool useGroups, const int numExperts) {
   if (useGroups || numExperts <= 256) {
@@ -120,10 +121,10 @@ __global__ void routingMainKernel(KernelParams params) {
   // registers for top group score reduction
   float topExpGroupScores[NumTopGroupScores];
   [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-  float topGroups[MaxNumTopGroups];  // bound of params.mNumLimitedGroups
-  int32_t topGroupIdx[MaxNumTopGroups];
-  float expertScoreGroup[MaxNumTopGroups];
-  int32_t expertIdxGroup[MaxNumTopGroups];
+  float topGroups[MaxNumTopGroupsDefault];  // bound of params.mNumLimitedGroups
+  int32_t topGroupIdx[MaxNumTopGroupsDefault];
+  float expertScoreGroup[MaxNumTopGroupsDefault];
+  int32_t expertIdxGroup[MaxNumTopGroupsDefault];
   float topScores[MaxNumTopExperts];  // bound of params.mTopK
   int32_t topExperts[MaxNumTopExperts];
 
