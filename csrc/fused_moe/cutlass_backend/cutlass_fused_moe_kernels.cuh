@@ -2177,10 +2177,13 @@ template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
-                                   int num_experts_per_node, int64_t inter_size,
+                                   int num_experts_per_node, int64_t inter_size_real_,
                                    float const* fc2_act_global_scale, bool use_per_expert_act_scale,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
                                    ActivationParams activation_params) {
+  constexpr int inter_size = 2048;
+  if (inter_size != inter_size_real_) { asm("trap;"); }
+
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       std::is_same_v<T, __nv_fp4_e2m1> &&
@@ -2265,9 +2268,9 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
     auto bias_ptr_vec = reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset);
     int64_t const start_offset = tid;
-    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
+    constexpr int64_t stride = ACTIVATION_THREADS_PER_BLOCK;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
-    int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
+    constexpr int64_t num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
@@ -2275,6 +2278,8 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     fn.alpha = gate_alpha;
     fn.beta = gate_beta;
     fn.limit = gate_limit;
+
+#pragma unroll
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
