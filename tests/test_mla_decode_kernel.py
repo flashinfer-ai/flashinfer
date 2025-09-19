@@ -406,10 +406,6 @@ def test_mla_decode_kernel(bsz, kv_len, page_size):
 
     mla_vanilla = DeepseekV2AttentionVanilla().cuda(device=dev_id)
 
-    bsz = 6
-    kv_len = 640
-    page_size = 16
-
     hidden_states = torch.randn([bsz, 1, mla_vanilla.hidden_size]).to(dev_id)
     compressed_kv_normed_cache = torch.randn(
         [bsz, kv_len, mla_vanilla.kv_lora_rank]
