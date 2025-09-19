@@ -1856,11 +1856,8 @@ __global__ void finalizeMoeRoutingKernel(
       auto const* expanded_permuted_rows_row_ptr =
           expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
-//       ComputeElem expert_result =
-//           arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
-      static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
-      InputElem input_val = reinterpret_cast<InputElem>(*reinterpret_cast<int4*>(expanded_permuted_rows_row_ptr + elem_index));
-      ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(input_val);
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
       if (bias) {
         auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
@@ -1869,11 +1866,8 @@ __global__ void finalizeMoeRoutingKernel(
       thread_output = thread_output + row_scale * expert_result;
     }
 
-//     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
-//     reduced_row_ptr_v[elem_index] = output_elem;
-    int4 output_elem = reinterpret_cast<int4>(arrayConvert<ComputeElem, OutputElem>(thread_output));
-    static_assert(sizeof(reduced_row_ptr_v[0]) == sizeof(int4));
-    *reinterpret_cast<int4>(reduced_row_ptr_v + elem_index) = output_elem;
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
