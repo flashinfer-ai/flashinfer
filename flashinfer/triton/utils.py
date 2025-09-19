@@ -1,6 +1,7 @@
 from typing import List
 
 import torch
+from flashinfer.utils import get_compute_capability
 
 
 def check_input(x: torch.Tensor):
@@ -28,6 +29,6 @@ def check_device(tensors: List[torch.Tensor], major:int = None, minor:int = None
         )
 
     if major is not None:
-        assert device.major == major, f"Device major should be {major}, but got {device.major}"
+        assert get_compute_capability(device)[0] == major, f"Device major should be {major}, but got {get_compute_capability(device)[0]}"
     if minor is not None:
-        assert device.minor == minor, f"Device minor should be {minor}, but got {device.minor}"
+        assert get_compute_capability(device)[1] == minor, f"Device minor should be {minor}, but got {get_compute_capability(device)[1]}"
