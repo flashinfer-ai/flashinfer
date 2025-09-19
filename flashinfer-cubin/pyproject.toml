@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "requests", "filelock", "torch", "tqdm"] # NOTE(Zihao): we should remove torch once https://github.com/flashinfer-ai/flashinfer/pull/1641 merged
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashinfer-cubin"
+dynamic = ["version"]
+description = "Pre-compiled cubins for FlashInfer"
+readme = {text = "This package contains pre-compiled CUDA kernels (cubins) for FlashInfer. It provides all necessary cubin files downloaded from the FlashInfer artifactory.", content-type = "text/plain"}
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "FlashInfer team"},
+]
+maintainers = [
+    {name = "FlashInfer team"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "requests",
+    "filelock",
+]
+
+[project.urls]
+Homepage = "https://github.com/flashinfer-ai/flashinfer"
+Documentation = "https://github.com/flashinfer-ai/flashinfer"
+Repository = "https://github.com/flashinfer-ai/flashinfer"
+"Issue Tracker" = "https://github.com/flashinfer-ai/flashinfer/issues"
+
+[tool.setuptools]
+packages = ["flashinfer_cubin"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "flashinfer_cubin.__version__"}
+
+[tool.setuptools.package-data]
+flashinfer_cubin = ["cubins/**/*"]
+
+[tool.setuptools.cmdclass]
+build_py = "setup.DownloadAndBuildPy"
+sdist = "setup.CustomSdist"

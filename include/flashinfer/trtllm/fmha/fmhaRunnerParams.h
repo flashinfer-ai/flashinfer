@@ -134,10 +134,14 @@ enum class TileScheduler {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 enum class MultiCtasKvMode {
-  // No multiCtasKvMode.
+  // Disable the multiCtasKvMode.
   Disabled = 0,
   // Do the reduction through the global memory and atomic counters.
   GmemReduction,
+  // Same as GmemReduction, but use a separate kernel for the reduction.
+  // It is only supported/needed for 2-CTA or 1-CTA keepsMmaAbForGeneration MLA kernels with large
+  // reduction tiles.
+  GmemReductionWithSeparateKernel,
   // Do the reduction through the CGA remote shared memory.
   CgaSmemReduction
 };
@@ -156,6 +160,7 @@ inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode) {
 
 MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
 MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
+MULTI_CTAS_KV_MODE_FUNCTION(GmemReductionWithSeparateKernel)
 MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 #undef MULTI_CTAS_KV_MODE_FUNCTION
