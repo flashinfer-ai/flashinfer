@@ -24,7 +24,6 @@
 #include <numeric>
 #include <random>
 #include <sstream>
-#include <type_traits>
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -1801,10 +1800,6 @@ __global__ void finalizeMoeRoutingKernel(
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
     int const num_experts_per_node, int const start_expert_id) {
-if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_same_v<OutputType, __nv_bfloat16>)) {
-  printf("finalizeMoeRoutingKernel see unsupported dtype\n");
-  asm("trap;");
-} else {
   constexpr int experts_per_token = 8;
   if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
 
@@ -1864,8 +1859,8 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
 //       ComputeElem expert_result =
 //           arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
       static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
-      const int4 input_val = *reinterpret_cast<const int4*>(expanded_permuted_rows_row_ptr + elem_index);
-      ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<const InputElem*>(&input_val));
+      InputElem input_val = reinterpret_cast<InputElem>(*reinterpret_cast<int4*>(expanded_permuted_rows_row_ptr + elem_index));
+      ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(input_val);
       if (bias) {
         auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
@@ -1876,16 +1871,13 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
 
 //     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
 //     reduced_row_ptr_v[elem_index] = output_elem;
-    // TODO alignment issue?
-    __align__(16) OutputElem output_elem_original = arrayConvert<ComputeElem, OutputElem>(thread_output);
-    int4 output_elem = *reinterpret_cast<int4*>(&output_elem_original);
+    int4 output_elem = reinterpret_cast<int4>(arrayConvert<ComputeElem, OutputElem>(thread_output));
     static_assert(sizeof(reduced_row_ptr_v[0]) == sizeof(int4));
-    *reinterpret_cast<int4*>(reduced_row_ptr_v + elem_index) = output_elem;
+    *reinterpret_cast<int4>(reduced_row_ptr_v + elem_index) = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-}
 }
 
 // Final kernel to unpermute and scale
