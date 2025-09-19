@@ -2439,7 +2439,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 6, std::max(expanded_num_tokens, num_padding_tokens));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
   auto fn = [&]() {
