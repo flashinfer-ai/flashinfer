@@ -1465,12 +1465,15 @@ template <class InputActivationsType, class ExpandedActivationsType,
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
-    int const* permuted_row_to_unpermuted_row, int64_t const num_tokens, int64_t const hidden_size,
+    int const* permuted_row_to_unpermuted_row, int64_t const num_tokens, int64_t const hidden_size_real_,
     int64_t const k, float const* fc1_act_global_scale, bool use_per_expert_act_scale,
     int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
     int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr) {
+  constexpr int hidden_size = 7168;
+  if (hidden_size != hidden_size_real_) { asm("trap;"); }
+
   static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE ||
                     !PRE_QUANT_AWQ,
                 "AWQ and Block Scaling are mutually exclusive");
@@ -1545,12 +1548,9 @@ __global__ void expandInputRowsKernel(
     auto* dest_row_ptr = reinterpret_cast<OutputElem*>(permuted_output) +
                          permuted_row * hidden_size / ELEM_PER_THREAD;
 
-    constexpr int HIDDEN_SIZE_CONST = 7168;
-    if (hidden_size != HIDDEN_SIZE_CONST) { asm("trap;"); }
-
     int64_t const start_offset = threadIdx.x;
     constexpr int64_t stride = EXPAND_THREADS_PER_BLOCK;
-    constexpr int64_t num_elems_in_col = HIDDEN_SIZE_CONST / ELEM_PER_THREAD;
+    constexpr int64_t num_elems_in_col = hidden_size / ELEM_PER_THREAD;
     assert(hidden_size % ELEM_PER_THREAD == 0);
     assert(hidden_size % VecSize == 0);
 
