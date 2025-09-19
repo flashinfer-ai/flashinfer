@@ -1502,7 +1502,8 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // (k-1)*rows_in_input all map to row 0 in the original matrix. Thus, to know where to read in the
 // source matrix, we simply take the modulus of the expanded index.
 
-constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
+// constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1624,7 +1625,7 @@ __global__ void expandInputRowsKernel(
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
 
-          constexpr int BUF_SIZE = 4;
+          constexpr int BUF_SIZE = 7;
           static_assert(ceilDiv(num_elems_in_col, stride) == BUF_SIZE);
           DataElem data_buf[BUF_SIZE];
           TmaWarpSpecializedGroupedGemmInput::ElementSF sf_buf[BUF_SIZE];
