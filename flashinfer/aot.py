@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Iterator
@@ -50,6 +51,71 @@ from .tllm_utils import gen_trtllm_utils_module
 from .utils import gen_logging_module, version_at_least
 from .xqa import gen_xqa_module
 from .compilation_context import CompilationContext
+
+
+@contextmanager
+def jit_environment_context(
+    project_root: Path = None, build_dir: Path = None, setup_paths: bool = True
+):
+    """
+    Context manager for temporarily modifying JIT environment settings.
+
+    Args:
+        project_root: Project root directory (auto-detected if None)
+        build_dir: Build directory (uses default if None)
+        setup_paths: Whether to set up source/include paths
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parents[1]
+
+    if build_dir is None:
+        build_dir = project_root / "build" / "aot"
+
+    # Store original values
+    original_values = {}
+
+    if setup_paths:
+        # Save and update source/include directories
+        original_values.update(
+            {
+                "FLASHINFER_CSRC_DIR": jit_env.FLASHINFER_CSRC_DIR,
+                "FLASHINFER_INCLUDE_DIR": jit_env.FLASHINFER_INCLUDE_DIR,
+                "CUTLASS_INCLUDE_DIRS": jit_env.CUTLASS_INCLUDE_DIRS,
+                "SPDLOG_INCLUDE_DIR": jit_env.SPDLOG_INCLUDE_DIR,
+            }
+        )
+
+        jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+        jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+        jit_env.CUTLASS_INCLUDE_DIRS = [
+            project_root / "3rdparty" / "cutlass" / "include",
+            project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+        ]
+        jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+    # Save and update workspace directories
+    original_values.update(
+        {
+            "FLASHINFER_WORKSPACE_DIR": jit_env.FLASHINFER_WORKSPACE_DIR,
+            "FLASHINFER_JIT_DIR": jit_env.FLASHINFER_JIT_DIR,
+            "FLASHINFER_GEN_SRC_DIR": jit_env.FLASHINFER_GEN_SRC_DIR,
+        }
+    )
+
+    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+
+    # Create directories
+    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        yield
+    finally:
+        # Restore original values
+        for attr_name, original_value in original_values.items():
+            setattr(jit_env, attr_name, original_value)
 
 
 def gen_fa2(
@@ -551,6 +617,129 @@ def register_default_modules() -> int:
     return len(jit_specs)
 
 
+def compile_and_package_modules(
+    output_dir: Path,
+    config: dict = None,
+    project_root: Path = None,
+    verbose: bool = True,
+    setup_environment: bool = True,
+) -> None:
+    """
+    Compile AOT modules and package them for distribution.
+
+    Args:
+        output_dir: Directory to store compiled modules
+        config: Configuration dict with compilation options (uses default if None)
+        project_root: Project root directory (auto-detected if None)
+        verbose: Enable verbose output
+        setup_environment: Whether to set up JIT environment paths
+    """
+    print("Compiling AOT modules...")
+
+    # Use default config if none provided
+    if config is None:
+        config = get_default_config()
+
+    # Auto-detect project root if not provided
+    if project_root is None:
+        project_root = Path(__file__).resolve().parents[1]
+
+    # Get CUDA arch list from environment or use default
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        # Try to detect from current CUDA device
+        try:
+            if torch.cuda.is_available():
+                capability = torch.cuda.get_device_capability()
+                compute_cap = f"{capability[0]}{capability[1]}"
+                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = compute_cap
+                if verbose:
+                    print(f"Detected CUDA compute capability: {compute_cap}")
+            else:
+                # Default to common architectures
+                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = "75;80;86;89;90"
+                if verbose:
+                    print(
+                        "No CUDA device detected, using default architectures: 75;80;86;89;90"
+                    )
+        except Exception as e:
+            raise RuntimeError(
+                f"FLASHINFER_CUDA_ARCH_LIST not set and failed to detect from current CUDA device: {e}"
+            ) from e
+
+    # Detect SM capabilities
+    has_sm90, has_sm100 = detect_sm_capabilities()
+
+    if setup_environment:
+        # Update JIT environment paths to use project root
+        jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+        jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+        jit_env.CUTLASS_INCLUDE_DIRS = [
+            project_root / "3rdparty" / "cutlass" / "include",
+            project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+        ]
+        jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+        # Set up build directory
+        build_dir = project_root / "build" / "aot"
+        jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+        jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+        jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+        jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+        jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"FLASHINFER_CUDA_ARCH_LIST: {os.environ['FLASHINFER_CUDA_ARCH_LIST']}")
+        print(f"has_sm90: {has_sm90}")
+        print(f"has_sm100: {has_sm100}")
+        print("Configuration:")
+        for key, value in config.items():
+            print(f"  {key}: {value}")
+
+    try:
+        # Generate JIT specs
+        if verbose:
+            print("Generating JIT specs...")
+
+        jit_specs = [gen_logging_module()]
+        jit_specs += gen_all_modules(
+            config["f16_dtype"],
+            config["f8_dtype"],
+            config["fa2_head_dim"],
+            config["fa3_head_dim"],
+            config["use_sliding_window"],
+            config["use_logits_soft_cap"],
+            has_sm90,
+            has_sm100,
+            config["add_comm"],
+            config["add_gemma"],
+            config["add_oai_oss"],
+            config["add_moe"],
+            config["add_act"],
+            config["add_misc"],
+            config["add_xqa"],
+        )
+
+        if verbose:
+            print(f"Total modules to compile: {len(jit_specs)}")
+
+        # Build the modules
+        if verbose:
+            print("Building JIT modules...")
+        build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=False)
+
+        # Copy built kernels to output directory
+        if verbose:
+            print(f"Copying built modules to {output_dir}...")
+        copy_built_kernels(jit_specs, output_dir)
+
+        if verbose:
+            print(f"AOT modules compiled successfully to {output_dir}")
+
+    except Exception as e:
+        print(f"AOT compilation failed with error: {e}")
+        raise RuntimeError(f"Failed to compile AOT modules: {e}") from e
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Ahead-of-Time (AOT) build all modules"
@@ -606,6 +795,10 @@ def main():
     )
     args = parser.parse_args()
 
+    # Require CUDA arch list to be set
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
     config = get_default_config()
@@ -645,80 +838,22 @@ def main():
         if arg_value is not None:
             config[key] = arg_value
 
-    # Cuda Arch
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+    # Update JIT environment for custom build directory
+    if args.build_dir:
+        jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+        jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+        jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+        jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+        jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
 
-    has_sm90, has_sm100 = detect_sm_capabilities()
-
-    # Update data dir
-    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-    jit_env.CUTLASS_INCLUDE_DIRS = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-    ]
-    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-    # Update workdir
-    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Print summary
-    print("AOT build summary:")
-    print("  out_dir:", out_dir)
-    print("  build_dir:", build_dir)
-    print("  fa2_head_dim:", config["fa2_head_dim"])
-    print("  fa3_head_dim:", config["fa3_head_dim"])
-    print("  f16_dtype:", config["f16_dtype"])
-    print("  f8_dtype:", config["f8_dtype"])
-    print("  use_sliding_window:", config["use_sliding_window"])
-    print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
-    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
-    print("  has_sm90:", has_sm90)
-    print("  has_sm100:", has_sm100)
-    for key in [
-        "add_comm",
-        "add_gemma",
-        "add_oai_oss",
-        "add_moe",
-        "add_act",
-        "add_misc",
-        "add_xqa",
-    ]:
-        print(f"  {key}:", config[key])
-
-    # Generate JIT specs
-    print("Generating JIT specs...")
-    jit_specs = [gen_logging_module()]
-    jit_specs += gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
-        has_sm90,
-        has_sm100,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
+    # Use the existing compile_and_package_modules function
+    compile_and_package_modules(
+        output_dir=out_dir,
+        config=config,
+        project_root=project_root,
+        verbose=True,
+        setup_environment=not args.build_dir,  # Skip environment setup if custom build dir is used
     )
-    print("Total ops:", len(jit_specs))
-
-    # Build
-    build_jit_specs(jit_specs, verbose=True, skip_prebuilt=False)
-
-    # Copy built kernels
-    copy_built_kernels(jit_specs, out_dir)
-    print("AOT kernels saved to:", out_dir)
 
 
 if __name__ == "__main__":
