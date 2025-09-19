@@ -219,6 +219,14 @@ def bench_cutlass_fused_moe(
         f"{str(tuple(hidden_states.shape)):<15} {str(tuple(w1.shape)):<20} {str(tuple(w2.shape)):<20} {median_ms:.3f}"
     )
 
+    from flashinfer.testing.utils import bench_kineto
+    ts = bench_kineto(
+        f,
+        ("expandInputRowsKernel", "doActivationKernel", "finalizeMoeRoutingKernel"),
+        suppress_kineto_output=False,
+    )
+    print(f"Kineto output: {ts=}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
