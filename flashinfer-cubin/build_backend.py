@@ -11,6 +11,17 @@ from setuptools.build_meta import *
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# add flashinfer._build_meta if not there, it should exist in Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
+build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
+if not build_meta_file.exists():
+    version_file = Path(__file__).parent.parent / "version.txt"
+    if version_file.exists():
+        with open(version_file, "r") as f:
+            version = f.read().strip()
+    with open(build_meta_file, "w") as f:
+        f.write('"""Build metadata for flashinfer package."""\n')
+        f.write(f'__version__ = "{version}"\n')
+
 
 def _download_cubins():
     """Download cubins to the source directory before building."""
