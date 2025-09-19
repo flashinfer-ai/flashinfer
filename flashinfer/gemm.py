@@ -905,7 +905,7 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
         (64, 32, 6),
         (64, 32, 8),
         (64, 64, 6),
-        (128, 64, 6),
+        (128, 16, 6),
     ]
 
     # Generate instances for the specified dtype
@@ -1652,6 +1652,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
     o_type,
     block_size,
     device,
+    alpha,
     use_nvfp4,
 ):
     _check_cudnn_availability()
@@ -1704,8 +1705,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
         c_final_cudnn_tensor = c_tensor
 
-        # if use_nvfp4 is True, we need to multiply the output by the global scale
-        if use_nvfp4:
+        if alpha is not None:
             global_scale_cudnn_tensor = graph.tensor(
                 name="global_scale",
                 dim=(1, 1, 1),
@@ -1734,7 +1734,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
         # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
         # in older cuDNN versions, so we deselect it.
-        if use_nvfp4 and not _is_cublas_fp4_available_in_cudnn():
+        if (alpha is not None) and (not _is_cublas_fp4_available_in_cudnn()):
             graph.deselect_engines(["eng0"])
         graph.check_support()
         graph.build_plans()
@@ -1743,7 +1743,14 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
 
 def execute_cudnn_gemm_fp4_graph(
-    graph, a, b, a_descale, b_descale, alpha, c_final, workspace_buffer, use_nvfp4
+    graph,
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    c_final,
+    workspace_buffer,
 ):
     variant_pack = {
         UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
@@ -1753,7 +1760,7 @@ def execute_cudnn_gemm_fp4_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    if use_nvfp4:
+    if alpha is not None:
         variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
     if workspace_buffer.numel() < graph.get_workspace_size():
@@ -1998,6 +2005,7 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -2016,7 +2024,7 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar in case of nvfp4 quantization. None in case of mxfp4 quantization.
+        Global scale tensor, float scalar.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16.
@@ -2032,6 +2040,9 @@ def mm_fp4(
 
     backend: Literal["cudnn", "trtllm", "cutlass"]
         Backend to use, defaults to "cudnn".
+
+    use_nvfp4: bool
+        Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.
 
     Notes
     -----
@@ -2057,9 +2068,6 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
-    # nvfp4 quantization if alpha provided, mxfp4 quantization if no alpha provided
-    use_nvfp4 = alpha is not None
-
     # pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_fp4 accepts 2d tensors, got {a.shape} and {b.shape}")
@@ -2147,12 +2155,13 @@ def mm_fp4(
             _torch_data_type_to_cudnn_data_type(out_dtype),
             block_size,
             a.device,
+            alpha,
             use_nvfp4,
         )
 
         # execute the fp4 cudnn graph
         execute_cudnn_gemm_fp4_graph(
-            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, use_nvfp4
+            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer
         )
     elif backend == "trtllm":
         if out_dtype != torch.bfloat16:

@@ -18,11 +18,12 @@ import os
 import platform
 import re
 import subprocess
+import sysconfig
 from pathlib import Path
 from typing import List, Mapping
 
 import setuptools
-from setuptools.dist import Distribution
+from setuptools.dist import Distribution, strtobool
 
 root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
@@ -103,11 +104,17 @@ class AotDistribution(Distribution):
         return enable_aot
 
 
+bdist_wheel_options = {}
+use_limited_api = strtobool(os.getenv("FLASHINFER_AOT_USE_PY_LIMITED_API", "1"))
+
+if use_limited_api and not sysconfig.get_config_var("Py_GIL_DISABLED"):
+    bdist_wheel_options["py_limited_api"] = "cp39"
+
 setuptools.setup(
     version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    options={"bdist_wheel": bdist_wheel_options},
     distclass=AotDistribution,
 )

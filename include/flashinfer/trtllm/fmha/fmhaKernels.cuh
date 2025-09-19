@@ -28,6 +28,7 @@
 #include "../common.h"
 #include "cuda_runtime_api.h"
 #include "flashInferMetaInfo.h"
+#include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 #include "lse.cuh"
@@ -252,6 +253,10 @@ class TllmGenFmhaKernel {
       }
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
+      // Run the separate reduction kernel if needed.
+      runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.enable_pdl,
+                       params.stream);
+
       if (params.lsePtr != nullptr) {
         flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
                                      params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
@@ -462,6 +467,10 @@ class TllmGenFmhaKernel {
       } else {
         // Otherwise, we use the high-throughput kernel.
         kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+        // Always use the separate reduction kernel.
+        if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
+          selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+        }
         // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
         if (params.mNumHeadsQPerKv == 128) {
           selectKernelParams.mUses2CtaMma = true;
