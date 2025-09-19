@@ -1813,6 +1813,10 @@ void finalizeMoeRoutingKernel(
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
     int const num_experts_per_node, int const start_expert_id) {
+if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_same_v<OutputType, __nv_bfloat16>)) {
+  printf("finalizeMoeRoutingKernel see unsupported dtype\n");
+  asm("trap;");
+} else {
   constexpr int experts_per_token = 8;
   if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
 
@@ -1847,6 +1851,11 @@ void finalizeMoeRoutingKernel(
   for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem thread_output;
     thread_output.fill(0);
+
+    int4 input_val_buf[experts_per_token];
+    uint32_t enable_input_buf = 0;
+
+#pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
@@ -1862,27 +1871,45 @@ void finalizeMoeRoutingKernel(
         continue;
       }
 
-      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
-
       auto const* expanded_permuted_rows_row_ptr =
           expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
-      ComputeElem expert_result =
-          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
-      if (bias) {
-        auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
-        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
-      }
+//       ComputeElem expert_result =
+//           arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      static_assert(sizeof(expanded_permuted_rows_row_ptr[0]) == sizeof(int4));
+      input_val_buf[k_idx] = *reinterpret_cast<const int4*>(expanded_permuted_rows_row_ptr + elem_index);
+      enable_input_buf |= 1 << k_idx;
+    }
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      if (not (enable_input_buf & (1 << k_idx))) continue;
+
+      int64_t const k_offset = original_row * experts_per_token + k_idx;
+      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
+      int4 input_val = input_val_buf[k_idx];
+      ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<const InputElem*>(&input_val));
+//       if (bias) {
+//         auto const* bias_ptr = bias_v + expert_id * num_elems_in_col;
+//         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+//       }
 
       thread_output = thread_output + row_scale * expert_result;
     }
 
-    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
-    reduced_row_ptr_v[elem_index] = output_elem;
+//     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+//     reduced_row_ptr_v[elem_index] = output_elem;
+    // TODO alignment issue?
+    __align__(16) OutputElem output_elem_original = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    int4 output_elem = *reinterpret_cast<int4*>(&output_elem_original);
+    static_assert(sizeof(reduced_row_ptr_v[0]) == sizeof(int4));
+    *reinterpret_cast<int4*>(reduced_row_ptr_v + elem_index) = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+}
 }
 
 // Final kernel to unpermute and scale
