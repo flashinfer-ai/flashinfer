@@ -1798,12 +1798,10 @@ template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleM
 __global__ void finalizeMoeRoutingKernel(
     GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
-    int const* token_selected_experts, int64_t const orig_cols_real_, int64_t const experts_per_token_real_,
+    int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
     int const num_experts_per_node, int const start_expert_id) {
   constexpr int experts_per_token = 8;
   if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
-  constexpr int orig_cols = 7168;
-  if (orig_cols != orig_cols_real_) { asm("trap;"); }
 
   int64_t const original_row = blockIdx.x;
   int64_t const num_rows = gridDim.x;
@@ -1817,8 +1815,8 @@ __global__ void finalizeMoeRoutingKernel(
   assert(orig_cols % FINALIZE_ELEM_PER_THREAD == 0);
 
   int64_t const start_offset = threadIdx.x;
-  constexpr int64_t stride = FINALIZE_THREADS_PER_BLOCK;
-  constexpr int64_t num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
 
   using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
   using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
