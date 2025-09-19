@@ -225,7 +225,7 @@ def bench_cutlass_fused_moe(
         ("expandInputRowsKernel", "doActivationKernel", "finalizeMoeRoutingKernel"),
         suppress_kineto_output=False,
     )
-    print(f"Kineto output: {ts=}")
+    print(f"Kineto output: ts_ms={['%.3f' % (t * 1000) for t in ts]}")
 
 
 if __name__ == "__main__":
