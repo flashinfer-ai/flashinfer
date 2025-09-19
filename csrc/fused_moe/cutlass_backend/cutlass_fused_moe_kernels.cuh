@@ -1503,7 +1503,7 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 // source matrix, we simply take the modulus of the expanded index.
 
 // constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
-constexpr static int EXPAND_THREADS_PER_BLOCK = 128;
+constexpr static int EXPAND_THREADS_PER_BLOCK = 32;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
@@ -1625,7 +1625,7 @@ __global__ void expandInputRowsKernel(
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
 
-          constexpr int BUF_SIZE = 7;
+          constexpr int BUF_SIZE = 28;
           static_assert(ceilDiv(num_elems_in_col, stride) == BUF_SIZE);
           DataElem data_buf[BUF_SIZE];
           TmaWarpSpecializedGroupedGemmInput::ElementSF sf_buf[BUF_SIZE];
