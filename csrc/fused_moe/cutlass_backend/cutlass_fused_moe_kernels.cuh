@@ -1818,10 +1818,10 @@ __global__ void finalizeMoeRoutingKernel(
   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
   int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
 
-  using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
-  using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
-  using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
-  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  using BiasElem = cutlass::AlignedArray<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+  using InputElem = cutlass::AlignedArray<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::AlignedArray<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::AlignedArray<float, FINALIZE_ELEM_PER_THREAD>;
   auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
   auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
   auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
