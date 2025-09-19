@@ -1,0 +1,69 @@
+name: Track Test Xfails
+
+on:
+  schedule:
+    # Run weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    # Allow manual triggering
+  
+  push:
+    paths:
+      - 'tests/**/*.py'
+      - 'scripts/generate_xfails_report.py'
+
+jobs:
+  generate-xfails-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Generate xfails report
+      run: |
+        python scripts/generate_xfails_report.py --output XFAILS_REPORT.md
+        
+    - name: Generate JSON report for tracking
+      run: |
+        python scripts/generate_xfails_report.py --format json --output xfails_data.json
+        
+    - name: Check for changes
+      id: changes
+      run: |
+        if git diff --quiet XFAILS_REPORT.md; then
+          echo "changed=false" >> $GITHUB_OUTPUT
+        else
+          echo "changed=true" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Commit and push if changed
+      if: steps.changes.outputs.changed == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add XFAILS_REPORT.md xfails_data.json
+        git commit -m "Update xfails report - $(date +'%Y-%m-%d')"
+        git push
+        
+    - name: Upload reports as artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: xfails-reports
+        path: |
+          XFAILS_REPORT.md
+          xfails_data.json
+          
+    - name: Create issue if xfails increased
+      if: steps.changes.outputs.changed == 'true'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          // This would need additional logic to compare with previous report
+          // and create an issue if xfails count increased significantly
+          console.log("Xfails report updated - consider manual review");
