@@ -29,9 +29,9 @@ def test_merge_state(seq_len, num_heads, head_dim):
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
 def test_merge_state_in_place(seq_len, num_heads, head_dim):
-    compute_capability = get_compute_capability(torch.device(device="cuda:0"))
-    if compute_capability[0] != 9:
-        pytest.skip("These tests are only guaranteed to work on Hopper GPUs.")
+    # compute_capability = get_compute_capability(torch.device(device="cuda:0"))
+    # if compute_capability[0] != 9:
+    #     pytest.skip("These tests are only guaranteed to work on Hopper GPUs.")
 
     v = torch.randn(seq_len, num_heads, head_dim).half()
     v_std = v.clone()
