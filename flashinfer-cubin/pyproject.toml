@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "requests", "filelock", "torch", "tqdm"] # NOTE(Zihao): we should remove torch once https://github.com/flashinfer-ai/flashinfer/pull/1641 merged
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel", "requests", "filelock", "torch", "tqdm", "numpy"] # NOTE(Zihao): we should remove torch once https://github.com/flashinfer-ai/flashinfer/pull/1641 merged
+build-backend = "build_backend"
+backend-path = ["."]
 
 [project]
 name = "flashinfer-cubin"
@@ -26,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
@@ -47,8 +49,4 @@ include-package-data = true
 version = {attr = "flashinfer_cubin.__version__"}
 
 [tool.setuptools.package-data]
-flashinfer_cubin = ["cubins/**/*"]
-
-[tool.setuptools.cmdclass]
-build_py = "setup.DownloadAndBuildPy"
-sdist = "setup.CustomSdist"
+flashinfer_cubin = ["cubins/**/*", "_build_meta.py"]
