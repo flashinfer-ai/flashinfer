@@ -870,11 +870,11 @@ def cutlass_fused_moe(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
 
-    print(
-        "hi flashinfer cutlass_fused_moe "
-        f"{input.shape=} {input.dtype=} "
-        f"{token_selected_experts.shape=}"
-    )
+    # print(
+    #     "hi flashinfer cutlass_fused_moe "
+    #     f"{input.shape=} {input.dtype=} "
+    #     f"{token_selected_experts.shape=}"
+    # )
 
     num_rows = input.shape[0]
     if min_latency_mode:
