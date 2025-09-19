@@ -1566,10 +1566,18 @@ __global__ void expandInputRowsKernel(
   int64_t const padded_hidden_size =
       TmaWarpSpecializedGroupedGemmInput::alignToSfDim(hidden_size, min_k_dim_alignment);
 
+  int64_t unpermuted_row_next = permuted_row_to_unpermuted_row[blockIdx.x];
+
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
   for (int64_t permuted_row = blockIdx.x; permuted_row < num_valid_tokens;
        permuted_row += gridDim.x) {
-    int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
+    int64_t const unpermuted_row = unpermuted_row_next;
+    {
+        int64_t idx = permuted_row + gridDim.x;
+        if (idx < num_valid_tokens) {
+            unpermuted_row_next = permuted_row_to_unpermuted_row[idx];
+        }
+    }
 
     // Load 128-bits per thread
 
