@@ -2482,7 +2482,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         return fn_list[static_cast<int>(activation_type.activation_type)];
       }
       if (num_experts_per_node == 64) {
-        constexpr int NUM_EXPERTS_PER_NODE_CONST = 128;
+        constexpr int NUM_EXPERTS_PER_NODE_CONST = 64;
         auto fn_list = std::array{
             &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                                 IdentityAdaptor<cutlass::epilogue::thread::GELU>,
