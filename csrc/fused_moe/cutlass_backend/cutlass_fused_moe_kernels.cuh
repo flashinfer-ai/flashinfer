@@ -1779,7 +1779,7 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = std::min(smCount * 16, std::max(num_rows * k, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
