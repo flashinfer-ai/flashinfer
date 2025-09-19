@@ -73,7 +73,7 @@ def gen_xqa_module(
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
         ],
         extra_cuda_cflags=xqa_nvcc_flags
         + sm90a_nvcc_flags
@@ -118,7 +118,7 @@ def get_xqa_module(
         semaphores: torch.Tensor,
         scratch: torch.Tensor,
     ) -> None:
-        module.xqa_wrapper.default(
+        module.xqa_wrapper(
             multiProcessorCount,
             nbKHeads,
             slidingWinSize,
