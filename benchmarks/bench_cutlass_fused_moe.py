@@ -220,13 +220,14 @@ def bench_cutlass_fused_moe(
     )
 
     from flashinfer.testing.utils import bench_kineto
-    ts = bench_kineto(
-        f,
-        ("expandInputRowsKernel", "doActivationKernel", "finalizeMoeRoutingKernel"),
-        suppress_kineto_output=False,
-        num_tests=100,
-    )
-    print(f"Kineto output: ts_ms={['%.3f' % (t * 1000) for t in ts]}")
+    for _ in range(5):
+        ts = bench_kineto(
+            f,
+            ("expandInputRowsKernel", "doActivationKernel", "finalizeMoeRoutingKernel"),
+            suppress_kineto_output=False,
+            num_tests=100,
+        )
+        print(f"Kineto output: ts_ms={['%.3f' % (t * 1000) for t in ts]}")
 
 
 if __name__ == "__main__":
