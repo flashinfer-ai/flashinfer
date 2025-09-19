@@ -38,7 +38,7 @@ __global__ void routingMainKernel(KernelParams params) {
   // declare types
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
-  static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
+  static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
   constexpr int MaxNumTopGroups =
       getMaxNumTopGroups(KernelParams::UseGroups, KernelParams::NumExperts);
@@ -71,19 +71,19 @@ __global__ void routingMainKernel(KernelParams params) {
 
   // load bias already; each warp represents one expert group
   auto threadExpert = threadIdx.x;
-  bool expertSelected = threadExpert < KernelParams::NumExperts;
+  bool expertSelected = threadExpert < params.mNumExperts;
   if constexpr (KernelParams::UseGroups) {
     threadExpert = warpIdx * params.mNumExpertsPerGroup + laneIdx;
     expertSelected = laneIdx < params.mNumExpertsPerGroup;
   }
-  auto scoreIdx = int64_t{blockIdx.x} * int64_t{KernelParams::NumExperts} + threadExpert;
+  auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
   auto biasVal = expertSelected ? params.mPtrRoutingBias[threadExpert] : invalidScore;
 
   // initialize the mPtrExpertCounts
   if (params.mPtrExpertCounts) {
     int32_t globalThreadIdx = blockIdx.x * NumThreads + threadIdx.x;
     int32_t globalThreadStride = gridDim.x * NumThreads;
-    int32_t expertCountsNum = 2 * KernelParams::NumExperts;
+    int32_t expertCountsNum = 2 * params.mNumExperts;
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
   }
 
@@ -173,7 +173,7 @@ __global__ void routingMainKernel(KernelParams params) {
         auto expertIdx = ii * WarpSize + laneIdx;
         expertIdxGroup[ii] = expertIdx;
         expertScoreGroup[ii] =
-            expertIdx < KernelParams::NumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
+            expertIdx < params.mNumExperts? smemScoreBias[expertIdx] : invalidScoreFloat;
       }
     }
 
@@ -214,7 +214,7 @@ __global__ void routingMainKernel(KernelParams params) {
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
-    __launch_bounds__(KernelParams::NumExperts) routingIndicesClusterKernel(KernelParams params) {
+    routingIndicesClusterKernel(KernelParams params) {
   using OutputT = typename KernelParams::OutputT;
   static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
@@ -241,7 +241,7 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __launch_bounds__(KernelParams::NumExperts)
+__global__ void
     routingIndicesCoopKernel(KernelParams params) {
   static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
@@ -336,7 +336,7 @@ __global__ void __launch_bounds__(KernelParams::NumExperts)
   int32_t const localExpertCount = smemExpertCount[threadIdx.x];
 
   int32_t blockExpertOffset = 0;
-  if (threadIdx.x < KernelParams::NumExperts) {
+  if (threadIdx.x < params.mNumExperts) {
     blockExpertOffset = atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
   }
 
@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(KernelParams::NumExperts)
 
   // Get total count for this expert.
   int32_t count =
-      (threadIdx.x < KernelParams::NumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+      (threadIdx.x < params.mNumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
 
   // Note: the scan is redundant in all CTAs, but doing it in only 1 CTA would be worse for latency.
 
@@ -425,13 +425,13 @@ __global__ void routingIndicesCoopKernel(KernelParams params) {
 
 template <int NumExperts>
 void runImpl(Data& data, void* stream) {
-  static constexpr int NumThreads = NumExperts;  // DeepSeek: 1 thread per expert
+  static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
   const int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, NumExperts);
 
   // Validate that the template parameter matches the data
-  TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
-              NumExperts, " experts, got ", data.mNumExperts);
+  // TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
+  //             NumExperts, " experts, got ", data.mNumExperts);
   TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrPermutedIdxSize != nullptr ||
                   data.mPtrExpertWeights != nullptr,
               "Routing kernel requires at least one output parameter");
@@ -548,15 +548,7 @@ void runImpl(Data& data, void* stream) {
 }
 
 void run(Data& data, void* stream) {
-  if (data.mNumExperts == 72) {
-    runImpl<72>(data, stream);
-  } else if (data.mNumExperts == 256) {
-    runImpl<256>(data, stream);
-  } else if (data.mNumExperts == 384) {
-    runImpl<384>(data, stream);
-  } else {
-    TORCH_CHECK(false, "Unsupported number of experts: ", data.mNumExperts);
-  }
+  runImpl<256>(data, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
