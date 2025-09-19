@@ -357,11 +357,11 @@ def test_trtllm_batch_prefill(
         "window_left": window_left,
     }
     wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
-    output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+    output, lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
         workspace_buffer,
@@ -380,6 +380,7 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        return_lse=True,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -402,6 +403,7 @@ def test_trtllm_batch_prefill(
     torch.testing.assert_close(
         output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
     )
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
@@ -411,14 +413,18 @@ def test_trtllm_batch_prefill(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
-        output_wrapper = wrapper_trtllm_gen.run(
+        output_wrapper, lse_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            return_lse=True,
         )
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
@@ -426,9 +432,7 @@ def test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
@@ -554,10 +558,10 @@ def test_trtllm_batch_decode(
         "window_left": window_left,
     }
     wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
 
     if q_len_per_req > 1:
-        # hide the output_ref from decode wrapper for speculative decoding test
+        # hide the output_ref, lse_ref from decode wrapper for speculative decoding test
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer_ref, kv_layout
         )
@@ -578,12 +582,12 @@ def test_trtllm_batch_decode(
             "window_left": window_left,
         }
         wrapper_ref.plan(**plan_params_prefill)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
 
     # Run trtllm-gen function call
     sm_scale = float(1.0 / (head_dim**0.5))
 
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+    output, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
         workspace_buffer,
@@ -599,6 +603,7 @@ def test_trtllm_batch_decode(
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
+        return_lse=True,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -628,7 +633,7 @@ def test_trtllm_batch_decode(
         rtol=rtol,
         atol=atol,
     )
-
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -637,7 +642,7 @@ def test_trtllm_batch_decode(
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
-        output_wrapper = wrapper_trtllm_gen.run(
+        output_wrapper, lse_wrapper = wrapper_trtllm_gen.run(
             q.contiguous(),
             kv_cache,
             q_scale=q_scale,
@@ -645,6 +650,7 @@ def test_trtllm_batch_decode(
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
+            return_lse=True,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -675,6 +681,7 @@ def test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
+        torch.testing.assert_close(lse_wrapper, lse_ref, rtol=1e-2, atol=1e-2)
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()

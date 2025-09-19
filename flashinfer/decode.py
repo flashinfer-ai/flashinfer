@@ -1848,11 +1848,14 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
+
+        assert workspace_size > 0, "workspace_size must be greater than 0"
 
         self._op.trtllm_paged_attention_decode(
             out,
@@ -1874,6 +1877,7 @@ class TrtllmGenDecodeModule:
             enable_pdl,
             workspace_size,
             sinks,
+            lse,
         )
         return out
 
@@ -1936,7 +1940,6 @@ def get_trtllm_gen_decode_module(*args):
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> None:
-        assert maybe_lse is None
         assert paged_kv_cache is not None
         assert num_qo_heads is not None
         assert num_kv_heads is not None
@@ -1961,6 +1964,7 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            lse=maybe_lse,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2023,11 +2027,13 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale: float,
     bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
     window_left: int = -1,
+    return_lse: bool = False,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    lse: Optional[torch.Tensor] = None,
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
 ) -> Union[torch.Tensor, FP4Tensor]:
@@ -2081,6 +2087,12 @@ def trtllm_batch_decode_with_kv_cache(
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+
+    return_lse : bool = False
+        whether to return lse
 
     Returns
     -------
@@ -2177,6 +2189,14 @@ def trtllm_batch_decode_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
     run_func(
         out,
         out_scale_factor,
@@ -2199,13 +2219,20 @@ def trtllm_batch_decode_with_kv_cache(
         enable_pdl,
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
+        lse,
     )
-
-    return (
-        out
-        if out_dtype != "nvfp4"
-        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
-    )
+    if return_lse:
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        ), lse
+    else:
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
 
 
 def _check_trtllm_gen_mla_shape(
@@ -2260,12 +2287,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
+    return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,
     bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
     bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    lse: Optional[torch.Tensor] = None,
     enable_pdl: bool = None,
 ) -> torch.Tensor:
     """
@@ -2279,12 +2308,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
+    return_lse: bool = False
+        whether to return lse
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
     bmm2_scale: fused scale for mla bmm2 input.
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
     sinks: additional value per head in the denominator of the softmax.
+    lse: lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
@@ -2337,6 +2369,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0] * query.shape[1],
+            query.shape[2],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
     if bmm1_scale_log2_tensor is not None and bmm2_scale_tensor is not None:
         # dynamic scale factors
         if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
@@ -2364,5 +2404,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         enable_pdl,
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
+        lse,
     )
-    return out
+    if return_lse:
+        return out, lse
+    else:
+        return out

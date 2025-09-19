@@ -115,7 +115,7 @@ def test_trtllm_batch_decode_mla(
 
     bmm1_log2_scale_tensor = (
         torch.tensor(
-            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
+            [scale / ((512 + 64) ** 0.5 * math.log2(math.e))],
             dtype=torch.float32,
             device=device,
         )
@@ -129,7 +129,7 @@ def test_trtllm_batch_decode_mla(
     )
 
     # Run decode-MLA
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+    output, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -139,11 +139,12 @@ def test_trtllm_batch_decode_mla(
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
-        bmm1_scale=scale / ((128 + 64) ** 0.5),
+        bmm1_scale=scale / ((512 + 64) ** 0.5),
         bmm2_scale=1.0,
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
+        return_lse=True,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -151,7 +152,7 @@ def test_trtllm_batch_decode_mla(
 
     # Run reference attention and align output
     sm_scale = scale / (
-        (128 + 64) ** 0.5
+        (512 + 64) ** 0.5
     )  # use head dimension before matrix absorption
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
@@ -192,11 +193,10 @@ def test_trtllm_batch_decode_mla(
         batch_size * q_len_per_request, num_q_heads, qk_rope_head_dim
     )
 
-    # todo: fix kv_cache
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
     # check is nan
     assert not torch.isnan(o_ref).any(), "o_ref is nan"
@@ -226,3 +226,19 @@ def test_trtllm_batch_decode_mla(
             print("output:", output)
             print("o_ref:", o_ref)
             raise e
+    if dtype == torch.float8_e4m3fn:
+        # NOTE(Yingyi): the logits is multipled with 448 (maximum value of fp8 e4m3) to improve numerical stability internally
+        lse -= math.log2(448)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+if __name__ == "__main__":
+    test_trtllm_batch_decode_mla(
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.float8_e4m3fn,
+        page_size=32,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=True,
+    )
