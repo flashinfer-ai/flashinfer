@@ -28,8 +28,8 @@ def check_device(tensors: List[torch.Tensor], major:List[int] = [], minor:List[i
             f"All tensors should be on the same device, but got {device} and {t.device}"
         )
     if len(major) > 0 or len(minor) > 0:
-        major, minor = get_compute_capability(device)
-        if len(major) > 0 and major not in major:
-            raise GPUArchitectureError(f"Device major should be in {major}, but got {major}")
-        if len(minor) > 0 and minor not in minor:
-            raise GPUArchitectureError(f"Device minor should be in {minor}, but got {minor}")
+        actual_major, actual_minor = get_compute_capability(device)
+        if len(major) > 0 and actual_major not in major:
+            raise GPUArchitectureError(f"Device major should be in {major}, but got {actual_major}")
+        if len(minor) > 0 and actual_minor not in minor:
+            raise GPUArchitectureError(f"Device minor should be in {minor}, but got {actual_minor}")
