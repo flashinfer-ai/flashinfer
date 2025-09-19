@@ -207,26 +207,3 @@ jobs:
         with:
           tag_name: ${{ inputs.ref || github.ref_name }}
           files: dist/*.whl
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
-        env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
-
-      - name: Update wheel index
-        run: |
-          # Copy wheels to wheel index repo
-          cp dist/*.whl flashinfer-whl/
-          # If update script exists, use it
-          if [ -f scripts/update_whl_index.py ]; then
-            python3 scripts/update_whl_index.py
-          fi
-
-      - name: Push wheel index
-        run: |
-          cd flashinfer-whl
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Update wheels for ${{ inputs.ref || github.ref_name }}" || echo "No changes"
-          git push
