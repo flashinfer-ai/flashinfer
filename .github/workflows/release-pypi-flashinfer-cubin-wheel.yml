@@ -122,18 +122,17 @@ jobs:
           pip install dist/flashinfer_cubin*.whl
 
           # Test import and check for cubins
-          python -c "
+          python -c '
 import flashinfer_cubin
-print(f'✓ Successfully imported flashinfer_cubin')
+print("✓ Successfully imported flashinfer_cubin")
 from pathlib import Path
-import flashinfer_cubin
-cubin_dir = Path(flashinfer_cubin.__file__).parent / 'cubins'
+cubin_dir = Path(flashinfer_cubin.__file__).parent / "cubins"
 if cubin_dir.exists():
-    cubins = list(cubin_dir.rglob('*.cubin'))
-    print(f'✓ Found {len(cubins)} cubin files in package')
+    cubins = list(cubin_dir.rglob("*.cubin"))
+    print(f"✓ Found {len(cubins)} cubin files in package")
 else:
-    print('⚠ Warning: cubins directory not found in package')
-"
+    print("⚠ Warning: cubins directory not found in package")
+'
 
           deactivate
           rm -rf test-env
