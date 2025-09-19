@@ -884,10 +884,10 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v1(T const* sorted_indices
 
 template <class T>
 __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices, int64_t const arr_length, T const target) {
-  constexpr int ARR_LENGTH_CONST = 128;
-  if (arr_length != ARR_LENGTH_CONST) {
-      asm("trap;");
-  }
+  // constexpr int ARR_LENGTH_CONST = 128;
+  // if (arr_length != ARR_LENGTH_CONST) {
+  //     asm("trap;");
+  // }
 
   constexpr unsigned full_mask = 0xffffffffu;
   constexpr int WARP_SZ = 32;
@@ -895,7 +895,7 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices
 
   int local_count = 0;
 #pragma unroll
-  for (int k = 0; k < ARR_LENGTH_CONST / WARP_SZ; ++k) {
+  for (int k = 0; k < arr_length / WARP_SZ; ++k) {
     const int idx = lane_id + k * WARP_SZ;
     T v = sorted_indices[idx];
     local_count += (v < target) ? 1 : 0;
