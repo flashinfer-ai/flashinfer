@@ -94,6 +94,7 @@ show_error_context = true
 follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
+exclude = ["flashinfer-aot-modules/"]
 
 
 [tool.ruff.lint]
