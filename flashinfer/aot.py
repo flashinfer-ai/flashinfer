@@ -652,13 +652,13 @@ def main():
     has_sm90, has_sm100 = detect_sm_capabilities()
 
     # Update data dir
-    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-    jit_env.CUTLASS_INCLUDE_DIRS = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-    ]
-    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+    # jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+    # jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+    # jit_env.CUTLASS_INCLUDE_DIRS = [
+    #     project_root / "3rdparty" / "cutlass" / "include",
+    #     project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    # ]
+    # jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
 
     # Update workdir
     jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
