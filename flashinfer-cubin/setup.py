@@ -41,6 +41,17 @@ class DownloadAndBuildPy(build_py):
     def run(self):
         print("Downloading cubins from artifactory...")
 
+        # Ensure the cubins directory exists in the source tree first
+        source_cubin_dir = Path(__file__).parent / "flashinfer_cubin" / "cubins"
+        source_cubin_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a placeholder file to ensure directory is not empty during packaging
+        placeholder_file = source_cubin_dir / ".placeholder"
+        if not placeholder_file.exists():
+            placeholder_file.write_text(
+                "# Placeholder file to ensure directory is not empty during packaging\n"
+            )
+
         # Create a temporary directory for cubins within the package
         cubin_package_dir = Path(self.build_lib) / "flashinfer_cubin" / "cubins"
         cubin_package_dir.mkdir(parents=True, exist_ok=True)
@@ -81,6 +92,17 @@ class CustomSdist(sdist):
     """Custom sdist command that includes downloaded cubins."""
 
     def run(self):
+        # Ensure the cubins directory exists in the source tree first
+        source_cubin_dir = Path(__file__).parent / "flashinfer_cubin" / "cubins"
+        source_cubin_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a placeholder file to ensure directory is not empty during packaging
+        placeholder_file = source_cubin_dir / ".placeholder"
+        if not placeholder_file.exists():
+            placeholder_file.write_text(
+                "# Placeholder file to ensure directory is not empty during packaging\n"
+            )
+
         # Download cubins first
         print("Downloading cubins for source distribution...")
 
