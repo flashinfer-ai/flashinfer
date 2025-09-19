@@ -1082,6 +1082,71 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
   }
 }
 
+template <int VecSize, int ElementsPerThread>
+__device__ TmaWarpSpecializedGroupedGemmInput::ElementSF writeSF_v2_read(int64_t num_tokens_before_expert, int64_t expert_id,
+                        int64_t source_token_id, int64_t token_id, int64_t elem_idx,
+                        int64_t num_cols,
+                        TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
+                        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf) {
+  static constexpr int NumThreadsPerSF = VecSize / ElementsPerThread;
+
+  // We need to offset into the scaling factors for just this expert
+  auto act_sf_expert =
+      act_sf_flat + getOffsetActivationSF(
+                        expert_id, num_tokens_before_expert, num_cols,
+                        (VecSize == TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize)
+                            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+
+  // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this
+  // expert
+  auto sf_out =
+      cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
+          std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
+          std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert,
+          QuantizationSFLayout::SWIZZLED_128x4);
+  if (sf_out) {
+    if (input_sf) {
+      auto const sf_in = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
+                                                     NumThreadsPerSF>(
+          std::nullopt /* batchIdx */, source_token_id, elem_idx, std::nullopt /* numRows */,
+          num_cols / VecSize, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
+          QuantizationSFLayout::SWIZZLED_128x4);
+      return *sf_in;
+    } else {
+      return 0x00;
+    }
+  }
+}
+
+template <int VecSize, int ElementsPerThread>
+__device__ void writeSF_v2_write(int64_t num_tokens_before_expert, int64_t expert_id,
+                        int64_t source_token_id, int64_t token_id, int64_t elem_idx,
+                        int64_t num_cols,
+                        TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
+                        TmaWarpSpecializedGroupedGemmInput::ElementSF value_to_write) {
+  static constexpr int NumThreadsPerSF = VecSize / ElementsPerThread;
+
+  // We need to offset into the scaling factors for just this expert
+  auto act_sf_expert =
+      act_sf_flat + getOffsetActivationSF(
+                        expert_id, num_tokens_before_expert, num_cols,
+                        (VecSize == TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize)
+                            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+
+  // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this
+  // expert
+  auto sf_out =
+      cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
+          std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
+          std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert,
+          QuantizationSFLayout::SWIZZLED_128x4);
+  if (sf_out) {
+    *sf_out = value_to_write;
+  }
+}
+
 // ====================== Compute FP8 dequant scale only ===============================
 __global__ void computeFP8DequantScaleKernel(float const** alpha_scale_ptr_array,
                                              int64_t const num_experts_per_node,
@@ -1577,9 +1642,13 @@ __global__ void expandInputRowsKernel(
         } else {
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
-          writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
+          TmaWarpSpecializedGroupedGemmInput::ElementSF sf_value =
+              writeSF_v2_read<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf);
+          writeSF_v2_write<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
+                                        permuted_row, elem_index, padded_hidden_size,
+                                        fc1_act_sf_flat, sf_value);
           dest_row_ptr[elem_index] = in_vec;
         }
       }
