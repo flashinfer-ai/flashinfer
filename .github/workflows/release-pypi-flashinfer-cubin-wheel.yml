@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+  pull_request:
+    branches:
+      - main
+
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
@@ -140,11 +144,11 @@ else:
           twine check dist/flashinfer_cubin*.whl
           echo "✓ Package validation passed"
 
-      - name: Upload to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Uploading flashinfer-cubin wheel to PyPI..."
-          twine upload --verbose --non-interactive dist/flashinfer_cubin*.whl
-          echo "✓ Successfully uploaded to PyPI"
+      # - name: Upload to PyPI
+      #   env:
+      #     TWINE_USERNAME: __token__
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      #   run: |
+      #     echo "Uploading flashinfer-cubin wheel to PyPI..."
+      #     twine upload --verbose --non-interactive dist/flashinfer_cubin*.whl
+      #     echo "✓ Successfully uploaded to PyPI"
