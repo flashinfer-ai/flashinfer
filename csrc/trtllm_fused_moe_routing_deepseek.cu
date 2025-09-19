@@ -27,7 +27,7 @@ static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 
-__host__ __device__ int constexpr getMaxNumTopGroups(const bool useGroups, const int numExperts) {
+__host__ __device__ int getMaxNumTopGroups(const bool useGroups, const int numExperts) {
   if (useGroups || numExperts <= 256) {
     return 4;
   } else {
@@ -42,7 +42,7 @@ __global__ void routingMainKernel(KernelParams params) {
   using InputT = typename KernelParams::InputT;
   static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
-  constexpr int MaxNumTopGroups =
+  int MaxNumTopGroups =
       getMaxNumTopGroups(KernelParams::UseGroups, params.mNumExperts);
 
   // declare shared memory structure
@@ -423,7 +423,7 @@ __global__ void routingIndicesCoopKernel(KernelParams params) {
 void runImpl(Data& data, void* stream) {
   static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
-  const int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, data.mNumExperts);
+  int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, data.mNumExperts);
 
   // Validate that the template parameter matches the data
   // TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
