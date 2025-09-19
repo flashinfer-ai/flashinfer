@@ -53,7 +53,8 @@ class DownloadAndBuildPy(build_py):
             # Download all cubins using the existing download_artifacts function
             download_artifacts()
             print(f"Cubins downloaded to {cubin_package_dir}")
-
+        except Exception as e:
+            raise RuntimeError(f"Error downloading cubins: {e}") from e
         finally:
             # Restore original environment variable
             if original_cubin_dir:
