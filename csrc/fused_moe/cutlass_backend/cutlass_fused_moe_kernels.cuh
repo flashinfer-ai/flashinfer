@@ -2208,7 +2208,9 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
-__global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
+__global__
+__maxnreg__(32)
+void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
                                    int num_experts_per_node, int64_t inter_size_real_,
