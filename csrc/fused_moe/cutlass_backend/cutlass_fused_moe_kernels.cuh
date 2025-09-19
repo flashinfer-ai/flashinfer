@@ -1844,12 +1844,13 @@ if constexpr (not (std::is_same_v<GemmOutputType, __nv_bfloat16> and std::is_sam
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
-      if (expert_id < 0 || expert_id >= num_experts_per_node) {
-        continue;
-      }
 
       int64_t const expanded_original_row = original_row + k_idx * num_rows;
       int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+      if (expert_id < 0 || expert_id >= num_experts_per_node) {
+        continue;
+      }
 
       int64_t expanded_rows = num_rows * experts_per_token;
       if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
