@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch", "ninja"]
+requires = ["setuptools>=61.0", "wheel", "torch", "ninja", "packaging", "requests", "cuda-python==12.9.0", "pynvml", "nvidia-nvshmem-cu12"]
 build-backend = "setuptools.build_meta"
 
 [project]

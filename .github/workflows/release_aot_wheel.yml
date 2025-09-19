@@ -1,0 +1,232 @@
+name: Release AOT Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (tag, branch, or commit SHA) - defaults to main'
+        required: false
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - 'flashinfer-aot-modules/**'
+      - '.github/workflows/build_wheel.yml'
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+
+env:
+  FORCE_COLOR: 1
+
+jobs:
+  build-x86_64:
+    name: Build x86_64 - CUDA ${{ matrix.cuda_version }}
+    runs-on: [self-hosted, Linux, x86_64]  # Self-hosted x86_64 runner
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_version: "12.6"
+            cuda_tag: "126"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a"
+          - cuda_version: "12.8"
+            cuda_tag: "128"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 12.0a"
+          - cuda_version: "12.9"
+            cuda_tag: "129"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a 12.1a"
+          - cuda_version: "13.0"
+            cuda_tag: "130"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a 12.1a"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Display build info
+        run: |
+          echo "Building from ref: ${{ inputs.ref || github.ref || 'default branch' }}"
+          echo "Current commit: $(git rev-parse HEAD)"
+          echo "Current branch/tag: $(git describe --tags --always)"
+          echo "Runner architecture: $(uname -m)"
+          echo "Target architecture: x86_64"
+
+          # Get version from version.txt if it exists
+          if [ -f "version.txt" ]; then
+            VERSION=$(cat version.txt | tr -d '[:space:]')
+            echo "Version from version.txt: $VERSION"
+          else
+            # Fallback to git describe or commit SHA
+            VERSION=$(git describe --tags --always | sed 's/^v//')
+            echo "Version from git: $VERSION"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build in container
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v ${{ github.workspace }}:/workspace \
+            -e FLASHINFER_CUDA_ARCH_LIST="${{ matrix.cuda_arch_list }}" \
+            -e CUDA_VERSION="${{ matrix.cuda_version }}" \
+            --workdir /workspace \
+            --user root \
+            docker.io/flashinfer/flashinfer-ci-cu${{ matrix.cuda_tag }}:latest \
+            bash -c "
+              python3 -m pip install --upgrade pip
+              pip install build wheel setuptools
+              pip install cuda-python==12.9.0 pynvml
+              cd flashinfer-aot-modules
+              echo 'Building AOT modules for CUDA ${{ matrix.cuda_version }} on x86_64'
+              echo 'FLASHINFER_CUDA_ARCH_LIST=${{ matrix.cuda_arch_list }}'
+              python3 -m build --wheel
+              echo '✓ Build completed'
+              ls -lh dist/
+              # Fix ownership for GitHub Actions
+              chown -R \$(stat -c '%u:%g' .) dist/
+            "
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-${{ env.VERSION }}-cu${{ matrix.cuda_tag }}-x86_64
+          path: flashinfer-aot-modules/dist/*.whl
+          retention-days: 7
+
+  build-aarch64:
+    name: Build aarch64 - CUDA ${{ matrix.cuda_version }}
+    runs-on: [self-hosted, Linux, ARM64]  # Self-hosted ARM64 runner
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_version: "12.6"
+            cuda_tag: "126"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a"
+          - cuda_version: "12.8"
+            cuda_tag: "128"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 12.0a"
+          - cuda_version: "12.9"
+            cuda_tag: "129"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a 12.1a"
+          - cuda_version: "13.0"
+            cuda_tag: "130"
+            cuda_arch_list: "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a 12.1a"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Display build info
+        run: |
+          echo "Building from ref: ${{ inputs.ref || github.ref || 'default branch' }}"
+          echo "Current commit: $(git rev-parse HEAD)"
+          echo "Current branch/tag: $(git describe --tags --always)"
+          echo "Runner architecture: $(uname -m)"
+          echo "Target architecture: aarch64"
+
+          # Get version from version.txt if it exists
+          if [ -f "version.txt" ]; then
+            VERSION=$(cat version.txt | tr -d '[:space:]')
+            echo "Version from version.txt: $VERSION"
+          else
+            # Fallback to git describe or commit SHA
+            VERSION=$(git describe --tags --always | sed 's/^v//')
+            echo "Version from git: $VERSION"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build in container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -e FLASHINFER_CUDA_ARCH_LIST="${{ matrix.cuda_arch_list }}" \
+            -e CUDA_VERSION="${{ matrix.cuda_version }}" \
+            --workdir /workspace \
+            --user root \
+            docker.io/flashinfer/flashinfer-ci-cu${{ matrix.cuda_tag }}:latest \
+            bash -c "
+              python3 -m pip install --upgrade pip
+              pip install build wheel setuptools
+              pip install cuda-python==12.9.0 pynvml
+              cd flashinfer-aot-modules
+              echo 'Building AOT modules for CUDA ${{ matrix.cuda_version }} on aarch64'
+              echo 'FLASHINFER_CUDA_ARCH_LIST=${{ matrix.cuda_arch_list }}'
+              python3 -m build --wheel
+              echo '✓ Build completed'
+              ls -lh dist/
+              # Fix ownership for GitHub Actions
+              chown -R \$(stat -c '%u:%g' .) dist/
+            "
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-${{ env.VERSION }}-cu${{ matrix.cuda_tag }}-aarch64
+          path: flashinfer-aot-modules/dist/*.whl
+          retention-days: 7
+
+  publish-wheels:
+    name: Publish Wheels
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || contains(inputs.ref, 'v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: flashinfer-*
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.ref || github.ref_name }}
+          files: dist/*.whl
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        run: |
+          # Copy wheels to wheel index repo
+          cp dist/*.whl flashinfer-whl/
+          # If update script exists, use it
+          if [ -f scripts/update_whl_index.py ]; then
+            python3 scripts/update_whl_index.py
+          fi
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Update wheels for ${{ inputs.ref || github.ref_name }}" || echo "No changes"
+          git push
