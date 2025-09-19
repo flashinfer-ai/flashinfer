@@ -894,7 +894,7 @@ __device__ inline int64_t findTotalEltsLessThanTarget_v2(T const* sorted_indices
   const int lane_id = threadIdx.x & (WARP_SZ - 1);
 
   int local_count = 0;
-#pragma unroll(4)
+#pragma unroll
   for (int k = 0; k < arr_length / WARP_SZ; ++k) {
     const int idx = lane_id + k * WARP_SZ;
     T v = sorted_indices[idx];
