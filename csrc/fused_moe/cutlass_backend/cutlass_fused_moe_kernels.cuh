@@ -1624,9 +1624,6 @@ __global__ void expandInputRowsKernel(
 #pragma unroll
           for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
               data_buf[idx] = source_row_ptr[elem_index];
-          }
-#pragma unroll
-          for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
               sf_buf[idx] = writeSF_v2_read<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf);
@@ -1634,13 +1631,10 @@ __global__ void expandInputRowsKernel(
 
 #pragma unroll
           for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
-              dest_row_ptr[elem_index] = data_buf[idx];
-          }
-#pragma unroll
-          for (int elem_index = start_offset, idx = 0; elem_index < num_elems_in_col; elem_index += stride, ++idx) {
               writeSF_v2_write<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, sf_buf[idx]);
+              dest_row_ptr[elem_index] = data_buf[idx];
           }
       }
 
