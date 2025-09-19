@@ -1117,6 +1117,8 @@ __device__ TmaWarpSpecializedGroupedGemmInput::ElementSF writeSF_v2_read(int64_t
       return 0x00;
     }
   }
+
+  return 0x00;
 }
 
 template <int VecSize, int ElementsPerThread>
