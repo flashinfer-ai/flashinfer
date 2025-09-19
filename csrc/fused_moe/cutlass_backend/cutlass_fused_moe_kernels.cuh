@@ -1798,8 +1798,11 @@ template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleM
 __global__ void finalizeMoeRoutingKernel(
     GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
-    int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token,
+    int const* token_selected_experts, int64_t const orig_cols, int64_t const experts_per_token_real_,
     int const num_experts_per_node, int const start_expert_id) {
+  constexpr int experts_per_token = 8;
+  if (experts_per_token != experts_per_token_real_) { asm("trap;"); }
+
   int64_t const original_row = blockIdx.x;
   int64_t const num_rows = gridDim.x;
   auto const offset = original_row * orig_cols;
@@ -1831,6 +1834,8 @@ __global__ void finalizeMoeRoutingKernel(
   for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     ComputeElem thread_output;
     thread_output.fill(0);
+
+#pragma unroll
     for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
       int64_t const k_offset = original_row * experts_per_token + k_idx;
       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
