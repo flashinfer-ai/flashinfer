@@ -219,17 +219,76 @@ def get_comm_alltoall_module():
         torch.Tensor,
         torch.Tensor,
     ]:
-        return module.moe_prepare(
+        attrs = {"dtype": torch.int32, "device": experts_ids.device}
+
+        prepared_local_expert_ids = torch.empty(
+            (max_token_count_per_rank * ep_size, top_k), **attrs
+        )
+        send_rank_count_cum_sum = torch.empty((ep_size,), **attrs)
+        recv_rank_count_cum_sum = torch.empty((ep_size,), **attrs)
+
+        gather_recv_rank_indices = torch.empty(
+            (max_token_count_per_rank * ep_size,), **attrs
+        )
+        recv_rank_indices = torch.empty((max_token_count_per_rank * ep_size,), **attrs)
+
+        max_send_ranks_per_token = max(ep_size, top_k)
+
+        gather_backward_recv_rank_indices = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token,), **attrs
+        )
+        backward_recv_rank_indices = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token,), **attrs
+        )
+        gather_send_rank_indices = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token,), **attrs
+        )
+        send_rank_indices = torch.empty(
+            (max_token_count_per_rank * max_send_ranks_per_token,), **attrs
+        )
+        if scales is not None:
+            prepared_local_scales = torch.empty(
+                (max_token_count_per_rank * ep_size, top_k), **attrs
+            )
+        else:
+            prepared_local_scales = None
+        if experts_statics is not None:
+            gathered_expert_statics = torch.empty((ep_size, expert_count), **attrs)
+        else:
+            gathered_expert_statics = None
+
+        module.moe_prepare(
             experts_ids,
             scales,
             experts_statics,
             workspace,
+            prepared_local_expert_ids,
+            send_rank_count_cum_sum,
+            recv_rank_count_cum_sum,
+            gather_recv_rank_indices,
+            recv_rank_indices,
+            gather_backward_recv_rank_indices,
+            backward_recv_rank_indices,
+            gather_send_rank_indices,
+            send_rank_indices,
+            prepared_local_scales,
+            gathered_expert_statics,
             max_token_count_per_rank,
             ep_rank,
             ep_size,
             expert_count,
             slot_count,
             top_k,
+        )
+        return (
+            prepared_local_expert_ids,
+            prepared_local_scales,
+            send_rank_count_cum_sum,
+            gather_send_rank_indices,
+            recv_rank_count_cum_sum,
+            gather_recv_rank_indices,
+            gather_backward_recv_rank_indices,
+            gathered_expert_statics,
         )
 
     return SimpleNamespace(

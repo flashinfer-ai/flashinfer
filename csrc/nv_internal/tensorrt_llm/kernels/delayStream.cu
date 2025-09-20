@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/CUDAContext.h>
-
-#include "pytorch_extension_utils.h"
+#include "../../tvm_ffi_utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 
@@ -35,11 +33,10 @@ void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream) {
   delayStreamKernel<<<1, 1, 0, stream>>>(delay_micro_secs);
   tensorrt_llm::common::check_cuda_error(cudaGetLastError());
 }
+
+void delay_kernel(int64_t delay_micro_secs) {
+  tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, get_current_stream());
+}
 }  // namespace tensorrt_llm::kernels
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("delay_kernel", [](int64_t delay_micro_secs) {
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
-  });
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(delay_kernel, tensorrt_llm::kernels::delay_kernel);

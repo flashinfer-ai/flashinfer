@@ -419,4 +419,4 @@ if __name__ == "__main__":
     # test_rope_cos_sin_cache(
     #     64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1
     # )
-    test_mla_rope_quantize(1, 1, torch.float16, torch.float8_e4m3fn)
+    test_mla_rope_quantize(1, torch.float16, torch.float8_e4m3fn)

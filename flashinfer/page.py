@@ -36,7 +36,7 @@ def gen_page_module() -> JitSpec:
         "page",
         [
             jit_env.FLASHINFER_CSRC_DIR / "page.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_binding.cu",
         ],
     )
 

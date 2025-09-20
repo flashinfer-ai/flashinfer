@@ -238,7 +238,7 @@ def trtllm_mnnvl_all_reduce(
     module.trtllm_mnnvl_all_reduce(
         inp,
         multicast_buffer_ptr,
-        buffer_ptrs_dev,
+        int(buffer_ptrs_dev),
         buffer_M,
         buffer_flags_mnnvl,
         nranks,

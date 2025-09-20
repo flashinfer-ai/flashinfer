@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import device_support_pdl
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -78,8 +78,7 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
         x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
         x = x[:, :hidden_size]
 
-    major, _ = get_compute_capability(x.device)
-    if major < 9 and enable_pdl:
+    if enable_pdl and not device_support_pdl(x.device):
         pytest.skip("PDL is only available for Hopper and later GPUs")
 
     w = torch.randn(hidden_size).to(0).to(dtype)
@@ -108,8 +107,7 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
         x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
         x = x[:, :hidden_size]
 
-    major, _ = get_compute_capability(x.device)
-    if major < 9 and enable_pdl:
+    if enable_pdl and not device_support_pdl(x.device):
         pytest.skip("PDL is only available for Hopper and later GPUs")
 
     residual = torch.randn_like(x)
@@ -144,8 +142,7 @@ def test_gemma_norm(
         x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
         x = x[:, :hidden_size]
 
-    major, _ = get_compute_capability(x.device)
-    if major < 9 and enable_pdl:
+    if enable_pdl and not device_support_pdl(x.device):
         pytest.skip("PDL is only available for Hopper and later GPUs")
 
     w = torch.randn(hidden_size).to(0).to(dtype)
@@ -176,8 +173,7 @@ def test_gemma_fused_add_rmsnorm(
         x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
         x = x[:, :hidden_size]
 
-    major, _ = get_compute_capability(x.device)
-    if major < 9 and enable_pdl:
+    if enable_pdl and not device_support_pdl(x.device):
         pytest.skip("PDL is only available for Hopper and later GPUs")
 
     residual = torch.randn_like(x)
@@ -198,5 +194,6 @@ def test_gemma_fused_add_rmsnorm(
 
 
 if __name__ == "__main__":
-    # test_norm(1, 1024, torch.float16, False, True)
-    test_fused_add_rmsnorm(1, 16384, torch.float16, True, True)
+    # test_norm(1, 1024, torch.float16, False, True, True)
+    test_norm(19, 1024, torch.float16, False, True, False)
+    # test_fused_add_rmsnorm(1, 16384, torch.float16, True, True)

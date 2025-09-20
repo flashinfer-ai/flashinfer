@@ -290,3 +290,7 @@ def test_trtllm_custom_allreduce(world_size, dtype):
         target_args=(),
     )
     print(f"custom allreduce tp = {world_size}: OK")
+
+
+if __name__ == "__main__":
+    test_trtllm_custom_allreduce(2, torch.float16)

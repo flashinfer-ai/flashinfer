@@ -31,7 +31,7 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...) \
   do {                                            \

@@ -13,18 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
 
-void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
-             at::Tensor workspace_buffer, int64_t cublas_handle);
+#include "tvm_ffi_utils.h"
 
-void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at::Tensor x_ptr,
-                        at::Tensor w_ptr, at::Tensor y_ptr, at::Tensor x_ld, at::Tensor w_ld,
-                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major);
+void bmm_fp8(Tensor A, Tensor B, Tensor D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer,
+             int64_t cublas_handle);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // "Cutlass Segment GEMM"
-  m.def("cutlass_segment_gemm", CutlassSegmentGEMM);
-  // "BMM FP8"
-  m.def("bmm_fp8", bmm_fp8);
-}
+void CutlassSegmentGEMM(Tensor workspace_buffer, Tensor all_problems, Tensor x_ptr, Tensor w_ptr,
+                        Tensor y_ptr, Tensor x_ld, Tensor w_ld, Tensor y_ld, Tensor empty_x_data,
+                        bool weight_column_major);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm, CutlassSegmentGEMM);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);

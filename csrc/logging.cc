@@ -15,7 +15,7 @@
  */
 #include "flashinfer/logging.h"
 
-#include <torch/library.h>
+#include <tvm/ffi/function.h>
 
 #include "Python.h"
 
@@ -26,7 +26,5 @@ void set_log_level(int64_t log_level_code) {
 
 void try_log_info(const std::string& msg) { FLASHINFER_LOG_INFO(msg); }
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("set_log_level", set_log_level);
-  m.def("try_log_info", try_log_info);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_log_level, set_log_level);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(try_log_info, try_log_info);

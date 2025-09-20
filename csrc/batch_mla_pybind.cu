@@ -14,22 +14,23 @@
  * limitations under the License.
  */
 #include "batch_mla_config.inc"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
-at::Tensor BatchMLAPagedAttentionPlan(at::Tensor float_workspace_buffer,
-                                      at::Tensor int_workspace_buffer,
-                                      at::Tensor page_locked_int_workspace_buffer,
-                                      at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len,
-                                      int64_t num_heads, int64_t head_dim_o, bool causal);
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
 
-void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                               at::Tensor plan_info_vec, at::Tensor q_nope, at::Tensor q_pe,
-                               at::Tensor ckv_cache, at::Tensor kpe_cache, at::Tensor kv_indices,
-                               at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                               int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
-                               double sm_scale);
+Array<int64_t> BatchMLAPagedAttentionPlan(Tensor float_workspace_buffer,
+                                          Tensor int_workspace_buffer,
+                                          Tensor page_locked_int_workspace_buffer, Tensor qo_indptr,
+                                          Tensor kv_indptr, Tensor kv_len, int64_t num_heads,
+                                          int64_t head_dim_o, bool causal);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchMLAPagedAttentionPlan);
-  m.def("run", &BatchMLAPagedAttentionRun);
-}
+void BatchMLAPagedAttentionRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                               Array<int64_t> plan_info_vec, Tensor q_nope, Tensor q_pe,
+                               Tensor ckv_cache, Tensor kpe_cache, Tensor kv_indices, Tensor o,
+                               Optional<Tensor> maybe_lse, int64_t mask_mode_code,
+                               int64_t num_heads, int64_t page_size, double sm_scale);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionPlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionRun);

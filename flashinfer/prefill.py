@@ -252,7 +252,7 @@ def get_trtllm_gen_prefill_module():
 def get_single_prefill_module(backend, *args):
     uri = get_single_prefill_uri(backend, *args)
     module = gen_single_prefill_module(backend, *args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_prefill_with_kv_cache
 
@@ -366,9 +366,9 @@ def get_batch_prefill_module(backend, *args):
     else:
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
-        plan_func = module.plan.default
-        ragged_run_func = module.ragged_run.default
-        paged_run_func = module.paged_run.default
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
 
     # torch library for ragged_run
 
@@ -720,9 +720,9 @@ def get_batch_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    ragged_run_func = jit_module.ragged_run.default
-    paged_run_func = jit_module.paged_run.default
+    plan_func = jit_module.plan
+    ragged_run_func = jit_module.ragged_run
+    paged_run_func = jit_module.paged_run
 
     # torch library for ragged_run
     @register_custom_op(
@@ -886,7 +886,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     lse = None
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=device)
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
@@ -1710,7 +1710,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             qo_indptr_host = qo_indptr.to("cpu")
             self._max_q_len = max(qo_indptr_host).item()
-            total_num_rows = qo_indptr_host[-1]
+            total_num_rows = int(qo_indptr_host[-1])
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
@@ -2640,7 +2640,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
 
-        total_num_rows = qo_indptr_host[-1]
+        total_num_rows = int(qo_indptr_host[-1])
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3464,6 +3464,13 @@ def trtllm_batch_context_with_kv_cache(
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(

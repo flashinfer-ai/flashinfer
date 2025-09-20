@@ -338,9 +338,11 @@ def test_nvfp4_batched_quantize(
     out, out_scale = nvfp4_batched_quantize(x, global_scale)
 
     # Basic shape checks
-    assert out.shape == (b, m, n // 2), (
-        f"Expected shape {(b, m, n // 2)}, got {out.shape}"
-    )
+    assert out.shape == (
+        b,
+        m,
+        n // 2,
+    ), f"Expected shape {(b, m, n // 2)}, got {out.shape}"
     assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
     assert out_scale.dtype == torch.uint8, f"Expected uint8, got {out_scale.dtype}"
 
