@@ -311,3 +311,7 @@ def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
         ),
     )
     print(f"moe finalize allreduce fusion tp = {world_size}: OK")
+
+
+if __name__ == "__main__":
+    test_trtllm_moe_finalize_allreduce_fusion(2, torch.float16)
