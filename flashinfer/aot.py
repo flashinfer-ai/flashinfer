@@ -613,7 +613,7 @@ def main():
     out_dir = (
         project_root / "aot-ops"
         if importlib.util.find_spec("flashinfer") is None
-        else jit_env.FLASHINFER_WORKSPACE_DIR
+        else jit_env.FLASHINFER_WORKSPACE_DIR / "cached_ops"
     )
     build_dir = project_root / "build" / "aot"
 
