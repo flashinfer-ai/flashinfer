@@ -2005,7 +2005,7 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
-    use_nvfp4: bool = True,
+    use_nvfp4: bool = False,
 ) -> torch.Tensor:
     r"""MM FP4
 
