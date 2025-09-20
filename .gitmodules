@@ -1,9 +1,6 @@
 [submodule "3rdparty/cutlass"]
 	path = 3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
-[submodule "3rdparty/composable_kernels"]
-	path = 3rdparty/composable_kernels
-	url = https://github.com/ROCm/composable_kernel.git
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
 	url = https://github.com/gabime/spdlog.git
