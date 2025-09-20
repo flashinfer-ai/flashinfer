@@ -4,6 +4,7 @@ import shutil
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Iterator
+import importlib
 
 import torch
 import torch.version
@@ -609,7 +610,11 @@ def main():
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
     config = get_default_config()
-    out_dir = project_root / "aot-ops"
+    out_dir = (
+        project_root / "aot-ops"
+        if importlib.util.find_spec("flashinfer") is None
+        else jit_env.FLASHINFER_WORKSPACE_DIR
+    )
     build_dir = project_root / "build" / "aot"
 
     # Override with command line arguments
@@ -653,7 +658,6 @@ def main():
 
     # Update data dir
     # if flashinfer installed, do not change these paths, otherwise change to the local paths
-    import importlib
 
     if importlib.util.find_spec("flashinfer") is None:
         # NOTE(Zihao): this script can run before or after flashinfer is installed, if flashinfer is not installed, use the local paths
