@@ -373,3 +373,7 @@ def test_trtllm_allreduce_fusion(world_size, dtype, hidden_dim):
         target_args=(),
     )
     print(f"allreduce fusion tp = {world_size}: OK")
+
+
+if __name__ == "__main__":
+    test_trtllm_allreduce_fusion(2, torch.float16, 1024)
