@@ -229,6 +229,8 @@ inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, co
 
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCUDA) << #x " must be a CUDA tensor";
+#define CHECK_CPU(x) \
+  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCPU) << #x " must be a host tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
 #define CHECK_LAST_DIM_CONTIGUOUS(x)            \
   TVM_FFI_ICHECK_EQ(x->strides[x->ndim - 1], 1) \
