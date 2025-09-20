@@ -8,7 +8,6 @@ from flashinfer import (
     nvfp4_quantize,
     mxfp4_quantize,
 )
-from flashinfer.utils import get_compute_capability
 
 
 # TODO: Consdier splitting this function up for the various backends
@@ -19,23 +18,17 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass"])
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
 @pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4"])
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
-    use_nvfp4 = fp4_type == "nvfp4"
-
-    if backend == "trtllm":
-        if res_dtype == torch.float16:
-            pytest.skip("Skipping test for trtllm fp4 with float16")
-        compute_capability = get_compute_capability(torch.device(device="cuda"))
-        if compute_capability[0] in [11, 12]:
-            pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
+    if backend == "trtllm" and res_dtype == torch.float16:
+        pytest.skip("Skipping test for trtllm fp4 with float16")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if auto_tuning and backend == "cudnn":
         pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
-    if not use_nvfp4 and backend != "cudnn":
+    if fp4_type == "mxfp4" and backend != "cudnn":
         pytest.skip("mx_fp4 is only supported for cudnn backend")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -48,8 +41,9 @@ def test_mm_fp4(
     # for trtllm, we need to shuffle mat2 because we swap A, B.
     do_shuffle_b = backend == "trtllm"
 
+    use_nvfp4 = fp4_type == "nvfp4"
     block_size = 16 if use_nvfp4 else 32
-    has_alpha = fp4_type == "mxfp4_alpha" or fp4_type == "nvfp4"
+    alpha = None  # None in case of mxfp4
 
     if use_nvfp4:
         input_fp4, input_inv_s = nvfp4_quantize(
@@ -61,11 +55,10 @@ def test_mm_fp4(
             sfLayout=SfLayout.layout_128x4,
             do_shuffle=do_shuffle_b,
         )
+        alpha = 1.0 / (global_sf_input * global_sf_mat2)
     else:
         input_fp4, input_inv_s = mxfp4_quantize(input)
         mat2_fp4, mat2_inv_s = mxfp4_quantize(mat2)
-
-    alpha = 1.0 / (global_sf_input * global_sf_mat2) if has_alpha else None
 
     reference = torch.mm(input, mat2.T)
 
@@ -83,7 +76,6 @@ def test_mm_fp4(
             block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,
             backend=backend,
-            use_nvfp4=use_nvfp4,
         )
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
