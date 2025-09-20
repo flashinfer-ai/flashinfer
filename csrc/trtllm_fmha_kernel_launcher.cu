@@ -11,9 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+
 #include <flashinfer/allocator.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
@@ -28,7 +26,9 @@
 #include <sstream>
 #include <unordered_map>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
+
+using tvm::ffi::Optional;
 
 namespace flashinfer {
 
@@ -123,8 +123,8 @@ void trtllm_paged_attention_launcher(
   runner_params.oSfPtr = out_scale_factor;
   runner_params.mSfStartTokenIdx = o_sf_start_index;
   runner_params.mScaleSfO = o_sf_scale;
-  TORCH_CHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1,
-              "Only support o_sf_vec_size == 16 or -1(not used)");
+  TVM_FFI_ICHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1)
+      << "Only support o_sf_vec_size == 16 or -1(not used)";
   runner_params.mChunkedAttentionSize = INT_MAX;  // disable chunked attention by INT_MAX
   runner_params.mAttentionWindowSize =
       window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
@@ -175,18 +175,18 @@ void trtllm_paged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-inline Data_type torch_dtype_to_tllm_data_type(at::ScalarType dtype) {
-  if (dtype == at::ScalarType::Float) {
+inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
+  if (dtype == dl_float32) {
     return Data_type::DATA_TYPE_FP32;
-  } else if (dtype == at::ScalarType::Half) {
+  } else if (dtype == dl_float16) {
     return Data_type::DATA_TYPE_FP16;
-  } else if (dtype == at::ScalarType::BFloat16) {
+  } else if (dtype == dl_bfloat16) {
     return Data_type::DATA_TYPE_BF16;
-  } else if (dtype == at::ScalarType::Float8_e4m3fn) {
+  } else if (dtype == dl_float8_e4m3fn) {
     return Data_type::DATA_TYPE_E4M3;
-  } else if (dtype == at::ScalarType::Float8_e5m2) {
+  } else if (dtype == dl_float8_e5m2) {
     return Data_type::DATA_TYPE_E5M2;
-  } else if (dtype == at::ScalarType::Byte) {
+  } else if (dtype == dl_uint8) {
     // fp4 tensor is not supported in torch and use uint8_t as container.
     return Data_type::DATA_TYPE_E2M1;
   }
@@ -195,65 +195,66 @@ inline Data_type torch_dtype_to_tllm_data_type(at::ScalarType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
-void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out_scale_factor,
-                                   at::Tensor query, at::Tensor key_cache, at::Tensor value_cache,
-                                   at::Tensor workspace_buffer, at::Tensor block_tables,
-                                   at::Tensor seq_lens, int64_t max_kv_len, double bmm1_scale,
-                                   double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
-                                   int64_t o_sf_start_index, int64_t window_left, int64_t sm_count,
-                                   bool enable_pdl, int64_t workspace_size,
-                                   std::optional<at::Tensor> attention_sinks) {
-  auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
-  auto kv_data_type = torch_dtype_to_tllm_data_type(key_cache.scalar_type());
-  TORCH_CHECK_EQ(key_cache.dim(), value_cache.dim());
-  for (int i = 0; i < key_cache.dim(); i++) {
-    TORCH_CHECK_EQ(key_cache.size(i), value_cache.size(i));
+void trtllm_paged_attention_decode(Tensor out, Optional<Tensor> out_scale_factor, Tensor query,
+                                   Tensor key_cache, Tensor value_cache, Tensor workspace_buffer,
+                                   Tensor block_tables, Tensor seq_lens, int64_t max_kv_len,
+                                   double bmm1_scale, double bmm2_scale, double o_sf_scale,
+                                   int64_t o_sf_vec_size, int64_t o_sf_start_index,
+                                   int64_t window_left, int64_t sm_count, bool enable_pdl,
+                                   int64_t workspace_size, Optional<Tensor> attention_sinks) {
+  auto q_data_type = dl_dtype_to_tllm_data_type(query->dtype);
+  auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache->dtype);
+  TVM_FFI_ICHECK_EQ(key_cache->ndim, value_cache->ndim);
+  for (int i = 0; i < key_cache->ndim; i++) {
+    TVM_FFI_ICHECK_EQ(key_cache->shape[i], value_cache->shape[i]);
   }
-  auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
+  auto o_data_type = dl_dtype_to_tllm_data_type(out->dtype);
   // NOTE(Zihao): query is [B, Q, H, D]
   // where Q is the number of query tokens per request, used in MTP
   // based on profiled results, always use decode mode for MTP (q_len is small)
   // example: when kv_len = 10000, q < 200, decode mode is faster
-  int batch_size = query.size(0);
-  int q_len_per_request = query.size(1);
+  int batch_size = query->shape[0];
+  int q_len_per_request = query->shape[1];
   int sum_seq_q = batch_size * q_len_per_request;
-  int num_qo_heads = query.size(2);
+  int num_qo_heads = query->shape[2];
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
-  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
-  int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
-  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
-  int head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
-  TORCH_CHECK(head_dim_k == head_dim_q, "head_dim_k and head_dim_q must be the same, got " +
-                                            std::to_string(head_dim_k) + " and " +
-                                            std::to_string(head_dim_q));
-  TORCH_CHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o,
-              "head_dim_v and head_dim_o must be the same for non-MLA attention, got " +
-                  std::to_string(head_dim_v) + " and " + std::to_string(head_dim_o));
-  int page_size = key_cache.size(-2);
-  int num_kv_heads = key_cache.size(-3);
-  int max_num_blocks_per_seq = block_tables.size(-1);
-  bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
-  int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
+  int head_dim_k = is_4bit(kv_data_type) ? key_cache->shape[key_cache->ndim - 1] * 2
+                                         : key_cache->shape[key_cache->ndim - 1];
+  int head_dim_q =
+      is_4bit(q_data_type) ? query->shape[query->ndim - 1] * 2 : query->shape[query->ndim - 1];
+  int head_dim_v = is_4bit(kv_data_type) ? value_cache->shape[value_cache->ndim - 1] * 2
+                                         : value_cache->shape[value_cache->ndim - 1];
+  int head_dim_o = is_4bit(o_data_type) ? out->shape[out->ndim - 1] * 2 : out->shape[out->ndim - 1];
+  TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
+      << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
+      << std::to_string(head_dim_q);
+  TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o)
+      << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
+      << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
+  int page_size = key_cache->shape[key_cache->ndim - 2];
+  int num_kv_heads = key_cache->shape[key_cache->ndim - 3];
+  int max_num_blocks_per_seq = block_tables->shape[block_tables->ndim - 1];
+  bool is_shared_kv = key_cache->data == value_cache->data;
+  int num_pages_in_mem_pool = is_shared_kv ? key_cache->shape[0] : key_cache->shape[0] * 2;
 
-  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
-  int kv_stride_heads = key_cache.stride(-3);        // head
-  int kv_stride_batch = key_cache.stride(0);         // batch
+  int kv_stride_keys_values = key_cache->strides[key_cache->ndim - 2];  // key/values
+  int kv_stride_heads = key_cache->strides[key_cache->ndim - 3];        // head
+  int kv_stride_batch = key_cache->strides[0];                          // batch
 
-  auto device = query.device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device.index());
-  void* output_sf_ptr = out_scale_factor ? out_scale_factor.value().data_ptr() : nullptr;
+  const auto stream = get_stream(query->device);
+  void* output_sf_ptr = out_scale_factor.has_value() ? out_scale_factor.value()->data : nullptr;
 
   float* attention_sinks_ptr = nullptr;
-  if (attention_sinks) {
-    TORCH_CHECK(attention_sinks->scalar_type() == at::ScalarType::Float,
-                "attention_sinks must be a float tensor");
-    attention_sinks_ptr = attention_sinks->data_ptr<float>();
+  if (attention_sinks.has_value()) {
+    TVM_FFI_ICHECK_EQ(attention_sinks.value()->dtype, dl_float32)
+        << "attention_sinks must be a float tensor";
+    attention_sinks_ptr = static_cast<float*>(attention_sinks.value()->data);
   }
 
   trtllm_paged_attention_launcher(
-      out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
-      static_cast<int*>(seq_lens.data_ptr()),
+      out->data, output_sf_ptr, query->data, key_cache->data, value_cache->data,
+      workspace_buffer->data, static_cast<int*>(block_tables->data),
+      static_cast<int*>(seq_lens->data),
       /*cum_seq_lens_q=*/nullptr,
       /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
       TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
@@ -263,59 +264,60 @@ void trtllm_paged_attention_decode(at::Tensor out, std::optional<at::Tensor> out
       enable_pdl, workspace_size, stream);
 }
 
-void trtllm_paged_attention_context(at::Tensor out, std::optional<at::Tensor> out_scale_factor,
-                                    at::Tensor query, at::Tensor key_cache, at::Tensor value_cache,
-                                    at::Tensor workspace_buffer, at::Tensor block_tables,
-                                    at::Tensor seq_lens, int64_t max_q_len, int64_t max_kv_len,
-                                    double bmm1_scale, double bmm2_scale, double o_sf_scale,
-                                    int64_t o_sf_vec_size, int64_t o_sf_start_index,
-                                    int64_t batch_size, int64_t window_left,
-                                    at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
-                                    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
-                                    std::optional<at::Tensor> attention_sinks) {
-  auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
-  auto kv_data_type = torch_dtype_to_tllm_data_type(key_cache.scalar_type());
-  auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
-  int num_qo_heads = query.size(1);
-  int sum_seq_q = query.size(0);
+void trtllm_paged_attention_context(Tensor out, Optional<Tensor> out_scale_factor, Tensor query,
+                                    Tensor key_cache, Tensor value_cache, Tensor workspace_buffer,
+                                    Tensor block_tables, Tensor seq_lens, int64_t max_q_len,
+                                    int64_t max_kv_len, double bmm1_scale, double bmm2_scale,
+                                    double o_sf_scale, int64_t o_sf_vec_size,
+                                    int64_t o_sf_start_index, int64_t batch_size,
+                                    int64_t window_left, Tensor cum_seq_lens_q,
+                                    Tensor cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
+                                    int64_t workspace_size, Optional<Tensor> attention_sinks) {
+  auto q_data_type = dl_dtype_to_tllm_data_type(query->dtype);
+  auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache->dtype);
+  auto o_data_type = dl_dtype_to_tllm_data_type(out->dtype);
+  int num_qo_heads = query->shape[1];
+  int sum_seq_q = query->shape[0];
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
-  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
-  int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
-  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
-  int head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
-  TORCH_CHECK(head_dim_k == head_dim_q, "head_dim_k and head_dim_q must be the same, got " +
-                                            std::to_string(head_dim_k) + " and " +
-                                            std::to_string(head_dim_q));
-  TORCH_CHECK(head_dim_v == head_dim_o, "head_dim_v and head_dim_o must be the same, got " +
-                                            std::to_string(head_dim_v) + " and " +
-                                            std::to_string(head_dim_o));
-  int max_num_blocks_per_seq = block_tables.size(-1);
-  bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
-  int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
-  int page_size = key_cache.size(-2);
-  int num_kv_heads = key_cache.size(-3);
+  int head_dim_k = is_4bit(kv_data_type) ? key_cache->shape[key_cache->ndim - 1] * 2
+                                         : key_cache->shape[key_cache->ndim - 1];
+  int head_dim_q =
+      is_4bit(q_data_type) ? query->shape[query->ndim - 1] * 2 : query->shape[query->ndim - 1];
+  int head_dim_v = is_4bit(kv_data_type) ? value_cache->shape[value_cache->ndim - 1] * 2
+                                         : value_cache->shape[value_cache->ndim - 1];
+  int head_dim_o = is_4bit(o_data_type) ? out->shape[out->ndim - 1] * 2 : out->shape[out->ndim - 1];
+  TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
+      << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
+      << std::to_string(head_dim_q);
+  TVM_FFI_ICHECK_EQ(head_dim_v, head_dim_o)
+      << "head_dim_v and head_dim_o must be the same, got " << std::to_string(head_dim_v) << " and "
+      << std::to_string(head_dim_o);
+  int max_num_blocks_per_seq = block_tables->shape[block_tables->ndim - 1];
+  bool is_shared_kv = key_cache->data == value_cache->data;
+  int num_pages_in_mem_pool = is_shared_kv ? key_cache->shape[0] : key_cache->shape[0] * 2;
+  int page_size = key_cache->shape[key_cache->ndim - 2];
+  int num_kv_heads = key_cache->shape[key_cache->ndim - 3];
 
-  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
-  int kv_stride_heads = key_cache.stride(-3);        // head
-  int kv_stride_batch = key_cache.stride(0);         // batch
+  int kv_stride_keys_values = key_cache->strides[key_cache->ndim - 2];  // key/values
+  int kv_stride_heads = key_cache->strides[key_cache->ndim - 3];        // head
+  int kv_stride_batch = key_cache->strides[0];                          // batch
 
-  auto device = query.device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device.index());
-  void* output_sf_ptr = out_scale_factor ? out_scale_factor.value().data_ptr() : nullptr;
+  const auto stream = get_stream(query->device);
+  void* output_sf_ptr = out_scale_factor.has_value() ? out_scale_factor.value()->data : nullptr;
 
   float* attention_sinks_ptr = nullptr;
-  if (attention_sinks) {
-    TORCH_CHECK(attention_sinks->scalar_type() == at::ScalarType::Float,
-                "attention_sinks must be a float tensor");
-    attention_sinks_ptr = attention_sinks->data_ptr<float>();
+  if (attention_sinks.has_value()) {
+    TVM_FFI_ICHECK_EQ(attention_sinks.value()->dtype, dl_float32)
+        << "attention_sinks must be a float tensor";
+    attention_sinks_ptr = static_cast<float*>(attention_sinks.value()->data);
   }
 
   trtllm_paged_attention_launcher(
-      out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
-      static_cast<int*>(seq_lens.data_ptr()),
-      /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
-      /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), attention_sinks_ptr,
+      out->data, output_sf_ptr, query->data, key_cache->data, value_cache->data,
+      workspace_buffer->data, static_cast<int*>(block_tables->data),
+      static_cast<int*>(seq_lens->data),
+      /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q->data),
+      /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv->data), attention_sinks_ptr,
       q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context, batch_size,
       max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q,
       head_dim_o, page_size, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
@@ -410,67 +412,62 @@ void trtllm_ragged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-void trtllm_ragged_attention(at::Tensor out, at::Tensor query, at::Tensor key, at::Tensor value,
-                             at::Tensor workspace_buffer, at::Tensor seq_lens, int64_t max_q_len,
+void trtllm_ragged_attention(Tensor out, Tensor query, Tensor key, Tensor value,
+                             Tensor workspace_buffer, Tensor seq_lens, int64_t max_q_len,
                              int64_t max_kv_len, double bmm1_scale, double bmm2_scale,
                              double o_sf_scale, int64_t batch_size, int64_t window_left,
-                             at::Tensor cum_seq_lens_q, at::Tensor cum_seq_lens_kv,
-                             int64_t sm_count, bool enable_pdl, bool is_causal,
-                             int64_t workspace_size, std::optional<at::Tensor> attention_sinks,
-                             std::optional<at::Tensor> lse) {
+                             Tensor cum_seq_lens_q, Tensor cum_seq_lens_kv, int64_t sm_count,
+                             bool enable_pdl, bool is_causal, int64_t workspace_size,
+                             Optional<Tensor> attention_sinks, Optional<Tensor> lse) {
   float* attention_sinks_ptr = nullptr;
-  if (attention_sinks) {
-    TORCH_CHECK(attention_sinks->scalar_type() == at::ScalarType::Float,
-                "attention_sinks must be a float tensor");
-    attention_sinks_ptr = attention_sinks->data_ptr<float>();
+  if (attention_sinks.has_value()) {
+    TVM_FFI_ICHECK_EQ(attention_sinks.value()->dtype, dl_float32)
+        << "attention_sinks must be a float tensor";
+    attention_sinks_ptr = static_cast<float*>(attention_sinks.value()->data);
   }
   float* lse_ptr = nullptr;
-  if (lse) {
-    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be a float tensor");
-    lse_ptr = lse->data_ptr<float>();
+  if (lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(lse.value()->dtype, dl_float32) << "lse must be a float tensor";
+    lse_ptr = static_cast<float*>(lse.value()->data);
   }
-  TORCH_CHECK(out.dim() == 3, "out must be a 3D tensor");
-  TORCH_CHECK(query.dim() == 3, "query must be a 3D tensor");
-  TORCH_CHECK(key.dim() == 3, "key must be a 3D tensor");
-  TORCH_CHECK(value.dim() == 3, "value must be a 3D tensor");
+  TVM_FFI_ICHECK_EQ(out->ndim, 3) << "out must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(query->ndim, 3) << "query must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(key->ndim, 3) << "key must be a 3D tensor";
+  TVM_FFI_ICHECK_EQ(value->ndim, 3) << "value must be a 3D tensor";
 
-  auto q_data_type = torch_dtype_to_tllm_data_type(query.scalar_type());
-  auto kv_data_type = torch_dtype_to_tllm_data_type(key.scalar_type());
-  auto o_data_type = torch_dtype_to_tllm_data_type(out.scalar_type());
-  auto device = query.device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device.index());
-  int num_qo_heads = query.size(1);
-  int num_kv_heads = key.size(1);
-  int sum_seq_q = query.size(0);
-  int sum_seq_kv = key.size(0);
-  int head_dim_qk = query.size(2);
-  int head_dim_v = value.size(2);
-  int k_stride_keys_values = key.stride(0);
-  int k_stride_heads = key.stride(1);
-  int k_stride_batch = key.numel();
-  int v_stride_keys_values = value.stride(0);
-  int v_stride_heads = value.stride(1);
-  int v_stride_batch = value.numel();
+  auto q_data_type = dl_dtype_to_tllm_data_type(query->dtype);
+  auto kv_data_type = dl_dtype_to_tllm_data_type(key->dtype);
+  auto o_data_type = dl_dtype_to_tllm_data_type(out->dtype);
+  const auto stream = get_stream(query->device);
+  int num_qo_heads = query->shape[1];
+  int num_kv_heads = key->shape[1];
+  int sum_seq_q = query->shape[0];
+  int sum_seq_kv = key->shape[0];
+  int head_dim_qk = query->shape[2];
+  int head_dim_v = value->shape[2];
+  int k_stride_keys_values = key->strides[0];
+  int k_stride_heads = key->strides[1];
+  int k_stride_batch = get_numel(key);
+  int v_stride_keys_values = value->strides[0];
+  int v_stride_heads = value->strides[1];
+  int v_stride_batch = get_numel(value);
 
   trtllm_ragged_attention_launcher(
-      out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(seq_lens.data_ptr()),
-      static_cast<int*>(cum_seq_lens_q.data_ptr()), static_cast<int*>(cum_seq_lens_kv.data_ptr()),
-      attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
-      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale,
-      bmm2_scale, o_sf_scale, batch_size, window_left, sm_count, enable_pdl, is_causal,
-      k_stride_keys_values, k_stride_heads, k_stride_batch, v_stride_keys_values, v_stride_heads,
-      v_stride_batch, workspace_size, stream);
+      out->data, query->data, key->data, value->data, workspace_buffer->data,
+      static_cast<int*>(seq_lens->data), static_cast<int*>(cum_seq_lens_q->data),
+      static_cast<int*>(cum_seq_lens_kv->data), attention_sinks_ptr, lse_ptr, q_data_type,
+      kv_data_type, o_data_type, max_q_len, max_kv_len, num_qo_heads, num_kv_heads, head_dim_qk,
+      head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale, bmm2_scale, o_sf_scale, batch_size,
+      window_left, sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads,
+      k_stride_batch, v_stride_keys_values, v_stride_heads, v_stride_batch, workspace_size, stream);
 }
 
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("trtllm_paged_attention_decode", trtllm_paged_attention_decode);
-  m.def("trtllm_paged_attention_context", trtllm_paged_attention_context);
-  m.def("trtllm_ragged_attention", trtllm_ragged_attention);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
 
 }  // namespace flashinfer
