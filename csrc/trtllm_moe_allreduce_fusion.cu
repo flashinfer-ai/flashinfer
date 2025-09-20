@@ -91,8 +91,8 @@ void trtllm_moe_finalize_allreduce_fusion(Tensor allreduce_in, Tensor residual_i
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(residual_in->dtype, c_type, [&] {
     MoeFinalizeAllReduceFusionParams<c_type> params;
 
-    int hidden_dim = residual_in.size(-1);
-    int top_k = expanded_idx_to_permuted_idx.size(-1);
+    int hidden_dim = residual_in->shape[residual_in->ndim - 1];
+    int top_k = expanded_idx_to_permuted_idx->shape[expanded_idx_to_permuted_idx->ndim - 1];
 
     params.quant_out = nullptr;
     params.scale_out = nullptr;
