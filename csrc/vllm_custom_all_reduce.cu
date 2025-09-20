@@ -28,7 +28,7 @@ fptr_t init_custom_ar(Array<fptr_t> fake_ipc_ptrs, Tensor rank_data, int64_t ran
   for (int i = 0; i < world_size; i++) {
     ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
   }
-  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data->data, rank_data.numel(), rank,
+  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data->data, get_numel(rank_data), rank,
                                             world_size, full_nvlink);
 }
 
