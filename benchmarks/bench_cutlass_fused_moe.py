@@ -29,20 +29,24 @@ from flashinfer.testing.utils import bench_gpu_time
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
+num_ranks = 4
 
 test_configs = [
+    # {
+    #     "hidden_size": 7168,
+    #     "num_experts": 256,
+    #     "top_k": 8,
+    #     "intermediate_size": 256,
+    # },
     {
         "hidden_size": 7168,
-        "num_experts": 256,
-        "top_k": 8,
-        "intermediate_size": 256,
-    },
-    {
-        "hidden_size": 7168,
-        "num_experts": 32,
+        "num_experts": num_experts,
         "top_k": 8,
         "intermediate_size": 2048,
-    },
+    }
+    for num_experts in [
+        256 // num_ranks,
+    ]
 ]
 
 
@@ -131,6 +135,13 @@ def bench_cutlass_fused_moe(
     router_logits = torch.randn(m, e, dtype=otype).cuda()
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
+    if 1:
+        print("HACK: mask some selected_experts")
+        selected_experts[torch.randn(selected_experts.shape) > 1 / num_ranks] = 9999999
+
+        tune_max_num_tokens = batch_size
+        print(f"HACK: {tune_max_num_tokens=}")
+
     flash_output = torch.zeros_like(x)
 
     quant_scales = [
@@ -143,6 +154,7 @@ def bench_cutlass_fused_moe(
     ]
     hidden_states = x
     hidden_states, input_sf = fp4_quantize(x, a1_gs)
+    print(f"{hidden_states.shape=}")
 
     # Warmup
     for _ in range(3):
@@ -156,7 +168,7 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-            tune_max_num_tokens=16384,
+            tune_max_num_tokens=tune_max_num_tokens,
         )
 
     if not skip_autotune:
@@ -171,10 +183,20 @@ def bench_cutlass_fused_moe(
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=flash_output,
-                tune_max_num_tokens=16384,
+                tune_max_num_tokens=tune_max_num_tokens,
             )
-    ms_list = bench_gpu_time(
-        lambda: fused_moe.cutlass_fused_moe(
+
+    counter = 0
+
+    def f():
+        nonlocal counter
+        counter += 1
+
+        if counter == 10:
+            print("hi call cudaProfilerStart")
+            torch.cuda.cudart().cudaProfilerStart()
+
+        fused_moe.cutlass_fused_moe(
             hidden_states,
             selected_experts.to(torch.int),
             routing_weights,
@@ -184,13 +206,28 @@ def bench_cutlass_fused_moe(
             quant_scales=quant_scales,
             input_sf=input_sf,
             output=flash_output,
-        ),
-    )
+        )
+
+        if counter == 10:
+            print("hi call cudaProfilerStop")
+            torch.cuda.cudart().cudaProfilerStop()
+
+    ms_list = bench_gpu_time(f)
     median_ms = np.median(ms_list)
     print(f"{'input':<15} {'weight1':<20} {'weight2':<20} {'time(ms)'}")
     print(
         f"{str(tuple(hidden_states.shape)):<15} {str(tuple(w1.shape)):<20} {str(tuple(w2.shape)):<20} {median_ms:.3f}"
     )
+
+    from flashinfer.testing.utils import bench_kineto
+    for _ in range(5):
+        ts = bench_kineto(
+            f,
+            ("expandInputRowsKernel", "doActivationKernel", "finalizeMoeRoutingKernel"),
+            suppress_kineto_output=False,
+            num_tests=100,
+        )
+        print(f"Kineto output: ts_ms={['%.3f' % (t * 1000) for t in ts]}")
 
 
 if __name__ == "__main__":
@@ -201,7 +238,7 @@ if __name__ == "__main__":
         help="Update the config file with the new profiling results",
     )
     parser.add_argument(
-        "--num-tokens", type=int, default=32, help="Number of tokens to profile"
+        "--num-tokens", type=int, default=32768 * num_ranks, help="Number of tokens to profile"
     )
     parser.add_argument("--skip-autotune", action="store_true", help="Skip autotuning")
     args = parser.parse_args()
