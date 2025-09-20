@@ -9,6 +9,8 @@ import torch.distributed as dist
 
 import flashinfer.comm as comm
 
+from tvm_ffi import use_torch_stream
+
 # todo(Yingyi): add benchmark and quant test
 
 # Usage: test var
@@ -159,7 +161,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     # warmup
                                     s = torch.cuda.Stream()
                                     s.wait_stream(torch.cuda.current_stream())
-                                    with torch.cuda.stream(s):
+                                    with use_torch_stream(torch.cuda.stream(s)):
                                         for _ in range(test_loop):
                                             comm.trtllm_allreduce_fusion(
                                                 allreduce_in=allreduce_in,
@@ -188,7 +190,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                     # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
                                     # capture
                                     g = torch.cuda.CUDAGraph()
-                                    with torch.cuda.graph(g):
+                                    with use_torch_stream(torch.cuda.graph(g)):
                                         for _ in range(test_loop):
                                             comm.trtllm_allreduce_fusion(
                                                 allreduce_in=allreduce_in,
