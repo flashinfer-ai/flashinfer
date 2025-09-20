@@ -19,8 +19,6 @@
 
 #include "flashinfer/comm/trtllm_alltoall.cuh"
 #include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
-#include "pytorch_extension_utils.h"
-#include "tvm/ffi/error.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer::trtllm_alltoall;
