@@ -286,7 +286,7 @@ def get_comm_alltoall_module():
             send_rank_count_cum_sum,
             gather_send_rank_indices,
             recv_rank_count_cum_sum,
-            recv_rank_indices,
+            gather_recv_rank_indices,
             gather_backward_recv_rank_indices,
             gathered_expert_statics,
         )
