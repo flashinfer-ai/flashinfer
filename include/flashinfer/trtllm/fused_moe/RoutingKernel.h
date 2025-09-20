@@ -92,11 +92,10 @@ struct DataBase {
   int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, int NumExperts_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, bool UsePdl_>
 struct KernelParamsBase {
   using InputT = InputT_;
   using OutputT = OutputT_;
-  static constexpr int NumExperts = NumExperts_;
   static constexpr bool UsePdl = UsePdl_;
 
   // Public pointer members
@@ -161,8 +160,8 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, bool UseGroups_, int NumExperts_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, NumExperts_, UsePdl_> {
+template <typename InputT_, typename OutputT_, bool UseGroups_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
@@ -216,8 +215,8 @@ struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, int NumExperts_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, NumExperts_, UsePdl_> {
+template <typename InputT_, typename OutputT_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
@@ -254,9 +253,8 @@ struct Data : public DataBase {
   bool mApplySoftmaxAfterTopK{false};
 };
 
-template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, int NumExperts_,
-          bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, NumExperts_, UsePdl_> {
+template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
