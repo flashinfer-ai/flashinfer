@@ -97,6 +97,7 @@ ignore_errors = false
 strict_optional = false
 exclude = [
     "flashinfer-cubin/",
+    "flashinfer-aot-modules/",
     "3rdparty/",
     "flashinfer/data/cutlass/",
     "build/",

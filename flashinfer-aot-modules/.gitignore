@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+flashinfer_aot_modules/aot_modules/
+_build_meta.py
