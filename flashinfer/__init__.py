@@ -143,7 +143,6 @@ try:
 
     flashinfer_cubin_version = flashinfer_cubin.__version__
 
-    print("__version__", __version__)
     if __version__ != flashinfer_cubin_version:
         raise RuntimeError(
             f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
