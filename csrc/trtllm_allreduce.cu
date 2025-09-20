@@ -28,10 +28,10 @@ using tvm::ffi::Optional;
     if (dtype == dl_float32) {                                                                   \
       using C_TYPE = float;                                                                      \
       __VA_ARGS__                                                                                \
-    } else if (scalar_type == dl_float16) {                                                      \
+    } else if (dtype == dl_float16) {                                                            \
       using C_TYPE = half;                                                                       \
       __VA_ARGS__                                                                                \
-    } else if (scalar_type == dl_bfloat16) {                                                     \
+    } else if (dtype == dl_bfloat16) {                                                           \
       using C_TYPE = __nv_bfloat16;                                                              \
       __VA_ARGS__                                                                                \
     } else {                                                                                     \

@@ -100,7 +100,7 @@ void trtllm_moe_finalize_allreduce_fusion(Tensor allreduce_in, Tensor residual_i
     params.nranks = static_cast<int>(world_size);
     params.rank = static_cast<int>(world_rank);
     // size: num_token * hidden_dim
-    params.size = residual_in.numel();
+    params.size = get_numel(residual_in);
     params.hidden_dim = hidden_dim;
 
     // workspace: AR scratch space
