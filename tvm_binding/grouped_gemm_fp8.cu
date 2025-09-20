@@ -98,35 +98,15 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100(
     size_t float_buffer_size_in_bytes, DTypeIn* A, DTypeIn* B, float* SFA, float* SFB, DTypeOut* D,
     int* m_indptr, int max_m, int n, int k, int num_groups, cudaStream_t stream);
 
-}  // namespace group_gemm
+}
 }  // namespace flashinfer
 
 // FP8 Group GEMM implementation with CUTLASS for SM100A (Blackwell)
-int GroupedGemmFp8Run(DLTensor* int_workspace_buffer, DLTensor* float_workspace_buffer, DLTensor* A,
-                      DLTensor* B, DLTensor* SFA, DLTensor* SFB, DLTensor* D, DLTensor* m_indptr,
-                      int64_t n, int64_t k, int64_t scale_granularity_m,
-                      int64_t scale_granularity_n, int64_t scale_granularity_k,
-                      int64_t scale_major_mode, int64_t mma_sm, TVMStreamHandle cuda_stream) {
-  LOG(INFO) << "Call to GroupedGemmFp8Run";
-
-  if (!int_workspace_buffer || !float_workspace_buffer) {
-    LOG(FATAL) << "work space buffer is null";
-  }
-  if (!A || !B) {
-    LOG(FATAL) << "A or B is null";
-  }
-  if (!SFA || !SFB) {
-    LOG(FATAL) << "Scale for A or B is null";
-  }
-  if (!D) {
-    LOG(FATAL) << "D is null";
-  }
-  if (!m_indptr) {
-    LOG(FATAL) << "m indptr is null";
-  }
-
-  LOG(INFO) << "=== NULL CHECKS PASSED ===";
-
+void GroupedGemmFp8Run(DLTensor* int_workspace_buffer, DLTensor* float_workspace_buffer,
+                       DLTensor* A, DLTensor* B, DLTensor* SFA, DLTensor* SFB, DLTensor* D,
+                       DLTensor* m_indptr, int64_t n, int64_t k, int64_t scale_granularity_m,
+                       int64_t scale_granularity_n, int64_t scale_granularity_k,
+                       int64_t scale_major_mode, int64_t mma_sm, TVMStreamHandle cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   size_t float_workspace_size =
@@ -138,34 +118,14 @@ int GroupedGemmFp8Run(DLTensor* int_workspace_buffer, DLTensor* float_workspace_
   int64_t max_m = SFA->shape[1];
 
   try {
-    LOG(INFO) << "=== STARTING DISPATCH ===";
     DISPATCH_TVM_DTYPE_TO_CTYPE(A->dtype, D->dtype, c_type_in, c_type_out, [&] {
-      LOG(INFO) << "=== INSIDE DTYPE DISPATCH ===";
       return DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
-        LOG(INFO) << "=== INSIDE SCALE_MAJOR_K DISPATCH ===";
         return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
-          LOG(INFO) << "=== INSIDE MMA_SM DISPATCH ===";
           return DISPATCH_SCALE_GRANULARITY(
               scale_granularity_m, scale_granularity_n, scale_granularity_k, SCALE_GRANULARITY_M,
               SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
-                // Validate kernel parameters before call
-                LOG(INFO) << "Kernel parameters:";
-                LOG(INFO) << "  max_m: " << max_m;
-                LOG(INFO) << "  n: " << n;
-                LOG(INFO) << "  k: " << k;
-                LOG(INFO) << "  num_groups: " << num_groups;
-                LOG(INFO) << "  scale_granularity: (" << scale_granularity_m << ","
-                          << scale_granularity_n << "," << scale_granularity_k << ")";
-                LOG(INFO) << "  scale_major_mode: " << scale_major_mode;
-                LOG(INFO) << "  mma_sm: " << mma_sm;
-
                 using cutlass_t_in = flashinfer::cutlass_dtype_t<c_type_in>;
                 using cutlass_t_out = flashinfer::cutlass_dtype_t<c_type_out>;
-                LOG(INFO) << "CUTLASS types created successfully";
-                LOG(INFO) << "sizeof(cutlass_t_in): " << sizeof(cutlass_t_in);
-                LOG(INFO) << "sizeof(cutlass_t_out): " << sizeof(cutlass_t_out);
-
-                LOG(INFO) << "Calling actual kernel now...";
 
                 auto status = flashinfer::group_gemm::CutlassFP8GroupwiseScaledGroupGEMMSM100<
                     SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
@@ -187,23 +147,15 @@ int GroupedGemmFp8Run(DLTensor* int_workspace_buffer, DLTensor* float_workspace_
                 // Check for CUDA errors immediately after kernel call
                 cudaError_t cuda_error = cudaGetLastError();
                 if (cuda_error != cudaSuccess) {
-                  LOG(ERROR) << "CUDA error after kernel call: " << cudaGetErrorString(cuda_error);
                   return false;
                 }
-                simple_print_kernel<<<1, 1>>>(static_cast<char*>(D->data) + D->byte_offset,
-                                              D->dtype.code);
-
                 LOG(INFO) << "Kernel execution completed successfully";
-
                 return status == cudaSuccess;
               });
         });
       });
-    })
-    ? 0 : -3;
-
+    });
   } catch (const std::exception& e) {
     LOG(INFO) << "Exception caught:" << e.what();
-    return -4;
   }
 }
