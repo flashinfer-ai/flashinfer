@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "dlpack/dlpack.h"
 #include "tvm_ffi_utils.h"
 
 #define NVSHMEMCHECK(stmt)                                                                    \
@@ -24,6 +25,8 @@
 namespace {
 
 constexpr int nvshmemx_uniqueid_t_size = sizeof(nvshmemx_uniqueid_t);
+
+using tvm::ffi::Array;
 
 void get_unique_id(Tensor uid) {
   CHECK_CONTIGUOUS(uid);
@@ -52,22 +55,24 @@ int64_t my_pe() { return nvshmem_my_pe(); }
 
 int64_t n_pes() { return nvshmem_n_pes(); }
 
-// Tensor malloc_tensor(ffi::Shape shape, DLDataType dtype,
-//                          const c10::Device& device) {
-//   size_t size = c10::elementSize(dtype) * c10::multiply_integers(shape);
-//   void* ptr = nvshmem_malloc(size);
-//   if (ptr == nullptr) {
-//     TVM_FFI_ICHECK(false) << "nvshmem_malloc failed. size: " << size;
-//   }
-//   auto tensor = alloc_tensor(ffi::Shape(shape), dtype, device);
-//   std::memcpy(tensor->data, ptr, size);
-//   return tensor;
-// }
+struct NVSHMEMNDAlloc {
+  void AllocData(DLTensor* tensor) {
+    size_t size = tvm::ffi::GetDataSize(*tensor);
+    tensor->data = nvshmem_malloc(size);
+    TVM_FFI_ICHECK_NE(tensor->data, nullptr) << "nvshmem_malloc failed. size: " << size;
+  }
+  void FreeData(DLTensor* tensor) { nvshmem_free(tensor->data); }
+};
+
+Tensor malloc_tensor(Array<int64_t> shape, DLDataType dtype, int device_id) {
+  return Tensor::FromNDAlloc(NVSHMEMNDAlloc(), tvm::ffi::Shape(shape), dtype,
+                             DLDevice{kDLCUDA, device_id});
+}
 
 void barrier_all() { nvshmem_barrier_all(); }
 
 void barrier_all_on_current_stream() {
-  cudaStream_t stream = get_stream(cpu);
+  cudaStream_t stream = get_current_stream();
   nvshmemx_barrier_all_on_stream(stream);
 }
 
@@ -78,8 +83,8 @@ void alltoall(Tensor dest, Tensor source) {
 
   size_t nbytes = get_numel(dest) * get_element_size(dest) / dest->shape[0];
   cudaStream_t stream = get_stream(dest->device);
-  NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, (uint8_t*)dest->data,
-                                              (uint8_t*)source->data, nbytes, stream));
+  NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, static_cast<uint8_t*>(dest->data),
+                                              static_cast<uint8_t*>(source->data), nbytes, stream));
 }
 
 void fake_alltoall(Tensor dest, Tensor source) {}
@@ -99,20 +104,23 @@ void sum_reduce(Tensor dest, Tensor source, int64_t nelems) {
   switch (encode_dlpack_dtype(dest->dtype)) {
     case float16_code:  // float16
       NVSHMEMCHECK(nvshmemx_half_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (__half*)dest->data, (__half*)source->data, nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<nv_half*>(dest->data),
+          static_cast<nv_half*>(source->data), nelems_size_t, stream));
       break;
     case float32_code:  // float32
       NVSHMEMCHECK(nvshmemx_float_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (float*)dest->data, (float*)source->data, nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<float*>(dest->data), static_cast<float*>(source->data),
+          nelems_size_t, stream));
       break;
     case bfloat16_code:  // bfloat16
       NVSHMEMCHECK(nvshmemx_bfloat16_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, (__nv_bfloat16*)dest->data, (__nv_bfloat16*)source->data,
-          nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<nv_bfloat16*>(dest->data),
+          static_cast<nv_bfloat16*>(source->data), nelems_size_t, stream));
       break;
 
     default:
-      TVM_FFI_ICHECK(false) << "Unsupported dtype for nvshmem_sum_reduce: " << dest->dtype;
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "Unsupported dtype for nvshmem_sum_reduce: " << dest->dtype;
   }
 }
 
@@ -151,7 +159,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_init, init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_finalize, finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_my_pe, my_pe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_n_pes, n_pes);
-// TVM_FFI_DLL_EXPORT_TYPED_FUNC(malloc_tensor, malloc_tensor);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(malloc_tensor, malloc_tensor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all, barrier_all);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all_on_current_stream, barrier_all_on_current_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_alltoall, alltoall);
