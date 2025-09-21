@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <string>
 
-#include "dlpack/dlpack.h"
 #include "flashinfer/comm/trtllm_allreduce.cuh"
 #include "tvm_ffi_utils.h"
 

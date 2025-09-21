@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include "dlpack/dlpack.h"
 #include "tvm_ffi_utils.h"
 
 #define NVSHMEMCHECK(stmt)                                                                    \
@@ -27,6 +26,7 @@ namespace {
 constexpr int nvshmemx_uniqueid_t_size = sizeof(nvshmemx_uniqueid_t);
 
 using tvm::ffi::Array;
+using tvm::ffi::Shape;
 
 void get_unique_id(Tensor uid) {
   CHECK_CONTIGUOUS(uid);
@@ -64,7 +64,7 @@ struct NVSHMEMNDAlloc {
   void FreeData(DLTensor* tensor) { nvshmem_free(tensor->data); }
 };
 
-Tensor malloc_tensor(Array<int64_t> shape, DLDataType dtype, int device_id) {
+Tensor malloc_tensor(Shape shape, DLDataType dtype, int device_id) {
   return Tensor::FromNDAlloc(NVSHMEMNDAlloc(), tvm::ffi::Shape(shape), dtype,
                              DLDevice{kDLCUDA, device_id});
 }
