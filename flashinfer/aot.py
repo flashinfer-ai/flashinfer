@@ -28,6 +28,7 @@ from .gemm import (
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_tgv,
     gen_trtllm_gen_gemm_module,
+    gen_batch_attention_module,
 )
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
@@ -184,6 +185,17 @@ def gen_attention(
             dtype_kv=dtype_kv,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
+        yield from gen_batch_attention_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
         )
