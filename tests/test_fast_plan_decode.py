@@ -16,15 +16,13 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import flashinfer
-max_bs = 128
 
-import flashinfer
+MAX_BATCH_SIZE = 128
 
 global_override_indptr_cpu = None
+
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 2048, 16384])
@@ -56,10 +54,12 @@ def test_cuda_graph_batch_fast_decode_with_paged_kv_cache(
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
 
     if global_override_indptr_cpu is None:
-        global_override_indptr_cpu = torch.empty(max_bs + 1, device="cpu")
+        global_override_indptr_cpu = torch.empty(MAX_BATCH_SIZE + 1, device="cpu")
 
-    global_override_indptr_cpu = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
-    
+    global_override_indptr_cpu = (
+        torch.arange(0, batch_size + 1).int() * num_pages_per_seq
+    )
+
     total_num_pages = num_pages_per_seq * batch_size
     if kv_layout == "HND":
         kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
@@ -113,7 +113,7 @@ def test_cuda_graph_batch_fast_decode_with_paged_kv_cache(
         kv_layout,
     )
 
-    wrapper.plan = partial(fast_decode_plan, wrapper)
+    wrapper.plan = partial(flashinfer.decode.fast_decode_plan, wrapper)
 
     wrapper.plan(
         kv_indptr_host_warmup,
@@ -224,7 +224,6 @@ def test_cuda_graph_batch_fast_decode_with_paged_kv_cache(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
-
 if __name__ == "__main__":
     # test_batch_decode_with_paged_kv_cache(
     #     256,
@@ -314,4 +313,3 @@ if __name__ == "__main__":
     test_cuda_graph_batch_fast_decode_with_paged_kv_cache(
         12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2, True
     )
-    

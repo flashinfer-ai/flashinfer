@@ -2368,6 +2368,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return out
 
 
+global_override_indptr_cpu = None
+
+
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -2502,7 +2505,7 @@ def fast_decode_plan(
                     disable_split_kv,
                 )
             except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}")
+                raise RuntimeError(f"Error in standard plan: {e}") from e
         else:
             try:
                 # Make sure we pass exactly 15 arguments for standard version
@@ -2524,7 +2527,7 @@ def fast_decode_plan(
                     empty_kv_cache,
                 )
             except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}")
+                raise RuntimeError(f"Error in standard plan: {e}") from e
 
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left
