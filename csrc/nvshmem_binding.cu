@@ -159,7 +159,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_init, init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_finalize, finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_my_pe, my_pe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_n_pes, n_pes);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(malloc_tensor, malloc_tensor);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_malloc, malloc_tensor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all, barrier_all);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all_on_current_stream, barrier_all_on_current_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_alltoall, alltoall);
