@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 
@@ -29,6 +29,42 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
+
+from torch.utils.cpp_extension import load_inline
+
+
+def gen_seed_and_offset() -> Callable:
+    cpp_sources = """
+std::tuple<uint64_t, uint64_t> gen(uint64_t increment, std::optional<at::Generator> gen_);
+"""
+
+    cuda_sources = """
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+
+std::tuple<uint64_t, uint64_t> gen(uint64_t increment, std::optional<at::Generator> gen_) {
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    std::lock_guard<std::mutex> lock(gen->mutex_);
+    at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(increment);
+    return std::make_tuple(rng_engine_inputs.seed_.val, rng_engine_inputs.offset_.val);
+}
+"""
+
+    mod = load_inline(
+        name="gen_seed_and_offset",
+        cpp_sources=cpp_sources,
+        cuda_sources=cuda_sources,
+        functions=["gen"],
+        extra_cflags=["-O3"],
+    )
+    return mod.gen
+
+
+@functools.cache
+def get_seed_and_offset(
+    increment: int, generator: Optional[torch.Generator] = None
+) -> Tuple[int, int]:
+    return gen_seed_and_offset()(increment, generator)
 
 
 def gen_sampling_module() -> JitSpec:
@@ -59,7 +95,7 @@ def get_sampling_module():
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
-        module.softmax.default(
+        module.softmax(
             workspace_buffer,
             logits,
             probs,
@@ -93,12 +129,14 @@ def get_sampling_module():
         logits = logits.float()
         batch_size = indices.size(0) if indices is not None else logits.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.sampling_from_logits.default(
+        seed, offset = get_seed_and_offset(batch_size * logits.size(1), generator)
+        module.sampling_from_logits(
             logits,
             samples,
             indices,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -125,12 +163,14 @@ def get_sampling_module():
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.sampling_from_probs.default(
+        seed, offset = get_seed_and_offset(batch_size, generator)
+        module.sampling_from_probs(
             probs,
             samples,
             indices,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -164,14 +204,16 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.top_p_sampling_from_probs.default(
+        seed, offset = get_seed_and_offset(batch_size * 32, generator)
+        module.top_p_sampling_from_probs(
             probs,
             samples,
             indices,
             maybe_top_p_arr,
             top_p_val,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -203,14 +245,16 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.top_k_sampling_from_probs.default(
+        seed, offset = get_seed_and_offset(batch_size * 32, generator)
+        module.top_k_sampling_from_probs(
             probs,
             samples,
             indices,
             maybe_top_k_arr,
             top_k_val,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -245,14 +289,16 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.min_p_sampling_from_probs.default(
+        seed, offset = get_seed_and_offset(batch_size, generator)
+        module.min_p_sampling_from_probs(
             probs,
             samples,
             indices,
             maybe_min_p_arr,
             min_p_val,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -277,7 +323,8 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        module.top_k_top_p_sampling_from_probs.default(
+        seed, offset = get_seed_and_offset(batch_size * 32, generator)
+        module.top_k_top_p_sampling_from_probs(
             probs,
             samples,
             indices,
@@ -286,7 +333,8 @@ def get_sampling_module():
             maybe_top_p_arr,
             top_p_val,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return samples
 
@@ -318,7 +366,7 @@ def get_sampling_module():
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         renorm_probs = torch.empty_like(probs)
-        module.top_p_renorm_probs.default(
+        module.top_p_renorm_probs(
             probs,
             renorm_probs,
             maybe_top_p_arr,
@@ -345,7 +393,7 @@ def get_sampling_module():
         probs = probs.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         renorm_probs = torch.empty_like(probs)
-        module.top_k_renorm_probs.default(
+        module.top_k_renorm_probs(
             probs,
             renorm_probs,
             maybe_top_k_arr,
@@ -372,7 +420,7 @@ def get_sampling_module():
         logits = logits.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)
-        module.top_k_mask_logits.default(
+        module.top_k_mask_logits(
             logits,
             mask_logits,
             maybe_top_k_arr,
@@ -414,7 +462,10 @@ def get_sampling_module():
         output_emitted_draft_token_num = output_emitted_draft_token_num.int()
         b, n = draft_token_ids.shape
         output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
-        module.chain_speculative_sampling.default(
+        seed, offset = get_seed_and_offset(
+            draft_probs.size(0) * (draft_probs.size(1) + 1), generator
+        )
+        module.chain_speculative_sampling(
             draft_probs,
             draft_token_ids,
             target_probs,
@@ -422,7 +473,8 @@ def get_sampling_module():
             output_accepted_token_num,
             output_emitted_draft_token_num,
             deterministic,
-            generator,
+            seed,
+            offset,
         )
         return output_token_ids
 
