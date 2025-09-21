@@ -16,11 +16,9 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
-#include <optional>
 
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
-#include "tvm/ffi/error.h"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -102,7 +100,7 @@ void BatchPrefillWithRaggedKVCacheRun(Tensor float_workspace_buffer, Tensor int_
     v_stride_n = v->strides[1];
   }
 
-  if (maybe_lse) {
+  if (maybe_lse.has_value()) {
     const auto& lse = *maybe_lse;
     TVM_FFI_ICHECK_EQ(lse->shape[0], q->shape[0]);
     TVM_FFI_ICHECK_EQ(lse->shape[1], q->shape[1]);
@@ -126,7 +124,7 @@ void BatchPrefillWithRaggedKVCacheRun(Tensor float_workspace_buffer, Tensor int_
         params.k = static_cast<DTypeKV*>(k->data);
         params.v = static_cast<DTypeKV*>(v->data);
         params.o = static_cast<DTypeO*>(o->data);
-        params.lse = maybe_lse ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
+        params.lse = maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
         params.q_indptr = static_cast<IdType*>(qo_indptr->data);
         params.kv_indptr = static_cast<IdType*>(kv_indptr->data);
         params.num_qo_heads = num_qo_heads;

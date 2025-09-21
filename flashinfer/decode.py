@@ -68,7 +68,7 @@ from .utils import (
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
     module = gen_single_decode_module(*args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_decode_with_kv_cache
 
@@ -128,8 +128,8 @@ def get_single_decode_module(*args):
 
 @functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    run_func = jit_module.run.default
+    plan_func = jit_module.plan
+    run_func = jit_module.run
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -207,8 +207,8 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
-    plan_func = mod.plan.default
-    run_func = mod.run.default
+    plan_func = mod.plan
+    run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -325,7 +325,7 @@ def single_decode_with_kv_cache_with_jit_module(
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
     else:
         lse = None
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,

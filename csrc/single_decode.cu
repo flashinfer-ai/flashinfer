@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 #include <flashinfer/pos_enc.cuh>
-#include <optional>
 
-#include "pytorch_extension_utils.h"
 #include "single_decode_config.inc"
+#include "tvm_ffi_utils.h"
+
+using tvm::ffi::Optional;
 
 namespace flashinfer {
 
@@ -29,57 +30,55 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
 
 using namespace flashinfer;
 
-void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t layout,
+void single_decode_with_kv_cache(Tensor q, Tensor k, Tensor v, Tensor tmp, Tensor o,
+                                 Optional<Tensor> maybe_lse, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
   CHECK_INPUT(tmp);
-  auto device = q.device();
-  CHECK_EQ(k.device(), device);
-  CHECK_EQ(v.device(), device);
-  CHECK_EQ(tmp.device(), device);
+  CHECK_DEVICE(k, q);
+  CHECK_DEVICE(v, q);
+  CHECK_DEVICE(tmp, q);
   CHECK_DIM(2, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
-  CHECK_EQ(q.size(1), k.size(2));
-  CHECK_EQ(v.scalar_type(), k.scalar_type());
-  unsigned int num_qo_heads = q.size(0);
-  unsigned int head_dim_qk = q.size(1);
-  unsigned int head_dim_vo = v.size(2);
+  TVM_FFI_ICHECK_EQ(q->shape[1], k->shape[2]);
+  TVM_FFI_ICHECK_EQ(v->dtype, k->dtype);
+  unsigned int num_qo_heads = q->shape[0];
+  unsigned int head_dim_qk = q->shape[1];
+  unsigned int head_dim_vo = v->shape[2];
   unsigned int kv_len, num_kv_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   if (kv_layout == QKVLayout::kNHD) {
-    kv_len = k.size(0);
-    num_kv_heads = k.size(1);
+    kv_len = k->shape[0];
+    num_kv_heads = k->shape[1];
   } else {
-    num_kv_heads = k.size(0);
-    kv_len = k.size(1);
+    num_kv_heads = k->shape[0];
+    kv_len = k->shape[1];
   }
-  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
 
-  auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = k.scalar_type();
+  cudaSetDevice(q->device.device_id);
+  const cudaStream_t stream = get_stream(q->device);
 
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-
-  TORCH_CHECK(head_dim_qk == head_dim_vo,
-              "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
-              "cores template for different head dim");
+  TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
+      << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+         "cores template for different head dim";
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         Params params;
 
-        params.q = static_cast<DTypeQ*>(q.data_ptr());
-        params.k = static_cast<DTypeKV*>(k.data_ptr());
-        params.v = static_cast<DTypeKV*>(v.data_ptr());
-        params.o = static_cast<DTypeO*>(o.data_ptr());
-        params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.q = static_cast<DTypeQ*>(q->data);
+        params.k = static_cast<DTypeKV*>(k->data);
+        params.v = static_cast<DTypeKV*>(v->data);
+        params.o = static_cast<DTypeO*>(o->data);
+        params.lse = maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
         params.kv_len = kv_len;
         params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
@@ -96,9 +95,10 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
         cudaError_t status =
             flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                           AttentionVariant>(
-                params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
-        TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +
-                                               std::string(cudaGetErrorString(status)));
+                params, static_cast<DTypeO*>(tmp->data), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "SingleDecodeWithKVCache kernel launch failed, error: "
+            << cudaGetErrorString(status);
         return true;
       });
 }

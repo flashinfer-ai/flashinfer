@@ -20,6 +20,7 @@ import torch
 from jit_utils import gen_prefill_attention_modules
 
 import flashinfer
+from tvm_ffi import use_torch_stream
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -194,7 +195,7 @@ def test_batch_prefill_with_paged_kv_cache(
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        with use_torch_stream(torch.cuda.stream(s)):
             for _ in range(3):
                 if return_lse:
                     o, _ = wrapper.run(q, kv_data, return_lse=True)
@@ -203,7 +204,7 @@ def test_batch_prefill_with_paged_kv_cache(
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with use_torch_stream(torch.cuda.graph(g)):
             if return_lse:
                 o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:
@@ -432,7 +433,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        with use_torch_stream(torch.cuda.stream(s)):
             for _ in range(3):
                 if return_lse:
                     o, _ = wrapper.run(q, kv_data, return_lse=True)
@@ -441,7 +442,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with use_torch_stream(torch.cuda.graph(g)):
             if return_lse:
                 o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:
@@ -1021,6 +1022,25 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 
 
 if __name__ == "__main__":
+    test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
+        1,
+        54,
+        37,
+        17,
+        list(range(17)) + list(range(19)) + [0],
+        100,
+        [18],
+        5,
+        4,
+        32,
+        128,
+        True,
+        "NHD",
+        "ROPE_LLAMA",
+        0.0,
+        True,
+    )
+    exit()
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False, True
     )
