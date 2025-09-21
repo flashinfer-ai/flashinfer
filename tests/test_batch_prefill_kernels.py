@@ -884,9 +884,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
         .to(dtype=torch.uint16)
         .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
+        token_pos_in_items_len=token_pos_in_items_len,
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     if return_lse:
@@ -1022,25 +1020,6 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
-        1,
-        54,
-        37,
-        17,
-        list(range(17)) + list(range(19)) + [0],
-        100,
-        [18],
-        5,
-        4,
-        32,
-        128,
-        True,
-        "NHD",
-        "ROPE_LLAMA",
-        0.0,
-        True,
-    )
-    exit()
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False, True
     )
