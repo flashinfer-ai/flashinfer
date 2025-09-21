@@ -50,6 +50,9 @@ from .decode import (
 from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
+from .decode import (
+    fast_decode_plan as fast_decode_plan,
+)
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
