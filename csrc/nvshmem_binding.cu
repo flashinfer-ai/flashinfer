@@ -23,26 +23,26 @@
 
 namespace {
 
-Tensor get_unique_id() {
-  nvshmemx_uniqueid_t uid = NVSHMEMX_UNIQUEID_INITIALIZER;
-  nvshmemx_get_uniqueid(&uid);
-  auto tensor = alloc_tensor(ffi::Shape({sizeof(uid)}), dl_uint8, cpu);
-  std::memcpy(tensor->data, &uid, sizeof(uid));
-  return tensor;
+constexpr int nvshmemx_uniqueid_t_size = sizeof(nvshmemx_uniqueid_t);
+
+void get_unique_id(Tensor uid) {
+  CHECK_CONTIGUOUS(uid);
+  TVM_FFI_ICHECK_EQ(get_numel(uid) * get_element_size(uid), nvshmemx_uniqueid_t_size);
+  TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
+  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
+  *uid_ptr = NVSHMEMX_UNIQUEID_INITIALIZER;
+  nvshmemx_get_uniqueid(uid_ptr);
 }
 
-int64_t unique_id_size() { return sizeof(nvshmemx_uniqueid_t); }
+int64_t unique_id_size() { return nvshmemx_uniqueid_t_size; }
 
 int64_t init(Tensor uid, int64_t rank, int64_t world_size) {
-  TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU) << "uid must be a host tensor";
-  CHECK_INPUT_TYPE(uid, dl_uint8);
-  TVM_FFI_ICHECK_EQ(get_numel(uid), sizeof(nvshmemx_uniqueid_t))
-      << "Invalid unique id size. Expected: " << sizeof(nvshmemx_uniqueid_t)
-      << ", Got: " << get_numel(uid);
-  nvshmemx_uniqueid_t id;
-  std::memcpy(&id, uid->data, sizeof(id));
+  CHECK_CONTIGUOUS(uid);
+  TVM_FFI_ICHECK_EQ(get_numel(uid) * get_element_size(uid), nvshmemx_uniqueid_t_size);
+  TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
+  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
-  nvshmemx_set_attr_uniqueid_args(rank, world_size, &id, &attr);
+  nvshmemx_set_attr_uniqueid_args(rank, world_size, uid_ptr, &attr);
   return nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
 }
 

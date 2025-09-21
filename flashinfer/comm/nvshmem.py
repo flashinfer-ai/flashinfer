@@ -56,7 +56,9 @@ def get_nvshmem_module():
 
 
 def get_unique_id() -> torch.Tensor:
-    return get_nvshmem_module().nvshmem_get_unique_id()
+    uid = alloc_empty_unique_id()
+    get_nvshmem_module().nvshmem_get_unique_id(uid)
+    return uid
 
 
 def unique_id_size() -> int:
