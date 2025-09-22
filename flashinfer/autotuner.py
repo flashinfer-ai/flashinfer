@@ -447,6 +447,11 @@ class AutoTuner:
                 logger.debug(
                     f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
                 )
+            else:
+                # NOTE ADD
+                logger.debug(
+                    f"[AutoTunner]: HACK ADD cache hit {custom_op=} {input_shapes=}"
+                )
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
