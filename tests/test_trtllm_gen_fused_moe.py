@@ -2041,7 +2041,9 @@ def test_moe_quantization_classes(
         and compute_capability[0] == 10
         and compute_capability[1] == 3
     ):
-        pytest.xfail("Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression")
+        pytest.xfail(
+            "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
+        )
 
     moe_impl._cache_permute_indices = cache_permute_indices
 
