@@ -303,5 +303,11 @@ stage('Unittest') {
       run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-5-cu129',
         { node_type -> shard_run_unittest_GPU(node_type, 5, 'cu129') })
     },
+    // JIT unit test for CUDA 12.9 with SM75 (AWS G4)
+    // For now, we only enable sampling test for SM75
+    'JIT-Unittest-G4-cu129': {
+      run_with_spot_retry('GPU-G4-SPOT', 'GPU-G4', 'JIT-Unittest-G4-cu129',
+        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu129') })
+    },
   )
 }
