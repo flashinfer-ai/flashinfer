@@ -16,6 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
+from functools import partial
 from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
@@ -325,10 +326,6 @@ def test_batch_decode_tensor_cores_cuda_graph(
 
     torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
-
-
-global_override_indptr_cpu = None
-
 
 @pytest.mark.parametrize("batch_size", [5, 12])
 @pytest.mark.parametrize("invariant_bs", [4])
