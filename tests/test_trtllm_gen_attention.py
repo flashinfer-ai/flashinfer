@@ -400,8 +400,8 @@ def test_trtllm_batch_prefill(
 
     allowed_mismatch_rate = 1e-7
 
-    # convert to float32 for fp8 is not supported by assert_close
     try:
+        # convert to float32 for fp8 is not supported by assert_close
         torch.testing.assert_close(
             output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
         )
