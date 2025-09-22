@@ -635,8 +635,8 @@ def test_attention_sink_chunk_prefill(
     Simulate chunk-based processing of long sequences where current chunk
     attends to all historical tokens plus current chunk tokens
     """
-    if not causal:
-        # xfail for non-causal case
+    if not causal and window_left >= 0:
+        # xfail for non-causal + sliding window case
         pytest.xfail(
             "NOTE(Zihao): attention sink with sliding window and non-causal will fail after https://github.com/flashinfer-ai/flashinfer/pull/1661, temporarily xfail the test."
         )
