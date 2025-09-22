@@ -2482,7 +2482,6 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                print("11111")
                 # Make sure we pass exactly 15 arguments for tensor core version
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
