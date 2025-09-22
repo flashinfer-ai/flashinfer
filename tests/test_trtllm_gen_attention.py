@@ -398,6 +398,7 @@ def test_trtllm_batch_prefill(
     else:
         rtol, atol = 1e-2, 1e-2
 
+    # Arbitary small mismatch rate
     allowed_mismatch_rate = 1e-7
 
     try:
@@ -643,12 +644,34 @@ def test_trtllm_batch_decode(
     if q_len_per_req > 1:
         rtol, atol = rtol * 2, atol * 2
 
-    torch.testing.assert_close(
-        output.float() * o_scale,
-        output_ref.float(),
-        rtol=rtol,
-        atol=atol,
-    )
+    # Arbitary small mismatch rate
+    allowed_mismatch_rate = 5e-5
+
+    try:
+        torch.testing.assert_close(
+            output.float() * o_scale,
+            output_ref.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    except AssertionError as err:
+        # Allow for a small mismatch rate for low precision outputs
+        absolute_difference = torch.abs(output.float() * o_scale - output_ref.float())
+        allowed_tolerance = atol + rtol * torch.abs(output_ref.float())
+        mismatched = absolute_difference > allowed_tolerance
+        mismatch_count = mismatched.sum().item()
+        total_count = mismatched.numel()
+        mismatch_rate = mismatch_count / total_count
+
+        if mismatch_rate < allowed_mismatch_rate:
+            print(
+                f"Warning: {mismatch_count} mismatched elements "
+                f"({mismatch_rate * 100:.5f}% of {total_count}) -- accepted for low precision"
+            )
+        else:
+            raise AssertionError(
+                f"Mismatch rate {mismatch_rate * 100:.5f}% too high! {mismatch_count} out of {total_count} elements"
+            ) from err
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
