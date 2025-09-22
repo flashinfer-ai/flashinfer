@@ -1,3 +1,25 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+AOT build script for FlashInfer.
+
+NOTE (Zihao): The following modules are intentionally excluded from the AOT build:
+- gen_pod_module
+- gen_deepgemm_sm100_module (it doesn't involve host-side compilation)
+"""
+
 import argparse
 import os
 import shutil
@@ -25,7 +47,6 @@ from .fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .gemm import (
-    gen_deepgemm_sm100_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
@@ -45,7 +66,6 @@ from .jit import (
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_pod_module,
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
@@ -205,8 +225,9 @@ def gen_attention(
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
+            # use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            use_profiler=False,
         )
 
     # FA3 MHA / MQA / GQA
@@ -432,12 +453,6 @@ def gen_all_modules(
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
-            # Add DeepGEMM module for SM100
-            deepgemm_result = gen_deepgemm_sm100_module()
-            if hasattr(deepgemm_result, "__iter__"):
-                jit_specs.extend(deepgemm_result)
-            else:
-                jit_specs.append(deepgemm_result)
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
         if has_sm110:
@@ -491,19 +506,6 @@ def gen_all_modules(
                 has_sm90,
             )
         )
-
-    # Add specialized/custom modules
-    # POD (Persistent Online Decode) module
-    jit_specs.append(
-        gen_pod_module(
-            dtype_q=torch.float16,
-            dtype_kv=torch.float16,
-            dtype_o=torch.float16,
-            head_dim_qk=128,
-            head_dim_vo=128,
-            pos_encoding_mode=0,
-        )
-    )
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
