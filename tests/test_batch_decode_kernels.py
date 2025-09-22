@@ -266,7 +266,7 @@ def test_batch_decode_with_paged_kv_cache_with_fast_plan(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    wrapper.plan = partial(flashinfer.decode.fast_decode_plan, wrapper)
+    wrapper.plan = partial(flashinfer.fast_decode_plan, wrapper)
     wrapper.plan(
         kv_indptr,
         kv_indices,

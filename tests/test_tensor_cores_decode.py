@@ -410,7 +410,7 @@ def test_batch_decode_tensor_cores_with_fast_plan(
         disable_split_kv=disable_split_kv,
     )
     wrapper_tensor_cores.plan = partial(
-        flashinfer.decode.fast_decode_plan, wrapper_tensor_cores
+        flashinfer.fast_decode_plan, wrapper_tensor_cores
     )
     wrapper_tensor_cores.plan(
         kv_indptr,
@@ -534,7 +534,7 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
         q_data_type=torch.float16,
     )
 
-    wrapper.plan = partial(flashinfer.decode.fast_decode_plan, wrapper)
+    wrapper.plan = partial(flashinfer.fast_decode_plan, wrapper)
 
     # warmup
     s = torch.cuda.Stream()
