@@ -217,7 +217,7 @@ def gen_attention(
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
         )
-        yield from gen_batch_attention_module(
+        yield gen_batch_attention_module(
             dtype_q=dtype_qo,
             dtype_kv=dtype_kv,
             dtype_o=dtype_qo,
