@@ -25,7 +25,6 @@ from .fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .gemm import (
-    gen_batch_attention_module,
     gen_deepgemm_sm100_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
@@ -40,6 +39,7 @@ from .gemm import (
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
+    gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
