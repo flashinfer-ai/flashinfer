@@ -78,6 +78,9 @@ from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
 
+from .gemm import gen_grouped_gemm_fp8_tvm_binding as gen_grouped_gemm_fp8_tvm_binding
+from .gemm import get_grouped_gemm_fp8_uri as get_grouped_gemm_fp8_uri
+
 
 @functools.cache
 def get_cudnn_fmha_gen_module():
