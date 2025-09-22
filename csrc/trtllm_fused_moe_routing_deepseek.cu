@@ -29,11 +29,12 @@ static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroupsDefault = 16;
 
 __host__ __device__ int getMaxNumTopGroups(const bool useGroups, const int numExperts) {
-  if (useGroups || numExperts <= 256) {
-    return 4;
-  } else {
-    return 16;
-  }
+  // if (useGroups || numExperts <= 256) {
+  //   return 4;
+  // } else {
+  //   return 16;
+  // }
+  return 4;
 }
 
 template <typename KernelParams>
