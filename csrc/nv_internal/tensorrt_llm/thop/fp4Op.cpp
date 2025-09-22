@@ -340,7 +340,7 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
     int scale_n_idx = packed_idx / (k / 2);
     int scale_k_idx = ((packed_idx * 2) % k) / group_size;
 
-    float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale.size(1) + scale_k_idx]);
+    float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale->shape[1] + scale_k_idx]);
 
     dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
     dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;

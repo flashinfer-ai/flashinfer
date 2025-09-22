@@ -20,7 +20,6 @@
 
 #include "../../../tvm_ffi_utils.h"
 
-#define CHECK_CPU(x) TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCPU) << #x " must be a CPU tensor";
 #define CHECK_CPU_INPUT(x, st) \
   CHECK_CPU(x)                 \
   CHECK_CONTIGUOUS(x)          \
