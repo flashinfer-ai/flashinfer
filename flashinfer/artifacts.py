@@ -94,6 +94,7 @@ class MetaInfoHash:
 
 
 def get_cubin_file_list():
+    base = FLASHINFER_CUBINS_REPOSITORY.rstrip("/")
     cubin_files = [
         (ArtifactPath.TRTLLM_GEN_FMHA + "include/flashInferMetaInfo", ".h"),
         (ArtifactPath.TRTLLM_GEN_GEMM + "include/flashinferMetaInfo", ".h"),
@@ -108,7 +109,7 @@ def get_cubin_file_list():
         cubin_files += [
             (kernel + name, extension)
             for name, extension in get_available_cubin_files(
-                FLASHINFER_CUBINS_REPOSITORY + "/" + kernel
+                base + "/" + kernel
             )
         ]
     return cubin_files
