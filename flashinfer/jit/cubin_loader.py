@@ -154,7 +154,8 @@ def get_cubin(name, sha256, file_extension=".cubin", session=None):
     if cubin:
         return cubin
     # either the file does not exist or it is corrupted, we'll download a new one.
-    uri = FLASHINFER_CUBINS_REPOSITORY + "/" + cubin_fname
+    base = FLASHINFER_CUBINS_REPOSITORY.rstrip("/")
+    uri = base + "/" + cubin_fname
     logger.info(f"Fetching cubin {name} from {uri}")
     download_file(uri, cubin_path, session=session)
     return load_cubin(cubin_path, sha256)
