@@ -947,7 +947,7 @@ void decode(int64_t max_s_kv, at::Tensor q, at::Tensor k_cache, at::Tensor v_cac
                                                         nullptr};
   static CUfunction lean_attn_reduction{nullptr};
 
-  static uint32_t sm_count = 0;
+  static int sm_count = 0;
 
   // Setup decode kernels
   if (hfunc_decode[0] == nullptr) {

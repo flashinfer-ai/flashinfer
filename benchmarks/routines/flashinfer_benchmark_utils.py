@@ -1,6 +1,7 @@
 import torch
 
 from flashinfer.testing.utils import set_seed
+from flashinfer.utils import get_compute_capability
 
 # Output columns for the test results.
 output_column_dict = {
@@ -156,3 +157,151 @@ def dtype_str_to_torch_dtype(dtype_str):
         return torch.float8_e5m2
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
+
+
+routine_cc_to_supported_backends = {
+    # ATTENTION
+    "BatchDecodeWithPagedKVCacheWrapper": {
+        "7.5": ["fa2"],
+        "8.0": ["fa2", "fa2_tc", "cudnn"],
+        "8.6": ["fa2", "fa2_tc", "cudnn"],
+        "8.9": ["fa2", "fa2_tc", "cudnn"],
+        "9.0": ["fa2", "fa2_tc", "cudnn"],
+        "10.0": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-gen-native"],
+        "10.3": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-gen-native"],
+        "12.0": ["fa2", "fa2_tc", "cudnn"],
+    },
+    "BatchPrefillWithPagedKVCacheWrapper": {
+        "7.5": [],
+        "8.0": ["fa2", "cudnn"],
+        "8.6": ["fa2", "cudnn"],
+        "8.9": ["fa2", "cudnn"],
+        "9.0": ["fa2", "fa3", "cudnn"],
+        "10.0": ["fa2", "cudnn", "trtllm-gen"],
+        "10.3": ["fa2", "cudnn", "trtllm-gen"],
+        "12.0": ["fa2", "cudnn"],
+    },
+    "BatchPrefillWithRaggedKVCacheWrapper": {
+        "7.5": [],
+        "8.0": ["fa2", "cudnn"],
+        "8.6": ["fa2", "cudnn"],
+        "8.9": ["fa2", "cudnn"],
+        "9.0": ["fa2", "fa3", "cudnn"],
+        "10.0": ["fa2", "cudnn", "cutlass"],
+        "10.3": ["fa2", "cudnn", "cutlass"],
+        "12.0": ["fa2", "cudnn"],
+    },
+    "BatchMLAPagedAttentionWrapper": {
+        "7.5": [],
+        "8.0": ["fa2"],
+        "8.6": ["fa2"],
+        "8.9": ["fa2"],
+        "9.0": ["fa2", "fa3"],
+        "10.0": ["fa2", "trtllm-gen-native"],
+        "10.3": ["fa2", "trtllm-gen-native"],
+        "12.0": ["fa2"],
+    },
+    # GEMM
+    "gemm_fp8_nt_groupwise": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
+        "12.0": [],
+    },
+    "group_gemm_fp8_nt_groupwise": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
+        "12.0": [],
+    },
+    "bmm_fp8": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": ["cudnn", "cublas"],
+        "9.0": ["cudnn", "cublas"],
+        "10.0": ["cudnn", "cublas", "cutlass"],
+        "10.3": ["cudnn", "cublas", "cutlass"],
+        "12.0": ["cudnn", "cublas"],
+    },
+    "mm_fp4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cudnn", "trtllm", "cutlass"],
+        "10.3": ["cudnn", "trtllm", "cutlass"],
+        "12.0": ["cudnn"],
+    },
+    # MOE
+    "trtllm_fp4_block_scale_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["trtllm"],
+        "10.3": ["trtllm"],
+        "12.0": [],
+    },
+    "trtllm_fp8_block_scale_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["trtllm"],
+        "10.3": ["trtllm"],
+        "12.0": [],
+    },
+    "trtllm_fp8_per_tensor_scale_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["trtllm"],
+        "10.3": ["trtllm"],
+        "12.0": [],
+    },
+    "cutlass_fused_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
+        "12.0": [],
+    },
+}
+
+
+def filter_backends_by_compute_capability(backends, routine, device):
+    # FlashInfer currently does not have an isSupported() function that checks support.
+    # WAR: Use helper function to check support.
+    major, minor = get_compute_capability(device)
+    compute_capability = f"{major}.{minor}"
+
+    # If the compute capability is not supported, return an empty list.
+    cc_to_supported_backends = routine_cc_to_supported_backends[routine]
+    supported_backends = cc_to_supported_backends.get(compute_capability, [])
+    backends_to_remove = []
+    for backend in backends:
+        if backend not in supported_backends:
+            backends_to_remove.append(backend)
+    for backend in backends_to_remove:
+        backends.remove(backend)
+        print(
+            f"[WARNING] {backend} for routine {routine} is not supported on compute capability {compute_capability}. Skipping."
+        )
+    return backends
