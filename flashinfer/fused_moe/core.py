@@ -397,13 +397,9 @@ def gen_cutlass_fused_moe_module(
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
     if backend in ("100", "103", "110", "120", "121"):
-        FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
-            use_fast_build
-        ).build_and_load(class_name="FusedMoeRunner")
+        module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
-        FusedMoeRunner = gen_cutlass_fused_moe_sm90_module(
-            use_fast_build
-        ).build_and_load(class_name="FusedMoeRunner")
+        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
@@ -468,7 +464,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = FusedMoeRunner(
+                MoERunner.runner_dict[instance_key] = module.init(
                     x_dtype,
                     weight_dtype,
                     output_dtype,
@@ -626,7 +622,29 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if min_latency_mode
             else moe_runner.fused_moe_runner.run_moe
         )
-        result = run_moe(
+        num_active_experts_per_node = torch.empty(
+            (1,), dtype=torch.int32, device=input.device
+        )
+        experts_to_token_score = torch.empty(
+            (fc2_expert_weights.shape[0], input.shape[0]),
+            dtype=torch.float32,
+            device=input.device,
+        )
+        active_expert_global_ids = torch.empty(
+            (fc2_expert_weights.shape[0],),
+            dtype=torch.int32,
+            device=input.device,
+        )
+        min_latency_output = (
+            [
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+            if min_latency_mode
+            else []
+        )
+        run_moe(
             output,
             input,
             token_selected_experts,
@@ -640,6 +658,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            *min_latency_output,
             tp_size,
             tp_rank,
             ep_size,
@@ -652,7 +671,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl,
         )
 
-        return result if min_latency_mode else [result]
+        return (
+            output
+            if min_latency_mode
+            else [
+                output,
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+        )
 
     @register_fake_op("flashinfer::cutlass_fused_moe")
     def _fake_cutlass_fused_moe(
