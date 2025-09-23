@@ -19,19 +19,19 @@
 
 using namespace flashinfer;
 
-#define DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...) \
-  [&]() -> bool {                                                                                  \
-    if (input_dtype == output_dtype) {                                                             \
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type_in, [&] {                    \
-        using c_type_out = c_type_in;                                                              \
-        return __VA_ARGS__();                                                                      \
-      });                                                                                          \
-    } else {                                                                                       \
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                  \
-        return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                         \
-                                                   [&] { return __VA_ARGS__(); });                 \
-      });                                                                                          \
-    }                                                                                              \
+#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...) \
+  [&]() -> bool {                                                                                 \
+    if (input_dtype == output_dtype) {                                                            \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input_dtype, c_type_in, [&] {                    \
+        using c_type_out = c_type_in;                                                             \
+        return __VA_ARGS__();                                                                     \
+      });                                                                                         \
+    } else {                                                                                      \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                  \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                         \
+                                                  [&] { return __VA_ARGS__(); });                 \
+      });                                                                                         \
+    }                                                                                             \
   }()
 
 namespace flashinfer {
@@ -54,7 +54,7 @@ void CutlassSegmentGEMMSM90(Tensor float_workspace_buffer, Tensor int_workspace_
   unsigned int batch_size = x_ptr->shape[0];
   cudaSetDevice(float_workspace_buffer->device.device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer->device);
-  DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
+  DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
       empty_x_data->dtype, empty_y_data->dtype, c_type_in, c_type_out, [&] {
         using cutlass_t_in = cutlass_dtype_t<c_type_in>;
         using cutlass_t_out = cutlass_dtype_t<c_type_out>;
