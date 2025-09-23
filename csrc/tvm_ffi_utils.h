@@ -263,10 +263,10 @@ inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }
 
-inline int64_t get_element_size(Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
+inline int64_t get_element_size(ffi::Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
 
-inline int64_t get_numel(Tensor x) { return x.shape().Product(); }
+inline int64_t get_numel(ffi::Tensor x) { return x.shape().Product(); }
 
-inline Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
+inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
   return ffi::Tensor::FromDLPackAlloc(TVMFFIEnvGetTensorAllocator(), shape, dtype, device);
 }
