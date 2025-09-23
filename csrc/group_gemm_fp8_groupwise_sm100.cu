@@ -32,12 +32,12 @@ using namespace flashinfer;
     return false;                                  \
   }()
 
-#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...)  \
-  [&]() -> bool {                                                                                  \
-    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                     \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                            \
-                                                 [&] { return __VA_ARGS__(); });                   \
-    });                                                                                            \
+#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...) \
+  [&]() -> bool {                                                                                 \
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                    \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                           \
+                                                [&] { return __VA_ARGS__(); });                   \
+    });                                                                                           \
   }()
 
 #define DISPATCH_SCALE_GRANULARITY(scale_granularity_m, scale_granularity_n, scale_granularity_k, \
@@ -86,11 +86,13 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100(
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassGroupGemmFP8GroupwiseScaledSM100(
-    Tensor int_workspace_buffer, Tensor float_workspace_buffer, Tensor A, Tensor B,
-    Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr, int64_t n, int64_t k,
-    int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
-    std::string scale_major_mode, int64_t mma_sm) {
+void CutlassGroupGemmFP8GroupwiseScaledSM100(Tensor int_workspace_buffer,
+                                             Tensor float_workspace_buffer, Tensor A, Tensor B,
+                                             Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr,
+                                             int64_t n, int64_t k, int64_t scale_granularity_m,
+                                             int64_t scale_granularity_n,
+                                             int64_t scale_granularity_k,
+                                             std::string scale_major_mode, int64_t mma_sm) {
   cudaSetDevice(float_workspace_buffer->device.device_id);
   auto stream = get_stream(D->device);
   int num_groups = m_indptr->shape[0] - 1;
@@ -105,15 +107,15 @@ void CutlassGroupGemmFP8GroupwiseScaledSM100(
               using cutlass_t_out = cutlass_dtype_t<c_type_out>;
               auto status = flashinfer::group_gemm::CutlassFP8GroupwiseScaledGroupGEMMSM100<
                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
-                  MMA_SM>(static_cast<int*>(int_workspace_buffer->data),
-                          get_element_size(int_workspace_buffer) * int_workspace_buffer->shape[0],
-                          static_cast<float*>(float_workspace_buffer->data),
-                          get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
-                          static_cast<cutlass_t_in*>(A->data),
-                          static_cast<cutlass_t_in*>(B->data),
-                          static_cast<float*>(SFA->data), static_cast<float*>(SFB->data),
-                          static_cast<cutlass_t_out*>(D->data),
-                          static_cast<int*>(m_indptr->data), max_m, n, k, num_groups, stream);
+                  MMA_SM>(
+                  static_cast<int*>(int_workspace_buffer->data),
+                  get_element_size(int_workspace_buffer) * int_workspace_buffer->shape[0],
+                  static_cast<float*>(float_workspace_buffer->data),
+                  get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
+                  static_cast<cutlass_t_in*>(A->data), static_cast<cutlass_t_in*>(B->data),
+                  static_cast<float*>(SFA->data), static_cast<float*>(SFB->data),
+                  static_cast<cutlass_t_out*>(D->data), static_cast<int*>(m_indptr->data), max_m, n,
+                  k, num_groups, stream);
               return status == cudaSuccess;
             });
       });

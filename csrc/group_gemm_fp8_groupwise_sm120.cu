@@ -19,39 +19,39 @@
 
 using namespace flashinfer;
 
-#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...)  \
-  [&]() -> bool {                                                                                  \
-    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                     \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                            \
-                                                 [&] { return __VA_ARGS__(); });                   \
-    });                                                                                            \
+#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_dtype, output_dtype, c_type_in, c_type_out, ...) \
+  [&]() -> bool {                                                                                 \
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_dtype, c_type_out, [&] {                    \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(input_dtype, c_type_in,                           \
+                                                [&] { return __VA_ARGS__(); });                   \
+    });                                                                                           \
   }()
 
-#define DISPATCH_SCALE_GRANULARITY(scale_granularity_m, scale_granularity_n, scale_granularity_k,  \
-                                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K,  \
-                                   ...)                                                            \
-  [&]() -> bool {                                                                                  \
-    constexpr int SCALE_GRANULARITY_K = 128;                                                       \
-    if (scale_granularity_k != 128) {                                                              \
-      TVM_FFI_ICHECK(false)                                                                        \
-          << "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must "    \
-          "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";       \
-      return false;                                                                                \
-    }                                                                                              \
-    /* Match SM100's approach: support only (1,128,128) and (128,128,128) */                       \
-    if (scale_granularity_m == 1 && scale_granularity_n == 128) {                                  \
-      constexpr int SCALE_GRANULARITY_M = 1;                                                       \
-      constexpr int SCALE_GRANULARITY_N = 128;                                                     \
-      return __VA_ARGS__();                                                                        \
-    } else if (scale_granularity_m == 128 && scale_granularity_n == 128) {                         \
-      constexpr int SCALE_GRANULARITY_M = 128;                                                     \
-      constexpr int SCALE_GRANULARITY_N = 128;                                                     \
-      return __VA_ARGS__();                                                                        \
-    }                                                                                              \
-    TVM_FFI_ICHECK(false) << "SM120: Unsupported scale granularity combination ("                  \
-                << scale_granularity_m << "," << scale_granularity_n << ","                        \
-                << scale_granularity_k << ")";                                                     \
-    return false;                                                                                  \
+#define DISPATCH_SCALE_GRANULARITY(scale_granularity_m, scale_granularity_n, scale_granularity_k, \
+                                   SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
+                                   ...)                                                           \
+  [&]() -> bool {                                                                                 \
+    constexpr int SCALE_GRANULARITY_K = 128;                                                      \
+    if (scale_granularity_k != 128) {                                                             \
+      TVM_FFI_ICHECK(false)                                                                       \
+          << "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must "   \
+             "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";   \
+      return false;                                                                               \
+    }                                                                                             \
+    /* Match SM100's approach: support only (1,128,128) and (128,128,128) */                      \
+    if (scale_granularity_m == 1 && scale_granularity_n == 128) {                                 \
+      constexpr int SCALE_GRANULARITY_M = 1;                                                      \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                    \
+      return __VA_ARGS__();                                                                       \
+    } else if (scale_granularity_m == 128 && scale_granularity_n == 128) {                        \
+      constexpr int SCALE_GRANULARITY_M = 128;                                                    \
+      constexpr int SCALE_GRANULARITY_N = 128;                                                    \
+      return __VA_ARGS__();                                                                       \
+    }                                                                                             \
+    TVM_FFI_ICHECK(false) << "SM120: Unsupported scale granularity combination ("                 \
+                          << scale_granularity_m << "," << scale_granularity_n << ","             \
+                          << scale_granularity_k << ")";                                          \
+    return false;                                                                                 \
   }()
 
 #define DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, ...) \
@@ -81,10 +81,9 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
 }  // namespace flashinfer
 
 void CutlassGroupGemmFP8GroupwiseScaledSM120(
-    Tensor int_workspace_buffer, Tensor float_workspace_buffer, Tensor A, Tensor B,
-    Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr, int64_t n, int64_t k,
-    int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
-    std::string scale_major_mode) {
+    Tensor int_workspace_buffer, Tensor float_workspace_buffer, Tensor A, Tensor B, Tensor SFA,
+    Tensor SFB, Tensor D, Tensor m_indptr, int64_t n, int64_t k, int64_t scale_granularity_m,
+    int64_t scale_granularity_n, int64_t scale_granularity_k, std::string scale_major_mode) {
   cudaSetDevice(float_workspace_buffer->device.device_id);
   auto stream = get_stream(D->device);
   int num_groups = m_indptr->shape[0] - 1;
@@ -112,10 +111,9 @@ void CutlassGroupGemmFP8GroupwiseScaledSM120(
                 static_cast<float*>(float_workspace_buffer->data),
                 get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
                 static_cast<cutlass_t_in*>(A->data), static_cast<cutlass_t_in*>(B->data),
-                static_cast<float*>(SFA->data),
-                static_cast<float*>(SFB->data),
-                static_cast<cutlass_t_out*>(D->data), static_cast<int*>(m_indptr->data),
-                max_m, n, k, num_groups, stream);
+                static_cast<float*>(SFA->data), static_cast<float*>(SFB->data),
+                static_cast<cutlass_t_out*>(D->data), static_cast<int*>(m_indptr->data), max_m, n,
+                k, num_groups, stream);
             return status == cudaSuccess;
           });
     });

@@ -16,7 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
+# from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
 from tvm_ffi import use_torch_stream
