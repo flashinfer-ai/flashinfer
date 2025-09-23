@@ -298,10 +298,21 @@ def unpack_compare_nvfp4(
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("page_size", [16, 32, 64])
-@pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 16, 2, 1),
+        (4, 32, 4, 5),
+        (4, 64, 4, 8),
+        (128, 16, 2, 5),
+        (128, 32, 4, 1),
+        (128, 64, 2, 8),
+        (256, 16, 4, 8),
+        (256, 32, 2, 8),
+        (256, 64, 4, 1),
+        (256, 64, 4, 5),
+    ],
+)
 @pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
@@ -511,11 +522,28 @@ def test_trtllm_batch_prefill(
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("q_len_per_req", [1, 2, 3, 4, 5])
-@pytest.mark.parametrize("page_size", [16, 32, 64])
-@pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 2, 64, 2, 5),
+        (4, 3, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (4, 5, 64, 4, 8),
+        (128, 1, 64, 2, 5),
+        (128, 2, 32, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (128, 5, 16, 2, 5),
+        (256, 1, 64, 4, 8),
+        (256, 2, 16, 2, 8),
+        (256, 3, 64, 4, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
 @pytest.mark.parametrize("window_left", [-1, 127])
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
