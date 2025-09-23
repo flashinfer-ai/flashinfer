@@ -1,0 +1,112 @@
+name: Build and Release flashinfer-aot-modules wheels
+
+on:
+  # workflow_dispatch:
+  #   inputs:
+  #     tag:
+  #       description: 'Tag (e.g., v1.2.3) to build wheels for'
+  #       required: true
+  #       type: string
+
+  pull_request:
+    branches:
+      - main
+    # hardcode tag to v0.4.0rc2
+
+env:
+  FLASHINFER_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0 10.0 10.3 12.0"
+
+jobs:
+  # validate-tag:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Validate tag format
+  #       run: |
+  #         if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+  #           echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
+  #           exit 1
+  #         fi
+  #         echo "✓ Tag format is valid: ${{ inputs.tag }}"
+
+  #     - name: Check out tag
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.tag }}
+  #         submodules: true
+
+  #     - name: Verify tag matches version.txt
+  #       run: |
+  #         # Extract version from tag (remove 'v' prefix)
+  #         TAG_VERSION="${{ inputs.tag }}"
+  #         TAG_VERSION="${TAG_VERSION#v}"
+
+  #         # Check version.txt - this is the source of truth
+  #         if [ ! -f "version.txt" ]; then
+  #           echo "Error: version.txt file not found!"
+  #           exit 1
+  #         fi
+
+  #         VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+
+  #         if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+  #           echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+  #           echo "  Tag version: $TAG_VERSION"
+  #           echo "  version.txt: $VERSION_TXT"
+  #           echo ""
+  #           echo "Please update version.txt to match the release version before creating a release."
+  #           echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+  #           exit 1
+  #         fi
+
+  #         echo "✓ version.txt matches tag version: $VERSION_TXT"
+
+  build-wheel:
+    # needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['129'] #['126', '128', '129', '130']
+        arch: ['x86_64'] #['x86_64', 'aarch64']
+
+    # Use self-hosted runners with specific labels based on architecture
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+
+    container:
+      image: ${{ format('flashinfer/flashinfer-ci-cu{0}', matrix.cuda) }}
+      options: --gpus all --shm-size 16gb
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ref: ${{ inputs.tag }}
+          ref: v0.3.1
+          submodules: true
+
+      - name: Build wheel in container
+        run: |
+          echo "Building flashinfer-aot-modules wheel..."
+          echo "CUDA Version: ${{ matrix.cuda }}"
+          echo "Architecture: ${{ matrix.arch }}"
+          echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
+
+          # Run the build script
+          cd flashinfer-aot-modules
+
+          # Clean any previous builds
+          rm -rf dist build *.egg-info
+
+          # Build the wheel using the build module for better isolation
+          python -m build --wheel
+
+          echo "✓ Build completed"
+          ls -lh dist/
+        timeout-minutes: 180
+
+      - name: Display wheel size
+        run: du -h flashinfer-aot-modules/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda${{ matrix.cuda }}-${{ matrix.arch }}
+          retention-days: 7
+          path: flashinfer-aot-modules/dist/*
