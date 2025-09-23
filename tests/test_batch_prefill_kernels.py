@@ -1021,7 +1021,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
-        12, 54, 37, 1, 4, 4, 128, False, "NHD", None, False, 0.0, True, True
+        12, 54, 37, 1, 4, 4, 128, False, "NHD", "NONE", False, 0.0, True, True
     )
     exit()
     test_batch_prefill_with_paged_kv_cache(
