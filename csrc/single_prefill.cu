@@ -34,9 +34,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
 using namespace flashinfer;
 
-void single_prefill_with_kv_cache(Tensor q, Tensor k, Tensor v, Tensor tmp, Tensor o,
-                                  Optional<Tensor> maybe_lse, int64_t mask_mode_code,
-                                  int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+void single_prefill_with_kv_cache(ffi::Tensor q, ffi::Tensor k, ffi::Tensor v, ffi::Tensor tmp,
+                                  ffi::Tensor o, Optional<ffi::Tensor> maybe_lse,
+                                  int64_t mask_mode_code, int64_t layout,
+                                  int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q->shape[2];
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
