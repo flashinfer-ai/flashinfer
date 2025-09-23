@@ -2615,6 +2615,7 @@ __global__ void SamplingFromRadiKSelectKernel(DType* select_probs, IdType* selec
   float aggregate(0);
   float u = curand_uniform(&state);
 
+#pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(K, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < K) {

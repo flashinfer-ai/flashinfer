@@ -834,9 +834,13 @@ def top_k_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    if (isinstance(top_k, int) and top_k <= 100) or (
-        isinstance(top_k, torch.Tensor) and top_k.max() <= 100
-    ):
+    # NOTE: radik_sampling_from_probs is non-deterministic
+    use_radik_impl = not deterministic and (
+        (isinstance(top_k, int) and top_k <= 100)
+        or (isinstance(top_k, torch.Tensor) and top_k.max() <= 100)
+    )
+
+    if use_radik_impl:
         return radik_sampling_from_probs(
             probs,
             top_k,
@@ -861,12 +865,9 @@ def radik_sampling_from_probs(
     selected_probs: Optional[torch.Tensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
-    r"""Fused GPU kernel for top-k sampling from probabilities,
-    this operator implements GPU-based rejection sampling without explicit sorting.
-    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
-
-    The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
-    which is more efficient than the naive implementation that launches a series of kernels.
+    r"""GPU kernel for radix top-k sampling from probability distributions,
+    utilizing radix selection to efficiently identify top-k elements followed by sampling from the selected subset.
+    Check the `radik paper <https://arxiv.org/abs/2501.14336>`_ for more details.
 
     Parameters
     ----------
@@ -885,7 +886,7 @@ def radik_sampling_from_probs(
         This allows reusing the same probability distribution for multiple outputs.
         If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        Whether to use deterministic kernel implementation, default is ``True``. However, the radix sampling process itself is inherently non-deterministic.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     selected_probs: Optional[torch.Tensor]
