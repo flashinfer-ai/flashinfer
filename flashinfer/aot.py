@@ -534,6 +534,111 @@ def copy_built_kernels(
         shutil.copy2(src, dst)
 
 
+def compile_and_package_modules(
+    out_dir: Path,
+    build_dir: Path,
+    project_root: Path,
+    config: dict = None,
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    """
+    Compile and package modules based on the provided configuration.
+
+    Args:
+        out_dir: Output directory for packaged modules
+        build_dir: Build directory for compilation
+        project_root: Project root directory
+        config: Configuration dictionary to override defaults (optional)
+        verbose: Whether to print verbose build output
+        skip_prebuilt: Whether to skip pre-built modules
+    """
+    # Start with default config and override with user config
+    final_config = get_default_config()
+    if config is not None:
+        final_config.update(config)
+    config = final_config
+    # Cuda Arch
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    sm_capabilities = detect_sm_capabilities()
+
+    # Update data dir
+    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+    jit_env.CUTLASS_INCLUDE_DIRS = [
+        project_root / "3rdparty" / "cutlass" / "include",
+        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    ]
+    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+    # Update workdir
+    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Print summary
+    if verbose:
+        print("AOT build summary:")
+        print("  out_dir:", out_dir)
+        print("  build_dir:", build_dir)
+        print("  fa2_head_dim:", config["fa2_head_dim"])
+        print("  fa3_head_dim:", config["fa3_head_dim"])
+        print("  f16_dtype:", config["f16_dtype"])
+        print("  f8_dtype:", config["f8_dtype"])
+        print("  use_sliding_window:", config["use_sliding_window"])
+        print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
+        print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
+        print("  SM capabilities detected:")
+        for sm_name, has_sm in sm_capabilities.items():
+            if has_sm:
+                print(f"    {sm_name}: True")
+        for key in [
+            "add_comm",
+            "add_gemma",
+            "add_oai_oss",
+            "add_moe",
+            "add_act",
+            "add_misc",
+            "add_xqa",
+        ]:
+            print(f"  {key}:", config[key])
+
+    # Generate JIT specs
+    if verbose:
+        print("Generating JIT specs...")
+    jit_specs = [gen_logging_module()]
+    jit_specs += gen_all_modules(
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
+        sm_capabilities,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
+    )
+    if verbose:
+        print("Total ops:", len(jit_specs))
+
+    # Build
+    build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
+
+    # Copy built kernels
+    copy_built_kernels(jit_specs, out_dir)
+    if verbose:
+        print("AOT kernels saved to:", out_dir)
+
+
 def parse_bool(s: str) -> bool:
     if s.lower() in ("true", "1"):
         return True
@@ -711,81 +816,15 @@ def main():
         if arg_value is not None:
             config[key] = arg_value
 
-    # Cuda Arch
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
-
-    sm_capabilities = detect_sm_capabilities()
-
-    # Update data dir
-    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-    jit_env.CUTLASS_INCLUDE_DIRS = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-    ]
-    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-    # Update workdir
-    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Print summary
-    print("AOT build summary:")
-    print("  out_dir:", out_dir)
-    print("  build_dir:", build_dir)
-    print("  fa2_head_dim:", config["fa2_head_dim"])
-    print("  fa3_head_dim:", config["fa3_head_dim"])
-    print("  f16_dtype:", config["f16_dtype"])
-    print("  f8_dtype:", config["f8_dtype"])
-    print("  use_sliding_window:", config["use_sliding_window"])
-    print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
-    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
-    print("  SM capabilities detected:")
-    for sm_name, has_sm in sm_capabilities.items():
-        if has_sm:
-            print(f"    {sm_name}: True")
-    for key in [
-        "add_comm",
-        "add_gemma",
-        "add_oai_oss",
-        "add_moe",
-        "add_act",
-        "add_misc",
-        "add_xqa",
-    ]:
-        print(f"  {key}:", config[key])
-
-    # Generate JIT specs
-    print("Generating JIT specs...")
-    jit_specs = [gen_logging_module()]
-    jit_specs += gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
-        sm_capabilities,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
+    # Use the reusable compile_and_package_modules function
+    compile_and_package_modules(
+        out_dir=out_dir,
+        build_dir=build_dir,
+        project_root=project_root,
+        config=config,
+        verbose=True,
+        skip_prebuilt=False,
     )
-    print("Total ops:", len(jit_specs))
-
-    # Build
-    build_jit_specs(jit_specs, verbose=True, skip_prebuilt=False)
-
-    # Copy built kernels
-    copy_built_kernels(jit_specs, out_dir)
-    print("AOT kernels saved to:", out_dir)
 
 
 if __name__ == "__main__":
