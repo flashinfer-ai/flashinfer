@@ -2,8 +2,10 @@ import math
 
 import pytest
 import torch
+import einops
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
+from sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
@@ -161,6 +163,42 @@ def create_page_table(batch_size, seq_lens, page_size):
     return page_tables, all_page_ids, page_per_seq
 
 
+def flatten_paged_kv(
+    ref_kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    kv_last_page_len: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build flat K/V and token-level indptr from paged KV cache and page table."""
+    device = ref_kv_cache.device
+    batch_size = page_table.shape[0]
+    page_per_seq = (seq_lens + page_size - 1) // page_size
+    k_list = []
+    v_list = []
+    for i in range(batch_size):
+        pages_i = int(page_per_seq[i].item())
+        last_len_i = int(kv_last_page_len[i].item())
+        for j in range(pages_i):
+            page_id = int(page_table[i, j].item())
+            k_page = ref_kv_cache[page_id, 0]
+            v_page = ref_kv_cache[page_id, 1]
+            if j == pages_i - 1:
+                k_page = k_page[:, :last_len_i, :]
+                v_page = v_page[:, :last_len_i, :]
+            k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
+            v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+    k_flat = torch.cat(k_list, dim=0)
+    v_flat = torch.cat(v_list, dim=0)
+    kv_indptr_tokens = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.cumsum(seq_lens.to(device), dim=0, dtype=torch.int32),
+        ]
+    )
+    return k_flat, v_flat, kv_indptr_tokens
+
+
 def create_workspace_buffers(device):
     # Lazily initialize and reuse global workspace buffers
     global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
@@ -272,6 +310,7 @@ def unpack_compare_nvfp4(
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -283,6 +322,7 @@ def test_trtllm_batch_prefill(
     o_dtype,
     kv_dtype,
     enable_pdl,
+    enable_sink,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] in [11, 12]:
@@ -333,10 +373,9 @@ def test_trtllm_batch_prefill(
         q, o_dtype, create_out_tensor, create_out_dtype
     )
 
-    # Run reference wrapper
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, kv_layout
-    )
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    # Build reference output
     plan_params = {
         "qo_indptr": q_indptr,
         "paged_kv_indptr": kv_indptr,
@@ -353,11 +392,37 @@ def test_trtllm_batch_prefill(
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
     }
-    wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    if not enable_sink:
+        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer_ref, kv_layout
+        )
+        wrapper_ref.plan(**plan_params)
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    else:
+        # Construct flat K/V via helper
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+        )
+        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+        output_ref = sink_attention_unified(
+            ref_q,
+            k_flat,
+            v_flat,
+            sink,
+            window_left,
+            True,
+            sm_scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=q_indptr,
+            kv_indptr=kv_indptr_tokens,
+        )
 
     # Run trtllm-gen function call
-    sm_scale = float(1.0 / (head_dim**0.5))
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -377,6 +442,7 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        sinks=(sink if enable_sink else None),
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -425,6 +491,7 @@ def test_trtllm_batch_prefill(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -459,6 +526,7 @@ def test_trtllm_batch_prefill(
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -471,6 +539,7 @@ def test_trtllm_batch_decode(
     o_dtype,
     kv_dtype,
     enable_pdl,
+    enable_sink,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -525,6 +594,9 @@ def test_trtllm_batch_decode(
         q, o_dtype, create_out_tensor, create_out_dtype
     )
 
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    # Build reference output
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -538,39 +610,61 @@ def test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    # Run reference wrapper
-    if q_len_per_req == 1:
+    if not enable_sink:
         wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer_ref, kv_layout, use_tensor_cores=True
         )
         wrapper_ref.plan(**plan_params)
         output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+        if q_len_per_req > 1:
+            # hide the output_ref from decode wrapper for speculative decoding test
+            wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer_ref, kv_layout
+            )
+            plan_params_prefill = {
+                "qo_indptr": q_indptr,
+                "paged_kv_indptr": kv_indptr,
+                "paged_kv_indices": all_page_ids,
+                "paged_kv_last_page_len": kv_last_page_len.to(GPU_DEVICE),
+                "num_qo_heads": num_qo_heads,
+                "num_kv_heads": num_kv_heads,
+                "head_dim_qk": head_dim,
+                "page_size": page_size,
+                "causal": True,
+                "pos_encoding_mode": "NONE",
+                "logits_soft_cap": 0.0,
+                "q_data_type": ref_q.dtype,
+                "kv_data_type": ref_kv_cache.dtype,
+                "window_left": window_left,
+            }
+            wrapper_ref.plan(**plan_params_prefill)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
-        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer_ref, kv_layout
+        # Construct flat K/V via helper
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
         )
-        plan_params_prefill = {
-            "qo_indptr": q_indptr,
-            "paged_kv_indptr": kv_indptr,
-            "paged_kv_indices": all_page_ids,
-            "paged_kv_last_page_len": kv_last_page_len.to(GPU_DEVICE),
-            "num_qo_heads": num_qo_heads,
-            "num_kv_heads": num_kv_heads,
-            "head_dim_qk": head_dim,
-            "page_size": page_size,
-            "causal": True,
-            "pos_encoding_mode": "NONE",
-            "logits_soft_cap": 0.0,
-            "q_data_type": ref_q.dtype,
-            "kv_data_type": ref_kv_cache.dtype,
-            "window_left": window_left,
-        }
-        wrapper_ref.plan(**plan_params_prefill)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+        output_ref = sink_attention_unified(
+            ref_q,
+            k_flat,
+            v_flat,
+            sink,
+            window_left,
+            True,
+            sm_scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=q_indptr,
+            kv_indptr=kv_indptr_tokens,
+        )
 
     # Run trtllm-gen function call
-    sm_scale = float(1.0 / (head_dim**0.5))
-
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -586,6 +680,7 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        sinks=(sink if enable_sink else None),
         q_len_per_req=q_len_per_req,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -639,6 +734,7 @@ def test_trtllm_batch_decode(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
             q_len_per_req=q_len_per_req,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
