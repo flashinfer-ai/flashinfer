@@ -28,6 +28,7 @@ FLASHINFER_BASE_DIR = pathlib.Path(
 )
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+_package_root = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _get_cubin_dir():
@@ -86,11 +87,9 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
-_package_root = pathlib.Path(__file__).resolve().parents[1]
 FLASHINFER_DATA = _package_root / "data"
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
-# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",

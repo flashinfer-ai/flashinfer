@@ -467,8 +467,8 @@ def gen_all_modules(
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
         from .comm.nvshmem import gen_nvshmem_module
-        from .comm.trtllm_alltoall import gen_comm_alltoall_module
-        from .comm.trtllm_mnnvl_ar import gen_trtllm_mnnvl_comm_module
+        from .jit import gen_comm_alltoall_module
+        from .jit import gen_trtllm_mnnvl_comm_module
 
         jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+
 try:
     from ._build_meta import __version__ as __version__
 except ModuleNotFoundError:
@@ -141,17 +143,25 @@ from .sparse import (
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 
-try:
+# Check optional dependencies for version consistency.
+if importlib.util.find_spec("flashinfer_cubin"):
     import flashinfer_cubin
 
     flashinfer_cubin_version = flashinfer_cubin.__version__
-
     if __version__ != flashinfer_cubin_version:
         raise RuntimeError(
             f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
             f"flashinfer version ({__version__}). "
             "Please install the same version of both packages."
         )
-except ImportError:
-    # flashinfer-cubin is not installed
-    pass
+
+if importlib.util.find_spec("flashinfer_aot_modules"):
+    import flashinfer_aot_modules
+
+    flashinfer_aot_modules_version = flashinfer_aot_modules.__version__
+    if __version__ != flashinfer_aot_modules_version:
+        raise RuntimeError(
+            f"flashinfer-aot-modules version ({flashinfer_aot_modules_version}) does not match "
+            f"flashinfer version ({__version__}). "
+            "Please install the same version of both packages."
+        )
