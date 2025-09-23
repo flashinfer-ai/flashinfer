@@ -1,7 +1,28 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+AOT build script for FlashInfer.
+
+NOTE (Zihao): The following modules are intentionally excluded from the AOT build:
+- gen_pod_module
+- gen_deepgemm_sm100_module (it doesn't involve host-side compilation)
+"""
+
 import argparse
 import os
 import shutil
-from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 from typing import List, Tuple, Iterator
@@ -13,8 +34,12 @@ from .activation import act_func_def_str, gen_act_and_mul_module
 from .fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .cascade import gen_cascade_module
 from .fp4_quantization import (
-    gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm90_module,
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm121_module,
 )
 from .fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
@@ -28,14 +53,18 @@ from .gemm import (
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_tgv,
+    gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cutlass_fp4,
     gen_trtllm_gen_gemm_module,
 )
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
+    gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
+    gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_decode_module,
     gen_single_prefill_module,
@@ -51,71 +80,6 @@ from .tllm_utils import gen_trtllm_utils_module
 from .utils import gen_logging_module, version_at_least
 from .xqa import gen_xqa_module
 from .compilation_context import CompilationContext
-
-
-@contextmanager
-def jit_environment_context(
-    project_root: Path = None, build_dir: Path = None, setup_paths: bool = True
-):
-    """
-    Context manager for temporarily modifying JIT environment settings.
-
-    Args:
-        project_root: Project root directory (auto-detected if None)
-        build_dir: Build directory (uses default if None)
-        setup_paths: Whether to set up source/include paths
-    """
-    if project_root is None:
-        project_root = Path(__file__).resolve().parents[1]
-
-    if build_dir is None:
-        build_dir = project_root / "build" / "aot"
-
-    # Store original values
-    original_values = {}
-
-    if setup_paths:
-        # Save and update source/include directories
-        original_values.update(
-            {
-                "FLASHINFER_CSRC_DIR": jit_env.FLASHINFER_CSRC_DIR,
-                "FLASHINFER_INCLUDE_DIR": jit_env.FLASHINFER_INCLUDE_DIR,
-                "CUTLASS_INCLUDE_DIRS": jit_env.CUTLASS_INCLUDE_DIRS,
-                "SPDLOG_INCLUDE_DIR": jit_env.SPDLOG_INCLUDE_DIR,
-            }
-        )
-
-        jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-        jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-        jit_env.CUTLASS_INCLUDE_DIRS = [
-            project_root / "3rdparty" / "cutlass" / "include",
-            project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-        ]
-        jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-    # Save and update workspace directories
-    original_values.update(
-        {
-            "FLASHINFER_WORKSPACE_DIR": jit_env.FLASHINFER_WORKSPACE_DIR,
-            "FLASHINFER_JIT_DIR": jit_env.FLASHINFER_JIT_DIR,
-            "FLASHINFER_GEN_SRC_DIR": jit_env.FLASHINFER_GEN_SRC_DIR,
-        }
-    )
-
-    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-
-    # Create directories
-    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
-
-    try:
-        yield
-    finally:
-        # Restore original values
-        for attr_name, original_value in original_values.items():
-            setattr(jit_env, attr_name, original_value)
 
 
 def gen_fa2(
@@ -252,6 +216,18 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+        )
+        yield gen_batch_attention_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            # use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+            use_profiler=False,
         )
 
     # FA3 MHA / MQA / GQA
@@ -423,8 +399,7 @@ def gen_all_modules(
     fa3_head_dim_: List[Tuple[int, int]],
     use_sliding_window_: List[bool],
     use_logits_soft_cap_: List[bool],
-    has_sm90: bool,
-    has_sm100: bool,
+    sm_capabilities: dict,
     add_comm: bool,
     add_gemma: bool,
     add_oai_oss: bool,
@@ -434,6 +409,12 @@ def gen_all_modules(
     add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
+    has_sm90 = sm_capabilities.get("sm90", False)
+    has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm110 = sm_capabilities.get("sm110", False)
+    has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
         gen_attention(
@@ -472,6 +453,16 @@ def gen_all_modules(
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+        if has_sm103:
+            jit_specs.append(gen_fp4_quantization_sm103_module())
+        if has_sm110:
+            jit_specs.append(gen_fp4_quantization_sm110_module())
+        if has_sm120:
+            jit_specs.append(gen_fp4_quantization_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
+        if has_sm121:
+            jit_specs.append(gen_fp4_quantization_sm121_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
@@ -515,6 +506,9 @@ def gen_all_modules(
                 has_sm90,
             )
         )
+
+    # Add cuDNN FMHA module
+    jit_specs.append(gen_cudnn_fmha_module())
 
     # dedup
     names = set()
@@ -589,13 +583,20 @@ def detect_sm_capabilities():
             return True
         return version_at_least(torch.version.cuda, version)
 
-    return has_sm("compute_90", "12.3"), has_sm("compute_100", "12.8")
+    return {
+        "sm90": has_sm("compute_90", "12.3"),
+        "sm100": has_sm("compute_100", "12.8"),
+        "sm103": has_sm("compute_103", "12.8"),
+        "sm110": has_sm("compute_110", "12.9"),
+        "sm120": has_sm("compute_120", "13.0"),
+        "sm121": has_sm("compute_121", "13.0"),
+    }
 
 
 def register_default_modules() -> int:
     """Register the default set of modules"""
     config = get_default_config()
-    has_sm90, has_sm100 = detect_sm_capabilities()
+    sm_capabilities = detect_sm_capabilities()
 
     jit_specs = gen_all_modules(
         config["f16_dtype"],
@@ -604,8 +605,7 @@ def register_default_modules() -> int:
         config["fa3_head_dim"],
         config["use_sliding_window"],
         config["use_logits_soft_cap"],
-        has_sm90,
-        has_sm100,
+        sm_capabilities,
         config["add_comm"],
         config["add_gemma"],
         config["add_oai_oss"],
@@ -615,129 +615,6 @@ def register_default_modules() -> int:
         config["add_xqa"],
     )
     return len(jit_specs)
-
-
-def compile_and_package_modules(
-    output_dir: Path,
-    config: dict = None,
-    project_root: Path = None,
-    verbose: bool = True,
-    setup_environment: bool = True,
-) -> None:
-    """
-    Compile AOT modules and package them for distribution.
-
-    Args:
-        output_dir: Directory to store compiled modules
-        config: Configuration dict with compilation options (uses default if None)
-        project_root: Project root directory (auto-detected if None)
-        verbose: Enable verbose output
-        setup_environment: Whether to set up JIT environment paths
-    """
-    print("Compiling AOT modules...")
-
-    # Use default config if none provided
-    if config is None:
-        config = get_default_config()
-
-    # Auto-detect project root if not provided
-    if project_root is None:
-        project_root = Path(__file__).resolve().parents[1]
-
-    # Get CUDA arch list from environment or use default
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        # Try to detect from current CUDA device
-        try:
-            if torch.cuda.is_available():
-                capability = torch.cuda.get_device_capability()
-                compute_cap = f"{capability[0]}{capability[1]}"
-                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = compute_cap
-                if verbose:
-                    print(f"Detected CUDA compute capability: {compute_cap}")
-            else:
-                # Default to common architectures
-                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = "75;80;86;89;90"
-                if verbose:
-                    print(
-                        "No CUDA device detected, using default architectures: 75;80;86;89;90"
-                    )
-        except Exception as e:
-            raise RuntimeError(
-                f"FLASHINFER_CUDA_ARCH_LIST not set and failed to detect from current CUDA device: {e}"
-            ) from e
-
-    # Detect SM capabilities
-    has_sm90, has_sm100 = detect_sm_capabilities()
-
-    if setup_environment:
-        # Update JIT environment paths to use project root
-        jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-        jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-        jit_env.CUTLASS_INCLUDE_DIRS = [
-            project_root / "3rdparty" / "cutlass" / "include",
-            project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-        ]
-        jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-        # Set up build directory
-        build_dir = project_root / "build" / "aot"
-        jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-        jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-        jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-        jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-        jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
-
-    if verbose:
-        print(f"FLASHINFER_CUDA_ARCH_LIST: {os.environ['FLASHINFER_CUDA_ARCH_LIST']}")
-        print(f"has_sm90: {has_sm90}")
-        print(f"has_sm100: {has_sm100}")
-        print("Configuration:")
-        for key, value in config.items():
-            print(f"  {key}: {value}")
-
-    try:
-        # Generate JIT specs
-        if verbose:
-            print("Generating JIT specs...")
-
-        jit_specs = [gen_logging_module()]
-        jit_specs += gen_all_modules(
-            config["f16_dtype"],
-            config["f8_dtype"],
-            config["fa2_head_dim"],
-            config["fa3_head_dim"],
-            config["use_sliding_window"],
-            config["use_logits_soft_cap"],
-            has_sm90,
-            has_sm100,
-            config["add_comm"],
-            config["add_gemma"],
-            config["add_oai_oss"],
-            config["add_moe"],
-            config["add_act"],
-            config["add_misc"],
-            config["add_xqa"],
-        )
-
-        if verbose:
-            print(f"Total modules to compile: {len(jit_specs)}")
-
-        # Build the modules
-        if verbose:
-            print("Building JIT modules...")
-        build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=False)
-
-        # Copy built kernels to output directory
-        if verbose:
-            print(f"Copying built modules to {output_dir}...")
-        copy_built_kernels(jit_specs, output_dir)
-
-        if verbose:
-            print(f"AOT modules compiled successfully to {output_dir}")
-
-    except Exception as e:
-        print(f"AOT compilation failed with error: {e}")
-        raise RuntimeError(f"Failed to compile AOT modules: {e}") from e
 
 
 def main():
@@ -795,10 +672,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Require CUDA arch list to be set
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
-
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
     config = get_default_config()
@@ -838,22 +711,81 @@ def main():
         if arg_value is not None:
             config[key] = arg_value
 
-    # Update JIT environment for custom build directory
-    if args.build_dir:
-        jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-        jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-        jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-        jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-        jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+    # Cuda Arch
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
 
-    # Use the existing compile_and_package_modules function
-    compile_and_package_modules(
-        output_dir=out_dir,
-        config=config,
-        project_root=project_root,
-        verbose=True,
-        setup_environment=not args.build_dir,  # Skip environment setup if custom build dir is used
+    sm_capabilities = detect_sm_capabilities()
+
+    # Update data dir
+    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+    jit_env.CUTLASS_INCLUDE_DIRS = [
+        project_root / "3rdparty" / "cutlass" / "include",
+        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    ]
+    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+    # Update workdir
+    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Print summary
+    print("AOT build summary:")
+    print("  out_dir:", out_dir)
+    print("  build_dir:", build_dir)
+    print("  fa2_head_dim:", config["fa2_head_dim"])
+    print("  fa3_head_dim:", config["fa3_head_dim"])
+    print("  f16_dtype:", config["f16_dtype"])
+    print("  f8_dtype:", config["f8_dtype"])
+    print("  use_sliding_window:", config["use_sliding_window"])
+    print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
+    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
+    print("  SM capabilities detected:")
+    for sm_name, has_sm in sm_capabilities.items():
+        if has_sm:
+            print(f"    {sm_name}: True")
+    for key in [
+        "add_comm",
+        "add_gemma",
+        "add_oai_oss",
+        "add_moe",
+        "add_act",
+        "add_misc",
+        "add_xqa",
+    ]:
+        print(f"  {key}:", config[key])
+
+    # Generate JIT specs
+    print("Generating JIT specs...")
+    jit_specs = [gen_logging_module()]
+    jit_specs += gen_all_modules(
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
+        sm_capabilities,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
     )
+    print("Total ops:", len(jit_specs))
+
+    # Build
+    build_jit_specs(jit_specs, verbose=True, skip_prebuilt=False)
+
+    # Copy built kernels
+    copy_built_kernels(jit_specs, out_dir)
+    print("AOT kernels saved to:", out_dir)
 
 
 if __name__ == "__main__":

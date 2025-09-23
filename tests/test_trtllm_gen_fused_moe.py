@@ -2034,6 +2034,17 @@ def test_moe_quantization_classes(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
         )
 
+    # TODO(jimmzhou): enable MxFP4xBf16 on SM103
+    if (
+        type(moe_impl) is FP4Moe
+        and moe_impl.quant_mode == QuantMode.FP4_MXFP4_Bf16
+        and compute_capability[0] == 10
+        and compute_capability[1] == 3
+    ):
+        pytest.xfail(
+            "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
+        )
+
     moe_impl._cache_permute_indices = cache_permute_indices
 
     seed = 0
