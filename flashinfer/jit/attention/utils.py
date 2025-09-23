@@ -40,9 +40,9 @@ def generate_additional_params(
     additional_func_params = "".join(
         [
             (
-                f", Optional<Tensor> {var}"
+                f", Optional<ffi::Tensor> {var}"
                 if var.startswith("maybe")
-                else f", Tensor {var}"
+                else f", ffi::Tensor {var}"
             )
             for var in additional_tensor_names
         ]
