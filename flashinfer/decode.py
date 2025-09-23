@@ -2368,9 +2368,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return out
 
 
-global_override_indptr_cpu = None
-
-
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -2392,6 +2389,7 @@ def fast_decode_plan(
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
     disable_split_kv: bool = False,
+    global_override_indptr_cpu: Optional[torch.Tensor] = None,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
