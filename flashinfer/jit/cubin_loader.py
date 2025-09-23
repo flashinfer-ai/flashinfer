@@ -17,7 +17,7 @@ limitations under the License.
 import ctypes
 import hashlib
 import os
-from pathlib import Path
+from urllib.parse import urljoin
 import shutil
 import time
 
