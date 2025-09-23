@@ -15,7 +15,7 @@
  */
 #include <flashinfer/cutlass_utils.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
@@ -47,29 +47,27 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                            at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
-                            at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
-                            at::Tensor y_stride, at::Tensor empty_x_data, at::Tensor empty_y_data,
-                            bool weight_column_major) {
-  unsigned int batch_size = x_ptr.size(0);
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+void CutlassSegmentGEMMSM90(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                            Tensor all_problems, Tensor x_ptr, Tensor w_ptr, Tensor y_ptr,
+                            Tensor x_stride, Tensor weight_stride, Tensor y_stride,
+                            Tensor empty_x_data, Tensor empty_y_data, bool weight_column_major) {
+  unsigned int batch_size = x_ptr->shape[0];
+  cudaSetDevice(float_workspace_buffer->device.device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
   DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
-      empty_x_data.scalar_type(), empty_y_data.scalar_type(), c_type_in, c_type_out, [&] {
+      empty_x_data->dtype, empty_y_data->dtype, c_type_in, c_type_out, [&] {
         using cutlass_t_in = cutlass_dtype_t<c_type_in>;
         using cutlass_t_out = cutlass_dtype_t<c_type_out>;
         auto status =
             flashinfer::group_gemm::CutlassSegmentGEMMSM90Run<cutlass_t_in, cutlass_t_out>(
-                float_workspace_buffer.data_ptr(),
-                float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
-                int_workspace_buffer.data_ptr(),
-                int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
-                all_problems.data_ptr(), batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(),
-                y_ptr.data_ptr(), x_stride.data_ptr(), weight_stride.data_ptr(),
-                y_stride.data_ptr(), weight_column_major, stream);
-        TORCH_CHECK(status == cudaSuccess,
-                    "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
+                float_workspace_buffer->data,
+                get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
+                int_workspace_buffer->data,
+                get_element_size(int_workspace_buffer) * int_workspace_buffer->shape[0],
+                all_problems->data, batch_size, x_ptr->data, w_ptr->data, y_ptr->data,
+                x_stride->data, weight_stride->data, y_stride->data, weight_column_major, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "Failed to run CutlassSegmentGEMM: " << cudaGetErrorString(status);
         return true;
       });
 }

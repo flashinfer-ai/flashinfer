@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                            at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
-                            at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
-                            at::Tensor y_stride, at::Tensor empty_x_data, at::Tensor empty_y_data,
-                            bool weight_column_major);
+void CutlassSegmentGEMMSM90(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                            Tensor all_problems, Tensor x_ptr, Tensor w_ptr, Tensor y_ptr,
+                            Tensor x_stride, Tensor weight_stride, Tensor y_stride,
+                            Tensor empty_x_data, Tensor empty_y_data, bool weight_column_major);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // "Cutlass Segment GEMM operator for SM90"
-  m.def("cutlass_segment_gemm_sm90", CutlassSegmentGEMMSM90);
-}
+// "Cutlass Segment GEMM operator for SM90"
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm_sm90, CutlassSegmentGEMMSM90);
