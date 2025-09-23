@@ -30,7 +30,6 @@ from .jit.cubin_loader import (
 )
 
 
-import logging
 from contextlib import contextmanager
 
 
@@ -45,45 +44,6 @@ def temp_env_var(key, value):
             os.environ.pop(key, None)
         else:
             os.environ[key] = old_value
-
-
-@contextmanager
-def patch_logger_for_tqdm(logger):
-    """
-    Context manager to patch the logger so that log messages are displayed using tqdm.write,
-    preventing interference with tqdm progress bars.
-    """
-    import tqdm
-
-    class TqdmLoggingHandler(logging.Handler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-                tqdm.write(msg, end="\n")
-            except Exception:
-                self.handleError(record)
-
-    # Save original handlers and level
-    original_handlers = logger.handlers[:]
-    original_level = logger.level
-
-    # Remove all existing handlers to prevent duplicate output
-    for h in original_handlers:
-        logger.removeHandler(h)
-
-    # Add our tqdm-aware handler
-    handler = TqdmLoggingHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    try:
-        yield
-    finally:
-        # Remove tqdm handler and restore original handlers and level
-        logger.removeHandler(handler)
-        for h in original_handlers:
-            logger.addHandler(h)
-        logger.setLevel(original_level)
 
 
 def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
@@ -109,25 +69,25 @@ def get_available_cubin_files(source, retries=3, delay=5, timeout=10):
 
 
 class ArtifactPath:
-    TRTLLM_GEN_FMHA: str = "037e528e719ec3456a7d7d654f26b805e44c63b1/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "538f8e38ace07f701f61e26b138b2b8c70ce9e8e/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "037e528e719ec3456a7d7d654f26b805e44c63b1/batched_gemm-8704aa4-ba3b00d/"
+        "e6f22dcc3fdeb29ff87af2f4a2cb3d30b8d273e0/batched_gemm-45beda1-ee6a802/"
     )
     TRTLLM_GEN_GEMM: str = (
         "037e528e719ec3456a7d7d654f26b805e44c63b1/gemm-8704aa4-f91dc9e/"
     )
     CUDNN_SDPA: str = "4c623163877c8fef5751c9c7a59940cd2baae02e/fmha/cudnn/"
-    DEEPGEMM: str = "d25901733420c7cddc1adf799b0d4639ed1e162f/deep-gemm/"
+    DEEPGEMM: str = "51d730202c9eef782f06ecc950005331d85c5d4b/deep-gemm/"
 
 
 class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
-        "0ff77215b86997665cf75973e13cd2932f551d46b4e008f851d32d47e1d9560f"
+        "71f06a8fc03d28cc94ee6fc180fb7e37256a9e1c30ab2a6c0bf20a2d97af3eff"
     )
     TRTLLM_GEN_BMM: str = (
-        "34bdfe7acfd49f5fb8b48e06d56e6a5ad88b951c730552f228fc5f614f7632a8"
+        "c98b4ce69a39fd41556d67033c30ea814ef76b0a2fe16e798e55baf0104acc34"
     )
-    DEEPGEMM: str = "69aa277b7f3663ed929e73f9c57301792b8c594dac15a465b44a5d151b6a1d50"
+    DEEPGEMM: str = "b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48"
     TRTLLM_GEN_GEMM: str = (
         "0345358c916d990709f9670e113e93f35c76aa22715e2d5128ec2ca8740be5ba"
     )
@@ -155,25 +115,31 @@ def get_cubin_file_list():
 
 
 def download_artifacts():
-    import tqdm
+    from tqdm.contrib.logging import tqdm_logging_redirect
+
+    # use a shared session to make use of HTTP keep-alive and reuse of
+    # HTTPS connections.
+    session = requests.Session()
 
     with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
         cubin_files = get_cubin_file_list()
         num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-        pool = ThreadPoolExecutor(num_threads)
-        futures = []
-        for name, extension in cubin_files:
-            ret = pool.submit(get_cubin, name, "", extension)
-            futures.append(ret)
-        results = []
-        with (
-            patch_logger_for_tqdm(logger),
-            tqdm(total=len(futures), desc="Downloading cubins") as pbar,
-        ):
-            for ret in as_completed(futures):
-                result = ret.result()
-                results.append(result)
+        with tqdm_logging_redirect(
+            total=len(cubin_files), desc="Downloading cubins"
+        ) as pbar:
+
+            def update_pbar_cb(_) -> None:
                 pbar.update(1)
+
+            with ThreadPoolExecutor(num_threads) as pool:
+                futures = []
+                for name, extension in cubin_files:
+                    fut = pool.submit(get_cubin, name, "", extension, session)
+                    fut.add_done_callback(update_pbar_cb)
+                    futures.append(fut)
+
+                results = [fut.result() for fut in as_completed(futures)]
+
         all_success = all(results)
     if not all_success:
         raise RuntimeError("Failed to download cubins")

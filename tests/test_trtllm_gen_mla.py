@@ -4,8 +4,10 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
-global_workspace_buffer = None
+global_workspace_buffer = None  # can.be empty initialized
+global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
@@ -30,6 +32,9 @@ def test_trtllm_batch_decode_mla(
     dynamic_scale: bool,
     enable_pdl: bool,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 
@@ -96,12 +101,17 @@ def test_trtllm_batch_decode_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     bmm1_log2_scale_tensor = (
         torch.tensor(
@@ -135,12 +145,14 @@ def test_trtllm_batch_decode_mla(
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
         (128 + 64) ** 0.5
     )  # use head dimension before matrix absorption
-    workspace_buffer_ref = torch.empty(workspace_size, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer_ref,
         backend="fa2",

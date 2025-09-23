@@ -6,7 +6,7 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up
+from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
 
 DTYPE_MAP = {
     "fp16": torch.float16,
@@ -17,8 +17,9 @@ DTYPE_MAP = {
 
 GPU_DEVICE = "cuda:0"
 
-global_workspace_buffer = None
-workspace_size = 128 * 1024 * 1024
+global_workspace_buffer = None  # can.be empty initialized
+global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+workspace_size = 256 * 1024 * 1024
 
 
 def flip_coin(*args, **kwargs):
@@ -268,6 +269,9 @@ def test_trtllm_batch_prefill(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
@@ -320,16 +324,21 @@ def test_trtllm_batch_prefill(
             else None
         )
 
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer_ref = global_workspace_buffer
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer_ref, kv_layout
     )
     plan_params = {
         "qo_indptr": q_indptr,
@@ -372,6 +381,9 @@ def test_trtllm_batch_prefill(
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -414,6 +426,9 @@ def test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
@@ -450,6 +465,10 @@ def test_trtllm_batch_decode(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
@@ -505,16 +524,21 @@ def test_trtllm_batch_decode(
             else None
         )
 
-    global global_workspace_buffer
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
     if global_workspace_buffer is None:
-        global_workspace_buffer = torch.zeros(
+        global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=GPU_DEVICE
         )
-    workspace_buffer = global_workspace_buffer
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=GPU_DEVICE
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     # Run reference wrapper
     wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, use_tensor_cores=True
+        workspace_buffer_ref, kv_layout, use_tensor_cores=True
     )
     plan_params = {
         "indptr": kv_indptr,
@@ -535,7 +559,7 @@ def test_trtllm_batch_decode(
     if q_len_per_req > 1:
         # hide the output_ref from decode wrapper for speculative decoding test
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
+            workspace_buffer_ref, kv_layout
         )
         plan_params_prefill = {
             "qo_indptr": q_indptr,
@@ -576,6 +600,9 @@ def test_trtllm_batch_decode(
         enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -648,6 +675,9 @@ def test_trtllm_batch_decode(
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
@@ -659,6 +689,9 @@ def test_trtllm_batch_decode(
 def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 
@@ -699,7 +732,17 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer_ref = global_workspace_buffer
 
     qo_indptr = torch.cat(
         [
@@ -722,7 +765,7 @@ def test_trtllm_gen_prefill_deepseek(
     ).int()
 
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.zeros(workspace_size, device="cuda", dtype=torch.uint8),
+        workspace_buffer_ref,
         kv_layout="NHD",
         backend="cutlass",
     )
@@ -775,6 +818,9 @@ def test_trtllm_gen_prefill_deepseek(
         atol=1e-3,
         rtol=1e-3,
     )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
 if __name__ == "__main__":

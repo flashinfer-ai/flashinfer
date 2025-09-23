@@ -1,10 +1,10 @@
 import dataclasses
 import logging
 import os
-import warnings
 from contextlib import nullcontext
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union
+from datetime import datetime
 
 import torch
 from filelock import FileLock
@@ -80,6 +80,93 @@ sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_fl
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
 
 current_compilation_context = CompilationContext()
+
+
+@dataclasses.dataclass
+class JitSpecStatus:
+    """Status information for a JitSpec"""
+
+    name: str
+    created_at: datetime
+    is_aot: bool
+    is_compiled: bool
+    library_path: Optional[Path]
+    sources: List[Path]
+    needs_device_linking: bool
+
+    @property
+    def compilation_type(self) -> str:
+        return "AOT" if self.is_aot else "JIT"
+
+    @property
+    def status(self) -> str:
+        if self.is_compiled:
+            return "Compiled"
+        else:
+            return "Not Compiled"
+
+
+class JitSpecRegistry:
+    """Global registry to track all JitSpecs"""
+
+    def __init__(self):
+        self._specs: Dict[str, JitSpec] = {}
+        self._creation_times: Dict[str, datetime] = {}
+
+    def register(self, spec: "JitSpec") -> None:
+        """Register a new JitSpec"""
+        if spec.name not in self._specs:
+            self._specs[spec.name] = spec
+            self._creation_times[spec.name] = datetime.now()
+
+    def get_all_specs(self) -> Dict[str, "JitSpec"]:
+        """Get all registered JitSpecs"""
+        return self._specs.copy()
+
+    def get_spec_status(self, name: str) -> Optional[JitSpecStatus]:
+        """Get status for a specific JitSpec"""
+        if name not in self._specs:
+            return None
+
+        spec = self._specs[name]
+        library_path = (
+            spec.get_library_path()
+            if (spec.is_aot or spec.jit_library_path.exists())
+            else None
+        )
+
+        return JitSpecStatus(
+            name=spec.name,
+            created_at=self._creation_times[name],
+            is_aot=spec.is_aot,
+            is_compiled=spec.is_aot or spec.jit_library_path.exists(),
+            library_path=library_path,
+            sources=spec.sources,
+            needs_device_linking=spec.needs_device_linking,
+        )
+
+    def get_all_statuses(self) -> List[JitSpecStatus]:
+        """Get status for all registered JitSpecs"""
+        statuses = []
+        for name in self._specs:
+            status = self.get_spec_status(name)
+            if status:
+                statuses.append(status)
+        return statuses
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get compilation statistics"""
+        statuses = self.get_all_statuses()
+        return {
+            "total": len(statuses),
+            "aot_compiled": sum(1 for s in statuses if s.is_aot),
+            "jit_compiled": sum(1 for s in statuses if not s.is_aot and s.is_compiled),
+            "not_compiled": sum(1 for s in statuses if not s.is_compiled),
+        }
+
+
+# Global registry instance
+jit_spec_registry = JitSpecRegistry()
 
 
 @dataclasses.dataclass
@@ -175,9 +262,8 @@ def gen_jit_spec(
     check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
-    cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
+    cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
-        "-O3",
         "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
@@ -187,8 +273,11 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
     if verbose:
+        cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
+            "-O0",
+            "-G",
             "-lineinfo",
             "--ptxas-options=-v",
             "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
@@ -196,7 +285,12 @@ def gen_jit_spec(
         ]
     else:
         # non debug mode
-        cuda_cflags += ["-DNDEBUG"]
+        cuda_cflags += ["-DNDEBUG", "-O3"]
+        cflags += ["-O3"]
+
+    # useful for ncu
+    if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
+        cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:
         cflags += extra_cflags
@@ -217,6 +311,10 @@ def gen_jit_spec(
         needs_device_linking=needs_device_linking,
     )
     spec.write_ninja()
+
+    # Register the spec in the global registry
+    jit_spec_registry.register(spec)
+
     return spec
 
 
@@ -248,28 +346,3 @@ def build_jit_specs(
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
         run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
-
-
-def load_cuda_ops(
-    name: str,
-    sources: List[Union[str, Path]],
-    extra_cflags: Optional[List[str]] = None,
-    extra_cuda_cflags: Optional[List[str]] = None,
-    extra_ldflags=None,
-    extra_include_paths=None,
-):
-    # TODO(lequn): Remove this function and use JitSpec directly.
-    warnings.warn(
-        "load_cuda_ops is deprecated. Use JitSpec directly.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    spec = gen_jit_spec(
-        name=name,
-        sources=sources,
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cuda_cflags,
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=extra_include_paths,
-    )
-    return spec.build_and_load()

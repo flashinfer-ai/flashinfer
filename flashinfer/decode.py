@@ -826,6 +826,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         non_blocking: bool = True,
         block_tables: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -834,7 +836,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``
@@ -873,8 +875,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
-
-
+        fixed_split_size : Optional[int],
+            The fixed split size for FA2 split-kv decode, in pages. Only supported by tensor core decode for now. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -943,6 +951,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if fixed_split_size is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_split_size is only supported by tensor core decode for now."
+            )
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -1031,6 +1045,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 head_dim,
                 False,  # causal
+                window_left,
+                fixed_split_size,
+                disable_split_kv,
             )
         else:
             if self._jit_module is not None:
@@ -1047,7 +1064,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                 )
-
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -2350,3 +2366,171 @@ def trtllm_batch_decode_with_kv_cache_mla(
         sinks,
     )
     return out
+
+
+global_override_indptr_cpu = None
+
+
+def fast_decode_plan(
+    self,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pos_encoding_mode: str = "NONE",
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
+) -> None:
+    """
+    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
+    Modifications:
+    - Remove unnecessary device-to-device copy for the cuda graph buffers.
+    - Remove unnecessary host-to-device copy for the metadata buffers.
+    """
+    batch_size = len(last_page_len)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+
+    if kv_data_type is None:
+        kv_data_type = q_data_type
+
+    if self.use_tensor_cores:
+        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+    if self.is_cuda_graph_enabled:
+        if batch_size != self._fixed_batch_size:
+            raise ValueError(
+                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                " mismatches the batch size set during initialization {}".format(
+                    batch_size, self._fixed_batch_size
+                )
+            )
+        if len(indices) > len(self._paged_kv_indices_buf):
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
+    else:
+        self._paged_kv_indptr_buf = indptr
+        self._paged_kv_indices_buf = indices
+        self._paged_kv_last_page_len_buf = last_page_len
+        if self.use_tensor_cores:
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
+
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+        ),
+        device=self.device,
+    )
+
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, kv_data_type)
+            if isinstance(kv_data_type, str)
+            else kv_data_type
+        ),
+        device=self.device,
+    )
+
+    indptr_host = (
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
+    )
+
+    with torch.cuda.device(self.device):
+        if self.use_tensor_cores:
+            # ALSO convert last_page_len to CPU
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones(
+                    (batch_size,), dtype=torch.int32, device="cpu"
+                )
+            else:
+                last_page_len_host = last_page_len.cpu()
+
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+
+            try:
+                # Make sure we pass exactly 15 arguments for tensor core version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                    False,  # causal
+                    window_left,
+                    fixed_split_size,
+                    disable_split_kv,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+        else:
+            try:
+                # Make sure we pass exactly 15 arguments for standard version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    window_left,
+                    logits_soft_cap,
+                    head_dim,
+                    head_dim,
+                    empty_q_data,
+                    empty_kv_cache,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+
+    self._pos_encoding_mode = pos_encoding_mode
+    self._window_left = window_left
+    self._logits_soft_cap = logits_soft_cap
+    self._sm_scale = sm_scale
+    self._rope_scale = rope_scale
+    self._rope_theta = rope_theta

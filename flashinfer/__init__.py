@@ -19,11 +19,15 @@ try:
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
 
+
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .attention import BatchAttention as BatchAttention
+from .attention import (
+    BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+)
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
@@ -46,6 +50,9 @@ from .decode import (
 from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
+from .decode import (
+    fast_decode_plan as fast_decode_plan,
+)
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
@@ -58,6 +65,7 @@ from .fp4_quantization import (
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,
+    nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
@@ -75,6 +83,7 @@ from .fused_moe import (
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
@@ -131,3 +140,19 @@ from .sparse import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
+
+try:
+    import flashinfer_cubin
+
+    flashinfer_cubin_version = flashinfer_cubin.__version__
+
+    print("__version__", __version__)
+    if __version__ != flashinfer_cubin_version:
+        raise RuntimeError(
+            f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
+            f"flashinfer version ({__version__}). "
+            "Please install the same version of both packages."
+        )
+except ImportError:
+    # flashinfer-cubin is not installed
+    pass

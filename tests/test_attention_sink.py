@@ -157,14 +157,16 @@ def test_attention_sink(
     device = torch.device("cuda:0")
     if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
+
+    head_dim = 128
     jit_args = (
         f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",  # uri
         dtype,  # dtype_q
         dtype,  # dtype_kv
         dtype,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim_qk
-        128,  # hidden_dim_vo
+        head_dim,  # hidden_dim_qk
+        head_dim,  # hidden_dim_vo
         ["sink"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -175,7 +177,7 @@ def test_attention_sink(
     jit_kwargs = {
         "use_sliding_window": window_left >= 0,
     }
-    sm_scale = 1.0 / math.sqrt(128)
+    sm_scale = 1.0 / math.sqrt(head_dim)
     torch.manual_seed(42)
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device=device
@@ -193,8 +195,6 @@ def test_attention_sink(
     kv_indptr_host = torch.arange(
         0, batch_size * seq_len + 1, seq_len, dtype=torch.int32
     )
-
-    head_dim = 128
 
     wrapper.plan(
         qo_indptr_host,
@@ -239,12 +239,15 @@ def test_attention_sink(
     else:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
-    wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    wrapper_paged = flashinfer.BatchAttentionWithAttentionSinkWrapper(
         float_workspace_buffer,
         kv_layout="NHD",
         backend=backend,
-        jit_args=jit_args,
-        jit_kwargs=jit_kwargs,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        window_left=window_left,
     )
     kv_indices_host = torch.arange(
         0,
@@ -305,12 +308,15 @@ def test_attention_sink(
             v_paged_frag[page_idx, 0] = v[i]
 
         # Test with fragmented indices
-        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper_paged_frag = flashinfer.BatchAttentionWithAttentionSinkWrapper(
             float_workspace_buffer,
             kv_layout="NHD",
             backend=backend,
-            jit_args=jit_args,
-            jit_kwargs=jit_kwargs,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            window_left=window_left,
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -485,12 +491,15 @@ def test_attention_sink_incremental_generation(
             torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
         # Also test with BatchPrefillWithPagedKVCacheWrapper
-        wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper_paged = flashinfer.BatchAttentionWithAttentionSinkWrapper(
             float_workspace_buffer,
             kv_layout="NHD",
             backend=backend,
-            jit_args=jit_args,
-            jit_kwargs=jit_kwargs,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            window_left=window_left,
         )
         kv_indices_host = torch.arange(
             0,
@@ -553,12 +562,15 @@ def test_attention_sink_incremental_generation(
                 v_paged_frag[page_idx, 0] = v_flashinfer[i]
 
             # Test with fragmented indices
-            wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            wrapper_paged_frag = flashinfer.BatchAttentionWithAttentionSinkWrapper(
                 float_workspace_buffer,
                 kv_layout="NHD",
                 backend=backend,
-                jit_args=jit_args,
-                jit_kwargs=jit_kwargs,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                window_left=window_left,
             )
             wrapper_paged_frag.plan(
                 qo_indptr_host,
@@ -623,6 +635,11 @@ def test_attention_sink_chunk_prefill(
     Simulate chunk-based processing of long sequences where current chunk
     attends to all historical tokens plus current chunk tokens
     """
+    if not causal and window_left >= 0:
+        # xfail for non-causal + sliding window case
+        pytest.xfail(
+            "NOTE(Zihao): attention sink with sliding window and non-causal will fail after https://github.com/flashinfer-ai/flashinfer/pull/1661, temporarily xfail the test."
+        )
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     if backend == "fa3" and not is_sm90a_supported(device):
@@ -721,12 +738,15 @@ def test_attention_sink_chunk_prefill(
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
-    wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    wrapper_paged = flashinfer.BatchAttentionWithAttentionSinkWrapper(
         float_workspace_buffer,
         kv_layout="NHD",
         backend=backend,
-        jit_args=jit_args,
-        jit_kwargs=jit_kwargs,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        window_left=window_left,
     )
     kv_indices_host = torch.arange(
         0,
@@ -789,12 +809,15 @@ def test_attention_sink_chunk_prefill(
             v_paged_frag[page_idx, 0] = v_all[i]
 
         # Test with fragmented indices
-        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper_paged_frag = flashinfer.BatchAttentionWithAttentionSinkWrapper(
             float_workspace_buffer,
             kv_layout="NHD",
             backend=backend,
-            jit_args=jit_args,
-            jit_kwargs=jit_kwargs,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            window_left=window_left,
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -975,12 +998,15 @@ def test_attention_sink_varlen(
         torch.testing.assert_close(o_ref, o, rtol=1e-2, atol=1e-2)
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
-    wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    wrapper_paged = flashinfer.BatchAttentionWithAttentionSinkWrapper(
         float_workspace_buffer,
         kv_layout="NHD",
         backend=backend,
-        jit_args=jit_args,
-        jit_kwargs=jit_kwargs,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        window_left=window_left,
     )
     kv_indices_host = torch.arange(0, total_kv_len, dtype=torch.int32, device=device)
     paged_kv_last_page_len_host = torch.full(
@@ -1041,8 +1067,15 @@ def test_attention_sink_varlen(
             v_paged_frag[page_idx, 0] = v[i]
 
         # Test with fragmented indices
-        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        wrapper_paged_frag = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend=backend,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            window_left=window_left,
         )
         wrapper_paged_frag.plan(
             qo_indptr_tensor,

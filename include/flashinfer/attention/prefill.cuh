@@ -295,7 +295,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
     for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
-        smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         *gptr += 8 * upcast_size<DTypeKV>();
       }
@@ -434,7 +434,7 @@ __device__ __forceinline__ void load_q_global_smem(
   const uint32_t lane_idx = tid.x, warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
 
   if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
-    uint32_t q_smem_offset_w = q_smem->get_permuted_offset<UPCAST_STRIDE_Q>(
+    uint32_t q_smem_offset_w = q_smem->template get_permuted_offset<UPCAST_STRIDE_Q>(
         warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
 #pragma unroll
@@ -449,8 +449,8 @@ __device__ __forceinline__ void load_q_global_smem(
 #pragma unroll
         for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_QK / 4; ++mma_do) {
           // load q fragment from gmem to smem
-          q_smem->load_128b_async<SharedMemFillMode::kNoFill>(q_smem_offset_w, q_ptr,
-                                                              q_idx < qo_upper_bound);
+          q_smem->template load_128b_async<SharedMemFillMode::kNoFill>(q_smem_offset_w, q_ptr,
+                                                                       q_idx < qo_upper_bound);
           q_smem_offset_w = q_smem->template advance_offset_by_column<8>(q_smem_offset_w, mma_do);
           q_ptr += 8 * upcast_size<DTypeQ>();
         }
@@ -1258,12 +1258,12 @@ __device__ __forceinline__ void write_o_reg_gmem(
           vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_q][mma_d]);
 
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+          uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
               (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
               mma_d * 2 + lane_idx / 16);
           o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
 #else
-          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+          uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
               (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
           ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
           ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_STRIDE_O))[lane_idx % 4] =
@@ -1275,7 +1275,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
         }
       }
 
-      uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_STRIDE_O>(
+      uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
           warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
 #pragma unroll
@@ -1379,7 +1379,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint32_t k_stride_h = params.k_stride_h;
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -1419,7 +1418,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                              ? o + chunk_idx * o_stride_n + (kv_head_idx * group_size) * o_stride_h
                              : o + (kv_head_idx * group_size) * o_stride_h;
 
-    uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
+    uint32_t q_smem_offset_r = qo_smem.template get_permuted_offset<UPCAST_STRIDE_Q>(
         get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h,
                                 group_size, &qo_smem, tid);
@@ -1768,7 +1767,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t k_stride_h = params.k_stride_h;
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -1790,13 +1788,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-    const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
+
+    // skip out-of-window kv tile by add non-zero kv_start_idx offset
+    const uint32_t kv_start_idx = sub_if_greater_or_zero(
+        kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
+    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    const uint32_t chunk_start =
+        partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
+    const uint32_t chunk_end =
+        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
@@ -1970,8 +1973,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
-
+    const uint32_t num_kv_chunks =
+        ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
                                       kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
@@ -2065,7 +2068,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     bool* block_valid_mask = params.block_valid_mask;
     const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
-    const int32_t maybe_window_left = params.window_left;
     const uint_fastdiv& group_size = params.group_size;
 
     uint32_t* maybe_prefix_len_ptr = nullptr;
@@ -2102,14 +2104,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-    const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
+    const uint32_t kv_start_idx = sub_if_greater_or_zero(
+        kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
+    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    const uint32_t chunk_start =
+        partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
+    const uint32_t chunk_end =
+        partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2301,12 +2306,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
         logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
+                             kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                             kv_head_idx);
       } else {
         if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
           if (iter >= mask_iteration || iter < window_iteration) {
             logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                 kv_head_idx);
           }
         } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
           if (iter + 1 >= num_iterations_prefix) {
@@ -2319,7 +2326,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag);
+                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                   kv_head_idx);
             }
           }
         }
@@ -2353,7 +2361,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-    const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
+    const uint32_t num_kv_chunks =
+        ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,

@@ -54,6 +54,8 @@ from .utils import (
     is_float8,
     is_sm100a_supported,
     is_sm110a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -75,7 +77,12 @@ def get_fmha_module(
     device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if is_sm100a_supported(device) or is_sm110a_supported(device):
+    if (
+        is_sm100a_supported(device)
+        or is_sm110a_supported(device)
+        or is_sm120a_supported(device)
+        or is_sm121a_supported(device)
+    ):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -1540,6 +1547,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1550,7 +1559,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -1639,6 +1648,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
             Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+        fixed_split_size : Optional[int],
+            The fixed split size for FA2 split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1660,6 +1677,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -1857,7 +1876,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     block_id += num_blocks_needed
 
         if self._cached_module is not None:
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1873,6 +1892,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
+                window_left,
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._causal = causal
@@ -2479,6 +2505,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2562,7 +2590,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
-
+        fixed_split_size : Optional[int],
+            The fixed split size for split-kv FA2 prefill/decode, in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2581,7 +2616,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-
+        if fixed_split_size is None:
+            fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
@@ -2700,7 +2736,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         else:
             assert self._cached_module is not None, "cached module is not initialized"
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -2716,6 +2752,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
+                window_left,
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._causal = causal

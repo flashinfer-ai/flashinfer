@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from flashinfer import xqa
+from flashinfer.utils import get_compute_capability
 
 
 def set_random_seed(seed=42):
@@ -147,6 +148,10 @@ def ref_attention(
     return out
 
 
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] != 9,
+    reason="XQA is only supported on SM90 GPUs",
+)
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("use_fp16", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
@@ -167,6 +172,9 @@ def test_xqa(
     use_attention_sinks,
     use_sliding_window,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 9:
+        pytest.skip("XQA only supports on Hopper at this moment")
     set_random_seed(42)
 
     nb_v_heads = nb_k_heads

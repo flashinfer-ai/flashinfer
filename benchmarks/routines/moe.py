@@ -17,7 +17,6 @@ from flashinfer.fused_moe import (
 from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.testing.utils import (
     bench_gpu_time,
-    bench_gpu_time_with_cudagraph,
 )
 
 from .flashinfer_benchmark_utils import (
@@ -721,27 +720,17 @@ def testTrtllmFp4BlockScaleMoe(args):
                 run_fp4_moe()
 
     # Benchmark timing
-    if is_cuda_graph_compatible:
-        times = bench_gpu_time_with_cudagraph(
-            fn=run_fp4_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            num_iters_within_graph=20,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
-    else:
-        times = bench_gpu_time(
-            fn=run_fp4_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
+    times = bench_gpu_time(
+        fn=run_fp4_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
 
     # Compute performance metrics
     median_time = np.median(times)
@@ -1054,27 +1043,17 @@ def testCutlassFusedMoe(args):
                 run_cutlass()
 
     # Measure
-    if is_cuda_graph_compatible:
-        times = bench_gpu_time_with_cudagraph(
-            fn=run_cutlass,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            num_iters_within_graph=20,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
-    else:
-        times = bench_gpu_time(
-            fn=run_cutlass,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
+    times = bench_gpu_time(
+        fn=run_cutlass,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
 
     median_time = np.median(times)
     std_time = np.std(times)
@@ -1331,27 +1310,17 @@ def testTrtllmFp8BlockScaleMoe(args):
         )
 
     # Benchmark timing
-    if is_cuda_graph_compatible:
-        times = bench_gpu_time_with_cudagraph(
-            fn=run_fp8_block_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            num_iters_within_graph=20,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
-    else:
-        times = bench_gpu_time(
-            fn=run_fp8_block_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
+    times = bench_gpu_time(
+        fn=run_fp8_block_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
 
     # Compute performance metrics
     median_time = np.median(times)
@@ -1540,27 +1509,17 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         )
 
     # Benchmark timing
-    if is_cuda_graph_compatible:
-        times = bench_gpu_time_with_cudagraph(
-            fn=run_fp8_per_tensor_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            num_iters_within_graph=20,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
-    else:
-        times = bench_gpu_time(
-            fn=run_fp8_per_tensor_moe,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
-            sleep_after_run=False,
-        )
+    times = bench_gpu_time(
+        fn=run_fp8_per_tensor_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        l2_flush=True,
+        l2_flush_size_mb=256,
+        l2_flush_device=device,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
 
     # Compute performance metrics
     median_time = np.median(times)

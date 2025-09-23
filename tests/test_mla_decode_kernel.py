@@ -1,19 +1,18 @@
 from typing import Optional, Tuple
+import pytest
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 import flashinfer
+from rope_reference import apply_rotary_emb, precompute_freqs_cis
 
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):
     sum_abs_error = (preds - target).abs().sum().detach().item()
     sum_scale = target.abs().sum().detach().item()
     return sum_abs_error / sum_scale
-
-
-from rope_reference import *
 
 
 class DeepseekV2RMSNorm(nn.Module):
@@ -247,6 +246,10 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
         k_pe_cache: torch.Tensor,
         use_flashinfer_kernel: bool,
         convert_float16: bool,
+        bsz: int,
+        kv_len: int,
+        page_size: int,
+        dev_id: int,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         c_Q = torch.matmul(hidden_states, self.W_DQ)
         # c_Q ~ [bsz, q_lora_rank:1536]
@@ -392,17 +395,16 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
         return output
 
 
-if __name__ == "__main__":
+@pytest.mark.parametrize("bsz", [6])
+@pytest.mark.parametrize("kv_len", [640])
+@pytest.mark.parametrize("page_size", [16])
+def test_mla_decode_kernel(bsz, kv_len, page_size):
     dev_id = 0
 
     torch.manual_seed(666)
     torch.set_grad_enabled(False)
 
     mla_vanilla = DeepseekV2AttentionVanilla().cuda(device=dev_id)
-
-    bsz = 6
-    kv_len = 640
-    page_size = 16
 
     hidden_states = torch.randn([bsz, 1, mla_vanilla.hidden_size]).to(dev_id)
     compressed_kv_normed_cache = torch.randn(
@@ -421,6 +423,10 @@ if __name__ == "__main__":
         k_pe_cache,
         use_flashinfer_kernel=False,
         convert_float16=False,
+        bsz=bsz,
+        kv_len=kv_len,
+        page_size=page_size,
+        dev_id=dev_id,
     )
     output_mat_absorbed_use_torch_f16 = mla_mat_absorb.run_proof_of_concept(
         hidden_states.squeeze(1),
@@ -428,6 +434,10 @@ if __name__ == "__main__":
         k_pe_cache,
         use_flashinfer_kernel=False,
         convert_float16=True,
+        bsz=bsz,
+        kv_len=kv_len,
+        page_size=page_size,
+        dev_id=dev_id,
     )
     output_mat_absorbed_use_flashinfer = mla_mat_absorb.run_proof_of_concept(
         hidden_states.squeeze(1),
@@ -435,6 +445,10 @@ if __name__ == "__main__":
         k_pe_cache,
         use_flashinfer_kernel=True,
         convert_float16=True,
+        bsz=bsz,
+        kv_len=kv_len,
+        page_size=page_size,
+        dev_id=dev_id,
     )
 
     cos_use_torch_f32 = F.cosine_similarity(
@@ -489,3 +503,10 @@ if __name__ == "__main__":
         output_vanilla.reshape(-1), output_mat_absorbed_use_flashinfer.reshape(-1)
     )
     print(f"mse_use_flashinfer = {mse_use_flashinfer}")
+
+
+if __name__ == "__main__":
+    bsz = 6
+    kv_len = 640
+    page_size = 16
+    test_mla_decode_kernel(bsz, kv_len, page_size)

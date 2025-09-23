@@ -393,6 +393,7 @@ class PODWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             )
+
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -409,6 +410,9 @@ class PODWithPagedKVCacheWrapper:
             head_dim,
             head_dim,
             False,  # causal
+            window_left,
+            -1,  # fixed_split_size
+            False,  # disable_split_kv
         )
 
         self._indptr_type = indptr.dtype

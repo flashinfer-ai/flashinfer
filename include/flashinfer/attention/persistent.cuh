@@ -140,7 +140,8 @@ __device__ __forceinline__ void write_o_(float (*o_frag)[KTraits::NUM_MMA_D_VO][
 
 template <typename KTraits>
 __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
+                                            float v_scale = 1.0f) {
   using AttentionVariant = typename KTraits::AttentionVariant;
   if constexpr (AttentionVariant::use_softmax) {
     float d_rcp[KTraits::NUM_MMA_Q][2];
@@ -163,6 +164,9 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
               o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id >> 1) & 1];
+          if (v_scale != 1.0f) {
+            o_frag[mma_q][mma_d][reg_id] *= v_scale;
+          }
         }
       }
     }
@@ -391,7 +395,7 @@ struct BlockBatchPagedAttentionPersistent {
       threadblock_sync_mdo_states<KTraits>(o_frag, smem_storage, m, d, warp_idx, lane_idx, tid);
 
       // normalize d
-      normalize_d<KTraits>(o_frag, m, d);
+      normalize_d<KTraits>(o_frag, m, d, params.v_scale);
 
       // write back to global memory
       // o_indptr (partial_o): [packed_qo_len * num_kv_chunks, num_kv_heads, head_dim]

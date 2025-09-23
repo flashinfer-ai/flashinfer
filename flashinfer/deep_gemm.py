@@ -193,8 +193,14 @@ def transform_sf_into_required_layout(
     gran = (recipe[0 if is_sfa else 1], recipe[2])
 
     should_skip_transform = (
-        sf.dtype == torch.int and gran == (1, 128) and get_device_arch() == "100a"
-    ) or (sf.dtype == torch.int and gran == (128, 128) and get_device_arch() == "100a")
+        sf.dtype == torch.int
+        and gran == (1, 128)
+        and get_device_arch() in ("100a", "103a")
+    ) or (
+        sf.dtype == torch.int
+        and gran == (128, 128)
+        and get_device_arch() in ("100a", "103a")
+    )
 
     if not should_skip_transform:
         # Pre-transform checks
@@ -205,7 +211,11 @@ def transform_sf_into_required_layout(
         raise NotImplementedError
 
     # (FP32, 1, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
-    if sf.dtype == torch.float and gran == (1, 128) and get_device_arch() == "100a":
+    if (
+        sf.dtype == torch.float
+        and gran == (1, 128)
+        and get_device_arch() in ("100a", "103a")
+    ):
         sf = get_col_major_tma_aligned_packed_tensor(sf)
         return check_sf_layout(
             sf,
@@ -222,7 +232,11 @@ def transform_sf_into_required_layout(
         raise NotImplementedError
 
     # (FP32, 128, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
-    if sf.dtype == torch.float and gran == (128, 128) and get_device_arch() == "100a":
+    if (
+        sf.dtype == torch.float
+        and gran == (128, 128)
+        and get_device_arch() in ("100a", "103a")
+    ):
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
         sf = get_col_major_tma_aligned_packed_tensor(sf)
         return check_sf_layout(
@@ -247,7 +261,9 @@ def transform_sf_into_required_layout(
             type_check=torch.int,
         )
 
-    AssertionError(f"Unknown cases: {sf.dtype=}, {gran=}, arch={get_device_arch()}")
+    raise AssertionError(
+        f"Unknown cases: {sf.dtype=}, {gran=}, arch={get_device_arch()}"
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -268,6 +284,7 @@ def must_be_k_major() -> bool:
     return {
         "90a": True,
         "100a": False,
+        "103a": False,
     }[get_device_arch()]
 
 
@@ -280,6 +297,8 @@ def get_default_recipe(
         ("90a", torch.float): (1, 128, 128),
         ("100a", torch.float): (1, 128, 128),
         ("100a", torch.int): (1, 1, 128),
+        ("103a", torch.float): (1, 128, 128),
+        ("103a", torch.int): (1, 1, 128),
     }[(get_device_arch(), sfb_dtype)]
 
 
@@ -798,11 +817,13 @@ class SM100FP8GemmRuntime:
 
     def __del__(self) -> None:
         if self.lib is not None:
-            try:
-                checkCudaErrors(self._cleanup_func(self.lib))
-            except Exception as e:
-                # Ignore any errors during shutdown
-                print(f"Failed to delete SM100FP8GemmRuntime: {e}")
+            cleanup = getattr(self, "_cleanup_func", None)
+            if callable(cleanup):
+                try:
+                    cleanup(self.lib)
+                except Exception as e:
+                    # Ignore any errors during shutdown
+                    print(f"Failed to delete SM100FP8GemmRuntime with exception: {e}")
 
     @staticmethod
     def generate(kwargs: Dict[str, Any]) -> str:
@@ -923,7 +944,7 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     signature = f"{name}$${code}"
     cubin_name = f"kernel.{name}.{hash_to_hex(signature)}"
     if cubin_name not in KERNEL_MAP:
-        raise ValueError("cubin not registered")
+        raise ValueError(f"cubin not registered: {cubin_name}")
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
@@ -1111,7 +1132,7 @@ def m_grouped_fp8_gemm_nt_contiguous_kwargs_gen(
     return static_kwargs, all_kwargs
 
 
-def m_grouped_fp8_gemm_nt_contiguous_sm100(
+def m_grouped_fp8_gemm_nt_contiguous_sm10x(
     a: torch.Tensor,
     sfa: torch.Tensor,
     b: torch.Tensor,
@@ -1314,7 +1335,7 @@ def m_grouped_fp8_gemm_nt_masked_kwargs_gen(
     return static_kwargs, all_kwargs
 
 
-def m_grouped_fp8_gemm_nt_masked_sm100(
+def m_grouped_fp8_gemm_nt_masked_sm10x(
     a: torch.Tensor,
     sfa: torch.Tensor,
     b: torch.Tensor,
@@ -1385,11 +1406,17 @@ def m_grouped_fp8_gemm_nt_contiguous(
 
     impl = {
         "100a": functools.partial(
-            m_grouped_fp8_gemm_nt_contiguous_sm100,
+            m_grouped_fp8_gemm_nt_contiguous_sm10x,
             major_a=major_a,
             major_b=major_b,
             compiled_dims=compiled_dims,
-        )
+        ),
+        "103a": functools.partial(
+            m_grouped_fp8_gemm_nt_contiguous_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, m_indices)
 
@@ -1442,11 +1469,17 @@ def m_grouped_fp8_gemm_nt_masked(
 
     impl = {
         "100a": functools.partial(
-            m_grouped_fp8_gemm_nt_masked_sm100,
+            m_grouped_fp8_gemm_nt_masked_sm10x,
             major_a=major_a,
             major_b=major_b,
             compiled_dims=compiled_dims,
-        )
+        ),
+        "103a": functools.partial(
+            m_grouped_fp8_gemm_nt_masked_sm10x,
+            major_a=major_a,
+            major_b=major_b,
+            compiled_dims=compiled_dims,
+        ),
     }[get_device_arch()]
     impl(a, sfa, b, sfb, d, masked_m, expected_m)
 

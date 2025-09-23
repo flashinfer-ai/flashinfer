@@ -39,6 +39,7 @@ output_column_dict = {
         "out_dtype",
         "mma_sm",
         "use_128x4_sf_layout",
+        "use_nvfp4",
     ],
     "moe": [
         "num_tokens",
@@ -71,6 +72,7 @@ output_column_dict = {
     "general": [
         "refcheck",
         "no_cuda_graph",
+        "use_cupti",
         "allow_output_mismatch",
         "random_seed",
         "case_tag",

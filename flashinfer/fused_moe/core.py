@@ -29,6 +29,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..jit.core import logger
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import (
@@ -394,7 +395,7 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("100", "103", "110", "121", "122"):
+    if backend in ("100", "103", "110", "120", "121"):
         FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
             use_fast_build
         ).build_and_load(class_name="FusedMoeRunner")
@@ -1104,9 +1105,14 @@ def get_trtllm_moe_sm100_module():
                 num_tokens,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
-                MoERunner.valid_tactics_dict[instance_key] = (
-                    moe_op.trtllm_get_valid_moe_configs(*instance_key)
-                )
+                try:
+                    valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
+                except Exception as e:
+                    logger.debug(
+                        f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
+                    )
+                    return []
+                MoERunner.valid_tactics_dict[instance_key] = valid_tactics
             return MoERunner.valid_tactics_dict[instance_key]
 
         def forward(

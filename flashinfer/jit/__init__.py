@@ -63,6 +63,9 @@ from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
 from .core import JitSpec as JitSpec
+from .core import JitSpecStatus as JitSpecStatus
+from .core import JitSpecRegistry as JitSpecRegistry
+from .core import jit_spec_registry as jit_spec_registry
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
@@ -74,6 +77,9 @@ from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
+
+from .gemm import gen_grouped_gemm_fp8_tvm_binding as gen_grouped_gemm_fp8_tvm_binding
+from .gemm import get_grouped_gemm_fp8_uri as get_grouped_gemm_fp8_uri
 
 
 @functools.cache
