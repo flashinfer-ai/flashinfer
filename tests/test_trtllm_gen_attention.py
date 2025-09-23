@@ -161,7 +161,21 @@ def create_page_table(batch_size, seq_lens, page_size):
     return page_tables, all_page_ids, page_per_seq
 
 
-def create_output(q, o_dtype, create_out_tensor):
+def create_workspace_buffers(device):
+    # Lazily initialize and reuse global workspace buffers
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
+
+
+def create_output(q, o_dtype, create_out_tensor, create_out_dtype):
     if o_dtype == "fp8":
         o_scale = torch.rand(1).item() * 0.5 + 0.5  # Scale range: 0.5 ~ 1.0
     else:
@@ -197,7 +211,8 @@ def create_output(q, o_dtype, create_out_tensor):
             out = torch.empty_like(q, dtype=DTYPE_MAP[o_dtype])
     else:
         out = None
-    return out, o_scale, o_sf_scale, o_sf_vec_size
+    out_dtype = DTYPE_MAP[o_dtype] if create_out_dtype else None
+    return out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size
 
 
 def get_last_page_len(seq_lens, page_size):
@@ -304,37 +319,19 @@ def test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
     # Create output tensor and related data
     create_out_tensor = flip_coin(
         batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
     )
-    out, o_scale, o_sf_scale, o_sf_vec_size = create_output(
-        q, o_dtype, create_out_tensor
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
     )
-
-    # determine to pass out_dtype explicitly or not
-    if q_dtype != o_dtype and not create_out_tensor:
-        out_dtype = DTYPE_MAP[o_dtype]
-    else:
-        out_dtype = (
-            DTYPE_MAP[o_dtype]
-            if flip_coin(
-                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-            )
-            else None
-        )
-
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    workspace_buffer_ref = global_workspace_buffer
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
+    )
 
     # Run reference wrapper
     wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
@@ -514,37 +511,19 @@ def test_trtllm_batch_decode(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
     # Create output tensor and related data
     create_out_tensor = flip_coin(
         batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
     )
-    out, o_scale, o_sf_scale, o_sf_vec_size = create_output(
-        q, o_dtype, create_out_tensor
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
     )
-
-    # determine to pass out_dtype explicitly or not
-    if q_dtype != o_dtype and not create_out_tensor:
-        out_dtype = DTYPE_MAP[o_dtype]
-    else:
-        out_dtype = (
-            DTYPE_MAP[o_dtype]
-            if flip_coin(
-                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-            )
-            else None
-        )
-
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
-    workspace_buffer_ref = global_workspace_buffer
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
+    )
 
     plan_params = {
         "indptr": kv_indptr,
@@ -748,17 +727,7 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=device
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=device
-        )
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
-    workspace_buffer_ref = global_workspace_buffer
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
 
     qo_indptr = torch.cat(
         [
