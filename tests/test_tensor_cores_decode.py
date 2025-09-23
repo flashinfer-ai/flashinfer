@@ -646,5 +646,7 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
 
 
 if __name__ == "__main__":
-    test_batch_decode_tensor_cores_with_fast_plan(5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE")
+    test_batch_decode_tensor_cores_with_fast_plan(
+        5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE"
+    )
     test_batch_fast_decode_tensor_cores_cuda_graph(12, 54, 1, 4, 1, 128, "HND", "NONE")
