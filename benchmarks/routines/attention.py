@@ -15,6 +15,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     is_close_stats,
+    filter_backends_by_compute_capability,
 )
 
 
@@ -241,7 +242,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
 
-    # Derived parameters
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
         head_grp_size = (
@@ -279,7 +281,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
-        return
+        return res
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -665,6 +667,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
 
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
@@ -673,16 +676,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             remove_fa2 = True
         if remove_fa2:
             backends.remove("fa2")
-    if "fa3" in backends:
-        remove_fa3 = False
-        device_capability = torch.cuda.get_device_capability()
-        if device_capability[0] != 9:
-            print(
-                f"[INFO] FA3 backend does not support capability {device_capability}. Skipping."
-            )
-            remove_fa3 = True
-        if remove_fa3:
-            backends.remove("fa3")
     if "cudnn" in backends:
         remove_cudnn = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1134,6 +1127,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
 
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "cudnn" in backends:
         remove_cudnn = False
@@ -1170,7 +1164,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
-        return
+        return res
 
     # Check for layer-specific constraints
     layer_not_supported = False
@@ -1549,6 +1543,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     causal = False  # False for MLA
     run_refcheck = args.refcheck
 
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
         remove_fa2 = False
@@ -1560,6 +1555,19 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_fa2 = True
         if remove_fa2:
             backends.remove("fa2")
+    if "fa3" in backends:
+        remove_fa3 = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] FA3 backend does not support FP8. Skipping.")
+            remove_fa3 = True
+        if remove_fa3:
+            backends.remove("fa3")
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1664,30 +1672,32 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
-    if "fa2" in backends:
-        fi_fa2_mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            float_workspace_buffer=workspace_buffer,
-            use_cuda_graph=is_cuda_graph_compatible,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_len_arr=actual_seq_lens_kv,
-            backend="fa2",
-        )
-        fi_fa2_mla_wrapper.plan(
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_len_arr=actual_seq_lens_kv,
-            num_heads=num_qo_heads,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            page_size=page_size,
-            causal=causal,
-            sm_scale=sm_scale,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-        )
+    backend_wrappers = {}
+    for backend in backends:
+        if backend in ["fa2", "fa3"]:
+            backend_wrappers[backend] = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                float_workspace_buffer=workspace_buffer,
+                use_cuda_graph=is_cuda_graph_compatible,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=actual_seq_lens_kv,
+                backend=backend,
+            )
+            backend_wrappers[backend].plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=actual_seq_lens_kv,
+                num_heads=num_qo_heads,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                page_size=page_size,
+                causal=causal,
+                sm_scale=sm_scale,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+            )
 
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
@@ -1699,8 +1709,8 @@ def testBatchMLAPagedAttentionWrapper(args):
         kv_cache = kv_cache.to(kv_dtype)
 
     def run_backend_wrapper(backend):
-        if backend == "fa2":
-            return fi_fa2_mla_wrapper.run(
+        if backend in ["fa2", "fa3"]:
+            return backend_wrappers[backend].run(
                 q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
             )
         if backend == "trtllm-gen-native":
