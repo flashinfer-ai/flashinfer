@@ -108,9 +108,7 @@ def get_cubin_file_list():
     ]:
         cubin_files += [
             (kernel + name, extension)
-            for name, extension in get_available_cubin_files(
-                base + "/" + kernel
-            )
+            for name, extension in get_available_cubin_files(base + "/" + kernel)
         ]
     return cubin_files
 
