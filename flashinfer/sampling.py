@@ -28,6 +28,8 @@ from .utils import (
     device_support_pdl,
     register_custom_op,
     register_fake_op,
+    get_radik_workspace_size,
+    _is_buf_cached,
 )
 
 
@@ -834,11 +836,24 @@ def top_k_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
 
-    # NOTE: radik_sampling_from_probs is non-deterministic
+    # dispatch non-determinitic and small top-k requests to radik_sampling_from_probs
     use_radik_impl = not deterministic and (
         (isinstance(top_k, int) and top_k <= 100)
         or (isinstance(top_k, torch.Tensor) and top_k.max() <= 100)
     )
+    # Check if GPU memory is available for radik_sampling_from_probs
+    is_radik_buf_cached, radik_buf_bytes = _is_buf_cached(
+        "radik_sampling_from_probs_workspace", probs.device
+    )
+    required_radik_buf_bytes = get_radik_workspace_size(probs, top_k)
+    memory_avaliable = (
+        is_radik_buf_cached and radik_buf_bytes >= required_radik_buf_bytes
+    ) or (
+        not is_radik_buf_cached
+        and torch.cuda.mem_get_info()[1] >= required_radik_buf_bytes
+    )
+
+    use_radik_impl = use_radik_impl and memory_avaliable
 
     if use_radik_impl:
         return radik_sampling_from_probs(

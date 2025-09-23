@@ -2685,7 +2685,9 @@ cudaError_t RadiKSamplingFromProb(T* probs, IdType* output, IdType* indices, int
   void* workSpace = 0;
   bool workspace_allocated = false;
   if (workSpaceSize > workspace_buffer_size_in_bytes) {
-    FLASHINFER_CUDA_CALL(cudaMalloc(&workSpace, workSpaceSize));
+    auto const cu_malloc_status = cudaMalloc(&workSpace, workSpaceSize);
+    TORCH_CHECK(cu_malloc_status == cudaSuccess,
+                "CUDA out of memory when allocating workspace for radix select.");
     workspace_allocated = true;
   } else {
     workSpace = workspace_buffer;
