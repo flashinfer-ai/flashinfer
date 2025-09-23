@@ -172,15 +172,20 @@ def flatten_paged_kv(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat K/V and token-level indptr from paged KV cache and page table."""
     device = ref_kv_cache.device
-    batch_size = page_table.shape[0]
-    page_per_seq = (seq_lens + page_size - 1) // page_size
+    batch_size = int(page_table.shape[0])
+
+    # Move loop-control tensors to CPU to avoid GPU sync in loops
+    page_table_cpu = page_table.cpu()
+    seq_lens_cpu = seq_lens.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    page_per_seq = (seq_lens_cpu + page_size - 1) // page_size
     k_list = []
     v_list = []
     for i in range(batch_size):
         pages_i = int(page_per_seq[i].item())
-        last_len_i = int(kv_last_page_len[i].item())
+        last_len_i = int(kv_last_page_len_cpu[i].item())
         for j in range(pages_i):
-            page_id = int(page_table[i, j].item())
+            page_id = int(page_table_cpu[i, j].item())
             k_page = ref_kv_cache[page_id, 0]
             v_page = ref_kv_cache[page_id, 1]
             if j == pages_i - 1:
@@ -193,7 +198,7 @@ def flatten_paged_kv(
     kv_indptr_tokens = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(seq_lens.to(device), dim=0, dtype=torch.int32),
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
         ]
     )
     return k_flat, v_flat, kv_indptr_tokens
@@ -611,33 +616,30 @@ def test_trtllm_batch_decode(
         "window_left": window_left,
     }
     if not enable_sink:
-        wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer_ref, kv_layout, use_tensor_cores=True
-        )
-        wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        if q_len_per_req == 1:
+            wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer_ref, kv_layout, use_tensor_cores=True
+            )
+            wrapper_ref.plan(**plan_params)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
-        if q_len_per_req > 1:
-            # hide the output_ref from decode wrapper for speculative decoding test
+        else:
+            # speculative decoding test
             wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                 workspace_buffer_ref, kv_layout
             )
-            plan_params_prefill = {
-                "qo_indptr": q_indptr,
-                "paged_kv_indptr": kv_indptr,
-                "paged_kv_indices": all_page_ids,
-                "paged_kv_last_page_len": kv_last_page_len.to(GPU_DEVICE),
-                "num_qo_heads": num_qo_heads,
-                "num_kv_heads": num_kv_heads,
-                "head_dim_qk": head_dim,
-                "page_size": page_size,
-                "causal": True,
-                "pos_encoding_mode": "NONE",
-                "logits_soft_cap": 0.0,
-                "q_data_type": ref_q.dtype,
-                "kv_data_type": ref_kv_cache.dtype,
-                "window_left": window_left,
-            }
+            plan_params_prefill = plan_params.copy()
+            plan_params_prefill.update(
+                {
+                    "qo_indptr": q_indptr,
+                    "paged_kv_indptr": plan_params_prefill.pop("indptr"),
+                    "paged_kv_indices": plan_params_prefill.pop("indices"),
+                    "paged_kv_last_page_len": plan_params_prefill.pop("last_page_len"),
+                    "head_dim_qk": plan_params_prefill.pop("head_dim"),
+                    "causal": True,
+                    "logits_soft_cap": 0.0,
+                }
+            )
             wrapper_ref.plan(**plan_params_prefill)
             output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
