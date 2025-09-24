@@ -400,30 +400,18 @@ def test_trtllm_batch_prefill(
 
     # Arbitary small mismatch rate
     allowed_mismatch_rate = 1e-7
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
 
-    try:
-        # convert to float32 for fp8 is not supported by assert_close
-        torch.testing.assert_close(
-            output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
-        )
-    except AssertionError as err:
-        # Allow for a small mismatch rate for low precision outputs
-        absolute_difference = torch.abs(output.float() * o_scale - output_ref.float())
-        allowed_tolerance = atol + rtol * torch.abs(output_ref.float())
-        mismatched = absolute_difference > allowed_tolerance
-        mismatch_count = mismatched.sum().item()
-        total_count = mismatched.numel()
-        mismatch_rate = mismatch_count / total_count
-
-        if mismatch_rate < allowed_mismatch_rate:
-            print(
-                f"Warning: {mismatch_count} mismatched elements "
-                f"({mismatch_rate * 100:.5f}% of {total_count}) -- accepted for low precision"
-            )
-        else:
-            raise AssertionError(
-                f"Mismatch rate {mismatch_rate * 100:.5f}% too high! {mismatch_count} out of {total_count} elements"
-            ) from err
+    # convert to float32 for fp8 is not supported by assert_close
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
+    )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
@@ -646,32 +634,17 @@ def test_trtllm_batch_decode(
 
     # Arbitary small mismatch rate
     allowed_mismatch_rate = 5e-5
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
 
-    try:
-        torch.testing.assert_close(
-            output.float() * o_scale,
-            output_ref.float(),
-            rtol=rtol,
-            atol=atol,
-        )
-    except AssertionError as err:
-        # Allow for a small mismatch rate for low precision outputs
-        absolute_difference = torch.abs(output.float() * o_scale - output_ref.float())
-        allowed_tolerance = atol + rtol * torch.abs(output_ref.float())
-        mismatched = absolute_difference > allowed_tolerance
-        mismatch_count = mismatched.sum().item()
-        total_count = mismatched.numel()
-        mismatch_rate = mismatch_count / total_count
-
-        if mismatch_rate < allowed_mismatch_rate:
-            print(
-                f"Warning: {mismatch_count} mismatched elements "
-                f"({mismatch_rate * 100:.5f}% of {total_count}) -- accepted for low precision"
-            )
-        else:
-            raise AssertionError(
-                f"Mismatch rate {mismatch_rate * 100:.5f}% too high! {mismatch_count} out of {total_count} elements"
-            ) from err
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
+    )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
