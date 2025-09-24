@@ -14,17 +14,13 @@ def get_version():
         with open(version_file, "r") as f:
             version = f.read().strip()
     else:
-        version = "0.0.0+unknown"
+        version = "0.0.0"
 
     # Append CUDA version suffix if available
     cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
     if cuda_suffix:
-        # Replace + with . for proper version formatting
-        if "+" in version:
-            base_version, local = version.split("+", 1)
-            version = f"{base_version}+{cuda_suffix}.{local}"
-        else:
-            version = f"{version}+{cuda_suffix}"
+        # Use + to create a local version identifier that will appear in wheel name
+        version = f"{version}+{cuda_suffix}"
 
     return version
 
