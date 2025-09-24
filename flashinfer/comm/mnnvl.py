@@ -25,12 +25,18 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import torch
 
 try:
-    from cuda import cuda
-except ImportError as e:
-    raise ImportError(
-        "Could not import the 'cuda' module. "
-        "Please install cuda-python that matches your CUDA version."
-    ) from e
+    # cuda-python >= 12.9 (has cuda.bindings.driver)
+    from cuda.bindings import driver as cuda
+except ImportError:
+    try:
+        # cuda-python < 12.9 (no cuda.bindings.driver, use cuda as driver)
+        # from cuda import cuda is not available in cuda-python >= 13.0
+        from cuda import cuda
+    except ImportError as e:
+        raise ImportError(
+            "Could not import the 'cuda' module. "
+            "Please install cuda-python that matches your CUDA version."
+        ) from e
 
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
