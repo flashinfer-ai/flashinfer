@@ -16,7 +16,7 @@ echo "Working directory: $(pwd)"
 echo ""
 
 # Navigate to the flashinfer-aot-modules directory
-cd /workspace/flashinfer-aot-modules
+cd flashinfer-aot-modules
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
