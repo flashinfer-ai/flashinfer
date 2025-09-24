@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import sys
+import os
 from pathlib import Path
 from setuptools import build_meta as _orig
 
@@ -37,8 +38,21 @@ def get_version():
     version_file = Path(__file__).parent.parent / "version.txt"
     if version_file.exists():
         with open(version_file, "r") as f:
-            return f.read().strip()
-    return "0.0.0+unknown"
+            version = f.read().strip()
+    else:
+        version = "0.0.0+unknown"
+
+    # Append CUDA version suffix if available
+    cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
+    if cuda_suffix:
+        # Replace + with . for proper version formatting
+        if "+" in version:
+            base_version, local = version.split("+", 1)
+            version = f"{base_version}+{cuda_suffix}.{local}"
+        else:
+            version = f"{version}+{cuda_suffix}"
+
+    return version
 
 
 def compile_aot_modules(output_dir: Path, verbose: bool = True):

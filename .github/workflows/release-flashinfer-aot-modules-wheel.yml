@@ -64,7 +64,7 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                cuda: ["12.9"] #['12.6', '12.8', '12.9', '13.0']
+                cuda: ["12.8", "12.9", "13.0"]
                 arch: ["x86_64"] #['x86_64', 'aarch64']
 
         # Use self-hosted runners with specific labels based on architecture
@@ -85,6 +85,7 @@ jobs:
                   CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
                   export CUDA_MAJOR
                   export CUDA_MINOR
+                  export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
 
@@ -96,6 +97,7 @@ jobs:
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
                     -e CUDA_MAJOR="$CUDA_MAJOR" \
                     -e CUDA_MINOR="$CUDA_MINOR" \
+                    -e CUDA_VERSION_SUFFIX="$CUDA_VERSION_SUFFIX" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
                     --user $CI_UID:$CI_GID \
@@ -107,8 +109,14 @@ jobs:
             - name: Display wheel size
               run: du -h flashinfer-aot-modules/dist/*
 
+            - name: Create artifact name
+              id: artifact-name
+              run: |
+                  CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
+                  echo "name=wheel-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+
             - uses: actions/upload-artifact@v4
               with:
-                  name: wheel-cuda${{ matrix.cuda }}-${{ matrix.arch }}
+                  name: ${{ steps.artifact-name.outputs.name }}
                   retention-days: 7
                   path: flashinfer-aot-modules/dist/*
