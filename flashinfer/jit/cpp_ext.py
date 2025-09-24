@@ -162,6 +162,7 @@ def generate_ninja_build_for_op(
         "-shared",
         "-L$torch_home/lib",
         "-L$cuda_home/lib64",
+        "-L$cuda_home/lib64/stubs",
         "-lc10",
         "-lc10_cuda",
         "-ltorch_cpu",
