@@ -580,12 +580,6 @@ def compile_and_package_modules(
     jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
     jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
 
-    # NOTE(Zihao): for debugging
-    print(f"FLASHINFER_WORKSPACE_DIR: {jit_env.FLASHINFER_WORKSPACE_DIR}")
-    print(f"FLASHINFER_JIT_DIR: {jit_env.FLASHINFER_JIT_DIR}")
-    print(f"FLASHINFER_GEN_SRC_DIR: {jit_env.FLASHINFER_GEN_SRC_DIR}")
-    print(f"FLASHINFER_INCLUDE_DIR: {jit_env.FLASHINFER_INCLUDE_DIR}")
-
     # Print summary
     if verbose:
         print("AOT build summary:")
