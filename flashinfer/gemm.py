@@ -3078,6 +3078,11 @@ def group_deepgemm_fp8_nt_groupwise(
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_contiguous is only supported on SM100, SM100, SM103."
+        )
+
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
@@ -3205,6 +3210,11 @@ def batch_deepgemm_fp8_nt_groupwise(
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
+
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_masked is only supported on SM100, SM103."
+        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
