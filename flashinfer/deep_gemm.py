@@ -285,7 +285,6 @@ def must_be_k_major() -> bool:
         "90a": True,
         "100a": False,
         "103a": False,
-        "120a": False,
     }[get_device_arch()]
 
 
