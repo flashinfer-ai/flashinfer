@@ -80,8 +80,7 @@ jobs:
 
             - name: Build wheel in container
               run: |
-                  # Make the build script executable
-                  chmod +x scripts/build_flashinfer_aot_modules_whl.sh
+                  chown -R $CI_UID:$CI_GID ${{ github.workspace }}
 
                   # Create output directory for wheels
                   mkdir -p ${{ github.workspace }}/wheel-output
@@ -94,6 +93,7 @@ jobs:
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
                     -e OUTPUT_DIR="/output" \
+                    --user $CI_UID:$CI_GID \
                     -w /workspace \
                     flashinfer/flashinfer-ci-cu${{ matrix.cuda }} \
                     bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
