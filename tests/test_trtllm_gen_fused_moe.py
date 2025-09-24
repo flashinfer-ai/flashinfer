@@ -1855,6 +1855,23 @@ def cache_permute_indices():
     [
         pytest.param(
             {
+                "num_experts": 384,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 12,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8BlockScaleMoe,
+                ],
+            },
+            id="kimi_k2",
+        ),
+        pytest.param(
+            {
                 "num_experts": 256,
                 "top_k": 8,
                 "padding": 8,
