@@ -15,15 +15,15 @@ limitations under the License.
 """
 
 from .core import JitSpec, gen_jit_spec
-from .env import FLASHINFER_CSRC_DIR
+from .jit import env as jit_env
 
 
 def gen_comm_alltoall_module() -> JitSpec:
     return gen_jit_spec(
         "comm",
         [
-            FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
-            FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
         ],
     )
 
@@ -32,6 +32,6 @@ def gen_trtllm_mnnvl_comm_module() -> JitSpec:
     return gen_jit_spec(
         "trtllm_mnnvl_comm",
         [
-            FLASHINFER_CSRC_DIR / "trtllm_mnnvl_allreduce.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mnnvl_allreduce.cu",
         ],
     )
