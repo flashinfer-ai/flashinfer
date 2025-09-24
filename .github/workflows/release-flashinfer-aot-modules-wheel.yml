@@ -1,64 +1,59 @@
 name: Build and Release flashinfer-aot-modules wheels
 
 on:
-    # workflow_dispatch:
-    #   inputs:
-    #     tag:
-    #       description: 'Tag (e.g., v1.2.3) to build wheels for'
-    #       required: true
-    #       type: string
-
-    pull_request:
-        branches:
-            - main
-        # hardcode tag to v0.4.0rc2
+    workflow_dispatch:
+      inputs:
+        tag:
+          description: 'Tag (e.g., v1.2.3) to build wheels for'
+          required: true
+          type: string
 
 env:
     FLASHINFER_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0 10.0 10.3 12.0"
 
 jobs:
-    # validate-tag:
-    #   runs-on: ubuntu-latest
-    #   steps:
-    #     - name: Validate tag format
-    #       run: |
-    #         if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
-    #           echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
-    #           exit 1
-    #         fi
-    #         echo "✓ Tag format is valid: ${{ inputs.tag }}"
+    validate-tag:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Validate tag format
+          run: |
+            if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+              echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
+              exit 1
+            fi
+            echo "✓ Tag format is valid: ${{ inputs.tag }}"
 
-    #     - name: Check out tag
-    #       uses: actions/checkout@v4
-    #       with:
-    #         ref: ${{ inputs.tag }}
-    #         submodules: true
+        - name: Check out tag
+          uses: actions/checkout@v4
+          with:
+            ref: ${{ inputs.tag }}
+            submodules: true
 
-    #     - name: Verify tag matches version.txt
-    #       run: |
-    #         # Extract version from tag (remove 'v' prefix)
-    #         TAG_VERSION="${{ inputs.tag }}"
-    #         TAG_VERSION="${TAG_VERSION#v}"
+        - name: Verify tag matches version.txt
+          run: |
+            # Extract version from tag (remove 'v' prefix)
+            TAG_VERSION="${{ inputs.tag }}"
+            TAG_VERSION="${TAG_VERSION#v}"
 
-    #         # Check version.txt - this is the source of truth
-    #         if [ ! -f "version.txt" ]; then
-    #           echo "Error: version.txt file not found!"
-    #           exit 1
-    #         fi
+            # Check version.txt - this is the source of truth
+            if [ ! -f "version.txt" ]; then
+              echo "Error: version.txt file not found!"
+              exit 1
+            fi
 
-    #         VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+            VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
 
-    #         if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
-    #           echo "❌ CRITICAL ERROR: version.txt does not match tag!"
-    #           echo "  Tag version: $TAG_VERSION"
-    #           echo "  version.txt: $VERSION_TXT"
-    #           echo ""
-    #           echo "Please update version.txt to match the release version before creating a release."
-    #           echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
-    #           exit 1
-    #         fi
+            if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+              echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+              echo "  Tag version: $TAG_VERSION"
+              echo "  version.txt: $VERSION_TXT"
+              echo ""
+              echo "Please update version.txt to match the release version before creating a release."
+              echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+              exit 1
+            fi
 
-    #         echo "✓ version.txt matches tag version: $VERSION_TXT"
+            echo "✓ version.txt matches tag version: $VERSION_TXT"
 
     build-wheel:
         # needs: validate-tag
@@ -74,14 +69,12 @@ jobs:
         steps:
             - uses: actions/checkout@v4
               with:
-                  # ref: ${{ inputs.tag }}
+                  ref: ${{ inputs.tag }}
                   submodules: true
 
             - name: Build wheel in container
               run: |
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
-                  ls -alh ${{ github.workspace }}
-
                   # Create output directory for wheels
                   mkdir -p ${{ github.workspace }}/wheel-output
 
@@ -100,7 +93,7 @@ jobs:
 
                   # Move wheels to the expected location for artifact upload
                   mv wheel-output/* flashinfer-aot-modules/dist/ 2>/dev/null || true
-              timeout-minutes: 180
+              timeout-minutes: 300
 
             - name: Display wheel size
               run: du -h flashinfer-aot-modules/dist/*
