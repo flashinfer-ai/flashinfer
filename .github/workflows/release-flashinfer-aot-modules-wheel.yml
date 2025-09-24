@@ -81,6 +81,7 @@ jobs:
             - name: Build wheel in container
               run: |
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
+                  ls -alh ${{ github.workspace }}
 
                   # Create output directory for wheels
                   mkdir -p ${{ github.workspace }}/wheel-output
