@@ -16,8 +16,8 @@ limitations under the License.
 
 import pytest
 import torch
-from flashinfer.tests.test_helpers.alibi_reference import alibi_attention
-from flashinfer.tests.test_helpers.jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
+from ..test_helpers.alibi_reference import alibi_attention
+from ..test_helpers.jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
 
