@@ -23,6 +23,10 @@ cd flashinfer-aot-modules
 export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE}/conda-pkgs"
 export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE}/xdg-cache"
 mkdir -p "$CONDA_pkgs_dirs" "$XDG_CACHE_HOME"
+export HOME=/tmp/home
+mkdir -p $HOME
+export PATH="$HOME/.local/bin:$PATH"
+export PATH="/opt/python/cp312-cp312/bin:$PATH"
 
 echo "::group::Install PyTorch"
 pip install torch==2.8 --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
