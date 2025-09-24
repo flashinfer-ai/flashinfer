@@ -28,12 +28,7 @@ mkdir -p $HOME
 export PATH="$HOME/.local/bin:$PATH"
 export PATH="/opt/python/cp312-cp312/bin:$PATH"
 
-echo "::group::Install PyTorch"
-pip install torch==2.8 --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
-echo "::endgroup::"
-
 echo "::group::Install build system"
-pip install ninja numpy
 pip install --upgrade setuptools packaging wheel build
 echo "::endgroup::"
 
@@ -43,7 +38,7 @@ rm -rf dist build *.egg-info
 
 # Build the wheel using the build module for better isolation
 echo "Building wheel..."
-python -m build --wheel --no-isolation
+python -m build --wheel
 
 echo ""
 echo "✓ Build completed successfully"
