@@ -536,10 +536,6 @@ def test_trtllm_batch_decode(
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    # Run reference wrapper
-    wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer_ref, kv_layout, use_tensor_cores=True
-    )
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -553,11 +549,14 @@ def test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
-
-    if q_len_per_req > 1:
-        # hide the output_ref from decode wrapper for speculative decoding test
+    # Run reference wrapper
+    if q_len_per_req == 1:
+        wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer_ref, kv_layout, use_tensor_cores=True
+        )
+        wrapper_ref.plan(**plan_params)
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    else:
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer_ref, kv_layout
         )
