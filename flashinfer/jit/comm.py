@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from .core import JitSpec, gen_jit_spec
-from .jit import env as jit_env
+from . import env as jit_env
 
 
 def gen_comm_alltoall_module() -> JitSpec:
