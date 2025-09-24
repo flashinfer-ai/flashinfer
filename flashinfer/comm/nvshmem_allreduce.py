@@ -83,12 +83,12 @@ class NVSHMEMAllReduce:
         self.symm_buffer_input = self.nvshmem_module.nvshmem_malloc(
             [max_buffer_elements],
             self.dtype,
-            self.device,
+            self.device.index,
         )
         self.symm_buffer_output = self.nvshmem_module.nvshmem_malloc(
             [max_buffer_elements],
             self.dtype,
-            self.device,
+            self.device.index,
         )
         torch.distributed.barrier(self.group)
 
