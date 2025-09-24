@@ -20,6 +20,15 @@ echo ""
 # Navigate to the flashinfer-aot-modules directory
 cd flashinfer-aot-modules
 
+echo "::group::Install PyTorch"
+pip install torch==2.8 --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
+echo "::endgroup::"
+
+echo "::group::Install build system"
+pip install ninja numpy
+pip install --upgrade setuptools packaging wheel build
+echo "::endgroup::"
+
 # Clean any previous builds
 echo "Cleaning previous builds..."
 rm -rf dist build *.egg-info
@@ -33,15 +42,6 @@ echo "✓ Build completed successfully"
 echo ""
 echo "Built wheels:"
 ls -lh dist/
-
-echo "::group::Install PyTorch"
-pip install torch==2.8 --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
-echo "::endgroup::"
-
-echo "::group::Install build system"
-pip install ninja numpy
-pip install --upgrade setuptools packaging wheel build
-echo "::endgroup::"
 
 # Copy wheels to output directory if specified
 if [ -n "${OUTPUT_DIR}" ]; then
