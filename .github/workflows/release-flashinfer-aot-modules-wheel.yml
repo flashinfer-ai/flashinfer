@@ -79,17 +79,21 @@ jobs:
             - name: Build wheel in container
               env:
                   DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-                  CUDA_MAJOR: ${{ (split(matrix.cuda, '.'))[0] }}
-                  CUDA_MINOR: ${{ (split(matrix.cuda, '.'))[1] }}
               run: |
+                  # Extract CUDA major and minor versions
+                  CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
+                  CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
+                  export CUDA_MAJOR
+                  export CUDA_MINOR
+
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
 
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
                     -v ${{ github.workspace }}:/workspace \
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
-                    -e CUDA_MAJOR="${{ (split(matrix.cuda, '.'))[0] }}" \
-                    -e CUDA_MINOR="${{ (split(matrix.cuda, '.'))[1] }}" \
+                    -e CUDA_MAJOR="$CUDA_MAJOR" \
+                    -e CUDA_MINOR="$CUDA_MINOR" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
                     --user $CI_UID:$CI_GID \
