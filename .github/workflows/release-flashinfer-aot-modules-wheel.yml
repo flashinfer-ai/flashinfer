@@ -91,6 +91,8 @@ jobs:
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
                     -v ${{ github.workspace }}:/workspace \
+                    -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
+                    -e FLASHINFER_CI_CACHE=/ci-cache \
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
                     -e CUDA_MAJOR="$CUDA_MAJOR" \
                     -e CUDA_MINOR="$CUDA_MINOR" \
