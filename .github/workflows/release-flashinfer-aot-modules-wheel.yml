@@ -78,7 +78,7 @@ jobs:
 
             - name: Build wheel in container
               env:
-                  DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28_builder:cuda{0}', matrix.cuda) }}
+                  DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
               run: |
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
 
