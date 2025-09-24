@@ -24,6 +24,7 @@ CUDA_VERSION=${1:-cu128}
 
 pip3 install torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
 pip3 install requests ninja pytest numpy scipy build nvidia-ml-py cuda-python einops nvidia-nvshmem-cu12
+pip3 install 'apache-tvm-ffi>=0.1.0b6'
 pip3 install nvidia-cutlass-dsl
 pip3 install 'nvidia-cudnn-frontend>=1.13.0'
 

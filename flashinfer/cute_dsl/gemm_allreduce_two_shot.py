@@ -2,7 +2,20 @@ from typing import Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
-from cuda import cuda
+
+try:
+    # cuda-python >= 12.9 (has cuda.bindings.driver)
+    from cuda.bindings import driver as cuda
+except ImportError:
+    try:
+        # cuda-python < 12.9 (no cuda.bindings.driver, use cuda as driver)
+        # from cuda import cuda is not available in cuda-python >= 13.0
+        from cuda import cuda
+    except ImportError as e:
+        raise ImportError(
+            "Could not import the 'cuda' module. "
+            "Please install cuda-python that matches your CUDA version."
+        ) from e
 
 import cutlass
 import cutlass.cute as cute

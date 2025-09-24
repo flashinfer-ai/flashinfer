@@ -328,6 +328,10 @@ def test_batch_decode_tensor_cores_cuda_graph(
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
+global_override_indptr_cpu = None
+MAX_BATCH_SIZE = 128
+
+
 @pytest.mark.parametrize("batch_size", [5, 12])
 @pytest.mark.parametrize("invariant_bs", [4])
 @pytest.mark.parametrize("kv_len", [4096, 8192, 5000])
@@ -358,6 +362,16 @@ def test_batch_decode_tensor_cores_with_fast_plan(
     )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
+
+    global global_override_indptr_cpu
+    if global_override_indptr_cpu is None:
+        global_override_indptr_cpu = torch.empty(MAX_BATCH_SIZE + 1, device="cpu")
+    if global_override_indptr_cpu is not None:
+        global_override_indptr_cpu = (
+            torch.arange(0, batch_size + 1, device="cpu", dtype=torch.int32)
+            * num_pages_per_seq
+        )
+
     kv_data = (
         torch.randn(
             total_num_pages,
@@ -425,6 +439,7 @@ def test_batch_decode_tensor_cores_with_fast_plan(
         q_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        global_override_indptr_cpu=global_override_indptr_cpu,
     )
     o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
         q, kv_data, return_lse=True
@@ -432,6 +447,7 @@ def test_batch_decode_tensor_cores_with_fast_plan(
 
     kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
     kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
+    global_override_indptr_cpu = global_override_indptr_cpu[: invariant_bs + 1]
     wrapper_tensor_cores.plan(
         kv_indptr_invariant,
         kv_indices,
@@ -445,6 +461,7 @@ def test_batch_decode_tensor_cores_with_fast_plan(
         q_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        global_override_indptr_cpu=global_override_indptr_cpu,
     )
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
         q[:invariant_bs], kv_data, return_lse=True
@@ -477,6 +494,16 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
+
+    global global_override_indptr_cpu
+    if global_override_indptr_cpu is None:
+        global_override_indptr_cpu = torch.empty(MAX_BATCH_SIZE + 1, device="cpu")
+    if global_override_indptr_cpu is not None:
+        global_override_indptr_cpu = (
+            torch.arange(0, batch_size + 1, device="cpu", dtype=torch.int32)
+            * num_pages_per_seq
+        )
+
     kv_data = (
         torch.randn(
             total_num_pages,
@@ -562,6 +589,8 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
         paged_kv_indices_buffer=kv_indices,
         paged_kv_last_page_len_buffer=kv_last_page_len,
     )
+
+    # cache
     wrapper_tensor_cores.plan(
         kv_indptr,
         kv_indices,
@@ -573,6 +602,24 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
         pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
+    )
+
+    wrapper_tensor_cores.plan = partial(
+        flashinfer.fast_decode_plan, wrapper_tensor_cores
+    )
+
+    wrapper_tensor_cores.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        data_type=torch.float16,
+        q_data_type=torch.float16,
+        global_override_indptr_cpu=global_override_indptr_cpu,
     )
     # warmup
     s = torch.cuda.Stream()
@@ -596,3 +643,10 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
 
     torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    test_batch_decode_tensor_cores_with_fast_plan(
+        5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE"
+    )
+    test_batch_fast_decode_tensor_cores_cuda_graph(12, 54, 1, 4, 1, 128, "HND", "NONE")
