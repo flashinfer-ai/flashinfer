@@ -75,7 +75,6 @@ jobs:
             - uses: actions/checkout@v4
               with:
                   # ref: ${{ inputs.tag }}
-                  ref: v0.3.1
                   submodules: true
 
             - name: Build wheel in container
@@ -97,8 +96,7 @@ jobs:
                     --user $CI_UID:$CI_GID \
                     -w /workspace \
                     flashinfer/flashinfer-ci-cu${{ matrix.cuda }} \
-                    ls /workspace/scripts
-                    # bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
+                    bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
 
                   # Move wheels to the expected location for artifact upload
                   mv wheel-output/* flashinfer-aot-modules/dist/ 2>/dev/null || true
