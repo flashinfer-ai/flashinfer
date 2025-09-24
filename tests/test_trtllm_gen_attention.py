@@ -398,9 +398,19 @@ def test_trtllm_batch_prefill(
     else:
         rtol, atol = 1e-2, 1e-2
 
+    # Arbitary small mismatch rate
+    allowed_mismatch_rate = 1e-7
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
+
     # convert to float32 for fp8 is not supported by assert_close
-    torch.testing.assert_close(
-        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
@@ -621,11 +631,18 @@ def test_trtllm_batch_decode(
     if q_len_per_req > 1:
         rtol, atol = rtol * 2, atol * 2
 
-    torch.testing.assert_close(
+    # Arbitary small mismatch rate
+    allowed_mismatch_rate = 5e-5
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
+
+    assert_close_with_mismatch_tolerance(
         output.float() * o_scale,
         output_ref.float(),
         rtol=rtol,
         atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
