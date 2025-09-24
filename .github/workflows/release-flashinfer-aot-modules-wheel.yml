@@ -68,7 +68,7 @@ jobs:
                 arch: ['x86_64', 'aarch64']
 
         # Use self-hosted runners with specific labels based on architecture
-        runs-on: [self-hosted, "${{ matrix.arch }}"]
+        runs-on: [self-hosted, "${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }}"]
 
         steps:
             - uses: actions/checkout@v4
