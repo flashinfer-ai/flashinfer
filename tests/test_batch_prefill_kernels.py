@@ -17,31 +17,31 @@ limitations under the License.
 import numpy
 import pytest
 import torch
-# from jit_utils import gen_prefill_attention_modules
+from jit_utils import gen_prefill_attention_modules
 
 import flashinfer
 from tvm_ffi import use_torch_stream
 
 
-# @pytest.fixture(autouse=True, scope="module")
-# def warmup_jit():
-#     flashinfer.jit.build_jit_specs(
-#         gen_prefill_attention_modules(
-#             [torch.float16],  # q_dtypes
-#             [
-#                 torch.float16,
-#                 torch.float8_e4m3fn,
-#                 torch.float8_e5m2,
-#             ],  # kv_dtypes
-#             [128, 256],  # head_dims
-#             [0, 1],  # pos_encoding_modes
-#             [False],  # use_sliding_windows
-#             [False],  # use_logits_soft_caps
-#             [False],  # use_fp16_qk_reductions
-#         ),
-#         verbose=False,
-#     )
-#     yield
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    flashinfer.jit.build_jit_specs(
+        gen_prefill_attention_modules(
+            [torch.float16],  # q_dtypes
+            [
+                torch.float16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ],  # kv_dtypes
+            [128, 256],  # head_dims
+            [0, 1],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_logits_soft_caps
+            [False],  # use_fp16_qk_reductions
+        ),
+        verbose=False,
+    )
+    yield
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
