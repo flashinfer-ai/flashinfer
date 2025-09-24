@@ -2,7 +2,7 @@ import math
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
 
 import flashinfer

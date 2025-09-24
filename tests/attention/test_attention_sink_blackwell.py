@@ -17,7 +17,7 @@ limitations under the License.
 import einops
 import pytest
 import torch
-from sink_attention_reference import sink_attention_unified
+from tests.test_helpers.sink_attention_reference import sink_attention_unified
 from conftest import assert_close_with_mismatch_tolerance
 
 import flashinfer

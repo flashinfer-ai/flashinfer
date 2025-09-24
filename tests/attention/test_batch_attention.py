@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import flashinfer
-from jit_utils import (
+from tests.test_helpers.jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )

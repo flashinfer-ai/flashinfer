@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import flashinfer
-from rope_reference import apply_rotary_emb, precompute_freqs_cis
+from tests.test_helpers.rope_reference import apply_rotary_emb, precompute_freqs_cis
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):
     sum_abs_error = (preds - target).abs().sum().detach().item()

@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
+from tests.test_helpers.jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
 
