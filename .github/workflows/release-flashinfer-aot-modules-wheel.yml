@@ -97,7 +97,7 @@ jobs:
                     --user $CI_UID:$CI_GID \
                     -w /workspace \
                     flashinfer/flashinfer-ci-cu${{ matrix.cuda }} \
-                    ls /workspace
+                    ls /workspace/scripts
                     # bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
 
                   # Move wheels to the expected location for artifact upload
