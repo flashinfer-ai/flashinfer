@@ -79,8 +79,8 @@ jobs:
             - name: Build wheel in container
               env:
                   DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-                  CUDA_MAJOR: ${{ matrix.cuda.split('.')[0] }}
-                  CUDA_MINOR: ${{ matrix.cuda.split('.')[1] }}
+                  CUDA_MAJOR: ${{ (split(matrix.cuda, '.'))[0] }}
+                  CUDA_MINOR: ${{ (split(matrix.cuda, '.'))[1] }}
               run: |
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
 
@@ -88,8 +88,8 @@ jobs:
                   docker run --rm \
                     -v ${{ github.workspace }}:/workspace \
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
-                    -e CUDA_MAJOR="${{ matrix.cuda.split('.')[0] }}" \
-                    -e CUDA_MINOR="${{ matrix.cuda.split('.')[1] }}" \
+                    -e CUDA_MAJOR="${{ (split(matrix.cuda, '.'))[0] }}" \
+                    -e CUDA_MINOR="${{ (split(matrix.cuda, '.'))[1] }}" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
                     --user $CI_UID:$CI_GID \
