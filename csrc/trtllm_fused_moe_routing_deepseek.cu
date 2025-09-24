@@ -22,7 +22,7 @@ namespace routingDeepSeek {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr int NumThreads = 256;
+static constexpr int NumThreads = 384;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
@@ -41,7 +41,6 @@ __global__ void routingMainKernel(KernelParams params) {
   // declare types
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
-  static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
   int MaxNumTopGroups = getMaxNumTopGroups(KernelParams::UseGroups, params.mNumExperts);
 
@@ -240,7 +239,6 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void routingIndicesCoopKernel(KernelParams params) {
-  static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
   // number of experts is bounded by number of threads
   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
@@ -419,7 +417,6 @@ __global__ void routingIndicesCoopKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void runImpl(Data& data, void* stream) {
-  static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
   int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, data.mNumExperts);
 
