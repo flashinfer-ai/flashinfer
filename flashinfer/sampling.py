@@ -30,41 +30,21 @@ from .utils import (
     register_fake_op,
 )
 
-from torch.utils.cpp_extension import load_inline
 
-
-def gen_seed_and_offset() -> Callable:
-    cpp_sources = """
-std::tuple<uint64_t, uint64_t> gen(uint64_t increment, std::optional<at::Generator> gen_);
-"""
-
-    cuda_sources = """
-#include <ATen/cuda/CUDAGeneratorImpl.h>
-
-std::tuple<uint64_t, uint64_t> gen(uint64_t increment, std::optional<at::Generator> gen_) {
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        gen_, at::cuda::detail::getDefaultCUDAGenerator());
-    std::lock_guard<std::mutex> lock(gen->mutex_);
-    at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(increment);
-    return std::make_tuple(rng_engine_inputs.seed_.val, rng_engine_inputs.offset_.val);
-}
-"""
-
-    mod = load_inline(
-        name="gen_seed_and_offset",
-        cpp_sources=cpp_sources,
-        cuda_sources=cuda_sources,
-        functions=["gen"],
-        extra_cflags=["-O3"],
-    )
-    return mod.gen
-
-
-@functools.cache
 def get_seed_and_offset(
     increment: int, generator: Optional[torch.Generator] = None
 ) -> Tuple[int, int]:
-    return gen_seed_and_offset()(increment, generator)
+    if generator is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        generator = torch.Generator(device=device)
+    # add mutex if multi-trheading needed
+    state = generator.get_state()
+    seed, offset = state.view(torch.int64)
+    offset += (increment + 3) // 4 * 4
+    generator.set_state(
+        torch.tensor([seed, offset], dtype=torch.int64).view(torch.uint8)
+    )
+    return int(seed), int(offset)
 
 
 def gen_sampling_module() -> JitSpec:
