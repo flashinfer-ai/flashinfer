@@ -1,12 +1,16 @@
 name: Build and Release flashinfer-aot-modules wheels
 
 on:
-    workflow_dispatch:
-      inputs:
-        tag:
-          description: 'Tag (e.g., v1.2.3) to build wheels for'
-          required: true
-          type: string
+    # workflow_dispatch:
+    #   inputs:
+    #     tag:
+    #       description: 'Tag (e.g., v1.2.3) to build wheels for'
+    #       required: true
+    #       type: string
+
+    pull_request:
+      branches:
+        - main
 
 env:
     FLASHINFER_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0 10.0 10.3 12.0"
@@ -15,52 +19,52 @@ jobs:
     validate-tag:
       runs-on: ubuntu-latest
       steps:
-        - name: Validate tag format
-          run: |
-            if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
-              echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
-              exit 1
-            fi
-            echo "✓ Tag format is valid: ${{ inputs.tag }}"
+        # - name: Validate tag format
+        #   run: |
+        #     if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+        #       echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
+        #       exit 1
+        #     fi
+        #     echo "✓ Tag format is valid: ${{ inputs.tag }}"
 
-        - name: Check out tag
-          uses: actions/checkout@v4
-          with:
-            ref: ${{ inputs.tag }}
-            submodules: true
+        # - name: Check out tag
+        #   uses: actions/checkout@v4
+        #   with:
+        #     ref: ${{ inputs.tag }}
+        #     submodules: true
 
-        - name: Verify tag matches version.txt
-          run: |
-            # Extract version from tag (remove 'v' prefix)
-            TAG_VERSION="${{ inputs.tag }}"
-            TAG_VERSION="${TAG_VERSION#v}"
+        # - name: Verify tag matches version.txt
+        #   run: |
+        #     # Extract version from tag (remove 'v' prefix)
+        #     TAG_VERSION="${{ inputs.tag }}"
+        #     TAG_VERSION="${TAG_VERSION#v}"
 
-            # Check version.txt - this is the source of truth
-            if [ ! -f "version.txt" ]; then
-              echo "Error: version.txt file not found!"
-              exit 1
-            fi
+        #     # Check version.txt - this is the source of truth
+        #     if [ ! -f "version.txt" ]; then
+        #       echo "Error: version.txt file not found!"
+        #       exit 1
+        #     fi
 
-            VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+        #     VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
 
-            if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
-              echo "❌ CRITICAL ERROR: version.txt does not match tag!"
-              echo "  Tag version: $TAG_VERSION"
-              echo "  version.txt: $VERSION_TXT"
-              echo ""
-              echo "Please update version.txt to match the release version before creating a release."
-              echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
-              exit 1
-            fi
+        #     if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+        #       echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+        #       echo "  Tag version: $TAG_VERSION"
+        #       echo "  version.txt: $VERSION_TXT"
+        #       echo ""
+        #       echo "Please update version.txt to match the release version before creating a release."
+        #       echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+        #       exit 1
+        #     fi
 
-            echo "✓ version.txt matches tag version: $VERSION_TXT"
+        #     echo "✓ version.txt matches tag version: $VERSION_TXT"
 
     build-wheel:
         # needs: validate-tag
         strategy:
             fail-fast: false
             matrix:
-                cuda: ["129"] #['126', '128', '129', '130']
+                cuda: ["12.9"] #['12.6', '12.8', '12.9', '13.0']
                 arch: ["x86_64"] #['x86_64', 'aarch64']
 
         # Use self-hosted runners with specific labels based on architecture
@@ -69,31 +73,26 @@ jobs:
         steps:
             - uses: actions/checkout@v4
               with:
-                  ref: ${{ inputs.tag }}
+                #   ref: ${{ inputs.tag }}
                   submodules: true
 
             - name: Build wheel in container
+              env:
+                  DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28_builder:cuda{0}', matrix.cuda) }}
               run: |
                   chown -R $CI_UID:$CI_GID ${{ github.workspace }}
-                  # Create output directory for wheels
-                  mkdir -p ${{ github.workspace }}/wheel-output
 
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
                     -v ${{ github.workspace }}:/workspace \
-                    -v ${{ github.workspace }}/wheel-output:/output \
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
-                    -e OUTPUT_DIR="/output" \
                     --user $CI_UID:$CI_GID \
                     -w /workspace \
-                    flashinfer/flashinfer-ci-cu${{ matrix.cuda }} \
+                    ${{ env.DOCKER_IMAGE }} \
                     bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
-
-                  # Move wheels to the expected location for artifact upload
-                  mv wheel-output/* flashinfer-aot-modules/dist/ 2>/dev/null || true
-              timeout-minutes: 300
+              timeout-minutes: 180
 
             - name: Display wheel size
               run: du -h flashinfer-aot-modules/dist/*

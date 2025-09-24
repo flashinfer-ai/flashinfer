@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import sys
+import sysconfig
 from pathlib import Path
 from setuptools import build_meta as _orig
+from setuptools.dist import strtobool
 
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -96,8 +99,30 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
     print(f"Created build metadata file with version {version}")
 
-    # Now build the wheel using setuptools
-    return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    # Configure py_limited_api
+    use_limited_api = strtobool(os.getenv("FLASHINFER_AOT_USE_PY_LIMITED_API", "1"))
+
+    # Temporarily create a setup.cfg to pass py_limited_api option
+    setup_cfg_path = Path(__file__).parent / "setup.cfg"
+    setup_cfg_created = False
+
+    if use_limited_api and not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        print("Building with py_limited_api=cp39 for ABI3 compatibility")
+        if not setup_cfg_path.exists():
+            with open(setup_cfg_path, "w") as f:
+                f.write("[bdist_wheel]\n")
+                f.write("py_limited_api=cp39\n")
+            setup_cfg_created = True
+
+    try:
+        # Now build the wheel using setuptools
+        result = _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    finally:
+        # Clean up temporary setup.cfg if we created it
+        if setup_cfg_created and setup_cfg_path.exists():
+            setup_cfg_path.unlink()
+
+    return result
 
 
 def build_sdist(sdist_directory, config_settings=None):
