@@ -29,12 +29,11 @@ static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroupsDefault = 16;
 
 __host__ __device__ int getMaxNumTopGroups(const bool useGroups, const int numExperts) {
-  // if (useGroups || numExperts <= 256) {
-  //   return 4;
-  // } else {
-  //   return 16;
-  // }
-  return 4;
+  if (useGroups || numExperts <= 256) {
+    return 4;
+  } else {
+    return 16;
+  }
 }
 
 template <typename KernelParams>
@@ -44,8 +43,7 @@ __global__ void routingMainKernel(KernelParams params) {
   using InputT = typename KernelParams::InputT;
   static constexpr int NumThreads = 256;
   static constexpr int NumWarps = NumThreads / WarpSize;
-  int MaxNumTopGroups =
-      getMaxNumTopGroups(KernelParams::UseGroups, params.mNumExperts);
+  int MaxNumTopGroups = getMaxNumTopGroups(KernelParams::UseGroups, params.mNumExperts);
 
   // declare shared memory structure
   // number of experts is bounded by number of threads
@@ -172,7 +170,6 @@ __global__ void routingMainKernel(KernelParams params) {
     } else {
       // without groups, each thread just takes `MaxNumTopGroups` experts
 
-#pragma unroll
       for (int ii = 0; ii < MaxNumTopGroups; ++ii) {
         auto expertIdx = ii * WarpSize + laneIdx;
         expertIdxGroup[ii] = expertIdx;
@@ -180,7 +177,6 @@ __global__ void routingMainKernel(KernelParams params) {
             expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
       }
     }
-
     topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
                      /* minValue */ invalidScoreFloat, params.mTopK);
 
