@@ -71,9 +71,6 @@ jobs:
         # Use self-hosted runners with specific labels based on architecture
         runs-on: [self-hosted, "${{ matrix.arch }}"]
 
-        container:
-            image: ${{ format('flashinfer/flashinfer-ci-cu{0}', matrix.cuda) }}
-
         steps:
             - uses: actions/checkout@v4
               with:
@@ -83,22 +80,26 @@ jobs:
 
             - name: Build wheel in container
               run: |
-                  echo "Building flashinfer-aot-modules wheel..."
-                  echo "CUDA Version: ${{ matrix.cuda }}"
-                  echo "Architecture: ${{ matrix.arch }}"
-                  echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
+                  # Make the build script executable
+                  chmod +x scripts/build_flashinfer_aot_modules_whl.sh
 
-                  # Run the build script
-                  cd flashinfer-aot-modules
+                  # Create output directory for wheels
+                  mkdir -p ${{ github.workspace }}/wheel-output
 
-                  # Clean any previous builds
-                  rm -rf dist build *.egg-info
+                  # Run the build script inside the container with proper mounts
+                  docker run --rm \
+                    -v ${{ github.workspace }}:/workspace \
+                    -v ${{ github.workspace }}/wheel-output:/output \
+                    -e CUDA_VERSION="${{ matrix.cuda }}" \
+                    -e ARCH="${{ matrix.arch }}" \
+                    -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+                    -e OUTPUT_DIR="/output" \
+                    -w /workspace \
+                    flashinfer/flashinfer-ci-cu${{ matrix.cuda }} \
+                    bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
 
-                  # Build the wheel using the build module for better isolation
-                  python -m build --wheel
-
-                  echo "✓ Build completed"
-                  ls -lh dist/
+                  # Move wheels to the expected location for artifact upload
+                  mv wheel-output/* flashinfer-aot-modules/dist/ 2>/dev/null || true
               timeout-minutes: 180
 
             - name: Display wheel size
