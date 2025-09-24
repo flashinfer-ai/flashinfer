@@ -453,6 +453,12 @@ def has_cuda_cudart() -> bool:
     return importlib.util.find_spec("cuda.cudart") is not None
 
 
+def get_cuda_python_version() -> str:
+    import cuda
+
+    return cuda.__version__
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
