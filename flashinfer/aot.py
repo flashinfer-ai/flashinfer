@@ -510,6 +510,8 @@ def gen_all_modules(
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
 
+    jit_specs = [gen_trtllm_gen_fmha_module()]
+
     # dedup
     names = set()
     ret: List[JitSpec] = []

@@ -27,6 +27,7 @@ export HOME=/tmp/home
 mkdir -p $HOME
 export PATH="$HOME/.local/bin:$PATH"
 export PATH="/opt/python/cp312-cp312/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
 echo "::group::Install build system"
 pip install --upgrade build
