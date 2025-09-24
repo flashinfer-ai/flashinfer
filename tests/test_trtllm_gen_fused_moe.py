@@ -48,7 +48,7 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w2_permute_indices,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from flashinfer.utils import calculate_tile_tokens_dim
+from flashinfer.utils import calculate_tile_tokens_dim, get_compute_capability
 
 
 def check_cuda(err):
@@ -2005,6 +2005,9 @@ def test_moe_quantization_classes(
 
     Each quantization class clearly shows which precision is being used.
     """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     # Skip incompatible combinations
     if gated_act_type == GatedActType.GeGlu and (
         type(moe_impl) is not FP4Moe
@@ -2031,6 +2034,17 @@ def test_moe_quantization_classes(
     if type(moe_impl) not in weight_processing["compatible_moe_impls"]:
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
+        )
+
+    # TODO(jimmzhou): enable MxFP4xBf16 on SM103
+    if (
+        type(moe_impl) is FP4Moe
+        and moe_impl.quant_mode == QuantMode.FP4_MXFP4_Bf16
+        and compute_capability[0] == 10
+        and compute_capability[1] == 3
+    ):
+        pytest.xfail(
+            "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
         )
 
     moe_impl._cache_permute_indices = cache_permute_indices

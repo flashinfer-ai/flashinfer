@@ -169,9 +169,10 @@ def test_mnnvl_custom_communicator(world_size):
     dtype = torch.float16
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
+
     print(f"Running test for world_size={world_size}")
 
     multi_process_parallel(

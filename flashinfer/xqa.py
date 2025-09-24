@@ -25,6 +25,7 @@ from .jit import gen_jit_spec, sm90a_nvcc_flags
 from .utils import (
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 
 xqa_nvcc_flags = [
@@ -185,6 +186,8 @@ def xqa(
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
+    if get_compute_capability(torch.device(device="cuda"))[0] != 9:
+        raise RuntimeError("XQA is only supported on SM90 GPUs")
     xqa_module = get_xqa_module(
         use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
     )

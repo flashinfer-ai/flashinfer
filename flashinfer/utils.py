@@ -51,6 +51,18 @@ class TensorLayout(Enum):
 log2e = 1.44269504088896340736
 
 
+class GPUArchitectureError(Exception):
+    def __init__(self, msg: str):
+        self.msg = msg
+        super().__init__(self.msg)
+
+    def __str__(self):
+        return self.msg
+
+    def __repr__(self):
+        return self.msg
+
+
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if x.ndim not in [4, 5]:
         raise ValueError("x must be 4D or 5D")
@@ -439,6 +451,12 @@ def has_cuda_cudart() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("cuda.cudart") is not None
+
+
+def get_cuda_python_version() -> str:
+    import cuda
+
+    return cuda.__version__
 
 
 def is_sm90a_supported(device: torch.device) -> bool:

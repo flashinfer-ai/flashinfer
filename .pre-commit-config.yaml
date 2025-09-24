@@ -47,6 +47,9 @@ repos:
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
       hooks:
       -   id: mypy
+          args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
+          files: ^flashinfer/
+          exclude: ^(flashinfer-cubin/|3rdparty/|build/)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

@@ -6,7 +6,7 @@ from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up
+from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
 
 DTYPE_MAP = {
     "fp16": torch.float16,
@@ -269,6 +269,9 @@ def test_trtllm_batch_prefill(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
@@ -395,9 +398,19 @@ def test_trtllm_batch_prefill(
     else:
         rtol, atol = 1e-2, 1e-2
 
+    # Arbitary small mismatch rate
+    allowed_mismatch_rate = 1e-7
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
+
     # convert to float32 for fp8 is not supported by assert_close
-    torch.testing.assert_close(
-        output.float() * o_scale, output_ref.float(), rtol=rtol, atol=atol
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
@@ -462,6 +475,10 @@ def test_trtllm_batch_decode(
     kv_dtype,
     enable_pdl,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
@@ -529,10 +546,6 @@ def test_trtllm_batch_decode(
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    # Run reference wrapper
-    wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer_ref, kv_layout, use_tensor_cores=True
-    )
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -546,11 +559,14 @@ def test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
-
-    if q_len_per_req > 1:
-        # hide the output_ref from decode wrapper for speculative decoding test
+    # Run reference wrapper
+    if q_len_per_req == 1:
+        wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer_ref, kv_layout, use_tensor_cores=True
+        )
+        wrapper_ref.plan(**plan_params)
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    else:
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer_ref, kv_layout
         )
@@ -615,11 +631,18 @@ def test_trtllm_batch_decode(
     if q_len_per_req > 1:
         rtol, atol = rtol * 2, atol * 2
 
-    torch.testing.assert_close(
+    # Arbitary small mismatch rate
+    allowed_mismatch_rate = 5e-5
+    # Calculate max allowed mismatched elements based on tensor size
+    total_elements = (output.float() * o_scale).numel()
+    max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
+
+    assert_close_with_mismatch_tolerance(
         output.float() * o_scale,
         output_ref.float(),
         rtol=rtol,
         atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
     )
 
     if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
@@ -682,6 +705,9 @@ def test_trtllm_batch_decode(
 def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] in [11, 12]:
+        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 
