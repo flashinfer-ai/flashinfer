@@ -29,7 +29,7 @@ export PATH="$HOME/.local/bin:$PATH"
 export PATH="/opt/python/cp312-cp312/bin:$PATH"
 
 echo "::group::Install build system"
-pip install --upgrade setuptools packaging wheel build
+pip install --upgrade build
 echo "::endgroup::"
 
 # Clean any previous builds
