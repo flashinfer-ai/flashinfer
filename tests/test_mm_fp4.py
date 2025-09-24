@@ -8,7 +8,7 @@ from flashinfer import (
     nvfp4_quantize,
     mxfp4_quantize,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, LibraryError
 
 
 # TODO: Consdier splitting this function up for the various backends
@@ -25,10 +25,10 @@ def test_mm_fp4(
 ):
     use_nvfp4 = fp4_type == "nvfp4"
 
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "trtllm":
         if res_dtype == torch.float16:
             pytest.skip("Skipping test for trtllm fp4 with float16")
-        compute_capability = get_compute_capability(torch.device(device="cuda"))
         if compute_capability[0] in [11, 12]:
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
@@ -71,23 +71,36 @@ def test_mm_fp4(
 
     res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
-    with autotune(auto_tuning):
-        mm_fp4(
-            input_fp4,
-            mat2_fp4.T,
-            input_inv_s,
-            mat2_inv_s.T,
-            alpha,
-            res_dtype,
-            res,
-            block_size=block_size,
-            use_8x4_sf_layout=not use_128x4_sf_layout,
-            backend=backend,
-            use_nvfp4=use_nvfp4,
-        )
+    try:
+        with autotune(auto_tuning):
+            mm_fp4(
+                input_fp4,
+                mat2_fp4.T,
+                input_inv_s,
+                mat2_inv_s.T,
+                alpha,
+                res_dtype,
+                res,
+                block_size=block_size,
+                use_8x4_sf_layout=not use_128x4_sf_layout,
+                backend=backend,
+                use_nvfp4=use_nvfp4,
+            )
 
-    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
-    assert cos_sim > 0.97
+        cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+        assert cos_sim > 0.97
+    except LibraryError:
+        # TODO: Remove this check once cuDNN backend version is updated to 9.14.0
+        if (
+            backend == "cudnn"
+            and not use_nvfp4
+            and (compute_capability[0] == 12 and compute_capability[1] == 0)
+        ):
+            pytest.xfail(
+                "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+            )
+        else:
+            pytest.fail("Unexpected LibraryError")
 
 
 if __name__ == "__main__":
