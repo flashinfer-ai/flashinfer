@@ -186,6 +186,10 @@ def test_batch_decode_with_paged_kv_cache(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
 
+global_override_indptr_cpu = None
+MAX_BATCH_SIZE = 128
+
+
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
@@ -217,6 +221,15 @@ def test_batch_decode_with_paged_kv_cache_with_fast_plan(
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
+
+    global global_override_indptr_cpu
+    if global_override_indptr_cpu is None:
+        global_override_indptr_cpu = torch.empty(MAX_BATCH_SIZE + 1, device="cpu")
+    if global_override_indptr_cpu is not None:
+        global_override_indptr_cpu = (
+            torch.arange(0, batch_size + 1, device="cpu", dtype=torch.int32)
+            * num_pages_per_seq
+        )
 
     if kv_layout == "HND":
         kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
@@ -280,6 +293,7 @@ def test_batch_decode_with_paged_kv_cache_with_fast_plan(
         data_type=kv_dtype,
         q_data_type=q_dtype,
         non_blocking=True,
+        global_override_indptr_cpu=global_override_indptr_cpu,
     )
     if return_lse:
         o, _ = wrapper.run(q, kv_data, return_lse=True)
