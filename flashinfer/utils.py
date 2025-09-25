@@ -52,15 +52,15 @@ log2e = 1.44269504088896340736
 
 
 class GPUArchitectureError(Exception):
-    def __init__(self, msg: str):
-        self.msg = msg
-        super().__init__(self.msg)
+    """Custom exception for GPU architecture-related errors."""
 
-    def __str__(self):
-        return self.msg
+    pass
 
-    def __repr__(self):
-        return self.msg
+
+class LibraryError(Exception):
+    """Custom exception for library-related errors."""
+
+    pass
 
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:

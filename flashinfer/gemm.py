@@ -38,7 +38,12 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .jit.cubin_loader import get_cubin
-from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
+from .utils import (
+    is_sm100a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+    LibraryError,
+)
 
 CUDNN_AVAILABLE = False
 try:
@@ -2112,6 +2117,15 @@ def mm_fp4(
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
+    if (
+        backend == "cudnn"
+        and not use_nvfp4
+        and _match_sm_version(a.device, ["120"])
+        and cudnn.backend_version() < 91400
+    ):
+        raise LibraryError(
+            "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+        )
 
     # allocate the output tensor if not provided
     if out is None:
