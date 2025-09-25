@@ -796,7 +796,7 @@ def silu_and_mul_fp4_batched_quantize(
     sf_vec_size=16,
 ):
     """
-    Quantize batched input tensor to NVFP4 format.
+    Silu and multiply and quantize batched input tensor to NVFP4 format with mask.
 
     Parameters:
         a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
