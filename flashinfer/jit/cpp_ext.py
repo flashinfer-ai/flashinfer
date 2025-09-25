@@ -267,7 +267,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers(verbose)
+    num_workers = _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 
