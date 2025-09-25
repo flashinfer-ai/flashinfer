@@ -5,6 +5,17 @@ from setuptools import build_meta as orig
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
+_aot_ops_dir = _root / "aot-ops"
+_aot_ops_package_dir = _root / "build" / "aot-ops-package-dir"
+
+_requires_for_aot = ["torch", "ninja", "numpy", "requests", "apache-tvm-ffi"]
+
+
+def _rm_aot_ops_package_dir():
+    if _aot_ops_package_dir.is_symlink():
+        _aot_ops_package_dir.unlink()
+    elif _aot_ops_package_dir.exists():
+        shutil.rmtree(_aot_ops_package_dir)
 
 
 def _create_data_dir():
@@ -32,9 +43,23 @@ def _prepare_for_wheel():
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
 
+    # Link AOT ops directory to "aot-ops"
+    _rm_aot_ops_package_dir()
+    if not _aot_ops_dir.exists():
+        _aot_ops_dir.mkdir()
+    num_ops = len(list(_aot_ops_dir.glob("*/*.so")))
+    print(f"{num_ops} AOT ops found in {_aot_ops_dir}")
+    _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.symlink_to(_aot_ops_dir)
+
 
 def _prepare_for_editable():
     _create_data_dir()
+
+    _rm_aot_ops_package_dir()
+    _aot_ops_dir.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.symlink_to(_aot_ops_dir)
 
 
 def _prepare_for_sdist():
@@ -42,10 +67,15 @@ def _prepare_for_sdist():
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
 
+    # Create an empty directory for AOT ops
+    _rm_aot_ops_package_dir()
+    _aot_ops_package_dir.parent.mkdir(parents=True, exist_ok=True)
+    _aot_ops_package_dir.mkdir(parents=True)
+
 
 def get_requires_for_build_wheel(config_settings=None):
     _prepare_for_wheel()
-    return []
+    return _requires_for_aot
 
 
 def get_requires_for_build_sdist(config_settings=None):
@@ -55,7 +85,7 @@ def get_requires_for_build_sdist(config_settings=None):
 
 def get_requires_for_build_editable(config_settings=None):
     _prepare_for_editable()
-    return []
+    return _requires_for_aot
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
