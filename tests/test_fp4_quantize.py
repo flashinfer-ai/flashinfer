@@ -389,7 +389,7 @@ def test_silu_and_mul_fp4_batched_quantize(
 
     b, m, n = batch_shape
     x = torch.randn((b, m, n * 2), dtype=dtype)
-    mask = torch.randint(low=m, high=m + 1, size=(b,), dtype=torch.int32, device=device)
+    mask = torch.randint(low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device)
     from flashinfer import silu_and_mul
 
     ref_y = silu_and_mul(x)
