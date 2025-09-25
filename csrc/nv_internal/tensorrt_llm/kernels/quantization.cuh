@@ -28,6 +28,10 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm {
 namespace kernels {
 
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
+
 __global__ static void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4,
                                        float const* scalePtr) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4;
@@ -397,6 +401,30 @@ struct PackedVec<__nv_fp8_e4m3> {
                 "Vector size should match the number of elements per thread.");
 };
 
+
+template <class Type>
+inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
+  float2 x[CVT_ELTS_PER_THREAD / 2];
+  float2 y[CVT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<Type, half>) {
+      x[i] = __half22float2(x_vec.elts[i]);
+      y[i] = __half22float2(y_vec.elts[i]);
+      x[i].x = silu(x[i].x) * y[i].x;
+      x[i].y = silu(x[i].y) * y[i].y;
+      x_vec.elts[i] = __float22half2_rn(x[i]);
+    } else {
+      x[i] = __bfloat1622float2(x_vec.elts[i]);
+      y[i] = __bfloat1622float2(y_vec.elts[i]);
+      x[i].x = silu(x[i].x) * y[i].x;
+      x[i].y = silu(x[i].y) * y[i].y;
+      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
+    }
+  }
+}
+
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
@@ -746,9 +774,11 @@ __launch_bounds__(512, 4) quantize_with_block_size(
 quantize_with_block_size(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
-    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout) {
+    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout, int32_t const* mask) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-
+  // TODO(shuw@nvidia.com): For now, we assume mask is only used together with
+  // silu_and_mul. 
+  bool use_mask = mask != nullptr;
   // The elements per thread.
   static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
                                              ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
@@ -774,6 +804,7 @@ quantize_with_block_size(
   // The number of threads in the column dimension。
   // Note that numCols/numPaddedCols/numColsForSf are guaranteed to be multiples of ELTS_PER_THREAD.
   int numColThreads = numCols / ELTS_PER_THREAD;
+  int actualColsThreads = use_mask ? numColThreads * 2 : numColThreads;
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
@@ -792,7 +823,7 @@ quantize_with_block_size(
 
         // The input tensor offset.
         int64_t inOffset =
-            static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+            static_cast<int64_t>(batchIdx * numRows + rowIdx) * actualColsThreads + colIdx;
         int64_t outOffset =
             static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
 
@@ -814,8 +845,22 @@ quantize_with_block_size(
             sf_out[0] = 0x00;
           }
         } else {
+        if (use_mask && rowIdx >= mask[batchIdx]) {
+          // since silu doesn't support fp8, we just skip the mask
+          continue;
+        }
           // Load the input vector.
           PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+          if (use_mask) {
+              PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + numColThreads];
+              if constexpr(!std::is_same_v<Type, __nv_fp8_e4m3>) {
+                // For bf16, we need to convert the mask values to fp16 first.
+                // printf("run silumul");
+                silu_and_mul(in_vec, in_vec_mul);
+              } else {
+                // For FP8: do nothing (or add an alternative implementation if needed).
+              }
+          }
 
           // Dispatch the quantization kernel.
           if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {

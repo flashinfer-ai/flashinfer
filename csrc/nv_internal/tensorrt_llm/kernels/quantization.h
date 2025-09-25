@@ -62,6 +62,12 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* glo
                            QuantizationSFLayout layout, int multiProcessorCount,
                            bool enable_pdl = false, cudaStream_t stream = 0);
 
+template <typename T, int SF_VEC_SIZE>
+void invokeSiluAndMulFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
+                           int32_t const* mask, int64_t* output, int32_t* SFOuput,
+                           QuantizationSFLayout layout, int multiProcessorCount,
+                           bool enable_pdl = false, cudaStream_t stream = 0);
+
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
                                 uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,
                                 cudaStream_t stream = 0);
