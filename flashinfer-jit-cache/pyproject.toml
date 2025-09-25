@@ -4,7 +4,7 @@ build-backend = "build_backend"
 backend-path = ["."]
 
 [project]
-name = "flashinfer-aot-modules"
+name = "flashinfer-jit-cache"
 dynamic = ["version"]
 description = "Pre-compiled AOT modules for FlashInfer"
 readme = {text = "This package contains pre-compiled AOT modules for FlashInfer. It provides all necessary compiled shared libraries (.so files) for optimized inference operations.", content-type = "text/plain"}
@@ -38,11 +38,11 @@ Repository = "https://github.com/flashinfer-ai/flashinfer"
 "Issue Tracker" = "https://github.com/flashinfer-ai/flashinfer/issues"
 
 [tool.setuptools]
-packages = ["flashinfer_aot_modules"]
+packages = ["flashinfer_jit_cache"]
 include-package-data = true
 
 [tool.setuptools.dynamic]
-version = {attr = "flashinfer_aot_modules.__version__"}
+version = {attr = "flashinfer_jit_cache.__version__"}
 
 [tool.setuptools.package-data]
-flashinfer_aot_modules = ["aot_modules/**/*.so"]
+flashinfer_jit_cache = ["jit_cache/**/*.so"]

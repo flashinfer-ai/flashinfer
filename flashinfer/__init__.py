@@ -155,13 +155,13 @@ if importlib.util.find_spec("flashinfer_cubin"):
             "Please install the same version of both packages."
         )
 
-if importlib.util.find_spec("flashinfer_aot_modules"):
-    import flashinfer_aot_modules
+if importlib.util.find_spec("flashinfer_jit_cache"):
+    import flashinfer_jit_cache
 
-    flashinfer_aot_modules_version = flashinfer_aot_modules.__version__
-    if __version__ != flashinfer_aot_modules_version:
+    flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
+    if __version__ != flashinfer_jit_cache_version:
         raise RuntimeError(
-            f"flashinfer-aot-modules version ({flashinfer_aot_modules_version}) does not match "
+            f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
             f"flashinfer version ({__version__}). "
             "Please install the same version of both packages."
         )

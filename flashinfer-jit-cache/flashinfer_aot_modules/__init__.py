@@ -19,12 +19,12 @@ from pathlib import Path
 from typing import List, Optional
 
 # Get the path to the AOT modules directory within this package
-AOT_MODULES_DIR = Path(__file__).parent / "aot_modules"
+jit_cache_DIR = Path(__file__).parent / "jit_cache"
 
 
-def get_aot_modules_dir() -> str:
+def get_jit_cache_dir() -> str:
     """Get the directory containing the AOT compiled modules."""
-    return str(AOT_MODULES_DIR)
+    return str(jit_cache_DIR)
 
 
 # Read version from build metadata or fallback to main flashinfer version.txt
@@ -47,5 +47,5 @@ def _get_version():
 
 __version__ = _get_version()
 __all__ = [
-    "get_aot_modules_dir",
+    "get_jit_cache_dir",
 ]

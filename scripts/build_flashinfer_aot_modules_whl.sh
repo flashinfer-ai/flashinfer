@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-# Script to build flashinfer-aot-modules wheel
+# Script to build flashinfer-jit-cache wheel
 # This script should be run inside the flashinfer container
 
 echo "=========================================="
-echo "Building flashinfer-aot-modules wheel"
+echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
 # Display build environment info
@@ -18,8 +18,8 @@ echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Working directory: $(pwd)"
 echo ""
 
-# Navigate to the flashinfer-aot-modules directory
-cd flashinfer-aot-modules
+# Navigate to the flashinfer-jit-cache directory
+cd flashinfer-jit-cache
 
 export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE}/conda-pkgs"
 export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE}/xdg-cache"

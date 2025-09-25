@@ -1,4 +1,4 @@
-name: Build and Release flashinfer-aot-modules wheels
+name: Build and Release flashinfer-jit-cache wheels
 
 on:
     # workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
             fail-fast: false
             matrix:
                 cuda: ["12.9"] #["12.8", "12.9", "13.0"]
-                arch: ['x86_64', 'aarch64']
+                arch: ['x86_64', 'aarch6t4']
 
         # Use self-hosted runners with specific labels based on architecture
         runs-on: [self-hosted, "${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }}"]
@@ -103,11 +103,11 @@ jobs:
                     --user $CI_UID:$CI_GID \
                     -w /workspace \
                     ${{ env.DOCKER_IMAGE }} \
-                    bash /workspace/scripts/build_flashinfer_aot_modules_whl.sh
+                    bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
               timeout-minutes: 180
 
             - name: Display wheel size
-              run: du -h flashinfer-aot-modules/dist/*
+              run: du -h flashinfer-jit-cache/dist/*
 
             - name: Create artifact name
               id: artifact-name
@@ -119,4 +119,4 @@ jobs:
               with:
                   name: ${{ steps.artifact-name.outputs.name }}
                   retention-days: 7
-                  path: flashinfer-aot-modules/dist/*
+                  path: flashinfer-jit-cache/dist/*

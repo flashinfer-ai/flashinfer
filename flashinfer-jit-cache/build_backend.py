@@ -55,7 +55,7 @@ def get_version():
     return version
 
 
-def compile_aot_modules(output_dir: Path, verbose: bool = True):
+def compile_jit_cache(output_dir: Path, verbose: bool = True):
     """Compile AOT modules using flashinfer.aot functions directly."""
     from flashinfer import aot
 
@@ -78,15 +78,15 @@ def compile_aot_modules(output_dir: Path, verbose: bool = True):
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build wheel with custom AOT module compilation."""
-    print("Building flashinfer-aot-modules wheel...")
+    print("Building flashinfer-jit-cache wheel...")
 
     # First, ensure AOT modules are compiled
-    aot_package_dir = Path(__file__).parent / "flashinfer_aot_modules" / "aot_modules"
+    aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
     aot_package_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         # Compile AOT modules
-        compile_aot_modules(aot_package_dir)
+        compile_jit_cache(aot_package_dir)
 
         # Verify that some modules were actually compiled
         so_files = list(aot_package_dir.rglob("*.so"))
@@ -100,12 +100,12 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         raise
 
     # Create build metadata file with version information
-    package_dir = Path(__file__).parent / "flashinfer_aot_modules"
+    package_dir = Path(__file__).parent / "flashinfer_jit_cache"
     build_meta_file = package_dir / "_build_meta.py"
     version = get_version()
 
     with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer-aot-modules package."""\n')
+        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
         f.write(f'__version__ = "{version}"\n')
 
     print(f"Created build metadata file with version {version}")
@@ -119,25 +119,25 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 def build_sdist(sdist_directory, config_settings=None):
     """Build source distribution with custom handling."""
-    print("Building flashinfer-aot-modules source distribution...")
+    print("Building flashinfer-jit-cache source distribution...")
 
     # Compile AOT modules for source distribution
-    aot_package_dir = Path(__file__).parent / "flashinfer_aot_modules" / "aot_modules"
+    aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
     aot_package_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        compile_aot_modules(aot_package_dir)
+        compile_jit_cache(aot_package_dir)
     except Exception as e:
         print(f"Warning: Failed to compile AOT modules for sdist: {e}")
         print("The source distribution will not include pre-compiled modules")
 
     # Create build metadata file with version information
-    package_dir = Path(__file__).parent / "flashinfer_aot_modules"
+    package_dir = Path(__file__).parent / "flashinfer_jit_cache"
     build_meta_file = package_dir / "_build_meta.py"
     version = get_version()
 
     with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer-aot-modules package."""\n')
+        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
         f.write(f'__version__ = "{version}"\n')
 
     print(f"Created build metadata file with version {version}")

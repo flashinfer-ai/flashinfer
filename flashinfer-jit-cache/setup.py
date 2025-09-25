@@ -1,4 +1,4 @@
-"""Setup script for flashinfer-aot-modules package."""
+"""Setup script for flashinfer-jit-cache package."""
 
 import os
 import platform
@@ -61,7 +61,7 @@ class PlatformSpecificBdistWheel(bdist_wheel):
 
 if __name__ == "__main__":
     setup(
-        name="flashinfer-aot-modules",
+        name="flashinfer-jit-cache",
         version=get_version(),
         description="Pre-compiled AOT modules for FlashInfer",
         long_description="This package contains pre-compiled AOT modules for FlashInfer. It provides all necessary compiled shared libraries (.so files) for optimized inference operations.",
@@ -77,7 +77,7 @@ if __name__ == "__main__":
         },
         packages=find_packages(),
         package_data={
-            "flashinfer_aot_modules": ["aot_modules/**/*.so"],
+            "flashinfer_jit_cache": ["jit_cache/**/*.so"],
         },
         include_package_data=True,
         python_requires=">=3.9",

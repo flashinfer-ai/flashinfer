@@ -5,5 +5,5 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-flashinfer_aot_modules/aot_modules/
+flashinfer_jit_cache/jit_cache/
 _build_meta.py
