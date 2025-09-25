@@ -14,8 +14,6 @@ def wmape(target: torch.Tensor, preds: torch.Tensor):
     return sum_abs_error / sum_scale
 
 
-
-
 class DeepseekV2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -395,6 +393,10 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 
         return output
 
+<<<<<<< HEAD:tests/attention/test_mla_decode_kernel.py
+=======
+
+>>>>>>> main:tests/test_mla_decode_kernel.py
 @pytest.mark.parametrize("bsz", [6])
 @pytest.mark.parametrize("kv_len", [640])
 @pytest.mark.parametrize("page_size", [16])
@@ -504,8 +506,16 @@ def test_mla_decode_kernel(bsz, kv_len, page_size):
     )
     print(f"mse_use_flashinfer = {mse_use_flashinfer}")
 
+<<<<<<< HEAD:tests/attention/test_mla_decode_kernel.py
+=======
+
+>>>>>>> main:tests/test_mla_decode_kernel.py
 if __name__ == "__main__":
     bsz = 6
     kv_len = 640
     page_size = 16
+<<<<<<< HEAD:tests/attention/test_mla_decode_kernel.py
     test_mla_decode_kernel(bsz, kv_len, page_size)
+=======
+    test_mla_decode_kernel(bsz, kv_len, page_size)
+>>>>>>> main:tests/test_mla_decode_kernel.py

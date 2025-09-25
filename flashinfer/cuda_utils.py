@@ -19,7 +19,7 @@ from flashinfer.utils import has_cuda_cudart
 try:
     # Check if cuda.cudart module is available and import accordingly
     if has_cuda_cudart():
-        # cuda-python <= 12.9 (has cuda.cudart)
+        # cuda-python < 12.9 (has cuda.cudart)
         import cuda.bindings.driver as driver
         import cuda.bindings.runtime as runtime
         import cuda.cudart as cudart

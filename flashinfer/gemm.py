@@ -38,7 +38,12 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .jit.cubin_loader import get_cubin
-from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
+from .utils import (
+    is_sm100a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+    LibraryError,
+)
 
 CUDNN_AVAILABLE = False
 try:
@@ -2112,6 +2117,15 @@ def mm_fp4(
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
+    if (
+        backend == "cudnn"
+        and not use_nvfp4
+        and _match_sm_version(a.device, ["120"])
+        and cudnn.backend_version() < 91400
+    ):
+        raise LibraryError(
+            "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+        )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -3078,6 +3092,11 @@ def group_deepgemm_fp8_nt_groupwise(
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_contiguous is only supported on SM100, SM100, SM103."
+        )
+
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
@@ -3205,6 +3224,11 @@ def batch_deepgemm_fp8_nt_groupwise(
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
+
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_masked is only supported on SM100, SM103."
+        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16

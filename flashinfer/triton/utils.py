@@ -21,15 +21,21 @@ def check_shape(a: torch.Tensor, b: torch.Tensor):
         )
 
 
-def check_device(tensors: List[torch.Tensor], major:List[int] = [], minor:List[int] = []):
-    device = tensors[0].device 
+def check_device(
+    tensors: List[torch.Tensor], major: List[int] = None, minor: List[int] = None
+):
+    device = tensors[0].device
     for t in tensors:
         assert t.device == device, (
             f"All tensors should be on the same device, but got {device} and {t.device}"
         )
-    if len(major) > 0 or len(minor) > 0:
+    if major is not None or minor is not None:
         actual_major, actual_minor = get_compute_capability(device)
-        if len(major) > 0 and actual_major not in major:
-            raise GPUArchitectureError(f"Device major should be in {major}, but got {actual_major}")
-        if len(minor) > 0 and actual_minor not in minor:
-            raise GPUArchitectureError(f"Device minor should be in {minor}, but got {actual_minor}")
+        if major is not None and actual_major not in major:
+            raise GPUArchitectureError(
+                f"Device major should be in {major}, but got {actual_major}"
+            )
+        if minor is not None and actual_minor not in minor:
+            raise GPUArchitectureError(
+                f"Device minor should be in {minor}, but got {actual_minor}"
+            )
