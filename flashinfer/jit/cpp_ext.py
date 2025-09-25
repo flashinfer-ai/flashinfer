@@ -12,11 +12,6 @@ from typing import List, Optional
 
 import tvm_ffi
 import torch
-from torch.utils.cpp_extension import (
-    _TORCH_PATH,
-    CUDA_HOME,
-    _get_num_workers,
-)
 
 from . import env as jit_env
 from ..compilation_context import CompilationContext
@@ -40,22 +35,20 @@ def torch_get_pybind11_abi_build_flags() -> List[str]:
 
 @functools.cache
 def get_cuda_path() -> str:
-    if CUDA_HOME is None:
-        # get output of "which nvcc"
-        result = subprocess.run(["which", "nvcc"], capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Could not find nvcc")
-        return result.stdout.decode("utf-8").strip()
-    else:
-        return CUDA_HOME
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is not None:
+        return cuda_home
+    # get output of "which nvcc"
+    result = subprocess.run(["which", "nvcc"], capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError("Could not find nvcc")
+    return result.stdout.decode("utf-8").strip()
 
 
 @functools.cache
 def get_cuda_version() -> Version:
-    if CUDA_HOME is None:
-        nvcc = "nvcc"
-    else:
-        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
+    cuda_home = get_cuda_path()
+    nvcc = os.path.join(cuda_home, "bin/nvcc")
     txt = subprocess.check_output([nvcc, "--version"], text=True)
     matches = re.findall(r"release (\d+\.\d+),", txt)
     if not matches:
@@ -190,14 +183,14 @@ def generate_ninja_build_for_op(
         ldflags += extra_ldflags
 
     cxx = os.environ.get("CXX", "c++")
-    cuda_home = CUDA_HOME or "/usr/local/cuda"
+    cuda_home = get_cuda_path()
     nvcc = os.environ.get("PYTORCH_NVCC", "$cuda_home/bin/nvcc")
 
     lines = [
         "ninja_required_version = 1.3",
         f"name = {name}",
         f"cuda_home = {cuda_home}",
-        f"torch_home = {_TORCH_PATH}",
+        f"torch_home = {torch.__path__[0]}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
         "",
@@ -255,6 +248,13 @@ def generate_ninja_build_for_op(
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _get_num_workers() -> Optional[int]:
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs is not None and max_jobs.isdigit():
+        return int(max_jobs)
+    return None
 
 
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
