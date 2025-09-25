@@ -1,0 +1,35 @@
+name: Triage new issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add needs-triage label
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = context.issue.number;
+            const { owner, repo } = context.repo;
+            const labelName = 'needs-triage';
+            try {
+              await github.rest.repos.getLabel({ owner, repo, name: labelName });
+            } catch (error) {
+              if (error.status === 404) {
+                throw new Error(`Required label '${labelName}' does not exist in ${owner}/${repo}. Please create it in the repository settings.`);
+              }
+              throw error;
+            }
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: [labelName],
+            });
