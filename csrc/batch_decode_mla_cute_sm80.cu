@@ -63,7 +63,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     TVM_FFI_ICHECK_EQ(lse->shape[1], num_qo_heads);
   }
 
-  TVM_FFI_ICHECK_GE(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
+  TVM_FFI_ICHECK_GE(logits_soft_cap, 0.f) << "logits_soft_cap must be non-negative";
 
   void* float_buffer = static_cast<void*>(float_workspace_buffer->data);
   void* int_buffer = static_cast<void*>(int_workspace_buffer->data);
