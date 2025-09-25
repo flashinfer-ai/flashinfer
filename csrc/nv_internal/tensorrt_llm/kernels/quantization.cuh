@@ -768,13 +768,13 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
 
 
 struct NoSiluPolicy {
-    static constexpr bool use_mask = false;
+    static constexpr bool run_silu = false; 
     template <typename PackedVec>
     __device__ static void maybe_silu(PackedVec&, const PackedVec&, bool) {}
 };
 
 struct SiluPolicy {
-    static constexpr bool use_mask = true;
+    static constexpr bool run_silu = true; 
     template <typename PackedVec>
     __device__ static void maybe_silu(PackedVec& in_vec,
                                       const PackedVec& in_vec_mul,
@@ -793,7 +793,8 @@ __device__ inline void quantize_with_block_size_impl(
     const Type* in, const float* SFScale, uint32_t* out, uint32_t* SFout,
     QuantizationSFLayout layout, const int32_t* mask)
 {
-    bool use_mask = Policy::use_mask && mask != nullptr;
+    bool use_mask = mask != nullptr;
+    bool use_silu = Policy::run_silu;
     static constexpr int ELTS_PER_THREAD =
         quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
             ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
@@ -812,7 +813,7 @@ __device__ inline void quantize_with_block_size_impl(
     int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
 
     int numColThreads = numCols / ELTS_PER_THREAD;
-    int actualColsThreads = use_mask ? numColThreads * 2 : numColThreads;
+    int actualColsThreads = use_silu ? numColThreads * 2 : numColThreads;
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
@@ -847,7 +848,7 @@ __device__ inline void quantize_with_block_size_impl(
                     if (use_mask && rowIdx >= mask[batchIdx]) continue;
 
                     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-                    if (use_mask) {
+                    if (use_silu) {
                         PackedVec in_vec_mul =
                             reinterpret_cast<PackedVec const*>(in)[inOffset + numColThreads];
                         Policy::maybe_silu(in_vec, in_vec_mul,
@@ -882,12 +883,12 @@ __launch_bounds__(512,4)
 quantize_with_block_size(
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols,
     const Type* in, const float* SFScale, uint32_t* out, uint32_t* SFout,
-    QuantizationSFLayout layout)
+    QuantizationSFLayout layout, const int32_t* mask)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     quantize_with_block_size_impl<quantization_type,Type,SF_VEC_SIZE,UE8M0_SF,NoSiluPolicy>(
         numbatches,numRows,numCols,numPaddedCols,
-        in,SFScale,out,SFout,layout,nullptr);
+        in,SFScale,out,SFout,layout,mask);
 #endif
 }
 

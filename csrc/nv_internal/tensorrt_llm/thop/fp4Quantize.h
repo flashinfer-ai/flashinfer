@@ -30,6 +30,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 bool enable_pdl);
 
 std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
+                                                        std::optional<at::Tensor> const& mask,
                                                         at::Tensor const& globalScale,
                                                         int64_t sfVecSize, bool sfUseUE8M0);
 }  // namespace torch_ext

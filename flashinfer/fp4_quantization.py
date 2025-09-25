@@ -257,6 +257,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
     def fp4_batched_quantize_sm100(
         input: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
@@ -271,6 +272,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         Args:
             input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
                 torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
+            mask (torch.Tensor, optional): mask tensor of shape [B] with dtype torch.int32.  
             global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
                 dtype float32.
             sf_vec_size (int, optional): Scale-factor vector size and alignment unit along K.
@@ -298,6 +300,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         """
         return module.fp4_batched_quantize(
             input,
+            mask,
             global_scale,
             sf_vec_size,
             sf_use_ue8m0,
@@ -306,6 +309,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     @register_fake_op("flashinfer::fp4_batched_quantize_sm100")
     def _fp4_batched_quantize_sm100(
         input: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
@@ -753,12 +757,14 @@ def nvfp4_batched_quantize(
     a,
     a_global_sf,
     sf_vec_size=16,
+    mask=None,
 ):
     """
     Quantize batched input tensor to NVFP4 format.
 
     Parameters:
         a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
+        mask (torch.Tensor): Mask tensor to apply before quantization.
         a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
 
@@ -771,6 +777,7 @@ def nvfp4_batched_quantize(
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(
         a,
+        mask,
         a_global_sf,
         sf_vec_size,
         False,
