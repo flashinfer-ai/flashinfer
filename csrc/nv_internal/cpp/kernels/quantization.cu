@@ -103,7 +103,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
       &config,
       quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>, b,
       m, n, padded_n, input, nullptr, reinterpret_cast<uint32_t*>(output),
-      reinterpret_cast<uint32_t*>(SFOuput), layout, nullptr);
+      reinterpret_cast<uint32_t*>(SFOuput), layout);
 }
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
@@ -187,7 +187,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
                                                             T, SF_VEC_SIZE, false>;
     kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
                                                 reinterpret_cast<uint32_t*>(output),
-                                                reinterpret_cast<uint32_t*>(SFOuput), layout, nullptr);
+                                                reinterpret_cast<uint32_t*>(SFOuput), layout);
 
   } else
 #endif
@@ -218,7 +218,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
                        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
-                       layout, nullptr);
+                       layout);
   }
 }
 
@@ -236,7 +236,7 @@ void invokeSiluAndMulFP4Quantization(int b, int m, int n, T const* input, float 
     dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
-    auto* kernel_instance = &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
+    auto* kernel_instance = &silu_mul_quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
                                                             T, SF_VEC_SIZE, false>;
 
     cudaLaunchConfig_t config;
