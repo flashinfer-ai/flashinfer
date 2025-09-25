@@ -20,8 +20,7 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
                          at::Tensor work_indptr, at::Tensor qo_tile_indices,
                          at::Tensor qo_head_indices, at::Tensor batch_indices, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len);
+                         double sm_scale, int64_t max_qo_len);
 
 void blackwell_fmha_plan(at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
                          at::Tensor work_indptr, at::Tensor qo_tile_indices,
