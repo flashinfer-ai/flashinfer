@@ -39,7 +39,7 @@ namespace cudnn_sdpa_kernel_launcher {
 
 #include <flashinfer/cubin_loader.h>
 
-#include "tvm_ffi_utils.h"
+using tvm::ffi::Optional;
 
 inline __host__ int clz(int x) {
   for (int i = 31; i >= 0; --i) {
@@ -538,7 +538,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, Tensor q, Tensor k_cache
 
   int64_t d_qk = q->shape[2];
 
-  int64_t d_vo = v_cache->ndim == 3 ? v_cache->shape[2] : v_cache.size(3);
+  int64_t d_vo = v_cache->ndim == 3 ? v_cache->shape[2] : v_cache->shape[3];
 
   if (prefill_func[0] == nullptr) {
     setup_prefill(prefill_func);
@@ -612,8 +612,8 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, Tensor q, Tensor k_cache
 
   // Step 4: Set up the launch arguments
 
-  auto k_strides = k_cache->strides();
-  auto v_strides = v_cache->strides();
+  auto k_strides = k_cache.strides();
+  auto v_strides = v_cache.strides();
 
   bool is_kv_ragged = k_cache->ndim == 3;
 
@@ -865,7 +865,7 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
   std::array<uint32_t, DIMS_QKV> tensor_size_qo = {d, 1 /* s_qo */, h_qo, b};
   std::array<uint32_t, DIMS_QKV> tensor_size_kv = {d, page_size, h_kv, total_num_pages};
 
-  auto kv_strides = k_cache->strides();
+  auto kv_strides = k_cache.strides();
 
   std::array<uint64_t, DIMS_QKV - 1> tensor_stride_qo = {h_qo * d * BYTES_PER_ELEMENT,
                                                          d * BYTES_PER_ELEMENT, 0};
@@ -983,8 +983,8 @@ void decode(int64_t max_s_kv, Tensor q, Tensor k_cache, Tensor v_cache, double s
   split_factor = 1;  // Fix split factor. Setting it to 1 for now
 
   // Set up TMA descriptors for Q, K, V, O
-  auto qo_strides = q->strides();
-  auto kv_strides = v_cache->strides();
+  auto qo_strides = q.strides();
+  auto kv_strides = v_cache.strides();
 
   // Launch config for main kernel
   CUlaunchConfig config;
