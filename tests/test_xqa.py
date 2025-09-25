@@ -228,6 +228,8 @@ def test_xqa(
     )
     cache_heads.normal_(0, 1)
     if fp8_kv_cache:
+        # Scale down the cache heads to keep values within the representable range of FP8
+        # and prevent overflow during computation. The factor 4.0 is chosen empirically.
         cache_heads /= 4.0
 
     nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
