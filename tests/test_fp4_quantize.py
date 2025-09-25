@@ -339,7 +339,9 @@ def test_nvfp4_batched_quantize(
     mask = None
     # Test the batched quantization
     if use_mask:
-        mask = torch.randint(low=1, high=m+1, size=(b,), dtype=torch.int32, device=device)
+        mask = torch.randint(
+            low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device
+        )
         out, out_scale = nvfp4_batched_quantize(x, global_scale, mask=mask)
     else:
         out, out_scale = nvfp4_batched_quantize(x, global_scale)
@@ -355,13 +357,17 @@ def test_nvfp4_batched_quantize(
     for i in range(b):
         single_out, single_scale = fp4_quantize(x[i], global_scale, 16, False, True)
         if use_mask:
-            torch.testing.assert_close(out[i][:mask[i]], single_out[:mask[i]], rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(
+                out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
+            )
             scale_ref = unswizzle_sf(single_scale, m, n)
             scale_ans = unswizzle_sf(out_scale[i], m, n)
-            torch.testing.assert_close(scale_ref[:mask[i]], scale_ans[:mask[i]])
+            torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
         else:
             torch.testing.assert_close(out[i], single_out, rtol=1e-5, atol=1e-5)
-            torch.testing.assert_close(out_scale[i], single_scale.flatten(), rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(
+                out_scale[i], single_scale.flatten(), rtol=1e-5, atol=1e-5
+            )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -383,8 +389,9 @@ def test_silu_and_mul_fp4_batched_quantize(
 
     b, m, n = batch_shape
     x = torch.randn((b, m, n * 2), dtype=dtype)
-    mask = torch.randint(low=m, high=m+1, size=(b,), dtype=torch.int32, device=device)
+    mask = torch.randint(low=m, high=m + 1, size=(b,), dtype=torch.int32, device=device)
     from flashinfer import silu_and_mul
+
     ref_y = silu_and_mul(x)
 
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
@@ -397,24 +404,30 @@ def test_silu_and_mul_fp4_batched_quantize(
         mask=mask,
     )
     # Basic shape checks
-    assert out.shape == (b, m, n // 2), (
-        f"Expected shape {(b, m, n)}, got {out.shape}"
-    )
+    assert out.shape == (b, m, n // 2), f"Expected shape {(b, m, n)}, got {out.shape}"
     assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
     assert out_scale.dtype == torch.uint8, f"Expected uint8, got {out_scale.dtype}"
 
     # Compare with single tensor quantization for each batch
     for i in range(b):
         x_silu_mul = silu_and_mul(x[i])
-        single_out, single_scale = fp4_quantize(x_silu_mul, global_scale, 16, False, True)
-        torch.testing.assert_close(out[i][:mask[i]], single_out[:mask[i]], rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(out[i][:mask[i]], ref_out[i][:mask[i]], rtol=1e-5, atol=1e-5)
+        single_out, single_scale = fp4_quantize(
+            x_silu_mul, global_scale, 16, False, True
+        )
+        torch.testing.assert_close(
+            out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            out[i][: mask[i]], ref_out[i][: mask[i]], rtol=1e-5, atol=1e-5
+        )
 
         scale_ref = unswizzle_sf(single_scale, m, n)
         scale_ans = unswizzle_sf(out_scale[i], m, n)
         ref_out_scale_expert = unswizzle_sf(ref_out_scale[i], m, n)
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
-        torch.testing.assert_close(ref_out_scale_expert[: mask[i]], scale_ans[: mask[i]])
+        torch.testing.assert_close(
+            ref_out_scale_expert[: mask[i]], scale_ans[: mask[i]]
+        )
 
 
 if __name__ == "__main__":

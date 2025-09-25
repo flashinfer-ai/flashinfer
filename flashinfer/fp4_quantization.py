@@ -272,7 +272,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         Args:
             input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
                 torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
-            mask (torch.Tensor, optional): mask tensor of shape [B] with dtype torch.int32.  
+            mask (torch.Tensor, optional): mask tensor of shape [B] with dtype torch.int32.
             global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
                 dtype float32.
             sf_vec_size (int, optional): Scale-factor vector size and alignment unit along K.
@@ -317,7 +317,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         b, m, k = input.shape
         return (
             input.new_empty([b, m, k // 2], dtype=torch.int64),  # float4_e2m1_x2
-            input.new_empty([b, m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+            input.new_empty(
+                [b, m * k // sf_vec_size], dtype=torch.int32
+            ),  # Scale factors
         )
 
     @register_custom_op(
@@ -340,7 +342,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         Args:
             input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
                 torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
-            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.                
+            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
             global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
                 dtype float32.
             sf_vec_size (int, optional): Scale-factor vector size and alignment unit along K.
@@ -381,7 +383,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         b, m, k = input.shape
         return (
             input.new_empty([b, m, k // 4], dtype=torch.int64),  # float4_e2m1_x2
-            input.new_empty([b, m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+            input.new_empty(
+                [b, m * k // sf_vec_size], dtype=torch.int32
+            ),  # Scale factors
         )
 
     @register_custom_op(
@@ -787,7 +791,7 @@ def nvfp4_batched_quantize(
 
 def silu_and_mul_fp4_batched_quantize(
     a,
-    mask,    
+    mask,
     a_global_sf,
     sf_vec_size=16,
 ):
@@ -807,7 +811,9 @@ def silu_and_mul_fp4_batched_quantize(
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
-    a_fp4, a_sf = get_fp4_quantization_module(device_arch).silu_and_mul_fp4_batched_quantize_sm100(
+    a_fp4, a_sf = get_fp4_quantization_module(
+        device_arch
+    ).silu_and_mul_fp4_batched_quantize_sm100(
         a,
         mask,
         a_global_sf,

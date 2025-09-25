@@ -160,7 +160,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
   CHECK_CONTIGUOUS(self);
   CHECK_INPUT_TYPE(globalScale, c10::ScalarType::Float);
   TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16");
-  
+
   auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
 
@@ -180,7 +180,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
   outputShape[rank - 1] = k / 2;
 
-  at::Tensor valueE2M1 = 
+  at::Tensor valueE2M1 =
       at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
   at::Tensor scaleFP8SF =
       at::detail::empty_cuda({b, tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)},
@@ -194,7 +194,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
       b, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(),               \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      use_mask ? mask.value().data_ptr<int32_t>() : nullptr, at::cuda::getCurrentCUDAStream(self.get_device()));
+      use_mask ? mask.value().data_ptr<int32_t>() : nullptr,                                       \
+      at::cuda::getCurrentCUDAStream(self.get_device()));
 
   if (self.scalar_type() == at::ScalarType::Half) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
@@ -222,9 +223,9 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(at::Tensor const& self,
 }
 
 std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp4_batched_quantize(at::Tensor const& self,
-                                                        at::Tensor const& mask,
-                                                        at::Tensor const& globalScale,
-                                                        int64_t sfVecSize) {
+                                                                     at::Tensor const& mask,
+                                                                     at::Tensor const& globalScale,
+                                                                     int64_t sfVecSize) {
   // TODO(shuw): mask can be none
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
@@ -258,12 +259,11 @@ std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp4_batched_quantize(at::Tensor 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
   auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
 
-#define LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
-  tensorrt_llm::kernels::invokeSiluAndMulFP4Quantization<T, SF_VEC_SIZE>(                                    \
-      b, m, k_by_2, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(),               \
-      mask.data_ptr<int32_t>(), \
-      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
-      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, \
+#define LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                           \
+  tensorrt_llm::kernels::invokeSiluAndMulFP4Quantization<T, SF_VEC_SIZE>(                 \
+      b, m, k_by_2, reinterpret_cast<T*>(self.data_ptr()), globalScale.data_ptr<float>(), \
+      mask.data_ptr<int32_t>(), reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),         \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount,    \
       at::cuda::getCurrentCUDAStream(self.get_device()));
 
   if (self.scalar_type() == at::ScalarType::Half) {
@@ -290,6 +290,5 @@ std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp4_batched_quantize(at::Tensor 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_quantize", &torch_ext::fp4_quantize);
   m.def("fp4_batched_quantize", &torch_ext::fp4_batched_quantize);
-  m.def("silu_and_mul_fp4_batched_quantize",
-      &torch_ext::silu_and_mul_fp4_batched_quantize);
+  m.def("silu_and_mul_fp4_batched_quantize", &torch_ext::silu_and_mul_fp4_batched_quantize);
 }
