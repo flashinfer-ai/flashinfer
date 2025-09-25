@@ -22,7 +22,6 @@
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
-#include <optional>
 #include <sstream>
 #include <unordered_map>
 

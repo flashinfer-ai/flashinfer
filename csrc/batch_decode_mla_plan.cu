@@ -1,6 +1,5 @@
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <optional>
 
 #include "mla_config.inc"
 #include "tvm/ffi/container/array.h"
