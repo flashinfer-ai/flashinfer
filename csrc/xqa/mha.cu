@@ -476,7 +476,7 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                 col + actualQSeqLen < nbValidCols
                     ? true
                     : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : -INFINITY;
+            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
           }
         }
       }
@@ -2709,11 +2709,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                      mask,
 #endif
-                     attentionSinks, cacheList,
-#if BEAM_WIDTH > 1
-                     beamSearchParams,
-#endif
-                     batchSize, kvCacheScale, semaphores, scratch);
+                     attentionSinks, cacheList, batchSize, kvCacheScale, semaphores, scratch);
 #else
   KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
 #ifndef NDEBUG

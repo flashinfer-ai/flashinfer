@@ -356,7 +356,8 @@ def gen_attention(
 
 
 def gen_xqa(
-    use_fp16_: List[bool],
+    fp16_input_: List[bool],
+    fp8_kv_cache_: List[bool],
     token_per_page_: List[int],
     head_size_: List[int],
     head_grp_size_: List[int],
@@ -368,13 +369,15 @@ def gen_xqa(
         return  # XQA requires SM90+
 
     for (
-        use_fp16,
+        fp16_input,
+        fp8_kv_cache,
         token_per_page,
         head_size,
         head_grp_size,
         use_sliding_window,
     ) in product(
-        use_fp16_,
+        fp16_input_,
+        fp8_kv_cache_,
         token_per_page_,
         head_size_,
         head_grp_size_,
@@ -387,7 +390,8 @@ def gen_xqa(
             continue
 
         yield gen_xqa_module(
-            use_fp16=use_fp16,
+            fp16_input=fp16_input,
+            fp8_kv_cache=fp8_kv_cache,
             token_per_page=token_per_page,
             head_size=head_size,
             head_grp_size=head_grp_size,
@@ -508,14 +512,16 @@ def gen_all_modules(
 
     if add_xqa:
         # Define XQA configurations to iterate over
-        xqa_use_fp16_ = [True, False]  # fp16 and bf16
+        xqa_fp16_input_ = [True, False]  # fp16 and bf16
+        xqa_fp8_kv_cache_ = [True, False]
         xqa_token_per_page_ = [16, 32, 64, 128]
         xqa_head_size_ = [64, 128, 256]
         xqa_head_grp_size_ = [1, 2, 4, 8]  # Different group sizes for MQA/GQA
 
         jit_specs += list(
             gen_xqa(
-                xqa_use_fp16_,
+                xqa_fp16_input_,
+                xqa_fp8_kv_cache_,
                 xqa_token_per_page_,
                 xqa_head_size_,
                 xqa_head_grp_size_,
