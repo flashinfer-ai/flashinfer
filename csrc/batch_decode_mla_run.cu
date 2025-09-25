@@ -26,8 +26,8 @@ void BatchDecodeWithPagedKVCacheRunMLA(Tensor float_workspace_buffer, Tensor int
   int64_t num_qo_heads = q_nope->shape[1];
   int64_t page_size = paged_ckv_cache->shape[1];
 
-  if (maybe_lse) {
-    const auto& lse = *maybe_lse;
+  if (maybe_lse.has_value()) {
+    const auto& lse = maybe_lse.value();
     TVM_FFI_ICHECK_EQ(lse->shape[0], batch_size);
     TVM_FFI_ICHECK_EQ(lse->shape[1], num_qo_heads);
   }

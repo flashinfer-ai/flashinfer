@@ -213,8 +213,6 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
   TVM_FFI_ICHECK(rows % 128 == 0) << "rows of Interleaved block scales should be multiple of 128.";
   TVM_FFI_ICHECK(cols % 4 == 0) << "cols of Interleaved block scales should be multiple of 4.";
   auto expert_out_size = rows * cols;
-  // Tensor reversedBlockScale = at::empty(
-  //     blockScaleShape, at::dtype(dl_uint8).device(blockScale.device()).requires_grad(false));
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -257,11 +255,9 @@ void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<T
   TVM_FFI_ICHECK_EQ(packedShape.size(), 2) << "valueE2M1 should be 2D tensor.";
   TVM_FFI_ICHECK_EQ(scaleShape.size(), 1) << "scaleFP8SF should be 1D tensor.";
 
-  // CHECK_CPU_INPUT(globalScale, at::ScalarType::Float);
   float globalScaleVal{1.0f};
   if (sfType == 1) {
     TVM_FFI_ICHECK(globalScale.has_value()) << "globalScale is required when sfType is 1.";
-    // CHECK_CPU_INPUT(globalScale.value(), at::kFloat32);
     globalScaleVal = static_cast<float*>(globalScale.value()->data)[0];
   }
 

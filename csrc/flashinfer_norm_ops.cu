@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// #include "pytorch_extension_utils.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Tensor;

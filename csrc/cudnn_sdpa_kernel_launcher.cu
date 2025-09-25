@@ -12,9 +12,6 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
@@ -28,6 +25,7 @@
 #include <map>
 
 #include "cudnn_sdpa_utils.h"
+#include "tvm_ffi_utils.h"
 
 #ifdef CUDNN_SDPA_CUBIN_PATH
 static const std::string cudnn_sdpa_cubin_path = std::string(CUDNN_SDPA_CUBIN_PATH);
@@ -522,8 +520,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, Tensor q, Tensor k_cache
 
   constexpr int32_t NUM_THREADS = 512;
 
-  auto device = q.device();
-  const CUstream stream = at::cuda::getCurrentCUDAStream(device.index());
+  const CUstream stream = get_stream(q->device);
 
   int64_t* batch_offset_q_array_data = nullptr;
   int64_t* batch_offset_o_array_data = nullptr;
@@ -687,8 +684,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, Tensor q, Tensor k_cache
     dim3 grid(1, 1, 1);
     dim3 block(128, 1, 1);
 
-    at::cuda::CUDAStream cuda_stream = at::cuda::getCurrentCUDAStream(device.index());
-    cudaStream_t raw_stream = cuda_stream.stream();
+    cudaStream_t raw_stream = get_stream(q->device);
 
     cudaError_t err = cudaStreamQuery(raw_stream);
     if (!(err == cudaSuccess || err == cudaErrorNotReady)) {

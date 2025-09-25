@@ -146,35 +146,6 @@ void register_graph_buffers(fptr_t _fa, Array<Array<int64_t>> handles,
   fa->register_graph_buffers(bytes, off);
 }
 
-/*
-void AllReduceSum(at::Tensor data, at::Tensor workspace, int64_t world_size, int64_t rank,
-                  int64_t num_ctas
-                  ) {
-  printf("AllReduce called with num_ctas = %d\n", (int)num_ctas);
-
-  float* workspace_ptr = workspace.data_ptr<float>();
-  auto dtype = data.scalar_type();
-  int hidden_size = data.size(-1);
-  int token_num = data.numel() / hidden_size;
-  auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
-  if (fusion_op.has_value()) {
-      auto fusion_op = fusion_op.value();
-  } else {
-      auto fusion_op = tensorrt_llm::kernels::AllReduceFusionOp::NONE;
-  }
-  auto stream = at::cuda::getCurrentCUDAStream();
-
-  auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-      reinterpret_cast<int64_t*>(workspace_ptr), world_size, rank, dtype, token_num, hidden_size,
-      fusion_op);
-
-  auto strat_config = tensorrt_llm::kernels::AllReduceStrategyConfig::PUSH_MODE;
-  auto strat_type = tensorrt_llm::kernels::AllReduceStrategyType::AUTO;
-
-  customAllReduce(params, dtype, strat_type, strat_config, fusion_op, stream, num_ctas);
-}
-*/
-
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_graph_buffer_ipc_meta, get_graph_buffer_ipc_meta);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_graph_buffers, register_graph_buffers);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dispose, dispose);

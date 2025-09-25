@@ -21,8 +21,6 @@
 #include <optional>
 
 #include "batch_prefill_sm90_config.inc"
-#include "pytorch_conversion_utils.h"
-#include "pytorch_extension_utils.h"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
