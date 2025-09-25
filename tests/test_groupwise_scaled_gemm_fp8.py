@@ -202,6 +202,11 @@ def test_fp8_groupwise_group_deepgemm(
     group_size,
     out_dtype,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip(
+            "group_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+        )
     torch.random.manual_seed(0)
     m_per_group = m // group_size
     if m_per_group < 128:
@@ -245,6 +250,11 @@ def test_fp8_groupwise_batch_deepgemm_masked(
     group_size,
     out_dtype,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip(
+            "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103."
+        )
     torch.random.manual_seed(0)
     n, k = nk
     a = torch.randn((group_size, m, k), device="cuda", dtype=torch.float32)
