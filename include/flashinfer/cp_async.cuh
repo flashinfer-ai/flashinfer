@@ -154,7 +154,7 @@ __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
     load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
   } else {
     load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
-    load_128b<prefetch_mode>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T));
+    load_128b<prefetch_mode>(smem_ptr + get_vec_size_128b<T>(), gmem_ptr + get_vec_size_128b<T>());
   }
 }
 
@@ -177,8 +177,8 @@ __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool p
     pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
   } else {
     pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
-    pred_load_128b<prefetch_mode, fill_mode>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T),
-                                             predicate);
+    pred_load_128b<prefetch_mode, fill_mode>(smem_ptr + get_vec_size_128b<T>(),
+                                             gmem_ptr + get_vec_size_128b<T>(), predicate);
   }
 }
 

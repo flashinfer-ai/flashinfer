@@ -108,7 +108,7 @@ template <typename T>
 cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
                     uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
                     bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = std::gcd(get_vec_size_128b<T>(), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -236,7 +236,7 @@ template <typename T>
 cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
                             uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
                             bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = std::gcd(get_vec_size_128b<T>(), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -273,7 +273,7 @@ template <typename T>
 cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
                          uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
                          bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = std::gcd(get_vec_size_128b<T>(), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
@@ -308,7 +308,7 @@ template <typename T>
 cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
                                  uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
                                  bool enable_pdl = false, cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = std::gcd(get_vec_size_128b<T>(), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
