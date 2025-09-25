@@ -2,7 +2,7 @@ import math
 
 import pytest
 import torch
-from conftest import VARLEN_INDPTR_PARAMS
+from tests.test_helpers.params import VARLEN_INDPTR_PARAMS
 
 import flashinfer
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported

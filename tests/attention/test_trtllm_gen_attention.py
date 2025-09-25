@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 from tests.test_helpers.utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
-from conftest import assert_close_with_mismatch_tolerance
+from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
