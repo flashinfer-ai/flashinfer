@@ -8,8 +8,6 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 
 pip install -e . -v
-pip install --upgrade nvidia-cudnn-cu12
-pip install --upgrade cuda-python==12.*
 
 EXIT_CODE=0
 
