@@ -371,7 +371,7 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
-            with tuse_torch_stream(orch.cuda.stream(s)):
+            with use_torch_stream(torch.cuda.stream(s)):
                 for _ in range(3):
                     o, lse = wrapper.run(
                         q_nope, q_pe, paged_ckv_cache, paged_kpe_cache, return_lse=True
