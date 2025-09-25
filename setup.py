@@ -16,8 +16,6 @@ limitations under the License.
 
 import os
 import platform
-import re
-import subprocess
 import sysconfig
 from pathlib import Path
 from packaging.version import Version
@@ -25,6 +23,7 @@ from typing import List, Mapping
 
 import setuptools
 from setuptools.dist import Distribution, strtobool
+from flashinfer.jit.cpp_ext import get_cuda_version
 
 root = Path(__file__).parent.resolve()
 aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
@@ -51,29 +50,6 @@ def generate_build_meta(aot_build_meta: dict) -> None:
     if len(aot_build_meta) != 0:
         build_meta_str += f"build_meta = {aot_build_meta!r}\n"
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
-
-
-def get_cuda_path() -> str:
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is not None:
-        return cuda_home
-    # get output of "which nvcc"
-    result = subprocess.run(["which", "nvcc"], capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError("Could not find nvcc")
-    return result.stdout.decode("utf-8").strip()
-
-
-def get_cuda_version() -> Version:
-    cuda_home = get_cuda_path()
-    nvcc = os.path.join(cuda_home, "bin/nvcc")
-    txt = subprocess.check_output([nvcc, "--version"], text=True)
-    matches = re.findall(r"release (\d+\.\d+),", txt)
-    if not matches:
-        raise RuntimeError(
-            f"Could not parse CUDA version from nvcc --version output: {txt}"
-        )
-    return Version(matches[0])
 
 
 ext_modules: List[setuptools.Extension] = []
