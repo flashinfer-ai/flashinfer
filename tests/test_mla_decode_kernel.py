@@ -7,6 +7,7 @@ from torch import nn
 
 import flashinfer
 from rope_reference import apply_rotary_emb, precompute_freqs_cis
+from flashinfer.utils import get_compute_capability
 
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):
@@ -399,6 +400,13 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 @pytest.mark.parametrize("kv_len", [640])
 @pytest.mark.parametrize("page_size", [16])
 def test_mla_decode_kernel(bsz, kv_len, page_size):
+    major, minor = get_compute_capability(torch.device("cuda"))
+    device_arch = major * 10 + minor
+    if device_arch != 80:
+        pytest.skip(
+            "MLA decode kernel is not supported on this GPU (SM{device_arch}). Supported architecture: SM80."
+        )
+
     dev_id = 0
 
     torch.manual_seed(666)

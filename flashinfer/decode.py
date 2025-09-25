@@ -61,6 +61,8 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    get_compute_capability,
+    GPUArchitectureError,
 )
 
 
@@ -1755,6 +1757,15 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+
+        # MLA decode kernel supports SM80 only
+        major, minor = get_compute_capability(q_nope.device)
+        device_arch = major * 10 + minor
+        if device_arch != 80:
+            raise GPUArchitectureError(
+                f"MLA decode kernel is not supported on this GPU (SM{device_arch}). "
+                "Supported architecture: SM80."
+            )
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
