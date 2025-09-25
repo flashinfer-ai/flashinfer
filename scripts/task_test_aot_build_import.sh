@@ -32,7 +32,7 @@ if cuda_ver is not None:
 print(" ".join(arches))
 ')
 
-python -c "import torch; print(torch.version)"
+python -c "import torch; print(torch.__version__)"
 python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
 python -m flashinfer.aot
 python -m build --wheel
