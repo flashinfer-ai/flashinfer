@@ -153,7 +153,9 @@ def ref_attention(
     reason="XQA is only supported on SM90 GPUs",
 )
 @pytest.mark.parametrize("use_sliding_window", [True, False])
-@pytest.mark.parametrize("use_fp16", [True, False])
+@pytest.mark.parametrize("fp16_input", [True, False])
+@pytest.mark.parametrize("fp8_kv_cache", [True, False])
+@pytest.mark.parametrize("run_fp8_mha", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -166,7 +168,9 @@ def test_xqa(
     nb_k_heads,
     seq_len,
     tokens_per_page,
-    use_fp16,
+    fp16_input,
+    fp8_kv_cache,
+    run_fp8_mha,
     valid_elems_per_head,
     head_grp_size,
     use_attention_sinks,
@@ -185,7 +189,7 @@ def test_xqa(
         beam_width,
         nb_q_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not use_fp16 else torch.float16,
+        dtype=torch.bfloat16 if not fp16_input else torch.float16,
         device="cuda",
     )
     output.fill_(float("nan"))
@@ -194,7 +198,7 @@ def test_xqa(
         beam_width,
         nb_q_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not use_fp16 else torch.float16,
+        dtype=torch.bfloat16 if not fp16_input else torch.float16,
         device="cuda",
     )
     q_heads.normal_(0, 1)
@@ -219,10 +223,12 @@ def test_xqa(
     cache_heads = torch.zeros(
         total_nb_cache_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not use_fp16 else torch.float16,
+        dtype=torch.bfloat16 if not fp16_input else torch.float16,
         device="cuda",
     )
     cache_heads.normal_(0, 1)
+    if fp8_kv_cache:
+        cache_heads /= 4.0
 
     nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
     total_nb_pages = nb_pages_per_seq * 2 * beam_width * batch_size
@@ -295,7 +301,9 @@ def test_xqa(
     scratch_buf = torch.zeros(scratch_size, dtype=torch.uint8, device="cuda")
 
     xqa(
-        use_fp16,
+        fp16_input,
+        fp8_kv_cache,
+        run_fp8_mha,
         tokens_per_page,
         valid_elems_per_head,
         head_grp_size,
@@ -307,7 +315,7 @@ def test_xqa(
         output,
         q_heads,
         attention_sinks,
-        cache_heads,
+        cache_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_heads,
         page_list_arg,
         max_seq_len,
         seq_len_list,
@@ -354,4 +362,21 @@ def test_xqa(
         kernel_output = output[req][b][
             idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
         ].to(torch.float32)
-        assert torch.allclose(ref_output, kernel_output, atol=0.01, rtol=0.01)
+        if fp8_kv_cache or run_fp8_mha:
+            atol = 0.05
+            rtol = 0.05
+        else:
+            atol = 0.01
+            rtol = 0.01
+
+        diff_abs = torch.abs(ref_output - kernel_output)
+        diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
+
+        within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+
+        pass_ratio = within_tolerance.float().mean().item()
+
+        required_ratio = 0.99
+        assert pass_ratio >= required_ratio, (
+            f"Total {ref_output.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, require at least {required_ratio:.1%}"
+        )

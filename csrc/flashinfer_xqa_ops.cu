@@ -16,8 +16,8 @@
 
 #include "pytorch_extension_utils.h"
 
-void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, at::Tensor output,
+void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+                 int64_t slidingWinSize, double qScale, at::Tensor output,
 #if LOW_PREC_OUTPUT
                  at::Tensor rcpOutScale,
 #endif
