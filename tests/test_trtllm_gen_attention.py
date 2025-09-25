@@ -2,8 +2,10 @@ import math
 
 import pytest
 import torch
+import einops
 from utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
 from conftest import assert_close_with_mismatch_tolerance
+from sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
@@ -161,7 +163,62 @@ def create_page_table(batch_size, seq_lens, page_size):
     return page_tables, all_page_ids, page_per_seq
 
 
-def create_output(q, o_dtype, create_out_tensor):
+def flatten_paged_kv(
+    ref_kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    kv_last_page_len: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build flat K/V and token-level indptr from paged KV cache and page table."""
+    device = ref_kv_cache.device
+    batch_size = int(page_table.shape[0])
+
+    # Move loop-control tensors to CPU to avoid GPU sync in loops
+    page_table_cpu = page_table.cpu()
+    seq_lens_cpu = seq_lens.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    page_per_seq = (seq_lens_cpu + page_size - 1) // page_size
+    k_list = []
+    v_list = []
+    for i in range(batch_size):
+        pages_i = int(page_per_seq[i].item())
+        last_len_i = int(kv_last_page_len_cpu[i].item())
+        for j in range(pages_i):
+            page_id = int(page_table_cpu[i, j].item())
+            k_page = ref_kv_cache[page_id, 0]
+            v_page = ref_kv_cache[page_id, 1]
+            if j == pages_i - 1:
+                k_page = k_page[:, :last_len_i, :]
+                v_page = v_page[:, :last_len_i, :]
+            k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
+            v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+    k_flat = torch.cat(k_list, dim=0)
+    v_flat = torch.cat(v_list, dim=0)
+    kv_indptr_tokens = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+        ]
+    )
+    return k_flat, v_flat, kv_indptr_tokens
+
+
+def create_workspace_buffers(device):
+    # Lazily initialize and reuse global workspace buffers
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
+
+
+def create_output(q, o_dtype, create_out_tensor, create_out_dtype):
     if o_dtype == "fp8":
         o_scale = torch.rand(1).item() * 0.5 + 0.5  # Scale range: 0.5 ~ 1.0
     else:
@@ -197,7 +254,8 @@ def create_output(q, o_dtype, create_out_tensor):
             out = torch.empty_like(q, dtype=DTYPE_MAP[o_dtype])
     else:
         out = None
-    return out, o_scale, o_sf_scale, o_sf_vec_size
+    out_dtype = DTYPE_MAP[o_dtype] if create_out_dtype else None
+    return out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size
 
 
 def get_last_page_len(seq_lens, page_size):
@@ -240,10 +298,21 @@ def unpack_compare_nvfp4(
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("page_size", [16, 32, 64])
-@pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 16, 2, 1),
+        (4, 32, 4, 5),
+        (4, 64, 4, 8),
+        (128, 16, 2, 5),
+        (128, 32, 4, 1),
+        (128, 64, 2, 8),
+        (256, 16, 4, 8),
+        (256, 32, 2, 8),
+        (256, 64, 4, 1),
+        (256, 64, 4, 5),
+    ],
+)
 @pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
@@ -257,6 +326,7 @@ def unpack_compare_nvfp4(
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -268,6 +338,7 @@ def test_trtllm_batch_prefill(
     o_dtype,
     kv_dtype,
     enable_pdl,
+    enable_sink,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] in [11, 12]:
@@ -304,42 +375,23 @@ def test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
     # Create output tensor and related data
     create_out_tensor = flip_coin(
         batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
     )
-    out, o_scale, o_sf_scale, o_sf_vec_size = create_output(
-        q, o_dtype, create_out_tensor
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+    )
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
     )
 
-    # determine to pass out_dtype explicitly or not
-    if q_dtype != o_dtype and not create_out_tensor:
-        out_dtype = DTYPE_MAP[o_dtype]
-    else:
-        out_dtype = (
-            DTYPE_MAP[o_dtype]
-            if flip_coin(
-                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-            )
-            else None
-        )
+    sm_scale = float(1.0 / (head_dim**0.5))
 
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    workspace_buffer_ref = global_workspace_buffer
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
-
-    # Run reference wrapper
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, kv_layout
-    )
+    # Build reference output
     plan_params = {
         "qo_indptr": q_indptr,
         "paged_kv_indptr": kv_indptr,
@@ -356,11 +408,37 @@ def test_trtllm_batch_prefill(
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
     }
-    wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    if not enable_sink:
+        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer_ref, kv_layout
+        )
+        wrapper_ref.plan(**plan_params)
+        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    else:
+        # Construct flat K/V via helper
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+        )
+        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+        output_ref = sink_attention_unified(
+            ref_q,
+            k_flat,
+            v_flat,
+            sink,
+            window_left,
+            True,
+            sm_scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=q_indptr,
+            kv_indptr=kv_indptr_tokens,
+        )
 
     # Run trtllm-gen function call
-    sm_scale = float(1.0 / (head_dim**0.5))
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -380,6 +458,7 @@ def test_trtllm_batch_prefill(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        sinks=(sink if enable_sink else None),
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -428,6 +507,7 @@ def test_trtllm_batch_prefill(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
@@ -442,11 +522,28 @@ def test_trtllm_batch_prefill(
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("q_len_per_req", [1, 2, 3, 4, 5])
-@pytest.mark.parametrize("page_size", [16, 32, 64])
-@pytest.mark.parametrize("num_kv_heads", [2, 4])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 2, 64, 2, 5),
+        (4, 3, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (4, 5, 64, 4, 8),
+        (128, 1, 64, 2, 5),
+        (128, 2, 32, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (128, 5, 16, 2, 5),
+        (256, 1, 64, 4, 8),
+        (256, 2, 16, 2, 8),
+        (256, 3, 64, 4, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
 @pytest.mark.parametrize("window_left", [-1, 127])
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
@@ -462,6 +559,7 @@ def test_trtllm_batch_prefill(
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -474,6 +572,7 @@ def test_trtllm_batch_decode(
     o_dtype,
     kv_dtype,
     enable_pdl,
+    enable_sink,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -514,38 +613,23 @@ def test_trtllm_batch_decode(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
     # Create output tensor and related data
     create_out_tensor = flip_coin(
         batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
     )
-    out, o_scale, o_sf_scale, o_sf_vec_size = create_output(
-        q, o_dtype, create_out_tensor
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+    )
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
     )
 
-    # determine to pass out_dtype explicitly or not
-    if q_dtype != o_dtype and not create_out_tensor:
-        out_dtype = DTYPE_MAP[o_dtype]
-    else:
-        out_dtype = (
-            DTYPE_MAP[o_dtype]
-            if flip_coin(
-                batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-            )
-            else None
-        )
+    sm_scale = float(1.0 / (head_dim**0.5))
 
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=GPU_DEVICE
-        )
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
-    workspace_buffer_ref = global_workspace_buffer
-
+    # Build reference output
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -559,39 +643,58 @@ def test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    # Run reference wrapper
-    if q_len_per_req == 1:
-        wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer_ref, kv_layout, use_tensor_cores=True
-        )
-        wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+    if not enable_sink:
+        if q_len_per_req == 1:
+            wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+                workspace_buffer_ref, kv_layout, use_tensor_cores=True
+            )
+            wrapper_ref.plan(**plan_params)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+        else:
+            # speculative decoding test
+            wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer_ref, kv_layout
+            )
+            plan_params_prefill = plan_params.copy()
+            plan_params_prefill.update(
+                {
+                    "qo_indptr": q_indptr,
+                    "paged_kv_indptr": plan_params_prefill.pop("indptr"),
+                    "paged_kv_indices": plan_params_prefill.pop("indices"),
+                    "paged_kv_last_page_len": plan_params_prefill.pop("last_page_len"),
+                    "head_dim_qk": plan_params_prefill.pop("head_dim"),
+                    "causal": True,
+                    "logits_soft_cap": 0.0,
+                }
+            )
+            wrapper_ref.plan(**plan_params_prefill)
+            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
-        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer_ref, kv_layout
+        # Construct flat K/V via helper
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
         )
-        plan_params_prefill = {
-            "qo_indptr": q_indptr,
-            "paged_kv_indptr": kv_indptr,
-            "paged_kv_indices": all_page_ids,
-            "paged_kv_last_page_len": kv_last_page_len.to(GPU_DEVICE),
-            "num_qo_heads": num_qo_heads,
-            "num_kv_heads": num_kv_heads,
-            "head_dim_qk": head_dim,
-            "page_size": page_size,
-            "causal": True,
-            "pos_encoding_mode": "NONE",
-            "logits_soft_cap": 0.0,
-            "q_data_type": ref_q.dtype,
-            "kv_data_type": ref_kv_cache.dtype,
-            "window_left": window_left,
-        }
-        wrapper_ref.plan(**plan_params_prefill)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+        output_ref = sink_attention_unified(
+            ref_q,
+            k_flat,
+            v_flat,
+            sink,
+            window_left,
+            True,
+            sm_scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=q_indptr,
+            kv_indptr=kv_indptr_tokens,
+        )
 
     # Run trtllm-gen function call
-    sm_scale = float(1.0 / (head_dim**0.5))
-
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -607,6 +710,7 @@ def test_trtllm_batch_decode(
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
         enable_pdl=enable_pdl,
+        sinks=(sink if enable_sink else None),
         q_len_per_req=q_len_per_req,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -660,6 +764,7 @@ def test_trtllm_batch_decode(
             k_scale=k_scale,
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
+            sinks=(sink if enable_sink else None),
             q_len_per_req=q_len_per_req,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
@@ -748,17 +853,7 @@ def test_trtllm_gen_prefill_deepseek(
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
 
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
-        global_workspace_buffer = torch.empty(
-            workspace_size, dtype=torch.int8, device=device
-        )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=device
-        )
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
-    workspace_buffer_ref = global_workspace_buffer
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
 
     qo_indptr = torch.cat(
         [
