@@ -19,7 +19,6 @@
 #include <tvm/ffi/container/tuple.h>
 
 #include <cstdint>
-#include <optional>
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/thop/utils.h"
