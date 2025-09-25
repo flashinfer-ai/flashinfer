@@ -7,7 +7,7 @@ from torch import nn
 
 import flashinfer
 from tests.test_helpers.rope_reference import apply_rotary_emb, precompute_freqs_cis
-
+from tests.test_helpers.test_helpers import skip_on_gpu_arch_error
 def wmape(target: torch.Tensor, preds: torch.Tensor):
     sum_abs_error = (preds - target).abs().sum().detach().item()
     sum_scale = target.abs().sum().detach().item()
@@ -393,6 +393,8 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 
         return output
 
+
+@skip_on_gpu_arch_error
 @pytest.mark.parametrize("bsz", [6])
 @pytest.mark.parametrize("kv_len", [640])
 @pytest.mark.parametrize("page_size", [16])

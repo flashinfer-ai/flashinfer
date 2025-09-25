@@ -139,3 +139,13 @@ def pytest_runtest_call(item):
             pytest.skip("Skipping due to OOM")
         else:
             raise
+
+def skip_on_gpu_arch_error(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except flashinfer.utils.GPUArchitectureError as e:
+            pytest.skip(e.msg)
+
+    return wrapper
