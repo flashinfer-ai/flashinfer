@@ -66,7 +66,6 @@ include-package-data = false
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
-"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 

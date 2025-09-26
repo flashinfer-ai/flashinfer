@@ -6,8 +6,8 @@ backend-path = ["."]
 [project]
 name = "flashinfer-jit-cache"
 dynamic = ["version"]
-description = "Pre-compiled AOT modules for FlashInfer"
-readme = {text = "This package contains pre-compiled AOT modules for FlashInfer. It provides all necessary compiled shared libraries (.so files) for optimized inference operations.", content-type = "text/plain"}
+description = "Pre-compiled JIT Cache for FlashInfer"
+readme = {text = "This package contains pre-compiled JIT Cache for FlashInfer. It provides most of the necessary shared libraries (.so files) of FlashInfer.", content-type = "text/plain"}
 requires-python = ">=3.8"
 license = {text = "Apache-2.0"}
 authors = [
@@ -21,7 +21,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

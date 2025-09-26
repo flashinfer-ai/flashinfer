@@ -25,7 +25,7 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Iterator
+from typing import List, Tuple, Iterator, Optional
 
 import torch
 import torch.version
@@ -537,7 +537,7 @@ def copy_built_kernels(
 
 
 def compile_and_package_modules(
-    out_dir: Path,
+    out_dir: Optional[Path],
     build_dir: Path,
     project_root: Path,
     config: dict = None,
@@ -585,7 +585,8 @@ def compile_and_package_modules(
     # Print summary
     if verbose:
         print("AOT build summary:")
-        print("  out_dir:", out_dir)
+        if out_dir is not None:
+            print("  out_dir:", out_dir)
         print("  build_dir:", build_dir)
         print("  fa2_head_dim:", config["fa2_head_dim"])
         print("  fa3_head_dim:", config["fa3_head_dim"])
@@ -636,7 +637,8 @@ def compile_and_package_modules(
     build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
 
     # Copy built kernels
-    copy_built_kernels(jit_specs, out_dir)
+    if out_dir is not None:
+        copy_built_kernels(jit_specs, out_dir)
     if verbose:
         print("AOT kernels saved to:", out_dir)
 
@@ -782,8 +784,8 @@ def main():
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
     config = get_default_config()
-    out_dir = project_root / "aot-ops"
-    build_dir = project_root / "build" / "aot"
+    build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
+    out_dir: Optional[Path] = None
 
     # Override with command line arguments
     if args.out_dir:
