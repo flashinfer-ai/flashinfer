@@ -94,7 +94,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      nullptr, enable_pdl, at::cuda::getCurrentCUDAStream(self.get_device()));
+      /*mask=*/nullptr, enable_pdl, at::cuda::getCurrentCUDAStream(self.get_device()));
 
   if (sfUseUE8M0) {
     if (self.scalar_type() == at::ScalarType::Half) {

@@ -102,7 +102,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
       &config,
       quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>, b,
       m, n, padded_n, input, nullptr, reinterpret_cast<uint32_t*>(output),
-      reinterpret_cast<uint32_t*>(SFOuput), layout, /*mask*/nullptr);
+      reinterpret_cast<uint32_t*>(SFOuput), layout, /*mask=*/nullptr);
 }
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
