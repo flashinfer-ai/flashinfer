@@ -17,8 +17,8 @@
 #include "../pytorch_extension_utils.h"
 #include "mha.h"
 
-void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, at::Tensor output,
+void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+                 int64_t slidingWinSize, double qScale, at::Tensor output,
 #if LOW_PREC_OUTPUT
                  at::Tensor rcpOutScale,
 #endif
@@ -33,21 +33,22 @@ void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingW
   float const* attentionSinksPtr = attentionSinks.defined()
                                        ? reinterpret_cast<float const*>(attentionSinks.data_ptr())
                                        : nullptr;
+  auto const mha_func = run_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
 
-  launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
-                      reinterpret_cast<OutputHead*>(output.data_ptr()),
+  mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
+           reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-                      reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
+           reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
 #endif
-                      reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
-                      reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
-                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
-                      reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
+           reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
+           reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
+           reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+           reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+           reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
 #if SPEC_DEC
-                      qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
-                      reinterpret_cast<MaskType const*>(mask.data_ptr()),
+           qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
+           reinterpret_cast<MaskType const*>(mask.data_ptr()),
 #endif
-                      reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-                      reinterpret_cast<void*>(scratch.data_ptr()), stream);
+           reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+           reinterpret_cast<void*>(scratch.data_ptr()), stream);
 }

@@ -31,7 +31,7 @@ from .utils import (
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
     "-DBEAM_WIDTH=1",
-    "-DCACHE_ELEM_ENUM=0",
+    "-DUSE_INPUT_KV=0",
     "-DUSE_CUSTOM_BARRIER=1",
     "-DLOW_PREC_OUTPUT=0",
     "-DSPEC_DEC=0",
@@ -39,16 +39,22 @@ xqa_nvcc_flags = [
 
 
 def gen_xqa_module(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
     use_sliding_window: bool,
 ) -> JitSpec:
-    if use_fp16:
-        flag_use_fp16 = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
+    if fp16_input:
+        flag_data_type = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
     else:
-        flag_use_fp16 = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
+        flag_data_type = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
+
+    if fp8_kv_cache:
+        flag_data_type.append("-DCACHE_ELEM_ENUM=2")
+    else:
+        flag_data_type.append("-DCACHE_ELEM_ENUM=0")
 
     if token_per_page not in [16, 32, 64, 128]:
         raise ValueError(
@@ -70,9 +76,11 @@ def gen_xqa_module(
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
     return gen_jit_spec(
-        f"xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
+        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_ops.cu",
         ],
@@ -80,29 +88,37 @@ def gen_xqa_module(
         + sm90a_nvcc_flags
         + flag_tokens_per_page
         + flag_head_size
-        + flag_use_fp16
+        + flag_data_type
         + flag_head_grp_size
         + flag_sliding_window,
+        extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
 
 
 @functools.cache
 def get_xqa_module(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
     use_sliding_window: bool,
 ):
     module = gen_xqa_module(
-        use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
+        fp16_input,
+        fp8_kv_cache,
+        token_per_page,
+        head_size,
+        head_grp_size,
+        use_sliding_window,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
+        f"flashinfer::xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "scratch"),
     )
     def xqa(
+        run_fp8_mha: bool,
         multiProcessorCount: int,
         nbKHeads: int,
         slidingWinSize: int,
@@ -120,6 +136,7 @@ def get_xqa_module(
         scratch: torch.Tensor,
     ) -> None:
         module.xqa_wrapper.default(
+            run_fp8_mha,
             multiProcessorCount,
             nbKHeads,
             slidingWinSize,
@@ -138,9 +155,10 @@ def get_xqa_module(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}"
+        f"flashinfer::xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa(
+        run_fp8_mha: bool,
         multiProcessorCount: int,
         nbKHeads: int,
         slidingWinSize: int,
@@ -165,7 +183,9 @@ def get_xqa_module(
 
 
 def xqa(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
+    run_fp8_mha: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
@@ -189,9 +209,15 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] != 9:
         raise RuntimeError("XQA is only supported on SM90 GPUs")
     xqa_module = get_xqa_module(
-        use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
+        fp16_input,
+        fp8_kv_cache,
+        token_per_page,
+        head_size,
+        head_grp_size,
+        use_sliding_window,
     )
     xqa_module.xqa(
+        run_fp8_mha,
         multiProcessorCount,
         nbKHeads,
         sliding_win_size if use_sliding_window else 0,
