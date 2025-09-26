@@ -557,6 +557,94 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_radik_top_k_sampling(batch_size, vocab_size, distribution, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = distribution((batch_size, vocab_size), "cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_radik_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    k = torch.randint(1, k + 1, (batch_size,), device="cuda:0")
+    pivot = sorted_prob[torch.arange(batch_size), k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = flashinfer.sampling.radik_sampling_from_probs(normalized_prob, k)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_radik_top_k_sampling_freq(vocab_size, distribution, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    logits = distribution((1, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    sorted_prob, _ = torch.sort(probs, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (probs >= pivot.unsqueeze(-1)).int()
+
+    renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
+    num_trials = 5000000
+    samples = flashinfer.sampling.radik_sampling_from_probs(
+        probs,
+        k,
+        indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device),
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / num_trials
+    assert torch.all(mask[torch.arange(1), samples] == 1)
+    similarity = torch.cosine_similarity(freq, renorm_probs)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))

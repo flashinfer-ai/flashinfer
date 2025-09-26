@@ -195,6 +195,15 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
+def _is_buf_cached(name: str, device: torch.device) -> Tuple[bool, int]:
+    key = (name, device)
+    if key in _cache_buf:
+        buf = _cache_buf[key]
+        bytes_size = buf.numel() * buf.element_size()
+        return (True, bytes_size)
+    return (False, 0)
+
+
 # find the least power of 2 that is greater than or equal to x
 def _ceil_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
@@ -743,3 +752,34 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+def get_radik_workspace_size(probs: torch.Tensor, top_k: Union[torch.Tensor, int]):
+    """
+    Calculate the workspace size required for the radix select algorithm
+
+    Args:
+        probs: The input probabilities
+        top_k: The k value in top-k selection
+
+    Returns:
+        size_in_bytes: Required workspace size in bytes
+    """
+    k = top_k.max() if isinstance(top_k, torch.Tensor) else top_k
+    task_num = probs.size(0)
+    vocab_size = probs.size(1)
+
+    sizeof_CompT = 4
+    sizeof_int = 4
+    sizeof_T = probs.element_size()
+    sizeof_IdxType = 4
+
+    size_in_bytes = task_num * (
+        sizeof_CompT * vocab_size * 2  # buffer for val
+        + sizeof_int * (1**12)  # buffer for hist (4096 = 2^12)
+        + sizeof_int * 5  # buffer for globalCount,old_taskLen,new_taskLen,K,binId
+        + sizeof_T * k  # buffer for top-k select result
+        + sizeof_IdxType * k  # buffer for top-k select result
+    )
+
+    return size_in_bytes
