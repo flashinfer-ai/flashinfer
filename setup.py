@@ -15,19 +15,12 @@ limitations under the License.
 """
 
 import os
-import platform
-import re
-import subprocess
-import sysconfig
 from pathlib import Path
 from typing import List, Mapping
 
 import setuptools
-from setuptools.dist import Distribution, strtobool
 
 root = Path(__file__).parent.resolve()
-aot_ops_package_dir = root / "build" / "aot-ops-package-dir"
-enable_aot = aot_ops_package_dir.is_dir() and any(aot_ops_package_dir.iterdir())
 
 
 def write_if_different(path: Path, content: str) -> None:
@@ -45,10 +38,8 @@ def get_version():
     return f"{package_version}+{local_version}"
 
 
-def generate_build_meta(aot_build_meta: dict) -> None:
+def generate_build_meta() -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
-    if len(aot_build_meta) != 0:
-        build_meta_str += f"build_meta = {aot_build_meta!r}\n"
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 
@@ -67,54 +58,11 @@ install_requires = [
     "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
-generate_build_meta({})
-
-if enable_aot:
-    import torch
-    import torch.utils.cpp_extension as torch_cpp_ext
-    from packaging.version import Version
-
-    def get_cuda_version() -> Version:
-        if torch_cpp_ext.CUDA_HOME is None:
-            nvcc = "nvcc"
-        else:
-            nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
-        txt = subprocess.check_output([nvcc, "--version"], text=True)
-        return Version(re.findall(r"release (\d+\.\d+),", txt)[0])
-
-    cuda_version = get_cuda_version()
-    torch_full_version = Version(torch.__version__)
-    torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
-    install_requires = [req for req in install_requires if not req.startswith("torch ")]
-    install_requires.append(f"torch == {torch_version}.*")
-
-    aot_build_meta = {}
-    aot_build_meta["cuda_major"] = cuda_version.major
-    aot_build_meta["cuda_minor"] = cuda_version.minor
-    aot_build_meta["torch"] = torch_version
-    aot_build_meta["python"] = platform.python_version()
-    aot_build_meta["FLASHINFER_CUDA_ARCH_LIST"] = os.environ.get(
-        "FLASHINFER_CUDA_ARCH_LIST"
-    )
-    generate_build_meta(aot_build_meta)
-
-
-class AotDistribution(Distribution):
-    def has_ext_modules(self) -> bool:
-        return enable_aot
-
-
-bdist_wheel_options = {}
-use_limited_api = strtobool(os.getenv("FLASHINFER_AOT_USE_PY_LIMITED_API", "1"))
-
-if use_limited_api and not sysconfig.get_config_var("Py_GIL_DISABLED"):
-    bdist_wheel_options["py_limited_api"] = "cp39"
+generate_build_meta()
 
 setuptools.setup(
     version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
-    options={"bdist_wheel": bdist_wheel_options},
-    distclass=AotDistribution,
 )
