@@ -64,13 +64,13 @@ def get_cuda_version() -> Version:
                 f"Could not parse CUDA version from nvcc --version output: {txt}"
             )
         return Version(matches[0])
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
         # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
         if torch.version.cuda is None:
             raise RuntimeError(
                 "nvcc not found and PyTorch is not built with CUDA support. "
                 "Could not determine CUDA version."
-            )
+            ) from e
         return Version(torch.version.cuda)
 
 
