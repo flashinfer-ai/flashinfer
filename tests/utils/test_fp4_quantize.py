@@ -2,7 +2,7 @@ import functools
 
 import pytest
 import torch
-from utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
 
 from flashinfer import (
     block_scale_interleave,

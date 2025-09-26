@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch import nn
 
 import flashinfer
-from rope_reference import apply_rotary_emb, precompute_freqs_cis
-from conftest import skip_on_gpu_arch_error
+from tests.test_helpers.rope_reference import apply_rotary_emb, precompute_freqs_cis
+from tests.test_helpers.test_helpers import skip_on_gpu_arch_error
 
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):

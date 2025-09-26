@@ -16,7 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
-from rope_reference import *
+from tests.test_helpers.rope_reference import *
 
 import flashinfer
 

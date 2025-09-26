@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from sink_attention_reference import sink_attention_unified
+from tests.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map

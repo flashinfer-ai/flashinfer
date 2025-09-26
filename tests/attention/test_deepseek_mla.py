@@ -18,7 +18,7 @@ import math
 
 import pytest
 import torch
-from conftest import clear_cuda_cache
+from tests.test_helpers.test_helpers import clear_cuda_cache
 
 import flashinfer
 from flashinfer.jit import build_jit_specs
