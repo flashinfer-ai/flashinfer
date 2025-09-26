@@ -836,12 +836,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         num_kv_heads : int
@@ -897,6 +897,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
         self._workspace_size = (
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
@@ -1611,12 +1621,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         head_dim_compressed_kv : int
@@ -1646,6 +1656,16 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

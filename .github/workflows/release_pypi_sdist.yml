@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Validate tag format
         run: |
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z0-9]+)?$ ]]; then
             echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
             exit 1
           fi

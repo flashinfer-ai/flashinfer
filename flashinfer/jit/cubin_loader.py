@@ -106,12 +106,6 @@ def download_file(
         )
         return False
 
-    finally:
-        # Clean up the lock file
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-            logger.info(f"Lock file {lock_path} removed.")
-
 
 def load_cubin(cubin_path, sha256) -> bytes:
     """

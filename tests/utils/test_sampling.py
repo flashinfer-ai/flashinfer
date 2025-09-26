@@ -557,6 +557,152 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
+def test_check_tensor_param_min_p(batch_size, vocab_size, p):
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # 1: Float p works and returns samples of shape (batch_size,).
+    samples = flashinfer.sampling.min_p_sampling_from_probs(normalized_prob, p)
+    assert samples.shape == (batch_size,)
+
+    # 2: 2D tensor raises error.
+    with pytest.raises(
+        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+    ):
+        flashinfer.sampling.min_p_sampling_from_probs(
+            normalized_prob,
+            torch.tensor(
+                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+            ),
+        )
+
+    # 3: 0D tensor raises error.
+    with pytest.raises(
+        ValueError,
+        match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
+    ):
+        flashinfer.sampling.min_p_sampling_from_probs(
+            normalized_prob, torch.tensor(p, dtype=torch.int, device="cuda:0")
+        )
+
+    # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
+    if batch_size > 1:
+        with pytest.raises(
+            ValueError, match="Sampling parameter tensor batch size mismatch"
+        ):
+            flashinfer.sampling.min_p_sampling_from_probs(
+                normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
+            )
+
+    # 5: 1D tensor with the correct batch size works.
+    samples = flashinfer.sampling.min_p_sampling_from_probs(
+        normalized_prob,
+        torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+    )
+    assert samples.shape == (batch_size,)
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_check_tensor_param_top_p(batch_size, vocab_size, p):
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # 1: Float p has the same shape as probs.
+    samples = flashinfer.sampling.top_p_renorm_probs(normalized_prob, p)
+    assert samples.shape == normalized_prob.shape
+
+    # 2: 2D tensor raises error.
+    with pytest.raises(
+        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+    ):
+        flashinfer.sampling.top_p_renorm_probs(
+            normalized_prob,
+            torch.tensor(
+                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+            ),
+        )
+
+    # 3: 0D tensor raises error.
+    with pytest.raises(
+        ValueError,
+        match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
+    ):
+        flashinfer.sampling.top_p_renorm_probs(
+            normalized_prob, torch.tensor(p, dtype=torch.int, device="cuda:0")
+        )
+
+    # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
+    if batch_size > 1:
+        with pytest.raises(
+            ValueError, match="Sampling parameter tensor batch size mismatch"
+        ):
+            flashinfer.sampling.top_p_renorm_probs(
+                normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
+            )
+
+    # 5: 1D tensor with the correct batch size works.
+    samples = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob,
+        torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+    )
+    assert samples.shape == normalized_prob.shape
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_check_tensor_param_top_k(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # 1: Scalar k has the same shape as probs.
+    samples = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
+    assert samples.shape == normalized_prob.shape
+
+    # 2: 2D tensor raises error.
+    with pytest.raises(
+        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+    ):
+        flashinfer.sampling.top_k_renorm_probs(
+            normalized_prob,
+            torch.tensor(
+                [[k] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+            ),
+        )
+
+    # 3: 0D tensor raises error.
+    with pytest.raises(
+        ValueError,
+        match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
+    ):
+        flashinfer.sampling.top_k_renorm_probs(
+            normalized_prob, torch.tensor(k, dtype=torch.int, device="cuda:0")
+        )
+
+    # 4: 1D tensor with a wrong shape raises error (only when batch_size > 1).
+    if batch_size > 1:
+        with pytest.raises(
+            ValueError, match="Sampling parameter tensor batch size mismatch"
+        ):
+            flashinfer.sampling.top_k_renorm_probs(
+                normalized_prob, torch.tensor([k], dtype=torch.int, device="cuda:0")
+            )
+
+    # 5: 1D tensor with the correct batch size works.
+    samples = flashinfer.sampling.top_k_renorm_probs(
+        normalized_prob,
+        torch.tensor([k] * batch_size, dtype=torch.int, device="cuda:0"),
+    )
+    assert samples.shape == normalized_prob.shape
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
