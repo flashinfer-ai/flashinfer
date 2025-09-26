@@ -55,13 +55,18 @@ def get_cuda_version() -> Version:
         nvcc = "nvcc"
     else:
         nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
-    txt = subprocess.check_output([nvcc, "--version"], text=True)
-    matches = re.findall(r"release (\d+\.\d+),", txt)
-    if not matches:
-        raise RuntimeError(
-            f"Could not parse CUDA version from nvcc --version output: {txt}"
-        )
-    return Version(matches[0])
+    # Try to query nvcc for CUDA version; if nvcc is unavailable, fall back to torch.version.cuda
+    try:
+        txt = subprocess.check_output([nvcc, "--version"], text=True)
+        matches = re.findall(r"release (\d+\.\d+),", txt)
+        if not matches:
+            raise RuntimeError(
+                f"Could not parse CUDA version from nvcc --version output: {txt}"
+            )
+        return Version(matches[0])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
+        return Version(torch.version.cuda)
 
 
 def is_cuda_version_at_least(version_str: str) -> bool:
