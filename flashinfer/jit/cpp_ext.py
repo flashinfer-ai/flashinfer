@@ -66,6 +66,11 @@ def get_cuda_version() -> Version:
         return Version(matches[0])
     except (FileNotFoundError, subprocess.CalledProcessError):
         # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
+        if torch.version.cuda is None:
+            raise RuntimeError(
+                "nvcc not found and PyTorch is not built with CUDA support. "
+                "Could not determine CUDA version."
+            )
         return Version(torch.version.cuda)
 
 
