@@ -38,6 +38,7 @@ from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
+    trtllm_bf16_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -984,6 +985,142 @@ class FP8PerTensorMoe(Moe):
 
 
 # ====================================================================================
+# BF16 Implementation
+# ====================================================================================
+
+
+class BF16Moe(Moe):
+    """BF16 MoE implementation."""
+
+    def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
+        """No scaling for weights."""
+        return {
+            "hidden_states_scale_global": None,
+            "gemm1_weights": gemm1_weights.to(torch.bfloat16),
+            "gemm1_scales": None,
+            "gemm1_scales_global": None,
+            "gemm2_weights": gemm2_weights.to(torch.bfloat16),
+            "gemm2_scales": None,
+            "gemm2_scales_global": None,
+        }
+
+    def quantize_inputs(self, hidden_states, *unused_args):
+        """No scaling for hidden states."""
+        return {
+            "hidden_states": hidden_states.to(torch.bfloat16),
+            "hidden_states_scale": None,
+        }
+
+    def prepare_static_weights_for_kernel(
+        self,
+        args_dequant,
+        args,
+        gemm1_weights_orig,
+        gemm2_weights_orig,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    ):
+        """Prepare quantized weights for kernel (done offline with weights)."""
+
+        # Use shuffled weights with BlockMajorK layout for better performance
+        use_shuffled_weight = weight_processing["use_shuffled_weight"]
+        weight_layout = weight_processing["layout"]
+
+        if use_shuffled_weight:
+            # FIXME: this depends on the kernel internals
+            epilogue_tile_m = 128
+
+            # Reorder rows of W1 for fused gated activation
+            gemm1_weights_bf16_interleaved = []
+            for i in range(num_experts):
+                gemm1_weights_bf16_interleaved.append(
+                    reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
+                )
+
+            # Stack weights and scales for all experts
+            gemm1_weights_bf16_interleaved = torch.stack(
+                gemm1_weights_bf16_interleaved
+            ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+
+            # Shuffle weights and scaling factors for transposed mma output
+            gemm1_weights_bf16_shuffled = []
+            gemm2_weights_bf16_shuffled = []
+            for i in range(num_experts):
+                tmp_weights1 = shuffle_matrix_a(
+                    args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+                )
+                tmp_weights2 = shuffle_matrix_a(
+                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                )
+
+                if weight_layout == WeightLayout.BlockMajorK:
+                    block_k = 128
+                    tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                    tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
+
+                gemm1_weights_bf16_shuffled.append(tmp_weights1)
+                gemm2_weights_bf16_shuffled.append(tmp_weights2)
+
+            # Stack weights for all experts
+            gemm1_weights_bf16_shuffled = torch.stack(gemm1_weights_bf16_shuffled).view(
+                torch.bfloat16
+            )
+            gemm2_weights_bf16_shuffled = torch.stack(gemm2_weights_bf16_shuffled).view(
+                torch.bfloat16
+            )
+
+            return {
+                "gemm1_weights": gemm1_weights_bf16_shuffled,
+                "gemm2_weights": gemm2_weights_bf16_shuffled,
+            }
+
+    def call_moe(
+        self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
+    ):
+        """Call MoE with runtime input quantization + kernel execution (done at runtime)."""
+        expert_logits = kwargs["expert_logits"]
+        routing_bias = kwargs["routing_bias"]
+        num_experts = kwargs["num_experts"]
+        top_k = kwargs["top_k"]
+        n_groups = kwargs["n_groups"]
+        top_k_groups = kwargs["top_k_groups"]
+        intermediate_size = kwargs["intermediate_size"]
+        routing_method_type = kwargs["routing_method_type"]
+        tile_tokens_dim = kwargs["tile_tokens_dim"]
+
+        output = trtllm_bf16_moe(
+            expert_logits,  # float
+            routing_bias,
+            hidden_states_orig,
+            static_data["gemm1_weights"],
+            static_data["gemm2_weights"],
+            num_experts,
+            top_k,
+            n_groups,
+            top_k_groups,
+            intermediate_size,
+            0,
+            num_experts,
+            # the rest are enforced by the api to be passed in the keyword form
+            # as opposed to the positional form
+            tile_tokens_dim=tile_tokens_dim,
+            routing_method_type=routing_method_type,
+        )
+
+        return output.to(torch.float)
+
+    def compute_reference(self, args):
+        """BF16 reference implementation."""
+        return run_moe_reference_bf16(args)
+
+    def get_tolerances(self):
+        """Get BF16 accuracy tolerances."""
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+
+
+# ====================================================================================
 # Quantizer Factory
 # ====================================================================================
 
@@ -1789,6 +1926,37 @@ def run_moe_reference_per_tensor_scale_fp8(args):
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
 
 
+def run_moe_reference_bf16(args):
+    """BF16 reference implementation."""
+
+    # no scaling for hidden states and weights
+    hidden_states_dequant = args.hidden_states.to(torch.float)
+    gemm1_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm1_weights_dequant[i] = args.gemm1_weights[i].to(torch.float)
+    gemm2_weights_dequant = {}
+    for i in range(args.num_experts):
+        gemm2_weights_dequant[i] = args.gemm2_weights[i].to(torch.float)
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens,
+        args.num_experts,
+        args.hidden_size,
+        args.intermediate_size,
+        args.top_k,
+        args.padding,
+        hidden_states_dequant,
+        args.expert_logits,
+        gemm1_weights_dequant,
+        gemm2_weights_dequant,
+        args.permute_info,
+        args.use_routing_scales_on_input,
+        GatedActType.SwiGlu.value,  # gated_act_type
+    )
+
+    return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
+
+
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
     """Unified actual computation that delegates to implementation-specific methods."""
     # 1. Prepare static weights for the kernel (offline processing)
@@ -1848,6 +2016,7 @@ def cache_permute_indices():
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
         pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(BF16Moe(), id="All_BF16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1897,7 +2066,12 @@ def cache_permute_indices():
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                ],
             },
             id="Renorm",
             marks=pytest.mark.skip(
@@ -1914,7 +2088,7 @@ def cache_permute_indices():
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
-                "compatible_moe_impls": [FP4Moe],
+                "compatible_moe_impls": [FP4Moe, BF16Moe],
             },
             id="RenormNaive",
         ),
@@ -1971,7 +2145,7 @@ def cache_permute_indices():
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
             },
             id="Shuffled_BlockMajorK",
         ),
@@ -2004,31 +2178,34 @@ def test_moe_quantization_classes(
     Each quantization class clearly shows which precision is being used.
     """
     # Skip incompatible combinations
+    # NOTE Don't worry about the short-lived variables between if & skip - formatting simplifications
     if gated_act_type == GatedActType.GeGlu and (
         type(moe_impl) is not FP4Moe
         or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
         or routing_config["routing_method_type"] != RoutingMethodType.TopK
         or num_tokens > 128
     ):
+        routing = routing_config["routing_method_type"].name
         # GeGlu is only supported for FP4Moe FP4_NVFP4_NVFP4 and TopK routing
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
+            f"Incompatible: {moe_impl.name} {gated_act_type.name} {routing=} {num_tokens=}"
         )
     elif gated_act_type == GatedActType.SwiGlu and (
         hidden_size > 1024 or intermediate_size > 1024
     ):
         # Skip some tests for SwiGlu for testing speed
         pytest.skip(
-            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
+            f"Skip for testing speed: {gated_act_type.name} {hidden_size=} {intermediate_size=}"
         )
 
     if type(moe_impl) not in routing_config["compatible_moe_impls"]:
-        pytest.skip(
-            f"Incompatible: {moe_impl.name} + {routing_config['routing_method_type'].name}"
-        )
+        routing = routing_config["routing_method_type"].name
+        pytest.skip(f"Incompatible routing: {moe_impl.name} {routing=}")
     if type(moe_impl) not in weight_processing["compatible_moe_impls"]:
+        layout = weight_processing["layout"].name
+        use_shuffled_weight = weight_processing["use_shuffled_weight"]
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
+            f"Incompatible weight format: {moe_impl.name} {use_shuffled_weight=} {layout=}"
         )
 
     moe_impl._cache_permute_indices = cache_permute_indices

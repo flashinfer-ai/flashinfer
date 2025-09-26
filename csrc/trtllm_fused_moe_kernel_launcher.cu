@@ -39,8 +39,467 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+using batchedGemm::gemm::MatrixLayout;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::GatedActType;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
+
+/*
+
+Abstraction layers:
+
+1. TORCH_LIBRARY_FRAGMENT bindings
+These are currently the same signature as the public python APIs.
+We strive to make the python interface relatively stable
+and the naming of parameters meaningful to the users.
+
+2. FusedMoeLauncher
+This performs checks and preparations for the execution,
+organized in several stages, see FusedMoeLauncher::run().
+
+3. MoE::Runner
+Orchestrate and dispatch all the kernels executions to fulfill the requested operation.
+This includes PermuteGemm1, Gemm2, activation (if not fused), and finalize.
+
+4. TrtllmGenBatchedGemmRunner
+This provides tactic selection if not determined yet at the public API (or auto-tuning)
+
+5. BatchedGemm Runner
+The low-level gemm kernel executor which is updated together with the kernels.
+
+6. BatchedGemmInterface
+Driver calls take place to carry out the gemm operations.
+*/
+
+class FusedMoeLauncher {
+ protected:
+  at::Tensor const* routing_logits{};
+  at::Tensor const* routing_bias{};
+  at::Tensor const* hidden_states{};
+  at::Tensor const* gemm1_weights{};
+  at::Tensor const* output1_scales_scalar{};
+  at::Tensor const* output1_scales_gate_scalar{};
+  at::Tensor const* gemm2_weights{};
+  at::Tensor const* output2_scales_scalar{};
+
+  int64_t tile_tokens_dim{};
+  int64_t routing_method_type{};
+  bool use_shuffled_weight{};
+  MatrixLayout weight_layout{MatrixLayout::MajorK};
+
+  std::tuple<int, int> device_version;
+  std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs> args;
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
+
+  btg::Dtype mDtypeAct{btg::Dtype::Bfloat16};
+  btg::Dtype mDtypeWeights{btg::Dtype::Bfloat16};
+  GatedActType gated_act_type{GatedActType::SwiGlu};
+
+  // Initialize common data necessary for later.
+  // May throw exception from TORCH_CHECK.
+  void init_common(at::Tensor const* routing_logits, at::Tensor const* routing_bias,
+                   at::Tensor const* hidden_states, at::Tensor const* gemm1_weights,
+                   at::Tensor const* gemm2_weights,
+                   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
+                   int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
+                   int64_t weight_layout, int64_t gated_act_type);
+
+  // Routing logits [num_tokens, num_experts]
+  void check_routing_logits_shape() const {
+    TORCH_CHECK(routing_logits->dim() == 2, "routing_logits must be 2D.");
+    TORCH_CHECK(routing_logits->sizes()[0] == hidden_states->sizes()[0],
+                "routing_logits and hidden_states must have the same number of tokens.");
+    TORCH_CHECK(routing_logits->sizes()[1] == args->num_experts,
+                "routing_logits dim1 must match num_experts.");
+  }
+
+  // Routing bias [num_experts]
+  void check_routing_bias_shape() const {
+    if (routing_bias != nullptr) {
+      TORCH_CHECK(routing_bias->dim() == 1, "routing_bias must be 1D.");
+      TORCH_CHECK(routing_bias->sizes()[0] == args->num_experts,
+                  "routing_bias has incorrect shape.");
+    }
+  }
+
+  // Hidden states [num_tokens, hidden_size]
+  void check_hidden_states_shape() const {
+    TORCH_CHECK(hidden_states->dim() == 2, "hidden_states must be 2D.");
+    TORCH_CHECK(hidden_states->sizes()[1] == args->intermediate_size,
+                "hidden_states has incorrect shape.");
+  }
+
+  // GEMM1 or GEMM2 weights [num_experts, M, K] or [num_experts, K/block_k, M, block_k]
+  void check_weights_shape(std::string which_weights) const {
+    at::Tensor const* weights{};
+    if (which_weights == "gemm1") {
+      weights = gemm1_weights;
+    } else if (which_weights == "gemm2") {
+      weights = gemm2_weights;
+    } else {
+      TORCH_CHECK(false, "Internal error: which_weights = ", which_weights);
+    }
+
+    int64_t Mn = 0, K = 0;
+    if (weight_layout == MatrixLayout::MajorK) {
+      // MajorK [num_experts, M, K]
+      Mn = weights->sizes()[1];
+      K = weights->sizes()[2];
+    } else if (weight_layout == MatrixLayout::BlockMajorK) {
+      // BlockMajorK [num_experts, K/block_k, M, block_k]
+      Mn = weights->sizes()[2];
+      int64_t block_k = weights->sizes()[3];
+      K = weights->sizes()[1] * block_k;
+    } else {
+      TORCH_CHECK(false, "Unsupported weight_layout: ", weight_layout);
+    }
+    TORCH_CHECK(weights->sizes()[0] == args->num_experts,
+                which_weights + " weights expert dimension must match num_experts");
+    if (which_weights == "gemm1") {
+      TORCH_CHECK(Mn % 2 == 0, which_weights + " weights Mn dimension must be even.");
+      TORCH_CHECK(args->intermediate_size == Mn / 2, "intermediate_size has incorrect shape.");
+      TORCH_CHECK(K == hidden_states->sizes()[1],
+                  which_weights + " weights K dimension must be equal to hidden_size.");
+    } else if (which_weights == "gemm2") {
+      TORCH_CHECK(K == args->intermediate_size,
+                  which_weights + " weights K dimension must be equal to intermediate_size.");
+    }
+  }
+
+  void check_routing_common() const {
+    TORCH_CHECK(args->top_k > 0 && args->top_k <= args->num_experts,
+                "top_k must be between 1 and num_experts");
+    TORCH_CHECK(args->local_num_experts > 0 && args->local_num_experts <= args->num_experts,
+                "local_num_experts must be between 1 and num_experts");
+    TORCH_CHECK(args->local_expert_offset >= 0 &&
+                    args->local_expert_offset + args->local_num_experts <= args->num_experts,
+                "expert offset and count must be within valid range");
+
+    check_routing_logits_shape();
+
+    if (routing_bias) {
+      check_routing_bias_shape();
+    }
+  }
+
+  // Routing phase workspace tensors (allocated in prepare_routing() or prepare_routing_common())
+  at::Tensor num_tokens_per_expert;
+  at::Tensor total_num_padded_tokens;
+  at::Tensor expanded_idx_to_permuted_idx;
+  at::Tensor permuted_idx_to_token_idx;
+  at::Tensor expert_weights;
+  at::Tensor expert_indexes;
+  at::Tensor expert_count_histogram;
+  at::Tensor cta_idx_xy_to_batch_idx;
+  at::Tensor cta_idx_xy_to_mn_limit;
+  at::Tensor num_non_exiting_ctas;
+
+  void prepare_routing_common() {
+    // Allocate routing phase workspace tensors
+    int32_t max_num_padded_tokens =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+            args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+
+    // Common routing workspace tensors allocation
+    num_tokens_per_expert = at::detail::empty_cuda({args->num_experts}, at::ScalarType::Int,
+                                                   routing_logits->device(), std::nullopt);
+
+    total_num_padded_tokens = at::empty(
+        {}, at::TensorOptions().device(routing_logits->device()).dtype(at::ScalarType::Int));
+
+    expanded_idx_to_permuted_idx =
+        at::detail::empty_cuda({args->num_tokens * args->top_k}, at::ScalarType::Int,
+                               routing_logits->device(), std::nullopt);
+
+    permuted_idx_to_token_idx = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int,
+                                                       routing_logits->device(), std::nullopt);
+
+    expert_indexes = at::detail::empty_cuda({args->num_tokens, args->top_k}, at::ScalarType::Int,
+                                            routing_logits->device(), std::nullopt);
+
+    // expert_weights allocation should be done by derived class since data type could vary
+
+    int64_t const size_of_expert_count_histogram = std::max(args->num_experts * 2, 256 * 2);
+    expert_count_histogram =
+        at::detail::empty_cuda({size_of_expert_count_histogram},
+                               at::ScalarType::Int,  // 256 is the max number of threads per block
+                                                     // and max number of experts
+                               routing_logits->device(), std::nullopt);
+
+    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+        args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+
+    cta_idx_xy_to_batch_idx = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int,
+                                                     routing_logits->device(), std::nullopt);
+
+    cta_idx_xy_to_mn_limit = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int,
+                                                    routing_logits->device(), std::nullopt);
+
+    num_non_exiting_ctas = at::empty(
+        {}, at::TensorOptions().device(routing_logits->device()).dtype(at::ScalarType::Int));
+
+    workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
+    workspace.total_max_padded_tokens = max_num_padded_tokens;
+    workspace.ProjUpTileN = tile_tokens_dim;
+    workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
+    workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
+    workspace.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.data_ptr<int>();
+    workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>();
+    // workspace.expert_weights will be set by derived class after expert_weights allocation
+    workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
+    workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
+    workspace.num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
+  }
+
+  void check_moe_common() const {
+    // Hidden states [num_tokens, hidden_size]
+    TORCH_CHECK(hidden_states->dim() == 2, "hidden_states must be 2D.");
+  }
+
+  // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
+  at::Tensor gemm1_output;
+  at::Tensor activation_output;
+  at::Tensor gemm2_output;
+  at::Tensor workspace_fc1;
+  at::Tensor workspace_fc2;
+  at::Tensor output;
+  int64_t moe_tactic{-1};
+  std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
+
+  void prepare_moe_common(int64_t& moe_tactic) {
+    using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+    moe_runner = std::make_unique<RunnerType>(
+        this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
+        static_cast<GatedActType>(this->gated_act_type), this->use_shuffled_weight);
+
+    if (moe_tactic == -1) {
+      moe_tactic = moe_runner->getDefaultValidConfigIndex(
+          args->top_k, args->hidden_size, args->intermediate_size, args->local_num_experts,
+          args->num_tokens);
+    }
+    this->moe_tactic = moe_tactic;
+
+    auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
+    workspace_fc1 = at::detail::empty_cuda({std::get<0>(workspace_sizes)}, at::ScalarType::Char,
+                                           hidden_states->device(), std::nullopt);
+    workspace_fc2 = at::detail::empty_cuda({std::get<1>(workspace_sizes)}, at::ScalarType::Char,
+                                           hidden_states->device(), std::nullopt);
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+
+ public:
+  virtual void check_routing() const = 0;
+  virtual void prepare_routing() = 0;
+  virtual void check_moe() const = 0;
+  virtual void prepare_moe(int64_t& moe_tactic) = 0;
+
+  // Main entry point for all the executions.
+  // Do initializations prior to calling this as the initializations are different for bf16, fp8 and
+  // fp4. The executions are non-blocking by default.
+  std::vector<at::Tensor> run(int64_t moe_tactic, bool enable_pdl = true) {
+    check_routing();
+    prepare_routing();
+
+    // Execute routing
+    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    int routing_device = routing_logits->get_device();
+    auto const& routing_stream = at::cuda::getCurrentCUDAStream(routing_device);
+    routing_runner.run(
+        routing_logits->data_ptr<float>(), args->routing_bias, args->num_tokens, args->num_experts,
+        args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor, expert_indexes.data_ptr<int>(),
+        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+        expanded_idx_to_permuted_idx.data_ptr<int>(),
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/,
+        permuted_idx_to_token_idx.data_ptr<int>(), expert_weights.data_ptr(),
+        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
+        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(),
+        args->mDtypeElt, false, true, static_cast<RoutingMethodType>(routing_method_type),
+        routing_stream);
+
+    check_moe();
+    // if moe_tactic is -1, it will be set to the default valid config index
+    prepare_moe(moe_tactic);
+
+    // Execute MoE
+    int moe_device = hidden_states->get_device();
+    auto const& moe_stream = at::cuda::getCurrentCUDAStream(moe_device);
+    moe_runner->run(*args, workspace, moe_device, moe_stream, moe_tactic, enable_pdl);
+
+    if (args->do_finalize) {
+      return {output};
+    }
+    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+  }
+};
+
+void FusedMoeLauncher::init_common(
+    at::Tensor const* routing_logits, at::Tensor const* routing_bias,
+    at::Tensor const* hidden_states, at::Tensor const* gemm1_weights,
+    at::Tensor const* gemm2_weights,
+    std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
+    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
+    int64_t weight_layout, int64_t gated_act_type) {
+  // Check devicearchitecture: Blackwell (SM 10.x) required
+  TORCH_CHECK(hidden_states != nullptr, "hidden_states is required");
+  auto device = hidden_states->device().index();
+  int major = 0, minor = 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  TORCH_CHECK(major == 10, "BF16 MoE requires 10.x architecture. Current device has SM ", major,
+              minor);
+  this->device_version = std::make_tuple(major, minor);
+
+  this->routing_logits = routing_logits;
+  this->routing_bias = routing_bias;
+  this->hidden_states = hidden_states;
+  this->gemm1_weights = gemm1_weights;
+  this->gemm2_weights = gemm2_weights;
+
+  args->routing_logits = routing_logits->data_ptr<float>();
+  args->routing_bias = routing_bias ? routing_bias->data_ptr() : nullptr;
+  args->hidden_states = hidden_states->data_ptr();
+  args->gemm1_weights = gemm1_weights->data_ptr();
+  args->gemm2_weights = gemm2_weights->data_ptr();
+
+  this->args = std::move(args);
+  this->tile_tokens_dim = tile_tokens_dim;
+  this->routing_method_type = routing_method_type;
+  this->use_shuffled_weight = use_shuffled_weight;
+  TORCH_CHECK(0 <= weight_layout && weight_layout <= 2,
+              "the value of weight_layout is not recognized");
+  this->weight_layout = static_cast<MatrixLayout>(weight_layout);
+  TORCH_CHECK(0 <= gated_act_type && gated_act_type <= 1,
+              "the value of gated_act_type is not recognized");
+  this->gated_act_type = static_cast<GatedActType>(gated_act_type);
+}
+
+class Bf16MoeLauncher : public FusedMoeLauncher {
+ public:
+  Bf16MoeLauncher() = default;
+
+  void init(at::Tensor const& routing_logits, std::optional<at::Tensor> const& routing_bias,
+            at::Tensor const& hidden_states, at::Tensor const& gemm1_weights,
+            at::Tensor const& gemm2_weights,
+            std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
+            int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
+            int64_t weight_layout) {
+    constexpr int64_t gated_act_type =
+        static_cast<int64_t>(GatedActType::SwiGlu);  // not exposed in api for now
+
+    // Do base class init and perform common checks
+    FusedMoeLauncher::init_common(
+        &routing_logits, routing_bias.has_value() ? &routing_bias.value() : nullptr, &hidden_states,
+        &gemm1_weights, &gemm2_weights, std::move(args), tile_tokens_dim, routing_method_type,
+        use_shuffled_weight, weight_layout, gated_act_type);
+  }
+
+  void check_routing() const override {
+    FusedMoeLauncher::check_routing_common();
+
+    // TODO n_group, topk_group validation?
+  }
+
+  void prepare_routing() override {
+    FusedMoeLauncher::prepare_routing_common();
+
+    args->mDtypeElt = btg::Dtype::Bfloat16;
+    args->mDtypeExpW = btg::Dtype::Bfloat16;
+    args->mUseDeepSeekFp8 = false;
+
+    auto const routing_bias_dtype = at::ScalarType::BFloat16;
+    expert_weights = at::detail::empty_cuda({args->num_tokens, args->top_k}, routing_bias_dtype,
+                                            routing_logits->device(), std::nullopt);
+
+    workspace.expert_weights = expert_weights.data_ptr();
+  }
+
+  void check_moe() const override {
+    FusedMoeLauncher::check_moe_common();
+
+    TORCH_CHECK(weight_layout == MatrixLayout::BlockMajorK,
+                "BF16 Moe: weight_layout must be BlockMajorK");
+    check_weights_shape("gemm1");
+    check_weights_shape("gemm2");
+
+    TORCH_CHECK(args->intermediate_size % 128 == 0,
+                "the second dimension of weights must be a multiple of 128.");
+  }
+
+  void prepare_moe(int64_t& moe_tactic) override {
+    // in the next line moe_tactic is passed by reference so modification will be propagated back
+    // here
+    FusedMoeLauncher::prepare_moe_common(moe_tactic);
+
+    int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
+    gemm1_output =
+        at::detail::empty_cuda({max_num_padded_tokens, 2 * args->intermediate_size},
+                               at::ScalarType::BFloat16, hidden_states->device(), std::nullopt);
+    activation_output =
+        at::detail::empty_cuda({max_num_padded_tokens, args->intermediate_size},
+                               at::ScalarType::BFloat16, hidden_states->device(), std::nullopt);
+    gemm2_output =
+        at::detail::empty_cuda({max_num_padded_tokens, args->hidden_size}, at::ScalarType::BFloat16,
+                               hidden_states->device(), std::nullopt);
+
+    workspace.hidden_states_scale_linear = nullptr;
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = nullptr;  // BF16 doesn't use scale tensors
+    workspace.activation_output = activation_output.data_ptr();
+    workspace.activation_output_scale = nullptr;  // BF16 doesn't use scale tensors
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output_scale = nullptr;
+
+    output = at::detail::empty_cuda({args->num_tokens, args->hidden_size}, at::ScalarType::BFloat16,
+                                    hidden_states->device(), std::nullopt);
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
+  }
+};
+
+at::Tensor trtllm_bf16_moe(at::Tensor const& routing_logits,
+                           std::optional<at::Tensor> const& routing_bias,
+                           at::Tensor const& hidden_states, at::Tensor const& gemm1_weights,
+                           at::Tensor const& gemm2_weights, int64_t num_experts, int64_t top_k,
+                           int64_t n_group, int64_t topk_group, int64_t intermediate_size,
+                           int64_t local_expert_offset, int64_t local_num_experts,
+                           int64_t tile_tokens_dim, int64_t routing_method_type,
+                           bool use_shuffled_weight, int64_t weight_layout, int64_t moe_tactic,
+                           bool enable_pdl) {
+  // Just some basic type validation first and leave more checks to the launcher
+  TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float ||
+                  routing_logits.scalar_type() == at::ScalarType::BFloat16,
+              "BF16 MoE: routing_logits must be bfoat16 or float.");
+  if (routing_bias.has_value()) {
+    TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16,
+                "BF16 MoE: routing_bias must be bfloat16.");
+  }
+  TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::BFloat16,
+              "BF16 MoE: hidden_states must be bfloat16.");
+  TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::BFloat16,
+              "BF16 MoE: gemm1_weights must be bfloat16.");
+  TORCH_CHECK(gemm2_weights.scalar_type() == at::ScalarType::BFloat16,
+              "BF16 MoE: gemm2_weights must be bfloat16.");
+
+  // Save params to MoE arguments
+  auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
+  args->num_tokens = hidden_states.sizes()[0];
+  args->num_experts = num_experts;
+  args->hidden_size = hidden_states.sizes()[1];
+  args->hidden_size_output = args->hidden_size;
+  args->top_k = top_k;
+  args->n_group = n_group;
+  args->topk_group = topk_group;
+  args->local_expert_offset = local_expert_offset;
+  args->local_num_experts = local_num_experts;
+  args->intermediate_size = intermediate_size;
+
+  Bf16MoeLauncher launcher;
+  launcher.init(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights,
+                std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight,
+                weight_layout);
+  return launcher.run(moe_tactic, enable_pdl)[0];
+}
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     at::Tensor const& routing_logits, std::optional<at::Tensor> routing_bias,
@@ -301,6 +760,27 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
+    //        // Create unified runner for FP8 per-tensor mode
+    // using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+    // auto mRunner = std::make_unique<RunnerType>(
+    //     btg::Dtype::E4m3, false, tile_tokens_dim, /*useShuffledMatrixA*/ true);
+
+    // auto const moeConfigIndex = mRunner->getDefaultValidConfigIndex(
+    //     top_k, hidden_states.sizes()[1], intermediate_size, local_num_experts,
+    //     hidden_states.sizes()[0]);
+
+    // // Call unified launcher with nullopt for expert_indices, expert_weights, and output (will be
+    // created internally) auto results = trtllm_fp4_block_scale_moe_launcher(
+    //     routing_logits, std::nullopt, std::nullopt, routing_bias, hidden_states, std::nullopt,
+    //     gemm1_weights, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+    //     gemm2_weights, std::nullopt, std::nullopt,
+    //     output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
+    //     num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
+    //     local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type, true, //
+    //     do_finalize = true *mRunner, btg::Dtype::E4m3, btg::Dtype::E4m3, moeConfigIndex,
+    //     enable_pdl);
+
+    // return results[0];  // Return the first tensor from the vector
     return trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
@@ -1161,6 +1641,7 @@ namespace trtllm_cubin_loader {
 }
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("trtllm_bf16_moe", trtllm_bf16_moe);
   m.def("trtllm_fp8_per_tensor_scale_moe", trtllm_fp8_per_tensor_scale_moe);
   m.def("trtllm_fp8_block_scale_moe", trtllm_fp8_block_scale_moe);
   m.def("trtllm_fp4_block_scale_moe", trtllm_fp4_block_scale_moe);
