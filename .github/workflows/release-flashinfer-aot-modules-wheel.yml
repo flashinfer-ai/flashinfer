@@ -65,7 +65,7 @@ jobs:
             fail-fast: false
             matrix:
                 cuda: ["12.9"] #["12.8", "12.9", "13.0"]
-                arch: ['x86_64', 'aarch6t4']
+                arch: ['x86_64', 'aarch64']
 
         # Use self-hosted runners with specific labels based on architecture
         runs-on: [self-hosted, "${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }}"]
