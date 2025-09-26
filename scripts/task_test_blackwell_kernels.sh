@@ -4,6 +4,7 @@ set -eo pipefail
 set -x
 : ${JUNIT_DIR:=$(realpath ./junit)}
 
+pip install -e . -v
 
 EXIT_CODE=0
 scripts_to_run=(
